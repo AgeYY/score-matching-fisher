@@ -1,0 +1,10 @@
+Multi-sigma score-to-Fisher evaluation (no kernel averaging)
+Extrapolation model: I_sigma(theta)=a(theta)+b(theta)*sigma^2
+sigma_alpha: [0.08, 0.06, 0.045, 0.03, 0.02]
+sigma_values: [0.13897965429786424, 0.10423474072339817, 0.07817605554254863, 0.052117370361699084, 0.03474491357446606]
+n_valid_bins: 35
+rmse: 6.522256
+mae: 4.651831
+relative_rmse: 0.196625
+corr: 0.924494
+mean_extrapolation_r2: 0.926104

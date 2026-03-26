@@ -1,0 +1,6 @@
+Direct score-to-Fisher evaluation (no kernel averaging)
+n_valid_bins: 35
+rmse: 7.901446
+mae: 6.890503
+relative_rmse: 0.238203
+corr: 0.971909
