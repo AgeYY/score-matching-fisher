@@ -1,8 +1,0 @@
-Decoder-based Fisher via local classification
-epsilon: 0.120000
-n_bins: 35
-valid_bins: 35/35
-rmse: 6.874985
-mae: 5.187304
-relative_rmse: 0.206704
-corr: 0.947888
