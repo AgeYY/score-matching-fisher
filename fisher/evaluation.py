@@ -21,9 +21,10 @@ def parse_sigma_alpha_list(items: list[float]) -> np.ndarray:
 def log_p_x_given_theta(x: np.ndarray, theta: np.ndarray, dataset: ToyConditionalGaussianDataset) -> np.ndarray:
     mu = dataset.tuning_curve(theta)
     delta = x - mu
-    inv_cov = np.linalg.inv(dataset.cov)
-    quad = np.einsum("ni,ij,nj->n", delta, inv_cov, delta)
-    _, logdet = np.linalg.slogdet(dataset.cov)
+    cov = dataset.covariance(theta)
+    inv_cov = np.linalg.inv(cov)
+    quad = np.einsum("ni,nij,nj->n", delta, inv_cov, delta)
+    _, logdet = np.linalg.slogdet(cov)
     d = x.shape[1]
     return -0.5 * (d * np.log(2.0 * np.pi) + logdet + quad)
 

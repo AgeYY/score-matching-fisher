@@ -31,6 +31,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sigma-x1", type=float, default=0.30)
     p.add_argument("--sigma-x2", type=float, default=0.22)
     p.add_argument("--rho", type=float, default=0.15)
+    p.add_argument("--cov-theta-amp1", type=float, default=0.35)
+    p.add_argument("--cov-theta-amp2", type=float, default=0.30)
+    p.add_argument("--cov-theta-amp-rho", type=float, default=0.30)
+    p.add_argument("--cov-theta-freq1", type=float, default=0.90)
+    p.add_argument("--cov-theta-freq2", type=float, default=0.75)
+    p.add_argument("--cov-theta-freq-rho", type=float, default=1.10)
+    p.add_argument("--cov-theta-phase1", type=float, default=0.20)
+    p.add_argument("--cov-theta-phase2", type=float, default=-0.35)
+    p.add_argument("--cov-theta-phase-rho", type=float, default=0.40)
+    p.add_argument("--rho-clip", type=float, default=0.85)
     p.add_argument("--n-total", type=int, default=60000)
     p.add_argument("--train-frac", type=float, default=0.7)
     p.add_argument("--device", type=str, default="cuda")
@@ -73,11 +83,16 @@ def require_device(name: str) -> torch.device:
 
 def analytic_fisher_curve(centers: np.ndarray, dataset: ToyConditionalGaussianDataset) -> np.ndarray:
     t = centers.reshape(-1, 1)
-    dmu1 = 1.10 * 1.25 * np.cos(1.25 * t) + 0.28
-    dmu2 = -0.85 * 1.05 * np.sin(1.05 * t + 0.30) - 0.24 * t + 0.05
-    dmu = np.concatenate([dmu1, dmu2], axis=1)  # (B,2)
-    inv_cov = np.linalg.inv(dataset.cov)
-    fisher = np.einsum("bi,ij,bj->b", dmu, inv_cov, dmu)
+    dmu = dataset.tuning_curve_derivative(t)  # (B,2)
+    cov = dataset.covariance(t)  # (B,2,2)
+    dcov = dataset.covariance_derivative(t)  # (B,2,2)
+    inv_cov = np.linalg.inv(cov)
+    mean_term = np.einsum("bi,bij,bj->b", dmu, inv_cov, dmu)
+    a = np.einsum("bij,bjk->bik", inv_cov, dcov)
+    b = np.einsum("bij,bjk->bik", a, inv_cov)
+    c = np.einsum("bij,bjk->bik", b, dcov)
+    cov_term = 0.5 * np.einsum("bii->b", c)
+    fisher = mean_term + cov_term
     return fisher.astype(np.float64)
 
 
@@ -201,6 +216,16 @@ def main() -> None:
         sigma_x1=args.sigma_x1,
         sigma_x2=args.sigma_x2,
         rho=args.rho,
+        cov_theta_amp1=args.cov_theta_amp1,
+        cov_theta_amp2=args.cov_theta_amp2,
+        cov_theta_amp_rho=args.cov_theta_amp_rho,
+        cov_theta_freq1=args.cov_theta_freq1,
+        cov_theta_freq2=args.cov_theta_freq2,
+        cov_theta_freq_rho=args.cov_theta_freq_rho,
+        cov_theta_phase1=args.cov_theta_phase1,
+        cov_theta_phase2=args.cov_theta_phase2,
+        cov_theta_phase_rho=args.cov_theta_phase_rho,
+        rho_clip=args.rho_clip,
         seed=args.seed,
     )
 
@@ -277,7 +302,7 @@ def main() -> None:
     score_metrics = compute_metrics(score_eval.curves.fisher_model, gt, score_valid)
     decoder_metrics = compute_metrics(decoder_fisher, gt, decoder_valid)
 
-    fig_path = os.path.join(args.output_dir, "fisher_curve_shared_dataset_vs_analytic.png")
+    fig_path = os.path.join(args.output_dir, "fisher_curve_shared_dataset_vs_analytic_theta_cov.png")
     plt.figure(figsize=(9.0, 5.6))
     plt.plot(centers, gt, color="black", linewidth=2.6, label="Analytic Fisher (GT)")
     plt.plot(
@@ -321,7 +346,7 @@ def main() -> None:
     plt.savefig(fig_path, dpi=180)
     plt.close()
 
-    npz_path = os.path.join(args.output_dir, "shared_dataset_compare_curves.npz")
+    npz_path = os.path.join(args.output_dir, "shared_dataset_compare_curves_theta_cov.npz")
     np.savez(
         npz_path,
         centers=centers,
@@ -335,13 +360,20 @@ def main() -> None:
         score_losses=np.asarray(score_losses, dtype=np.float64),
     )
 
-    metrics_path = os.path.join(args.output_dir, "metrics_vs_analytic.txt")
+    metrics_path = os.path.join(args.output_dir, "metrics_vs_analytic_theta_cov.txt")
     with open(metrics_path, "w", encoding="utf-8") as f:
         f.write("Shared dataset Fisher comparison against analytic GT\n")
         f.write(f"n_total: {args.n_total}\n")
         f.write(f"train_frac: {args.train_frac}\n")
         f.write(f"decoder_epsilon: {args.decoder_epsilon}\n")
         f.write(f"decoder_bandwidth: {args.decoder_bandwidth}\n")
+        f.write(
+            "cov_theta: "
+            f"amp1={args.cov_theta_amp1}, amp2={args.cov_theta_amp2}, amp_rho={args.cov_theta_amp_rho}, "
+            f"freq1={args.cov_theta_freq1}, freq2={args.cov_theta_freq2}, freq_rho={args.cov_theta_freq_rho}, "
+            f"phase1={args.cov_theta_phase1}, phase2={args.cov_theta_phase2}, phase_rho={args.cov_theta_phase_rho}, "
+            f"rho_clip={args.rho_clip}\n"
+        )
         f.write(
             "score_vs_gt: "
             f"valid={int(score_metrics['n_valid'])}/{args.n_bins}, "

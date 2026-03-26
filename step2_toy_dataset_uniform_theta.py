@@ -22,6 +22,13 @@ def summarize_dataset(theta: np.ndarray, x: np.ndarray, dataset: ToyConditionalG
     print(f"  x std:  [{x[:,0].std():.4f}, {x[:,1].std():.4f}]")
     print("  configured covariance Sigma:")
     print(dataset.cov)
+    s1, s2, rho_t = dataset.covariance_components(theta)
+    print(
+        "  theta-dependent covariance ranges: "
+        f"sigma1 in [{s1.min():.4f}, {s1.max():.4f}], "
+        f"sigma2 in [{s2.min():.4f}, {s2.max():.4f}], "
+        f"rho in [{rho_t.min():.4f}, {rho_t.max():.4f}]"
+    )
 
     n_bins = 18
     bins = np.linspace(dataset.theta_low, dataset.theta_high, n_bins + 1)
@@ -110,6 +117,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sigma-x1", type=float, default=0.30)
     parser.add_argument("--sigma-x2", type=float, default=0.22)
     parser.add_argument("--rho", type=float, default=0.15)
+    parser.add_argument("--cov-theta-amp1", type=float, default=0.35)
+    parser.add_argument("--cov-theta-amp2", type=float, default=0.30)
+    parser.add_argument("--cov-theta-amp-rho", type=float, default=0.30)
+    parser.add_argument("--cov-theta-freq1", type=float, default=0.90)
+    parser.add_argument("--cov-theta-freq2", type=float, default=0.75)
+    parser.add_argument("--cov-theta-freq-rho", type=float, default=1.10)
+    parser.add_argument("--cov-theta-phase1", type=float, default=0.20)
+    parser.add_argument("--cov-theta-phase2", type=float, default=-0.35)
+    parser.add_argument("--cov-theta-phase-rho", type=float, default=0.40)
+    parser.add_argument("--rho-clip", type=float, default=0.85)
     parser.add_argument("--slice-thetas", type=float, nargs="+", default=[-2.4, -0.8, 0.8, 2.4])
     parser.add_argument("--output-dir", type=str, default="outputs_step2")
     return parser.parse_args()
@@ -125,6 +142,16 @@ def main() -> None:
         sigma_x1=args.sigma_x1,
         sigma_x2=args.sigma_x2,
         rho=args.rho,
+        cov_theta_amp1=args.cov_theta_amp1,
+        cov_theta_amp2=args.cov_theta_amp2,
+        cov_theta_amp_rho=args.cov_theta_amp_rho,
+        cov_theta_freq1=args.cov_theta_freq1,
+        cov_theta_freq2=args.cov_theta_freq2,
+        cov_theta_freq_rho=args.cov_theta_freq_rho,
+        cov_theta_phase1=args.cov_theta_phase1,
+        cov_theta_phase2=args.cov_theta_phase2,
+        cov_theta_phase_rho=args.cov_theta_phase_rho,
+        rho_clip=args.rho_clip,
         seed=args.seed,
     )
 
