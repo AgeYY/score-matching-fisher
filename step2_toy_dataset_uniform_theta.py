@@ -1,74 +1,15 @@
 #!/usr/bin/env python3
-"""Step 2: toy dataset with uniform theta and Gaussian p(x|theta).
-
-This script defines a reusable toy generator:
-  theta ~ Uniform[theta_low, theta_high]
-  x | theta ~ N(mu(theta), Sigma)
-where mu(theta) is a nonlinear 2D tuning curve.
-It also creates visualizations to inspect the dataset geometry.
-"""
+"""Step 2: toy dataset with uniform theta and Gaussian p(x|theta)."""
 
 from __future__ import annotations
 
 import argparse
 import os
-from dataclasses import dataclass
 
 import matplotlib.pyplot as plt
 import numpy as np
 
-
-def set_seed(seed: int) -> np.random.Generator:
-    return np.random.default_rng(seed)
-
-
-@dataclass
-class ToyConditionalGaussianDataset:
-    theta_low: float = -3.0
-    theta_high: float = 3.0
-    sigma_x1: float = 0.30
-    sigma_x2: float = 0.22
-    rho: float = 0.15
-    seed: int = 42
-
-    def __post_init__(self) -> None:
-        if not (self.theta_low < self.theta_high):
-            raise ValueError("theta_low must be smaller than theta_high.")
-        if not (-0.99 < self.rho < 0.99):
-            raise ValueError("rho must be in (-0.99, 0.99).")
-        self.rng = set_seed(self.seed)
-        self.cov = np.array(
-            [
-                [self.sigma_x1**2, self.rho * self.sigma_x1 * self.sigma_x2],
-                [self.rho * self.sigma_x1 * self.sigma_x2, self.sigma_x2**2],
-            ],
-            dtype=np.float64,
-        )
-        # Numerical safety for covariance decomposition.
-        self.cov = self.cov + 1e-8 * np.eye(2, dtype=np.float64)
-        self.cov_chol = np.linalg.cholesky(self.cov)
-
-    def sample_theta(self, n: int) -> np.ndarray:
-        theta = self.rng.uniform(self.theta_low, self.theta_high, size=(n, 1))
-        return theta.astype(np.float64)
-
-    def tuning_curve(self, theta: np.ndarray) -> np.ndarray:
-        """Nonlinear 2D mean map mu(theta). theta shape: (N,1)."""
-        t = np.asarray(theta, dtype=np.float64).reshape(-1, 1)
-        mu1 = 1.10 * np.sin(1.25 * t) + 0.28 * t
-        mu2 = 0.85 * np.cos(1.05 * t + 0.30) - 0.12 * (t**2) + 0.05 * t
-        return np.concatenate([mu1, mu2], axis=1)
-
-    def sample_x(self, theta: np.ndarray) -> np.ndarray:
-        mu = self.tuning_curve(theta)
-        eps = self.rng.standard_normal(size=mu.shape)
-        x = mu + eps @ self.cov_chol.T
-        return x.astype(np.float64)
-
-    def sample_joint(self, n: int) -> tuple[np.ndarray, np.ndarray]:
-        theta = self.sample_theta(n)
-        x = self.sample_x(theta)
-        return theta, x
+from fisher.data import ToyConditionalGaussianDataset
 
 
 def summarize_dataset(theta: np.ndarray, x: np.ndarray, dataset: ToyConditionalGaussianDataset) -> None:
@@ -82,7 +23,6 @@ def summarize_dataset(theta: np.ndarray, x: np.ndarray, dataset: ToyConditionalG
     print("  configured covariance Sigma:")
     print(dataset.cov)
 
-    # Quick sanity check: bin by theta and compare empirical mean to tuning curve mean.
     n_bins = 18
     bins = np.linspace(dataset.theta_low, dataset.theta_high, n_bins + 1)
     centers = 0.5 * (bins[:-1] + bins[1:])

@@ -256,3 +256,76 @@ python step3_direct_fisher_score.py
 - Using multiple noise levels with $\sigma\to0$ extrapolation is practical and aligns with standard score-model practice.
 - Relative noise scaling ($\sigma=\alpha\cdot\mathrm{std}(\theta)$) is a good default for portability across different data scales.
 - On this toy problem, the method gives a strong match to the finite-difference Fisher reference without kernel averaging.
+
+---
+
+## 13) Decoder-Based Fisher (Second Idea)
+
+In addition to score matching, we implemented the second idea in `idea.md`: estimate Fisher from a local decoder classifier.
+
+### Method
+
+For each target $\theta_0$, define two nearby parameters:
+
+$$
+\theta_+ = \theta_0 + \frac{\varepsilon}{2}, \qquad
+\theta_- = \theta_0 - \frac{\varepsilon}{2}.
+$$
+
+Train a binary decoder on samples from the two conditionals:
+- class 1: $x \sim p(x\mid\theta_+)$
+- class 0: $x \sim p(x\mid\theta_-)$
+
+Let $\ell_\phi(x)$ be the learned logit (log density-ratio surrogate). The local Fisher estimate is:
+
+$$
+\hat I_{\text{dec}}(\theta_0) = \frac{1}{\varepsilon^2}\,\mathbb E[\ell_\phi(x)^2].
+$$
+
+We use a single fixed $\varepsilon$ (no $\varepsilon\to0$ extrapolation in this step).
+
+### Settings
+
+Script: `step4_decoder_fisher.py`
+
+- $\varepsilon = 0.12$
+- $\theta$ eval bins: `35` over interior range $[-2.7, 2.7]$
+- local train/eval per class: `1200 / 1200`
+- decoder MLP: input $x\in\mathbb R^2$, depth `2`, hidden `64`, SiLU
+- optimization: Adam, lr `1e-3`, epochs `80`, batch size `256`
+
+Baseline remains finite-difference Fisher from analytic $p(x\mid\theta)$.
+
+### Results
+
+From `outputs_step4_decoder/metrics.txt`:
+
+- Valid bins: `35/35`
+- RMSE: `6.874985`
+- MAE: `5.187304`
+- Relative RMSE: `0.206704`
+- Correlation: `0.947888`
+
+Interpretation:
+- The decoder-based Fisher curve aligns well with the finite-difference curve.
+- Correlation is high, indicating strong shape agreement over $\theta$.
+
+### Visualizations
+
+Fisher curve (decoder vs finite-difference baseline):
+
+![Decoder Fisher curve](outputs_step4_decoder/fisher_curve_decoder_vs_fd.png)
+
+Representative decoder logit separation for selected $\theta_0$:
+
+![Decoder calibration examples](outputs_step4_decoder/decoder_calibration_examples.png)
+
+Representative local decoder training losses:
+
+![Decoder training loss examples](outputs_step4_decoder/training_loss_examples.png)
+
+### Repro Command
+
+```bash
+python step4_decoder_fisher.py
+```
