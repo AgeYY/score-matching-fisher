@@ -96,6 +96,28 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--score-proxy-min-mult", type=float, default=0.1)
     p.add_argument("--score-proxy-max-mult", type=float, default=2.0)
     p.add_argument("--score-fixed-sigma", type=float, default=0.02)
+    p.add_argument("--score-fisher-estimator", type=str, default="gp", choices=["binned", "nw", "gp"])
+    p.add_argument("--score-nw-bandwidth", type=float, default=0.10)
+    p.add_argument(
+        "--score-nw-bandwidth-scale",
+        type=str,
+        default="theta_range",
+        choices=["absolute", "theta_range"],
+    )
+    p.add_argument("--score-nw-min-effective-count", type=float, default=80.0)
+    p.add_argument("--score-gp-max-fit-points", type=int, default=2500)
+    p.add_argument("--score-gp-length-scale", type=float, default=0.10)
+    p.add_argument(
+        "--score-gp-length-scale-scale",
+        type=str,
+        default="theta_range",
+        choices=["absolute", "theta_range"],
+    )
+    p.add_argument("--score-gp-white-noise", type=float, default=1e-3)
+    p.add_argument("--score-gp-alpha", type=float, default=1e-6)
+    p.add_argument("--score-gp-opt-restarts", type=int, default=0)
+    p.add_argument("--score-gp-normalize-y", action="store_true", default=True)
+    p.add_argument("--no-score-gp-normalize-y", action="store_false", dest="score_gp_normalize_y")
 
     # Shared eval curve settings.
     p.add_argument("--n-bins", type=int, default=35)
@@ -303,6 +325,20 @@ def main() -> None:
         raise ValueError("--score-proxy-min-mult must be <= --score-proxy-max-mult.")
     if args.score_fixed_sigma <= 0.0:
         raise ValueError("--score-fixed-sigma must be positive.")
+    if args.score_nw_bandwidth <= 0.0:
+        raise ValueError("--score-nw-bandwidth must be positive.")
+    if args.score_nw_min_effective_count < 0.0:
+        raise ValueError("--score-nw-min-effective-count must be non-negative.")
+    if args.score_gp_max_fit_points < 1:
+        raise ValueError("--score-gp-max-fit-points must be >= 1.")
+    if args.score_gp_length_scale <= 0.0:
+        raise ValueError("--score-gp-length-scale must be positive.")
+    if args.score_gp_white_noise <= 0.0:
+        raise ValueError("--score-gp-white-noise must be positive.")
+    if args.score_gp_alpha < 0.0:
+        raise ValueError("--score-gp-alpha must be non-negative.")
+    if args.score_gp_opt_restarts < 0:
+        raise ValueError("--score-gp-opt-restarts must be >= 0.")
     os.makedirs(args.output_dir, exist_ok=True)
     device = require_device(args.device)
     np.random.seed(args.seed)
@@ -547,6 +583,18 @@ def main() -> None:
         eval_low=eval_low,
         eval_high=eval_high,
         device=device,
+        estimator=args.score_fisher_estimator,
+        nw_bandwidth=args.score_nw_bandwidth,
+        nw_bandwidth_scale=args.score_nw_bandwidth_scale,
+        nw_min_effective_count=args.score_nw_min_effective_count,
+        gp_max_fit_points=args.score_gp_max_fit_points,
+        gp_length_scale=args.score_gp_length_scale,
+        gp_length_scale_scale=args.score_gp_length_scale_scale,
+        gp_white_noise=args.score_gp_white_noise,
+        gp_alpha=args.score_gp_alpha,
+        gp_normalize_y=args.score_gp_normalize_y,
+        gp_optimizer_restarts=args.score_gp_opt_restarts,
+        gp_seed=args.seed,
     )
     centers = score_eval.curves.centers
 
@@ -597,7 +645,15 @@ def main() -> None:
         score_eval.curves.fisher_model[score_valid],
         color="#1f77b4",
         linewidth=2.2,
-        label=r"Score matching ($\sigma\to0$ extrapolated)",
+        label=(
+            r"Score matching + NW ($\sigma\to0$ extrapolated)"
+            if args.score_fisher_estimator == "nw"
+            else (
+                r"Score matching + GP ($\sigma\to0$ extrapolated)"
+                if args.score_fisher_estimator == "gp"
+                else r"Score matching ($\sigma\to0$ extrapolated)"
+            )
+        ),
     )
     if np.any(np.isfinite(score_eval.curves.se_model[score_valid])):
         plt.fill_between(
@@ -652,6 +708,15 @@ def main() -> None:
         score_stopped_epoch=np.asarray([stopped_epoch], dtype=np.int32),
         score_stopped_early=np.asarray([int(stopped_early)], dtype=np.int32),
         score_best_val_loss=np.asarray([best_val_loss], dtype=np.float64),
+        score_fisher_estimator=np.asarray([args.score_fisher_estimator]),
+        score_nw_bandwidth=np.asarray([args.score_nw_bandwidth], dtype=np.float64),
+        score_nw_min_effective_count=np.asarray([args.score_nw_min_effective_count], dtype=np.float64),
+        score_gp_max_fit_points=np.asarray([args.score_gp_max_fit_points], dtype=np.int32),
+        score_gp_length_scale=np.asarray([args.score_gp_length_scale], dtype=np.float64),
+        score_gp_white_noise=np.asarray([args.score_gp_white_noise], dtype=np.float64),
+        score_gp_alpha=np.asarray([args.score_gp_alpha], dtype=np.float64),
+        score_gp_opt_restarts=np.asarray([args.score_gp_opt_restarts], dtype=np.int32),
+        score_gp_normalize_y=np.asarray([int(args.score_gp_normalize_y)], dtype=np.int32),
     )
 
     metrics_path = os.path.join(args.output_dir, f"metrics_vs_gt{suffix}.txt")
@@ -681,6 +746,23 @@ def main() -> None:
             f"best_epoch={best_epoch}, stopped_epoch={stopped_epoch}, best_val_loss={best_val_loss}\n"
         )
         f.write(f"score_noise_mode: {args.score_noise_mode}\n")
+        f.write(f"score_fisher_estimator: {args.score_fisher_estimator}\n")
+        f.write(
+            "score_nw: "
+            f"bandwidth={args.score_nw_bandwidth}, "
+            f"bandwidth_scale={args.score_nw_bandwidth_scale}, "
+            f"min_effective_count={args.score_nw_min_effective_count}\n"
+        )
+        f.write(
+            "score_gp: "
+            f"max_fit_points={args.score_gp_max_fit_points}, "
+            f"length_scale={args.score_gp_length_scale}, "
+            f"length_scale_scale={args.score_gp_length_scale_scale}, "
+            f"white_noise={args.score_gp_white_noise}, "
+            f"alpha={args.score_gp_alpha}, "
+            f"opt_restarts={args.score_gp_opt_restarts}, "
+            f"normalize_y={args.score_gp_normalize_y}\n"
+        )
         f.write(f"score_sigma_scale_mode: {args.score_sigma_scale_mode}\n")
         f.write(f"theta_std_train: {theta_std}\n")
         if np.isfinite(sigma_post):

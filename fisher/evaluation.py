@@ -4,6 +4,8 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import ConstantKernel, RBF, WhiteKernel
 
 from fisher.data import ToyConditionalGMMNonGaussianDataset, ToyConditionalGaussianDataset
 from fisher.models import ConditionalScore1D, LocalDecoderLogit
@@ -97,6 +99,118 @@ def bin_mean_and_se(
     return BinnedStats(centers=centers, mean=mean, se=se, counts=counts, valid=valid)
 
 
+def make_theta_centers(theta_low: float, theta_high: float, n_bins: int) -> np.ndarray:
+    bins = np.linspace(theta_low, theta_high, n_bins + 1)
+    return 0.5 * (bins[:-1] + bins[1:])
+
+
+def nw_regress_scalar_1d(
+    theta: np.ndarray,
+    values: np.ndarray,
+    centers: np.ndarray,
+    bandwidth: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if bandwidth <= 0.0:
+        raise ValueError("NW bandwidth must be positive.")
+    t = np.asarray(theta, dtype=np.float64).reshape(-1)
+    v = np.asarray(values, dtype=np.float64).reshape(-1)
+    c = np.asarray(centers, dtype=np.float64).reshape(-1)
+    if t.size != v.size:
+        raise ValueError("theta and values must have the same number of samples.")
+    if t.size < 1:
+        raise ValueError("theta and values must be non-empty.")
+
+    diff = (t[:, None] - c[None, :]) / bandwidth
+    logw = -0.5 * (diff**2)
+    # Normalize in log space for stability.
+    logw = logw - np.max(logw, axis=0, keepdims=True)
+    w = np.exp(logw)
+    z = np.sum(w, axis=0, keepdims=True)
+    z = np.maximum(z, 1e-30)
+    w = w / z
+
+    mean = np.sum(w * v[:, None], axis=0)
+    centered = v[:, None] - mean[None, :]
+    var = np.sum(w * (centered**2), axis=0)
+    neff = 1.0 / np.maximum(np.sum(w**2, axis=0), 1e-30)
+    se = np.sqrt(np.maximum(var, 0.0) / np.maximum(neff, 1e-30))
+    return mean.astype(np.float64), se.astype(np.float64), neff.astype(np.float64)
+
+
+def gp_regress_scalar_1d(
+    theta: np.ndarray,
+    values: np.ndarray,
+    centers: np.ndarray,
+    max_fit_points: int,
+    length_scale: float,
+    length_scale_scale: str,
+    theta_low: float,
+    theta_high: float,
+    white_noise: float,
+    alpha: float,
+    normalize_y: bool,
+    optimizer_restarts: int,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    if max_fit_points < 1:
+        raise ValueError("gp max_fit_points must be >= 1.")
+    if length_scale <= 0.0:
+        raise ValueError("gp length_scale must be positive.")
+    if length_scale_scale not in {"absolute", "theta_range"}:
+        raise ValueError("gp length_scale_scale must be one of {'absolute','theta_range'}.")
+    if white_noise <= 0.0:
+        raise ValueError("gp white_noise must be positive.")
+    if alpha < 0.0:
+        raise ValueError("gp alpha must be non-negative.")
+    if optimizer_restarts < 0:
+        raise ValueError("gp optimizer_restarts must be >= 0.")
+
+    t = np.asarray(theta, dtype=np.float64).reshape(-1)
+    v = np.asarray(values, dtype=np.float64).reshape(-1)
+    c = np.asarray(centers, dtype=np.float64).reshape(-1)
+    if t.size != v.size:
+        raise ValueError("theta and values must have the same number of samples.")
+    if t.size < 2:
+        raise ValueError("need at least 2 samples for GP regression.")
+
+    mask = np.isfinite(t) & np.isfinite(v)
+    t = t[mask]
+    v = v[mask]
+    if t.size < 2:
+        raise ValueError("need at least 2 finite samples for GP regression.")
+
+    rng = np.random.default_rng(seed)
+    if t.size > max_fit_points:
+        idx = rng.choice(t.size, size=max_fit_points, replace=False)
+        t = t[idx]
+        v = v[idx]
+    n_fit = int(t.size)
+
+    if length_scale_scale == "theta_range":
+        ls = length_scale * float(theta_high - theta_low)
+    else:
+        ls = length_scale
+    ls = max(ls, 1e-6)
+    white = max(white_noise, 1e-8)
+    ls_lb = max(ls * 1e-3, 1e-6)
+    ls_ub = max(ls * 1e3, ls_lb * 10.0)
+
+    kernel = (
+        ConstantKernel(1.0, (1e-3, 1e3)) * RBF(length_scale=ls, length_scale_bounds=(ls_lb, ls_ub))
+        + WhiteKernel(noise_level=white, noise_level_bounds=(1e-8, 1e2))
+    )
+    gp = GaussianProcessRegressor(
+        kernel=kernel,
+        alpha=max(alpha, 0.0),
+        normalize_y=normalize_y,
+        n_restarts_optimizer=optimizer_restarts,
+        random_state=seed,
+    )
+    gp.fit(t.reshape(-1, 1), v)
+    mean, std = gp.predict(c.reshape(-1, 1), return_std=True)
+    return mean.astype(np.float64), std.astype(np.float64), n_fit
+
+
 def extrapolate_sigma2_to_zero(
     sigma_values: np.ndarray, fisher_per_sigma: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -186,7 +300,28 @@ def evaluate_score_fisher(
     eval_low: float,
     eval_high: float,
     device: torch.device,
+    estimator: str = "binned",
+    nw_bandwidth: float = 0.1,
+    nw_bandwidth_scale: str = "theta_range",
+    nw_min_effective_count: float = 80.0,
+    gp_max_fit_points: int = 2500,
+    gp_length_scale: float = 0.1,
+    gp_length_scale_scale: str = "theta_range",
+    gp_white_noise: float = 1e-3,
+    gp_alpha: float = 1e-6,
+    gp_normalize_y: bool = True,
+    gp_optimizer_restarts: int = 0,
+    gp_seed: int = 7,
 ) -> ScoreEvalResult:
+    if estimator not in {"binned", "nw", "gp"}:
+        raise ValueError("estimator must be one of {'binned','nw','gp'}.")
+    if nw_bandwidth_scale not in {"absolute", "theta_range"}:
+        raise ValueError("nw_bandwidth_scale must be one of {'absolute','theta_range'}.")
+    if nw_bandwidth <= 0.0:
+        raise ValueError("nw_bandwidth must be positive.")
+    if nw_min_effective_count < 0.0:
+        raise ValueError("nw_min_effective_count must be non-negative.")
+
     with torch.no_grad():
         t_eval_t = torch.from_numpy(theta_eval.astype(np.float32)).to(device)
         x_eval_t = torch.from_numpy(x_eval.astype(np.float32)).to(device)
@@ -197,33 +332,114 @@ def evaluate_score_fisher(
     score_model_by_sigma_arr = np.stack(score_model_by_sigma, axis=0)
     score_fd = finite_difference_score(x_eval, theta_eval, dataset, delta=fd_delta)
 
-    fd_stats = bin_mean_and_se(
-        theta=theta_eval,
-        values=score_fd**2,
-        theta_low=eval_low,
-        theta_high=eval_high,
-        n_bins=n_bins,
-        min_count=min_bin_count,
-    )
+    centers_ref = make_theta_centers(eval_low, eval_high, n_bins)
+    theta_flat = theta_eval.reshape(-1)
+    in_range = (theta_flat >= eval_low) & (theta_flat <= eval_high)
+    theta_in = theta_flat[in_range]
+    score_fd_in = score_fd.reshape(-1)[in_range]
+    score_model_by_sigma_in = score_model_by_sigma_arr[:, in_range]
 
-    fisher_per_sigma = []
-    se_per_sigma = []
-    counts_ref = None
-    centers_ref = None
-    for k in range(score_model_by_sigma_arr.shape[0]):
-        st = bin_mean_and_se(
-            theta=theta_eval,
-            values=score_model_by_sigma_arr[k] ** 2,
+    if estimator == "binned":
+        fd_stats = bin_mean_and_se(
+            theta=theta_in,
+            values=score_fd_in**2,
             theta_low=eval_low,
             theta_high=eval_high,
             n_bins=n_bins,
             min_count=min_bin_count,
         )
-        fisher_per_sigma.append(st.mean)
-        se_per_sigma.append(st.se)
-        if counts_ref is None:
-            counts_ref = st.counts
-            centers_ref = st.centers
+        counts_ref = fd_stats.counts
+    elif estimator == "nw":
+        if nw_bandwidth_scale == "theta_range":
+            bw = nw_bandwidth * float(eval_high - eval_low)
+        else:
+            bw = nw_bandwidth
+        fd_mean, fd_se, fd_neff = nw_regress_scalar_1d(
+            theta=theta_in,
+            values=score_fd_in**2,
+            centers=centers_ref,
+            bandwidth=bw,
+        )
+        if nw_min_effective_count == 0.0:
+            fd_valid = np.isfinite(fd_mean)
+        else:
+            fd_valid = np.isfinite(fd_mean) & np.isfinite(fd_neff) & (fd_neff >= nw_min_effective_count)
+        fd_stats = BinnedStats(
+            centers=centers_ref,
+            mean=fd_mean,
+            se=fd_se,
+            counts=np.rint(fd_neff).astype(np.int64),
+            valid=fd_valid,
+        )
+        counts_ref = fd_neff
+    else:
+        fd_mean, fd_std, fd_nfit = gp_regress_scalar_1d(
+            theta=theta_in,
+            values=score_fd_in**2,
+            centers=centers_ref,
+            max_fit_points=gp_max_fit_points,
+            length_scale=gp_length_scale,
+            length_scale_scale=gp_length_scale_scale,
+            theta_low=eval_low,
+            theta_high=eval_high,
+            white_noise=gp_white_noise,
+            alpha=gp_alpha,
+            normalize_y=gp_normalize_y,
+            optimizer_restarts=gp_optimizer_restarts,
+            seed=gp_seed,
+        )
+        fd_valid = np.isfinite(fd_mean) & np.isfinite(fd_std)
+        fd_stats = BinnedStats(
+            centers=centers_ref,
+            mean=fd_mean,
+            se=fd_std,
+            counts=np.full(centers_ref.size, fill_value=fd_nfit, dtype=np.int64),
+            valid=fd_valid,
+        )
+        counts_ref = np.full(centers_ref.size, fill_value=fd_nfit, dtype=np.float64)
+
+    fisher_per_sigma = []
+    se_per_sigma = []
+    for k in range(score_model_by_sigma_arr.shape[0]):
+        if estimator == "binned":
+            st = bin_mean_and_se(
+                theta=theta_in,
+                values=score_model_by_sigma_in[k] ** 2,
+                theta_low=eval_low,
+                theta_high=eval_high,
+                n_bins=n_bins,
+                min_count=min_bin_count,
+            )
+            fisher_per_sigma.append(st.mean)
+            se_per_sigma.append(st.se)
+        elif estimator == "nw":
+            mean_k, se_k, _ = nw_regress_scalar_1d(
+                theta=theta_in,
+                values=score_model_by_sigma_in[k] ** 2,
+                centers=centers_ref,
+                bandwidth=bw,
+            )
+            fisher_per_sigma.append(mean_k)
+            se_per_sigma.append(se_k)
+        else:
+            mean_k, std_k, nfit_k = gp_regress_scalar_1d(
+                theta=theta_in,
+                values=score_model_by_sigma_in[k] ** 2,
+                centers=centers_ref,
+                max_fit_points=gp_max_fit_points,
+                length_scale=gp_length_scale,
+                length_scale_scale=gp_length_scale_scale,
+                theta_low=eval_low,
+                theta_high=eval_high,
+                white_noise=gp_white_noise,
+                alpha=gp_alpha,
+                normalize_y=gp_normalize_y,
+                optimizer_restarts=gp_optimizer_restarts,
+                seed=gp_seed + 1000 + k,
+            )
+            fisher_per_sigma.append(mean_k)
+            se_per_sigma.append(std_k)
+            counts_ref = np.full(centers_ref.size, fill_value=nfit_k, dtype=np.float64)
     fisher_per_sigma_arr = np.stack(fisher_per_sigma, axis=0)
     se_per_sigma_arr = np.stack(se_per_sigma, axis=0)
 
@@ -237,7 +453,7 @@ def evaluate_score_fisher(
         fisher_fd=fd_stats.mean,
         se_model=se_model0,
         se_fd=fd_stats.se,
-        counts=counts_ref,
+        counts=np.asarray(counts_ref),
         valid=valid,
     )
     metrics = compute_curve_metrics(curves.fisher_model, curves.fisher_fd, curves.valid)
