@@ -7,8 +7,9 @@ from torch import nn
 class ConditionalScore1D(nn.Module):
     """Score model for s(theta_tilde, x, sigma), with scalar theta."""
 
-    def __init__(self, hidden_dim: int = 128, depth: int = 3) -> None:
+    def __init__(self, hidden_dim: int = 128, depth: int = 3, use_log_sigma: bool = False) -> None:
         super().__init__()
+        self.use_log_sigma = use_log_sigma
         in_dim = 1 + 2 + 1  # theta_tilde, x(2), sigma
         layers: list[nn.Module] = []
         for _ in range(depth):
@@ -21,7 +22,8 @@ class ConditionalScore1D(nn.Module):
     def forward(self, theta_tilde: torch.Tensor, x: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
         if sigma.ndim == 1:
             sigma = sigma.unsqueeze(-1)
-        feats = torch.cat([theta_tilde, x, sigma], dim=-1)
+        sigma_feat = torch.log(torch.clamp(sigma, min=1e-8)) if self.use_log_sigma else sigma
+        feats = torch.cat([theta_tilde, x, sigma_feat], dim=-1)
         return self.net(feats)
 
     @torch.no_grad()

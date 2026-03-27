@@ -201,7 +201,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sigma-dsm", type=float, default=0.2)
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--depth", type=int, default=3)
-    parser.add_argument("--output-dir", type=str, default="outputs_step1")
+    parser.add_argument("--output-dir", type=str, default="data/outputs_step1")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--log-every", type=int, default=25)
     return parser.parse_args()

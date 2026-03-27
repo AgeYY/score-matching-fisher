@@ -1,8 +1,0 @@
-Shared dataset Fisher comparison against analytic GT
-n_total: 60000
-train_frac: 0.7
-decoder_epsilon: 0.12
-decoder_bandwidth: 0.1
-cov_theta: amp1=0.35, amp2=0.3, amp_rho=0.3, freq1=0.9, freq2=0.75, freq_rho=1.1, phase1=0.2, phase2=-0.35, phase_rho=0.4, rho_clip=0.85
-score_vs_gt: valid=35/35, rmse=7.141434, mae=4.294039, corr=0.978338
-decoder_vs_gt: valid=35/35, rmse=4.518555, mae=3.084805, corr=0.965513

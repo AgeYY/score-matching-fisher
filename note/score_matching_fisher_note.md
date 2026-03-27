@@ -197,7 +197,7 @@ This uses one shared train/eval split to fit both methods and compare to analyti
 
 Main figure:
 
-![Score vs Decoder vs Analytic GT (theta-dependent covariance)](../outputs_step6_shared_dataset/fisher_curve_shared_dataset_vs_analytic_theta_cov.png)
+![Score vs Decoder vs Analytic GT (theta-dependent covariance)](figures/score_matching_fisher_compare_theta_cov.png)
 
 Metrics (`outputs_step6_shared_dataset/metrics_vs_analytic_theta_cov.txt`):
 - score vs GT: `valid=35/35`, `rmse=7.141434`, `mae=4.294039`, `corr=0.978338`

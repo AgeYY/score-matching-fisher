@@ -17,15 +17,21 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from fisher.data import ToyConditionalGaussianDataset
+from fisher.data import ToyConditionalGMMNonGaussianDataset, ToyConditionalGaussianDataset
 from fisher.evaluation import evaluate_score_fisher, parse_sigma_alpha_list
 from fisher.models import ConditionalScore1D, LocalDecoderLogit
-from fisher.trainers import train_local_decoder, train_score_model
+from fisher.trainers import (
+    geometric_sigma_schedule,
+    train_local_decoder,
+    train_score_model,
+    train_score_model_ncsm_continuous,
+)
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Shared-dataset score-vs-decoder comparison with analytic GT.")
     p.add_argument("--seed", type=int, default=7)
+    p.add_argument("--dataset-family", type=str, default="gmm_non_gauss", choices=["gaussian", "gmm_non_gauss"])
     p.add_argument("--theta-low", type=float, default=-3.0)
     p.add_argument("--theta-high", type=float, default=3.0)
     p.add_argument("--sigma-x1", type=float, default=0.30)
@@ -41,9 +47,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cov-theta-phase2", type=float, default=-0.35)
     p.add_argument("--cov-theta-phase-rho", type=float, default=0.40)
     p.add_argument("--rho-clip", type=float, default=0.85)
+    p.add_argument("--gmm-sep-scale", type=float, default=1.10)
+    p.add_argument("--gmm-sep-freq", type=float, default=0.85)
+    p.add_argument("--gmm-sep-phase", type=float, default=0.35)
+    p.add_argument("--gmm-mix-logit-scale", type=float, default=1.40)
+    p.add_argument("--gmm-mix-bias", type=float, default=0.00)
+    p.add_argument("--gmm-mix-freq", type=float, default=0.95)
+    p.add_argument("--gmm-mix-phase", type=float, default=-0.20)
     p.add_argument("--n-total", type=int, default=60000)
     p.add_argument("--train-frac", type=float, default=0.7)
     p.add_argument("--device", type=str, default="cuda")
+    p.add_argument("--gt-mc-samples-per-bin", type=int, default=6000)
 
     # Score method args.
     p.add_argument("--score-epochs", type=int, default=120)
@@ -51,7 +65,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--score-lr", type=float, default=1e-3)
     p.add_argument("--score-hidden-dim", type=int, default=128)
     p.add_argument("--score-depth", type=int, default=3)
+    p.add_argument("--score-noise-mode", type=str, default="continuous", choices=["discrete", "continuous"])
     p.add_argument("--score-sigma-alpha-list", type=float, nargs="+", default=[0.08, 0.06, 0.045, 0.03, 0.02])
+    p.add_argument("--score-sigma-min-alpha", type=float, default=0.01)
+    p.add_argument("--score-sigma-max-alpha", type=float, default=0.25)
+    p.add_argument("--score-eval-sigmas", type=int, default=12)
 
     # Shared eval curve settings.
     p.add_argument("--n-bins", type=int, default=35)
@@ -71,7 +89,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--decoder-train-cap", type=int, default=1200)
     p.add_argument("--decoder-eval-cap", type=int, default=1200)
     p.add_argument("--log-every", type=int, default=5)
-    p.add_argument("--output-dir", type=str, default="outputs_step6_shared_dataset")
+    p.add_argument("--output-dir", type=str, default="data/outputs_step6_shared_dataset")
     return p.parse_args()
 
 
@@ -94,6 +112,23 @@ def analytic_fisher_curve(centers: np.ndarray, dataset: ToyConditionalGaussianDa
     cov_term = 0.5 * np.einsum("bii->b", c)
     fisher = mean_term + cov_term
     return fisher.astype(np.float64)
+
+
+def gt_fisher_curve_exact_score_mc(
+    centers: np.ndarray,
+    dataset: ToyConditionalGMMNonGaussianDataset,
+    mc_samples_per_bin: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    fisher = np.full(centers.shape[0], np.nan, dtype=np.float64)
+    se = np.full(centers.shape[0], np.nan, dtype=np.float64)
+    for i, th in enumerate(centers):
+        t = np.full((mc_samples_per_bin, 1), fill_value=float(th), dtype=np.float64)
+        x = dataset.sample_x(t)
+        s = dataset.score_theta_exact(x, t)
+        sq = s**2
+        fisher[i] = float(np.mean(sq))
+        se[i] = float(np.std(sq, ddof=1) / np.sqrt(mc_samples_per_bin))
+    return fisher, se
 
 
 def compute_metrics(pred: np.ndarray, gt: np.ndarray, valid: np.ndarray) -> dict[str, float]:
@@ -204,30 +239,51 @@ def fit_decoder_from_shared_data(
 
 def main() -> None:
     args = parse_args()
+    if args.score_eval_sigmas < 2:
+        raise ValueError("--score-eval-sigmas must be >= 2 for sigma^2 extrapolation.")
+    if args.score_sigma_min_alpha <= 0.0 or args.score_sigma_max_alpha <= 0.0:
+        raise ValueError("--score-sigma-min-alpha and --score-sigma-max-alpha must be positive.")
     os.makedirs(args.output_dir, exist_ok=True)
     device = require_device(args.device)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     rng = np.random.default_rng(args.seed)
 
-    dataset = ToyConditionalGaussianDataset(
-        theta_low=args.theta_low,
-        theta_high=args.theta_high,
-        sigma_x1=args.sigma_x1,
-        sigma_x2=args.sigma_x2,
-        rho=args.rho,
-        cov_theta_amp1=args.cov_theta_amp1,
-        cov_theta_amp2=args.cov_theta_amp2,
-        cov_theta_amp_rho=args.cov_theta_amp_rho,
-        cov_theta_freq1=args.cov_theta_freq1,
-        cov_theta_freq2=args.cov_theta_freq2,
-        cov_theta_freq_rho=args.cov_theta_freq_rho,
-        cov_theta_phase1=args.cov_theta_phase1,
-        cov_theta_phase2=args.cov_theta_phase2,
-        cov_theta_phase_rho=args.cov_theta_phase_rho,
-        rho_clip=args.rho_clip,
-        seed=args.seed,
-    )
+    if args.dataset_family == "gaussian":
+        dataset: ToyConditionalGaussianDataset | ToyConditionalGMMNonGaussianDataset = ToyConditionalGaussianDataset(
+            theta_low=args.theta_low,
+            theta_high=args.theta_high,
+            sigma_x1=args.sigma_x1,
+            sigma_x2=args.sigma_x2,
+            rho=args.rho,
+            cov_theta_amp1=args.cov_theta_amp1,
+            cov_theta_amp2=args.cov_theta_amp2,
+            cov_theta_amp_rho=args.cov_theta_amp_rho,
+            cov_theta_freq1=args.cov_theta_freq1,
+            cov_theta_freq2=args.cov_theta_freq2,
+            cov_theta_freq_rho=args.cov_theta_freq_rho,
+            cov_theta_phase1=args.cov_theta_phase1,
+            cov_theta_phase2=args.cov_theta_phase2,
+            cov_theta_phase_rho=args.cov_theta_phase_rho,
+            rho_clip=args.rho_clip,
+            seed=args.seed,
+        )
+    else:
+        dataset = ToyConditionalGMMNonGaussianDataset(
+            theta_low=args.theta_low,
+            theta_high=args.theta_high,
+            sigma_x1=args.sigma_x1,
+            sigma_x2=args.sigma_x2,
+            rho=args.rho,
+            sep_scale=args.gmm_sep_scale,
+            sep_freq=args.gmm_sep_freq,
+            sep_phase=args.gmm_sep_phase,
+            mix_logit_scale=args.gmm_mix_logit_scale,
+            mix_bias=args.gmm_mix_bias,
+            mix_freq=args.gmm_mix_freq,
+            mix_phase=args.gmm_mix_phase,
+            seed=args.seed,
+        )
 
     theta_all, x_all = dataset.sample_joint(args.n_total)
     perm = rng.permutation(args.n_total)
@@ -241,22 +297,53 @@ def main() -> None:
     print(f"[data] total={args.n_total} train={theta_train.shape[0]} eval={theta_eval.shape[0]}")
 
     # Score method on shared split.
-    sigma_alpha = parse_sigma_alpha_list(args.score_sigma_alpha_list)
     theta_std = float(np.std(theta_train))
-    sigma_values = sigma_alpha * theta_std
-    print(f"[score] theta_std={theta_std:.6f}, sigma_values={sigma_values.tolist()}")
-    score_model = ConditionalScore1D(hidden_dim=args.score_hidden_dim, depth=args.score_depth).to(device)
-    score_losses = train_score_model(
-        model=score_model,
-        theta_train=theta_train,
-        x_train=x_train,
-        sigma_values=sigma_values,
-        epochs=args.score_epochs,
-        batch_size=args.score_batch_size,
-        lr=args.score_lr,
-        device=device,
-        log_every=max(1, args.log_every),
-    )
+    score_model = ConditionalScore1D(
+        hidden_dim=args.score_hidden_dim,
+        depth=args.score_depth,
+        use_log_sigma=(args.score_noise_mode == "continuous"),
+    ).to(device)
+    if args.score_noise_mode == "continuous":
+        sigma_min = args.score_sigma_min_alpha * theta_std
+        sigma_max = args.score_sigma_max_alpha * theta_std
+        sigma_values = geometric_sigma_schedule(
+            sigma_min=sigma_min,
+            sigma_max=sigma_max,
+            n_levels=args.score_eval_sigmas,
+            descending=True,
+        )
+        print(
+            f"[score:continuous] theta_std={theta_std:.6f}, "
+            f"sigma_min={min(sigma_min, sigma_max):.6f}, sigma_max={max(sigma_min, sigma_max):.6f}, "
+            f"eval_sigma_values={sigma_values.tolist()}"
+        )
+        score_losses = train_score_model_ncsm_continuous(
+            model=score_model,
+            theta_train=theta_train,
+            x_train=x_train,
+            sigma_min=sigma_min,
+            sigma_max=sigma_max,
+            epochs=args.score_epochs,
+            batch_size=args.score_batch_size,
+            lr=args.score_lr,
+            device=device,
+            log_every=max(1, args.log_every),
+        )
+    else:
+        sigma_alpha = parse_sigma_alpha_list(args.score_sigma_alpha_list)
+        sigma_values = sigma_alpha * theta_std
+        print(f"[score:discrete] theta_std={theta_std:.6f}, sigma_values={sigma_values.tolist()}")
+        score_losses = train_score_model(
+            model=score_model,
+            theta_train=theta_train,
+            x_train=x_train,
+            sigma_values=sigma_values,
+            epochs=args.score_epochs,
+            batch_size=args.score_batch_size,
+            lr=args.score_lr,
+            device=device,
+            log_every=max(1, args.log_every),
+        )
     eval_low = args.theta_low + args.eval_margin
     eval_high = args.theta_high - args.eval_margin
     score_eval = evaluate_score_fisher(
@@ -296,15 +383,26 @@ def main() -> None:
         rng=rng,
     )
 
-    gt = analytic_fisher_curve(centers, dataset)
+    if args.dataset_family == "gaussian":
+        gt = analytic_fisher_curve(centers, dataset)
+        gt_se = np.full_like(gt, np.nan)
+    else:
+        gt, gt_se = gt_fisher_curve_exact_score_mc(
+            centers=centers,
+            dataset=dataset,
+            mc_samples_per_bin=args.gt_mc_samples_per_bin,
+        )
     score_valid = np.isfinite(score_eval.curves.fisher_model) & score_eval.curves.valid
 
     score_metrics = compute_metrics(score_eval.curves.fisher_model, gt, score_valid)
     decoder_metrics = compute_metrics(decoder_fisher, gt, decoder_valid)
 
-    fig_path = os.path.join(args.output_dir, "fisher_curve_shared_dataset_vs_analytic_theta_cov.png")
+    suffix = "_non_gauss" if args.dataset_family == "gmm_non_gauss" else "_theta_cov"
+    fig_path = os.path.join(args.output_dir, f"fisher_curve_shared_dataset_vs_gt{suffix}.png")
     plt.figure(figsize=(9.0, 5.6))
-    plt.plot(centers, gt, color="black", linewidth=2.6, label="Analytic Fisher (GT)")
+    plt.plot(centers, gt, color="black", linewidth=2.6, label="GT Fisher")
+    if np.any(np.isfinite(gt_se)):
+        plt.fill_between(centers, gt - 1.96 * gt_se, gt + 1.96 * gt_se, color="black", alpha=0.10, linewidth=0.0)
     plt.plot(
         centers[score_valid],
         score_eval.curves.fisher_model[score_valid],
@@ -339,18 +437,19 @@ def main() -> None:
         )
     plt.xlabel(r"$\theta$")
     plt.ylabel("Fisher information")
-    plt.title("Shared Dataset Comparison: Score vs Decoder vs Analytic GT")
+    plt.title(f"Shared Dataset Comparison ({args.dataset_family}): Score vs Decoder vs GT")
     plt.grid(alpha=0.25, linestyle="--", linewidth=0.8)
     plt.legend()
     plt.tight_layout()
     plt.savefig(fig_path, dpi=180)
     plt.close()
 
-    npz_path = os.path.join(args.output_dir, "shared_dataset_compare_curves_theta_cov.npz")
+    npz_path = os.path.join(args.output_dir, f"shared_dataset_compare_curves{suffix}.npz")
     np.savez(
         npz_path,
         centers=centers,
         fisher_gt=gt,
+        fisher_gt_se=gt_se,
         fisher_score=score_eval.curves.fisher_model,
         fisher_score_se=score_eval.curves.se_model,
         fisher_score_valid=score_valid.astype(np.int32),
@@ -360,20 +459,39 @@ def main() -> None:
         score_losses=np.asarray(score_losses, dtype=np.float64),
     )
 
-    metrics_path = os.path.join(args.output_dir, "metrics_vs_analytic_theta_cov.txt")
+    metrics_path = os.path.join(args.output_dir, f"metrics_vs_gt{suffix}.txt")
     with open(metrics_path, "w", encoding="utf-8") as f:
-        f.write("Shared dataset Fisher comparison against analytic GT\n")
+        f.write("Shared dataset Fisher comparison against GT\n")
+        f.write(f"dataset_family: {args.dataset_family}\n")
         f.write(f"n_total: {args.n_total}\n")
         f.write(f"train_frac: {args.train_frac}\n")
+        f.write(f"gt_mc_samples_per_bin: {args.gt_mc_samples_per_bin}\n")
+        f.write(f"score_noise_mode: {args.score_noise_mode}\n")
+        if args.score_noise_mode == "continuous":
+            f.write(
+                "score_sigma_continuous: "
+                f"alpha_min={args.score_sigma_min_alpha}, alpha_max={args.score_sigma_max_alpha}, "
+                f"eval_levels={args.score_eval_sigmas}\n"
+            )
+        else:
+            f.write(f"score_sigma_alpha_list: {args.score_sigma_alpha_list}\n")
         f.write(f"decoder_epsilon: {args.decoder_epsilon}\n")
         f.write(f"decoder_bandwidth: {args.decoder_bandwidth}\n")
-        f.write(
-            "cov_theta: "
-            f"amp1={args.cov_theta_amp1}, amp2={args.cov_theta_amp2}, amp_rho={args.cov_theta_amp_rho}, "
-            f"freq1={args.cov_theta_freq1}, freq2={args.cov_theta_freq2}, freq_rho={args.cov_theta_freq_rho}, "
-            f"phase1={args.cov_theta_phase1}, phase2={args.cov_theta_phase2}, phase_rho={args.cov_theta_phase_rho}, "
-            f"rho_clip={args.rho_clip}\n"
-        )
+        if args.dataset_family == "gaussian":
+            f.write(
+                "cov_theta: "
+                f"amp1={args.cov_theta_amp1}, amp2={args.cov_theta_amp2}, amp_rho={args.cov_theta_amp_rho}, "
+                f"freq1={args.cov_theta_freq1}, freq2={args.cov_theta_freq2}, freq_rho={args.cov_theta_freq_rho}, "
+                f"phase1={args.cov_theta_phase1}, phase2={args.cov_theta_phase2}, phase_rho={args.cov_theta_phase_rho}, "
+                f"rho_clip={args.rho_clip}\n"
+            )
+        else:
+            f.write(
+                "gmm_theta: "
+                f"sep_scale={args.gmm_sep_scale}, sep_freq={args.gmm_sep_freq}, sep_phase={args.gmm_sep_phase}, "
+                f"mix_logit_scale={args.gmm_mix_logit_scale}, mix_bias={args.gmm_mix_bias}, "
+                f"mix_freq={args.gmm_mix_freq}, mix_phase={args.gmm_mix_phase}, rho_clip={args.rho_clip}\n"
+            )
         f.write(
             "score_vs_gt: "
             f"valid={int(score_metrics['n_valid'])}/{args.n_bins}, "
