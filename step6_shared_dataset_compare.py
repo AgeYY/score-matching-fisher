@@ -67,6 +67,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--score-hidden-dim", type=int, default=128)
     p.add_argument("--score-depth", type=int, default=3)
     p.add_argument("--score-data-mode", type=str, default="split", choices=["split", "full"])
+    p.add_argument(
+        "--score-fisher-eval-data",
+        type=str,
+        default="score_eval",
+        choices=["score_eval", "full"],
+        help="Data split used for score-based Fisher evaluation after training.",
+    )
     p.add_argument("--score-val-frac", type=float, default=0.15)
     p.add_argument("--score-min-val-size", type=int, default=256)
     p.add_argument("--score-val-source", type=str, default="train_split", choices=["train_split", "eval_set"])
@@ -519,10 +526,19 @@ def main() -> None:
     plt.close()
     eval_low = args.theta_low + args.eval_margin
     eval_high = args.theta_high - args.eval_margin
+    if args.score_fisher_eval_data == "full":
+        theta_score_fisher_eval, x_score_fisher_eval = theta_all, x_all
+    else:
+        theta_score_fisher_eval, x_score_fisher_eval = theta_score_eval, x_score_eval
+    print(
+        "[score_fisher_eval] "
+        f"data={args.score_fisher_eval_data} n={theta_score_fisher_eval.shape[0]}"
+    )
+
     score_eval = evaluate_score_fisher(
         model=score_model,
-        theta_eval=theta_score_eval,
-        x_eval=x_score_eval,
+        theta_eval=theta_score_fisher_eval,
+        x_eval=x_score_fisher_eval,
         dataset=dataset,
         sigma_values=sigma_values,
         fd_delta=args.fd_delta,
@@ -646,6 +662,7 @@ def main() -> None:
         f.write(f"n_total: {args.n_total}\n")
         f.write(f"train_frac: {args.train_frac}\n")
         f.write(f"score_data_mode: {args.score_data_mode}\n")
+        f.write(f"score_fisher_eval_data: {args.score_fisher_eval_data}\n")
         f.write(
             "score_data_counts: "
             f"train={theta_score_train.shape[0]}, eval={theta_score_eval.shape[0]}\n"
