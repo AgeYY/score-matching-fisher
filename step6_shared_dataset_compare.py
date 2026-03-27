@@ -55,13 +55,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--gmm-mix-bias", type=float, default=0.00)
     p.add_argument("--gmm-mix-freq", type=float, default=0.95)
     p.add_argument("--gmm-mix-phase", type=float, default=-0.20)
-    p.add_argument("--n-total", type=int, default=60000)
+    p.add_argument("--n-total", type=int, default=3000)
     p.add_argument("--train-frac", type=float, default=0.7)
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--gt-mc-samples-per-bin", type=int, default=6000)
 
     # Score method args.
-    p.add_argument("--score-epochs", type=int, default=120)
+    p.add_argument("--score-epochs", type=int, default=10000)
     p.add_argument("--score-batch-size", type=int, default=256)
     p.add_argument("--score-lr", type=float, default=1e-3)
     p.add_argument("--score-hidden-dim", type=int, default=128)
@@ -70,15 +70,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--score-fisher-eval-data",
         type=str,
-        default="score_eval",
+        default="full",
         choices=["score_eval", "full"],
         help="Data split used for score-based Fisher evaluation after training.",
     )
     p.add_argument("--score-val-frac", type=float, default=0.15)
     p.add_argument("--score-min-val-size", type=int, default=256)
     p.add_argument("--score-val-source", type=str, default="train_split", choices=["train_split", "eval_set"])
-    p.add_argument("--score-early-patience", type=int, default=30)
+    p.add_argument("--score-early-patience", type=int, default=1000)
     p.add_argument("--score-early-min-delta", type=float, default=1e-4)
+    p.add_argument(
+        "--score-early-smooth-window",
+        type=int,
+        default=20,
+        help="Moving-average window (epochs) for validation loss used by early stopping.",
+    )
     p.add_argument("--score-restore-best", action="store_true", default=True)
     p.add_argument("--no-score-restore-best", action="store_false", dest="score_restore_best")
     p.add_argument("--score-noise-mode", type=str, default="continuous", choices=["discrete", "continuous"])
@@ -100,7 +106,7 @@ def parse_args() -> argparse.Namespace:
     # Shared eval curve settings.
     p.add_argument("--n-bins", type=int, default=35)
     p.add_argument("--eval-margin", type=float, default=0.30)
-    p.add_argument("--score-min-bin-count", type=int, default=80)
+    p.add_argument("--score-min-bin-count", type=int, default=10)
     p.add_argument("--fd-delta", type=float, default=0.03)
 
     # Decoder local-classification settings (from shared dataset neighborhoods).
@@ -295,6 +301,8 @@ def main() -> None:
         raise ValueError("--score-early-patience must be >= 1.")
     if args.score_early_min_delta < 0.0:
         raise ValueError("--score-early-min-delta must be non-negative.")
+    if args.score_early_smooth_window < 1:
+        raise ValueError("--score-early-smooth-window must be >= 1.")
     if args.score_sigma_min_alpha <= 0.0 or args.score_sigma_max_alpha <= 0.0:
         raise ValueError("--score-sigma-min-alpha and --score-sigma-max-alpha must be positive.")
     if args.score_proxy_min_mult <= 0.0 or args.score_proxy_max_mult <= 0.0:
@@ -462,6 +470,7 @@ def main() -> None:
             x_val=x_score_val,
             early_stopping_patience=args.score_early_patience,
             early_stopping_min_delta=args.score_early_min_delta,
+            early_stopping_smooth_window=args.score_early_smooth_window,
             restore_best=args.score_restore_best,
         )
     else:
@@ -485,10 +494,12 @@ def main() -> None:
             x_val=x_score_val,
             early_stopping_patience=args.score_early_patience,
             early_stopping_min_delta=args.score_early_min_delta,
+            early_stopping_smooth_window=args.score_early_smooth_window,
             restore_best=args.score_restore_best,
         )
     score_train_losses = np.asarray(score_train_out["train_losses"], dtype=np.float64)
     score_val_losses = np.asarray(score_train_out["val_losses"], dtype=np.float64)
+    score_val_monitor_losses = np.asarray(score_train_out.get("val_monitor_losses", []), dtype=np.float64)
     best_epoch = int(score_train_out["best_epoch"])
     stopped_epoch = int(score_train_out["stopped_epoch"])
     stopped_early = bool(score_train_out["stopped_early"])
@@ -496,7 +507,8 @@ def main() -> None:
     print(
         "[score_early_stop] "
         f"stopped_early={stopped_early} stopped_epoch={stopped_epoch} "
-        f"best_epoch={best_epoch} best_val_loss={best_val_loss:.6f} "
+        f"best_epoch={best_epoch} best_val_smooth={best_val_loss:.6f} "
+        f"smooth_window={args.score_early_smooth_window} "
         f"restore_best={args.score_restore_best}"
     )
 
@@ -506,6 +518,15 @@ def main() -> None:
     plt.plot(epochs_arr, score_train_losses, color="#1f77b4", linewidth=2.0, label="Score train loss")
     if score_val_losses.size == score_train_losses.size and np.any(np.isfinite(score_val_losses)):
         plt.plot(epochs_arr, score_val_losses, color="#d62728", linewidth=2.0, label="Score val loss")
+    if score_val_monitor_losses.size == score_train_losses.size and np.any(np.isfinite(score_val_monitor_losses)):
+        plt.plot(
+            epochs_arr,
+            score_val_monitor_losses,
+            color="#ff7f0e",
+            linewidth=2.0,
+            linestyle="--",
+            label=f"Score val smooth (w={args.score_early_smooth_window})",
+        )
     if 1 <= best_epoch <= score_train_losses.size:
         plt.axvline(best_epoch, color="#2ca02c", linestyle="--", linewidth=1.5, label=f"Best epoch {best_epoch}")
     if 1 <= stopped_epoch <= score_train_losses.size:
@@ -648,6 +669,7 @@ def main() -> None:
         score_losses=score_train_losses,
         score_train_losses=score_train_losses,
         score_val_losses=score_val_losses,
+        score_val_smooth_losses=score_val_monitor_losses,
         score_best_epoch=np.asarray([best_epoch], dtype=np.int32),
         score_stopped_epoch=np.asarray([stopped_epoch], dtype=np.int32),
         score_stopped_early=np.asarray([int(stopped_early)], dtype=np.int32),
@@ -677,8 +699,9 @@ def main() -> None:
         f.write(
             "score_early_stopping: "
             f"patience={args.score_early_patience}, min_delta={args.score_early_min_delta}, "
+            f"smooth_window={args.score_early_smooth_window}, "
             f"restore_best={args.score_restore_best}, stopped_early={stopped_early}, "
-            f"best_epoch={best_epoch}, stopped_epoch={stopped_epoch}, best_val_loss={best_val_loss}\n"
+            f"best_epoch={best_epoch}, stopped_epoch={stopped_epoch}, best_val_smooth={best_val_loss}\n"
         )
         f.write(f"score_noise_mode: {args.score_noise_mode}\n")
         f.write(f"score_sigma_scale_mode: {args.score_sigma_scale_mode}\n")

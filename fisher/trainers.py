@@ -62,6 +62,7 @@ def train_score_model(
     x_val: np.ndarray | None = None,
     early_stopping_patience: int = 30,
     early_stopping_min_delta: float = 1e-4,
+    early_stopping_smooth_window: int = 1,
     restore_best: bool = True,
 ) -> dict[str, float | int | bool | list[float]]:
     loader = to_score_loader(theta_train, x_train, batch_size=batch_size, shuffle=True)
@@ -75,6 +76,7 @@ def train_score_model(
     )
     train_losses: list[float] = []
     val_losses: list[float] = []
+    val_monitor_losses: list[float] = []
     best_val_loss = float("inf")
     best_epoch = 0
     best_state: dict[str, torch.Tensor] | None = None
@@ -119,20 +121,28 @@ def train_score_model(
                     val_loss = torch.mean((pred - target) ** 2)
                     val_epoch_losses.append(float(val_loss.item()))
             mean_val_loss = float(np.mean(val_epoch_losses))
-            if mean_val_loss < (best_val_loss - early_stopping_min_delta):
-                best_val_loss = mean_val_loss
+            smooth_w = max(1, int(early_stopping_smooth_window))
+            smooth_val_loss = float(
+                np.mean(val_losses[max(0, len(val_losses) - smooth_w + 1) :] + [mean_val_loss])
+            )
+            if smooth_val_loss < (best_val_loss - early_stopping_min_delta):
+                best_val_loss = smooth_val_loss
                 best_epoch = epoch
                 best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
                 patience_counter = 0
             else:
                 patience_counter += 1
+            val_monitor_losses.append(smooth_val_loss)
+        else:
+            val_monitor_losses.append(float("nan"))
         val_losses.append(mean_val_loss)
 
         if epoch == 1 or epoch % log_every == 0 or epoch == epochs:
             if has_val:
                 print(
                     f"[epoch {epoch:4d}/{epochs}] train_loss={mean_train_loss:.6f} "
-                    f"val_loss={mean_val_loss:.6f} best_val={best_val_loss:.6f} best_epoch={best_epoch}"
+                    f"val_loss={mean_val_loss:.6f} val_smooth={val_monitor_losses[-1]:.6f} "
+                    f"best_smooth={best_val_loss:.6f} best_epoch={best_epoch}"
                 )
             else:
                 print(f"[epoch {epoch:4d}/{epochs}] train_loss={mean_train_loss:.6f}")
@@ -142,17 +152,18 @@ def train_score_model(
             stopped_epoch = epoch
             print(
                 f"[early-stop] epoch={epoch} best_epoch={best_epoch} "
-                f"best_val={best_val_loss:.6f} patience={early_stopping_patience}"
+                f"best_smooth={best_val_loss:.6f} patience={early_stopping_patience}"
             )
             break
 
     if has_val and restore_best and best_state is not None:
         model.load_state_dict(best_state)
-        print(f"[restore-best] restored epoch={best_epoch} val_loss={best_val_loss:.6f}")
+        print(f"[restore-best] restored epoch={best_epoch} val_smooth={best_val_loss:.6f}")
 
     return {
         "train_losses": train_losses,
         "val_losses": val_losses,
+        "val_monitor_losses": val_monitor_losses,
         "best_val_loss": float(best_val_loss),
         "best_epoch": int(best_epoch),
         "stopped_epoch": int(stopped_epoch),
@@ -175,6 +186,7 @@ def train_score_model_ncsm_continuous(
     x_val: np.ndarray | None = None,
     early_stopping_patience: int = 30,
     early_stopping_min_delta: float = 1e-4,
+    early_stopping_smooth_window: int = 1,
     restore_best: bool = True,
 ) -> dict[str, float | int | bool | list[float]]:
     loader = to_score_loader(theta_train, x_train, batch_size=batch_size, shuffle=True)
@@ -187,6 +199,7 @@ def train_score_model_ncsm_continuous(
     )
     train_losses: list[float] = []
     val_losses: list[float] = []
+    val_monitor_losses: list[float] = []
     best_val_loss = float("inf")
     best_epoch = 0
     best_state: dict[str, torch.Tensor] | None = None
@@ -237,20 +250,28 @@ def train_score_model_ncsm_continuous(
                     val_loss = torch.mean((sigma * pred + eps) ** 2)
                     val_epoch_losses.append(float(val_loss.item()))
             mean_val_loss = float(np.mean(val_epoch_losses))
-            if mean_val_loss < (best_val_loss - early_stopping_min_delta):
-                best_val_loss = mean_val_loss
+            smooth_w = max(1, int(early_stopping_smooth_window))
+            smooth_val_loss = float(
+                np.mean(val_losses[max(0, len(val_losses) - smooth_w + 1) :] + [mean_val_loss])
+            )
+            if smooth_val_loss < (best_val_loss - early_stopping_min_delta):
+                best_val_loss = smooth_val_loss
                 best_epoch = epoch
                 best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
                 patience_counter = 0
             else:
                 patience_counter += 1
+            val_monitor_losses.append(smooth_val_loss)
+        else:
+            val_monitor_losses.append(float("nan"))
         val_losses.append(mean_val_loss)
 
         if epoch == 1 or epoch % log_every == 0 or epoch == epochs:
             if has_val:
                 print(
                     f"[epoch {epoch:4d}/{epochs}] ncsm_train={mean_train_loss:.6f} "
-                    f"val_loss={mean_val_loss:.6f} best_val={best_val_loss:.6f} best_epoch={best_epoch}"
+                    f"val_loss={mean_val_loss:.6f} val_smooth={val_monitor_losses[-1]:.6f} "
+                    f"best_smooth={best_val_loss:.6f} best_epoch={best_epoch}"
                 )
             else:
                 print(f"[epoch {epoch:4d}/{epochs}] ncsm_loss={mean_train_loss:.6f}")
@@ -260,17 +281,18 @@ def train_score_model_ncsm_continuous(
             stopped_epoch = epoch
             print(
                 f"[early-stop] epoch={epoch} best_epoch={best_epoch} "
-                f"best_val={best_val_loss:.6f} patience={early_stopping_patience}"
+                f"best_smooth={best_val_loss:.6f} patience={early_stopping_patience}"
             )
             break
 
     if has_val and restore_best and best_state is not None:
         model.load_state_dict(best_state)
-        print(f"[restore-best] restored epoch={best_epoch} val_loss={best_val_loss:.6f}")
+        print(f"[restore-best] restored epoch={best_epoch} val_smooth={best_val_loss:.6f}")
 
     return {
         "train_losses": train_losses,
         "val_losses": val_losses,
+        "val_monitor_losses": val_monitor_losses,
         "best_val_loss": float(best_val_loss),
         "best_epoch": int(best_epoch),
         "stopped_epoch": int(stopped_epoch),
