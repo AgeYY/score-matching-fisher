@@ -58,11 +58,29 @@ def train_score_model(
     lr: float,
     device: torch.device,
     log_every: int,
-) -> list[float]:
+    theta_val: np.ndarray | None = None,
+    x_val: np.ndarray | None = None,
+    early_stopping_patience: int = 30,
+    early_stopping_min_delta: float = 1e-4,
+    restore_best: bool = True,
+) -> dict[str, float | int | bool | list[float]]:
     loader = to_score_loader(theta_train, x_train, batch_size=batch_size, shuffle=True)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     sigma_values_t = torch.from_numpy(sigma_values.astype(np.float32)).to(device)
-    losses: list[float] = []
+    has_val = theta_val is not None and x_val is not None and len(theta_val) > 0
+    val_loader = (
+        to_score_loader(theta_val, x_val, batch_size=batch_size, shuffle=False)
+        if has_val
+        else None
+    )
+    train_losses: list[float] = []
+    val_losses: list[float] = []
+    best_val_loss = float("inf")
+    best_epoch = 0
+    best_state: dict[str, torch.Tensor] | None = None
+    patience_counter = 0
+    stopped_early = False
+    stopped_epoch = epochs
 
     for epoch in range(1, epochs + 1):
         epoch_losses: list[float] = []
@@ -81,11 +99,65 @@ def train_score_model(
             loss.backward()
             optimizer.step()
             epoch_losses.append(float(loss.item()))
-        mean_loss = float(np.mean(epoch_losses))
-        losses.append(mean_loss)
+        mean_train_loss = float(np.mean(epoch_losses))
+        train_losses.append(mean_train_loss)
+
+        mean_val_loss = float("nan")
+        if has_val and val_loader is not None:
+            model.eval()
+            val_epoch_losses: list[float] = []
+            with torch.no_grad():
+                for tb, xb in val_loader:
+                    tb = tb.to(device, non_blocking=True)
+                    xb = xb.to(device, non_blocking=True)
+                    sigma_idx = torch.randint(low=0, high=sigma_values_t.numel(), size=(tb.shape[0],), device=tb.device)
+                    sigma = sigma_values_t[sigma_idx].unsqueeze(-1)
+                    eps = torch.randn_like(tb)
+                    theta_tilde = tb + sigma * eps
+                    target = -(theta_tilde - tb) / (sigma**2)
+                    pred = model(theta_tilde, xb, sigma)
+                    val_loss = torch.mean((pred - target) ** 2)
+                    val_epoch_losses.append(float(val_loss.item()))
+            mean_val_loss = float(np.mean(val_epoch_losses))
+            if mean_val_loss < (best_val_loss - early_stopping_min_delta):
+                best_val_loss = mean_val_loss
+                best_epoch = epoch
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                patience_counter = 0
+            else:
+                patience_counter += 1
+        val_losses.append(mean_val_loss)
+
         if epoch == 1 or epoch % log_every == 0 or epoch == epochs:
-            print(f"[epoch {epoch:4d}/{epochs}] train_loss={mean_loss:.6f}")
-    return losses
+            if has_val:
+                print(
+                    f"[epoch {epoch:4d}/{epochs}] train_loss={mean_train_loss:.6f} "
+                    f"val_loss={mean_val_loss:.6f} best_val={best_val_loss:.6f} best_epoch={best_epoch}"
+                )
+            else:
+                print(f"[epoch {epoch:4d}/{epochs}] train_loss={mean_train_loss:.6f}")
+
+        if has_val and patience_counter >= early_stopping_patience:
+            stopped_early = True
+            stopped_epoch = epoch
+            print(
+                f"[early-stop] epoch={epoch} best_epoch={best_epoch} "
+                f"best_val={best_val_loss:.6f} patience={early_stopping_patience}"
+            )
+            break
+
+    if has_val and restore_best and best_state is not None:
+        model.load_state_dict(best_state)
+        print(f"[restore-best] restored epoch={best_epoch} val_loss={best_val_loss:.6f}")
+
+    return {
+        "train_losses": train_losses,
+        "val_losses": val_losses,
+        "best_val_loss": float(best_val_loss),
+        "best_epoch": int(best_epoch),
+        "stopped_epoch": int(stopped_epoch),
+        "stopped_early": bool(stopped_early),
+    }
 
 
 def train_score_model_ncsm_continuous(
@@ -99,10 +171,28 @@ def train_score_model_ncsm_continuous(
     lr: float,
     device: torch.device,
     log_every: int,
-) -> list[float]:
+    theta_val: np.ndarray | None = None,
+    x_val: np.ndarray | None = None,
+    early_stopping_patience: int = 30,
+    early_stopping_min_delta: float = 1e-4,
+    restore_best: bool = True,
+) -> dict[str, float | int | bool | list[float]]:
     loader = to_score_loader(theta_train, x_train, batch_size=batch_size, shuffle=True)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    losses: list[float] = []
+    has_val = theta_val is not None and x_val is not None and len(theta_val) > 0
+    val_loader = (
+        to_score_loader(theta_val, x_val, batch_size=batch_size, shuffle=False)
+        if has_val
+        else None
+    )
+    train_losses: list[float] = []
+    val_losses: list[float] = []
+    best_val_loss = float("inf")
+    best_epoch = 0
+    best_state: dict[str, torch.Tensor] | None = None
+    patience_counter = 0
+    stopped_early = False
+    stopped_epoch = epochs
 
     for epoch in range(1, epochs + 1):
         epoch_losses: list[float] = []
@@ -124,11 +214,68 @@ def train_score_model_ncsm_continuous(
             loss.backward()
             optimizer.step()
             epoch_losses.append(float(loss.item()))
-        mean_loss = float(np.mean(epoch_losses))
-        losses.append(mean_loss)
+        mean_train_loss = float(np.mean(epoch_losses))
+        train_losses.append(mean_train_loss)
+
+        mean_val_loss = float("nan")
+        if has_val and val_loader is not None:
+            model.eval()
+            val_epoch_losses: list[float] = []
+            with torch.no_grad():
+                for tb, xb in val_loader:
+                    tb = tb.to(device, non_blocking=True)
+                    xb = xb.to(device, non_blocking=True)
+                    sigma = sample_continuous_geometric_sigmas(
+                        batch_size=tb.shape[0],
+                        sigma_min=sigma_min,
+                        sigma_max=sigma_max,
+                        device=tb.device,
+                    )
+                    eps = torch.randn_like(tb)
+                    theta_tilde = tb + sigma * eps
+                    pred = model(theta_tilde, xb, sigma)
+                    val_loss = torch.mean((sigma * pred + eps) ** 2)
+                    val_epoch_losses.append(float(val_loss.item()))
+            mean_val_loss = float(np.mean(val_epoch_losses))
+            if mean_val_loss < (best_val_loss - early_stopping_min_delta):
+                best_val_loss = mean_val_loss
+                best_epoch = epoch
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                patience_counter = 0
+            else:
+                patience_counter += 1
+        val_losses.append(mean_val_loss)
+
         if epoch == 1 or epoch % log_every == 0 or epoch == epochs:
-            print(f"[epoch {epoch:4d}/{epochs}] ncsm_loss={mean_loss:.6f}")
-    return losses
+            if has_val:
+                print(
+                    f"[epoch {epoch:4d}/{epochs}] ncsm_train={mean_train_loss:.6f} "
+                    f"val_loss={mean_val_loss:.6f} best_val={best_val_loss:.6f} best_epoch={best_epoch}"
+                )
+            else:
+                print(f"[epoch {epoch:4d}/{epochs}] ncsm_loss={mean_train_loss:.6f}")
+
+        if has_val and patience_counter >= early_stopping_patience:
+            stopped_early = True
+            stopped_epoch = epoch
+            print(
+                f"[early-stop] epoch={epoch} best_epoch={best_epoch} "
+                f"best_val={best_val_loss:.6f} patience={early_stopping_patience}"
+            )
+            break
+
+    if has_val and restore_best and best_state is not None:
+        model.load_state_dict(best_state)
+        print(f"[restore-best] restored epoch={best_epoch} val_loss={best_val_loss:.6f}")
+
+    return {
+        "train_losses": train_losses,
+        "val_losses": val_losses,
+        "best_val_loss": float(best_val_loss),
+        "best_epoch": int(best_epoch),
+        "stopped_epoch": int(stopped_epoch),
+        "stopped_early": bool(stopped_early),
+    }
 
 
 def train_local_decoder(

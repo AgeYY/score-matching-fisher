@@ -7,10 +7,18 @@ from torch import nn
 class ConditionalScore1D(nn.Module):
     """Score model for s(theta_tilde, x, sigma), with scalar theta."""
 
-    def __init__(self, hidden_dim: int = 128, depth: int = 3, use_log_sigma: bool = False) -> None:
+    def __init__(
+        self,
+        x_dim: int = 2,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        use_log_sigma: bool = False,
+    ) -> None:
         super().__init__()
+        if x_dim < 2:
+            raise ValueError("x_dim must be >= 2.")
         self.use_log_sigma = use_log_sigma
-        in_dim = 1 + 2 + 1  # theta_tilde, x(2), sigma
+        in_dim = 1 + x_dim + 1  # theta_tilde, x, sigma
         layers: list[nn.Module] = []
         for _ in range(depth):
             layers.append(nn.Linear(in_dim, hidden_dim))
@@ -36,9 +44,11 @@ class ConditionalScore1D(nn.Module):
 class LocalDecoderLogit(nn.Module):
     """Binary decoder that outputs logit for class y in {0,1}."""
 
-    def __init__(self, hidden_dim: int = 64, depth: int = 2) -> None:
+    def __init__(self, x_dim: int = 2, hidden_dim: int = 64, depth: int = 2) -> None:
         super().__init__()
-        in_dim = 2
+        if x_dim < 2:
+            raise ValueError("x_dim must be >= 2.")
+        in_dim = x_dim
         layers: list[nn.Module] = []
         for _ in range(depth):
             layers.append(nn.Linear(in_dim, hidden_dim))

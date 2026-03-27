@@ -34,6 +34,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dataset-family", type=str, default="gmm_non_gauss", choices=["gaussian", "gmm_non_gauss"])
     p.add_argument("--theta-low", type=float, default=-3.0)
     p.add_argument("--theta-high", type=float, default=3.0)
+    p.add_argument("--x-dim", type=int, default=2)
     p.add_argument("--sigma-x1", type=float, default=0.30)
     p.add_argument("--sigma-x2", type=float, default=0.22)
     p.add_argument("--rho", type=float, default=0.15)
@@ -66,11 +67,28 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--score-hidden-dim", type=int, default=128)
     p.add_argument("--score-depth", type=int, default=3)
     p.add_argument("--score-data-mode", type=str, default="split", choices=["split", "full"])
+    p.add_argument("--score-val-frac", type=float, default=0.15)
+    p.add_argument("--score-min-val-size", type=int, default=256)
+    p.add_argument("--score-val-source", type=str, default="train_split", choices=["train_split", "eval_set"])
+    p.add_argument("--score-early-patience", type=int, default=30)
+    p.add_argument("--score-early-min-delta", type=float, default=1e-4)
+    p.add_argument("--score-restore-best", action="store_true", default=True)
+    p.add_argument("--no-score-restore-best", action="store_false", dest="score_restore_best")
     p.add_argument("--score-noise-mode", type=str, default="continuous", choices=["discrete", "continuous"])
+    p.add_argument(
+        "--score-sigma-scale-mode",
+        type=str,
+        default="theta_std",
+        choices=["theta_std", "posterior_proxy", "fixed"],
+    )
     p.add_argument("--score-sigma-alpha-list", type=float, nargs="+", default=[0.08, 0.06, 0.045, 0.03, 0.02])
     p.add_argument("--score-sigma-min-alpha", type=float, default=0.01)
     p.add_argument("--score-sigma-max-alpha", type=float, default=0.25)
     p.add_argument("--score-eval-sigmas", type=int, default=12)
+    p.add_argument("--score-proxy-l2", type=float, default=1e-3)
+    p.add_argument("--score-proxy-min-mult", type=float, default=0.1)
+    p.add_argument("--score-proxy-max-mult", type=float, default=2.0)
+    p.add_argument("--score-fixed-sigma", type=float, default=0.02)
 
     # Shared eval curve settings.
     p.add_argument("--n-bins", type=int, default=35)
@@ -102,9 +120,9 @@ def require_device(name: str) -> torch.device:
 
 def analytic_fisher_curve(centers: np.ndarray, dataset: ToyConditionalGaussianDataset) -> np.ndarray:
     t = centers.reshape(-1, 1)
-    dmu = dataset.tuning_curve_derivative(t)  # (B,2)
-    cov = dataset.covariance(t)  # (B,2,2)
-    dcov = dataset.covariance_derivative(t)  # (B,2,2)
+    dmu = dataset.tuning_curve_derivative(t)  # (B,d)
+    cov = dataset.covariance(t)  # (B,d,d)
+    dcov = dataset.covariance_derivative(t)  # (B,d,d)
     inv_cov = np.linalg.inv(cov)
     mean_term = np.einsum("bi,bij,bj->b", dmu, inv_cov, dmu)
     a = np.einsum("bij,bjk->bik", inv_cov, dcov)
@@ -141,6 +159,24 @@ def compute_metrics(pred: np.ndarray, gt: np.ndarray, valid: np.ndarray) -> dict
     mae = float(np.mean(np.abs(a - b)))
     corr = float(np.corrcoef(a, b)[0, 1]) if a.size >= 2 else float("nan")
     return {"n_valid": float(a.size), "rmse": rmse, "mae": mae, "corr": corr}
+
+
+def posterior_proxy_sigma(theta: np.ndarray, x: np.ndarray, l2: float) -> float:
+    """Estimate posterior scale using ridge residual std of theta ~ x."""
+    if l2 < 0.0:
+        raise ValueError("score-proxy-l2 must be non-negative.")
+    y = np.asarray(theta, dtype=np.float64).reshape(-1, 1)
+    xx = np.asarray(x, dtype=np.float64)
+    if xx.ndim != 2 or xx.shape[0] != y.shape[0]:
+        raise ValueError("x must be 2D and match theta rows.")
+    x_aug = np.concatenate([np.ones((xx.shape[0], 1), dtype=np.float64), xx], axis=1)
+    xtx = x_aug.T @ x_aug
+    reg = np.eye(xtx.shape[0], dtype=np.float64)
+    reg[0, 0] = 0.0  # do not regularize intercept
+    w = np.linalg.solve(xtx + l2 * reg, x_aug.T @ y)
+    resid = y - x_aug @ w
+    sigma_post = float(np.std(resid.reshape(-1)))
+    return max(sigma_post, 1e-8)
 
 
 def _subset_x_by_theta(
@@ -209,7 +245,7 @@ def fit_decoder_from_shared_data(
         xtr = np.concatenate([xtr_pos, xtr_neg], axis=0)
         ytr = np.concatenate([np.ones(ntr, dtype=np.float64), np.zeros(ntr, dtype=np.float64)], axis=0)
 
-        model = LocalDecoderLogit(hidden_dim=hidden_dim, depth=depth).to(device)
+        model = LocalDecoderLogit(x_dim=x_train.shape[1], hidden_dim=hidden_dim, depth=depth).to(device)
         _ = train_local_decoder(
             model=model,
             x_train=xtr,
@@ -240,10 +276,26 @@ def fit_decoder_from_shared_data(
 
 def main() -> None:
     args = parse_args()
+    if args.x_dim < 2:
+        raise ValueError("--x-dim must be >= 2.")
     if args.score_eval_sigmas < 2:
         raise ValueError("--score-eval-sigmas must be >= 2 for sigma^2 extrapolation.")
+    if args.score_val_source == "train_split" and not (0.0 < args.score_val_frac < 1.0):
+        raise ValueError("--score-val-frac must be in (0, 1) when --score-val-source=train_split.")
+    if args.score_min_val_size < 1:
+        raise ValueError("--score-min-val-size must be >= 1.")
+    if args.score_early_patience < 1:
+        raise ValueError("--score-early-patience must be >= 1.")
+    if args.score_early_min_delta < 0.0:
+        raise ValueError("--score-early-min-delta must be non-negative.")
     if args.score_sigma_min_alpha <= 0.0 or args.score_sigma_max_alpha <= 0.0:
         raise ValueError("--score-sigma-min-alpha and --score-sigma-max-alpha must be positive.")
+    if args.score_proxy_min_mult <= 0.0 or args.score_proxy_max_mult <= 0.0:
+        raise ValueError("--score-proxy-min-mult and --score-proxy-max-mult must be positive.")
+    if args.score_proxy_min_mult > args.score_proxy_max_mult:
+        raise ValueError("--score-proxy-min-mult must be <= --score-proxy-max-mult.")
+    if args.score_fixed_sigma <= 0.0:
+        raise ValueError("--score-fixed-sigma must be positive.")
     os.makedirs(args.output_dir, exist_ok=True)
     device = require_device(args.device)
     np.random.seed(args.seed)
@@ -254,6 +306,7 @@ def main() -> None:
         dataset: ToyConditionalGaussianDataset | ToyConditionalGMMNonGaussianDataset = ToyConditionalGaussianDataset(
             theta_low=args.theta_low,
             theta_high=args.theta_high,
+            x_dim=args.x_dim,
             sigma_x1=args.sigma_x1,
             sigma_x2=args.sigma_x2,
             rho=args.rho,
@@ -273,6 +326,7 @@ def main() -> None:
         dataset = ToyConditionalGMMNonGaussianDataset(
             theta_low=args.theta_low,
             theta_high=args.theta_high,
+            x_dim=args.x_dim,
             sigma_x1=args.sigma_x1,
             sigma_x2=args.sigma_x2,
             rho=args.rho,
@@ -308,55 +362,161 @@ def main() -> None:
         f"mode={args.score_data_mode} "
         f"train={theta_score_train.shape[0]} eval={theta_score_eval.shape[0]}"
     )
+    if args.score_val_source == "eval_set":
+        theta_score_fit = theta_score_train
+        x_score_fit = x_score_train
+        theta_score_val = theta_score_eval
+        x_score_val = x_score_eval
+        if theta_score_fit.shape[0] < 1 or theta_score_val.shape[0] < 1:
+            raise ValueError("score train/eval split must have non-empty train and eval sets.")
+        print(
+            "[score_train] "
+            f"val_source=eval_set fit={theta_score_fit.shape[0]} val={theta_score_val.shape[0]}"
+        )
+    else:
+        n_score_total = theta_score_train.shape[0]
+        if n_score_total < 2:
+            raise ValueError("score training requires at least 2 samples for train/validation split.")
+        n_score_val = int(round(args.score_val_frac * n_score_total))
+        n_score_val = max(n_score_val, args.score_min_val_size)
+        n_score_val = min(n_score_val, n_score_total - 1)
+        score_perm = rng.permutation(n_score_total)
+        score_val_idx = score_perm[:n_score_val]
+        score_fit_idx = score_perm[n_score_val:]
+        theta_score_fit = theta_score_train[score_fit_idx]
+        x_score_fit = x_score_train[score_fit_idx]
+        theta_score_val = theta_score_train[score_val_idx]
+        x_score_val = x_score_train[score_val_idx]
+        print(
+            "[score_train] "
+            f"val_source=train_split fit={theta_score_fit.shape[0]} val={theta_score_val.shape[0]} "
+            f"val_frac_eff={theta_score_val.shape[0]/n_score_total:.4f}"
+        )
 
-    # Score method data mode: either shared split or full dataset.
-    theta_std = float(np.std(theta_score_train))
+    # Score sigma scale calibration.
+    theta_std = float(np.std(theta_score_fit))
+    sigma_post = float("nan")
+    sigma_min: float | None = None
+    sigma_max: float | None = None
+    sigma_base: float | None = None
+    if args.score_sigma_scale_mode == "theta_std":
+        sigma_base = theta_std
+        sigma_min = args.score_sigma_min_alpha * sigma_base
+        sigma_max = args.score_sigma_max_alpha * sigma_base
+        print(f"[sigma_scale] mode=theta_std theta_std={theta_std:.6f}")
+    elif args.score_sigma_scale_mode == "posterior_proxy":
+        sigma_post = posterior_proxy_sigma(theta_score_fit, x_score_fit, l2=args.score_proxy_l2)
+        sigma_base = sigma_post
+        sigma_min = args.score_proxy_min_mult * sigma_post
+        sigma_max = args.score_proxy_max_mult * sigma_post
+        print(
+            "[sigma_scale] "
+            f"mode=posterior_proxy theta_std={theta_std:.6f} "
+            f"sigma_post={sigma_post:.6f} l2={args.score_proxy_l2:g} "
+            f"mult=[{args.score_proxy_min_mult:g},{args.score_proxy_max_mult:g}]"
+        )
+    else:
+        sigma_min = args.score_fixed_sigma
+        sigma_max = args.score_fixed_sigma
+        sigma_base = args.score_fixed_sigma
+        print(f"[sigma_scale] mode=fixed sigma={args.score_fixed_sigma:.6f} theta_std={theta_std:.6f}")
+
     score_model = ConditionalScore1D(
+        x_dim=args.x_dim,
         hidden_dim=args.score_hidden_dim,
         depth=args.score_depth,
         use_log_sigma=(args.score_noise_mode == "continuous"),
     ).to(device)
     if args.score_noise_mode == "continuous":
-        sigma_min = args.score_sigma_min_alpha * theta_std
-        sigma_max = args.score_sigma_max_alpha * theta_std
         sigma_values = geometric_sigma_schedule(
-            sigma_min=sigma_min,
-            sigma_max=sigma_max,
+            sigma_min=float(sigma_min),
+            sigma_max=float(sigma_max),
             n_levels=args.score_eval_sigmas,
             descending=True,
         )
         print(
-            f"[score:continuous] theta_std={theta_std:.6f}, "
-            f"sigma_min={min(sigma_min, sigma_max):.6f}, sigma_max={max(sigma_min, sigma_max):.6f}, "
+            f"[score:continuous] "
+            f"sigma_min={min(float(sigma_min), float(sigma_max)):.6f}, "
+            f"sigma_max={max(float(sigma_min), float(sigma_max)):.6f}, "
             f"eval_sigma_values={sigma_values.tolist()}"
         )
-        score_losses = train_score_model_ncsm_continuous(
+        score_train_out = train_score_model_ncsm_continuous(
             model=score_model,
-            theta_train=theta_score_train,
-            x_train=x_score_train,
-            sigma_min=sigma_min,
-            sigma_max=sigma_max,
+            theta_train=theta_score_fit,
+            x_train=x_score_fit,
+            sigma_min=float(sigma_min),
+            sigma_max=float(sigma_max),
             epochs=args.score_epochs,
             batch_size=args.score_batch_size,
             lr=args.score_lr,
             device=device,
             log_every=max(1, args.log_every),
+            theta_val=theta_score_val,
+            x_val=x_score_val,
+            early_stopping_patience=args.score_early_patience,
+            early_stopping_min_delta=args.score_early_min_delta,
+            restore_best=args.score_restore_best,
         )
     else:
-        sigma_alpha = parse_sigma_alpha_list(args.score_sigma_alpha_list)
-        sigma_values = sigma_alpha * theta_std
-        print(f"[score:discrete] theta_std={theta_std:.6f}, sigma_values={sigma_values.tolist()}")
-        score_losses = train_score_model(
+        if args.score_sigma_scale_mode == "fixed":
+            sigma_values = np.full((args.score_eval_sigmas,), fill_value=float(sigma_base), dtype=np.float64)
+        else:
+            sigma_alpha = parse_sigma_alpha_list(args.score_sigma_alpha_list)
+            sigma_values = sigma_alpha * float(sigma_base)
+        print(f"[score:discrete] sigma_values={sigma_values.tolist()}")
+        score_train_out = train_score_model(
             model=score_model,
-            theta_train=theta_score_train,
-            x_train=x_score_train,
+            theta_train=theta_score_fit,
+            x_train=x_score_fit,
             sigma_values=sigma_values,
             epochs=args.score_epochs,
             batch_size=args.score_batch_size,
             lr=args.score_lr,
             device=device,
             log_every=max(1, args.log_every),
+            theta_val=theta_score_val,
+            x_val=x_score_val,
+            early_stopping_patience=args.score_early_patience,
+            early_stopping_min_delta=args.score_early_min_delta,
+            restore_best=args.score_restore_best,
         )
+    score_train_losses = np.asarray(score_train_out["train_losses"], dtype=np.float64)
+    score_val_losses = np.asarray(score_train_out["val_losses"], dtype=np.float64)
+    best_epoch = int(score_train_out["best_epoch"])
+    stopped_epoch = int(score_train_out["stopped_epoch"])
+    stopped_early = bool(score_train_out["stopped_early"])
+    best_val_loss = float(score_train_out["best_val_loss"])
+    print(
+        "[score_early_stop] "
+        f"stopped_early={stopped_early} stopped_epoch={stopped_epoch} "
+        f"best_epoch={best_epoch} best_val_loss={best_val_loss:.6f} "
+        f"restore_best={args.score_restore_best}"
+    )
+
+    loss_fig_path = os.path.join(args.output_dir, "score_loss_vs_epoch.png")
+    epochs_arr = np.arange(1, score_train_losses.size + 1)
+    plt.figure(figsize=(8.8, 5.0))
+    plt.plot(epochs_arr, score_train_losses, color="#1f77b4", linewidth=2.0, label="Score train loss")
+    if score_val_losses.size == score_train_losses.size and np.any(np.isfinite(score_val_losses)):
+        plt.plot(epochs_arr, score_val_losses, color="#d62728", linewidth=2.0, label="Score val loss")
+    if 1 <= best_epoch <= score_train_losses.size:
+        plt.axvline(best_epoch, color="#2ca02c", linestyle="--", linewidth=1.5, label=f"Best epoch {best_epoch}")
+    if 1 <= stopped_epoch <= score_train_losses.size:
+        plt.axvline(
+            stopped_epoch,
+            color="#9467bd",
+            linestyle=":",
+            linewidth=1.6,
+            label=f"Stop epoch {stopped_epoch}",
+        )
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Score Training and Validation Loss")
+    plt.grid(alpha=0.25, linestyle="--", linewidth=0.8)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(loss_fig_path, dpi=180)
+    plt.close()
     eval_low = args.theta_low + args.eval_margin
     eval_high = args.theta_high - args.eval_margin
     score_eval = evaluate_score_fisher(
@@ -469,13 +629,20 @@ def main() -> None:
         fisher_decoder=decoder_fisher,
         fisher_decoder_se=decoder_se,
         fisher_decoder_valid=decoder_valid.astype(np.int32),
-        score_losses=np.asarray(score_losses, dtype=np.float64),
+        score_losses=score_train_losses,
+        score_train_losses=score_train_losses,
+        score_val_losses=score_val_losses,
+        score_best_epoch=np.asarray([best_epoch], dtype=np.int32),
+        score_stopped_epoch=np.asarray([stopped_epoch], dtype=np.int32),
+        score_stopped_early=np.asarray([int(stopped_early)], dtype=np.int32),
+        score_best_val_loss=np.asarray([best_val_loss], dtype=np.float64),
     )
 
     metrics_path = os.path.join(args.output_dir, f"metrics_vs_gt{suffix}.txt")
     with open(metrics_path, "w", encoding="utf-8") as f:
         f.write("Shared dataset Fisher comparison against GT\n")
         f.write(f"dataset_family: {args.dataset_family}\n")
+        f.write(f"x_dim: {args.x_dim}\n")
         f.write(f"n_total: {args.n_total}\n")
         f.write(f"train_frac: {args.train_frac}\n")
         f.write(f"score_data_mode: {args.score_data_mode}\n")
@@ -483,16 +650,37 @@ def main() -> None:
             "score_data_counts: "
             f"train={theta_score_train.shape[0]}, eval={theta_score_eval.shape[0]}\n"
         )
+        f.write(
+            "score_fit_val_counts: "
+            f"fit={theta_score_fit.shape[0]}, val={theta_score_val.shape[0]}, "
+            f"val_source={args.score_val_source}, "
+            f"val_frac={args.score_val_frac}, min_val_size={args.score_min_val_size}\n"
+        )
         f.write(f"gt_mc_samples_per_bin: {args.gt_mc_samples_per_bin}\n")
+        f.write(
+            "score_early_stopping: "
+            f"patience={args.score_early_patience}, min_delta={args.score_early_min_delta}, "
+            f"restore_best={args.score_restore_best}, stopped_early={stopped_early}, "
+            f"best_epoch={best_epoch}, stopped_epoch={stopped_epoch}, best_val_loss={best_val_loss}\n"
+        )
         f.write(f"score_noise_mode: {args.score_noise_mode}\n")
+        f.write(f"score_sigma_scale_mode: {args.score_sigma_scale_mode}\n")
+        f.write(f"theta_std_train: {theta_std}\n")
+        if np.isfinite(sigma_post):
+            f.write(f"sigma_post_proxy: {sigma_post}\n")
         if args.score_noise_mode == "continuous":
             f.write(
                 "score_sigma_continuous: "
+                f"sigma_min={min(float(sigma_min), float(sigma_max))}, "
+                f"sigma_max={max(float(sigma_min), float(sigma_max))}, "
+                f"eval_levels={args.score_eval_sigmas}, "
                 f"alpha_min={args.score_sigma_min_alpha}, alpha_max={args.score_sigma_max_alpha}, "
-                f"eval_levels={args.score_eval_sigmas}\n"
+                f"proxy_l2={args.score_proxy_l2}, proxy_mult=[{args.score_proxy_min_mult},{args.score_proxy_max_mult}], "
+                f"fixed_sigma={args.score_fixed_sigma}\n"
             )
         else:
             f.write(f"score_sigma_alpha_list: {args.score_sigma_alpha_list}\n")
+            f.write(f"score_sigma_discrete_values: {sigma_values.tolist()}\n")
         f.write(f"decoder_epsilon: {args.decoder_epsilon}\n")
         f.write(f"decoder_bandwidth: {args.decoder_bandwidth}\n")
         if args.dataset_family == "gaussian":
@@ -537,6 +725,7 @@ def main() -> None:
         f"rmse={decoder_metrics['rmse']:.4f}, mae={decoder_metrics['mae']:.4f}, corr={decoder_metrics['corr']:.4f}"
     )
     print("Saved artifacts:")
+    print(f"  - {loss_fig_path}")
     print(f"  - {fig_path}")
     print(f"  - {npz_path}")
     print(f"  - {metrics_path}")

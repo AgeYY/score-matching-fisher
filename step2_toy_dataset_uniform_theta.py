@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Step 2: toy dataset with uniform theta and Gaussian p(x|theta)."""
+"""Step 2: toy dataset with uniform theta and configurable p(x|theta) dimension."""
 
 from __future__ import annotations
 
@@ -12,25 +12,45 @@ import numpy as np
 from fisher.data import ToyConditionalGMMNonGaussianDataset, ToyConditionalGaussianDataset
 
 
-def summarize_dataset(theta: np.ndarray, x: np.ndarray, dataset: ToyConditionalGaussianDataset) -> None:
+def pca_project(x: np.ndarray, n_components: int = 2) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return PCA projection and PCA basis for centered x."""
+    x0 = x - x.mean(axis=0, keepdims=True)
+    _, _, vh = np.linalg.svd(x0, full_matrices=False)
+    basis = vh[:n_components].T
+    proj = x0 @ basis
+    return proj, x.mean(axis=0), basis
+
+
+def pca_transform(x: np.ndarray, mean: np.ndarray, basis: np.ndarray) -> np.ndarray:
+    return (x - mean.reshape(1, -1)) @ basis
+
+
+def summarize_dataset(
+    theta: np.ndarray,
+    x: np.ndarray,
+    dataset: ToyConditionalGaussianDataset | ToyConditionalGMMNonGaussianDataset,
+) -> None:
     print("Dataset summary")
     print(f"  theta shape: {theta.shape}")
     print(f"  x shape: {x.shape}")
+    print(f"  x_dim: {x.shape[1]}")
     print(f"  theta min/max: {theta.min():.4f} / {theta.max():.4f}")
     print(f"  theta mean/std: {theta.mean():.4f} / {theta.std():.4f}")
-    print(f"  x mean: [{x[:,0].mean():.4f}, {x[:,1].mean():.4f}]")
-    print(f"  x std:  [{x[:,0].std():.4f}, {x[:,1].std():.4f}]")
+
+    n_show = min(6, x.shape[1])
+    x_mean = ", ".join(f"{v:.4f}" for v in x.mean(axis=0)[:n_show])
+    x_std = ", ".join(f"{v:.4f}" for v in x.std(axis=0)[:n_show])
+    suffix = " ..." if x.shape[1] > n_show else ""
+    print(f"  x mean (first dims): [{x_mean}]{suffix}")
+    print(f"  x std  (first dims): [{x_std}]{suffix}")
+
     print("  covariance summary:")
-    if hasattr(dataset, "covariance_components"):
-        if hasattr(dataset, "cov"):
-            print(dataset.cov)
-        s1, s2, rho_t = dataset.covariance_components(theta)
-        print(
-            "  theta-dependent covariance ranges: "
-            f"sigma1 in [{s1.min():.4f}, {s1.max():.4f}], "
-            f"sigma2 in [{s2.min():.4f}, {s2.max():.4f}], "
-            f"rho in [{rho_t.min():.4f}, {rho_t.max():.4f}]"
-        )
+    if hasattr(dataset, "covariance_scales"):
+        scales = dataset.covariance_scales(theta)
+        smin = scales.min(axis=0)[:n_show]
+        smax = scales.max(axis=0)[:n_show]
+        print(f"  theta-dependent sigma min (first dims): {np.round(smin, 4).tolist()}{suffix}")
+        print(f"  theta-dependent sigma max (first dims): {np.round(smax, 4).tolist()}{suffix}")
     elif hasattr(dataset, "component_covariances"):
         print("  non-Gaussian mixture with theta-dependent component covariances.")
     if hasattr(dataset, "_mix_weight"):
@@ -44,7 +64,7 @@ def summarize_dataset(theta: np.ndarray, x: np.ndarray, dataset: ToyConditionalG
     valid = (idx >= 0) & (idx < n_bins)
     idx = idx[valid]
     x_valid = x[valid]
-    empirical = np.zeros((n_bins, 2), dtype=np.float64)
+    empirical = np.zeros((n_bins, x.shape[1]), dtype=np.float64)
     counts = np.zeros(n_bins, dtype=np.int64)
     for b in range(n_bins):
         mask = idx == b
@@ -54,15 +74,24 @@ def summarize_dataset(theta: np.ndarray, x: np.ndarray, dataset: ToyConditionalG
     model_mean = dataset.tuning_curve(centers[:, None])
     used = counts > 0
     mae = np.mean(np.abs(empirical[used] - model_mean[used])) if used.any() else np.nan
-    print(f"  binned E[x|theta] vs tuning curve MAE: {mae:.4f}")
+    print(f"  binned E[x|theta] vs tuning curve MAE (all dims): {mae:.4f}")
 
 
 def plot_joint_scatter(theta: np.ndarray, x: np.ndarray, out_path: str) -> None:
+    if x.shape[1] == 2:
+        proj = x
+        xlabel, ylabel = "x1", "x2"
+        title = r"Joint Samples of $x$ Colored by $\theta$"
+    else:
+        proj, _, _ = pca_project(x, n_components=2)
+        xlabel, ylabel = "PC1", "PC2"
+        title = rf"Joint Samples (PCA Projection, x_dim={x.shape[1]}) Colored by $\theta$"
+
     plt.figure(figsize=(7, 6))
-    sc = plt.scatter(x[:, 0], x[:, 1], c=theta.ravel(), s=8, alpha=0.55, cmap="viridis")
-    plt.xlabel("x1")
-    plt.ylabel("x2")
-    plt.title(r"Joint Samples of $x$ Colored by $\theta$")
+    sc = plt.scatter(proj[:, 0], proj[:, 1], c=theta.ravel(), s=8, alpha=0.55, cmap="viridis")
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.title(title)
     cb = plt.colorbar(sc)
     cb.set_label(r"$\theta$")
     plt.tight_layout()
@@ -73,12 +102,13 @@ def plot_joint_scatter(theta: np.ndarray, x: np.ndarray, out_path: str) -> None:
 def plot_tuning_curve(dataset: ToyConditionalGaussianDataset | ToyConditionalGMMNonGaussianDataset, out_path: str) -> None:
     t = np.linspace(dataset.theta_low, dataset.theta_high, 500, dtype=np.float64)[:, None]
     mu = dataset.tuning_curve(t)
+    n_plot = min(4, mu.shape[1])
     plt.figure(figsize=(8, 4.5))
-    plt.plot(t[:, 0], mu[:, 0], label=r"$\mu_1(\theta)$", linewidth=2.2)
-    plt.plot(t[:, 0], mu[:, 1], label=r"$\mu_2(\theta)$", linewidth=2.2)
+    for j in range(n_plot):
+        plt.plot(t[:, 0], mu[:, j], label=rf"$\mu_{{{j+1}}}(\theta)$", linewidth=2.0)
     plt.xlabel(r"$\theta$")
     plt.ylabel(r"Mean of $x|\theta$")
-    plt.title("Nonlinear Tuning Curve")
+    plt.title("Nonlinear Tuning Curves (first dimensions)")
     plt.grid(alpha=0.25, linestyle="--", linewidth=0.8)
     plt.legend()
     plt.tight_layout()
@@ -97,20 +127,46 @@ def plot_conditional_slices(
     if cols == 1:
         axes = [axes]
 
+    # Build a shared PCA frame for x_dim > 2 for comparable slice panels.
+    pca_mean = None
+    pca_basis = None
+    if dataset.x_dim > 2:
+        fit_theta = np.repeat(slice_thetas.reshape(-1, 1), repeats=max(150, n_slice // 6), axis=0)
+        fit_x = dataset.sample_x(fit_theta)
+        _, pca_mean, pca_basis = pca_project(fit_x, n_components=2)
+
     for ax, th in zip(axes, slice_thetas):
         theta_block = np.full((n_slice, 1), fill_value=th, dtype=np.float64)
         x_slice = dataset.sample_x(theta_block)
         mu = dataset.tuning_curve(np.array([[th]], dtype=np.float64))[0]
-        ax.scatter(x_slice[:, 0], x_slice[:, 1], s=12, alpha=0.45, color="#1f77b4")
-        ax.scatter([mu[0]], [mu[1]], marker="x", s=120, color="#d62728", linewidths=2.0, label="mu(theta)")
+
+        if dataset.x_dim == 2:
+            x_plot = x_slice
+            mu_plot = mu
+            xlabel, ylabel = "x1", "x2"
+        else:
+            x_plot = pca_transform(x_slice, pca_mean, pca_basis)
+            mu_plot = pca_transform(mu.reshape(1, -1), pca_mean, pca_basis)[0]
+            xlabel, ylabel = "PC1", "PC2"
+
+        ax.scatter(x_plot[:, 0], x_plot[:, 1], s=12, alpha=0.45, color="#1f77b4")
+        ax.scatter([mu_plot[0]], [mu_plot[1]], marker="x", s=120, color="#d62728", linewidths=2.0, label="mu(theta)")
+
         if hasattr(dataset, "component_means"):
             m1, m2 = dataset.component_means(np.array([[th]], dtype=np.float64))
-            ax.scatter([m1[0, 0]], [m1[0, 1]], marker="^", s=80, color="#2ca02c", alpha=0.9, label="comp mean 1")
-            ax.scatter([m2[0, 0]], [m2[0, 1]], marker="v", s=80, color="#9467bd", alpha=0.9, label="comp mean 2")
+            if dataset.x_dim > 2:
+                m1p = pca_transform(m1, pca_mean, pca_basis)[0]
+                m2p = pca_transform(m2, pca_mean, pca_basis)[0]
+            else:
+                m1p, m2p = m1[0], m2[0]
+            ax.scatter([m1p[0]], [m1p[1]], marker="^", s=80, color="#2ca02c", alpha=0.9, label="comp mean 1")
+            ax.scatter([m2p[0]], [m2p[1]], marker="v", s=80, color="#9467bd", alpha=0.9, label="comp mean 2")
+
         ax.set_title(rf"$\theta={th:.2f}$")
-        ax.set_xlabel("x1")
+        ax.set_xlabel(xlabel)
         ax.grid(alpha=0.2, linestyle=":")
-    axes[0].set_ylabel("x2")
+
+    axes[0].set_ylabel(ylabel)
     axes[0].legend(loc="upper right")
     fig.suptitle(r"Conditional Slices: Samples from $p(x|\theta)$", y=1.02)
     fig.tight_layout()
@@ -126,6 +182,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-slice", type=int, default=1400)
     parser.add_argument("--theta-low", type=float, default=-3.0)
     parser.add_argument("--theta-high", type=float, default=3.0)
+    parser.add_argument("--x-dim", type=int, default=2)
     parser.add_argument("--sigma-x1", type=float, default=0.30)
     parser.add_argument("--sigma-x2", type=float, default=0.22)
     parser.add_argument("--rho", type=float, default=0.15)
@@ -153,12 +210,15 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.x_dim < 2:
+        raise ValueError("--x-dim must be >= 2.")
     os.makedirs(args.output_dir, exist_ok=True)
 
     if args.dataset_family == "gaussian":
         dataset: ToyConditionalGaussianDataset | ToyConditionalGMMNonGaussianDataset = ToyConditionalGaussianDataset(
             theta_low=args.theta_low,
             theta_high=args.theta_high,
+            x_dim=args.x_dim,
             sigma_x1=args.sigma_x1,
             sigma_x2=args.sigma_x2,
             rho=args.rho,
@@ -178,6 +238,7 @@ def main() -> None:
         dataset = ToyConditionalGMMNonGaussianDataset(
             theta_low=args.theta_low,
             theta_high=args.theta_high,
+            x_dim=args.x_dim,
             sigma_x1=args.sigma_x1,
             sigma_x2=args.sigma_x2,
             rho=args.rho,

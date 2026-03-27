@@ -110,6 +110,17 @@ def extrapolate_sigma2_to_zero(
     slope = np.full(n_bins, np.nan, dtype=np.float64)
     r2 = np.full(n_bins, np.nan, dtype=np.float64)
 
+    # Fixed-noise mode: if all sigma values are (numerically) identical,
+    # return the single-noise Fisher estimate directly.
+    if np.allclose(x, x[0], rtol=0.0, atol=1e-15):
+        for b in range(n_bins):
+            yy = y[:, b]
+            mask = np.isfinite(yy)
+            if int(mask.sum()) < 1:
+                continue
+            intercept[b] = float(np.mean(yy[mask]))
+        return intercept, slope, r2
+
     for b in range(n_bins):
         yy = y[:, b]
         mask = np.isfinite(yy)
