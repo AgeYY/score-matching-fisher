@@ -65,6 +65,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--score-lr", type=float, default=1e-3)
     p.add_argument("--score-hidden-dim", type=int, default=128)
     p.add_argument("--score-depth", type=int, default=3)
+    p.add_argument("--score-data-mode", type=str, default="split", choices=["split", "full"])
     p.add_argument("--score-noise-mode", type=str, default="continuous", choices=["discrete", "continuous"])
     p.add_argument("--score-sigma-alpha-list", type=float, nargs="+", default=[0.08, 0.06, 0.045, 0.03, 0.02])
     p.add_argument("--score-sigma-min-alpha", type=float, default=0.01)
@@ -296,8 +297,20 @@ def main() -> None:
 
     print(f"[data] total={args.n_total} train={theta_train.shape[0]} eval={theta_eval.shape[0]}")
 
-    # Score method on shared split.
-    theta_std = float(np.std(theta_train))
+    if args.score_data_mode == "full":
+        theta_score_train, x_score_train = theta_all, x_all
+        theta_score_eval, x_score_eval = theta_all, x_all
+    else:
+        theta_score_train, x_score_train = theta_train, x_train
+        theta_score_eval, x_score_eval = theta_eval, x_eval
+    print(
+        "[score_data] "
+        f"mode={args.score_data_mode} "
+        f"train={theta_score_train.shape[0]} eval={theta_score_eval.shape[0]}"
+    )
+
+    # Score method data mode: either shared split or full dataset.
+    theta_std = float(np.std(theta_score_train))
     score_model = ConditionalScore1D(
         hidden_dim=args.score_hidden_dim,
         depth=args.score_depth,
@@ -319,8 +332,8 @@ def main() -> None:
         )
         score_losses = train_score_model_ncsm_continuous(
             model=score_model,
-            theta_train=theta_train,
-            x_train=x_train,
+            theta_train=theta_score_train,
+            x_train=x_score_train,
             sigma_min=sigma_min,
             sigma_max=sigma_max,
             epochs=args.score_epochs,
@@ -335,8 +348,8 @@ def main() -> None:
         print(f"[score:discrete] theta_std={theta_std:.6f}, sigma_values={sigma_values.tolist()}")
         score_losses = train_score_model(
             model=score_model,
-            theta_train=theta_train,
-            x_train=x_train,
+            theta_train=theta_score_train,
+            x_train=x_score_train,
             sigma_values=sigma_values,
             epochs=args.score_epochs,
             batch_size=args.score_batch_size,
@@ -348,8 +361,8 @@ def main() -> None:
     eval_high = args.theta_high - args.eval_margin
     score_eval = evaluate_score_fisher(
         model=score_model,
-        theta_eval=theta_eval,
-        x_eval=x_eval,
+        theta_eval=theta_score_eval,
+        x_eval=x_score_eval,
         dataset=dataset,
         sigma_values=sigma_values,
         fd_delta=args.fd_delta,
@@ -465,6 +478,11 @@ def main() -> None:
         f.write(f"dataset_family: {args.dataset_family}\n")
         f.write(f"n_total: {args.n_total}\n")
         f.write(f"train_frac: {args.train_frac}\n")
+        f.write(f"score_data_mode: {args.score_data_mode}\n")
+        f.write(
+            "score_data_counts: "
+            f"train={theta_score_train.shape[0]}, eval={theta_score_eval.shape[0]}\n"
+        )
         f.write(f"gt_mc_samples_per_bin: {args.gt_mc_samples_per_bin}\n")
         f.write(f"score_noise_mode: {args.score_noise_mode}\n")
         if args.score_noise_mode == "continuous":
