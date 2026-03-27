@@ -1,0 +1,168 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+
+
+\title{Charting cognitive map with denoising score matching}
+\author{Zeyuan Ye}
+\date{March 2026}
+
+\begin{document}
+\maketitle
+
+\section{Introduction}
+The brain represents the external world through internal neural representations. For example, while driving, our brain represents the surrounding spatial environment and the positions of nearby cars. Forming internal representations is a fundamental ability of the brain and serves as the basis for other cognitive functions.
+
+This internal representation is recently referred to as a \emph{cognitive map}. Importantly, a cognitive map is usually different from the corresponding physical map. In spatial navigation, for instance, the physical environment may be a square with a uniform spatial layout. However, the corresponding cognitive map need not be uniform: animals often form biased representations of locations associated with their own niches. The idea of a cognitive map is not limited to spatial locations. Another example is the neural representation of grating orientation. In the physical world, grating images with orientations $\theta$ and $\theta + \Delta\theta$ differ only by a rotation. If one measures the Euclidean distance between such images, that distance is independent of $\theta$, reflecting the rotational symmetry of the stimulus space. In this sense, no orientation is intrinsically more special than another in the physical world. In contrast, animals often show better perceptual discrimination for vertical and horizontal orientations than for oblique ones. This suggests that the cognitive map of grating orientation differs from the physical map.
+
+Fisher information is a fundamental quantity for characterizing such cognitive maps. At a high level, the Fisher information at a stimulus value $\theta$ quantifies the upper bound on how accurately $\theta$ can be decoded from neural activity. Therefore, Fisher information tells us how well the brain represents a particular stimulus value.
+
+From another perspective, Fisher information measures the local distance between nearby stimulus values in neural representation space. Returning to the grating example, although the Euclidean distance between physical images with nearby orientations is independent of orientation, the neural distance---as quantified by Fisher information---can be larger near vertical and horizontal orientations than near oblique ones. This geometric perspective directly connects Fisher information to the notion of a cognitive map: Fisher information defines a local metric on the stimulus manifold represented by the neural population. An important advantage of Fisher information over the Euclidean distance is that Fisher information is invariant to the subjective choice of coordinate system. Fisher information therefore reflects intrinsic properties of the neural representation.
+
+However, estimating Fisher information from neural population activity is hard, arguably because neural responses are both high-dimensional and noisy. Existing methods for estimating Fisher information can be broadly divided into two categories.
+
+First, there are model-based methods, which assume a specific statistical model for neural activity, such as Poisson spiking or an exponential-family model. In practice, however, neural population activity is shaped by complex inter-neuron interactions, and the true statistical model is typically unknown.
+
+Second, there are model-free methods. A central idea in this category is to train a classifier to distinguish between two nearby stimulus values based on neural activity $x$, and then use the classifier performance to estimate Fisher information. This approach is natural when stimulus values are discretized and repeated trials are available for each stimulus. However, many neuroscience experiments (such as navigation tasks)---especially increasingly common naturalistic experiments---do not provide repeated trials at discrete stimulus values; for example, an animal's spatial location varies continuously during navigation. To apply classical model-free methods in such settings, one must first discretize the continuous stimulus into bins, which introduces subjective choices such as bin width. Moreover, such discretization fails to exploit the continuity of the stimulus space, where nearby observations may contain useful information for estimating Fisher information.
+
+More recently, score-matching-based methods have been proposed for Fisher information estimation. Score matching is a generative framework closely related to diffusion models, which have achieved remarkable success in generating high-dimensional data such as images, audio, and video. Recent work has adapted score-based techniques to estimate Fisher information. However, these methods often require modifying the score matching method itself, such as latent-variable inference or simulator-specific objectives. As a result, they cannot always directly leverage the broad and rapidly developing family of existing score-matching methods. Furthermore, their applicability to high-dimensional, noisy neural data---especially discrete spiking data---remains unclear.
+
+In this manuscript, we propose a simple alternative. Using Bayes' rule, we express the Fisher score in terms of Stein score which can be directly estimated by score-matching methods without any modification. In this way, our approach can immediately benefit from the broad and rapidly advancing score-matching literature. Moreover, the proposed method can be applied directly to spiking data, without converting spikes into continuous firing rates or imposing a Poisson assumption.
+
+\section{Results}
+\subsection{Bayes' rule to express Fisher score in terms of Stein score}
+
+Score matching is a method to estimate the Stein score, however, is different from Fisher score. Therefore we express Fisher score in terms of Stein score using Bayes' rule.
+\begin{equation}
+\label{eq:fisher-stein}
+\nabla_\theta \log p(x\mid\theta) = \nabla_\theta \log p(\theta\mid x) - \nabla_\theta \log p(\theta),
+\end{equation}
+where $\theta \in \mathbb{R}^d$ is the stimulus parameter, such as grating orientation or spatial postiion; $x \in \mathbb{R}^n$ is the neural population activity; $\nabla_\theta \log p(x\mid\theta)$ is the Fisher score, $\nabla_\theta \log p(\theta\mid x)$ is the Stein score, and $\nabla_\theta \log p(\theta)$ is the Stein score of the stimulus parameter prior. In some experiments, this prior is controlled by the experimentists, for example, sampling uniform orientation values for grating images; in other experiments, this prior is not controlled such as in navigation task the animal's spatial location is not controlled. But often the stimulus parameter dimensionality $d$ is much smaller than the neural population activity dimensionality $n$, thus Stein score $\nabla_\theta \log p(\theta\mid x)$ can be estimated efficiently using classical methods or using a score-matching model.
+
+\subsection{Conditonal denoising score matching}
+Here we focus on describing conditional denoising score matching for estimating $\nabla_\theta \log p(\theta \mid x)$. A typical way of using conditional denoising score matching is to let it learn and generate high-dimensional data; however, here we use it in an opposite way, the condition $x$ is high-dimensional and the target $\theta$ is typically low-dimensional. Though, this does not change the mathematical nature of the problem -- any conditional score matching method can be used to estimate $\nabla_\theta \log p(\theta \mid x)$. It is a plug-in component of our Fisher information estimation framework.
+
+For better understanding, here we describe a concrete implementation of conditional denoising score matching. The spirit of denoising score matching is denoising. One adds Gaussian noise to a variable of interest and fits a network so that its output matches the noise that was injected; equivalently, the trained network approximates the Stein score---the gradient of the log-density---of a slightly smoothed distribution.
+
+Let $\theta$ denote the stimulus parameter and let $x$ denote an observation drawn from the conditional model $p(x\mid\theta)$. We sample a log-noise level $\log\sigma$ uniformly on an interval $[\log\sigma_{\min},\log\sigma_{\max}]$, draw a standard normal scalar $z\sim\mathcal{N}(0,1)$, and form the noisy latent $\tilde\theta=\theta+\sigma z$. We parameterize the score by a neural network $s_\phi$ with trainable weights $\phi$ and train it by minimizing the noise-conditional denoising objective
+\begin{equation}
+\label{eq:dsm-loss}
+\mathcal{L}(\phi)=\mathbb{E}\left[\left\|\sigma\,s_\phi(\tilde\theta,x,\sigma)+z\right\|^2\right],
+\end{equation}
+where the expectation is taken over $(\theta,x)$ drawn from the generative process, over the random choice of $\sigma$, and over $z$. Here $\mathcal{L}(\phi)$ is the scalar loss to be minimized, $\phi$ collects all network parameters, and $s_\phi(\tilde\theta,x,\sigma)$ is the network output intended to approximate the score of a $\sigma$-smoothed distribution in the $\theta$-direction, evaluated at the triplet $(\tilde\theta,x,\sigma)$.
+
+The experiments below illustrate this pipeline on a controlled Gaussian toy model; the Method section specifies noise-level ranges, stopping rules, and the protocol used to turn the trained score into a Fisher curve and compare it to baselines.
+
+Figure~\ref{fig:dataset} shows the Gaussian dataset visualization. The distribution of observations changes continuously with $\theta$, reflecting the nonlinear mean tuning and $\theta$-dependent covariance modulation.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.82\linewidth]{figures/joint_scatter_theta_color.png}
+    \caption{Dataset visualization for the Gaussian toy model with $x\in\mathbb{R}^{10}$. Each point is an observation (projected to the first two coordinates), and color indicates $\theta\in[-3,3]$.}
+    \label{fig:dataset}
+\end{figure}
+
+Figure~\ref{fig:compare} reports the shared-dataset Fisher comparison for the Gaussian run with $n_{\text{total}}=20000$ and $x$-dimension 10.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.86\linewidth]{figures/fisher_curve_shared_dataset_vs_gt_theta_cov.png}
+    \caption{Fisher-information comparison on the shared Gaussian dataset ($n_{\text{total}}=20000$, $x\in\mathbb{R}^{10}$).}
+    \label{fig:compare}
+\end{figure}
+
+Numerical metrics for this run are:
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+Method vs GT & RMSE & MAE & Correlation \\
+\midrule
+Score vs GT & 1.9128 & 1.5089 & 0.8640 \\
+Decoder vs GT & 4.5293 & 3.5260 & 0.2584 \\
+\bottomrule
+\end{tabular}
+\end{center}
+All 35 evaluation bins are valid for both methods.
+
+\section{Method}
+\subsection*{Data-generating model}
+The latent parameter is sampled as
+\[
+\theta\sim \mathrm{Uniform}[-3,3],
+\]
+and observations are generated from a Gaussian conditional family
+\[
+x\mid \theta\sim \mathcal N\!\bigl(\mu(\theta),\Sigma(\theta)\bigr),\qquad x\in\mathbb R^{10}.
+\]
+The mean components are smooth nonlinear functions of $\theta$ (sinusoidal and polynomial terms with coordinate-dependent amplitudes/frequencies), and the covariance has $\theta$-dependent scales and correlations. In particular,
+\[
+\Sigma(\theta)=D(\theta)\,R(\theta)\,D(\theta),
+\]
+where $D(\theta)$ is diagonal with positive coordinate-wise standard deviations and $R(\theta)$ is a valid correlation matrix with clipped pairwise correlations (maximum magnitude 0.85). This construction yields heteroscedastic, correlated Gaussian observations whose geometry changes with $\theta$.
+
+The reproduced run uses:
+\[
+n_{\text{total}}=20000,\quad n_{\text{train}}=14000,\quad n_{\text{eval}}=6000.
+\]
+
+\subsection*{Score-based Fisher estimator}
+We train a network $s_\phi(\tilde\theta,x,\sigma)$ using continuous noise-conditional denoising score matching. For each pair $(\theta,x)$,
+\[
+\log\sigma\sim\mathrm{Uniform}(\log\sigma_{\min},\log\sigma_{\max}),\qquad z\sim\mathcal N(0,1),\qquad \tilde\theta=\theta+\sigma z.
+\]
+The objective is
+\[
+\mathcal L(\phi)=\mathbb E\left[\left\|\sigma s_\phi(\tilde\theta,x,\sigma)+z\right\|^2\right].
+\]
+For this experiment, $\sigma$ is scaled by the training standard deviation of $\theta$:
+\[
+\sigma_{\min}=0.01\,\mathrm{std}(\theta_{\text{train}}),\qquad
+\sigma_{\max}=0.25\,\mathrm{std}(\theta_{\text{train}}),
+\]
+with $\mathrm{std}(\theta_{\text{train}})=1.7320085$, so
+\[
+\sigma_{\min}=0.0173201,\qquad \sigma_{\max}=0.4330021.
+\]
+Early stopping is applied using a 15\% validation split of score-training data (11900 fit, 2100 validation), with patience 1000, minimum improvement $10^{-4}$, smoothing window 20, and best-epoch restoration.
+
+Fisher is then estimated on 35 $\theta$ bins via
+\[
+\widehat I_\sigma(\theta_0)=\mathbb E\!\left[\hat s(\theta,x,\sigma)^2\,\middle|\,\theta\in\mathrm{bin}(\theta_0)\right].
+\]
+Although 12 geometric $\sigma$ levels are available for evaluation, this run uses the sigma-min direct estimator:
+\[
+\widehat I_{\mathrm{score}}(\theta_0)=\widehat I_{\sigma_{\min}}(\theta_0).
+\]
+
+\subsection*{Decoder Fisher baseline}
+For each bin center $\theta_0$, define two nearby parameters
+\[
+\theta_+=\theta_0+\frac{\varepsilon}{2},\qquad \theta_-=\theta_0-\frac{\varepsilon}{2},\qquad \varepsilon=0.12.
+\]
+A local classifier is trained to distinguish samples near $\theta_+$ and $\theta_-$ using neighborhood bandwidth 0.1 in $\theta$. If $\ell(x)$ is the classifier logit, then for small $\varepsilon$,
+\[
+\ell(x)\approx \varepsilon\,\partial_\theta\log p(x\mid\theta_0),
+\]
+and the decoder-based Fisher estimator is
+\[
+\widehat I_{\mathrm{dec}}(\theta_0)=\frac{1}{\varepsilon^2}\,\mathbb E\!\left[\ell(x)^2\right].
+\]
+Decoder training uses validation fraction 0.15, minimum validation class size 20, patience 100, minimum improvement $10^{-4}$, smoothing window 5, and best-epoch restoration.
+
+\subsection*{Ground-truth Fisher and evaluation protocol}
+Ground truth is
+\[
+I_{\mathrm{gt}}(\theta)=\mathbb E_{x\sim p(x\mid\theta)}\!\left[\left(\partial_\theta\log p(x\mid\theta)\right)^2\right],
+\]
+computed by Monte Carlo with 6000 samples per bin center. For the Gaussian model with $\theta$-dependent mean and covariance, this is equivalent to evaluating the analytic Fisher form
+\[
+I_{\mathrm{gt}}(\theta)=\mu'(\theta)^\top\Sigma(\theta)^{-1}\mu'(\theta)
++\frac{1}{2}\,\mathrm{tr}\!\left[\Sigma(\theta)^{-1}\Sigma'(\theta)\Sigma(\theta)^{-1}\Sigma'(\theta)\right],
+\]
+with derivatives induced by the chosen mean and covariance parameterization.
+
+Finally, both estimated curves are compared to $I_{\mathrm{gt}}$ over 35 bins using RMSE, MAE, and Pearson correlation, producing Figure~\ref{fig:compare}.
+
+\end{document}
