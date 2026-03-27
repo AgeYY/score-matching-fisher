@@ -227,8 +227,11 @@ def evaluate_score_fisher(
     fisher_per_sigma_arr = np.stack(fisher_per_sigma, axis=0)
     se_per_sigma_arr = np.stack(se_per_sigma, axis=0)
 
-    fisher0, slope, r2 = extrapolate_sigma2_to_zero(sigma_values=sigma_values, fisher_per_sigma=fisher_per_sigma_arr)
-    se_model0 = se_per_sigma_arr[-1]
+    k_min = int(np.argmin(np.asarray(sigma_values, dtype=np.float64)))
+    fisher0 = fisher_per_sigma_arr[k_min]
+    se_model0 = se_per_sigma_arr[k_min]
+    slope = np.full(fisher0.shape, np.nan, dtype=np.float64)
+    r2 = np.full(fisher0.shape, np.nan, dtype=np.float64)
     valid = np.isfinite(fisher0) & fd_stats.valid
 
     curves = BinnedFisher(

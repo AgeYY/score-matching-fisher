@@ -308,12 +308,29 @@ def train_local_decoder(
     batch_size: int,
     lr: float,
     device: torch.device,
-) -> list[float]:
+    x_val: np.ndarray | None = None,
+    y_val: np.ndarray | None = None,
+    early_stopping_patience: int = 0,
+    early_stopping_min_delta: float = 1e-4,
+    early_stopping_smooth_window: int = 1,
+    restore_best: bool = True,
+    log_every: int = 20,
+) -> dict[str, float | int | bool | list[float]]:
     loader = to_decoder_loader(x_train, y_train, batch_size=batch_size, shuffle=True)
+    has_val = x_val is not None and y_val is not None and len(x_val) > 0 and len(y_val) > 0
+    val_loader = to_decoder_loader(x_val, y_val, batch_size=batch_size, shuffle=False) if has_val else None
+    best_state: dict[str, torch.Tensor] | None = None
+    best_val_loss = float("inf")
+    best_epoch = 0
+    patience_counter = 0
+    stopped_early = False
+    stopped_epoch = epochs
+    val_losses: list[float] = []
+    val_monitor_losses: list[float] = []
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = nn.BCEWithLogitsLoss()
     losses: list[float] = []
-    for _ in range(epochs):
+    for epoch in range(1, epochs + 1):
         model.train()
         epoch_losses: list[float] = []
         for xb, yb in loader:
@@ -325,5 +342,66 @@ def train_local_decoder(
             loss.backward()
             optimizer.step()
             epoch_losses.append(float(loss.item()))
-        losses.append(float(np.mean(epoch_losses)))
-    return losses
+        mean_train_loss = float(np.mean(epoch_losses))
+        losses.append(mean_train_loss)
+
+        mean_val_loss = float("nan")
+        if has_val and val_loader is not None:
+            model.eval()
+            val_epoch_losses: list[float] = []
+            with torch.no_grad():
+                for xb, yb in val_loader:
+                    xb = xb.to(device, non_blocking=True)
+                    yb = yb.to(device, non_blocking=True)
+                    logits = model(xb)
+                    val_loss = criterion(logits, yb)
+                    val_epoch_losses.append(float(val_loss.item()))
+            mean_val_loss = float(np.mean(val_epoch_losses))
+            smooth_w = max(1, int(early_stopping_smooth_window))
+            smooth_val_loss = float(
+                np.mean(val_losses[max(0, len(val_losses) - smooth_w + 1) :] + [mean_val_loss])
+            )
+            if smooth_val_loss < (best_val_loss - early_stopping_min_delta):
+                best_val_loss = smooth_val_loss
+                best_epoch = epoch
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                patience_counter = 0
+            else:
+                patience_counter += 1
+            val_monitor_losses.append(smooth_val_loss)
+        else:
+            val_monitor_losses.append(float("nan"))
+        val_losses.append(mean_val_loss)
+
+        if epoch == 1 or epoch % max(1, log_every) == 0 or epoch == epochs:
+            if has_val:
+                print(
+                    f"[decoder epoch {epoch:4d}/{epochs}] train={mean_train_loss:.6f} "
+                    f"val={mean_val_loss:.6f} val_smooth={val_monitor_losses[-1]:.6f} "
+                    f"best_smooth={best_val_loss:.6f} best_epoch={best_epoch}"
+                )
+            else:
+                print(f"[decoder epoch {epoch:4d}/{epochs}] train={mean_train_loss:.6f}")
+
+        if has_val and early_stopping_patience > 0 and patience_counter >= early_stopping_patience:
+            stopped_early = True
+            stopped_epoch = epoch
+            print(
+                f"[decoder early-stop] epoch={epoch} best_epoch={best_epoch} "
+                f"best_smooth={best_val_loss:.6f} patience={early_stopping_patience}"
+            )
+            break
+
+    if has_val and restore_best and best_state is not None:
+        model.load_state_dict(best_state)
+        print(f"[decoder restore-best] restored epoch={best_epoch} val_smooth={best_val_loss:.6f}")
+
+    return {
+        "train_losses": losses,
+        "val_losses": val_losses,
+        "val_monitor_losses": val_monitor_losses,
+        "best_val_loss": float(best_val_loss),
+        "best_epoch": int(best_epoch),
+        "stopped_epoch": int(stopped_epoch),
+        "stopped_early": bool(stopped_early),
+    }

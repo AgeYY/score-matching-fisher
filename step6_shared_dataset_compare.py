@@ -120,6 +120,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--decoder-min-class-count", type=int, default=60)
     p.add_argument("--decoder-train-cap", type=int, default=1200)
     p.add_argument("--decoder-eval-cap", type=int, default=1200)
+    p.add_argument("--decoder-val-frac", type=float, default=0.15)
+    p.add_argument("--decoder-min-val-class-size", type=int, default=20)
+    p.add_argument("--decoder-early-patience", type=int, default=100)
+    p.add_argument("--decoder-early-min-delta", type=float, default=1e-4)
+    p.add_argument("--decoder-early-smooth-window", type=int, default=5)
+    p.add_argument("--decoder-restore-best", action="store_true", default=True)
+    p.add_argument("--no-decoder-restore-best", action="store_false", dest="decoder_restore_best")
     p.add_argument("--log-every", type=int, default=5)
     p.add_argument("--output-dir", type=str, default="data/outputs_step6_shared_dataset")
     return p.parse_args()
@@ -224,6 +231,12 @@ def fit_decoder_from_shared_data(
     lr: float,
     hidden_dim: int,
     depth: int,
+    val_frac: float,
+    min_val_class_size: int,
+    early_patience: int,
+    early_min_delta: float,
+    early_smooth_window: int,
+    restore_best: bool,
     device: torch.device,
     log_every: int,
     rng: np.random.Generator,
@@ -255,8 +268,26 @@ def fit_decoder_from_shared_data(
         if xev_neg.shape[0] != nev:
             xev_neg = xev_neg[rng.choice(xev_neg.shape[0], size=nev, replace=False)]
 
-        xtr = np.concatenate([xtr_pos, xtr_neg], axis=0)
-        ytr = np.concatenate([np.ones(ntr, dtype=np.float64), np.zeros(ntr, dtype=np.float64)], axis=0)
+        nval = int(round(float(val_frac) * ntr))
+        nval = max(int(min_val_class_size), nval)
+        nval = min(nval, ntr - 1)
+        if nval < 1:
+            continue
+        nfit = ntr - nval
+        if nfit < min_class_count:
+            continue
+
+        perm_pos = rng.permutation(ntr)
+        perm_neg = rng.permutation(ntr)
+        pos_fit = xtr_pos[perm_pos[:nfit]]
+        pos_val = xtr_pos[perm_pos[nfit:]]
+        neg_fit = xtr_neg[perm_neg[:nfit]]
+        neg_val = xtr_neg[perm_neg[nfit:]]
+
+        xtr = np.concatenate([pos_fit, neg_fit], axis=0)
+        ytr = np.concatenate([np.ones(nfit, dtype=np.float64), np.zeros(nfit, dtype=np.float64)], axis=0)
+        xval = np.concatenate([pos_val, neg_val], axis=0)
+        yval = np.concatenate([np.ones(nval, dtype=np.float64), np.zeros(nval, dtype=np.float64)], axis=0)
 
         model = LocalDecoderLogit(x_dim=x_train.shape[1], hidden_dim=hidden_dim, depth=depth).to(device)
         _ = train_local_decoder(
@@ -267,6 +298,13 @@ def fit_decoder_from_shared_data(
             batch_size=batch_size,
             lr=lr,
             device=device,
+            x_val=xval,
+            y_val=yval,
+            early_stopping_patience=early_patience,
+            early_stopping_min_delta=early_min_delta,
+            early_stopping_smooth_window=early_smooth_window,
+            restore_best=restore_best,
+            log_every=max(1, log_every),
         )
         model.eval()
         with torch.no_grad():
@@ -281,7 +319,7 @@ def fit_decoder_from_shared_data(
         if i == 0 or (i + 1) % log_every == 0 or (i + 1) == centers.size:
             print(
                 f"[decoder theta {i+1:3d}/{centers.size}] theta0={theta0:+.3f} "
-                f"ntr={ntr} nev={nev} fisher={fisher[i]:.4f}"
+                f"ntr={ntr} fit={nfit} val={nval} nev={nev} fisher={fisher[i]:.4f}"
             )
 
     return fisher, se, valid
@@ -291,8 +329,8 @@ def main() -> None:
     args = parse_args()
     if args.x_dim < 2:
         raise ValueError("--x-dim must be >= 2.")
-    if args.score_eval_sigmas < 2:
-        raise ValueError("--score-eval-sigmas must be >= 2 for sigma^2 extrapolation.")
+    if args.score_eval_sigmas < 1:
+        raise ValueError("--score-eval-sigmas must be >= 1.")
     if args.score_val_source == "train_split" and not (0.0 < args.score_val_frac < 1.0):
         raise ValueError("--score-val-frac must be in (0, 1) when --score-val-source=train_split.")
     if args.score_min_val_size < 1:
@@ -311,6 +349,16 @@ def main() -> None:
         raise ValueError("--score-proxy-min-mult must be <= --score-proxy-max-mult.")
     if args.score_fixed_sigma <= 0.0:
         raise ValueError("--score-fixed-sigma must be positive.")
+    if not (0.0 < args.decoder_val_frac < 1.0):
+        raise ValueError("--decoder-val-frac must be in (0, 1).")
+    if args.decoder_min_val_class_size < 1:
+        raise ValueError("--decoder-min-val-class-size must be >= 1.")
+    if args.decoder_early_patience < 1:
+        raise ValueError("--decoder-early-patience must be >= 1.")
+    if args.decoder_early_min_delta < 0.0:
+        raise ValueError("--decoder-early-min-delta must be non-negative.")
+    if args.decoder_early_smooth_window < 1:
+        raise ValueError("--decoder-early-smooth-window must be >= 1.")
     os.makedirs(args.output_dir, exist_ok=True)
     device = require_device(args.device)
     np.random.seed(args.seed)
@@ -588,6 +636,12 @@ def main() -> None:
         lr=args.decoder_lr,
         hidden_dim=args.decoder_hidden_dim,
         depth=args.decoder_depth,
+        val_frac=args.decoder_val_frac,
+        min_val_class_size=args.decoder_min_val_class_size,
+        early_patience=args.decoder_early_patience,
+        early_min_delta=args.decoder_early_min_delta,
+        early_smooth_window=args.decoder_early_smooth_window,
+        restore_best=args.decoder_restore_best,
         device=device,
         log_every=max(1, args.log_every),
         rng=rng,
@@ -618,7 +672,7 @@ def main() -> None:
         score_eval.curves.fisher_model[score_valid],
         color="#1f77b4",
         linewidth=2.2,
-        label=r"Score matching ($\sigma\to0$ extrapolated)",
+        label=r"Score matching (at $\sigma_{\min}$)",
     )
     if np.any(np.isfinite(score_eval.curves.se_model[score_valid])):
         plt.fill_between(
@@ -705,6 +759,10 @@ def main() -> None:
         )
         f.write(f"score_noise_mode: {args.score_noise_mode}\n")
         f.write(f"score_sigma_scale_mode: {args.score_sigma_scale_mode}\n")
+        f.write(
+            "score_fisher_eval_method: "
+            f"sigma_min_direct, sigma_eval_used={float(np.min(score_eval.sigma_values))}\n"
+        )
         f.write(f"theta_std_train: {theta_std}\n")
         if np.isfinite(sigma_post):
             f.write(f"sigma_post_proxy: {sigma_post}\n")
@@ -723,6 +781,12 @@ def main() -> None:
             f.write(f"score_sigma_discrete_values: {sigma_values.tolist()}\n")
         f.write(f"decoder_epsilon: {args.decoder_epsilon}\n")
         f.write(f"decoder_bandwidth: {args.decoder_bandwidth}\n")
+        f.write(
+            "decoder_early_stopping: "
+            f"val_frac={args.decoder_val_frac}, min_val_class_size={args.decoder_min_val_class_size}, "
+            f"patience={args.decoder_early_patience}, min_delta={args.decoder_early_min_delta}, "
+            f"smooth_window={args.decoder_early_smooth_window}, restore_best={args.decoder_restore_best}\n"
+        )
         if args.dataset_family == "gaussian":
             f.write(
                 "cov_theta: "
