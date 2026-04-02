@@ -31,7 +31,7 @@ More recently, score-matching-based methods have been proposed for Fisher inform
 
 In this manuscript, we propose a simple alternative. Using Bayes' rule, we express the Fisher score in terms of Stein score which can be directly estimated by score-matching methods without any modification. In this way, our approach can immediately benefit from the broad and rapidly advancing score-matching literature. Moreover, the proposed method can be applied directly to spiking data, without converting spikes into continuous firing rates or imposing a Poisson assumption.
 
-\section{Results}
+\section{Preliminary results}
 \subsection{Bayes' rule to express Fisher score in terms of Stein score}
 
 Score matching is a method to estimate the Stein score, however, is different from Fisher score. Therefore we express Fisher score in terms of Stein score using Bayes' rule.
@@ -51,26 +51,18 @@ Let $\theta$ denote the stimulus parameter and let $x$ denote an observation dra
 \label{eq:dsm-loss}
 \mathcal{L}(\phi)=\mathbb{E}\left[\left\|\sigma\,s_\phi(\tilde\theta,x,\sigma)+z\right\|^2\right],
 \end{equation}
-where the expectation is taken over $(\theta,x)$ drawn from the generative process, over the random choice of $\sigma$, and over $z$. Here $\mathcal{L}(\phi)$ is the scalar loss to be minimized, $\phi$ collects all network parameters, and $s_\phi(\tilde\theta,x,\sigma)$ is the network output intended to approximate the score of a $\sigma$-smoothed distribution in the $\theta$-direction, evaluated at the triplet $(\tilde\theta,x,\sigma)$.
+where the expectation is taken over $(\theta,x)$ drawn from the generative process, over the random choice of $\sigma$, and over $z$. Here $\mathcal{L}(\phi)$ is the scalar loss to be minimized, $\phi$ collects all network parameters, and $s_\phi(\tilde\theta,x,\sigma)$ is the network output intended to approximate the score of a $\sigma$-smoothed conditional posterior, in the $\theta$-direction, at $(\tilde\theta,x,\sigma)$: namely $\nabla_{\tilde{\theta}} \log p_\sigma(\tilde{\theta}\mid x)$, where $p_\sigma(\cdot\mid x)$ is the density of $\tilde\theta=\theta+\sigma z$ when $\theta\sim p(\cdot\mid x)$ and $z$ is isotropic Gaussian noise of the same dimension as $\theta$. As $\sigma \rightarrow 0$, $p_\sigma(\cdot\mid x)$ converges to $p(\cdot\mid x)$ and $\nabla_{\tilde{\theta}} \log p_\sigma(\tilde{\theta}\mid x)$ converges to the Stein score $\nabla_{\theta} \log p(\theta\mid x)$. Together with $\nabla_\theta \log p(\theta)$, which is typically known or low-dimensional and can be estimated easily, we obtain the Fisher score via equation~\ref{eq:fisher-stein}.
 
-The experiments below illustrate this pipeline on a controlled Gaussian toy model; the Method section specifies noise-level ranges, stopping rules, and the protocol used to turn the trained score into a Fisher curve and compare it to baselines.
+\subsection{Preliminary experiments}
+The experiments below illustrate this pipeline on a Gaussian toy model; the Method section specifies noise-level ranges, stopping rules, and the protocol used to turn the trained score into a Fisher curve and compare it to baselines.
 
-Figure~\ref{fig:dataset} shows the Gaussian dataset visualization. The distribution of observations changes continuously with $\theta$, reflecting the nonlinear mean tuning and $\theta$-dependent covariance modulation.
-
-\begin{figure}[t]
-    \centering
-    \includegraphics[width=0.82\linewidth]{figures/joint_scatter_theta_color.png}
-    \caption{Dataset visualization for the Gaussian toy model with $x\in\mathbb{R}^{10}$. Each point is an observation (projected to the first two coordinates), and color indicates $\theta\in[-3,3]$.}
-    \label{fig:dataset}
-\end{figure}
-
-Figure~\ref{fig:compare} reports the shared-dataset Fisher comparison for the Gaussian run with $n_{\text{total}}=20000$ and $x$-dimension 10.
+Figure~\ref{fig:gaussian_results} summarizes the Gaussian toy experiment. Panel~(A) visualizes the dataset: observations live in $x\in\mathbb{R}^{10}$ (here projected with PCA to two dimensions), colored by $\theta\in[-3,3]$; the distribution changes continuously with $\theta$, reflecting nonlinear mean tuning and $\theta$-dependent covariance modulation. Panel~(B) reports the shared-dataset Fisher comparison for $n_{\text{total}}=20000$.
 
 \begin{figure}[t]
     \centering
-    \includegraphics[width=0.86\linewidth]{figures/fisher_curve_shared_dataset_vs_gt_theta_cov.png}
-    \caption{Fisher-information comparison on the shared Gaussian dataset ($n_{\text{total}}=20000$, $x\in\mathbb{R}^{10}$).}
-    \label{fig:compare}
+    \includegraphics[width=\linewidth]{figures/gaussian_pca_and_fisher_merged.png}
+    \caption{Gaussian toy model ($n_{\text{total}}=20000$, $x\in\mathbb{R}^{10}$). \textbf{(A)}~Dataset visualization: each point is an observation (PCA projection), color indicates $\theta$. \textbf{(B)}~Fisher information vs.\ $\theta$: ground truth, score matching at $\sigma_{\min}$, and decoder baseline on the shared dataset (shaded bands indicate variability). Decoder baseline performance may be improved by carefully choosing hyperparameters like bin width, but have not throughly investigated.}
+    \label{fig:gaussian_results}
 \end{figure}
 
 Numerical metrics for this run are:
@@ -84,7 +76,8 @@ Decoder vs GT & 4.5293 & 3.5260 & 0.2584 \\
 \bottomrule
 \end{tabular}
 \end{center}
-All 35 evaluation bins are valid for both methods.
+
+\pagebreak
 
 \section{Method}
 \subsection*{Data-generating model}
@@ -101,11 +94,6 @@ The mean components are smooth nonlinear functions of $\theta$ (sinusoidal and p
 \Sigma(\theta)=D(\theta)\,R(\theta)\,D(\theta),
 \]
 where $D(\theta)$ is diagonal with positive coordinate-wise standard deviations and $R(\theta)$ is a valid correlation matrix with clipped pairwise correlations (maximum magnitude 0.85). This construction yields heteroscedastic, correlated Gaussian observations whose geometry changes with $\theta$.
-
-The reproduced run uses:
-\[
-n_{\text{total}}=20000,\quad n_{\text{train}}=14000,\quad n_{\text{eval}}=6000.
-\]
 
 \subsection*{Score-based Fisher estimator}
 We train a network $s_\phi(\tilde\theta,x,\sigma)$ using continuous noise-conditional denoising score matching. For each pair $(\theta,x)$,
@@ -131,7 +119,7 @@ Fisher is then estimated on 35 $\theta$ bins via
 \[
 \widehat I_\sigma(\theta_0)=\mathbb E\!\left[\hat s(\theta,x,\sigma)^2\,\middle|\,\theta\in\mathrm{bin}(\theta_0)\right].
 \]
-Although 12 geometric $\sigma$ levels are available for evaluation, this run uses the sigma-min direct estimator:
+The estimated Fisher information is defined as the sigma-min direct estimator:
 \[
 \widehat I_{\mathrm{score}}(\theta_0)=\widehat I_{\sigma_{\min}}(\theta_0).
 \]
@@ -163,6 +151,6 @@ I_{\mathrm{gt}}(\theta)=\mu'(\theta)^\top\Sigma(\theta)^{-1}\mu'(\theta)
 \]
 with derivatives induced by the chosen mean and covariance parameterization.
 
-Finally, both estimated curves are compared to $I_{\mathrm{gt}}$ over 35 bins using RMSE, MAE, and Pearson correlation, producing Figure~\ref{fig:compare}.
+Finally, both estimated curves are compared to $I_{\mathrm{gt}}$ over 35 bins using RMSE, MAE, and Pearson correlation, producing panel~(B) of Figure~\ref{fig:gaussian_results}.
 
 \end{document}
