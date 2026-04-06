@@ -384,6 +384,10 @@ def build_dataset_from_meta(meta: dict[str, Any]) -> ToyConditionalGaussianDatas
             theta_low=float(meta["theta_low"]),
             theta_high=float(meta["theta_high"]),
             x_dim=int(meta["x_dim"]),
+            tuning_curve_family=str(meta.get("tuning_curve_family", "cosine")),
+            vm_mu_amp=float(meta.get("vm_mu_amp", 1.0)),
+            vm_kappa=float(meta.get("vm_kappa", 1.0)),
+            vm_omega=float(meta.get("vm_omega", 1.0)),
             sigma_x1=float(meta["sigma_x1"]),
             sigma_x2=float(meta["sigma_x2"]),
             rho=float(meta["rho"]),
@@ -404,6 +408,10 @@ def build_dataset_from_meta(meta: dict[str, Any]) -> ToyConditionalGaussianDatas
             theta_low=float(meta["theta_low"]),
             theta_high=float(meta["theta_high"]),
             x_dim=int(meta["x_dim"]),
+            tuning_curve_family=str(meta.get("tuning_curve_family", "cosine")),
+            vm_mu_amp=float(meta.get("vm_mu_amp", 1.0)),
+            vm_kappa=float(meta.get("vm_kappa", 1.0)),
+            vm_omega=float(meta.get("vm_omega", 1.0)),
             sigma_x1=float(meta["sigma_x1"]),
             sigma_x2=float(meta["sigma_x2"]),
             rho=float(meta["rho"]),
@@ -424,6 +432,13 @@ def build_dataset_from_args(ns: Any) -> ToyConditionalGaussianDataset | ToyCondi
 
 
 def validate_dataset_sample_args(args: Any) -> None:
+    if getattr(args, "tuning_curve_family", "cosine") not in ("cosine", "von_mises_raw"):
+        raise ValueError('--tuning-curve-family must be "cosine" or "von_mises_raw".')
+    if getattr(args, "tuning_curve_family", "cosine") == "von_mises_raw":
+        if float(getattr(args, "vm_kappa", 0.0)) < 0.0:
+            raise ValueError("--vm-kappa must be non-negative for von_mises_raw.")
+        if float(getattr(args, "vm_mu_amp", 0.0)) <= 0.0:
+            raise ValueError("--vm-mu-amp must be positive for von_mises_raw.")
     if args.x_dim < 2:
         raise ValueError("--x-dim must be >= 2.")
     if int(args.n_total) < 2:

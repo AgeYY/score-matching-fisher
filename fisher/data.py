@@ -19,6 +19,10 @@ class ToyConditionalGaussianDataset:
     theta_low: float = -3.0
     theta_high: float = 3.0
     x_dim: int = 2
+    tuning_curve_family: str = "cosine"  # "cosine" | "von_mises_raw"
+    vm_mu_amp: float = 1.0
+    vm_kappa: float = 1.0
+    vm_omega: float = 1.0
     sigma_x1: float = 0.30
     sigma_x2: float = 0.22
     rho: float = 0.15
@@ -48,11 +52,19 @@ class ToyConditionalGaussianDataset:
             raise ValueError("cov_theta_amp_rho must be in [0, 1].")
         if not (0.1 <= self.rho_clip <= 0.95):
             raise ValueError("rho_clip must be in [0.1, 0.95].")
+        if self.tuning_curve_family not in ("cosine", "von_mises_raw"):
+            raise ValueError('tuning_curve_family must be "cosine" or "von_mises_raw".')
+        if self.tuning_curve_family == "von_mises_raw":
+            if self.vm_kappa < 0.0:
+                raise ValueError("vm_kappa must be non-negative for von_mises_raw.")
+            if self.vm_mu_amp <= 0.0:
+                raise ValueError("vm_mu_amp must be positive for von_mises_raw.")
 
         self.rng = np.random.default_rng(self.seed)
         idx = np.arange(1, self.x_dim + 1, dtype=np.float64)
 
-        # Cosine tuning curves: mu_j(theta) = A * cos(omega * theta + phi_j), phi_j uniform on [0, 2pi).
+        # Cosine tuning curves: mu_j(theta) = A * cos(omega * theta + phi_j)
+        # Von Mises (raw): mu_j(theta) = A * exp(kappa * cos(omega * theta - phi_j))
         self._mu_amp = 1.0
         self._mu_omega = 1.0
         self._mu_phases = 2.0 * np.pi * np.arange(self.x_dim, dtype=np.float64) / float(self.x_dim)
@@ -90,12 +102,24 @@ class ToyConditionalGaussianDataset:
     def tuning_curve(self, theta: np.ndarray) -> np.ndarray:
         t = _theta_col(theta)
         ph = self._mu_phases.reshape(1, -1)
-        return self._mu_amp * np.cos(self._mu_omega * t + ph)
+        if self.tuning_curve_family == "cosine":
+            return self._mu_amp * np.cos(self._mu_omega * t + ph)
+        z = self.vm_omega * t - ph
+        return self.vm_mu_amp * np.exp(self.vm_kappa * np.cos(z))
 
     def tuning_curve_derivative(self, theta: np.ndarray) -> np.ndarray:
         t = _theta_col(theta)
         ph = self._mu_phases.reshape(1, -1)
-        return -self._mu_amp * self._mu_omega * np.sin(self._mu_omega * t + ph)
+        if self.tuning_curve_family == "cosine":
+            return -self._mu_amp * self._mu_omega * np.sin(self._mu_omega * t + ph)
+        z = self.vm_omega * t - ph
+        return (
+            -self.vm_mu_amp
+            * np.exp(self.vm_kappa * np.cos(z))
+            * self.vm_kappa
+            * self.vm_omega
+            * np.sin(z)
+        )
 
     def covariance_scales(self, theta: np.ndarray) -> np.ndarray:
         t = _theta_col(theta)
@@ -188,6 +212,10 @@ class ToyConditionalGMMNonGaussianDataset:
     theta_low: float = -3.0
     theta_high: float = 3.0
     x_dim: int = 2
+    tuning_curve_family: str = "cosine"  # "cosine" | "von_mises_raw"
+    vm_mu_amp: float = 1.0
+    vm_kappa: float = 1.0
+    vm_omega: float = 1.0
     sigma_x1: float = 0.30
     sigma_x2: float = 0.22
     rho: float = 0.15
@@ -214,6 +242,13 @@ class ToyConditionalGMMNonGaussianDataset:
             raise ValueError("sep_scale must be positive.")
         if not (0.1 <= self.rho_clip <= 0.95):
             raise ValueError("rho_clip must be in [0.1, 0.95].")
+        if self.tuning_curve_family not in ("cosine", "von_mises_raw"):
+            raise ValueError('tuning_curve_family must be "cosine" or "von_mises_raw".')
+        if self.tuning_curve_family == "von_mises_raw":
+            if self.vm_kappa < 0.0:
+                raise ValueError("vm_kappa must be non-negative for von_mises_raw.")
+            if self.vm_mu_amp <= 0.0:
+                raise ValueError("vm_mu_amp must be positive for von_mises_raw.")
 
         self.rng = np.random.default_rng(self.seed)
         idx = np.arange(1, self.x_dim + 1, dtype=np.float64)
@@ -242,12 +277,24 @@ class ToyConditionalGMMNonGaussianDataset:
     def tuning_curve(self, theta: np.ndarray) -> np.ndarray:
         t = _theta_col(theta)
         ph = self._mu_phases.reshape(1, -1)
-        return self._mu_amp * np.cos(self._mu_omega * t + ph)
+        if self.tuning_curve_family == "cosine":
+            return self._mu_amp * np.cos(self._mu_omega * t + ph)
+        z = self.vm_omega * t - ph
+        return self.vm_mu_amp * np.exp(self.vm_kappa * np.cos(z))
 
     def tuning_curve_derivative(self, theta: np.ndarray) -> np.ndarray:
         t = _theta_col(theta)
         ph = self._mu_phases.reshape(1, -1)
-        return -self._mu_amp * self._mu_omega * np.sin(self._mu_omega * t + ph)
+        if self.tuning_curve_family == "cosine":
+            return -self._mu_amp * self._mu_omega * np.sin(self._mu_omega * t + ph)
+        z = self.vm_omega * t - ph
+        return (
+            -self.vm_mu_amp
+            * np.exp(self.vm_kappa * np.cos(z))
+            * self.vm_kappa
+            * self.vm_omega
+            * np.sin(z)
+        )
 
     def _mix_weight(self, theta: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         t = _theta_col(theta)

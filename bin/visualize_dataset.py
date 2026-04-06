@@ -200,6 +200,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--dataset-family", type=str, default="gaussian", choices=["gaussian", "gmm_non_gauss"])
+    parser.add_argument(
+        "--tuning-curve-family",
+        type=str,
+        default="cosine",
+        choices=["cosine", "von_mises_raw"],
+        help="Mean tuning curve (must match dataset .npz when using --dataset-npz).",
+    )
+    parser.add_argument("--vm-mu-amp", type=float, default=1.0)
+    parser.add_argument("--vm-kappa", type=float, default=1.0)
+    parser.add_argument("--vm-omega", type=float, default=1.0)
     parser.add_argument("--n-joint", type=int, default=12000)
     parser.add_argument("--n-slice", type=int, default=1400)
     parser.add_argument("--theta-low", type=float, default=-3.0)
@@ -261,6 +271,10 @@ def main() -> None:
                 theta_low=args.theta_low,
                 theta_high=args.theta_high,
                 x_dim=args.x_dim,
+                tuning_curve_family=args.tuning_curve_family,
+                vm_mu_amp=args.vm_mu_amp,
+                vm_kappa=args.vm_kappa,
+                vm_omega=args.vm_omega,
                 sigma_x1=args.sigma_x1,
                 sigma_x2=args.sigma_x2,
                 rho=args.rho,
@@ -281,6 +295,10 @@ def main() -> None:
                 theta_low=args.theta_low,
                 theta_high=args.theta_high,
                 x_dim=args.x_dim,
+                tuning_curve_family=args.tuning_curve_family,
+                vm_mu_amp=args.vm_mu_amp,
+                vm_kappa=args.vm_kappa,
+                vm_omega=args.vm_omega,
                 sigma_x1=args.sigma_x1,
                 sigma_x2=args.sigma_x2,
                 rho=args.rho,

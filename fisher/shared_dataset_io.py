@@ -30,6 +30,10 @@ def meta_dict_from_args(ns: Any) -> dict[str, Any]:
     return {
         "version": SHARED_DATASET_NPZ_VERSION,
         "dataset_family": str(ns.dataset_family),
+        "tuning_curve_family": str(ns.tuning_curve_family),
+        "vm_mu_amp": float(ns.vm_mu_amp),
+        "vm_kappa": float(ns.vm_kappa),
+        "vm_omega": float(ns.vm_omega),
         "seed": int(ns.seed),
         "theta_low": float(ns.theta_low),
         "theta_high": float(ns.theta_high),

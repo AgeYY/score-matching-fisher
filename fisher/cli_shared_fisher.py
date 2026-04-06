@@ -8,6 +8,31 @@ import argparse
 def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--dataset-family", type=str, default="gmm_non_gauss", choices=["gaussian", "gmm_non_gauss"])
+    p.add_argument(
+        "--tuning-curve-family",
+        type=str,
+        default="cosine",
+        choices=["cosine", "von_mises_raw"],
+        help="Mean tuning curve: cosine (default) or raw Von Mises form A*exp(kappa*cos(omega*theta-phi_j)).",
+    )
+    p.add_argument(
+        "--vm-mu-amp",
+        type=float,
+        default=1.0,
+        help="Amplitude A for von_mises_raw tuning curves (ignored for cosine).",
+    )
+    p.add_argument(
+        "--vm-kappa",
+        type=float,
+        default=1.0,
+        help="Concentration kappa >= 0 for von_mises_raw tuning curves (ignored for cosine).",
+    )
+    p.add_argument(
+        "--vm-omega",
+        type=float,
+        default=1.0,
+        help="Angular frequency omega for von_mises_raw tuning curves (ignored for cosine).",
+    )
     p.add_argument("--theta-low", type=float, default=-3.0)
     p.add_argument("--theta-high", type=float, default=3.0)
     p.add_argument("--x-dim", type=int, default=2)
