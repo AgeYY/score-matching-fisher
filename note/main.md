@@ -12,4 +12,4 @@ Collected markdown notes in this folder. Each link is a chapter-length document.
 
 4. **[Gaussian high-noise Fisher (x-dim 10)](gaussian_high_noise_xdim10_sigma_min_direct_note.md)** — Larger Gaussian experiment: score-based vs decoder Fisher at \(\sigma_{\min}\), reproducibility commands, and results.
 
-5. **[Executable scripts (`bin/`)](exec_code.md)** — What each of `step1`, `step2`, and `step6` does and how to run them from the repo root.
+5. **[Executable scripts (`bin/`)](exec_code.md)** — What `visualize_dataset` and `fisher_est` do and how to run them from the repo root.

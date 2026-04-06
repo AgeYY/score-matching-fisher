@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Step 6: shared-dataset comparison against analytic Fisher ground truth.
+"""Shared-dataset Fisher estimation: score vs decoder vs ground truth.
 
 Workflow:
 1) Sample one joint dataset (theta, x) from p(theta)p(x|theta), then split train/eval.
 2) Fit score-matching Fisher estimator on the shared train split.
 3) Fit decoder local-classification Fisher estimator using shared train/eval subsets.
-4) Compute analytic Fisher curve and compare all curves in one figure.
+4) Compute ground-truth Fisher (analytic for Gaussian, Monte Carlo for mixture) and plot comparisons.
 """
 
 from __future__ import annotations

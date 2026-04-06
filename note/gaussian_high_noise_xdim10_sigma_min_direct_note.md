@@ -12,7 +12,7 @@ The score-based method in this run uses **direct evaluation at $\sigma_{\min}$**
 ## 1. Reproducibility command
 
 ```bash
-mamba run -n geo_diffusion python bin/step6_shared_dataset_compare.py \
+mamba run -n geo_diffusion python bin/fisher_est.py \
   --dataset-family gaussian \
   --x-dim 10 \
   --sigma-x1 2.40 \

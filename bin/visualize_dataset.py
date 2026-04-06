@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Step 2: toy dataset with uniform theta and configurable p(x|theta) dimension."""
+"""Visualize the uniform-theta toy dataset (Gaussian or GMM) and save diagnostic figures."""
 
 from __future__ import annotations
 
