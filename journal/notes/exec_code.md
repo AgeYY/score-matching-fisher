@@ -1,8 +1,8 @@
 # Executable scripts (`bin/`)
 
-Top-level driver scripts live under [`bin/`](../bin/). Run them from the **repository root** so default output paths like `data/outputs_step2` (dataset visuals) / `data/outputs_step6_shared_dataset` (shared-dataset Fisher runs) resolve correctly and imports from the `fisher` package work.
+Top-level driver scripts live under [`bin/`](../../bin/). Run them from the **repository root** so default output paths like `data/outputs_step2` (dataset visuals) / `data/outputs_step6_shared_dataset` (shared-dataset Fisher runs) resolve correctly and imports from the `fisher` package work.
 
-Use the project environment and CUDA as in [`AGENTS.md`](../AGENTS.md):
+Use the project environment and CUDA as in [`AGENTS.md`](../../AGENTS.md):
 
 ```bash
 mamba run -n geo_diffusion python bin/<script>.py ... --device cuda

@@ -93,11 +93,21 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--decoder-lr", type=float, default=1e-3)
     p.add_argument("--decoder-hidden-dim", type=int, default=64)
     p.add_argument("--decoder-depth", type=int, default=2)
-    p.add_argument("--decoder-min-class-count", type=int, default=60)
+    p.add_argument(
+        "--decoder-min-class-count",
+        type=int,
+        default=5,
+        help="Minimum balanced samples per class in train AND eval windows; limited by eval mass near theta±epsilon/2.",
+    )
     p.add_argument("--decoder-train-cap", type=int, default=1200)
     p.add_argument("--decoder-eval-cap", type=int, default=1200)
     p.add_argument("--decoder-val-frac", type=float, default=0.15)
-    p.add_argument("--decoder-min-val-class-size", type=int, default=20)
+    p.add_argument(
+        "--decoder-min-val-class-size",
+        type=int,
+        default=10,
+        help="Minimum validation samples per class after holdout; lower values ease nfit>=min_class_count when ntr is modest.",
+    )
     p.add_argument("--decoder-early-patience", type=int, default=100)
     p.add_argument("--decoder-early-min-delta", type=float, default=1e-4)
     p.add_argument(
@@ -108,6 +118,12 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument("--decoder-restore-best", action="store_true", default=True)
     p.add_argument("--no-decoder-restore-best", action="store_false", dest="decoder_restore_best")
+    p.add_argument(
+        "--decoder-debug-bins",
+        action="store_true",
+        default=False,
+        help="Log per-center decoder skip details (counts and reasons) to stdout.",
+    )
     p.add_argument("--log-every", type=int, default=5)
     p.add_argument("--output-dir", type=str, default="data/outputs_step6_shared_dataset")
 

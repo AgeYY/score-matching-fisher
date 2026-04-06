@@ -104,6 +104,22 @@ def _subset_x_by_theta(
     return x[idx]
 
 
+def decoder_min_ntr_for_fit(min_class_count: int, val_frac: float, min_val_class_size: int) -> int:
+    """Smallest balanced per-class train count ``ntr`` such that after the validation holdout, ``nfit >= min_class_count``."""
+    if min_class_count < 1:
+        return 1
+    for ntr in range(1, 500000):
+        nval = int(round(float(val_frac) * ntr))
+        nval = max(int(min_val_class_size), nval)
+        nval = min(nval, ntr - 1)
+        if nval < 1:
+            continue
+        nfit = ntr - nval
+        if nfit >= min_class_count:
+            return int(ntr)
+    return -1
+
+
 def fit_decoder_from_shared_data(
     centers: np.ndarray,
     theta_train: np.ndarray,
@@ -129,10 +145,61 @@ def fit_decoder_from_shared_data(
     device: torch.device,
     log_every: int,
     rng: np.random.Generator,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    *,
+    debug_bins: bool = False,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
     fisher = np.full(centers.size, np.nan, dtype=np.float64)
     se = np.full(centers.size, np.nan, dtype=np.float64)
     valid = np.zeros(centers.size, dtype=bool)
+
+    n_centers = int(centers.size)
+    reasons = np.full(n_centers, "", dtype=object)
+    ntr_arr = np.full(n_centers, np.nan, dtype=np.float64)
+    nev_arr = np.full(n_centers, np.nan, dtype=np.float64)
+    nval_arr = np.full(n_centers, np.nan, dtype=np.float64)
+    nfit_arr = np.full(n_centers, np.nan, dtype=np.float64)
+    ntr_pos_raw = np.full(n_centers, np.nan, dtype=np.float64)
+    ntr_neg_raw = np.full(n_centers, np.nan, dtype=np.float64)
+    nev_pos_raw = np.full(n_centers, np.nan, dtype=np.float64)
+    nev_neg_raw = np.full(n_centers, np.nan, dtype=np.float64)
+
+    skip_counts: dict[str, int] = {
+        "ok": 0,
+        "insufficient_counts": 0,
+        "invalid_nval": 0,
+        "insufficient_fit_after_val": 0,
+    }
+
+    min_ntr_fit = decoder_min_ntr_for_fit(min_class_count, val_frac, min_val_class_size)
+    nev_max_scan = 0
+    ntr_max_scan = 0
+    for theta0 in centers:
+        tp = float(theta0 + 0.5 * epsilon)
+        tm = float(theta0 - 0.5 * epsilon)
+        # cap=0 => no subsampling; avoids consuming rng before the main loop.
+        ep = _subset_x_by_theta(theta_eval, x_eval, tp, bandwidth, 0, rng)
+        em = _subset_x_by_theta(theta_eval, x_eval, tm, bandwidth, 0, rng)
+        nev_max_scan = max(nev_max_scan, min(ep.shape[0], em.shape[0]))
+        tp_tr = _subset_x_by_theta(theta_train, x_train, tp, bandwidth, 0, rng)
+        tm_tr = _subset_x_by_theta(theta_train, x_train, tm, bandwidth, 0, rng)
+        ntr_max_scan = max(ntr_max_scan, min(tp_tr.shape[0], tm_tr.shape[0]))
+    print(
+        "[decoder] preflight: "
+        f"min_class_count={min_class_count}, val_frac={val_frac}, min_val_class_size={min_val_class_size} "
+        f"=> minimum balanced ntr needed for nfit>={min_class_count} is ~{min_ntr_fit} "
+        f"(and need nev>={min_class_count} per class in eval windows)."
+    )
+    print(
+        "[decoder] preflight scan (no training): "
+        f"max balanced ntr≈{ntr_max_scan}, max balanced nev≈{nev_max_scan} "
+        f"(if max_nev < min_class_count, bins will skip with insufficient_counts)."
+    )
+    if nev_max_scan < int(min_class_count):
+        print(
+            "[decoder] WARNING: max balanced eval count nev "
+            f"({nev_max_scan}) < --decoder-min-class-count ({min_class_count}). "
+            "Lower --decoder-min-class-count, widen --decoder-bandwidth, or use more eval data."
+        )
 
     for i, theta0 in enumerate(centers):
         theta_plus = float(theta0 + 0.5 * epsilon)
@@ -143,9 +210,25 @@ def fit_decoder_from_shared_data(
         xev_pos = _subset_x_by_theta(theta_eval, x_eval, theta_plus, bandwidth, eval_cap, rng)
         xev_neg = _subset_x_by_theta(theta_eval, x_eval, theta_minus, bandwidth, eval_cap, rng)
 
+        ntr_pos_raw[i] = float(xtr_pos.shape[0])
+        ntr_neg_raw[i] = float(xtr_neg.shape[0])
+        nev_pos_raw[i] = float(xev_pos.shape[0])
+        nev_neg_raw[i] = float(xev_neg.shape[0])
+
         ntr = min(xtr_pos.shape[0], xtr_neg.shape[0])
         nev = min(xev_pos.shape[0], xev_neg.shape[0])
+        ntr_arr[i] = float(ntr)
+        nev_arr[i] = float(nev)
         if ntr < min_class_count or nev < min_class_count:
+            reasons[i] = "insufficient_counts"
+            skip_counts["insufficient_counts"] += 1
+            if debug_bins:
+                print(
+                    f"[decoder skip {i+1:3d}/{n_centers}] theta0={theta0:+.5f} reason=insufficient_counts "
+                    f"ntr_pos={int(ntr_pos_raw[i])} ntr_neg={int(ntr_neg_raw[i])} ntr={ntr} "
+                    f"nev_pos={int(nev_pos_raw[i])} nev_neg={int(nev_neg_raw[i])} nev={nev} "
+                    f"(need ntr,nev>={min_class_count})"
+                )
             continue
 
         if xtr_pos.shape[0] != ntr:
@@ -160,10 +243,27 @@ def fit_decoder_from_shared_data(
         nval = int(round(float(val_frac) * ntr))
         nval = max(int(min_val_class_size), nval)
         nval = min(nval, ntr - 1)
+        nval_arr[i] = float(nval)
         if nval < 1:
+            reasons[i] = "invalid_nval"
+            skip_counts["invalid_nval"] += 1
+            if debug_bins:
+                print(
+                    f"[decoder skip {i+1:3d}/{n_centers}] theta0={theta0:+.5f} reason=invalid_nval "
+                    f"ntr={ntr} nval={nval}"
+                )
             continue
         nfit = ntr - nval
+        nfit_arr[i] = float(nfit)
         if nfit < min_class_count:
+            reasons[i] = "insufficient_fit_after_val"
+            skip_counts["insufficient_fit_after_val"] += 1
+            if debug_bins:
+                print(
+                    f"[decoder skip {i+1:3d}/{n_centers}] theta0={theta0:+.5f} reason=insufficient_fit_after_val "
+                    f"ntr={ntr} nval={nval} nfit={nfit} (need nfit>={min_class_count}); "
+                    f"min_ntr_hint~{min_ntr_fit}"
+                )
             continue
 
         perm_pos = rng.permutation(ntr)
@@ -204,6 +304,8 @@ def fit_decoder_from_shared_data(
         fisher[i] = float(np.mean(fisher_samples))
         se[i] = float(np.std(fisher_samples, ddof=1) / np.sqrt(fisher_samples.size))
         valid[i] = True
+        reasons[i] = "ok"
+        skip_counts["ok"] += 1
 
         if i == 0 or (i + 1) % log_every == 0 or (i + 1) == centers.size:
             print(
@@ -211,7 +313,65 @@ def fit_decoder_from_shared_data(
                 f"ntr={ntr} fit={nfit} val={nval} nev={nev} fisher={fisher[i]:.4f}"
             )
 
-    return fisher, se, valid
+    n_valid = int(np.sum(valid))
+    skip_non_ok = {k: v for k, v in skip_counts.items() if k != "ok"}
+    top_reason = max(skip_non_ok, key=skip_non_ok.get) if skip_non_ok and sum(skip_non_ok.values()) > 0 else ""
+
+    def _stat_line(name: str, arr: np.ndarray, mask: np.ndarray) -> str:
+        vals = arr[mask]
+        vals = vals[np.isfinite(vals)]
+        if vals.size == 0:
+            return f"{name}: (no finite values)"
+        return (
+            f"{name}: min={float(np.min(vals)):.1f}, p50={float(np.median(vals)):.1f}, "
+            f"max={float(np.max(vals)):.1f}"
+        )
+
+    skipped_mask = ~valid
+    print(
+        "[decoder] summary: "
+        f"valid={n_valid}/{n_centers}, "
+        f"skipped insufficient_counts={skip_counts['insufficient_counts']}, "
+        f"invalid_nval={skip_counts['invalid_nval']}, "
+        f"insufficient_fit_after_val={skip_counts['insufficient_fit_after_val']}"
+    )
+    if np.any(skipped_mask):
+        print(f"  among skipped bins: {_stat_line('ntr', ntr_arr, skipped_mask)}")
+        print(f"  among skipped bins: {_stat_line('nev', nev_arr, skipped_mask)}")
+        finite_nfit = skipped_mask & np.isfinite(nfit_arr)
+        if np.any(finite_nfit):
+            print(f"  among skipped (nfit known): {_stat_line('nfit', nfit_arr, finite_nfit)}")
+
+    if n_valid == 0:
+        print(
+            "[decoder] WARNING: zero valid decoder bins. "
+            f"Dominant skip reason: {top_reason} (count={skip_non_ok.get(top_reason, 0)}). "
+            "Typical fixes: lower --decoder-min-class-count, lower --decoder-min-val-class-size, "
+            "widen --decoder-bandwidth, increase data / caps, or reduce --decoder-epsilon."
+        )
+    elif min_ntr_fit > 0 and np.nanmax(ntr_arr) < float(min_ntr_fit) and skip_counts["insufficient_fit_after_val"] > 0:
+        print(
+            "[decoder] NOTE: some bins were skipped because nfit < min_class_count after validation holdout. "
+            f"Balanced local ntr must reach ~{min_ntr_fit} for current val settings; "
+            "consider lowering --decoder-min-val-class-size or --decoder-min-class-count."
+        )
+
+    diag: dict[str, Any] = {
+        "skip_counts": dict(skip_counts),
+        "min_ntr_for_fit": int(min_ntr_fit),
+        "reasons": reasons,
+        "ntr": ntr_arr,
+        "nev": nev_arr,
+        "nval": nval_arr,
+        "nfit": nfit_arr,
+        "ntr_pos_raw": ntr_pos_raw,
+        "ntr_neg_raw": ntr_neg_raw,
+        "nev_pos_raw": nev_pos_raw,
+        "nev_neg_raw": nev_neg_raw,
+        "dominant_skip_reason": top_reason,
+        "n_valid": n_valid,
+    }
+    return fisher, se, valid, diag
 
 
 def build_dataset_from_meta(meta: dict[str, Any]) -> ToyConditionalGaussianDataset | ToyConditionalGMMNonGaussianDataset:
@@ -301,6 +461,8 @@ def validate_estimation_args(args: Any) -> None:
         raise ValueError("--decoder-early-min-delta must be non-negative.")
     if not (0.0 < float(args.decoder_early_ema_alpha) <= 1.0):
         raise ValueError("--decoder-early-ema-alpha must be in (0, 1].")
+    if int(args.decoder_min_class_count) < 1:
+        raise ValueError("--decoder-min-class-count must be >= 1.")
 
 
 def merge_meta_into_args(meta: dict[str, Any], est_ns: Any) -> Any:
@@ -531,7 +693,7 @@ def run_shared_fisher_estimation(
     )
     centers = score_eval.curves.centers
 
-    decoder_fisher, decoder_se, decoder_valid = fit_decoder_from_shared_data(
+    decoder_fisher, decoder_se, decoder_valid, decoder_diag = fit_decoder_from_shared_data(
         centers=centers,
         theta_train=theta_train,
         x_train=x_train,
@@ -556,6 +718,7 @@ def run_shared_fisher_estimation(
         device=device,
         log_every=max(1, args.log_every),
         rng=rng,
+        debug_bins=bool(getattr(args, "decoder_debug_bins", False)),
     )
 
     if args.dataset_family == "gaussian":
@@ -571,6 +734,33 @@ def run_shared_fisher_estimation(
 
     score_metrics = compute_metrics(score_eval.curves.fisher_model, gt, score_valid)
     decoder_metrics = compute_metrics(decoder_fisher, gt, decoder_valid)
+
+    decoder_diag_path = os.path.join(args.output_dir, "decoder_bin_diagnostics.txt")
+    with open(decoder_diag_path, "w", encoding="utf-8") as df:
+        df.write("Per-bin decoder Fisher diagnostics (local two-class windows)\n")
+        df.write(
+            f"epsilon={args.decoder_epsilon} bandwidth={args.decoder_bandwidth} "
+            f"min_class_count={args.decoder_min_class_count}\n"
+        )
+        df.write(
+            f"val_frac={args.decoder_val_frac} min_val_class_size={args.decoder_min_val_class_size} "
+            f"min_ntr_for_fit_hint={decoder_diag['min_ntr_for_fit']}\n"
+        )
+        df.write(f"skip_counts={decoder_diag['skip_counts']}\n")
+        df.write(
+            "columns: i theta0 reason ntr_pos_raw ntr_neg_raw nev_pos_raw nev_neg_raw "
+            "ntr nev nval nfit valid\n"
+        )
+        for i in range(int(centers.size)):
+            r = str(decoder_diag["reasons"][i])
+            df.write(
+                f"{i} {float(centers[i]):+.6f} {r} "
+                f"{int(decoder_diag['ntr_pos_raw'][i])} {int(decoder_diag['ntr_neg_raw'][i])} "
+                f"{int(decoder_diag['nev_pos_raw'][i])} {int(decoder_diag['nev_neg_raw'][i])} "
+                f"{decoder_diag['ntr'][i]:.1f} {decoder_diag['nev'][i]:.1f} "
+                f"{decoder_diag['nval'][i]:.1f} {decoder_diag['nfit'][i]:.1f} "
+                f"{int(decoder_valid[i])}\n"
+            )
 
     suffix = "_non_gauss" if args.dataset_family == "gmm_non_gauss" else "_theta_cov"
     fig_path = os.path.join(args.output_dir, f"fisher_curve_shared_dataset_vs_gt{suffix}.png")
@@ -698,6 +888,10 @@ def run_shared_fisher_estimation(
             f"patience={args.decoder_early_patience}, min_delta={args.decoder_early_min_delta}, "
             f"ema_alpha={args.decoder_early_ema_alpha}, restore_best={args.decoder_restore_best}\n"
         )
+        f.write(f"decoder_min_ntr_for_fit_hint: {decoder_diag['min_ntr_for_fit']}\n")
+        f.write(f"decoder_skip_counts: {decoder_diag['skip_counts']}\n")
+        f.write(f"decoder_dominant_skip_reason: {decoder_diag['dominant_skip_reason']}\n")
+        f.write(f"decoder_bin_diagnostics_file: {decoder_diag_path}\n")
         if args.dataset_family == "gaussian":
             f.write(
                 "cov_theta: "
@@ -744,3 +938,4 @@ def run_shared_fisher_estimation(
     print(f"  - {fig_path}")
     print(f"  - {npz_path}")
     print(f"  - {metrics_path}")
+    print(f"  - {decoder_diag_path}")
