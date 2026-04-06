@@ -11,12 +11,14 @@ import numpy as np
 import torch
 
 from fisher.data import ToyConditionalGMMNonGaussianDataset, ToyConditionalGaussianDataset
-from fisher.evaluation import evaluate_score_fisher, parse_sigma_alpha_list
-from fisher.models import ConditionalScore1D, LocalDecoderLogit
+from fisher.evaluation import evaluate_score_fisher, evaluate_score_fisher_with_prior, parse_sigma_alpha_list
+from fisher.models import ConditionalScore1D, LocalDecoderLogit, PriorScore1D
 from fisher.shared_dataset_io import meta_dict_from_args
 from fisher.trainers import (
     geometric_sigma_schedule,
     train_local_decoder,
+    train_prior_score_model,
+    train_prior_score_model_ncsm_continuous,
     train_score_model,
     train_score_model_ncsm_continuous,
 )
@@ -463,6 +465,14 @@ def validate_estimation_args(args: Any) -> None:
         raise ValueError("--decoder-early-ema-alpha must be in (0, 1].")
     if int(args.decoder_min_class_count) < 1:
         raise ValueError("--decoder-min-class-count must be >= 1.")
+    if getattr(args, "prior_epochs", 1) < 1:
+        raise ValueError("--prior-epochs must be >= 1.")
+    if getattr(args, "prior_early_patience", 1) < 1:
+        raise ValueError("--prior-early-patience must be >= 1.")
+    if getattr(args, "prior_early_min_delta", 0.0) < 0.0:
+        raise ValueError("--prior-early-min-delta must be non-negative.")
+    if not (0.0 < float(getattr(args, "prior_early_ema_alpha", 0.05)) <= 1.0):
+        raise ValueError("--prior-early-ema-alpha must be in (0, 1].")
 
 
 def merge_meta_into_args(meta: dict[str, Any], est_ns: Any) -> Any:
@@ -678,20 +688,143 @@ def run_shared_fisher_estimation(
         f"data={args.score_fisher_eval_data} n={theta_score_fisher_eval.shape[0]}"
     )
 
-    score_eval = evaluate_score_fisher(
-        model=score_model,
-        theta_eval=theta_score_fisher_eval,
-        x_eval=x_score_fisher_eval,
-        dataset=dataset,
-        sigma_values=sigma_values,
-        fd_delta=args.fd_delta,
-        n_bins=args.n_bins,
-        min_bin_count=args.score_min_bin_count,
-        eval_low=eval_low,
-        eval_high=eval_high,
-        device=device,
-    )
-    centers = score_eval.curves.centers
+    prior_enable = bool(getattr(args, "prior_enable", True))
+    fisher_mode = str(getattr(args, "fisher_score_mode", "posterior_minus_prior"))
+    fisher_mode_display = fisher_mode if prior_enable else "posterior_only (prior disabled)"
+    prior_train_out: dict[str, Any] | None = None
+    prior_train_losses = np.asarray([], dtype=np.float64)
+    prior_val_losses = np.asarray([], dtype=np.float64)
+    prior_val_monitor_losses = np.asarray([], dtype=np.float64)
+    prior_best_epoch = 0
+    prior_stopped_epoch = 0
+    prior_stopped_early = False
+    prior_best_val_loss = float("nan")
+    prior_fig_path = ""
+    score_eval_wp: Any | None = None
+    score_eval: Any | None = None
+
+    if prior_enable:
+        prior_model = PriorScore1D(
+            hidden_dim=int(getattr(args, "prior_hidden_dim", 128)),
+            depth=int(getattr(args, "prior_depth", 3)),
+            use_log_sigma=(args.score_noise_mode == "continuous"),
+        ).to(device)
+        print(
+            "[prior_train] "
+            f"fit={theta_score_fit.shape[0]} val={theta_score_val.shape[0]} "
+            f"noise_mode={args.score_noise_mode} (same σ schedule as posterior)"
+        )
+        if args.score_noise_mode == "continuous":
+            prior_train_out = train_prior_score_model_ncsm_continuous(
+                model=prior_model,
+                theta_train=theta_score_fit,
+                sigma_min=float(sigma_min),
+                sigma_max=float(sigma_max),
+                epochs=int(getattr(args, "prior_epochs", 10000)),
+                batch_size=int(getattr(args, "prior_batch_size", 256)),
+                lr=float(getattr(args, "prior_lr", 1e-3)),
+                device=device,
+                log_every=max(1, args.log_every),
+                theta_val=theta_score_val,
+                early_stopping_patience=int(getattr(args, "prior_early_patience", 1000)),
+                early_stopping_min_delta=float(getattr(args, "prior_early_min_delta", 1e-4)),
+                early_stopping_ema_alpha=float(getattr(args, "prior_early_ema_alpha", 0.05)),
+                restore_best=bool(getattr(args, "prior_restore_best", True)),
+            )
+        else:
+            prior_train_out = train_prior_score_model(
+                model=prior_model,
+                theta_train=theta_score_fit,
+                sigma_values=sigma_values,
+                epochs=int(getattr(args, "prior_epochs", 10000)),
+                batch_size=int(getattr(args, "prior_batch_size", 256)),
+                lr=float(getattr(args, "prior_lr", 1e-3)),
+                device=device,
+                log_every=max(1, args.log_every),
+                theta_val=theta_score_val,
+                early_stopping_patience=int(getattr(args, "prior_early_patience", 1000)),
+                early_stopping_min_delta=float(getattr(args, "prior_early_min_delta", 1e-4)),
+                early_stopping_ema_alpha=float(getattr(args, "prior_early_ema_alpha", 0.05)),
+                restore_best=bool(getattr(args, "prior_restore_best", True)),
+            )
+        prior_train_losses = np.asarray(prior_train_out["train_losses"], dtype=np.float64)
+        prior_val_losses = np.asarray(prior_train_out["val_losses"], dtype=np.float64)
+        prior_val_monitor_losses = np.asarray(prior_train_out.get("val_monitor_losses", []), dtype=np.float64)
+        prior_best_epoch = int(prior_train_out["best_epoch"])
+        prior_stopped_epoch = int(prior_train_out["stopped_epoch"])
+        prior_stopped_early = bool(prior_train_out["stopped_early"])
+        prior_best_val_loss = float(prior_train_out["best_val_loss"])
+        print(
+            "[prior_early_stop] "
+            f"stopped_early={prior_stopped_early} stopped_epoch={prior_stopped_epoch} "
+            f"best_epoch={prior_best_epoch} best_val_smooth={prior_best_val_loss:.6f} "
+            f"ema_alpha={getattr(args, 'prior_early_ema_alpha', 0.05)} "
+            f"restore_best={getattr(args, 'prior_restore_best', True)}"
+        )
+        prior_fig_path = os.path.join(args.output_dir, "prior_score_loss_vs_epoch.png")
+        epochs_prior = np.arange(1, prior_train_losses.size + 1)
+        plt.figure(figsize=(8.8, 5.0))
+        plt.plot(epochs_prior, prior_train_losses, color="#1f77b4", linewidth=2.0, label="Prior score train loss")
+        if prior_val_losses.size == prior_train_losses.size and np.any(np.isfinite(prior_val_losses)):
+            plt.plot(epochs_prior, prior_val_losses, color="#d62728", linewidth=2.0, label="Prior score val loss")
+        if prior_val_monitor_losses.size == prior_train_losses.size and np.any(np.isfinite(prior_val_monitor_losses)):
+            plt.plot(
+                epochs_prior,
+                prior_val_monitor_losses,
+                color="#ff7f0e",
+                linewidth=2.0,
+                linestyle="--",
+                label=f"Prior val EMA (α={getattr(args, 'prior_early_ema_alpha', 0.05):g})",
+            )
+        if 1 <= prior_best_epoch <= prior_train_losses.size:
+            plt.axvline(prior_best_epoch, color="#2ca02c", linestyle="--", linewidth=1.5, label=f"Best epoch {prior_best_epoch}")
+        if 1 <= prior_stopped_epoch <= prior_train_losses.size:
+            plt.axvline(
+                prior_stopped_epoch,
+                color="#9467bd",
+                linestyle=":",
+                linewidth=1.6,
+                label=f"Stop epoch {prior_stopped_epoch}",
+            )
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.title("Prior score (unconditional DSM) training")
+        plt.grid(alpha=0.25, linestyle="--", linewidth=0.8)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(prior_fig_path, dpi=180)
+        plt.close()
+
+        score_eval_wp = evaluate_score_fisher_with_prior(
+            model_post=score_model,
+            model_prior=prior_model,
+            theta_eval=theta_score_fisher_eval,
+            x_eval=x_score_fisher_eval,
+            dataset=dataset,
+            sigma_values=sigma_values,
+            fd_delta=args.fd_delta,
+            n_bins=args.n_bins,
+            min_bin_count=args.score_min_bin_count,
+            eval_low=eval_low,
+            eval_high=eval_high,
+            device=device,
+        )
+        centers = score_eval_wp.curves_combined.centers
+    else:
+        score_eval = evaluate_score_fisher(
+            model=score_model,
+            theta_eval=theta_score_fisher_eval,
+            x_eval=x_score_fisher_eval,
+            dataset=dataset,
+            sigma_values=sigma_values,
+            fd_delta=args.fd_delta,
+            n_bins=args.n_bins,
+            min_bin_count=args.score_min_bin_count,
+            eval_low=eval_low,
+            eval_high=eval_high,
+            device=device,
+        )
+        centers = score_eval.curves.centers
 
     decoder_fisher, decoder_se, decoder_valid, decoder_diag = fit_decoder_from_shared_data(
         centers=centers,
@@ -730,9 +863,26 @@ def run_shared_fisher_estimation(
             dataset=dataset,
             mc_samples_per_bin=args.gt_mc_samples_per_bin,
         )
-    score_valid = np.isfinite(score_eval.curves.fisher_model) & score_eval.curves.valid
+    if prior_enable and score_eval_wp is not None:
+        score_valid_post = np.isfinite(score_eval_wp.curves_posterior.fisher_model) & score_eval_wp.curves_posterior.valid
+        score_valid_comb = np.isfinite(score_eval_wp.curves_combined.fisher_model) & score_eval_wp.curves_combined.valid
+        score_metrics_post = compute_metrics(score_eval_wp.curves_posterior.fisher_model, gt, score_valid_post)
+        score_metrics_comb = compute_metrics(score_eval_wp.curves_combined.fisher_model, gt, score_valid_comb)
+        if fisher_mode == "posterior_minus_prior":
+            score_metrics = score_metrics_comb
+            score_valid = score_valid_comb
+        else:
+            score_metrics = score_metrics_post
+            score_valid = score_valid_post
+    else:
+        assert score_eval is not None
+        score_valid = np.isfinite(score_eval.curves.fisher_model) & score_eval.curves.valid
+        score_metrics = compute_metrics(score_eval.curves.fisher_model, gt, score_valid)
+        score_metrics_post = score_metrics
+        score_metrics_comb = score_metrics
+        score_valid_post = score_valid
+        score_valid_comb = score_valid
 
-    score_metrics = compute_metrics(score_eval.curves.fisher_model, gt, score_valid)
     decoder_metrics = compute_metrics(decoder_fisher, gt, decoder_valid)
 
     decoder_diag_path = os.path.join(args.output_dir, "decoder_bin_diagnostics.txt")
@@ -768,22 +918,62 @@ def run_shared_fisher_estimation(
     plt.plot(centers, gt, color="black", linewidth=2.6, label="GT Fisher")
     if np.any(np.isfinite(gt_se)):
         plt.fill_between(centers, gt - 1.96 * gt_se, gt + 1.96 * gt_se, color="black", alpha=0.10, linewidth=0.0)
-    plt.plot(
-        centers[score_valid],
-        score_eval.curves.fisher_model[score_valid],
-        color="#1f77b4",
-        linewidth=2.2,
-        label=r"Score matching (at $\sigma_{\min}$)",
-    )
-    if np.any(np.isfinite(score_eval.curves.se_model[score_valid])):
-        plt.fill_between(
-            centers[score_valid],
-            score_eval.curves.fisher_model[score_valid] - 1.96 * score_eval.curves.se_model[score_valid],
-            score_eval.curves.fisher_model[score_valid] + 1.96 * score_eval.curves.se_model[score_valid],
-            color="#1f77b4",
-            alpha=0.12,
-            linewidth=0.0,
+    if prior_enable and score_eval_wp is not None:
+        plt.plot(
+            centers[score_valid_post],
+            score_eval_wp.curves_posterior.fisher_model[score_valid_post],
+            color="#aec7e8",
+            linewidth=2.0,
+            linestyle="--",
+            label=r"Posterior score only ($\sigma_{\min}$)",
         )
+        if np.any(np.isfinite(score_eval_wp.curves_posterior.se_model[score_valid_post])):
+            plt.fill_between(
+                centers[score_valid_post],
+                score_eval_wp.curves_posterior.fisher_model[score_valid_post]
+                - 1.96 * score_eval_wp.curves_posterior.se_model[score_valid_post],
+                score_eval_wp.curves_posterior.fisher_model[score_valid_post]
+                + 1.96 * score_eval_wp.curves_posterior.se_model[score_valid_post],
+                color="#aec7e8",
+                alpha=0.10,
+                linewidth=0.0,
+            )
+        plt.plot(
+            centers[score_valid_comb],
+            score_eval_wp.curves_combined.fisher_model[score_valid_comb],
+            color="#1f77b4",
+            linewidth=2.2,
+            label=r"Likelihood score (post $-$ prior, $\sigma_{\min}$)",
+        )
+        if np.any(np.isfinite(score_eval_wp.curves_combined.se_model[score_valid_comb])):
+            plt.fill_between(
+                centers[score_valid_comb],
+                score_eval_wp.curves_combined.fisher_model[score_valid_comb]
+                - 1.96 * score_eval_wp.curves_combined.se_model[score_valid_comb],
+                score_eval_wp.curves_combined.fisher_model[score_valid_comb]
+                + 1.96 * score_eval_wp.curves_combined.se_model[score_valid_comb],
+                color="#1f77b4",
+                alpha=0.12,
+                linewidth=0.0,
+            )
+    else:
+        assert score_eval is not None
+        plt.plot(
+            centers[score_valid],
+            score_eval.curves.fisher_model[score_valid],
+            color="#1f77b4",
+            linewidth=2.2,
+            label=r"Score matching (at $\sigma_{\min}$)",
+        )
+        if np.any(np.isfinite(score_eval.curves.se_model[score_valid])):
+            plt.fill_between(
+                centers[score_valid],
+                score_eval.curves.fisher_model[score_valid] - 1.96 * score_eval.curves.se_model[score_valid],
+                score_eval.curves.fisher_model[score_valid] + 1.96 * score_eval.curves.se_model[score_valid],
+                color="#1f77b4",
+                alpha=0.12,
+                linewidth=0.0,
+            )
     plt.plot(
         centers[decoder_valid],
         decoder_fisher[decoder_valid],
@@ -802,7 +992,10 @@ def run_shared_fisher_estimation(
         )
     plt.xlabel(r"$\theta$")
     plt.ylabel("Fisher information")
-    plt.title(f"Shared Dataset Comparison ({args.dataset_family}): Score vs Decoder vs GT")
+    plt.title(
+        f"Shared Dataset Comparison ({args.dataset_family}): "
+        f"{'Post/prior score vs ' if prior_enable else ''}Decoder vs GT"
+    )
     plt.grid(alpha=0.25, linestyle="--", linewidth=0.8)
     plt.legend()
     plt.tight_layout()
@@ -810,26 +1003,81 @@ def run_shared_fisher_estimation(
     plt.close()
 
     npz_path = os.path.join(args.output_dir, f"shared_dataset_compare_curves{suffix}.npz")
-    np.savez(
-        npz_path,
-        centers=centers,
-        fisher_gt=gt,
-        fisher_gt_se=gt_se,
-        fisher_score=score_eval.curves.fisher_model,
-        fisher_score_se=score_eval.curves.se_model,
-        fisher_score_valid=score_valid.astype(np.int32),
-        fisher_decoder=decoder_fisher,
-        fisher_decoder_se=decoder_se,
-        fisher_decoder_valid=decoder_valid.astype(np.int32),
-        score_losses=score_train_losses,
-        score_train_losses=score_train_losses,
-        score_val_losses=score_val_losses,
-        score_val_smooth_losses=score_val_monitor_losses,
-        score_best_epoch=np.asarray([best_epoch], dtype=np.int32),
-        score_stopped_epoch=np.asarray([stopped_epoch], dtype=np.int32),
-        score_stopped_early=np.asarray([int(stopped_early)], dtype=np.int32),
-        score_best_val_loss=np.asarray([best_val_loss], dtype=np.float64),
-    )
+    if prior_enable and score_eval_wp is not None:
+        fisher_primary = (
+            score_eval_wp.curves_combined.fisher_model
+            if fisher_mode == "posterior_minus_prior"
+            else score_eval_wp.curves_posterior.fisher_model
+        )
+        fisher_primary_se = (
+            score_eval_wp.curves_combined.se_model
+            if fisher_mode == "posterior_minus_prior"
+            else score_eval_wp.curves_posterior.se_model
+        )
+        fisher_primary_valid = (
+            score_valid_comb.astype(np.int32)
+            if fisher_mode == "posterior_minus_prior"
+            else score_valid_post.astype(np.int32)
+        )
+        np.savez(
+            npz_path,
+            centers=centers,
+            fisher_gt=gt,
+            fisher_gt_se=gt_se,
+            fisher_score=fisher_primary,
+            fisher_score_se=fisher_primary_se,
+            fisher_score_valid=fisher_primary_valid,
+            fisher_score_posterior=score_eval_wp.curves_posterior.fisher_model,
+            fisher_score_posterior_se=score_eval_wp.curves_posterior.se_model,
+            fisher_score_posterior_valid=score_valid_post.astype(np.int32),
+            fisher_score_combined=score_eval_wp.curves_combined.fisher_model,
+            fisher_score_combined_se=score_eval_wp.curves_combined.se_model,
+            fisher_score_combined_valid=score_valid_comb.astype(np.int32),
+            fisher_score_mode=np.asarray([fisher_mode_display], dtype=object),
+            prior_enable=np.asarray([1], dtype=np.int32),
+            fisher_decoder=decoder_fisher,
+            fisher_decoder_se=decoder_se,
+            fisher_decoder_valid=decoder_valid.astype(np.int32),
+            score_losses=score_train_losses,
+            score_train_losses=score_train_losses,
+            score_val_losses=score_val_losses,
+            score_val_smooth_losses=score_val_monitor_losses,
+            score_best_epoch=np.asarray([best_epoch], dtype=np.int32),
+            score_stopped_epoch=np.asarray([stopped_epoch], dtype=np.int32),
+            score_stopped_early=np.asarray([int(stopped_early)], dtype=np.int32),
+            score_best_val_loss=np.asarray([best_val_loss], dtype=np.float64),
+            prior_train_losses=prior_train_losses,
+            prior_val_losses=prior_val_losses,
+            prior_val_smooth_losses=prior_val_monitor_losses,
+            prior_best_epoch=np.asarray([prior_best_epoch], dtype=np.int32),
+            prior_stopped_epoch=np.asarray([prior_stopped_epoch], dtype=np.int32),
+            prior_stopped_early=np.asarray([int(prior_stopped_early)], dtype=np.int32),
+            prior_best_val_loss=np.asarray([prior_best_val_loss], dtype=np.float64),
+        )
+    else:
+        assert score_eval is not None
+        np.savez(
+            npz_path,
+            centers=centers,
+            fisher_gt=gt,
+            fisher_gt_se=gt_se,
+            fisher_score=score_eval.curves.fisher_model,
+            fisher_score_se=score_eval.curves.se_model,
+            fisher_score_valid=score_valid.astype(np.int32),
+            fisher_score_mode=np.asarray([fisher_mode_display], dtype=object),
+            prior_enable=np.asarray([0], dtype=np.int32),
+            fisher_decoder=decoder_fisher,
+            fisher_decoder_se=decoder_se,
+            fisher_decoder_valid=decoder_valid.astype(np.int32),
+            score_losses=score_train_losses,
+            score_train_losses=score_train_losses,
+            score_val_losses=score_val_losses,
+            score_val_smooth_losses=score_val_monitor_losses,
+            score_best_epoch=np.asarray([best_epoch], dtype=np.int32),
+            score_stopped_epoch=np.asarray([stopped_epoch], dtype=np.int32),
+            score_stopped_early=np.asarray([int(stopped_early)], dtype=np.int32),
+            score_best_val_loss=np.asarray([best_val_loss], dtype=np.float64),
+        )
 
     metrics_path = os.path.join(args.output_dir, f"metrics_vs_gt{suffix}.txt")
     with open(metrics_path, "w", encoding="utf-8") as f:
@@ -862,8 +1110,34 @@ def run_shared_fisher_estimation(
         f.write(f"score_sigma_scale_mode: {args.score_sigma_scale_mode}\n")
         f.write(
             "score_fisher_eval_method: "
-            f"sigma_min_direct, sigma_eval_used={float(np.min(score_eval.sigma_values))}\n"
+            f"sigma_min_direct, sigma_eval_used={float(np.min(sigma_values))}\n"
         )
+        f.write(f"prior_enable: {prior_enable}\n")
+        f.write(f"fisher_score_mode: {fisher_mode_display}\n")
+        if prior_enable and score_eval_wp is not None:
+            f.write(
+                "prior_early_stopping: "
+                f"patience={getattr(args, 'prior_early_patience', 1000)}, "
+                f"min_delta={getattr(args, 'prior_early_min_delta', 1e-4)}, "
+                f"ema_alpha={getattr(args, 'prior_early_ema_alpha', 0.05)}, "
+                f"restore_best={getattr(args, 'prior_restore_best', True)}, "
+                f"stopped_early={prior_stopped_early}, best_epoch={prior_best_epoch}, "
+                f"stopped_epoch={prior_stopped_epoch}, best_val_smooth={prior_best_val_loss}\n"
+            )
+            f.write(
+                "score_posterior_vs_gt: "
+                f"valid={int(score_metrics_post['n_valid'])}/{args.n_bins}, "
+                f"rmse={score_metrics_post['rmse']:.6f}, "
+                f"mae={score_metrics_post['mae']:.6f}, "
+                f"corr={score_metrics_post['corr']:.6f}\n"
+            )
+            f.write(
+                "score_combined_post_minus_prior_vs_gt: "
+                f"valid={int(score_metrics_comb['n_valid'])}/{args.n_bins}, "
+                f"rmse={score_metrics_comb['rmse']:.6f}, "
+                f"mae={score_metrics_comb['mae']:.6f}, "
+                f"corr={score_metrics_comb['corr']:.6f}\n"
+            )
         f.write(f"theta_std_train: {theta_std}\n")
         if np.isfinite(sigma_post):
             f.write(f"sigma_post_proxy: {sigma_post}\n")
@@ -908,7 +1182,8 @@ def run_shared_fisher_estimation(
                 f"mix_freq={args.gmm_mix_freq}, mix_phase={args.gmm_mix_phase}, rho_clip={args.rho_clip}\n"
             )
         f.write(
-            "score_vs_gt: "
+            "score_vs_gt_primary: "
+            f"(mode={fisher_mode_display}) "
             f"valid={int(score_metrics['n_valid'])}/{args.n_bins}, "
             f"rmse={score_metrics['rmse']:.6f}, "
             f"mae={score_metrics['mae']:.6f}, "
@@ -924,10 +1199,23 @@ def run_shared_fisher_estimation(
 
     print("[summary]")
     print(
-        "  score vs GT: "
+        f"  score vs GT (primary, mode={fisher_mode_display}): "
         f"valid={int(score_metrics['n_valid'])}/{args.n_bins}, "
         f"rmse={score_metrics['rmse']:.4f}, mae={score_metrics['mae']:.4f}, corr={score_metrics['corr']:.4f}"
     )
+    if prior_enable and score_eval_wp is not None:
+        print(
+            "  score posterior-only vs GT: "
+            f"valid={int(score_metrics_post['n_valid'])}/{args.n_bins}, "
+            f"rmse={score_metrics_post['rmse']:.4f}, mae={score_metrics_post['mae']:.4f}, "
+            f"corr={score_metrics_post['corr']:.4f}"
+        )
+        print(
+            "  score combined (post - prior) vs GT: "
+            f"valid={int(score_metrics_comb['n_valid'])}/{args.n_bins}, "
+            f"rmse={score_metrics_comb['rmse']:.4f}, mae={score_metrics_comb['mae']:.4f}, "
+            f"corr={score_metrics_comb['corr']:.4f}"
+        )
     print(
         "  decoder vs GT: "
         f"valid={int(decoder_metrics['n_valid'])}/{args.n_bins}, "
@@ -935,6 +1223,8 @@ def run_shared_fisher_estimation(
     )
     print("Saved artifacts:")
     print(f"  - {loss_fig_path}")
+    if prior_enable and prior_fig_path:
+        print(f"  - {prior_fig_path}")
     print(f"  - {fig_path}")
     print(f"  - {npz_path}")
     print(f"  - {metrics_path}")

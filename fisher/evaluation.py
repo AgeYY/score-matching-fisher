@@ -6,7 +6,7 @@ import numpy as np
 import torch
 
 from fisher.data import ToyConditionalGMMNonGaussianDataset, ToyConditionalGaussianDataset
-from fisher.models import ConditionalScore1D, LocalDecoderLogit
+from fisher.models import ConditionalScore1D, LocalDecoderLogit, PriorScore1D
 
 
 def parse_sigma_alpha_list(items: list[float]) -> np.ndarray:
@@ -252,6 +252,143 @@ def evaluate_score_fisher(
         slope=slope,
         r2=r2,
         metrics=metrics,
+    )
+
+
+@dataclass
+class ScoreEvalWithPriorResult:
+    """Posterior-only and posterior-minus-prior Fisher curves vs finite-difference likelihood score."""
+
+    curves_posterior: BinnedFisher
+    curves_combined: BinnedFisher
+    fisher_per_sigma_posterior: np.ndarray
+    fisher_per_sigma_combined: np.ndarray
+    se_per_sigma_posterior: np.ndarray
+    se_per_sigma_combined: np.ndarray
+    sigma_values: np.ndarray
+    slope: np.ndarray
+    r2: np.ndarray
+    metrics_posterior: dict[str, float]
+    metrics_combined: dict[str, float]
+
+
+def evaluate_score_fisher_with_prior(
+    model_post: ConditionalScore1D,
+    model_prior: PriorScore1D,
+    theta_eval: np.ndarray,
+    x_eval: np.ndarray,
+    dataset: ToyConditionalGaussianDataset | ToyConditionalGMMNonGaussianDataset,
+    sigma_values: np.ndarray,
+    fd_delta: float,
+    n_bins: int,
+    min_bin_count: int,
+    eval_low: float,
+    eval_high: float,
+    device: torch.device,
+) -> ScoreEvalWithPriorResult:
+    with torch.no_grad():
+        t_eval_t = torch.from_numpy(theta_eval.astype(np.float32)).to(device)
+        x_eval_t = torch.from_numpy(x_eval.astype(np.float32)).to(device)
+        score_post_by_sigma = []
+        score_prior_by_sigma = []
+        for s in sigma_values:
+            sp = model_post.predict_score(t_eval_t, x_eval_t, sigma_eval=float(s)).cpu().numpy().reshape(-1)
+            spr = model_prior.predict_score(t_eval_t, sigma_eval=float(s)).cpu().numpy().reshape(-1)
+            score_post_by_sigma.append(sp)
+            score_prior_by_sigma.append(spr)
+    score_post_arr = np.stack(score_post_by_sigma, axis=0)
+    score_prior_arr = np.stack(score_prior_by_sigma, axis=0)
+    score_total_arr = score_post_arr - score_prior_arr
+
+    score_fd = finite_difference_score(x_eval, theta_eval, dataset, delta=fd_delta)
+
+    fd_stats = bin_mean_and_se(
+        theta=theta_eval,
+        values=score_fd**2,
+        theta_low=eval_low,
+        theta_high=eval_high,
+        n_bins=n_bins,
+        min_count=min_bin_count,
+    )
+
+    fisher_post_per_sigma: list[np.ndarray] = []
+    fisher_combined_per_sigma: list[np.ndarray] = []
+    se_post_per_sigma: list[np.ndarray] = []
+    se_combined_per_sigma: list[np.ndarray] = []
+    counts_ref = None
+    centers_ref = None
+    for k in range(score_post_arr.shape[0]):
+        st_post = bin_mean_and_se(
+            theta=theta_eval,
+            values=score_post_arr[k] ** 2,
+            theta_low=eval_low,
+            theta_high=eval_high,
+            n_bins=n_bins,
+            min_count=min_bin_count,
+        )
+        st_comb = bin_mean_and_se(
+            theta=theta_eval,
+            values=score_total_arr[k] ** 2,
+            theta_low=eval_low,
+            theta_high=eval_high,
+            n_bins=n_bins,
+            min_count=min_bin_count,
+        )
+        fisher_post_per_sigma.append(st_post.mean)
+        fisher_combined_per_sigma.append(st_comb.mean)
+        se_post_per_sigma.append(st_post.se)
+        se_combined_per_sigma.append(st_comb.se)
+        if counts_ref is None:
+            counts_ref = st_post.counts
+            centers_ref = st_post.centers
+
+    fisher_per_sigma_posterior = np.stack(fisher_post_per_sigma, axis=0)
+    fisher_per_sigma_combined = np.stack(fisher_combined_per_sigma, axis=0)
+    se_per_sigma_posterior = np.stack(se_post_per_sigma, axis=0)
+    se_per_sigma_combined = np.stack(se_combined_per_sigma, axis=0)
+
+    k_min = int(np.argmin(np.asarray(sigma_values, dtype=np.float64)))
+    fisher_post0 = fisher_per_sigma_posterior[k_min]
+    fisher_comb0 = fisher_per_sigma_combined[k_min]
+    se_post0 = se_per_sigma_posterior[k_min]
+    se_comb0 = se_per_sigma_combined[k_min]
+    slope = np.full(fisher_post0.shape, np.nan, dtype=np.float64)
+    r2 = np.full(fisher_post0.shape, np.nan, dtype=np.float64)
+    valid_post = np.isfinite(fisher_post0) & fd_stats.valid
+    valid_comb = np.isfinite(fisher_comb0) & fd_stats.valid
+
+    curves_posterior = BinnedFisher(
+        centers=centers_ref,
+        fisher_model=fisher_post0,
+        fisher_fd=fd_stats.mean,
+        se_model=se_post0,
+        se_fd=fd_stats.se,
+        counts=counts_ref,
+        valid=valid_post,
+    )
+    curves_combined = BinnedFisher(
+        centers=centers_ref,
+        fisher_model=fisher_comb0,
+        fisher_fd=fd_stats.mean,
+        se_model=se_comb0,
+        se_fd=fd_stats.se,
+        counts=counts_ref,
+        valid=valid_comb,
+    )
+    metrics_posterior = compute_curve_metrics(curves_posterior.fisher_model, curves_posterior.fisher_fd, curves_posterior.valid)
+    metrics_combined = compute_curve_metrics(curves_combined.fisher_model, curves_combined.fisher_fd, curves_combined.valid)
+    return ScoreEvalWithPriorResult(
+        curves_posterior=curves_posterior,
+        curves_combined=curves_combined,
+        fisher_per_sigma_posterior=fisher_per_sigma_posterior,
+        fisher_per_sigma_combined=fisher_per_sigma_combined,
+        se_per_sigma_posterior=se_per_sigma_posterior,
+        se_per_sigma_combined=se_per_sigma_combined,
+        sigma_values=sigma_values,
+        slope=slope,
+        r2=r2,
+        metrics_posterior=metrics_posterior,
+        metrics_combined=metrics_combined,
     )
 
 

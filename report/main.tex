@@ -39,9 +39,9 @@ Score matching is a method to estimate the Stein score, however, is different fr
 \label{eq:fisher-stein}
 \nabla_\theta \log p(x\mid\theta) = \nabla_\theta \log p(\theta\mid x) - \nabla_\theta \log p(\theta),
 \end{equation}
-where $\theta \in \mathbb{R}^d$ is the stimulus parameter, such as grating orientation or spatial postiion; $x \in \mathbb{R}^n$ is the neural population activity; $\nabla_\theta \log p(x\mid\theta)$ is the Fisher score, $\nabla_\theta \log p(\theta\mid x)$ is the Stein score, and $\nabla_\theta \log p(\theta)$ is the Stein score of the stimulus parameter prior. In some experiments, this prior is controlled by the experimentists, for example, sampling uniform orientation values for grating images; in other experiments, this prior is not controlled such as in navigation task the animal's spatial location is not controlled. But often the stimulus parameter dimensionality $d$ is much smaller than the neural population activity dimensionality $n$, thus Stein score $\nabla_\theta \log p(\theta\mid x)$ can be estimated efficiently using classical methods or using a score-matching model.
+where $\theta \in \mathbb{R}^d$ is the stimulus parameter, such as grating orientation or spatial position; $x \in \mathbb{R}^n$ is the neural population activity; $\nabla_\theta \log p(x\mid\theta)$ is the Fisher score, $\nabla_\theta \log p(\theta\mid x)$ is the Stein score, and $\nabla_\theta \log p(\theta)$ is the score of the stimulus prior. In controlled experiments the prior may be known (e.g.\ uniform orientations); otherwise it can be learned from samples of $\theta$ alone. When $d\ll n$, the posterior score $\nabla_\theta \log p(\theta\mid x)$ can be estimated with conditional score matching; the prior score $\nabla_\theta \log p(\theta)$ can be estimated with a separate unconditional score model on $\theta$.
 
-\subsection{Conditonal denoising score matching}
+\subsection{Conditional denoising score matching}
 Here we focus on describing conditional denoising score matching for estimating $\nabla_\theta \log p(\theta \mid x)$. A typical way of using conditional denoising score matching is to let it learn and generate high-dimensional data; however, here we use it in an opposite way, the condition $x$ is high-dimensional and the target $\theta$ is typically low-dimensional. Though, this does not change the mathematical nature of the problem -- any conditional score matching method can be used to estimate $\nabla_\theta \log p(\theta \mid x)$. It is a plug-in component of our Fisher information estimation framework.
 
 For better understanding, here we describe a concrete implementation of conditional denoising score matching. The spirit of denoising score matching is denoising. One adds Gaussian noise to a variable of interest and fits a network so that its output matches the noise that was injected; equivalently, the trained network approximates the Stein score---the gradient of the log-density---of a slightly smoothed distribution.
@@ -51,36 +51,33 @@ Let $\theta$ denote the stimulus parameter and let $x$ denote an observation dra
 \label{eq:dsm-loss}
 \mathcal{L}(\phi)=\mathbb{E}\left[\left\|\sigma\,s_\phi(\tilde\theta,x,\sigma)+z\right\|^2\right],
 \end{equation}
-where the expectation is taken over $(\theta,x)$ drawn from the generative process, over the random choice of $\sigma$, and over $z$. Here $\mathcal{L}(\phi)$ is the scalar loss to be minimized, $\phi$ collects all network parameters, and $s_\phi(\tilde\theta,x,\sigma)$ is the network output intended to approximate the score of a $\sigma$-smoothed conditional posterior, in the $\theta$-direction, at $(\tilde\theta,x,\sigma)$: namely $\nabla_{\tilde{\theta}} \log p_\sigma(\tilde{\theta}\mid x)$, where $p_\sigma(\cdot\mid x)$ is the density of $\tilde\theta=\theta+\sigma z$. As $\sigma \rightarrow 0$, $p_\sigma(\cdot\mid x)$ converges to $p(\cdot\mid x)$ and $\nabla_{\tilde{\theta}} \log p_\sigma(\tilde{\theta}\mid x)$ converges to the Stein score $\nabla_{\theta} \log p(\theta\mid x)$. Together with $\nabla_\theta \log p(\theta)$, which is typically known or low-dimensional and can be estimated easily, we obtain the Fisher score via equation~\ref{eq:fisher-stein}.
+where the expectation is taken over $(\theta,x)$ drawn from the generative process, over the random choice of $\sigma$, and over $z$. Here $\mathcal{L}(\phi)$ is the scalar loss to be minimized, $\phi$ collects all network parameters, and $s_\phi(\tilde\theta,x,\sigma)$ is the network output intended to approximate the score of a $\sigma$-smoothed conditional posterior, in the $\theta$-direction, at $(\tilde\theta,x,\sigma)$: namely $\nabla_{\tilde{\theta}} \log p_\sigma(\tilde{\theta}\mid x)$, where $p_\sigma(\cdot\mid x)$ is the density of $\tilde\theta=\theta+\sigma z$. As $\sigma \rightarrow 0$, $p_\sigma(\cdot\mid x)$ converges to $p(\cdot\mid x)$ and $\nabla_{\tilde{\theta}} \log p_\sigma(\tilde{\theta}\mid x)$ converges to the Stein score $\nabla_{\theta} \log p(\theta\mid x)$. Together with $\nabla_\theta \log p(\theta)$, estimated by a second denoising score model on $\theta$ alone (see Method), we obtain the Fisher score via equation~\ref{eq:fisher-stein}.
 
 \subsection{Preliminary experiments}
-The experiments below illustrate this pipeline on a Gaussian toy model; the Method section specifies noise-level ranges, stopping rules, and the protocol used to turn the trained score into a Fisher curve and compare it to baselines.
-
-Figure~\ref{fig:gaussian_results} summarizes the Gaussian toy experiment. Panel~(A) visualizes the dataset: observations live in $x\in\mathbb{R}^{10}$ (here projected with PCA to two dimensions), colored by $\theta\in[-3,3]$; the distribution changes continuously with $\theta$, reflecting nonlinear mean tuning and $\theta$-dependent covariance modulation. Panel~(B) reports the shared-dataset Fisher comparison for $n_{\text{total}}=20000$.
+We illustrate the full pipeline on a Gaussian toy model with scalar $\theta$ and two-dimensional observations $x\in\mathbb{R}^2$: cosine tuning means $\mu(\theta)$ and a $\theta$-dependent covariance (heteroscedastic, correlated noise). We draw $n_{\text{total}}=4000$ pairs with $\theta\sim\mathrm{Uniform}[-3,3]$, use a 70/30 train/eval split (2800/1200), and train (i)~a conditional score network $s_\phi(\tilde\theta,x,\sigma)$ for the posterior score, (ii)~an unconditional score network $s_\psi(\tilde\theta,\sigma)$ for the prior on $\theta$, and (iii)~local decoder baselines per $\theta$ bin. Figure~\ref{fig:gaussian_results} compares Fisher information vs.\ $\theta$ for analytic ground truth, posterior-only score at $\sigma_{\min}$, likelihood score $s_\phi-s_\psi$ at $\sigma_{\min}$, and the decoder (shaded bands: reported uncertainty).
 
 \begin{figure}[t]
     \centering
-    \includegraphics[width=\linewidth]{figures/gaussian_pca_and_fisher_merged.png}
-    \caption{Gaussian toy model ($n_{\text{total}}=20000$, $x\in\mathbb{R}^{10}$). \textbf{(A)}~Dataset visualization: each point is an observation (PCA projection), color indicates $\theta$. \textbf{(B)}~Fisher information vs.\ $\theta$: ground truth, score matching at $\sigma_{\min}$, and decoder baseline on the shared dataset (shaded bands indicate variability). Decoder baseline performance may be improved by carefully choosing hyperparameters like bin width, but have not throughly investigated.}
+    \includegraphics[width=\linewidth]{figures/fisher_gaussian_xdim2_n4000_theta_cov.png}
+    \caption{Gaussian toy ($n_{\text{total}}=4000$, $x\in\mathbb{R}^2$). Fisher information vs.\ $\theta$: ground truth (black), posterior score at $\sigma_{\min}$ (dashed blue), likelihood score $s_{\mathrm{post}}-s_{\mathrm{prior}}$ at $\sigma_{\min}$ (solid blue), local decoder (green).}
     \label{fig:gaussian_results}
 \end{figure}
 
-Numerical metrics for this run are:
+Numerical metrics vs.\ ground truth (35 valid bins) are:
 \begin{center}
 \begin{tabular}{lccc}
 \toprule
-Method vs GT & RMSE & MAE & Correlation \\
+Method vs.\ GT & RMSE & MAE & Correlation \\
 \midrule
-Score vs GT & 1.9128 & 1.5089 & 0.8640 \\
-Decoder vs GT & 4.5293 & 3.5260 & 0.2584 \\
+Posterior score ($\sigma_{\min}$) & 8.525 & 5.489 & 0.918 \\
+Likelihood score ($s_{\mathrm{post}}-s_{\mathrm{prior}}$, $\sigma_{\min}$) & 8.039 & 5.246 & 0.930 \\
+Decoder & 21.417 & 13.738 & 0.727 \\
 \bottomrule
 \end{tabular}
 \end{center}
 
 \section{Future possible extensions}
-Figure 1: testing this method with other methods on toy datasets knowing ground truth, including spiking data.
-
-The other figures, applying this method to "chart" the cognitive map in visual and navigation tasks, to study representation bias etc.
+Planned directions include comparisons on additional toy models with known ground truth (including spiking observations), and applications to neural data in visual and navigation tasks to characterize representation bias in cognitive-map terms.
 
 \section{Method}
 \subsection*{Data-generating model}
@@ -90,49 +87,48 @@ The latent parameter is sampled as
 \]
 and observations are generated from a Gaussian conditional family
 \[
-x\mid \theta\sim \mathcal N\!\bigl(\mu(\theta),\Sigma(\theta)\bigr),\qquad x\in\mathbb R^{10}.
+x\mid \theta\sim \mathcal N\!\bigl(\mu(\theta),\Sigma(\theta)\bigr),\qquad x\in\mathbb R^{2}.
 \]
-The mean components are smooth nonlinear functions of $\theta$ (sinusoidal and polynomial terms with coordinate-dependent amplitudes/frequencies), and the covariance has $\theta$-dependent scales and correlations. In particular,
-\[
-\Sigma(\theta)=D(\theta)\,R(\theta)\,D(\theta),
-\]
-where $D(\theta)$ is diagonal with positive coordinate-wise standard deviations and $R(\theta)$ is a valid correlation matrix with clipped pairwise correlations (maximum magnitude 0.85). This construction yields heteroscedastic, correlated Gaussian observations whose geometry changes with $\theta$.
+Each coordinate of $\mu(\theta)$ uses a cosine tuning curve with a fixed phase; the covariance $\Sigma(\theta)$ varies smoothly with $\theta$ (coordinate-wise standard deviations and correlation), yielding heteroscedastic correlated Gaussian observations. The experiment in Section~2 uses $n_{\text{total}}=4000$, seed 7, and train fraction $0.7$ (2800 train, 1200 eval).
 
-\subsection*{Score-based Fisher estimator}
-We train a network $s_\phi(\tilde\theta,x,\sigma)$ using continuous noise-conditional denoising score matching. For each pair $(\theta,x)$,
+\subsection*{Posterior and prior score models}
+\paragraph{Posterior (conditional) score.}
+We train $s_\phi(\tilde\theta,x,\sigma)$ with continuous noise-conditional denoising score matching. For each pair $(\theta,x)$ from the data-generating process,
 \[
 \log\sigma\sim\mathrm{Uniform}(\log\sigma_{\min},\log\sigma_{\max}),\qquad z\sim\mathcal N(0,1),\qquad \tilde\theta=\theta+\sigma z.
 \]
 The objective is
 \[
-\mathcal L(\phi)=\mathbb E\left[\left\|\sigma s_\phi(\tilde\theta,x,\sigma)+z\right\|^2\right].
+\mathcal L(\phi)=\mathbb E\left[\left(\sigma s_\phi(\tilde\theta,x,\sigma)+z\right)^2\right].
 \]
-For this experiment, $\sigma$ is scaled by the training standard deviation of $\theta$:
+Noise levels are tied to the empirical spread of $\theta$ on the score \emph{fit} split: with $\hat s_\theta=\mathrm{std}(\theta_{\text{fit}})=1.7273$,
 \[
-\sigma_{\min}=0.01\,\mathrm{std}(\theta_{\text{train}}),\qquad
-\sigma_{\max}=0.25\,\mathrm{std}(\theta_{\text{train}}),
+\sigma_{\min}=0.01\,\hat s_\theta=0.01727,\qquad
+\sigma_{\max}=0.25\,\hat s_\theta=0.4318,
 \]
-with $\mathrm{std}(\theta_{\text{train}})=1.7320085$, so
-\[
-\sigma_{\min}=0.0173201,\qquad \sigma_{\max}=0.4330021.
-\]
-Early stopping is applied using a 15\% validation split of score-training data (11900 fit, 2100 validation), with patience 1000, minimum improvement $10^{-4}$, smoothing window 20, and best-epoch restoration.
+with 12 logarithmically spaced evaluation $\sigma$ values between these extremes. Training uses a 15\% validation holdout from the score-training pool (2380 fit / 420 validation), early stopping with patience 1000, minimum improvement $10^{-4}$, exponential moving average (EMA) smoothing of the validation loss with $\alpha=0.05$, and restoration of the best checkpoint.
 
-Fisher is then estimated on 35 $\theta$ bins via
+\paragraph{Prior (unconditional) score.}
+We train a separate network $s_\psi(\tilde\theta,\sigma)$ on $\theta$ samples only, with the same noise injection on $\tilde\theta$ and the denoising objective
 \[
-\widehat I_\sigma(\theta_0)=\mathbb E\!\left[\hat s(\theta,x,\sigma)^2\,\middle|\,\theta\in\mathrm{bin}(\theta_0)\right].
+\mathcal L(\psi)=\mathbb E\left[\left(\sigma s_\psi(\tilde\theta,\sigma)+z\right)^2\right],
 \]
-The estimated Fisher information is defined as the sigma-min direct estimator:
+and analogous early stopping (same patience, tolerance, EMA $\alpha=0.05$). This approximates the prior score $\nabla_\theta\log p(\theta)$ in the smoothed sense used by DSM.
+
+\subsection*{Score-based Fisher estimators}
+Let $\sigma_\ast$ denote the smallest evaluation noise level (here $0.01727$). For each evaluation pair $(\theta,x)$ we form posterior and prior score predictions at $\sigma_\ast$ and define the likelihood score $\hat s_{\mathrm{lik}}=s_\phi(\theta,x,\sigma_\ast)-s_\psi(\theta,\sigma_\ast)$. Fisher is estimated by binning $\theta$ into 35 equal-width bins on $[\theta_{\mathrm{low}}+m,\theta_{\mathrm{high}}-m]$ with margin $m=0.30$, requiring at least 10 points per bin, and averaging squared scores within bins:
 \[
-\widehat I_{\mathrm{score}}(\theta_0)=\widehat I_{\sigma_{\min}}(\theta_0).
+\widehat I_{\mathrm{post}}(\theta_0)=\mathbb E\!\left[s_\phi(\theta,x,\sigma_\ast)^2\,\middle|\,\theta\in\mathrm{bin}(\theta_0)\right],\qquad
+\widehat I_{\mathrm{lik}}(\theta_0)=\mathbb E\!\left[\hat s_{\mathrm{lik}}(\theta,x)^2\,\middle|\,\theta\in\mathrm{bin}(\theta_0)\right].
 \]
+The primary reported score curve is $\widehat I_{\mathrm{lik}}$ (posterior minus prior); $\widehat I_{\mathrm{post}}$ is kept as an ablation.
 
 \subsection*{Decoder Fisher baseline}
 For each bin center $\theta_0$, define two nearby parameters
 \[
 \theta_+=\theta_0+\frac{\varepsilon}{2},\qquad \theta_-=\theta_0-\frac{\varepsilon}{2},\qquad \varepsilon=0.12.
 \]
-A local classifier is trained to distinguish samples near $\theta_+$ and $\theta_-$ using neighborhood bandwidth 0.1 in $\theta$. If $\ell(x)$ is the classifier logit, then for small $\varepsilon$,
+A local classifier is trained to distinguish samples near $\theta_+$ and $\theta_-$ using neighborhood bandwidth $0.10$ in $\theta$. If $\ell(x)$ is the classifier logit, then for small $\varepsilon$,
 \[
 \ell(x)\approx \varepsilon\,\partial_\theta\log p(x\mid\theta_0),
 \]
@@ -140,20 +136,16 @@ and the decoder-based Fisher estimator is
 \[
 \widehat I_{\mathrm{dec}}(\theta_0)=\frac{1}{\varepsilon^2}\,\mathbb E\!\left[\ell(x)^2\right].
 \]
-Decoder training uses validation fraction 0.15, minimum validation class size 20, patience 100, minimum improvement $10^{-4}$, smoothing window 5, and best-epoch restoration.
+Decoder training uses validation fraction 0.15, minimum validation class size 10, patience 100, minimum improvement $10^{-4}$, EMA smoothing with $\alpha=0.2$, up to 80 epochs, and best-epoch restoration.
 
 \subsection*{Ground-truth Fisher and evaluation protocol}
-Ground truth is
-\[
-I_{\mathrm{gt}}(\theta)=\mathbb E_{x\sim p(x\mid\theta)}\!\left[\left(\partial_\theta\log p(x\mid\theta)\right)^2\right],
-\]
-computed by Monte Carlo with 6000 samples per bin center. For the Gaussian model with $\theta$-dependent mean and covariance, this is equivalent to evaluating the analytic Fisher form
+For the Gaussian conditional model, we evaluate ground truth analytically,
 \[
 I_{\mathrm{gt}}(\theta)=\mu'(\theta)^\top\Sigma(\theta)^{-1}\mu'(\theta)
 +\frac{1}{2}\,\mathrm{tr}\!\left[\Sigma(\theta)^{-1}\Sigma'(\theta)\Sigma(\theta)^{-1}\Sigma'(\theta)\right],
 \]
-with derivatives induced by the chosen mean and covariance parameterization.
+with derivatives induced by the chosen mean and covariance parameterization (equivalently the Fisher-trace definition).
 
-Finally, both estimated curves are compared to $I_{\mathrm{gt}}$ over 35 bins using RMSE, MAE, and Pearson correlation, producing panel~(B) of Figure~\ref{fig:gaussian_results}.
+Estimated curves are compared to $I_{\mathrm{gt}}$ over the 35 bins using RMSE, MAE, and Pearson correlation, as in Figure~\ref{fig:gaussian_results}.
 
 \end{document}

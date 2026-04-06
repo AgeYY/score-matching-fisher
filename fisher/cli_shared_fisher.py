@@ -81,6 +81,36 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--score-proxy-max-mult", type=float, default=2.0)
     p.add_argument("--score-fixed-sigma", type=float, default=0.02)
 
+    p.add_argument(
+        "--no-prior-score",
+        action="store_false",
+        dest="prior_enable",
+        default=True,
+        help="Disable unconditional prior score DSM; use posterior-only Fisher (legacy behavior).",
+    )
+    p.add_argument(
+        "--fisher-score-mode",
+        type=str,
+        default="posterior_minus_prior",
+        choices=["posterior_only", "posterior_minus_prior"],
+        help="When prior score is trained: which curve to treat as primary vs GT (combined uses s_post - s_prior).",
+    )
+    p.add_argument("--prior-epochs", type=int, default=10000)
+    p.add_argument("--prior-batch-size", type=int, default=256)
+    p.add_argument("--prior-lr", type=float, default=1e-3)
+    p.add_argument("--prior-hidden-dim", type=int, default=128)
+    p.add_argument("--prior-depth", type=int, default=3)
+    p.add_argument("--prior-early-patience", type=int, default=1000)
+    p.add_argument("--prior-early-min-delta", type=float, default=1e-4)
+    p.add_argument(
+        "--prior-early-ema-alpha",
+        type=float,
+        default=0.05,
+        help="EMA α for prior model validation monitor (early stopping).",
+    )
+    p.add_argument("--prior-restore-best", action="store_true", default=True)
+    p.add_argument("--no-prior-restore-best", action="store_false", dest="prior_restore_best")
+
     p.add_argument("--n-bins", type=int, default=35)
     p.add_argument("--eval-margin", type=float, default=0.30)
     p.add_argument("--score-min-bin-count", type=int, default=10)
