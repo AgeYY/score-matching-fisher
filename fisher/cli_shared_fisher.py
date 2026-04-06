@@ -181,6 +181,36 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument("--log-every", type=int, default=5)
     p.add_argument("--output-dir", type=str, default="data/outputs_step6_shared_dataset")
+    p.add_argument(
+        "--compute-h-matrix",
+        action="store_true",
+        default=False,
+        help="Estimate the sample-wise H matrix from trained posterior/prior score models.",
+    )
+    p.add_argument(
+        "--h-sigma-eval",
+        type=float,
+        default=-1.0,
+        help="Sigma used for h-matrix score evaluation; <=0 means use min(eval sigma grid).",
+    )
+    p.add_argument(
+        "--h-batch-size",
+        type=int,
+        default=65536,
+        help="Max pair evaluations per h-matrix score forward chunk.",
+    )
+    p.add_argument(
+        "--h-restore-original-order",
+        action="store_true",
+        default=False,
+        help="Return H matrices in original dataset order instead of theta-sorted order.",
+    )
+    p.add_argument(
+        "--h-save-intermediates",
+        action="store_true",
+        default=False,
+        help="Save intermediate matrices G, C, and DeltaL to h-matrix npz output.",
+    )
 
 
 def parse_full_args(argv: list[str] | None = None) -> argparse.Namespace:

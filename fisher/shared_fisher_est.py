@@ -12,6 +12,7 @@ import torch
 
 from fisher.data import ToyConditionalGMMNonGaussianDataset, ToyConditionalGaussianDataset
 from fisher.evaluation import evaluate_score_fisher, evaluate_score_fisher_with_prior, parse_sigma_alpha_list
+from fisher.h_matrix import HMatrixEstimator, HMatrixResult
 from fisher.models import ConditionalScore1D, LocalDecoderLogit, PriorScore1D
 from fisher.shared_dataset_io import meta_dict_from_args
 from fisher.trainers import (
@@ -488,6 +489,12 @@ def validate_estimation_args(args: Any) -> None:
         raise ValueError("--prior-early-min-delta must be non-negative.")
     if not (0.0 < float(getattr(args, "prior_early_ema_alpha", 0.05)) <= 1.0):
         raise ValueError("--prior-early-ema-alpha must be in (0, 1].")
+    if int(getattr(args, "h_batch_size", 1)) < 1:
+        raise ValueError("--h-batch-size must be >= 1.")
+    if float(getattr(args, "h_sigma_eval", -1.0)) == 0.0:
+        raise ValueError("--h-sigma-eval must be positive, or <= 0 to auto-select sigma_min.")
+    if bool(getattr(args, "compute_h_matrix", False)) and not bool(getattr(args, "prior_enable", True)):
+        raise ValueError("--compute-h-matrix requires prior score; do not use --no-prior-score.")
 
 
 def merge_meta_into_args(meta: dict[str, Any], est_ns: Any) -> Any:
@@ -717,6 +724,9 @@ def run_shared_fisher_estimation(
     prior_fig_path = ""
     score_eval_wp: Any | None = None
     score_eval: Any | None = None
+    prior_model: PriorScore1D | None = None
+    h_result: HMatrixResult | None = None
+    h_sigma_eval = float("nan")
 
     if prior_enable:
         prior_model = PriorScore1D(
@@ -841,6 +851,36 @@ def run_shared_fisher_estimation(
         )
         centers = score_eval.curves.centers
 
+    if bool(getattr(args, "compute_h_matrix", False)):
+        if prior_model is None:
+            raise RuntimeError("compute_h_matrix requires a trained prior model.")
+        sigma_min_eval = float(np.min(np.asarray(sigma_values, dtype=np.float64)))
+        h_sigma_eval = float(args.h_sigma_eval) if float(args.h_sigma_eval) > 0.0 else sigma_min_eval
+        print(
+            "[h_matrix] "
+            f"enabled=True sigma_eval={h_sigma_eval:.6f} "
+            f"restore_original_order={bool(getattr(args, 'h_restore_original_order', False))} "
+            f"pair_batch_size={int(getattr(args, 'h_batch_size', 65536))}"
+        )
+        h_estimator = HMatrixEstimator(
+            model_post=score_model,
+            model_prior=prior_model,
+            sigma_eval=h_sigma_eval,
+            device=device,
+            pair_batch_size=int(getattr(args, "h_batch_size", 65536)),
+        )
+        h_result = h_estimator.run(
+            theta=theta_score_fisher_eval,
+            x=x_score_fisher_eval,
+            restore_original_order=bool(getattr(args, "h_restore_original_order", False)),
+        )
+        print(
+            "[h_matrix] "
+            f"done n={h_result.theta_used.size} "
+            f"delta_diag_max_abs={h_result.delta_diag_max_abs:.3e} "
+            f"h_sym_max_asym_abs={h_result.h_sym_max_asym_abs:.3e}"
+        )
+
     decoder_fisher, decoder_se, decoder_valid, decoder_diag = fit_decoder_from_shared_data(
         centers=centers,
         theta_train=theta_train,
@@ -928,6 +968,69 @@ def run_shared_fisher_estimation(
             )
 
     suffix = "_non_gauss" if args.dataset_family == "gmm_non_gauss" else "_theta_cov"
+    h_npz_path = ""
+    h_summary_path = ""
+    h_fig_path = ""
+    h_delta_fig_path = ""
+    if h_result is not None:
+        h_npz_path = os.path.join(args.output_dir, f"h_matrix_results{suffix}.npz")
+        h_payload: dict[str, Any] = {
+            "theta_used": h_result.theta_used,
+            "theta_sorted": h_result.theta_sorted,
+            "perm": h_result.perm.astype(np.int64),
+            "inv_perm": h_result.inv_perm.astype(np.int64),
+            "h_directed": h_result.h_directed,
+            "h_sym": h_result.h_sym,
+            "sigma_eval": np.asarray([h_result.sigma_eval], dtype=np.float64),
+            "n_samples": np.asarray([h_result.theta_used.size], dtype=np.int32),
+            "order_mode": np.asarray([h_result.order_mode], dtype=object),
+            "delta_diag_max_abs": np.asarray([h_result.delta_diag_max_abs], dtype=np.float64),
+            "h_sym_max_asym_abs": np.asarray([h_result.h_sym_max_asym_abs], dtype=np.float64),
+        }
+        if bool(getattr(args, "h_save_intermediates", False)):
+            h_payload["g_matrix"] = h_result.g_matrix
+            h_payload["c_matrix"] = h_result.c_matrix
+            h_payload["delta_l_matrix"] = h_result.delta_l_matrix
+        np.savez(h_npz_path, **h_payload)
+
+        h_summary_path = os.path.join(args.output_dir, f"h_matrix_summary{suffix}.txt")
+        with open(h_summary_path, "w", encoding="utf-8") as hf:
+            hf.write("H-matrix estimation summary\n")
+            hf.write(f"dataset_family: {args.dataset_family}\n")
+            hf.write(f"n_samples: {h_result.theta_used.size}\n")
+            hf.write(f"sigma_eval: {h_result.sigma_eval}\n")
+            hf.write(f"order_mode: {h_result.order_mode}\n")
+            hf.write(f"h_shape: {h_result.h_sym.shape}\n")
+            hf.write(f"h_sym_min: {float(np.min(h_result.h_sym))}\n")
+            hf.write(f"h_sym_max: {float(np.max(h_result.h_sym))}\n")
+            hf.write(f"h_sym_diag_max_abs: {float(np.max(np.abs(np.diag(h_result.h_sym))))}\n")
+            hf.write(f"delta_diag_max_abs: {h_result.delta_diag_max_abs}\n")
+            hf.write(f"h_sym_max_asym_abs: {h_result.h_sym_max_asym_abs}\n")
+            hf.write(f"h_save_intermediates: {bool(getattr(args, 'h_save_intermediates', False))}\n")
+
+        h_fig_path = os.path.join(args.output_dir, f"h_matrix_sym_heatmap{suffix}.png")
+        plt.figure(figsize=(6.2, 5.6))
+        im = plt.imshow(h_result.h_sym, aspect="auto", origin="lower")
+        plt.colorbar(im, fraction=0.046, pad=0.04, label=r"$H^{sym}_{ij}$")
+        plt.xlabel("j")
+        plt.ylabel("i")
+        plt.title("Symmetric H-matrix heatmap")
+        plt.tight_layout()
+        plt.savefig(h_fig_path, dpi=180)
+        plt.close()
+
+        if bool(getattr(args, "h_save_intermediates", False)):
+            h_delta_fig_path = os.path.join(args.output_dir, f"delta_l_heatmap{suffix}.png")
+            plt.figure(figsize=(6.2, 5.6))
+            im = plt.imshow(h_result.delta_l_matrix, aspect="auto", origin="lower")
+            plt.colorbar(im, fraction=0.046, pad=0.04, label=r"$\Delta L_{ij}$")
+            plt.xlabel("j")
+            plt.ylabel("i")
+            plt.title("Directed log-ratio heatmap")
+            plt.tight_layout()
+            plt.savefig(h_delta_fig_path, dpi=180)
+            plt.close()
+
     fig_path = os.path.join(args.output_dir, f"fisher_curve_shared_dataset_vs_gt{suffix}.png")
     plt.figure(figsize=(9.0, 5.6))
     plt.plot(centers, gt, color="black", linewidth=2.6, label="GT Fisher")
@@ -1181,6 +1284,18 @@ def run_shared_fisher_estimation(
         f.write(f"decoder_skip_counts: {decoder_diag['skip_counts']}\n")
         f.write(f"decoder_dominant_skip_reason: {decoder_diag['dominant_skip_reason']}\n")
         f.write(f"decoder_bin_diagnostics_file: {decoder_diag_path}\n")
+        if h_result is not None:
+            f.write(f"h_matrix_enabled: True\n")
+            f.write(f"h_sigma_eval: {h_result.sigma_eval}\n")
+            f.write(f"h_order_mode: {h_result.order_mode}\n")
+            f.write(f"h_n_samples: {h_result.theta_used.size}\n")
+            f.write(f"h_delta_diag_max_abs: {h_result.delta_diag_max_abs}\n")
+            f.write(f"h_sym_max_asym_abs: {h_result.h_sym_max_asym_abs}\n")
+            f.write(f"h_matrix_npz: {h_npz_path}\n")
+            f.write(f"h_matrix_summary: {h_summary_path}\n")
+            f.write(f"h_matrix_heatmap: {h_fig_path}\n")
+            if h_delta_fig_path:
+                f.write(f"delta_l_heatmap: {h_delta_fig_path}\n")
         if args.dataset_family == "gaussian":
             f.write(
                 "cov_theta: "
@@ -1244,3 +1359,9 @@ def run_shared_fisher_estimation(
     print(f"  - {npz_path}")
     print(f"  - {metrics_path}")
     print(f"  - {decoder_diag_path}")
+    if h_result is not None:
+        print(f"  - {h_npz_path}")
+        print(f"  - {h_summary_path}")
+        print(f"  - {h_fig_path}")
+        if h_delta_fig_path:
+            print(f"  - {h_delta_fig_path}")
