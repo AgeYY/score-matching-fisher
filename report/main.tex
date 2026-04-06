@@ -5,7 +5,7 @@
 \usepackage{booktabs}
 
 
-\title{Charting cognitive map with denoising score matching}
+\title{Charting the Cognitive Map with Denoising Score Matching}
 \author{Zeyuan Ye}
 \date{March 2026}
 
@@ -51,7 +51,7 @@ Let $\theta$ denote the stimulus parameter and let $x$ denote an observation dra
 \label{eq:dsm-loss}
 \mathcal{L}(\phi)=\mathbb{E}\left[\left\|\sigma\,s_\phi(\tilde\theta,x,\sigma)+z\right\|^2\right],
 \end{equation}
-where the expectation is taken over $(\theta,x)$ drawn from the generative process, over the random choice of $\sigma$, and over $z$. Here $\mathcal{L}(\phi)$ is the scalar loss to be minimized, $\phi$ collects all network parameters, and $s_\phi(\tilde\theta,x,\sigma)$ is the network output intended to approximate the score of a $\sigma$-smoothed conditional posterior, in the $\theta$-direction, at $(\tilde\theta,x,\sigma)$: namely $\nabla_{\tilde{\theta}} \log p_\sigma(\tilde{\theta}\mid x)$, where $p_\sigma(\cdot\mid x)$ is the density of $\tilde\theta=\theta+\sigma z$ when $\theta\sim p(\cdot\mid x)$ and $z$ is isotropic Gaussian noise of the same dimension as $\theta$. As $\sigma \rightarrow 0$, $p_\sigma(\cdot\mid x)$ converges to $p(\cdot\mid x)$ and $\nabla_{\tilde{\theta}} \log p_\sigma(\tilde{\theta}\mid x)$ converges to the Stein score $\nabla_{\theta} \log p(\theta\mid x)$. Together with $\nabla_\theta \log p(\theta)$, which is typically known or low-dimensional and can be estimated easily, we obtain the Fisher score via equation~\ref{eq:fisher-stein}.
+where the expectation is taken over $(\theta,x)$ drawn from the generative process, over the random choice of $\sigma$, and over $z$. Here $\mathcal{L}(\phi)$ is the scalar loss to be minimized, $\phi$ collects all network parameters, and $s_\phi(\tilde\theta,x,\sigma)$ is the network output intended to approximate the score of a $\sigma$-smoothed conditional posterior, in the $\theta$-direction, at $(\tilde\theta,x,\sigma)$: namely $\nabla_{\tilde{\theta}} \log p_\sigma(\tilde{\theta}\mid x)$, where $p_\sigma(\cdot\mid x)$ is the density of $\tilde\theta=\theta+\sigma z$. As $\sigma \rightarrow 0$, $p_\sigma(\cdot\mid x)$ converges to $p(\cdot\mid x)$ and $\nabla_{\tilde{\theta}} \log p_\sigma(\tilde{\theta}\mid x)$ converges to the Stein score $\nabla_{\theta} \log p(\theta\mid x)$. Together with $\nabla_\theta \log p(\theta)$, which is typically known or low-dimensional and can be estimated easily, we obtain the Fisher score via equation~\ref{eq:fisher-stein}.
 
 \subsection{Preliminary experiments}
 The experiments below illustrate this pipeline on a Gaussian toy model; the Method section specifies noise-level ranges, stopping rules, and the protocol used to turn the trained score into a Fisher curve and compare it to baselines.
@@ -77,7 +77,10 @@ Decoder vs GT & 4.5293 & 3.5260 & 0.2584 \\
 \end{tabular}
 \end{center}
 
-\pagebreak
+\section{Future possible extensions}
+Figure 1: testing this method with other methods on toy datasets knowing ground truth, including spiking data.
+
+The other figures, applying this method to "chart" the cognitive map in visual and navigation tasks, to study representation bias etc.
 
 \section{Method}
 \subsection*{Data-generating model}

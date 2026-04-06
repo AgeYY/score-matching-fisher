@@ -69,7 +69,7 @@ $\rho_{\mathrm{clip}}=0.85$.
 Dataset visualization script:
 
 ```bash
-mamba run -n geo_diffusion python step2_toy_dataset_uniform_theta.py
+mamba run -n geo_diffusion python bin/step2_toy_dataset_uniform_theta.py
 ```
 
 Figures:
@@ -108,7 +108,7 @@ so this gives the likelihood score needed by Fisher information.
 Score-demo script (score quality only):
 
 ```bash
-mamba run -n geo_diffusion python step1_score_matching_2d.py --device cuda
+mamba run -n geo_diffusion python bin/step1_score_matching_2d.py --device cuda
 ```
 
 ## 3) From Score to Fisher Information
@@ -190,7 +190,7 @@ $\sigma_1(\theta),\sigma_2(\theta),\rho(\theta)$.
 Run:
 
 ```bash
-mamba run -n geo_diffusion python step6_shared_dataset_compare.py --device cuda
+mamba run -n geo_diffusion python bin/step6_shared_dataset_compare.py --device cuda
 ```
 
 This uses one shared train/eval split to fit both methods and compare to analytic GT.

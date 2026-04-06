@@ -129,7 +129,7 @@ computed by Monte Carlo at each bin center.
 Command used:
 
 ```bash
-mamba run -n geo_diffusion python step6_shared_dataset_compare.py \
+mamba run -n geo_diffusion python bin/step6_shared_dataset_compare.py \
   --device cuda \
   --dataset-family gmm_non_gauss \
   --score-noise-mode continuous \
