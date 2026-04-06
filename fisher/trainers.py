@@ -22,6 +22,13 @@ def to_decoder_loader(x: np.ndarray, y: np.ndarray, batch_size: int, shuffle: bo
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, drop_last=False)
 
 
+def _ema_update_val_monitor(prev_ema: float | None, mean_val_loss: float, ema_alpha: float) -> float:
+    """Exponential moving average of per-epoch validation loss for early-stopping monitor."""
+    if prev_ema is None:
+        return float(mean_val_loss)
+    return float(ema_alpha * mean_val_loss + (1.0 - ema_alpha) * prev_ema)
+
+
 def geometric_sigma_schedule(sigma_min: float, sigma_max: float, n_levels: int, descending: bool = True) -> np.ndarray:
     if n_levels < 2:
         raise ValueError("n_levels must be >= 2 for geometric sigma schedule.")
@@ -62,7 +69,7 @@ def train_score_model(
     x_val: np.ndarray | None = None,
     early_stopping_patience: int = 30,
     early_stopping_min_delta: float = 1e-4,
-    early_stopping_smooth_window: int = 1,
+    early_stopping_ema_alpha: float = 0.05,
     restore_best: bool = True,
 ) -> dict[str, float | int | bool | list[float]]:
     loader = to_score_loader(theta_train, x_train, batch_size=batch_size, shuffle=True)
@@ -83,6 +90,10 @@ def train_score_model(
     patience_counter = 0
     stopped_early = False
     stopped_epoch = epochs
+    val_ema: float | None = None
+    alpha = float(early_stopping_ema_alpha)
+    if not (0.0 < alpha <= 1.0):
+        raise ValueError("early_stopping_ema_alpha must be in (0, 1].")
 
     for epoch in range(1, epochs + 1):
         epoch_losses: list[float] = []
@@ -121,10 +132,8 @@ def train_score_model(
                     val_loss = torch.mean((pred - target) ** 2)
                     val_epoch_losses.append(float(val_loss.item()))
             mean_val_loss = float(np.mean(val_epoch_losses))
-            smooth_w = max(1, int(early_stopping_smooth_window))
-            smooth_val_loss = float(
-                np.mean(val_losses[max(0, len(val_losses) - smooth_w + 1) :] + [mean_val_loss])
-            )
+            val_ema = _ema_update_val_monitor(val_ema, mean_val_loss, alpha)
+            smooth_val_loss = val_ema
             if smooth_val_loss < (best_val_loss - early_stopping_min_delta):
                 best_val_loss = smooth_val_loss
                 best_epoch = epoch
@@ -186,7 +195,7 @@ def train_score_model_ncsm_continuous(
     x_val: np.ndarray | None = None,
     early_stopping_patience: int = 30,
     early_stopping_min_delta: float = 1e-4,
-    early_stopping_smooth_window: int = 1,
+    early_stopping_ema_alpha: float = 0.05,
     restore_best: bool = True,
 ) -> dict[str, float | int | bool | list[float]]:
     loader = to_score_loader(theta_train, x_train, batch_size=batch_size, shuffle=True)
@@ -206,6 +215,10 @@ def train_score_model_ncsm_continuous(
     patience_counter = 0
     stopped_early = False
     stopped_epoch = epochs
+    val_ema: float | None = None
+    alpha = float(early_stopping_ema_alpha)
+    if not (0.0 < alpha <= 1.0):
+        raise ValueError("early_stopping_ema_alpha must be in (0, 1].")
 
     for epoch in range(1, epochs + 1):
         epoch_losses: list[float] = []
@@ -250,10 +263,8 @@ def train_score_model_ncsm_continuous(
                     val_loss = torch.mean((sigma * pred + eps) ** 2)
                     val_epoch_losses.append(float(val_loss.item()))
             mean_val_loss = float(np.mean(val_epoch_losses))
-            smooth_w = max(1, int(early_stopping_smooth_window))
-            smooth_val_loss = float(
-                np.mean(val_losses[max(0, len(val_losses) - smooth_w + 1) :] + [mean_val_loss])
-            )
+            val_ema = _ema_update_val_monitor(val_ema, mean_val_loss, alpha)
+            smooth_val_loss = val_ema
             if smooth_val_loss < (best_val_loss - early_stopping_min_delta):
                 best_val_loss = smooth_val_loss
                 best_epoch = epoch
@@ -312,7 +323,7 @@ def train_local_decoder(
     y_val: np.ndarray | None = None,
     early_stopping_patience: int = 0,
     early_stopping_min_delta: float = 1e-4,
-    early_stopping_smooth_window: int = 1,
+    early_stopping_ema_alpha: float = 0.2,
     restore_best: bool = True,
     log_every: int = 20,
 ) -> dict[str, float | int | bool | list[float]]:
@@ -327,6 +338,10 @@ def train_local_decoder(
     stopped_epoch = epochs
     val_losses: list[float] = []
     val_monitor_losses: list[float] = []
+    val_ema: float | None = None
+    alpha = float(early_stopping_ema_alpha)
+    if not (0.0 < alpha <= 1.0):
+        raise ValueError("early_stopping_ema_alpha must be in (0, 1].")
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = nn.BCEWithLogitsLoss()
     losses: list[float] = []
@@ -357,10 +372,8 @@ def train_local_decoder(
                     val_loss = criterion(logits, yb)
                     val_epoch_losses.append(float(val_loss.item()))
             mean_val_loss = float(np.mean(val_epoch_losses))
-            smooth_w = max(1, int(early_stopping_smooth_window))
-            smooth_val_loss = float(
-                np.mean(val_losses[max(0, len(val_losses) - smooth_w + 1) :] + [mean_val_loss])
-            )
+            val_ema = _ema_update_val_monitor(val_ema, mean_val_loss, alpha)
+            smooth_val_loss = val_ema
             if smooth_val_loss < (best_val_loss - early_stopping_min_delta):
                 best_val_loss = smooth_val_loss
                 best_epoch = epoch

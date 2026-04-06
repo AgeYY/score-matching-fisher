@@ -16,6 +16,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from fisher.data import ToyConditionalGMMNonGaussianDataset, ToyConditionalGaussianDataset
+from fisher.shared_dataset_io import load_shared_dataset_npz
+from fisher.shared_fisher_est import build_dataset_from_meta
 
 
 def pca_project(x: np.ndarray, n_components: int = 2) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -83,43 +85,49 @@ def summarize_dataset(
     print(f"  binned E[x|theta] vs tuning curve MAE (all dims): {mae:.4f}")
 
 
-def plot_joint_scatter(theta: np.ndarray, x: np.ndarray, out_path: str) -> None:
+def plot_joint_and_tuning(
+    theta: np.ndarray,
+    x: np.ndarray,
+    dataset: ToyConditionalGaussianDataset | ToyConditionalGMMNonGaussianDataset,
+    out_path: str,
+) -> None:
+    """Single figure: left = joint scatter (PCA if x_dim>2), right = tuning curves."""
+    fig, (ax_scatter, ax_tune) = plt.subplots(1, 2, figsize=(14.5, 5.2))
+
     if x.shape[1] == 2:
         proj = x
         xlabel, ylabel = "x1", "x2"
-        title = r"Joint Samples of $x$ Colored by $\theta$"
+        title_s = r"Joint Samples of $x$ Colored by $\theta$"
     else:
         proj, _, _ = pca_project(x, n_components=2)
         xlabel, ylabel = "PC1", "PC2"
-        title = rf"Joint Samples (PCA Projection, x_dim={x.shape[1]}) Colored by $\theta$"
+        title_s = rf"Joint Samples (PCA Projection, x_dim={x.shape[1]}) Colored by $\theta$"
 
-    plt.figure(figsize=(7, 6))
-    sc = plt.scatter(proj[:, 0], proj[:, 1], c=theta.ravel(), s=8, alpha=0.55, cmap="viridis")
-    plt.xlabel(xlabel)
-    plt.ylabel(ylabel)
-    plt.title(title)
-    cb = plt.colorbar(sc)
-    cb.set_label(r"$\theta$")
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=180)
-    plt.close()
+    sc = ax_scatter.scatter(proj[:, 0], proj[:, 1], c=theta.ravel(), s=8, alpha=0.55, cmap="viridis")
+    ax_scatter.set_xlabel(xlabel)
+    ax_scatter.set_ylabel(ylabel)
+    ax_scatter.set_title(title_s)
+    fig.colorbar(sc, ax=ax_scatter, label=r"$\theta$")
 
-
-def plot_tuning_curve(dataset: ToyConditionalGaussianDataset | ToyConditionalGMMNonGaussianDataset, out_path: str) -> None:
     t = np.linspace(dataset.theta_low, dataset.theta_high, 500, dtype=np.float64)[:, None]
     mu = dataset.tuning_curve(t)
-    n_plot = min(4, mu.shape[1])
-    plt.figure(figsize=(8, 4.5))
+    n_plot = int(mu.shape[1])
     for j in range(n_plot):
-        plt.plot(t[:, 0], mu[:, j], label=rf"$\mu_{{{j+1}}}(\theta)$", linewidth=2.0)
-    plt.xlabel(r"$\theta$")
-    plt.ylabel(r"Mean of $x|\theta$")
-    plt.title("Nonlinear Tuning Curves (first dimensions)")
-    plt.grid(alpha=0.25, linestyle="--", linewidth=0.8)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=180)
-    plt.close()
+        ax_tune.plot(t[:, 0], mu[:, j], label=rf"$\mu_{{{j+1}}}(\theta)$", linewidth=2.0)
+    ax_tune.set_xlabel(r"$\theta$")
+    ax_tune.set_ylabel(r"Mean of $x|\theta$")
+    ax_tune.set_title(f"Tuning curves (all {n_plot} dimensions)")
+    ax_tune.grid(alpha=0.25, linestyle="--", linewidth=0.8)
+    leg_kw: dict = {}
+    if n_plot > 6:
+        leg_kw = {"ncol": 2, "fontsize": 8}
+    if n_plot > 14:
+        leg_kw = {"ncol": 3, "fontsize": 7}
+    ax_tune.legend(**leg_kw)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
 
 
 def plot_conditional_slices(
@@ -181,7 +189,15 @@ def plot_conditional_slices(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate and visualize uniform-theta toy dataset.")
+    parser = argparse.ArgumentParser(
+        description="Generate and visualize uniform-theta toy dataset, or visualize a shared .npz from fisher_make_dataset.py."
+    )
+    parser.add_argument(
+        "--dataset-npz",
+        type=str,
+        default=None,
+        help="Path to a shared dataset .npz from fisher_make_dataset.py. When set, data and model params come from file metadata; other dataset flags are ignored.",
+    )
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--dataset-family", type=str, default="gaussian", choices=["gaussian", "gmm_non_gauss"])
     parser.add_argument("--n-joint", type=int, default=12000)
@@ -216,62 +232,80 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if args.x_dim < 2:
-        raise ValueError("--x-dim must be >= 2.")
     os.makedirs(args.output_dir, exist_ok=True)
 
-    if args.dataset_family == "gaussian":
-        dataset: ToyConditionalGaussianDataset | ToyConditionalGMMNonGaussianDataset = ToyConditionalGaussianDataset(
-            theta_low=args.theta_low,
-            theta_high=args.theta_high,
-            x_dim=args.x_dim,
-            sigma_x1=args.sigma_x1,
-            sigma_x2=args.sigma_x2,
-            rho=args.rho,
-            cov_theta_amp1=args.cov_theta_amp1,
-            cov_theta_amp2=args.cov_theta_amp2,
-            cov_theta_amp_rho=args.cov_theta_amp_rho,
-            cov_theta_freq1=args.cov_theta_freq1,
-            cov_theta_freq2=args.cov_theta_freq2,
-            cov_theta_freq_rho=args.cov_theta_freq_rho,
-            cov_theta_phase1=args.cov_theta_phase1,
-            cov_theta_phase2=args.cov_theta_phase2,
-            cov_theta_phase_rho=args.cov_theta_phase_rho,
-            rho_clip=args.rho_clip,
-            seed=args.seed,
+    if args.dataset_npz is not None:
+        bundle = load_shared_dataset_npz(args.dataset_npz)
+        meta = bundle.meta
+        dataset = build_dataset_from_meta(meta)
+        theta, x = bundle.theta_all, bundle.x_all
+        n_total = int(meta.get("n_total", theta.shape[0]))
+        train_frac = float(meta.get("train_frac", float("nan")))
+        print(
+            "[data] source=shared_npz "
+            f"path={args.dataset_npz} "
+            f"family={meta.get('dataset_family')} "
+            f"seed={meta.get('seed')}"
         )
+        print(
+            f"[data] total={n_total} train={bundle.theta_train.shape[0]} eval={bundle.theta_eval.shape[0]} "
+            f"train_frac={train_frac}"
+        )
+        if x.shape[1] < 2:
+            raise ValueError("Loaded x must have x_dim >= 2.")
     else:
-        dataset = ToyConditionalGMMNonGaussianDataset(
-            theta_low=args.theta_low,
-            theta_high=args.theta_high,
-            x_dim=args.x_dim,
-            sigma_x1=args.sigma_x1,
-            sigma_x2=args.sigma_x2,
-            rho=args.rho,
-            sep_scale=args.gmm_sep_scale,
-            sep_freq=args.gmm_sep_freq,
-            sep_phase=args.gmm_sep_phase,
-            mix_logit_scale=args.gmm_mix_logit_scale,
-            mix_bias=args.gmm_mix_bias,
-            mix_freq=args.gmm_mix_freq,
-            mix_phase=args.gmm_mix_phase,
-            seed=args.seed,
-        )
+        if args.x_dim < 2:
+            raise ValueError("--x-dim must be >= 2.")
+        if args.dataset_family == "gaussian":
+            dataset: ToyConditionalGaussianDataset | ToyConditionalGMMNonGaussianDataset = ToyConditionalGaussianDataset(
+                theta_low=args.theta_low,
+                theta_high=args.theta_high,
+                x_dim=args.x_dim,
+                sigma_x1=args.sigma_x1,
+                sigma_x2=args.sigma_x2,
+                rho=args.rho,
+                cov_theta_amp1=args.cov_theta_amp1,
+                cov_theta_amp2=args.cov_theta_amp2,
+                cov_theta_amp_rho=args.cov_theta_amp_rho,
+                cov_theta_freq1=args.cov_theta_freq1,
+                cov_theta_freq2=args.cov_theta_freq2,
+                cov_theta_freq_rho=args.cov_theta_freq_rho,
+                cov_theta_phase1=args.cov_theta_phase1,
+                cov_theta_phase2=args.cov_theta_phase2,
+                cov_theta_phase_rho=args.cov_theta_phase_rho,
+                rho_clip=args.rho_clip,
+                seed=args.seed,
+            )
+        else:
+            dataset = ToyConditionalGMMNonGaussianDataset(
+                theta_low=args.theta_low,
+                theta_high=args.theta_high,
+                x_dim=args.x_dim,
+                sigma_x1=args.sigma_x1,
+                sigma_x2=args.sigma_x2,
+                rho=args.rho,
+                sep_scale=args.gmm_sep_scale,
+                sep_freq=args.gmm_sep_freq,
+                sep_phase=args.gmm_sep_phase,
+                mix_logit_scale=args.gmm_mix_logit_scale,
+                mix_bias=args.gmm_mix_bias,
+                mix_freq=args.gmm_mix_freq,
+                mix_phase=args.gmm_mix_phase,
+                seed=args.seed,
+            )
+        theta, x = dataset.sample_joint(args.n_joint)
+        print(f"[data] source=fresh_sample n_joint={args.n_joint} seed={args.seed}")
 
-    theta, x = dataset.sample_joint(args.n_joint)
     summarize_dataset(theta, x, dataset)
 
-    joint_path = os.path.join(args.output_dir, "joint_scatter_theta_color.png")
-    tuning_path = os.path.join(args.output_dir, "tuning_curve.png")
+    joint_tuning_path = os.path.join(args.output_dir, "joint_scatter_and_tuning_curve.png")
     slices_path = os.path.join(args.output_dir, "conditional_slices.png")
 
-    plot_joint_scatter(theta, x, joint_path)
-    plot_tuning_curve(dataset, tuning_path)
+    plot_joint_and_tuning(theta, x, dataset, joint_tuning_path)
     plot_conditional_slices(dataset, np.asarray(args.slice_thetas, dtype=np.float64), args.n_slice, slices_path)
 
     print("Saved artifacts:")
-    print(f"  - {joint_path}")
-    print(f"  - {tuning_path}")
+    print(f"  - {joint_tuning_path}")
     print(f"  - {slices_path}")
 
 

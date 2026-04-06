@@ -184,7 +184,11 @@ $\sigma_1(\theta),\sigma_2(\theta),\rho(\theta)$.
 Run:
 
 ```bash
-mamba run -n geo_diffusion python bin/fisher_est.py --device cuda
+mamba run -n geo_diffusion python bin/fisher_make_dataset.py --output-npz data/shared_fisher_dataset.npz
+mamba run -n geo_diffusion python bin/fisher_estimate_from_dataset.py \
+  --dataset-npz data/shared_fisher_dataset.npz \
+  --output-dir data/outputs_step6_shared_dataset \
+  --device cuda
 ```
 
 This uses one shared train/eval split to fit both methods and compare to analytic GT.

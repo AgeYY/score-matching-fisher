@@ -52,14 +52,10 @@ class ToyConditionalGaussianDataset:
         self.rng = np.random.default_rng(self.seed)
         idx = np.arange(1, self.x_dim + 1, dtype=np.float64)
 
-        # Mean function coefficients.
-        self._mu_amp_sin = 1.10 / (1.0 + 0.08 * (idx - 1.0))
-        self._mu_amp_cos = 0.35 / (1.0 + 0.06 * (idx - 1.0))
-        self._mu_freq_sin = 1.25 + 0.07 * (idx - 1.0)
-        self._mu_freq_cos = 0.60 + 0.05 * (idx - 1.0)
-        self._mu_phase = 0.30 * (idx - 1.0)
-        self._mu_lin = 0.08 * (idx / max(self.x_dim, 2) - 0.5)
-        self._mu_quad = 0.02 * np.where((idx.astype(np.int64) % 2) == 0, -1.0, 1.0)
+        # Cosine tuning curves: mu_j(theta) = A * cos(omega * theta + phi_j), phi_j uniform on [0, 2pi).
+        self._mu_amp = 1.0
+        self._mu_omega = 1.0
+        self._mu_phases = 2.0 * np.pi * np.arange(self.x_dim, dtype=np.float64) / float(self.x_dim)
 
         # Theta-dependent per-dimension covariance scales.
         self._sigma_base = np.linspace(self.sigma_x1, self.sigma_x2, self.x_dim, dtype=np.float64)
@@ -93,29 +89,13 @@ class ToyConditionalGaussianDataset:
 
     def tuning_curve(self, theta: np.ndarray) -> np.ndarray:
         t = _theta_col(theta)
-        phase = self._mu_phase.reshape(1, -1)
-        mu = (
-            self._mu_amp_sin.reshape(1, -1) * np.sin(t * self._mu_freq_sin.reshape(1, -1) + phase)
-            + self._mu_amp_cos.reshape(1, -1) * np.cos(t * self._mu_freq_cos.reshape(1, -1) - 0.5 * phase)
-            + self._mu_lin.reshape(1, -1) * t
-            + self._mu_quad.reshape(1, -1) * (t**2)
-        )
-        return mu
+        ph = self._mu_phases.reshape(1, -1)
+        return self._mu_amp * np.cos(self._mu_omega * t + ph)
 
     def tuning_curve_derivative(self, theta: np.ndarray) -> np.ndarray:
         t = _theta_col(theta)
-        phase = self._mu_phase.reshape(1, -1)
-        dmu = (
-            self._mu_amp_sin.reshape(1, -1)
-            * self._mu_freq_sin.reshape(1, -1)
-            * np.cos(t * self._mu_freq_sin.reshape(1, -1) + phase)
-            - self._mu_amp_cos.reshape(1, -1)
-            * self._mu_freq_cos.reshape(1, -1)
-            * np.sin(t * self._mu_freq_cos.reshape(1, -1) - 0.5 * phase)
-            + self._mu_lin.reshape(1, -1)
-            + 2.0 * self._mu_quad.reshape(1, -1) * t
-        )
-        return dmu
+        ph = self._mu_phases.reshape(1, -1)
+        return -self._mu_amp * self._mu_omega * np.sin(self._mu_omega * t + ph)
 
     def covariance_scales(self, theta: np.ndarray) -> np.ndarray:
         t = _theta_col(theta)
@@ -238,13 +218,9 @@ class ToyConditionalGMMNonGaussianDataset:
         self.rng = np.random.default_rng(self.seed)
         idx = np.arange(1, self.x_dim + 1, dtype=np.float64)
 
-        self._mu_amp_sin = 1.05 / (1.0 + 0.07 * (idx - 1.0))
-        self._mu_amp_cos = 0.30 / (1.0 + 0.06 * (idx - 1.0))
-        self._mu_freq_sin = 1.20 + 0.06 * (idx - 1.0)
-        self._mu_freq_cos = 0.65 + 0.05 * (idx - 1.0)
-        self._mu_phase = 0.25 * (idx - 1.0)
-        self._mu_lin = 0.06 * (idx / max(self.x_dim, 2) - 0.5)
-        self._mu_quad = 0.018 * np.where((idx.astype(np.int64) % 2) == 0, -1.0, 1.0)
+        self._mu_amp = 1.0
+        self._mu_omega = 1.0
+        self._mu_phases = 2.0 * np.pi * np.arange(self.x_dim, dtype=np.float64) / float(self.x_dim)
 
         self._sep_weight = 0.95 / (1.0 + 0.05 * (idx - 1.0))
         self._sep_freq = 0.72 + 0.09 * (idx - 1.0)
@@ -265,29 +241,13 @@ class ToyConditionalGMMNonGaussianDataset:
 
     def tuning_curve(self, theta: np.ndarray) -> np.ndarray:
         t = _theta_col(theta)
-        phase = self._mu_phase.reshape(1, -1)
-        mu = (
-            self._mu_amp_sin.reshape(1, -1) * np.sin(t * self._mu_freq_sin.reshape(1, -1) + phase)
-            + self._mu_amp_cos.reshape(1, -1) * np.cos(t * self._mu_freq_cos.reshape(1, -1) - 0.5 * phase)
-            + self._mu_lin.reshape(1, -1) * t
-            + self._mu_quad.reshape(1, -1) * (t**2)
-        )
-        return mu
+        ph = self._mu_phases.reshape(1, -1)
+        return self._mu_amp * np.cos(self._mu_omega * t + ph)
 
     def tuning_curve_derivative(self, theta: np.ndarray) -> np.ndarray:
         t = _theta_col(theta)
-        phase = self._mu_phase.reshape(1, -1)
-        dmu = (
-            self._mu_amp_sin.reshape(1, -1)
-            * self._mu_freq_sin.reshape(1, -1)
-            * np.cos(t * self._mu_freq_sin.reshape(1, -1) + phase)
-            - self._mu_amp_cos.reshape(1, -1)
-            * self._mu_freq_cos.reshape(1, -1)
-            * np.sin(t * self._mu_freq_cos.reshape(1, -1) - 0.5 * phase)
-            + self._mu_lin.reshape(1, -1)
-            + 2.0 * self._mu_quad.reshape(1, -1) * t
-        )
-        return dmu
+        ph = self._mu_phases.reshape(1, -1)
+        return -self._mu_amp * self._mu_omega * np.sin(self._mu_omega * t + ph)
 
     def _mix_weight(self, theta: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         t = _theta_col(theta)

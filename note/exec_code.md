@@ -1,6 +1,6 @@
 # Executable scripts (`bin/`)
 
-Top-level driver scripts live under [`bin/`](../bin/). Run them from the **repository root** so default output paths like `data/outputs_step2` (dataset visuals) / `data/outputs_step6_shared_dataset` (`fisher_est` comparison runs) resolve correctly and imports from the `fisher` package work.
+Top-level driver scripts live under [`bin/`](../bin/). Run them from the **repository root** so default output paths like `data/outputs_step2` (dataset visuals) / `data/outputs_step6_shared_dataset` (shared-dataset Fisher runs) resolve correctly and imports from the `fisher` package work.
 
 Use the project environment and CUDA as in [`AGENTS.md`](../AGENTS.md):
 
@@ -8,7 +8,49 @@ Use the project environment and CUDA as in [`AGENTS.md`](../AGENTS.md):
 mamba run -n geo_diffusion python bin/<script>.py ... --device cuda
 ```
 
-(`visualize_dataset` uses CPU-oriented NumPy/Matplotlib only; `fisher_est` follows the repo rule of not silently falling back when `--device cuda` is requested but unavailable.)
+(`visualize_dataset` uses CPU-oriented NumPy/Matplotlib only. Score/decoder scripts follow the repo rule of not silently falling back when `--device cuda` is requested but unavailable.)
+
+---
+
+## `bin/fisher_make_dataset.py`
+
+**Role:** **Stage 1 — generate and save** the shared joint dataset used by the Fisher comparison (train/eval split + metadata).
+
+**What it does:**
+
+- Builds the toy dataset family used by the shared Fisher pipeline (`--dataset-family`, covariance / GMM flags, etc.).
+- Samples once, splits train/eval with `--seed`, and writes a compressed `.npz` under **`--output-npz`** (default `data/shared_fisher_dataset.npz`).
+- The file contains arrays (`theta_all`, `x_all`, splits, indices) and JSON metadata (`meta_json_utf8`) so stage 2 can reconstruct the model and match ground-truth Fisher without resampling data.
+
+**Typical run:**
+
+```bash
+mamba run -n geo_diffusion python bin/fisher_make_dataset.py --output-npz data/shared_fisher_dataset.npz
+```
+
+**Notable flags:** dataset hyperparameters (`--dataset-family`, `--theta-*`, `--x-dim`, `--n-total`, `--train-frac`, …), `--seed`, `--output-npz`.
+
+---
+
+## `bin/fisher_estimate_from_dataset.py`
+
+**Role:** **Stage 2 — Fisher estimation** from a `.npz` produced by `fisher_make_dataset.py`.
+
+**What it does:**
+
+- Loads the saved arrays and metadata, instantiates the matching `ToyConditional*` dataset for **ground truth** (analytic or MC).
+- Runs score training, score-based Fisher on bins, decoder local classifiers, plots, curve `.npz`, and `metrics_vs_gt_*.txt` under **`--output-dir`**.
+
+**Typical run:**
+
+```bash
+mamba run -n geo_diffusion python bin/fisher_estimate_from_dataset.py \
+  --dataset-npz data/shared_fisher_dataset.npz \
+  --output-dir data/outputs_step6_shared_dataset \
+  --device cuda
+```
+
+**Notable flags:** **`--dataset-npz`** (required), all score/decoder/evaluation flags (`--score-*`, `--decoder-*`, `--n-bins`, `--gt-mc-samples-per-bin`, …), `--device`, `--output-dir`.
 
 ---
 
@@ -26,20 +68,3 @@ mamba run -n geo_diffusion python bin/<script>.py ... --device cuda
   - `conditional_slices.png` — conditional \(x\) slices at several \(\theta\) values.
 
 **Notable flags:** `--dataset-family` (`gaussian` / `gmm_non_gauss`), `--x-dim`, covariance and GMM hyperparameters, `--n-joint`, `--output-dir`.
-
----
-
-## `bin/fisher_est.py`
-
-**Role:** **End-to-end Fisher comparison** on a **single shared dataset**: score-based estimator vs. decoder-based local classification vs. **ground truth** (analytic Gaussian Fisher or Monte Carlo score-squared for the mixture).
-
-**What it does:**
-
-1. Samples one joint dataset from \(p(\theta)p(x\mid\theta)\), then splits train / eval.
-2. Trains the **noise-conditional score model** (discrete or continuous \(\sigma\) schedule) on the train split and evaluates **score-based Fisher** along a \(\theta\) bin grid.
-3. Trains **local binary classifiers** on \(\theta\pm\epsilon/2\) neighborhoods (decoder path) and evaluates **decoder Fisher** with standard errors.
-4. Computes **analytic** Fisher (Gaussian family) or **MC ground truth** (non-Gaussian mixture), then plots all curves and writes metrics under `--output-dir` (default `data/outputs_step6_shared_dataset`).
-
-**Notable flags:** `--dataset-family`, `--x-dim`, `--n-total`, `--train-frac`, score training (`--score-noise-mode`, `--score-sigma-*`, early stopping), decoder (`--decoder-epsilon`, `--decoder-bandwidth`, …), evaluation grid (`--n-bins`, `--eval-margin`), `--device`, `--output-dir`.
-
-This is the main reproducibility entry point referenced in the longer notes (Gaussian and mixture experiments).

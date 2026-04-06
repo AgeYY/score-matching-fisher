@@ -12,12 +12,17 @@ The score-based method in this run uses **direct evaluation at $\sigma_{\min}$**
 ## 1. Reproducibility command
 
 ```bash
-mamba run -n geo_diffusion python bin/fisher_est.py \
+mamba run -n geo_diffusion python bin/fisher_make_dataset.py \
   --dataset-family gaussian \
   --x-dim 10 \
   --sigma-x1 2.40 \
   --sigma-x2 1.76 \
   --n-total 20000 \
+  --output-npz data/shared_fisher_dataset_gaussian_xdim10.npz
+
+mamba run -n geo_diffusion python bin/fisher_estimate_from_dataset.py \
+  --dataset-npz data/shared_fisher_dataset_gaussian_xdim10.npz \
+  --output-dir data/outputs_step6_shared_dataset \
   --device cuda
 ```
 

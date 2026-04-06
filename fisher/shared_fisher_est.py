@@ -1,23 +1,10 @@
-#!/usr/bin/env python3
-"""Shared-dataset Fisher estimation: score vs decoder vs ground truth.
-
-Workflow:
-1) Sample one joint dataset (theta, x) from p(theta)p(x|theta), then split train/eval.
-2) Fit score-matching Fisher estimator on the shared train split.
-3) Fit decoder local-classification Fisher estimator using shared train/eval subsets.
-4) Compute ground-truth Fisher (analytic for Gaussian, Monte Carlo for mixture) and plot comparisons.
-"""
+"""Shared Fisher estimation: score vs decoder vs ground truth (core logic)."""
 
 from __future__ import annotations
 
-import argparse
 import os
-import sys
-from pathlib import Path
-
-_repo_root = Path(__file__).resolve().parent.parent
-if str(_repo_root) not in sys.path:
-    sys.path.insert(0, str(_repo_root))
+from types import SimpleNamespace
+from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -26,116 +13,13 @@ import torch
 from fisher.data import ToyConditionalGMMNonGaussianDataset, ToyConditionalGaussianDataset
 from fisher.evaluation import evaluate_score_fisher, parse_sigma_alpha_list
 from fisher.models import ConditionalScore1D, LocalDecoderLogit
+from fisher.shared_dataset_io import meta_dict_from_args
 from fisher.trainers import (
     geometric_sigma_schedule,
     train_local_decoder,
     train_score_model,
     train_score_model_ncsm_continuous,
 )
-
-
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Shared-dataset score-vs-decoder comparison with analytic GT.")
-    p.add_argument("--seed", type=int, default=7)
-    p.add_argument("--dataset-family", type=str, default="gmm_non_gauss", choices=["gaussian", "gmm_non_gauss"])
-    p.add_argument("--theta-low", type=float, default=-3.0)
-    p.add_argument("--theta-high", type=float, default=3.0)
-    p.add_argument("--x-dim", type=int, default=2)
-    p.add_argument("--sigma-x1", type=float, default=0.30)
-    p.add_argument("--sigma-x2", type=float, default=0.22)
-    p.add_argument("--rho", type=float, default=0.15)
-    p.add_argument("--cov-theta-amp1", type=float, default=0.35)
-    p.add_argument("--cov-theta-amp2", type=float, default=0.30)
-    p.add_argument("--cov-theta-amp-rho", type=float, default=0.30)
-    p.add_argument("--cov-theta-freq1", type=float, default=0.90)
-    p.add_argument("--cov-theta-freq2", type=float, default=0.75)
-    p.add_argument("--cov-theta-freq-rho", type=float, default=1.10)
-    p.add_argument("--cov-theta-phase1", type=float, default=0.20)
-    p.add_argument("--cov-theta-phase2", type=float, default=-0.35)
-    p.add_argument("--cov-theta-phase-rho", type=float, default=0.40)
-    p.add_argument("--rho-clip", type=float, default=0.85)
-    p.add_argument("--gmm-sep-scale", type=float, default=1.10)
-    p.add_argument("--gmm-sep-freq", type=float, default=0.85)
-    p.add_argument("--gmm-sep-phase", type=float, default=0.35)
-    p.add_argument("--gmm-mix-logit-scale", type=float, default=1.40)
-    p.add_argument("--gmm-mix-bias", type=float, default=0.00)
-    p.add_argument("--gmm-mix-freq", type=float, default=0.95)
-    p.add_argument("--gmm-mix-phase", type=float, default=-0.20)
-    p.add_argument("--n-total", type=int, default=3000)
-    p.add_argument("--train-frac", type=float, default=0.7)
-    p.add_argument("--device", type=str, default="cuda")
-    p.add_argument("--gt-mc-samples-per-bin", type=int, default=6000)
-
-    # Score method args.
-    p.add_argument("--score-epochs", type=int, default=10000)
-    p.add_argument("--score-batch-size", type=int, default=256)
-    p.add_argument("--score-lr", type=float, default=1e-3)
-    p.add_argument("--score-hidden-dim", type=int, default=128)
-    p.add_argument("--score-depth", type=int, default=3)
-    p.add_argument("--score-data-mode", type=str, default="split", choices=["split", "full"])
-    p.add_argument(
-        "--score-fisher-eval-data",
-        type=str,
-        default="full",
-        choices=["score_eval", "full"],
-        help="Data split used for score-based Fisher evaluation after training.",
-    )
-    p.add_argument("--score-val-frac", type=float, default=0.15)
-    p.add_argument("--score-min-val-size", type=int, default=256)
-    p.add_argument("--score-val-source", type=str, default="train_split", choices=["train_split", "eval_set"])
-    p.add_argument("--score-early-patience", type=int, default=1000)
-    p.add_argument("--score-early-min-delta", type=float, default=1e-4)
-    p.add_argument(
-        "--score-early-smooth-window",
-        type=int,
-        default=20,
-        help="Moving-average window (epochs) for validation loss used by early stopping.",
-    )
-    p.add_argument("--score-restore-best", action="store_true", default=True)
-    p.add_argument("--no-score-restore-best", action="store_false", dest="score_restore_best")
-    p.add_argument("--score-noise-mode", type=str, default="continuous", choices=["discrete", "continuous"])
-    p.add_argument(
-        "--score-sigma-scale-mode",
-        type=str,
-        default="theta_std",
-        choices=["theta_std", "posterior_proxy", "fixed"],
-    )
-    p.add_argument("--score-sigma-alpha-list", type=float, nargs="+", default=[0.08, 0.06, 0.045, 0.03, 0.02])
-    p.add_argument("--score-sigma-min-alpha", type=float, default=0.01)
-    p.add_argument("--score-sigma-max-alpha", type=float, default=0.25)
-    p.add_argument("--score-eval-sigmas", type=int, default=12)
-    p.add_argument("--score-proxy-l2", type=float, default=1e-3)
-    p.add_argument("--score-proxy-min-mult", type=float, default=0.1)
-    p.add_argument("--score-proxy-max-mult", type=float, default=2.0)
-    p.add_argument("--score-fixed-sigma", type=float, default=0.02)
-
-    # Shared eval curve settings.
-    p.add_argument("--n-bins", type=int, default=35)
-    p.add_argument("--eval-margin", type=float, default=0.30)
-    p.add_argument("--score-min-bin-count", type=int, default=10)
-    p.add_argument("--fd-delta", type=float, default=0.03)
-
-    # Decoder local-classification settings (from shared dataset neighborhoods).
-    p.add_argument("--decoder-epsilon", type=float, default=0.12)
-    p.add_argument("--decoder-bandwidth", type=float, default=0.10)
-    p.add_argument("--decoder-epochs", type=int, default=80)
-    p.add_argument("--decoder-batch-size", type=int, default=256)
-    p.add_argument("--decoder-lr", type=float, default=1e-3)
-    p.add_argument("--decoder-hidden-dim", type=int, default=64)
-    p.add_argument("--decoder-depth", type=int, default=2)
-    p.add_argument("--decoder-min-class-count", type=int, default=60)
-    p.add_argument("--decoder-train-cap", type=int, default=1200)
-    p.add_argument("--decoder-eval-cap", type=int, default=1200)
-    p.add_argument("--decoder-val-frac", type=float, default=0.15)
-    p.add_argument("--decoder-min-val-class-size", type=int, default=20)
-    p.add_argument("--decoder-early-patience", type=int, default=100)
-    p.add_argument("--decoder-early-min-delta", type=float, default=1e-4)
-    p.add_argument("--decoder-early-smooth-window", type=int, default=5)
-    p.add_argument("--decoder-restore-best", action="store_true", default=True)
-    p.add_argument("--no-decoder-restore-best", action="store_false", dest="decoder_restore_best")
-    p.add_argument("--log-every", type=int, default=5)
-    p.add_argument("--output-dir", type=str, default="data/outputs_step6_shared_dataset")
-    return p.parse_args()
 
 
 def require_device(name: str) -> torch.device:
@@ -146,9 +30,9 @@ def require_device(name: str) -> torch.device:
 
 def analytic_fisher_curve(centers: np.ndarray, dataset: ToyConditionalGaussianDataset) -> np.ndarray:
     t = centers.reshape(-1, 1)
-    dmu = dataset.tuning_curve_derivative(t)  # (B,d)
-    cov = dataset.covariance(t)  # (B,d,d)
-    dcov = dataset.covariance_derivative(t)  # (B,d,d)
+    dmu = dataset.tuning_curve_derivative(t)
+    cov = dataset.covariance(t)
+    dcov = dataset.covariance_derivative(t)
     inv_cov = np.linalg.inv(cov)
     mean_term = np.einsum("bi,bij,bj->b", dmu, inv_cov, dmu)
     a = np.einsum("bij,bjk->bik", inv_cov, dcov)
@@ -188,7 +72,6 @@ def compute_metrics(pred: np.ndarray, gt: np.ndarray, valid: np.ndarray) -> dict
 
 
 def posterior_proxy_sigma(theta: np.ndarray, x: np.ndarray, l2: float) -> float:
-    """Estimate posterior scale using ridge residual std of theta ~ x."""
     if l2 < 0.0:
         raise ValueError("score-proxy-l2 must be non-negative.")
     y = np.asarray(theta, dtype=np.float64).reshape(-1, 1)
@@ -198,7 +81,7 @@ def posterior_proxy_sigma(theta: np.ndarray, x: np.ndarray, l2: float) -> float:
     x_aug = np.concatenate([np.ones((xx.shape[0], 1), dtype=np.float64), xx], axis=1)
     xtx = x_aug.T @ x_aug
     reg = np.eye(xtx.shape[0], dtype=np.float64)
-    reg[0, 0] = 0.0  # do not regularize intercept
+    reg[0, 0] = 0.0
     w = np.linalg.solve(xtx + l2 * reg, x_aug.T @ y)
     resid = y - x_aug @ w
     sigma_post = float(np.std(resid.reshape(-1)))
@@ -241,7 +124,7 @@ def fit_decoder_from_shared_data(
     min_val_class_size: int,
     early_patience: int,
     early_min_delta: float,
-    early_smooth_window: int,
+    early_ema_alpha: float,
     restore_best: bool,
     device: torch.device,
     log_every: int,
@@ -308,7 +191,7 @@ def fit_decoder_from_shared_data(
             y_val=yval,
             early_stopping_patience=early_patience,
             early_stopping_min_delta=early_min_delta,
-            early_stopping_smooth_window=early_smooth_window,
+            early_stopping_ema_alpha=early_ema_alpha,
             restore_best=restore_best,
             log_every=max(1, log_every),
         )
@@ -331,10 +214,63 @@ def fit_decoder_from_shared_data(
     return fisher, se, valid
 
 
-def main() -> None:
-    args = parse_args()
+def build_dataset_from_meta(meta: dict[str, Any]) -> ToyConditionalGaussianDataset | ToyConditionalGMMNonGaussianDataset:
+    family = str(meta["dataset_family"])
+    seed = int(meta["seed"])
+    if family == "gaussian":
+        return ToyConditionalGaussianDataset(
+            theta_low=float(meta["theta_low"]),
+            theta_high=float(meta["theta_high"]),
+            x_dim=int(meta["x_dim"]),
+            sigma_x1=float(meta["sigma_x1"]),
+            sigma_x2=float(meta["sigma_x2"]),
+            rho=float(meta["rho"]),
+            cov_theta_amp1=float(meta["cov_theta_amp1"]),
+            cov_theta_amp2=float(meta["cov_theta_amp2"]),
+            cov_theta_amp_rho=float(meta["cov_theta_amp_rho"]),
+            cov_theta_freq1=float(meta["cov_theta_freq1"]),
+            cov_theta_freq2=float(meta["cov_theta_freq2"]),
+            cov_theta_freq_rho=float(meta["cov_theta_freq_rho"]),
+            cov_theta_phase1=float(meta["cov_theta_phase1"]),
+            cov_theta_phase2=float(meta["cov_theta_phase2"]),
+            cov_theta_phase_rho=float(meta["cov_theta_phase_rho"]),
+            rho_clip=float(meta["rho_clip"]),
+            seed=seed,
+        )
+    if family == "gmm_non_gauss":
+        return ToyConditionalGMMNonGaussianDataset(
+            theta_low=float(meta["theta_low"]),
+            theta_high=float(meta["theta_high"]),
+            x_dim=int(meta["x_dim"]),
+            sigma_x1=float(meta["sigma_x1"]),
+            sigma_x2=float(meta["sigma_x2"]),
+            rho=float(meta["rho"]),
+            sep_scale=float(meta["gmm_sep_scale"]),
+            sep_freq=float(meta["gmm_sep_freq"]),
+            sep_phase=float(meta["gmm_sep_phase"]),
+            mix_logit_scale=float(meta["gmm_mix_logit_scale"]),
+            mix_bias=float(meta["gmm_mix_bias"]),
+            mix_freq=float(meta["gmm_mix_freq"]),
+            mix_phase=float(meta["gmm_mix_phase"]),
+            seed=seed,
+        )
+    raise ValueError(f"Unknown dataset_family: {family}")
+
+
+def build_dataset_from_args(ns: Any) -> ToyConditionalGaussianDataset | ToyConditionalGMMNonGaussianDataset:
+    return build_dataset_from_meta(meta_dict_from_args(ns))
+
+
+def validate_dataset_sample_args(args: Any) -> None:
     if args.x_dim < 2:
         raise ValueError("--x-dim must be >= 2.")
+    if int(args.n_total) < 2:
+        raise ValueError("--n-total must be >= 2 for train/eval split.")
+    if not (0.0 < float(args.train_frac) < 1.0):
+        raise ValueError("--train-frac must be in (0, 1).")
+
+
+def validate_estimation_args(args: Any) -> None:
     if args.score_eval_sigmas < 1:
         raise ValueError("--score-eval-sigmas must be >= 1.")
     if args.score_val_source == "train_split" and not (0.0 < args.score_val_frac < 1.0):
@@ -345,8 +281,8 @@ def main() -> None:
         raise ValueError("--score-early-patience must be >= 1.")
     if args.score_early_min_delta < 0.0:
         raise ValueError("--score-early-min-delta must be non-negative.")
-    if args.score_early_smooth_window < 1:
-        raise ValueError("--score-early-smooth-window must be >= 1.")
+    if not (0.0 < float(args.score_early_ema_alpha) <= 1.0):
+        raise ValueError("--score-early-ema-alpha must be in (0, 1].")
     if args.score_sigma_min_alpha <= 0.0 or args.score_sigma_max_alpha <= 0.0:
         raise ValueError("--score-sigma-min-alpha and --score-sigma-max-alpha must be positive.")
     if args.score_proxy_min_mult <= 0.0 or args.score_proxy_max_mult <= 0.0:
@@ -363,62 +299,33 @@ def main() -> None:
         raise ValueError("--decoder-early-patience must be >= 1.")
     if args.decoder_early_min_delta < 0.0:
         raise ValueError("--decoder-early-min-delta must be non-negative.")
-    if args.decoder_early_smooth_window < 1:
-        raise ValueError("--decoder-early-smooth-window must be >= 1.")
-    os.makedirs(args.output_dir, exist_ok=True)
+    if not (0.0 < float(args.decoder_early_ema_alpha) <= 1.0):
+        raise ValueError("--decoder-early-ema-alpha must be in (0, 1].")
+
+
+def merge_meta_into_args(meta: dict[str, Any], est_ns: Any) -> Any:
+    out = vars(est_ns).copy()
+    for k, v in meta.items():
+        if k == "version":
+            continue
+        out[k] = v
+    return SimpleNamespace(**out)
+
+
+def run_shared_fisher_estimation(
+    args: Any,
+    dataset: ToyConditionalGaussianDataset | ToyConditionalGMMNonGaussianDataset,
+    *,
+    theta_all: np.ndarray,
+    x_all: np.ndarray,
+    theta_train: np.ndarray,
+    x_train: np.ndarray,
+    theta_eval: np.ndarray,
+    x_eval: np.ndarray,
+    rng: np.random.Generator,
+) -> None:
     device = require_device(args.device)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    rng = np.random.default_rng(args.seed)
-
-    if args.dataset_family == "gaussian":
-        dataset: ToyConditionalGaussianDataset | ToyConditionalGMMNonGaussianDataset = ToyConditionalGaussianDataset(
-            theta_low=args.theta_low,
-            theta_high=args.theta_high,
-            x_dim=args.x_dim,
-            sigma_x1=args.sigma_x1,
-            sigma_x2=args.sigma_x2,
-            rho=args.rho,
-            cov_theta_amp1=args.cov_theta_amp1,
-            cov_theta_amp2=args.cov_theta_amp2,
-            cov_theta_amp_rho=args.cov_theta_amp_rho,
-            cov_theta_freq1=args.cov_theta_freq1,
-            cov_theta_freq2=args.cov_theta_freq2,
-            cov_theta_freq_rho=args.cov_theta_freq_rho,
-            cov_theta_phase1=args.cov_theta_phase1,
-            cov_theta_phase2=args.cov_theta_phase2,
-            cov_theta_phase_rho=args.cov_theta_phase_rho,
-            rho_clip=args.rho_clip,
-            seed=args.seed,
-        )
-    else:
-        dataset = ToyConditionalGMMNonGaussianDataset(
-            theta_low=args.theta_low,
-            theta_high=args.theta_high,
-            x_dim=args.x_dim,
-            sigma_x1=args.sigma_x1,
-            sigma_x2=args.sigma_x2,
-            rho=args.rho,
-            sep_scale=args.gmm_sep_scale,
-            sep_freq=args.gmm_sep_freq,
-            sep_phase=args.gmm_sep_phase,
-            mix_logit_scale=args.gmm_mix_logit_scale,
-            mix_bias=args.gmm_mix_bias,
-            mix_freq=args.gmm_mix_freq,
-            mix_phase=args.gmm_mix_phase,
-            seed=args.seed,
-        )
-
-    theta_all, x_all = dataset.sample_joint(args.n_total)
-    perm = rng.permutation(args.n_total)
-    n_train = int(args.train_frac * args.n_total)
-    n_train = min(max(n_train, 1), args.n_total - 1)
-    tr_idx = perm[:n_train]
-    ev_idx = perm[n_train:]
-    theta_train, x_train = theta_all[tr_idx], x_all[tr_idx]
-    theta_eval, x_eval = theta_all[ev_idx], x_all[ev_idx]
-
-    print(f"[data] total={args.n_total} train={theta_train.shape[0]} eval={theta_eval.shape[0]}")
+    os.makedirs(args.output_dir, exist_ok=True)
 
     if args.score_data_mode == "full":
         theta_score_train, x_score_train = theta_all, x_all
@@ -462,7 +369,6 @@ def main() -> None:
             f"val_frac_eff={theta_score_val.shape[0]/n_score_total:.4f}"
         )
 
-    # Score sigma scale calibration.
     theta_std = float(np.std(theta_score_fit))
     sigma_post = float("nan")
     sigma_min: float | None = None
@@ -524,7 +430,7 @@ def main() -> None:
             x_val=x_score_val,
             early_stopping_patience=args.score_early_patience,
             early_stopping_min_delta=args.score_early_min_delta,
-            early_stopping_smooth_window=args.score_early_smooth_window,
+            early_stopping_ema_alpha=float(args.score_early_ema_alpha),
             restore_best=args.score_restore_best,
         )
     else:
@@ -548,7 +454,7 @@ def main() -> None:
             x_val=x_score_val,
             early_stopping_patience=args.score_early_patience,
             early_stopping_min_delta=args.score_early_min_delta,
-            early_stopping_smooth_window=args.score_early_smooth_window,
+            early_stopping_ema_alpha=float(args.score_early_ema_alpha),
             restore_best=args.score_restore_best,
         )
     score_train_losses = np.asarray(score_train_out["train_losses"], dtype=np.float64)
@@ -562,7 +468,7 @@ def main() -> None:
         "[score_early_stop] "
         f"stopped_early={stopped_early} stopped_epoch={stopped_epoch} "
         f"best_epoch={best_epoch} best_val_smooth={best_val_loss:.6f} "
-        f"smooth_window={args.score_early_smooth_window} "
+        f"ema_alpha={args.score_early_ema_alpha} "
         f"restore_best={args.score_restore_best}"
     )
 
@@ -579,7 +485,7 @@ def main() -> None:
             color="#ff7f0e",
             linewidth=2.0,
             linestyle="--",
-            label=f"Score val smooth (w={args.score_early_smooth_window})",
+            label=f"Score val EMA (α={args.score_early_ema_alpha:g})",
         )
     if 1 <= best_epoch <= score_train_losses.size:
         plt.axvline(best_epoch, color="#2ca02c", linestyle="--", linewidth=1.5, label=f"Best epoch {best_epoch}")
@@ -625,7 +531,6 @@ def main() -> None:
     )
     centers = score_eval.curves.centers
 
-    # Decoder method from same shared split.
     decoder_fisher, decoder_se, decoder_valid = fit_decoder_from_shared_data(
         centers=centers,
         theta_train=theta_train,
@@ -646,7 +551,7 @@ def main() -> None:
         min_val_class_size=args.decoder_min_val_class_size,
         early_patience=args.decoder_early_patience,
         early_min_delta=args.decoder_early_min_delta,
-        early_smooth_window=args.decoder_early_smooth_window,
+        early_ema_alpha=float(args.decoder_early_ema_alpha),
         restore_best=args.decoder_restore_best,
         device=device,
         log_every=max(1, args.log_every),
@@ -759,7 +664,7 @@ def main() -> None:
         f.write(
             "score_early_stopping: "
             f"patience={args.score_early_patience}, min_delta={args.score_early_min_delta}, "
-            f"smooth_window={args.score_early_smooth_window}, "
+            f"ema_alpha={args.score_early_ema_alpha}, "
             f"restore_best={args.score_restore_best}, stopped_early={stopped_early}, "
             f"best_epoch={best_epoch}, stopped_epoch={stopped_epoch}, best_val_smooth={best_val_loss}\n"
         )
@@ -791,7 +696,7 @@ def main() -> None:
             "decoder_early_stopping: "
             f"val_frac={args.decoder_val_frac}, min_val_class_size={args.decoder_min_val_class_size}, "
             f"patience={args.decoder_early_patience}, min_delta={args.decoder_early_min_delta}, "
-            f"smooth_window={args.decoder_early_smooth_window}, restore_best={args.decoder_restore_best}\n"
+            f"ema_alpha={args.decoder_early_ema_alpha}, restore_best={args.decoder_restore_best}\n"
         )
         if args.dataset_family == "gaussian":
             f.write(
@@ -839,7 +744,3 @@ def main() -> None:
     print(f"  - {fig_path}")
     print(f"  - {npz_path}")
     print(f"  - {metrics_path}")
-
-
-if __name__ == "__main__":
-    main()

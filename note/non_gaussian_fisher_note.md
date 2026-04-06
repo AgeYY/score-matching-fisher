@@ -129,9 +129,12 @@ computed by Monte Carlo at each bin center.
 Command used:
 
 ```bash
-mamba run -n geo_diffusion python bin/fisher_est.py \
+mamba run -n geo_diffusion python bin/fisher_make_dataset.py \
+  --dataset-family gmm_non_gauss
+
+mamba run -n geo_diffusion python bin/fisher_estimate_from_dataset.py \
+  --dataset-npz data/shared_fisher_dataset.npz \
   --device cuda \
-  --dataset-family gmm_non_gauss \
   --score-noise-mode continuous \
   --score-epochs 250
 ```
