@@ -5,7 +5,12 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from fisher.models import ConditionalXFlowVelocity, ConditionalXScore
+from fisher.models import (
+    ConditionalXFlowVelocity,
+    ConditionalXScore,
+    UnconditionalXFlowVelocity,
+    UnconditionalXScore,
+)
 
 
 @dataclass
@@ -53,6 +58,62 @@ def compute_cross_score_matrix(
     return s
 
 
+def compute_unconditional_score_vectors(
+    model: UnconditionalXScore,
+    x: np.ndarray,
+    sigma_eval: float,
+    device: torch.device,
+    row_batch_size: int = 128,
+) -> np.ndarray:
+    """Compute v_i = s(x_i, sigma_eval), shape (N, x_dim)."""
+    x2 = np.asarray(x, dtype=np.float64)
+    if x2.ndim != 2:
+        raise ValueError("x must be a 2D array.")
+    n = int(x2.shape[0])
+    if row_batch_size < 1:
+        raise ValueError("row_batch_size must be >= 1.")
+
+    model.eval()
+    out = np.zeros((n, x2.shape[1]), dtype=np.float64)
+    with torch.no_grad():
+        for i0 in range(0, n, row_batch_size):
+            i1 = min(n, i0 + row_batch_size)
+            xb = np.asarray(x2[i0:i1], dtype=np.float32)
+            x_t = torch.from_numpy(xb).to(device)
+            pred = model.predict_score(x=x_t, sigma_eval=float(sigma_eval))
+            out[i0:i1, :] = pred.cpu().numpy().astype(np.float64)
+    return out
+
+
+def compute_unconditional_flow_velocity_vectors(
+    model: UnconditionalXFlowVelocity,
+    x: np.ndarray,
+    t_eval: float,
+    device: torch.device,
+    row_batch_size: int = 128,
+) -> np.ndarray:
+    """Compute v_i = v(x_i, t_eval), shape (N, x_dim)."""
+    x2 = np.asarray(x, dtype=np.float64)
+    if x2.ndim != 2:
+        raise ValueError("x must be a 2D array.")
+    n = int(x2.shape[0])
+    if row_batch_size < 1:
+        raise ValueError("row_batch_size must be >= 1.")
+    if not (0.0 <= float(t_eval) <= 1.0):
+        raise ValueError("t_eval must be in [0, 1].")
+
+    model.eval()
+    out = np.zeros((n, x2.shape[1]), dtype=np.float64)
+    with torch.no_grad():
+        for i0 in range(0, n, row_batch_size):
+            i1 = min(n, i0 + row_batch_size)
+            xb = np.asarray(x2[i0:i1], dtype=np.float32)
+            x_t = torch.from_numpy(xb).to(device)
+            pred = model.predict_velocity(x_t=x_t, t_eval=float(t_eval))
+            out[i0:i1, :] = pred.cpu().numpy().astype(np.float64)
+    return out
+
+
 def compute_cross_flow_velocity_matrix(
     model: ConditionalXFlowVelocity,
     theta: np.ndarray,
@@ -97,6 +158,28 @@ def normalize_scores(scores: np.ndarray, eps: float = 1e-8) -> np.ndarray:
         raise ValueError("scores must have shape (N, N, x_dim).")
     denom = np.linalg.norm(s, axis=-1, keepdims=True)
     return s / np.maximum(denom, eps)
+
+
+def normalize_score_rows_l2(vecs: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    """L2 unit rows for (N, x_dim)."""
+    v = np.asarray(vecs, dtype=np.float64)
+    if v.ndim != 2:
+        raise ValueError("vecs must have shape (N, x_dim).")
+    denom = np.linalg.norm(v, axis=-1, keepdims=True)
+    return v / np.maximum(denom, eps)
+
+
+def normalize_score_rows_geom(vecs: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    """Per row: scale so geometric mean of |component| equals 1."""
+    v = np.asarray(vecs, dtype=np.float64)
+    if v.ndim != 2:
+        raise ValueError("vecs must have shape (N, x_dim).")
+    abs_v = np.abs(v)
+    gm = np.exp(np.mean(np.log(np.maximum(abs_v, eps)), axis=-1, keepdims=True))
+    denom = np.maximum(gm, eps)
+    out = v / denom
+    near_zero = np.all(abs_v <= eps, axis=-1, keepdims=True)
+    return np.where(near_zero, 0.0, out)
 
 
 def normalize_scores_geom(scores: np.ndarray, eps: float = 1e-8) -> np.ndarray:
@@ -192,12 +275,68 @@ def classical_mds_from_distances(
     )
 
 
+def pairwise_mean_score_distance_matrix(vecs: np.ndarray, *, use_sqrt: bool) -> np.ndarray:
+    """d_ij^2 = mean_k (v_ik - v_jk)^2 for rows v_i; symmetric, zero diagonal."""
+    v = np.asarray(vecs, dtype=np.float64)
+    if v.ndim != 2:
+        raise ValueError("vecs must have shape (N, x_dim).")
+    diff = v[:, None, :] - v[None, :, :]
+    d2 = np.mean(diff**2, axis=-1)
+    d2 = 0.5 * (d2 + d2.T)
+    np.fill_diagonal(d2, 0.0)
+    d2 = np.clip(d2, 0.0, None)
+    if use_sqrt:
+        d = np.sqrt(d2)
+        d = 0.5 * (d + d.T)
+        np.fill_diagonal(d, 0.0)
+        return d
+    return d2
+
+
+def evaluate_pairwise_score_distance_variants(
+    score_rows: np.ndarray,
+    *,
+    score_normalize: str = "none",
+) -> dict[str, np.ndarray | float]:
+    """Unconditional path: distances from rows v_i in R^{x_dim} (mean squared coordinate gap)."""
+    mode = str(score_normalize).strip().lower()
+    if mode not in ("none", "l2", "geom"):
+        raise ValueError("score_normalize must be one of: none, l2, geom.")
+    if mode == "none":
+        v = np.asarray(score_rows, dtype=np.float64)
+    elif mode == "l2":
+        v = normalize_score_rows_l2(score_rows)
+    else:
+        v = normalize_score_rows_geom(score_rows)
+    d = pairwise_mean_score_distance_matrix(v, use_sqrt=True)
+    d2 = pairwise_mean_score_distance_matrix(v, use_sqrt=False)
+    mds_d = classical_mds_from_distances(d, n_components=2)
+    mds_d2 = classical_mds_from_distances(d2, n_components=2)
+    return {
+        "distance_d": d,
+        "distance_d2": d2,
+        "embedding_d": mds_d.embedding,
+        "embedding_d2": mds_d2.embedding,
+        "strain_d": float(mds_d.strain_relative),
+        "strain_d2": float(mds_d2.strain_relative),
+        "positive_eig_d": float(mds_d.positive_eig_count),
+        "positive_eig_d2": float(mds_d2.positive_eig_count),
+        "eigenvalues_d": mds_d.eigenvalues_all,
+        "eigenvalues_d2": mds_d2.eigenvalues_all,
+    }
+
+
 def evaluate_distance_variants(
     cross_scores: np.ndarray,
     *,
     score_normalize: str = "none",
+    x_dim_aggregate: str = "mean",
 ) -> dict[str, np.ndarray | float]:
-    """score_normalize: none | l2 | geom (L2 unit vectors vs geometric mean |component| scale)."""
+    """score_normalize: none | l2 | geom (L2 unit vectors vs geometric mean |component| scale).
+
+    x_dim_aggregate: how to combine squared gaps along x_dim for the conditional cross-matrix
+    distance (sum | mean | geom_mean).
+    """
     mode = str(score_normalize).strip().lower()
     if mode not in ("none", "l2", "geom"):
         raise ValueError("score_normalize must be one of: none, l2, geom.")
@@ -207,15 +346,16 @@ def evaluate_distance_variants(
         s = normalize_scores(cross_scores)
     else:
         s = normalize_scores_geom(cross_scores)
+    agg = str(x_dim_aggregate).strip().lower()
     d = score_distance_matrix_from_cross_scores(
         s,
         use_sqrt=True,
-        x_dim_aggregate="geom_mean",
+        x_dim_aggregate=agg,
     )
     d2 = score_distance_matrix_from_cross_scores(
         s,
         use_sqrt=False,
-        x_dim_aggregate="geom_mean",
+        x_dim_aggregate=agg,
     )
     mds_d = classical_mds_from_distances(d, n_components=2)
     mds_d2 = classical_mds_from_distances(d2, n_components=2)
