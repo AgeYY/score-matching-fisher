@@ -15,6 +15,7 @@ if str(_repo_root) not in sys.path:
 import matplotlib.pyplot as plt
 import numpy as np
 
+from global_setting import DATAROOT
 from fisher.data import ToyConditionalGMMNonGaussianDataset, ToyConditionalGaussianDataset
 from fisher.shared_dataset_io import load_shared_dataset_npz
 from fisher.shared_fisher_est import build_dataset_from_meta
@@ -236,7 +237,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gmm-mix-freq", type=float, default=0.95)
     parser.add_argument("--gmm-mix-phase", type=float, default=-0.20)
     parser.add_argument("--slice-thetas", type=float, nargs="+", default=[-2.4, -0.8, 0.8, 2.4])
-    parser.add_argument("--output-dir", type=str, default="data/outputs_step2")
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=str(Path(DATAROOT) / "outputs_step2"),
+    )
     return parser.parse_args()
 
 

@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Load a shared dataset, estimate H-matrix via score/prior training, then Classical MDS embedding."""
+"""Load a shared dataset, estimate H-matrix via score/prior training, then Classical MDS embedding.
+
+Computes classical MDS from both H^sym and unbounded B^sym = -log(1 - H^sym), Isomap and UMAP on those
+distance matrices (metric=precomputed), plus Euclidean/PCA/Isomap-on-x baselines.
+"""
 
 from __future__ import annotations
 
@@ -20,6 +24,15 @@ from scipy.spatial.distance import pdist, squareform
 from sklearn.decomposition import PCA
 from sklearn.manifold import Isomap
 
+try:
+    import umap
+except ImportError as e:
+    raise ImportError(
+        "visualize_h_matrix_mds.py requires the umap-learn package. "
+        "Install with: pip install umap-learn"
+    ) from e
+
+from global_setting import DATAROOT
 from fisher.cli_shared_fisher import add_estimation_arguments
 from fisher.shared_dataset_io import SharedDatasetBundle, load_shared_dataset_npz
 from fisher.shared_fisher_est import (
@@ -30,12 +43,15 @@ from fisher.shared_fisher_est import (
     validate_estimation_args,
 )
 
+# Dense N×N arrays in h_mds_embedding.npz are omitted when n exceeds this (saves disk / quota).
+N_FULL_MATRIX_SAVE_MAX = 5000
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
             "Load a shared dataset .npz, run Fisher + H-matrix estimation, then 2D Classical MDS "
-            "from a distance matrix derived from H_sym."
+            "from both H_sym and B_sym distance matrices, plus baseline embeddings."
         )
     )
     p.add_argument(
@@ -45,17 +61,41 @@ def parse_args() -> argparse.Namespace:
         help="Path to shared dataset .npz from fisher_make_dataset.py.",
     )
     p.add_argument(
+        "--b-sym-eps",
+        type=float,
+        default=1e-15,
+        help="Lower clip for affinity (1-H^sym) when computing B^sym; avoids -log(0).",
+    )
+    p.add_argument(
         "--distance-transform",
         type=str,
         default="sqrt",
         choices=["identity", "sqrt"],
-        help="Build distance D from H_sym: identity (D=H) or sqrt (D=sqrt(max(H,0))).",
+        help="Build distance D from H_sym and B_sym: identity (D=L) or sqrt (D=sqrt(max(L,0))).",
     )
     p.add_argument(
         "--isomap-n-neighbors",
         type=int,
-        default=15,
+        default=100,
         help="Isomap n_neighbors (capped at n_samples - 1).",
+    )
+    p.add_argument(
+        "--umap-n-neighbors",
+        type=int,
+        default=100,
+        help="UMAP n_neighbors on precomputed H/B distances (capped at n_samples - 1).",
+    )
+    p.add_argument(
+        "--umap-min-dist",
+        type=float,
+        default=0.1,
+        help="UMAP min_dist for H/B precomputed embeddings.",
+    )
+    p.add_argument(
+        "--umap-random-state",
+        type=int,
+        default=-1,
+        help="Random seed for UMAP; -1 uses the dataset seed from the .npz meta.",
     )
     p.add_argument(
         "--pca-random-state",
@@ -63,23 +103,86 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Random seed for PCA (sklearn).",
     )
+    p.add_argument(
+        "--mds-only",
+        action="store_true",
+        default=False,
+        help="Skip score/prior/decoder training; load h_matrix_results*.npz from output-dir and only build MDS/embeddings.",
+    )
+    p.add_argument(
+        "--omit-npz-full-matrices",
+        action="store_true",
+        default=False,
+        help="Do not store N×N distance / H / B arrays in h_mds_embedding.npz (much smaller file; avoids disk quota issues).",
+    )
     add_estimation_arguments(p)
     # Prefer a dedicated default output directory for this workflow (overrides estimation default).
-    p.set_defaults(output_dir="data/outputs_h_matrix_mds")
+    p.set_defaults(output_dir=str(Path(DATAROOT) / "outputs_h_matrix_mds"))
     return p.parse_args()
 
 
-def distance_matrix_from_h_sym(h_sym: np.ndarray, transform: str) -> np.ndarray:
-    h = np.asarray(h_sym, dtype=np.float64)
+def distance_matrix_from_symmetric_loss(loss_sym: np.ndarray, transform: str) -> np.ndarray:
+    """Build a symmetric distance matrix from nonnegative symmetric loss entries."""
+    m = np.asarray(loss_sym, dtype=np.float64)
     if transform == "identity":
-        d = np.clip(h, 0.0, None)
+        d = np.clip(m, 0.0, None)
     elif transform == "sqrt":
-        d = np.sqrt(np.clip(h, 0.0, None))
+        d = np.sqrt(np.clip(m, 0.0, None))
     else:
         raise ValueError(f"Unknown distance transform: {transform}")
     d = 0.5 * (d + d.T)
     np.fill_diagonal(d, 0.0)
     return d
+
+
+def compute_b_sym_from_h_sym(h_sym: np.ndarray, eps: float) -> tuple[np.ndarray, dict[str, float | int]]:
+    """B^sym_ij = -log(clip(1 - H^sym_ij, eps, 1)); symmetric average; diagonal forced to 0."""
+    h = np.asarray(h_sym, dtype=np.float64)
+    n = h.shape[0]
+    if h.ndim != 2 or h.shape[0] != h.shape[1]:
+        raise ValueError("h_sym must be square.")
+    raw_aff = 1.0 - h
+    off = ~np.eye(n, dtype=bool)
+    n_off = int(np.sum(off))
+    clipped_mask = (raw_aff < eps) & off
+    n_clipped = int(np.sum(clipped_mask))
+    affinity = np.clip(raw_aff, eps, 1.0)
+    b = -np.log(affinity)
+    b = 0.5 * (b + b.T)
+    np.fill_diagonal(b, 0.0)
+    diag = {
+        "b_sym_eps": float(eps),
+        "b_sym_n_offdiag": n_off,
+        "b_sym_n_affinity_clipped": n_clipped,
+        "b_sym_frac_affinity_clipped": float(n_clipped / max(n_off, 1)),
+    }
+    return b, diag
+
+
+def compute_b_sym_from_directed(h_directed: np.ndarray, eps: float) -> np.ndarray:
+    """B^sym = -log(1 - 0.5 H^→ - 0.5 H^→T) with affinity clipped."""
+    hd = np.asarray(h_directed, dtype=np.float64)
+    raw_aff = 1.0 - 0.5 * hd - 0.5 * hd.T
+    affinity = np.clip(raw_aff, eps, 1.0)
+    b = -np.log(affinity)
+    b = 0.5 * (b + b.T)
+    np.fill_diagonal(b, 0.0)
+    return b
+
+
+def validate_symmetric_loss_matrix(mat: np.ndarray, name: str) -> None:
+    m = np.asarray(mat, dtype=np.float64)
+    if m.ndim != 2 or m.shape[0] != m.shape[1]:
+        raise ValueError(f"{name} must be square.")
+    asym = float(np.max(np.abs(m - m.T)))
+    if asym > 1e-8:
+        raise ValueError(f"{name} is not symmetric within tolerance: max|m-m.T|={asym}")
+    n = m.shape[0]
+    off = m[~np.eye(n, dtype=bool)]
+    if np.any(off < -1e-10):
+        raise ValueError(f"{name} has negative off-diagonal entries (min={float(np.min(off))}).")
+    if not np.all(np.isfinite(m)):
+        raise ValueError(f"{name} contains non-finite values.")
 
 
 def classical_mds_from_distances(
@@ -176,12 +279,47 @@ def fit_isomap_2d(x: np.ndarray, n_neighbors: int) -> np.ndarray:
     return iso.fit_transform(x).astype(np.float64)
 
 
+def fit_isomap_2d_precomputed_distance(d: np.ndarray, n_neighbors: int) -> np.ndarray:
+    """Isomap with a symmetric pairwise distance matrix (sklearn metric='precomputed')."""
+    d = np.asarray(d, dtype=np.float64)
+    n = d.shape[0]
+    if d.ndim != 2 or d.shape != (n, n):
+        raise ValueError("d must be a square distance matrix.")
+    k = int(n_neighbors)
+    k = max(2, min(k, n - 1))
+    iso = Isomap(n_components=2, n_neighbors=k, metric="precomputed")
+    return iso.fit_transform(d).astype(np.float64)
+
+
+def fit_umap_2d_precomputed_distance(
+    d: np.ndarray, n_neighbors: int, min_dist: float, random_state: int
+) -> np.ndarray:
+    """UMAP with a symmetric pairwise distance matrix (metric='precomputed')."""
+    d = np.asarray(d, dtype=np.float64)
+    n = d.shape[0]
+    if d.ndim != 2 or d.shape != (n, n):
+        raise ValueError("d must be a square distance matrix.")
+    k = int(n_neighbors)
+    k = max(2, min(k, n - 1))
+    reducer = umap.UMAP(
+        n_components=2,
+        n_neighbors=k,
+        min_dist=float(min_dist),
+        metric="precomputed",
+        random_state=int(random_state),
+    )
+    return reducer.fit_transform(d).astype(np.float64)
+
+
 def main() -> None:
     args = parse_args()
     dataset_npz = args.dataset_npz
     distance_transform = args.distance_transform
+    b_sym_eps = float(args.b_sym_eps)
 
     validate_estimation_args(args)
+    if b_sym_eps <= 0.0:
+        raise ValueError("--b-sym-eps must be positive.")
 
     bundle = load_shared_dataset_npz(dataset_npz)
     meta = bundle.meta
@@ -202,20 +340,24 @@ def main() -> None:
 
     print(
         f"[h_mds] dataset_npz={dataset_npz} output_dir={full_args.output_dir} "
-        f"distance_transform={distance_transform}"
+        f"distance_transform={distance_transform} mds_only={bool(getattr(args, 'mds_only', False))} "
+        f"omit_npz_full_matrices={bool(getattr(args, 'omit_npz_full_matrices', False))}"
     )
 
-    run_shared_fisher_estimation(
-        full_args,
-        dataset,
-        theta_all=bundle.theta_all,
-        x_all=bundle.x_all,
-        theta_train=bundle.theta_train,
-        x_train=bundle.x_train,
-        theta_eval=bundle.theta_eval,
-        x_eval=bundle.x_eval,
-        rng=rng,
-    )
+    if not bool(getattr(args, "mds_only", False)):
+        run_shared_fisher_estimation(
+            full_args,
+            dataset,
+            theta_all=bundle.theta_all,
+            x_all=bundle.x_all,
+            theta_train=bundle.theta_train,
+            x_train=bundle.x_train,
+            theta_eval=bundle.theta_eval,
+            x_eval=bundle.x_eval,
+            rng=rng,
+        )
+    else:
+        print("[h_mds] --mds-only: skipping Fisher training; using existing h_matrix_results*.npz.")
 
     suffix = "_non_gauss" if full_args.dataset_family == "gmm_non_gauss" else "_theta_cov"
     h_path = os.path.join(full_args.output_dir, f"h_matrix_results{suffix}.npz")
@@ -235,8 +377,22 @@ def main() -> None:
     if not np.allclose(theta_chk, theta_used, rtol=0.0, atol=1e-5):
         raise ValueError("theta_used from H-matrix npz does not match dataset theta for score_fisher_eval_data split.")
 
-    d_mat = distance_matrix_from_h_sym(h_sym, distance_transform)
-    emb_h, lam_used, lam_all, strain_rel = classical_mds_from_distances(d_mat, n_components=2)
+    validate_symmetric_loss_matrix(h_sym, "h_sym")
+    b_sym, b_sym_diag = compute_b_sym_from_h_sym(h_sym, b_sym_eps)
+    validate_symmetric_loss_matrix(b_sym, "b_sym")
+    if "h_directed" in h_npz.files:
+        b_from_dir = compute_b_sym_from_directed(
+            np.asarray(h_npz["h_directed"], dtype=np.float64), b_sym_eps
+        )
+        max_diff = float(np.max(np.abs(b_sym - b_from_dir)))
+        b_sym_diag["b_sym_max_abs_diff_hdir_route"] = max_diff
+        if max_diff > 1e-5:
+            print(f"[h_mds] WARNING: B_sym from H_sym vs h_directed differ max|Δ|={max_diff:.3e}")
+
+    d_mat_h = distance_matrix_from_symmetric_loss(h_sym, distance_transform)
+    d_mat_b = distance_matrix_from_symmetric_loss(b_sym, distance_transform)
+    emb_h_mds, lam_h_used, lam_h_all, strain_h = classical_mds_from_distances(d_mat_h, n_components=2)
+    emb_b_mds, lam_b_used, lam_b_all, strain_b = classical_mds_from_distances(d_mat_b, n_components=2)
 
     d_euclid = euclidean_distance_matrix(x_aligned)
     emb_euclid_mds, lam_euclid_used, lam_euclid_all, strain_euclid = classical_mds_from_distances(
@@ -246,67 +402,155 @@ def main() -> None:
     emb_pca, pca_evr = fit_pca_2d(x_aligned, random_state=int(args.pca_random_state))
     isomap_k = int(args.isomap_n_neighbors)
     emb_isomap = fit_isomap_2d(x_aligned, n_neighbors=isomap_k)
+    emb_h_isomap = fit_isomap_2d_precomputed_distance(d_mat_h, n_neighbors=isomap_k)
+    emb_b_isomap = fit_isomap_2d_precomputed_distance(d_mat_b, n_neighbors=isomap_k)
 
-    out_npz = os.path.join(full_args.output_dir, "h_mds_embedding.npz")
-    np.savez(
-        out_npz,
-        embedding_2d_h_mds=emb_h,
-        embedding_2d_euclidean_mds=emb_euclid_mds,
-        embedding_2d_pca=emb_pca,
-        embedding_2d_isomap=emb_isomap,
-        embedding_2d=emb_h,
-        theta=theta_used,
-        x_aligned=x_aligned,
-        distance_matrix_h=d_mat,
-        distance_matrix_euclidean=d_euclid,
-        h_sym=h_sym,
-        distance_transform=np.asarray([distance_transform], dtype=object),
-        eigenvalues_mds_h=lam_used,
-        eigenvalues_all_h=lam_all,
-        strain_relative_h=np.asarray([strain_rel], dtype=np.float64),
-        eigenvalues_mds_euclidean=lam_euclid_used,
-        eigenvalues_all_euclidean=lam_euclid_all,
-        strain_relative_euclidean=np.asarray([strain_euclid], dtype=np.float64),
-        pca_explained_variance_ratio=pca_evr,
-        isomap_n_neighbors=np.asarray([isomap_k], dtype=np.int64),
-        dataset_npz=np.asarray([os.path.abspath(dataset_npz)], dtype=object),
+    umap_k = int(args.umap_n_neighbors)
+    umap_min = float(args.umap_min_dist)
+    umap_rs = int(meta["seed"]) if int(args.umap_random_state) < 0 else int(args.umap_random_state)
+    emb_h_umap = fit_umap_2d_precomputed_distance(
+        d_mat_h, n_neighbors=umap_k, min_dist=umap_min, random_state=umap_rs
+    )
+    emb_b_umap = fit_umap_2d_precomputed_distance(
+        d_mat_b, n_neighbors=umap_k, min_dist=umap_min, random_state=umap_rs
     )
 
+    out_npz = os.path.join(full_args.output_dir, "h_mds_embedding.npz")
+    n_samples = int(h_sym.shape[0])
+    save_full_dense = (n_samples <= N_FULL_MATRIX_SAVE_MAX) and (not bool(getattr(args, "omit_npz_full_matrices", False)))
+
+    npz_payload: dict[str, object] = {
+        "embedding_2d_h_mds": emb_h_mds,
+        "embedding_2d_b_mds": emb_b_mds,
+        "embedding_2d_selected_mds": emb_h_mds,
+        "embedding_2d_euclidean_mds": emb_euclid_mds,
+        "embedding_2d_pca": emb_pca,
+        "embedding_2d_isomap": emb_isomap,
+        "embedding_2d_h_isomap": emb_h_isomap,
+        "embedding_2d_b_isomap": emb_b_isomap,
+        "embedding_2d_h_umap": emb_h_umap,
+        "embedding_2d_b_umap": emb_b_umap,
+        "embedding_2d": emb_h_mds,
+        "theta": theta_used,
+        "x_aligned": x_aligned,
+        "distance_transform": np.asarray([distance_transform], dtype=object),
+        "eigenvalues_mds_h": lam_h_used,
+        "eigenvalues_all_h": lam_h_all,
+        "strain_relative_h": np.asarray([strain_h], dtype=np.float64),
+        "eigenvalues_mds_b": lam_b_used,
+        "eigenvalues_all_b": lam_b_all,
+        "strain_relative_b": np.asarray([strain_b], dtype=np.float64),
+        "eigenvalues_mds_euclidean": lam_euclid_used,
+        "eigenvalues_all_euclidean": lam_euclid_all,
+        "strain_relative_euclidean": np.asarray([strain_euclid], dtype=np.float64),
+        "pca_explained_variance_ratio": pca_evr,
+        "isomap_n_neighbors": np.asarray([isomap_k], dtype=np.int64),
+        "umap_n_neighbors": np.asarray([umap_k], dtype=np.int64),
+        "umap_min_dist": np.asarray([umap_min], dtype=np.float64),
+        "umap_random_state": np.asarray([umap_rs], dtype=np.int64),
+        "dataset_npz": np.asarray([os.path.abspath(dataset_npz)], dtype=object),
+        "b_sym_eps": np.asarray([b_sym_eps], dtype=np.float64),
+        "npz_omits_full_matrices": np.asarray([not save_full_dense], dtype=bool),
+        "npz_full_matrix_save_max_n": np.asarray([N_FULL_MATRIX_SAVE_MAX], dtype=np.int64),
+    }
+    if save_full_dense:
+        npz_payload["distance_matrix_h"] = d_mat_h
+        npz_payload["distance_matrix_b"] = d_mat_b
+        npz_payload["distance_matrix_selected"] = d_mat_h
+        npz_payload["distance_matrix_euclidean"] = d_euclid
+        npz_payload["h_sym"] = h_sym
+        npz_payload["b_sym"] = b_sym
+        npz_payload["base_matrix_selected"] = h_sym
+    for k, v in b_sym_diag.items():
+        if k == "b_sym_eps":
+            continue
+        if isinstance(v, float):
+            npz_payload[k] = np.asarray([v], dtype=np.float64)
+        else:
+            npz_payload[k] = np.asarray([v], dtype=np.int64)
+    np.savez_compressed(out_npz, **npz_payload)
+
     fig_path = os.path.join(full_args.output_dir, "h_mds_embedding_theta_color.png")
-    fig, axes = plt.subplots(2, 2, figsize=(12.5, 10.5), sharex=False, sharey=False, layout="constrained")
+    k_used = max(2, min(isomap_k, theta_used.size - 1))
+    umap_k_used = max(2, min(umap_k, theta_used.size - 1))
+    fig, axes = plt.subplots(3, 3, figsize=(18.0, 14.0), sharex=False, sharey=False, layout="constrained")
+    ax_flat = np.asarray(axes).ravel()
+    umap_title_suffix = (
+        r"$k$=" + str(umap_k_used) + r", min\_dist=" + f"{umap_min:.3g}" + r", seed=" + str(umap_rs)
+    )
     panels: list[tuple[np.ndarray, str, str, str]] = [
-        (emb_h, "H → Classical MDS", "MDS 1", "MDS 2"),
+        (emb_h_mds, r"$H^{\mathrm{sym}}$ → Classical MDS", "MDS 1", "MDS 2"),
+        (emb_b_mds, r"$B^{\mathrm{sym}}$ → Classical MDS", "MDS 1", "MDS 2"),
         (emb_euclid_mds, r"Euclidean $\rightarrow$ Classical MDS", "MDS 1", "MDS 2"),
         (emb_pca, "PCA (2 components)", "PC 1", "PC 2"),
-        (emb_isomap, f"Isomap ($k$={max(2, min(isomap_k, theta_used.size - 1))})", "Isomap 1", "Isomap 2"),
+        (emb_isomap, f"Isomap on $x$ ($k$={k_used})", "Isomap 1", "Isomap 2"),
+        (
+            emb_h_isomap,
+            r"$H^{\mathrm{sym}}$ dist. $\rightarrow$ Isomap ($k$=" + str(k_used) + ")",
+            "Iso 1",
+            "Iso 2",
+        ),
+        (
+            emb_b_isomap,
+            r"$B^{\mathrm{sym}}$ dist. $\rightarrow$ Isomap ($k$=" + str(k_used) + ")",
+            "Iso 1",
+            "Iso 2",
+        ),
+        (
+            emb_h_umap,
+            r"$H^{\mathrm{sym}}$ dist. $\rightarrow$ UMAP (" + umap_title_suffix + ")",
+            "UMAP 1",
+            "UMAP 2",
+        ),
+        (
+            emb_b_umap,
+            r"$B^{\mathrm{sym}}$ dist. $\rightarrow$ UMAP (" + umap_title_suffix + ")",
+            "UMAP 1",
+            "UMAP 2",
+        ),
     ]
-    for ax, (emb, title, xl, yl) in zip(np.asarray(axes).ravel(), panels):
+    for ax, (emb, title, xl, yl) in zip(ax_flat[: len(panels)], panels):
         sc = ax.scatter(emb[:, 0], emb[:, 1], c=theta_used, s=12, alpha=0.65, cmap="viridis")
         ax.set_title(title, fontsize=11)
         ax.set_xlabel(xl)
         ax.set_ylabel(yl)
         ax.grid(alpha=0.25, linestyle="--", linewidth=0.8)
     fig.suptitle(r"2D embeddings colored by $\theta$", fontsize=13)
-    fig.colorbar(sc, ax=axes.ravel().tolist(), label=r"$\theta$", shrink=0.58, aspect=30)
+    fig.colorbar(sc, ax=ax_flat[: len(panels)].tolist(), label=r"$\theta$", shrink=0.58, aspect=30)
     plt.savefig(fig_path, dpi=180, bbox_inches="tight")
     plt.close()
 
     summary_path = os.path.join(full_args.output_dir, "h_mds_summary.txt")
     with open(summary_path, "w", encoding="utf-8") as f:
-        f.write("H-matrix + baseline embeddings summary\n")
+        f.write("H/B-matrix + baseline embeddings summary\n")
         f.write(f"dataset_npz: {dataset_npz}\n")
         f.write(f"output_dir: {full_args.output_dir}\n")
         f.write(f"n_samples: {h_sym.shape[0]}\n")
         f.write(f"score_fisher_eval_data: {getattr(full_args, 'score_fisher_eval_data', '')}\n")
-        f.write(f"distance_transform (H→D): {distance_transform}\n")
-        f.write(f"H MDS eigenvalues_used: {lam_used.tolist()}\n")
-        f.write(f"H MDS strain_relative_frobenius: {strain_rel}\n")
+        f.write(f"distance_transform (loss→D): {distance_transform}\n")
+        f.write(f"npz_omits_full_matrices: {not save_full_dense} (threshold n<={N_FULL_MATRIX_SAVE_MAX})\n")
+        f.write(f"h_sym min: {float(np.min(h_sym))} max: {float(np.max(h_sym))}\n")
+        f.write(f"b_sym min: {float(np.min(b_sym))} max: {float(np.max(b_sym))}\n")
+        f.write(f"b_sym_eps: {b_sym_eps}\n")
+        f.write(f"b_sym_n_affinity_clipped: {b_sym_diag.get('b_sym_n_affinity_clipped', '')}\n")
+        f.write(f"b_sym_frac_affinity_clipped: {b_sym_diag.get('b_sym_frac_affinity_clipped', '')}\n")
+        if "b_sym_max_abs_diff_hdir_route" in b_sym_diag:
+            f.write(f"b_sym_max_abs_diff_hdir_route: {b_sym_diag['b_sym_max_abs_diff_hdir_route']}\n")
+        f.write(f"H MDS eigenvalues_used: {lam_h_used.tolist()}\n")
+        f.write(f"H MDS strain_relative_frobenius: {strain_h}\n")
+        f.write(f"B MDS eigenvalues_used: {lam_b_used.tolist()}\n")
+        f.write(f"B MDS strain_relative_frobenius: {strain_b}\n")
         f.write(f"Euclidean MDS eigenvalues_used: {lam_euclid_used.tolist()}\n")
         f.write(f"Euclidean MDS strain_relative_frobenius: {strain_euclid}\n")
         f.write(f"PCA explained_variance_ratio: {pca_evr.tolist()}\n")
         f.write(f"Isomap n_neighbors (requested): {isomap_k}\n")
-        f.write(f"min_eigenvalue_all (H Gram): {float(np.min(lam_all))}\n")
-        f.write(f"max_eigenvalue_all (H Gram): {float(np.max(lam_all))}\n")
+        f.write("(Also: Isomap on precomputed D from H_sym and B_sym; see npz embedding_2d_h_isomap, embedding_2d_b_isomap.)\n")
+        f.write(f"UMAP n_neighbors: {umap_k} min_dist: {umap_min} random_state: {umap_rs}\n")
+        f.write("(UMAP on precomputed D from H_sym and B_sym: embedding_2d_h_umap, embedding_2d_b_umap.)\n")
+        f.write(f"min_eigenvalue_all (H Gram): {float(np.min(lam_h_all))}\n")
+        f.write(f"max_eigenvalue_all (H Gram): {float(np.max(lam_h_all))}\n")
+        f.write(f"min_eigenvalue_all (B Gram): {float(np.min(lam_b_all))}\n")
+        f.write(f"max_eigenvalue_all (B Gram): {float(np.max(lam_b_all))}\n")
         f.write(f"artifacts:\n  {out_npz}\n  {fig_path}\n")
 
     print("[h_mds] Saved:")
@@ -314,8 +558,9 @@ def main() -> None:
     print(f"  - {fig_path}")
     print(f"  - {summary_path}")
     print(
-        f"[h_mds] H_mds strain={strain_rel:.6f} Euclid_mds strain={strain_euclid:.6f} "
-        f"pca_evr={pca_evr} isomap_k={isomap_k}"
+        f"[h_mds] H_mds strain={strain_h:.6f} B_mds strain={strain_b:.6f} "
+        f"Euclid_mds strain={strain_euclid:.6f} pca_evr={pca_evr} isomap_k={isomap_k} "
+        f"(H/B Isomap on D_h, D_b) umap_k={umap_k} umap_min_dist={umap_min}"
     )
 
 

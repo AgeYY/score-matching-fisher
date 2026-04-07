@@ -3,6 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import sys
+from pathlib import Path
+
+_repo_root = Path(__file__).resolve().parent.parent
+if str(_repo_root) not in sys.path:
+    sys.path.insert(0, str(_repo_root))
+
+from global_setting import DATAROOT
 
 
 def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
@@ -180,7 +188,11 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         help="Log per-center decoder skip details (counts and reasons) to stdout.",
     )
     p.add_argument("--log-every", type=int, default=5)
-    p.add_argument("--output-dir", type=str, default="data/outputs_step6_shared_dataset")
+    p.add_argument(
+        "--output-dir",
+        type=str,
+        default=str(Path(DATAROOT) / "outputs_step6_shared_dataset"),
+    )
     p.add_argument(
         "--compute-h-matrix",
         action="store_true",
@@ -226,8 +238,8 @@ def parse_dataset_only_args(argv: list[str] | None = None) -> argparse.Namespace
     p.add_argument(
         "--output-npz",
         type=str,
-        default="data/shared_fisher_dataset.npz",
-        help="Path to write the shared dataset .npz (under data/ recommended).",
+        default=str(Path(DATAROOT) / "shared_fisher_dataset.npz"),
+        help="Path to write the shared dataset .npz (under DATAROOT recommended).",
     )
     return p.parse_args(argv)
 
