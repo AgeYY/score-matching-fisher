@@ -41,6 +41,44 @@ class ConditionalScore1D(nn.Module):
         return self.forward(theta, x, sigma)
 
 
+class ConditionalXScore(nn.Module):
+    """Conditional x-score model for s(x_tilde, theta, sigma) with vector output in R^{x_dim}."""
+
+    def __init__(
+        self,
+        x_dim: int = 2,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        use_log_sigma: bool = True,
+    ) -> None:
+        super().__init__()
+        if x_dim < 2:
+            raise ValueError("x_dim must be >= 2.")
+        self.x_dim = int(x_dim)
+        self.use_log_sigma = bool(use_log_sigma)
+        in_dim = x_dim + 1 + 1  # x_tilde, theta, sigma
+        layers: list[nn.Module] = []
+        for _ in range(depth):
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            layers.append(nn.SiLU())
+            in_dim = hidden_dim
+        layers.append(nn.Linear(hidden_dim, x_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x_tilde: torch.Tensor, theta: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+        if sigma.ndim == 1:
+            sigma = sigma.unsqueeze(-1)
+        sigma_feat = torch.log(torch.clamp(sigma, min=1e-8)) if self.use_log_sigma else sigma
+        feats = torch.cat([x_tilde, theta, sigma_feat], dim=-1)
+        return self.net(feats)
+
+    @torch.no_grad()
+    def predict_score(self, x: torch.Tensor, theta: torch.Tensor, sigma_eval: float) -> torch.Tensor:
+        self.eval()
+        sigma = torch.full((x.shape[0], 1), float(sigma_eval), device=x.device)
+        return self.forward(x, theta, sigma)
+
+
 class PriorScore1D(nn.Module):
     """Unconditional score model for s(theta_tilde, sigma) approximating prior score over scalar theta."""
 
