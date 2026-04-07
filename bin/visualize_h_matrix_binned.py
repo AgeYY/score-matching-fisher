@@ -24,7 +24,7 @@ import torch
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 
-from global_setting import DATAROOT
+from global_setting import DATA_DIR
 from fisher.cli_shared_fisher import add_estimation_arguments
 from fisher.shared_dataset_io import SharedDatasetBundle, load_shared_dataset_npz
 from fisher.shared_fisher_est import (
@@ -120,7 +120,7 @@ def parse_args() -> argparse.Namespace:
         help="Sampling seed for GT approximation; -1 uses dataset seed + 17.",
     )
     add_estimation_arguments(p)
-    p.set_defaults(output_dir=str(Path(DATAROOT) / "outputs_h_matrix_binned"))
+    p.set_defaults(output_dir=str(Path(DATA_DIR) / "outputs_h_matrix_binned"))
     return p.parse_args()
 
 

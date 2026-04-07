@@ -31,7 +31,7 @@ except ImportError as e:
         "Install with: pip install umap-learn"
     ) from e
 
-from global_setting import DATAROOT
+from global_setting import DATA_DIR
 from fisher.cli_shared_fisher import add_estimation_arguments
 from fisher.shared_dataset_io import SharedDatasetBundle, load_shared_dataset_npz
 from fisher.shared_fisher_est import (
@@ -116,7 +116,7 @@ def parse_args() -> argparse.Namespace:
     )
     add_estimation_arguments(p)
     # Prefer a dedicated default output directory for this workflow (overrides estimation default).
-    p.set_defaults(output_dir=str(Path(DATAROOT) / "outputs_h_matrix_mds"))
+    p.set_defaults(output_dir=str(Path(DATA_DIR) / "outputs_h_matrix_mds"))
     return p.parse_args()
 
 

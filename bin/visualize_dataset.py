@@ -15,7 +15,7 @@ if str(_repo_root) not in sys.path:
 import matplotlib.pyplot as plt
 import numpy as np
 
-from global_setting import DATAROOT
+from global_setting import DATA_DIR
 from fisher.data import ToyConditionalGMMNonGaussianDataset, ToyConditionalGaussianDataset
 from fisher.shared_dataset_io import load_shared_dataset_npz
 from fisher.shared_fisher_est import build_dataset_from_meta
@@ -240,7 +240,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=str,
-        default=str(Path(DATAROOT) / "outputs_step2"),
+        default=str(Path(DATA_DIR) / "outputs_step2"),
     )
     return parser.parse_args()
 

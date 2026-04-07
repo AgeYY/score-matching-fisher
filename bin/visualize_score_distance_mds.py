@@ -26,7 +26,7 @@ except ImportError as e:
         "Install with: pip install umap-learn"
     ) from e
 
-from global_setting import DATAROOT
+from global_setting import DATA_DIR
 from fisher.models import (
     ConditionalXFlowVelocity,
     ConditionalXFlowVelocityFiLMPerLayer,
@@ -64,7 +64,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--dataset-npz", type=str, required=True, help="Path to shared dataset .npz.")
     p.add_argument("--device", type=str, default="cuda")
-    p.add_argument("--output-dir", type=str, default=str(Path(DATAROOT) / "outputs_score_distance_mds"))
+    p.add_argument("--output-dir", type=str, default=str(Path(DATA_DIR) / "outputs_score_distance_mds"))
     p.add_argument(
         "--method",
         type=str,

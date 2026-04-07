@@ -10,7 +10,7 @@ _repo_root = Path(__file__).resolve().parent.parent
 if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 
-from global_setting import DATAROOT
+from global_setting import DATA_DIR
 
 
 def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
@@ -19,7 +19,7 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
         "--dataset-family",
         type=str,
         default="gmm_non_gauss",
-        choices=["gaussian", "gmm_non_gauss", "cos_sin_piecewise_noise"],
+        choices=["gaussian", "gmm_non_gauss", "cos_sin_piecewise_noise", "linear_piecewise_noise"],
     )
     p.add_argument(
         "--tuning-curve-family",
@@ -73,25 +73,31 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
         "--sigma-piecewise-low",
         type=float,
         default=0.30,
-        help="Piecewise scalar std for cos_sin_piecewise_noise when theta is on the low-noise side.",
+        help="Piecewise scalar std for cos_sin/linear piecewise_noise when theta is on the low-noise side.",
     )
     p.add_argument(
         "--sigma-piecewise-high",
         type=float,
         default=0.90,
-        help="Piecewise scalar std for cos_sin_piecewise_noise when theta is on the high-noise side.",
+        help="Piecewise scalar std for cos_sin/linear piecewise_noise when theta is on the high-noise side.",
+    )
+    p.add_argument(
+        "--linear-k",
+        type=float,
+        default=1.0,
+        help="For linear_piecewise_noise: first component mean is linear_k * theta (second is theta).",
     )
     p.add_argument(
         "--theta-zero-to-low",
         action="store_true",
         default=True,
-        help="For cos_sin_piecewise_noise: include theta=0 in the low-noise side (theta<=0 low, theta>0 high).",
+        help="For cos_sin/linear piecewise_noise: include theta=0 in the low-noise side (theta<=0 low, theta>0 high).",
     )
     p.add_argument(
         "--no-theta-zero-to-low",
         action="store_false",
         dest="theta_zero_to_low",
-        help="For cos_sin_piecewise_noise: put theta=0 in the high-noise side (theta<0 low, theta>=0 high).",
+        help="For cos_sin/linear piecewise_noise: put theta=0 in the high-noise side (theta<0 low, theta>=0 high).",
     )
     p.add_argument("--n-total", type=int, default=3000)
     p.add_argument(
@@ -258,7 +264,7 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--output-dir",
         type=str,
-        default=str(Path(DATAROOT) / "outputs_step6_shared_dataset"),
+        default=str(Path(DATA_DIR) / "outputs_step6_shared_dataset"),
     )
     p.add_argument(
         "--compute-h-matrix",
@@ -305,8 +311,8 @@ def parse_dataset_only_args(argv: list[str] | None = None) -> argparse.Namespace
     p.add_argument(
         "--output-npz",
         type=str,
-        default=str(Path(DATAROOT) / "shared_fisher_dataset.npz"),
-        help="Path to write the shared dataset .npz (under DATAROOT recommended).",
+        default=str(Path(DATA_DIR) / "shared_fisher_dataset.npz"),
+        help="Path to write the shared dataset .npz (under DATAROOT/data recommended).",
     )
     return p.parse_args(argv)
 
