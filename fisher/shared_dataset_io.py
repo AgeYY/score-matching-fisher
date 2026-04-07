@@ -58,6 +58,9 @@ def meta_dict_from_args(ns: Any) -> dict[str, Any]:
         "gmm_mix_bias": float(ns.gmm_mix_bias),
         "gmm_mix_freq": float(ns.gmm_mix_freq),
         "gmm_mix_phase": float(ns.gmm_mix_phase),
+        "sigma_piecewise_low": float(ns.sigma_piecewise_low),
+        "sigma_piecewise_high": float(ns.sigma_piecewise_high),
+        "theta_zero_to_low": bool(ns.theta_zero_to_low),
         "n_total": int(ns.n_total),
         "train_frac": float(ns.train_frac),
     }

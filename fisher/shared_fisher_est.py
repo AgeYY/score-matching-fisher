@@ -12,7 +12,7 @@ import torch
 
 from global_setting import SCORE_VAL_FRACTION
 
-from fisher.data import ToyConditionalGMMNonGaussianDataset, ToyConditionalGaussianDataset
+from fisher.data import ToyConditionalGMMNonGaussianDataset, ToyConditionalGaussianDataset, ToyCosSinPiecewiseNoiseDataset
 from fisher.evaluation import evaluate_score_fisher, evaluate_score_fisher_with_prior, parse_sigma_alpha_list
 from fisher.h_matrix import HMatrixEstimator, HMatrixResult
 from fisher.models import (
@@ -41,7 +41,9 @@ def require_device(name: str) -> torch.device:
     return torch.device(name)
 
 
-def analytic_fisher_curve(centers: np.ndarray, dataset: ToyConditionalGaussianDataset) -> np.ndarray:
+def analytic_fisher_curve(
+    centers: np.ndarray, dataset: ToyConditionalGaussianDataset | ToyCosSinPiecewiseNoiseDataset
+) -> np.ndarray:
     t = centers.reshape(-1, 1)
     dmu = dataset.tuning_curve_derivative(t)
     cov = dataset.covariance(t)
@@ -387,7 +389,9 @@ def fit_decoder_from_shared_data(
     return fisher, se, valid, diag
 
 
-def build_dataset_from_meta(meta: dict[str, Any]) -> ToyConditionalGaussianDataset | ToyConditionalGMMNonGaussianDataset:
+def build_dataset_from_meta(
+    meta: dict[str, Any],
+) -> ToyConditionalGaussianDataset | ToyCosSinPiecewiseNoiseDataset | ToyConditionalGMMNonGaussianDataset:
     family = str(meta["dataset_family"])
     seed = int(meta["seed"])
     if family == "gaussian":
@@ -435,10 +439,22 @@ def build_dataset_from_meta(meta: dict[str, Any]) -> ToyConditionalGaussianDatas
             mix_phase=float(meta["gmm_mix_phase"]),
             seed=seed,
         )
+    if family == "cos_sin_piecewise_noise":
+        return ToyCosSinPiecewiseNoiseDataset(
+            theta_low=float(meta["theta_low"]),
+            theta_high=float(meta["theta_high"]),
+            x_dim=int(meta["x_dim"]),
+            sigma_piecewise_low=float(meta.get("sigma_piecewise_low", 0.30)),
+            sigma_piecewise_high=float(meta.get("sigma_piecewise_high", 0.90)),
+            theta_zero_to_low=bool(meta.get("theta_zero_to_low", True)),
+            seed=seed,
+        )
     raise ValueError(f"Unknown dataset_family: {family}")
 
 
-def build_dataset_from_args(ns: Any) -> ToyConditionalGaussianDataset | ToyConditionalGMMNonGaussianDataset:
+def build_dataset_from_args(
+    ns: Any,
+) -> ToyConditionalGaussianDataset | ToyCosSinPiecewiseNoiseDataset | ToyConditionalGMMNonGaussianDataset:
     return build_dataset_from_meta(meta_dict_from_args(ns))
 
 
@@ -452,6 +468,12 @@ def validate_dataset_sample_args(args: Any) -> None:
             raise ValueError("--vm-mu-amp must be positive for von_mises_raw.")
     if args.x_dim < 2:
         raise ValueError("--x-dim must be >= 2.")
+    if str(getattr(args, "dataset_family", "")) == "cos_sin_piecewise_noise" and int(args.x_dim) != 2:
+        raise ValueError("--dataset-family cos_sin_piecewise_noise requires --x-dim 2.")
+    if float(getattr(args, "sigma_piecewise_low", 0.0)) <= 0.0:
+        raise ValueError("--sigma-piecewise-low must be positive.")
+    if float(getattr(args, "sigma_piecewise_high", 0.0)) <= 0.0:
+        raise ValueError("--sigma-piecewise-high must be positive.")
     if int(args.n_total) < 2:
         raise ValueError("--n-total must be >= 2 for train/eval split.")
     if not (0.0 < float(args.train_frac) <= 1.0):
@@ -530,7 +552,7 @@ def merge_meta_into_args(meta: dict[str, Any], est_ns: Any) -> Any:
 
 def run_shared_fisher_estimation(
     args: Any,
-    dataset: ToyConditionalGaussianDataset | ToyConditionalGMMNonGaussianDataset,
+    dataset: ToyConditionalGaussianDataset | ToyCosSinPiecewiseNoiseDataset | ToyConditionalGMMNonGaussianDataset,
     *,
     theta_all: np.ndarray,
     x_all: np.ndarray,
@@ -1180,7 +1202,7 @@ def run_shared_fisher_estimation(
         debug_bins=bool(getattr(args, "decoder_debug_bins", False)),
     )
 
-    if args.dataset_family == "gaussian":
+    if args.dataset_family in ("gaussian", "cos_sin_piecewise_noise"):
         gt = analytic_fisher_curve(centers, dataset)
         gt_se = np.full_like(gt, np.nan)
     else:
@@ -1584,6 +1606,13 @@ def run_shared_fisher_estimation(
                 f"freq1={args.cov_theta_freq1}, freq2={args.cov_theta_freq2}, freq_rho={args.cov_theta_freq_rho}, "
                 f"phase1={args.cov_theta_phase1}, phase2={args.cov_theta_phase2}, phase_rho={args.cov_theta_phase_rho}, "
                 f"rho_clip={args.rho_clip}\n"
+            )
+        elif args.dataset_family == "cos_sin_piecewise_noise":
+            f.write(
+                "cos_sin_piecewise_noise: "
+                f"sigma_piecewise_low={args.sigma_piecewise_low}, "
+                f"sigma_piecewise_high={args.sigma_piecewise_high}, "
+                f"theta_zero_to_low={args.theta_zero_to_low}\n"
             )
         else:
             f.write(

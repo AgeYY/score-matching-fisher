@@ -15,7 +15,12 @@ from global_setting import DATAROOT
 
 def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--seed", type=int, default=7)
-    p.add_argument("--dataset-family", type=str, default="gmm_non_gauss", choices=["gaussian", "gmm_non_gauss"])
+    p.add_argument(
+        "--dataset-family",
+        type=str,
+        default="gmm_non_gauss",
+        choices=["gaussian", "gmm_non_gauss", "cos_sin_piecewise_noise"],
+    )
     p.add_argument(
         "--tuning-curve-family",
         type=str,
@@ -64,6 +69,30 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--gmm-mix-bias", type=float, default=0.00)
     p.add_argument("--gmm-mix-freq", type=float, default=0.95)
     p.add_argument("--gmm-mix-phase", type=float, default=-0.20)
+    p.add_argument(
+        "--sigma-piecewise-low",
+        type=float,
+        default=0.30,
+        help="Piecewise scalar std for cos_sin_piecewise_noise when theta is on the low-noise side.",
+    )
+    p.add_argument(
+        "--sigma-piecewise-high",
+        type=float,
+        default=0.90,
+        help="Piecewise scalar std for cos_sin_piecewise_noise when theta is on the high-noise side.",
+    )
+    p.add_argument(
+        "--theta-zero-to-low",
+        action="store_true",
+        default=True,
+        help="For cos_sin_piecewise_noise: include theta=0 in the low-noise side (theta<=0 low, theta>0 high).",
+    )
+    p.add_argument(
+        "--no-theta-zero-to-low",
+        action="store_false",
+        dest="theta_zero_to_low",
+        help="For cos_sin_piecewise_noise: put theta=0 in the high-noise side (theta<0 low, theta>=0 high).",
+    )
     p.add_argument("--n-total", type=int, default=3000)
     p.add_argument(
         "--train-frac",

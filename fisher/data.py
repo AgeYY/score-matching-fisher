@@ -165,6 +165,82 @@ class ToyConditionalGaussianDataset:
 
 
 @dataclass
+class ToyCosSinPiecewiseNoiseDataset:
+    theta_low: float = -np.pi - 0.5
+    theta_high: float = np.pi + 0.5
+    x_dim: int = 2
+    sigma_piecewise_low: float = 0.30
+    sigma_piecewise_high: float = 0.90
+    theta_zero_to_low: bool = True
+    seed: int = 42
+
+    def __post_init__(self) -> None:
+        if not (self.theta_low < self.theta_high):
+            raise ValueError("theta_low must be smaller than theta_high.")
+        if self.x_dim != 2:
+            raise ValueError("ToyCosSinPiecewiseNoiseDataset requires x_dim == 2.")
+        if self.sigma_piecewise_low <= 0.0 or self.sigma_piecewise_high <= 0.0:
+            raise ValueError("sigma_piecewise_low and sigma_piecewise_high must be positive.")
+        self.rng = np.random.default_rng(self.seed)
+
+    def sample_theta(self, n: int) -> np.ndarray:
+        theta = self.rng.uniform(self.theta_low, self.theta_high, size=(n, 1))
+        return theta.astype(np.float64)
+
+    def tuning_curve(self, theta: np.ndarray) -> np.ndarray:
+        t = _theta_col(theta)
+        return np.concatenate([np.cos(t), np.sin(t)], axis=1).astype(np.float64)
+
+    def tuning_curve_derivative(self, theta: np.ndarray) -> np.ndarray:
+        t = _theta_col(theta)
+        return np.concatenate([-np.sin(t), np.cos(t)], axis=1).astype(np.float64)
+
+    def _sigma_from_theta(self, theta: np.ndarray) -> np.ndarray:
+        t = _theta_col(theta).reshape(-1)
+        if self.theta_zero_to_low:
+            low_mask = t <= 0.0
+        else:
+            low_mask = t < 0.0
+        sigma = np.where(low_mask, self.sigma_piecewise_low, self.sigma_piecewise_high)
+        return sigma.astype(np.float64)
+
+    def covariance_scales(self, theta: np.ndarray) -> np.ndarray:
+        sigma = self._sigma_from_theta(theta).reshape(-1, 1)
+        return np.repeat(sigma, repeats=2, axis=1).astype(np.float64)
+
+    def covariance_scales_derivative(self, theta: np.ndarray) -> np.ndarray:
+        # Piecewise-constant sigma(theta): derivative is zero away from the discontinuity at theta=0.
+        n = _theta_col(theta).shape[0]
+        return np.zeros((n, 2), dtype=np.float64)
+
+    def covariance(self, theta: np.ndarray) -> np.ndarray:
+        sigma = self._sigma_from_theta(theta)
+        var = sigma**2
+        n = var.shape[0]
+        cov = np.zeros((n, 2, 2), dtype=np.float64)
+        cov[:, 0, 0] = var
+        cov[:, 1, 1] = var
+        return cov
+
+    def covariance_derivative(self, theta: np.ndarray) -> np.ndarray:
+        # Piecewise-constant variance(theta): derivative is zero away from the discontinuity at theta=0.
+        n = _theta_col(theta).shape[0]
+        return np.zeros((n, 2, 2), dtype=np.float64)
+
+    def sample_x(self, theta: np.ndarray) -> np.ndarray:
+        mu = self.tuning_curve(theta)
+        sigma = self._sigma_from_theta(theta).reshape(-1, 1)
+        eps = self.rng.standard_normal(size=mu.shape)
+        x = mu + sigma * eps
+        return x.astype(np.float64)
+
+    def sample_joint(self, n: int) -> tuple[np.ndarray, np.ndarray]:
+        theta = self.sample_theta(n)
+        x = self.sample_x(theta)
+        return theta, x
+
+
+@dataclass
 class ToyConditionalGMMNonGaussianDataset:
     theta_low: float = -3.0
     theta_high: float = 3.0
@@ -416,7 +492,7 @@ def make_theta_grid(theta_low: float, theta_high: float, eval_margin: float, n_b
 
 
 def make_local_decoder_data(
-    dataset: ToyConditionalGaussianDataset | ToyConditionalGMMNonGaussianDataset,
+    dataset: ToyConditionalGaussianDataset | ToyCosSinPiecewiseNoiseDataset | ToyConditionalGMMNonGaussianDataset,
     theta0: float,
     epsilon: float,
     n_train_local: int,

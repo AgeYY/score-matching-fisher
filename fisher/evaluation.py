@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from fisher.data import ToyConditionalGMMNonGaussianDataset, ToyConditionalGaussianDataset
+from fisher.data import ToyConditionalGMMNonGaussianDataset, ToyConditionalGaussianDataset, ToyCosSinPiecewiseNoiseDataset
 from fisher.models import ConditionalScore1D, LocalDecoderLogit, PriorScore1D
 
 
@@ -18,7 +18,11 @@ def parse_sigma_alpha_list(items: list[float]) -> np.ndarray:
     return np.unique(arr)[::-1]
 
 
-def log_p_x_given_theta(x: np.ndarray, theta: np.ndarray, dataset: ToyConditionalGaussianDataset) -> np.ndarray:
+def log_p_x_given_theta(
+    x: np.ndarray,
+    theta: np.ndarray,
+    dataset: ToyConditionalGaussianDataset | ToyCosSinPiecewiseNoiseDataset,
+) -> np.ndarray:
     if hasattr(dataset, "log_p_x_given_theta"):
         return dataset.log_p_x_given_theta(x, theta)
     mu = dataset.tuning_curve(theta)
@@ -34,7 +38,7 @@ def log_p_x_given_theta(x: np.ndarray, theta: np.ndarray, dataset: ToyConditiona
 def finite_difference_score(
     x: np.ndarray,
     theta: np.ndarray,
-    dataset: ToyConditionalGaussianDataset | ToyConditionalGMMNonGaussianDataset,
+    dataset: ToyConditionalGaussianDataset | ToyCosSinPiecewiseNoiseDataset | ToyConditionalGMMNonGaussianDataset,
     delta: float,
 ) -> np.ndarray:
     theta_plus = theta + delta
@@ -178,7 +182,7 @@ def evaluate_score_fisher(
     model: ConditionalScore1D,
     theta_eval: np.ndarray,
     x_eval: np.ndarray,
-    dataset: ToyConditionalGaussianDataset | ToyConditionalGMMNonGaussianDataset,
+    dataset: ToyConditionalGaussianDataset | ToyCosSinPiecewiseNoiseDataset | ToyConditionalGMMNonGaussianDataset,
     sigma_values: np.ndarray,
     fd_delta: float,
     n_bins: int,
@@ -277,7 +281,7 @@ def evaluate_score_fisher_with_prior(
     model_prior: PriorScore1D,
     theta_eval: np.ndarray,
     x_eval: np.ndarray,
-    dataset: ToyConditionalGaussianDataset | ToyConditionalGMMNonGaussianDataset,
+    dataset: ToyConditionalGaussianDataset | ToyCosSinPiecewiseNoiseDataset | ToyConditionalGMMNonGaussianDataset,
     sigma_values: np.ndarray,
     fd_delta: float,
     n_bins: int,
@@ -406,7 +410,7 @@ def evaluate_local_decoder(
     x_eval_pos: np.ndarray,
     x_eval_neg: np.ndarray,
     epsilon: float,
-    dataset: ToyConditionalGaussianDataset | ToyConditionalGMMNonGaussianDataset,
+    dataset: ToyConditionalGaussianDataset | ToyCosSinPiecewiseNoiseDataset | ToyConditionalGMMNonGaussianDataset,
     theta0: float,
     n_eval_local: int,
     fd_delta: float,
