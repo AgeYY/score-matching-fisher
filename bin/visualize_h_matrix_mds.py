@@ -31,7 +31,6 @@ except ImportError as e:
         "Install with: pip install umap-learn"
     ) from e
 
-from global_setting import DATAROOT
 from fisher.cli_shared_fisher import add_estimation_arguments
 from fisher.shared_dataset_io import SharedDatasetBundle, load_shared_dataset_npz
 from fisher.shared_fisher_est import (
@@ -115,8 +114,6 @@ def parse_args() -> argparse.Namespace:
         help="Do not store N×N distance / H / B arrays in h_mds_embedding.npz (much smaller file; avoids disk quota issues).",
     )
     add_estimation_arguments(p)
-    # Prefer a dedicated default output directory for this workflow (overrides estimation default).
-    p.set_defaults(output_dir=str(Path(DATAROOT) / "outputs_h_matrix_mds"))
     return p.parse_args()
 
 

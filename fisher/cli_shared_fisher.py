@@ -200,7 +200,8 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--output-dir",
         type=str,
-        default=str(Path(DATAROOT) / "outputs_step6_shared_dataset"),
+        default=str(Path(DATAROOT)),
+        help="Directory for plots, metrics, and checkpoints. Default is DATAROOT (global_setting.DATAROOT).",
     )
     p.add_argument(
         "--compute-h-matrix",

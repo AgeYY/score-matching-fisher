@@ -240,7 +240,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=str,
-        default=str(Path(DATAROOT) / "outputs_step2"),
+        default=str(Path(DATAROOT)),
+        help="Directory for saved figures. Default is DATAROOT (global_setting.DATAROOT).",
     )
     return parser.parse_args()
 
