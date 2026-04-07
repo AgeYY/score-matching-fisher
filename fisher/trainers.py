@@ -5,7 +5,17 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from fisher.models import ConditionalScore1D, ConditionalXScore, LocalDecoderLogit, PriorScore1D
+from fisher.models import (
+    ConditionalScore1D,
+    ConditionalScore1DFiLMPerLayer,
+    ConditionalXScore,
+    ConditionalXScoreFiLMPerLayer,
+    ConditionalXScoreResidualConcat,
+    LocalDecoderLogit,
+    PriorScore1D,
+    UnconditionalXScore,
+    UnconditionalXScoreFiLMPerLayer,
+)
 
 
 def to_score_loader(theta: np.ndarray, x: np.ndarray, batch_size: int, shuffle: bool = True) -> DataLoader:
@@ -25,6 +35,12 @@ def to_decoder_loader(x: np.ndarray, y: np.ndarray, batch_size: int, shuffle: bo
 def to_prior_loader(theta: np.ndarray, batch_size: int, shuffle: bool = True) -> DataLoader:
     t = torch.from_numpy(theta.astype(np.float32))
     ds = TensorDataset(t)
+    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, drop_last=False)
+
+
+def to_x_loader(x: np.ndarray, batch_size: int, shuffle: bool = True) -> DataLoader:
+    xx = torch.from_numpy(x.astype(np.float32))
+    ds = TensorDataset(xx)
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, drop_last=False)
 
 
@@ -62,7 +78,7 @@ def sample_continuous_geometric_sigmas(
 
 
 def train_score_model(
-    model: ConditionalScore1D,
+    model: ConditionalScore1D | ConditionalScore1DFiLMPerLayer,
     theta_train: np.ndarray,
     x_train: np.ndarray,
     sigma_values: np.ndarray,
@@ -112,7 +128,7 @@ def train_score_model(
             eps = torch.randn_like(tb)
             theta_tilde = tb + sigma * eps
             target = -(theta_tilde - tb) / (sigma**2)
-            pred = model(theta_tilde, xb, sigma)
+            pred = model(theta_tilde, xb, sigma, theta=tb)
             loss = torch.mean((pred - target) ** 2)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -134,7 +150,7 @@ def train_score_model(
                     eps = torch.randn_like(tb)
                     theta_tilde = tb + sigma * eps
                     target = -(theta_tilde - tb) / (sigma**2)
-                    pred = model(theta_tilde, xb, sigma)
+                    pred = model(theta_tilde, xb, sigma, theta=tb)
                     val_loss = torch.mean((pred - target) ** 2)
                     val_epoch_losses.append(float(val_loss.item()))
             mean_val_loss = float(np.mean(val_epoch_losses))
@@ -187,7 +203,7 @@ def train_score_model(
 
 
 def train_score_model_ncsm_continuous(
-    model: ConditionalScore1D,
+    model: ConditionalScore1D | ConditionalScore1DFiLMPerLayer,
     theta_train: np.ndarray,
     x_train: np.ndarray,
     sigma_min: float,
@@ -240,7 +256,7 @@ def train_score_model_ncsm_continuous(
             )
             eps = torch.randn_like(tb)
             theta_tilde = tb + sigma * eps
-            pred = model(theta_tilde, xb, sigma)
+            pred = model(theta_tilde, xb, sigma, theta=tb)
             loss = torch.mean((sigma * pred + eps) ** 2)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -265,7 +281,7 @@ def train_score_model_ncsm_continuous(
                     )
                     eps = torch.randn_like(tb)
                     theta_tilde = tb + sigma * eps
-                    pred = model(theta_tilde, xb, sigma)
+                    pred = model(theta_tilde, xb, sigma, theta=tb)
                     val_loss = torch.mean((sigma * pred + eps) ** 2)
                     val_epoch_losses.append(float(val_loss.item()))
             mean_val_loss = float(np.mean(val_epoch_losses))
@@ -318,7 +334,7 @@ def train_score_model_ncsm_continuous(
 
 
 def train_conditional_x_score_model_ncsm_continuous(
-    model: ConditionalXScore,
+    model: ConditionalXScore | ConditionalXScoreResidualConcat | ConditionalXScoreFiLMPerLayer,
     theta_train: np.ndarray,
     x_train: np.ndarray,
     sigma_min: float,
@@ -423,6 +439,129 @@ def train_conditional_x_score_model_ncsm_continuous(
                 )
             else:
                 print(f"[epoch {epoch:4d}/{epochs}] x_ncsm_loss={mean_train_loss:.6f}")
+
+        if has_val and patience_counter >= early_stopping_patience:
+            stopped_early = True
+            stopped_epoch = epoch
+            print(
+                f"[early-stop] epoch={epoch} best_epoch={best_epoch} "
+                f"best_smooth={best_val_loss:.6f} patience={early_stopping_patience}"
+            )
+            break
+
+    if has_val and restore_best and best_state is not None:
+        model.load_state_dict(best_state)
+        print(f"[restore-best] restored epoch={best_epoch} val_smooth={best_val_loss:.6f}")
+
+    return {
+        "train_losses": train_losses,
+        "val_losses": val_losses,
+        "val_monitor_losses": val_monitor_losses,
+        "best_val_loss": float(best_val_loss),
+        "best_epoch": int(best_epoch),
+        "stopped_epoch": int(stopped_epoch),
+        "stopped_early": bool(stopped_early),
+    }
+
+
+def train_unconditional_x_score_model_ncsm_continuous(
+    model: UnconditionalXScore | UnconditionalXScoreFiLMPerLayer,
+    x_train: np.ndarray,
+    sigma_min: float,
+    sigma_max: float,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    device: torch.device,
+    log_every: int,
+    x_val: np.ndarray | None = None,
+    early_stopping_patience: int = 30,
+    early_stopping_min_delta: float = 1e-4,
+    early_stopping_ema_alpha: float = 0.05,
+    restore_best: bool = True,
+) -> dict[str, float | int | bool | list[float]]:
+    loader = to_x_loader(x_train, batch_size=batch_size, shuffle=True)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    has_val = x_val is not None and len(x_val) > 0
+    val_loader = to_x_loader(x_val, batch_size=batch_size, shuffle=False) if has_val else None
+    train_losses: list[float] = []
+    val_losses: list[float] = []
+    val_monitor_losses: list[float] = []
+    best_val_loss = float("inf")
+    best_epoch = 0
+    best_state: dict[str, torch.Tensor] | None = None
+    patience_counter = 0
+    stopped_early = False
+    stopped_epoch = epochs
+    val_ema: float | None = None
+    alpha = float(early_stopping_ema_alpha)
+    if not (0.0 < alpha <= 1.0):
+        raise ValueError("early_stopping_ema_alpha must be in (0, 1].")
+
+    for epoch in range(1, epochs + 1):
+        epoch_losses: list[float] = []
+        model.train()
+        for (xb,) in loader:
+            xb = xb.to(device, non_blocking=True)
+            sigma = sample_continuous_geometric_sigmas(
+                batch_size=xb.shape[0],
+                sigma_min=sigma_min,
+                sigma_max=sigma_max,
+                device=xb.device,
+            )
+            eps = torch.randn_like(xb)
+            x_tilde = xb + sigma * eps
+            pred = model(x_tilde, sigma)
+            loss = torch.mean((sigma * pred + eps) ** 2)
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+            epoch_losses.append(float(loss.item()))
+        mean_train_loss = float(np.mean(epoch_losses))
+        train_losses.append(mean_train_loss)
+
+        mean_val_loss = float("nan")
+        if has_val and val_loader is not None:
+            model.eval()
+            val_epoch_losses: list[float] = []
+            with torch.no_grad():
+                for (xb,) in val_loader:
+                    xb = xb.to(device, non_blocking=True)
+                    sigma = sample_continuous_geometric_sigmas(
+                        batch_size=xb.shape[0],
+                        sigma_min=sigma_min,
+                        sigma_max=sigma_max,
+                        device=xb.device,
+                    )
+                    eps = torch.randn_like(xb)
+                    x_tilde = xb + sigma * eps
+                    pred = model(x_tilde, sigma)
+                    val_loss = torch.mean((sigma * pred + eps) ** 2)
+                    val_epoch_losses.append(float(val_loss.item()))
+            mean_val_loss = float(np.mean(val_epoch_losses))
+            val_ema = _ema_update_val_monitor(val_ema, mean_val_loss, alpha)
+            smooth_val_loss = val_ema
+            if smooth_val_loss < (best_val_loss - early_stopping_min_delta):
+                best_val_loss = smooth_val_loss
+                best_epoch = epoch
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                patience_counter = 0
+            else:
+                patience_counter += 1
+            val_monitor_losses.append(smooth_val_loss)
+        else:
+            val_monitor_losses.append(float("nan"))
+        val_losses.append(mean_val_loss)
+
+        if epoch == 1 or epoch % log_every == 0 or epoch == epochs:
+            if has_val:
+                print(
+                    f"[epoch {epoch:4d}/{epochs}] x_uncond_ncsm_train={mean_train_loss:.6f} "
+                    f"val_loss={mean_val_loss:.6f} val_smooth={val_monitor_losses[-1]:.6f} "
+                    f"best_smooth={best_val_loss:.6f} best_epoch={best_epoch}"
+                )
+            else:
+                print(f"[epoch {epoch:4d}/{epochs}] x_uncond_ncsm_loss={mean_train_loss:.6f}")
 
         if has_val and patience_counter >= early_stopping_patience:
             stopped_early = True

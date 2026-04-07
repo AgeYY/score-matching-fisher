@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from fisher.models import ConditionalScore1D, PriorScore1D
+from fisher.models import ConditionalScore1D, ConditionalScore1DFiLMPerLayer, PriorScore1D
 
 
 @dataclass
@@ -33,7 +33,7 @@ class HMatrixEstimator:
     def __init__(
         self,
         *,
-        model_post: ConditionalScore1D,
+        model_post: ConditionalScore1D | ConditionalScore1DFiLMPerLayer,
         model_prior: PriorScore1D,
         sigma_eval: float,
         device: torch.device,

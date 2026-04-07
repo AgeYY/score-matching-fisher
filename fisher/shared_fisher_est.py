@@ -15,7 +15,7 @@ from global_setting import SCORE_VAL_FRACTION
 from fisher.data import ToyConditionalGMMNonGaussianDataset, ToyConditionalGaussianDataset
 from fisher.evaluation import evaluate_score_fisher, evaluate_score_fisher_with_prior, parse_sigma_alpha_list
 from fisher.h_matrix import HMatrixEstimator, HMatrixResult
-from fisher.models import ConditionalScore1D, LocalDecoderLogit, PriorScore1D
+from fisher.models import ConditionalScore1D, ConditionalScore1DFiLMPerLayer, LocalDecoderLogit, PriorScore1D
 from fisher.shared_dataset_io import meta_dict_from_args
 from fisher.trainers import (
     geometric_sigma_schedule,
@@ -588,12 +588,22 @@ def run_shared_fisher_estimation(
         sigma_base = args.score_fixed_sigma
         print(f"[sigma_scale] mode=fixed sigma={args.score_fixed_sigma:.6f} theta_std={theta_std:.6f}")
 
-    score_model = ConditionalScore1D(
-        x_dim=args.x_dim,
-        hidden_dim=args.score_hidden_dim,
-        depth=args.score_depth,
-        use_log_sigma=(args.score_noise_mode == "continuous"),
-    ).to(device)
+    score_arch = str(getattr(args, "score_arch", "plain"))
+    if score_arch == "film_per_layer":
+        score_model = ConditionalScore1DFiLMPerLayer(
+            x_dim=args.x_dim,
+            hidden_dim=args.score_hidden_dim,
+            depth=args.score_depth,
+            use_log_sigma=(args.score_noise_mode == "continuous"),
+        ).to(device)
+    else:
+        score_model = ConditionalScore1D(
+            x_dim=args.x_dim,
+            hidden_dim=args.score_hidden_dim,
+            depth=args.score_depth,
+            use_log_sigma=(args.score_noise_mode == "continuous"),
+        ).to(device)
+    print(f"[score_model] arch={score_arch}")
     if args.score_noise_mode == "continuous":
         sigma_values = geometric_sigma_schedule(
             sigma_min=float(sigma_min),

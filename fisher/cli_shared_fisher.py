@@ -83,6 +83,16 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--score-hidden-dim", type=int, default=128)
     p.add_argument("--score-depth", type=int, default=3)
     p.add_argument(
+        "--score-arch",
+        type=str,
+        default="plain",
+        choices=["plain", "film_per_layer"],
+        help=(
+            "plain: stacked MLP on [theta_tilde, x, sigma]. "
+            "film_per_layer: FiLM-modulate hidden layers from (theta, log sigma); backbone on [theta_tilde, x]."
+        ),
+    )
+    p.add_argument(
         "--score-data-mode",
         type=str,
         default="full",

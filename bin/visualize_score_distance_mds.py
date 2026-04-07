@@ -27,11 +27,27 @@ except ImportError as e:
     ) from e
 
 from global_setting import DATAROOT
-from fisher.models import ConditionalXScore
-from fisher.score_distance import classical_mds_from_distances, compute_cross_score_matrix, evaluate_distance_variants
+from fisher.models import (
+    ConditionalXScore,
+    ConditionalXScoreFiLMPerLayer,
+    ConditionalXScoreResidualConcat,
+    UnconditionalXScore,
+    UnconditionalXScoreFiLMPerLayer,
+)
+from fisher.score_distance import (
+    classical_mds_from_distances,
+    compute_cross_score_matrix,
+    compute_unconditional_score_vectors,
+    evaluate_distance_variants,
+    evaluate_pairwise_score_distance_variants,
+)
 from fisher.shared_dataset_io import load_shared_dataset_npz
 from fisher.shared_fisher_est import require_device
-from fisher.trainers import geometric_sigma_schedule, train_conditional_x_score_model_ncsm_continuous
+from fisher.trainers import (
+    geometric_sigma_schedule,
+    train_conditional_x_score_model_ncsm_continuous,
+    train_unconditional_x_score_model_ncsm_continuous,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,6 +72,28 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--score-lr", type=float, default=1e-3)
     p.add_argument("--score-hidden-dim", type=int, default=128)
     p.add_argument("--score-depth", type=int, default=3)
+    p.add_argument(
+        "--dsm-conditioning",
+        type=str,
+        default="conditional",
+        choices=["conditional", "unconditional"],
+        help=(
+            "conditional: train s(x_tilde, theta, sigma) and build cross-score matrix S_ij. "
+            "unconditional: train s(x_tilde, sigma) without theta and build pairwise distances over x samples."
+        ),
+    )
+    p.add_argument(
+        "--score-arch",
+        type=str,
+        default="plain",
+        choices=["plain", "residual_concat", "film_per_layer"],
+        help=(
+            "plain: feed [x̃,θ,logσ] once at input (stacked MLP). "
+            "residual_concat: concat θ and log σ into every block with residual hidden updates. "
+            "film_per_layer: FiLM-modulate every hidden layer from (θ, log σ) without hidden concatenation. "
+            "For unconditional DSM, FiLM uses log σ only."
+        ),
+    )
     p.add_argument("--score-sigma-min-alpha", type=float, default=0.01)
     p.add_argument("--score-sigma-max-alpha", type=float, default=0.25)
     p.add_argument("--score-eval-sigmas", type=int, default=12)
@@ -179,33 +217,63 @@ def main() -> None:
     print(
         "[score_x] "
         f"data_split={args.data_split} n={theta_use.shape[0]} fit={theta_fit.shape[0]} val={theta_val.shape[0]} "
+        f"dsm_conditioning={args.dsm_conditioning} "
+        f"arch={args.score_arch} "
         f"theta_std={theta_std:.6f} sigma_min={sigma_min:.6f} sigma_max={sigma_max:.6f} sigma_eval={sigma_eval:.6f}"
     )
 
-    model = ConditionalXScore(
+    score_kw = dict(
         x_dim=x_use.shape[1],
         hidden_dim=int(args.score_hidden_dim),
         depth=int(args.score_depth),
         use_log_sigma=True,
-    ).to(device)
-    train_out = train_conditional_x_score_model_ncsm_continuous(
-        model=model,
-        theta_train=theta_fit,
-        x_train=x_fit,
-        sigma_min=sigma_min,
-        sigma_max=sigma_max,
-        epochs=int(args.score_epochs),
-        batch_size=int(args.score_batch_size),
-        lr=float(args.score_lr),
-        device=device,
-        log_every=max(1, int(args.log_every)),
-        theta_val=theta_val,
-        x_val=x_val,
-        early_stopping_patience=int(args.score_early_patience),
-        early_stopping_min_delta=float(args.score_early_min_delta),
-        early_stopping_ema_alpha=float(args.score_early_ema_alpha),
-        restore_best=bool(args.score_restore_best),
     )
+    if str(args.dsm_conditioning) == "unconditional":
+        if str(args.score_arch) == "film_per_layer":
+            model = UnconditionalXScoreFiLMPerLayer(**score_kw).to(device)
+        else:
+            model = UnconditionalXScore(**score_kw).to(device)
+        train_out = train_unconditional_x_score_model_ncsm_continuous(
+            model=model,
+            x_train=x_fit,
+            sigma_min=sigma_min,
+            sigma_max=sigma_max,
+            epochs=int(args.score_epochs),
+            batch_size=int(args.score_batch_size),
+            lr=float(args.score_lr),
+            device=device,
+            log_every=max(1, int(args.log_every)),
+            x_val=x_val,
+            early_stopping_patience=int(args.score_early_patience),
+            early_stopping_min_delta=float(args.score_early_min_delta),
+            early_stopping_ema_alpha=float(args.score_early_ema_alpha),
+            restore_best=bool(args.score_restore_best),
+        )
+    else:
+        if str(args.score_arch) == "residual_concat":
+            model = ConditionalXScoreResidualConcat(**score_kw).to(device)
+        elif str(args.score_arch) == "film_per_layer":
+            model = ConditionalXScoreFiLMPerLayer(**score_kw).to(device)
+        else:
+            model = ConditionalXScore(**score_kw).to(device)
+        train_out = train_conditional_x_score_model_ncsm_continuous(
+            model=model,
+            theta_train=theta_fit,
+            x_train=x_fit,
+            sigma_min=sigma_min,
+            sigma_max=sigma_max,
+            epochs=int(args.score_epochs),
+            batch_size=int(args.score_batch_size),
+            lr=float(args.score_lr),
+            device=device,
+            log_every=max(1, int(args.log_every)),
+            theta_val=theta_val,
+            x_val=x_val,
+            early_stopping_patience=int(args.score_early_patience),
+            early_stopping_min_delta=float(args.score_early_min_delta),
+            early_stopping_ema_alpha=float(args.score_early_ema_alpha),
+            restore_best=bool(args.score_restore_best),
+        )
 
     train_losses = np.asarray(train_out["train_losses"], dtype=np.float64)
     val_losses = np.asarray(train_out["val_losses"], dtype=np.float64)
@@ -214,18 +282,31 @@ def main() -> None:
     stopped_epoch = int(train_out["stopped_epoch"])
     stopped_early = bool(train_out["stopped_early"])
 
-    cross_scores = compute_cross_score_matrix(
-        model=model,
-        theta=theta_use,
-        x=x_use,
-        sigma_eval=sigma_eval,
-        device=device,
-        row_batch_size=int(args.cross_row_batch_size),
-    )
-    print(f"[score_matrix] shape={cross_scores.shape} (N,N,x_dim)")
-
-    raw = evaluate_distance_variants(cross_scores, normalize_score=False)
-    norm = evaluate_distance_variants(cross_scores, normalize_score=True)
+    cross_scores: np.ndarray | None = None
+    score_vectors: np.ndarray | None = None
+    if str(args.dsm_conditioning) == "unconditional":
+        score_vectors = compute_unconditional_score_vectors(
+            model=model,
+            x=x_use,
+            sigma_eval=sigma_eval,
+            device=device,
+            row_batch_size=int(args.cross_row_batch_size),
+        )
+        print(f"[score_vector] shape={score_vectors.shape} (N,x_dim)")
+        raw = evaluate_pairwise_score_distance_variants(score_vectors, normalize_score=False)
+        norm = evaluate_pairwise_score_distance_variants(score_vectors, normalize_score=True)
+    else:
+        cross_scores = compute_cross_score_matrix(
+            model=model,
+            theta=theta_use,
+            x=x_use,
+            sigma_eval=sigma_eval,
+            device=device,
+            row_batch_size=int(args.cross_row_batch_size),
+        )
+        print(f"[score_matrix] shape={cross_scores.shape} (N,N,x_dim)")
+        raw = evaluate_distance_variants(cross_scores, normalize_score=False)
+        norm = evaluate_distance_variants(cross_scores, normalize_score=True)
 
     loss_fig_path = os.path.join(args.output_dir, "score_x_loss_vs_epoch.png")
     epochs = np.arange(1, train_losses.size + 1)
@@ -241,7 +322,10 @@ def main() -> None:
         plt.axvline(stopped_epoch, color="#9467bd", linestyle=":", linewidth=1.2, label=f"stop={stopped_epoch}")
     plt.xlabel("epoch")
     plt.ylabel("loss")
-    plt.title("Conditional x-score NCSM training")
+    if str(args.dsm_conditioning) == "unconditional":
+        plt.title("Unconditional x-score NCSM training")
+    else:
+        plt.title("Conditional x-score NCSM training")
     plt.grid(alpha=0.25, linestyle="--")
     plt.legend()
     plt.tight_layout()
@@ -263,14 +347,14 @@ def main() -> None:
     umap_rs = seed if int(args.umap_random_state) < 0 else int(args.umap_random_state)
     emb_umap = fit_umap_2d(x_use, n_neighbors=umap_k, min_dist=float(args.umap_min_dist), random_state=umap_rs)
 
-    # Primary: L2-normalized per (i,j) score vectors, then distance d (sqrt form).
-    primary_emb = np.asarray(norm["embedding_d"], dtype=np.float64)
+    # Primary: raw (unnormalized) per-(i,j) score vectors, then distance d (sqrt form).
+    primary_emb = np.asarray(raw["embedding_d"], dtype=np.float64)
 
     emb_fig_path = os.path.join(args.output_dir, "score_distance_mds_theta_color.png")
     fig, axes = plt.subplots(2, 2, figsize=(12.0, 10.0), layout="constrained")
     ax_flat = np.asarray(axes).ravel()
     panels: list[tuple[np.ndarray, str, str, str]] = [
-        (primary_emb, r"Score distance $\rightarrow$ Classical MDS (norm score, $d$)", "MDS 1", "MDS 2"),
+        (primary_emb, r"Score distance $\rightarrow$ Classical MDS (raw score, $d$)", "MDS 1", "MDS 2"),
         (emb_euclid, r"Euclidean $x$ → Classical MDS", "MDS 1", "MDS 2"),
         (emb_isomap, f"Isomap on $x$ ($k$={isomap_k})", "Isomap 1", "Isomap 2"),
         (
@@ -294,6 +378,8 @@ def main() -> None:
     npz_payload: dict[str, object] = {
         "theta": theta_use.reshape(-1),
         "x": x_use,
+        "dsm_conditioning": np.asarray([str(args.dsm_conditioning)]),
+        "score_arch": np.asarray([str(args.score_arch)]),
         "sigma_eval": np.asarray([sigma_eval], dtype=np.float64),
         "sigma_eval_grid": sigma_eval_grid.astype(np.float64),
         "train_losses": train_losses,
@@ -328,18 +414,23 @@ def main() -> None:
         "umap_random_state_used": np.asarray([umap_rs], dtype=np.int64),
     }
     if bool(args.save_cross_scores):
-        npz_payload["cross_scores"] = cross_scores.astype(np.float32)
+        if cross_scores is not None:
+            npz_payload["cross_scores"] = cross_scores.astype(np.float32)
+        if score_vectors is not None:
+            npz_payload["score_vectors"] = score_vectors.astype(np.float32)
     npz_path = os.path.join(args.output_dir, "score_distance_mds_results.npz")
     np.savez_compressed(npz_path, **npz_payload)
 
     summary_path = os.path.join(args.output_dir, "score_distance_mds_summary.txt")
     with open(summary_path, "w", encoding="utf-8") as f:
-        f.write("Conditional score distance + MDS summary\n")
+        f.write("Score distance + MDS summary\n")
         f.write(f"dataset_npz: {args.dataset_npz}\n")
         f.write(f"output_dir: {args.output_dir}\n")
         f.write(f"data_split: {args.data_split}\n")
+        f.write(f"dsm_conditioning: {args.dsm_conditioning}\n")
         f.write(f"n_samples: {theta_use.shape[0]}\n")
         f.write(f"x_dim: {x_use.shape[1]}\n")
+        f.write(f"score_arch: {args.score_arch}\n")
         f.write(
             "training: "
             f"epochs={args.score_epochs}, batch_size={args.score_batch_size}, lr={args.score_lr}, "
@@ -350,14 +441,21 @@ def main() -> None:
             f"theta_std={theta_std:.6f}, sigma_min={sigma_min:.6f}, sigma_max={sigma_max:.6f}, "
             f"sigma_eval(min)={sigma_eval:.6f}\n"
         )
-        f.write(
-            "cross_score: "
-            f"S shape={cross_scores.shape}, row_batch_size={args.cross_row_batch_size}, "
-            f"save_cross_scores={bool(args.save_cross_scores)}\n"
-        )
+        if cross_scores is not None:
+            f.write(
+                "cross_score: "
+                f"S shape={cross_scores.shape}, row_batch_size={args.cross_row_batch_size}, "
+                f"save_cross_scores={bool(args.save_cross_scores)}\n"
+            )
+        if score_vectors is not None:
+            f.write(
+                "score_vectors: "
+                f"V shape={score_vectors.shape}, row_batch_size={args.cross_row_batch_size}, "
+                f"save_cross_scores={bool(args.save_cross_scores)}\n"
+            )
         f.write(
             "figure score_distance_mds_theta_color.png (top-left score panel): "
-            "norm score + d (each S_ij vector L2-normalized in x_dim before distances).\n"
+            "raw score + d (unnormalized S_ij vectors in x_dim before distances).\n"
         )
         f.write("MDS quality (strain, lower is better):\n")
         f.write(f"  raw score + d:    strain={float(raw['strain_d']):.6f}, positive_eigs={int(raw['positive_eig_d'])}\n")

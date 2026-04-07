@@ -5,7 +5,13 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from fisher.models import ConditionalXScore
+from fisher.models import (
+    ConditionalXScore,
+    ConditionalXScoreFiLMPerLayer,
+    ConditionalXScoreResidualConcat,
+    UnconditionalXScore,
+    UnconditionalXScoreFiLMPerLayer,
+)
 
 
 @dataclass
@@ -18,7 +24,7 @@ class ClassicalMdsResult:
 
 
 def compute_cross_score_matrix(
-    model: ConditionalXScore,
+    model: ConditionalXScore | ConditionalXScoreResidualConcat | ConditionalXScoreFiLMPerLayer,
     theta: np.ndarray,
     x: np.ndarray,
     sigma_eval: float,
@@ -59,6 +65,80 @@ def normalize_scores(scores: np.ndarray, eps: float = 1e-8) -> np.ndarray:
         raise ValueError("scores must have shape (N, N, x_dim).")
     denom = np.linalg.norm(s, axis=-1, keepdims=True)
     return s / np.maximum(denom, eps)
+
+
+def compute_unconditional_score_vectors(
+    model: UnconditionalXScore | UnconditionalXScoreFiLMPerLayer,
+    x: np.ndarray,
+    sigma_eval: float,
+    device: torch.device,
+    row_batch_size: int = 128,
+) -> np.ndarray:
+    """Compute v_i = s_phi(x_i) with output shape (N, x_dim)."""
+    x2 = np.asarray(x, dtype=np.float64)
+    if x2.ndim != 2:
+        raise ValueError("x must be a 2D array.")
+    if row_batch_size < 1:
+        raise ValueError("row_batch_size must be >= 1.")
+    n = int(x2.shape[0])
+    out = np.zeros((n, x2.shape[1]), dtype=np.float64)
+    model.eval()
+    with torch.no_grad():
+        for i0 in range(0, n, row_batch_size):
+            i1 = min(n, i0 + row_batch_size)
+            xb = torch.from_numpy(np.asarray(x2[i0:i1], dtype=np.float32)).to(device)
+            pred = model.predict_score(x=xb, sigma_eval=float(sigma_eval))
+            out[i0:i1, :] = pred.detach().cpu().numpy().astype(np.float64)
+    return out
+
+
+def normalize_score_rows_l2(score_vectors: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    v = np.asarray(score_vectors, dtype=np.float64)
+    if v.ndim != 2:
+        raise ValueError("score_vectors must have shape (N, x_dim).")
+    denom = np.linalg.norm(v, axis=1, keepdims=True)
+    return v / np.maximum(denom, eps)
+
+
+def pairwise_mean_score_distance_matrix(score_vectors: np.ndarray, *, use_sqrt: bool) -> np.ndarray:
+    """Pairwise mean-squared distance over x-dim between score vectors."""
+    v = np.asarray(score_vectors, dtype=np.float64)
+    if v.ndim != 2:
+        raise ValueError("score_vectors must have shape (N, x_dim).")
+    diff = v[:, None, :] - v[None, :, :]
+    d2 = np.mean(diff * diff, axis=-1)
+    d2 = 0.5 * (d2 + d2.T)
+    np.fill_diagonal(d2, 0.0)
+    d2 = np.clip(d2, 0.0, None)
+    if use_sqrt:
+        d = np.sqrt(d2)
+        d = 0.5 * (d + d.T)
+        np.fill_diagonal(d, 0.0)
+        return d
+    return d2
+
+
+def evaluate_pairwise_score_distance_variants(
+    score_vectors: np.ndarray,
+    normalize_score: bool,
+) -> dict[str, np.ndarray | float]:
+    v = normalize_score_rows_l2(score_vectors) if normalize_score else np.asarray(score_vectors, dtype=np.float64)
+    d = pairwise_mean_score_distance_matrix(v, use_sqrt=True)
+    d2 = pairwise_mean_score_distance_matrix(v, use_sqrt=False)
+    mds_d = classical_mds_from_distances(d, n_components=2)
+    mds_d2 = classical_mds_from_distances(d2, n_components=2)
+    return {
+        "distance_d": d,
+        "distance_d2": d2,
+        "embedding_d": mds_d.embedding,
+        "embedding_d2": mds_d2.embedding,
+        "strain_d": float(mds_d.strain_relative),
+        "strain_d2": float(mds_d2.strain_relative),
+        "positive_eig_d": float(mds_d.positive_eig_count),
+        "positive_eig_d2": float(mds_d2.positive_eig_count),
+        "eigenvalues_d": mds_d.eigenvalues_all,
+        "eigenvalues_d2": mds_d2.eigenvalues_all,
+    }
 
 
 def score_distance_matrix_from_cross_scores(

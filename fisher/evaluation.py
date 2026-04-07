@@ -6,7 +6,7 @@ import numpy as np
 import torch
 
 from fisher.data import ToyConditionalGMMNonGaussianDataset, ToyConditionalGaussianDataset
-from fisher.models import ConditionalScore1D, LocalDecoderLogit, PriorScore1D
+from fisher.models import ConditionalScore1D, ConditionalScore1DFiLMPerLayer, LocalDecoderLogit, PriorScore1D
 
 
 def parse_sigma_alpha_list(items: list[float]) -> np.ndarray:
@@ -175,7 +175,7 @@ class ScoreEvalResult:
 
 
 def evaluate_score_fisher(
-    model: ConditionalScore1D,
+    model: ConditionalScore1D | ConditionalScore1DFiLMPerLayer,
     theta_eval: np.ndarray,
     x_eval: np.ndarray,
     dataset: ToyConditionalGaussianDataset | ToyConditionalGMMNonGaussianDataset,
@@ -273,7 +273,7 @@ class ScoreEvalWithPriorResult:
 
 
 def evaluate_score_fisher_with_prior(
-    model_post: ConditionalScore1D,
+    model_post: ConditionalScore1D | ConditionalScore1DFiLMPerLayer,
     model_prior: PriorScore1D,
     theta_eval: np.ndarray,
     x_eval: np.ndarray,
