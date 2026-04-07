@@ -354,6 +354,14 @@ def main() -> None:
     h_npz = np.load(h_path, allow_pickle=True)
     h_sym = np.asarray(h_npz["h_sym"], dtype=np.float64)
     theta_used = np.asarray(h_npz["theta_used"], dtype=np.float64).reshape(-1)
+    h_field_method = str(h_npz["h_field_method"][0]) if "h_field_method" in h_npz.files else "dsm"
+    h_eval_scalar_name = str(h_npz["h_eval_scalar_name"][0]) if "h_eval_scalar_name" in h_npz.files else "sigma_eval"
+    h_eval_scalar_value = (
+        float(np.asarray(h_npz["sigma_eval"], dtype=np.float64).reshape(-1)[0])
+        if "sigma_eval" in h_npz.files
+        else float("nan")
+    )
+    print(f"[h_mds] source_field={h_field_method} {h_eval_scalar_name}={h_eval_scalar_value:.6f}")
 
     x_aligned = x_for_fisher_theta_alignment(bundle, full_args)
     theta_chk = theta_for_fisher_alignment(bundle, full_args)
@@ -422,6 +430,9 @@ def main() -> None:
         "umap_min_dist": np.asarray([umap_min], dtype=np.float64),
         "umap_random_state": np.asarray([umap_rs], dtype=np.int64),
         "dataset_npz": np.asarray([os.path.abspath(dataset_npz)], dtype=object),
+        "h_field_method": np.asarray([h_field_method], dtype=object),
+        "h_eval_scalar_name": np.asarray([h_eval_scalar_name], dtype=object),
+        "h_eval_scalar_value": np.asarray([h_eval_scalar_value], dtype=np.float64),
         "b_sym_eps": np.asarray([b_sym_eps], dtype=np.float64),
         "npz_omits_full_matrices": np.asarray([not save_full_dense], dtype=bool),
         "npz_full_matrix_save_max_n": np.asarray([N_FULL_MATRIX_SAVE_MAX], dtype=np.int64),
@@ -482,6 +493,8 @@ def main() -> None:
         f.write(f"output_dir: {full_args.output_dir}\n")
         f.write(f"n_samples: {h_sym.shape[0]}\n")
         f.write(f"score_fisher_eval_data: {getattr(full_args, 'score_fisher_eval_data', '')}\n")
+        f.write(f"h_field_method: {h_field_method}\n")
+        f.write(f"{h_eval_scalar_name}: {h_eval_scalar_value}\n")
         f.write(f"distance_transform (loss→D): {distance_transform}\n")
         f.write(f"npz_omits_full_matrices: {not save_full_dense} (threshold n<={N_FULL_MATRIX_SAVE_MAX})\n")
         f.write(f"h_sym min: {float(np.min(h_sym))} max: {float(np.max(h_sym))}\n")

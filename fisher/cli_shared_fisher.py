@@ -76,6 +76,13 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
 def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--gt-mc-samples-per-bin", type=int, default=6000)
+    p.add_argument(
+        "--theta-field-method",
+        type=str,
+        default="dsm",
+        choices=["dsm", "flow"],
+        help="Scalar field for theta-derivative pipeline: denoising score model (dsm) or flow velocity model (flow).",
+    )
 
     p.add_argument("--score-epochs", type=int, default=10000)
     p.add_argument("--score-batch-size", type=int, default=256)
@@ -122,6 +129,28 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--score-proxy-min-mult", type=float, default=0.1)
     p.add_argument("--score-proxy-max-mult", type=float, default=2.0)
     p.add_argument("--score-fixed-sigma", type=float, default=0.02)
+    p.add_argument("--flow-epochs", type=int, default=10000)
+    p.add_argument("--flow-batch-size", type=int, default=256)
+    p.add_argument("--flow-lr", type=float, default=1e-3)
+    p.add_argument("--flow-hidden-dim", type=int, default=128)
+    p.add_argument("--flow-depth", type=int, default=3)
+    p.add_argument("--flow-scheduler", type=str, default="cosine", choices=["cosine", "vp", "linear_vp"])
+    p.add_argument(
+        "--flow-eval-t",
+        type=float,
+        default=0.5,
+        help="Fixed time t used to evaluate theta-flow velocity field for H-matrix (flow mode).",
+    )
+    p.add_argument("--flow-early-patience", type=int, default=1000)
+    p.add_argument("--flow-early-min-delta", type=float, default=1e-4)
+    p.add_argument(
+        "--flow-early-ema-alpha",
+        type=float,
+        default=0.05,
+        help="EMA smoothing factor α in (0,1] for flow validation monitor used by early stopping.",
+    )
+    p.add_argument("--flow-restore-best", action="store_true", default=True)
+    p.add_argument("--no-flow-restore-best", action="store_false", dest="flow_restore_best")
 
     p.add_argument(
         "--no-prior-score",

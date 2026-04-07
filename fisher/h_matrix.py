@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from fisher.models import ConditionalScore1D, PriorScore1D
+from fisher.models import ConditionalScore1D, ConditionalThetaFlowVelocity, PriorScore1D, PriorThetaFlowVelocity
 
 
 @dataclass
@@ -22,6 +22,8 @@ class HMatrixResult:
     h_directed: np.ndarray
     h_sym: np.ndarray
     sigma_eval: float
+    field_method: str
+    eval_scalar_name: str
     order_mode: str
     delta_diag_max_abs: float
     h_sym_max_asym_abs: float
@@ -33,11 +35,12 @@ class HMatrixEstimator:
     def __init__(
         self,
         *,
-        model_post: ConditionalScore1D,
-        model_prior: PriorScore1D,
+        model_post: ConditionalScore1D | ConditionalThetaFlowVelocity,
+        model_prior: PriorScore1D | PriorThetaFlowVelocity,
         sigma_eval: float,
         device: torch.device,
         pair_batch_size: int = 65536,
+        field_method: str = "dsm",
     ) -> None:
         if pair_batch_size < 1:
             raise ValueError("pair_batch_size must be >= 1.")
@@ -48,6 +51,10 @@ class HMatrixEstimator:
         self.sigma_eval = float(sigma_eval)
         self.device = device
         self.pair_batch_size = int(pair_batch_size)
+        method = str(field_method).strip().lower()
+        if method not in ("dsm", "flow"):
+            raise ValueError("field_method must be one of {'dsm', 'flow'}.")
+        self.field_method = method
 
     @staticmethod
     def sort_by_theta(theta: np.ndarray, x: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -82,9 +89,33 @@ class HMatrixEstimator:
                 x_rep = np.repeat(xb, repeats=n, axis=0)
                 theta_t = torch.from_numpy(theta_tile).to(self.device)
                 x_t = torch.from_numpy(x_rep).to(self.device)
-                s_post = self.model_post.predict_score(theta_t, x_t, sigma_eval=self.sigma_eval).cpu().numpy().reshape(b, n)
-                s_prior = self.model_prior.predict_score(theta_t, sigma_eval=self.sigma_eval).cpu().numpy().reshape(b, n)
-                g[i0:i1, :] = (s_post - s_prior).astype(np.float64)
+                if self.field_method == "flow":
+                    f_post = (
+                        self.model_post.predict_velocity(theta_t, x_t, t_eval=self.sigma_eval)
+                        .cpu()
+                        .numpy()
+                        .reshape(b, n)
+                    )
+                    f_prior = (
+                        self.model_prior.predict_velocity(theta_t, t_eval=self.sigma_eval)
+                        .cpu()
+                        .numpy()
+                        .reshape(b, n)
+                    )
+                else:
+                    f_post = (
+                        self.model_post.predict_score(theta_t, x_t, sigma_eval=self.sigma_eval)
+                        .cpu()
+                        .numpy()
+                        .reshape(b, n)
+                    )
+                    f_prior = (
+                        self.model_prior.predict_score(theta_t, sigma_eval=self.sigma_eval)
+                        .cpu()
+                        .numpy()
+                        .reshape(b, n)
+                    )
+                g[i0:i1, :] = (f_post - f_prior).astype(np.float64)
         return g
 
     @staticmethod
@@ -165,6 +196,8 @@ class HMatrixEstimator:
             h_directed=h_dir_used,
             h_sym=h_sym_used,
             sigma_eval=self.sigma_eval,
+            field_method=self.field_method,
+            eval_scalar_name=("t_eval" if self.field_method == "flow" else "sigma_eval"),
             order_mode=order_mode,
             delta_diag_max_abs=delta_diag_max_abs,
             h_sym_max_asym_abs=h_sym_max_asym_abs,

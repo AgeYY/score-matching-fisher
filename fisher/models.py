@@ -41,6 +41,85 @@ class ConditionalScore1D(nn.Module):
         return self.forward(theta, x, sigma)
 
 
+class ConditionalThetaFlowVelocity(nn.Module):
+    """Conditional theta-velocity model v(theta_t, x, t) with scalar output."""
+
+    def __init__(
+        self,
+        x_dim: int = 2,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        use_logit_time: bool = True,
+    ) -> None:
+        super().__init__()
+        if x_dim < 2:
+            raise ValueError("x_dim must be >= 2.")
+        self.use_logit_time = bool(use_logit_time)
+        in_dim = 1 + x_dim + 1  # theta_t, x, t
+        layers: list[nn.Module] = []
+        for _ in range(depth):
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            layers.append(nn.SiLU())
+            in_dim = hidden_dim
+        layers.append(nn.Linear(hidden_dim, 1))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, theta_t: torch.Tensor, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        if t.ndim == 1:
+            t = t.unsqueeze(-1)
+        if self.use_logit_time:
+            t_clip = torch.clamp(t, min=1e-4, max=1.0 - 1e-4)
+            t_feat = torch.log(t_clip) - torch.log1p(-t_clip)
+        else:
+            t_feat = t
+        feats = torch.cat([theta_t, x, t_feat], dim=-1)
+        return self.net(feats)
+
+    @torch.no_grad()
+    def predict_velocity(self, theta: torch.Tensor, x: torch.Tensor, t_eval: float) -> torch.Tensor:
+        self.eval()
+        t = torch.full((theta.shape[0], 1), float(t_eval), device=theta.device)
+        return self.forward(theta, x, t)
+
+
+class PriorThetaFlowVelocity(nn.Module):
+    """Unconditional theta-velocity model v(theta_t, t) with scalar output."""
+
+    def __init__(
+        self,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        use_logit_time: bool = True,
+    ) -> None:
+        super().__init__()
+        self.use_logit_time = bool(use_logit_time)
+        in_dim = 1 + 1  # theta_t, t
+        layers: list[nn.Module] = []
+        for _ in range(depth):
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            layers.append(nn.SiLU())
+            in_dim = hidden_dim
+        layers.append(nn.Linear(hidden_dim, 1))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, theta_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        if t.ndim == 1:
+            t = t.unsqueeze(-1)
+        if self.use_logit_time:
+            t_clip = torch.clamp(t, min=1e-4, max=1.0 - 1e-4)
+            t_feat = torch.log(t_clip) - torch.log1p(-t_clip)
+        else:
+            t_feat = t
+        feats = torch.cat([theta_t, t_feat], dim=-1)
+        return self.net(feats)
+
+    @torch.no_grad()
+    def predict_velocity(self, theta: torch.Tensor, t_eval: float) -> torch.Tensor:
+        self.eval()
+        t = torch.full((theta.shape[0], 1), float(t_eval), device=theta.device)
+        return self.forward(theta, t)
+
+
 class ConditionalXScore(nn.Module):
     """Conditional x-score model for s(x_tilde, theta, sigma) with vector output in R^{x_dim}."""
 

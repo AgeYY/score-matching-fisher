@@ -15,11 +15,19 @@ from global_setting import SCORE_VAL_FRACTION
 from fisher.data import ToyConditionalGMMNonGaussianDataset, ToyConditionalGaussianDataset
 from fisher.evaluation import evaluate_score_fisher, evaluate_score_fisher_with_prior, parse_sigma_alpha_list
 from fisher.h_matrix import HMatrixEstimator, HMatrixResult
-from fisher.models import ConditionalScore1D, LocalDecoderLogit, PriorScore1D
+from fisher.models import (
+    ConditionalScore1D,
+    ConditionalThetaFlowVelocity,
+    LocalDecoderLogit,
+    PriorScore1D,
+    PriorThetaFlowVelocity,
+)
 from fisher.shared_dataset_io import meta_dict_from_args
 from fisher.trainers import (
     geometric_sigma_schedule,
+    train_conditional_theta_flow_model,
     train_local_decoder,
+    train_prior_theta_flow_model,
     train_prior_score_model,
     train_prior_score_model_ncsm_continuous,
     train_score_model,
@@ -451,6 +459,8 @@ def validate_dataset_sample_args(args: Any) -> None:
 
 
 def validate_estimation_args(args: Any) -> None:
+    if str(getattr(args, "theta_field_method", "dsm")) not in ("dsm", "flow"):
+        raise ValueError("--theta-field-method must be one of {'dsm', 'flow'}.")
     if args.score_eval_sigmas < 1:
         raise ValueError("--score-eval-sigmas must be >= 1.")
     if args.score_early_patience < 1:
@@ -491,6 +501,20 @@ def validate_estimation_args(args: Any) -> None:
         raise ValueError("--h-batch-size must be >= 1.")
     if float(getattr(args, "h_sigma_eval", -1.0)) == 0.0:
         raise ValueError("--h-sigma-eval must be positive, or <= 0 to auto-select sigma_min.")
+    if int(getattr(args, "flow_epochs", 1)) < 1:
+        raise ValueError("--flow-epochs must be >= 1.")
+    if int(getattr(args, "flow_batch_size", 1)) < 1:
+        raise ValueError("--flow-batch-size must be >= 1.")
+    if float(getattr(args, "flow_lr", 0.0)) <= 0.0:
+        raise ValueError("--flow-lr must be positive.")
+    if int(getattr(args, "flow_early_patience", 1)) < 1:
+        raise ValueError("--flow-early-patience must be >= 1.")
+    if float(getattr(args, "flow_early_min_delta", 0.0)) < 0.0:
+        raise ValueError("--flow-early-min-delta must be non-negative.")
+    if not (0.0 < float(getattr(args, "flow_early_ema_alpha", 0.05)) <= 1.0):
+        raise ValueError("--flow-early-ema-alpha must be in (0, 1].")
+    if not (0.0 <= float(getattr(args, "flow_eval_t", 0.5)) <= 1.0):
+        raise ValueError("--flow-eval-t must be in [0, 1].")
     if bool(getattr(args, "compute_h_matrix", False)) and not bool(getattr(args, "prior_enable", True)):
         raise ValueError("--compute-h-matrix requires prior score; do not use --no-prior-score.")
 
@@ -560,6 +584,240 @@ def run_shared_fisher_estimation(
             f"val_target_frac={SCORE_VAL_FRACTION} "
             f"val_frac_eff={theta_score_val.shape[0]/n_score_total:.4f}"
         )
+
+    theta_field_method = str(getattr(args, "theta_field_method", "dsm")).strip().lower()
+    if theta_field_method == "flow":
+        if not bool(getattr(args, "prior_enable", True)):
+            raise ValueError("theta_field_method=flow currently requires prior model enabled.")
+        flow_eval_t = float(getattr(args, "flow_eval_t", 0.5))
+        if not (0.0 <= flow_eval_t <= 1.0):
+            raise ValueError("--flow-eval-t must be in [0, 1].")
+        theta_std = float(np.std(theta_score_fit))
+        print(
+            "[theta_flow] "
+            f"fit={theta_score_fit.shape[0]} val={theta_score_val.shape[0]} "
+            f"scheduler={getattr(args, 'flow_scheduler', 'cosine')} t_eval={flow_eval_t:.6f} "
+            f"theta_std={theta_std:.6f}"
+        )
+
+        post_model = ConditionalThetaFlowVelocity(
+            x_dim=args.x_dim,
+            hidden_dim=int(getattr(args, "flow_hidden_dim", 128)),
+            depth=int(getattr(args, "flow_depth", 3)),
+            use_logit_time=True,
+        ).to(device)
+        post_train_out = train_conditional_theta_flow_model(
+            model=post_model,
+            theta_train=theta_score_fit,
+            x_train=x_score_fit,
+            epochs=int(getattr(args, "flow_epochs", 10000)),
+            batch_size=int(getattr(args, "flow_batch_size", 256)),
+            lr=float(getattr(args, "flow_lr", 1e-3)),
+            device=device,
+            log_every=max(1, args.log_every),
+            theta_val=theta_score_val,
+            x_val=x_score_val,
+            early_stopping_patience=int(getattr(args, "flow_early_patience", 1000)),
+            early_stopping_min_delta=float(getattr(args, "flow_early_min_delta", 1e-4)),
+            early_stopping_ema_alpha=float(getattr(args, "flow_early_ema_alpha", 0.05)),
+            restore_best=bool(getattr(args, "flow_restore_best", True)),
+            scheduler_name=str(getattr(args, "flow_scheduler", "cosine")),
+        )
+        post_train_losses = np.asarray(post_train_out["train_losses"], dtype=np.float64)
+        post_val_losses = np.asarray(post_train_out["val_losses"], dtype=np.float64)
+        post_val_monitor_losses = np.asarray(post_train_out.get("val_monitor_losses", []), dtype=np.float64)
+        post_best_epoch = int(post_train_out["best_epoch"])
+        post_stopped_epoch = int(post_train_out["stopped_epoch"])
+        post_stopped_early = bool(post_train_out["stopped_early"])
+
+        post_loss_fig = os.path.join(args.output_dir, "score_loss_vs_epoch.png")
+        epochs_arr = np.arange(1, post_train_losses.size + 1)
+        plt.figure(figsize=(8.8, 5.0))
+        plt.plot(epochs_arr, post_train_losses, color="#1f77b4", linewidth=2.0, label="Theta-flow train loss")
+        if post_val_losses.size == post_train_losses.size and np.any(np.isfinite(post_val_losses)):
+            plt.plot(epochs_arr, post_val_losses, color="#d62728", linewidth=2.0, label="Theta-flow val loss")
+        if post_val_monitor_losses.size == post_train_losses.size and np.any(np.isfinite(post_val_monitor_losses)):
+            plt.plot(
+                epochs_arr,
+                post_val_monitor_losses,
+                color="#ff7f0e",
+                linewidth=2.0,
+                linestyle="--",
+                label=f"Theta-flow val EMA (α={getattr(args, 'flow_early_ema_alpha', 0.05):g})",
+            )
+        if 1 <= post_best_epoch <= post_train_losses.size:
+            plt.axvline(post_best_epoch, color="#2ca02c", linestyle="--", linewidth=1.5, label=f"Best epoch {post_best_epoch}")
+        if 1 <= post_stopped_epoch <= post_train_losses.size:
+            plt.axvline(
+                post_stopped_epoch,
+                color="#9467bd",
+                linestyle=":",
+                linewidth=1.6,
+                label=f"Stop epoch {post_stopped_epoch}",
+            )
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.title("Conditional theta-flow training")
+        plt.grid(alpha=0.25, linestyle="--", linewidth=0.8)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(post_loss_fig, dpi=180)
+        plt.close()
+
+        prior_model_flow = PriorThetaFlowVelocity(
+            hidden_dim=int(getattr(args, "prior_hidden_dim", 128)),
+            depth=int(getattr(args, "prior_depth", 3)),
+            use_logit_time=True,
+        ).to(device)
+        prior_train_out = train_prior_theta_flow_model(
+            model=prior_model_flow,
+            theta_train=theta_score_fit,
+            epochs=int(getattr(args, "prior_epochs", 10000)),
+            batch_size=int(getattr(args, "prior_batch_size", 256)),
+            lr=float(getattr(args, "prior_lr", 1e-3)),
+            device=device,
+            log_every=max(1, args.log_every),
+            theta_val=theta_score_val,
+            early_stopping_patience=int(getattr(args, "prior_early_patience", 1000)),
+            early_stopping_min_delta=float(getattr(args, "prior_early_min_delta", 1e-4)),
+            early_stopping_ema_alpha=float(getattr(args, "prior_early_ema_alpha", 0.05)),
+            restore_best=bool(getattr(args, "prior_restore_best", True)),
+            scheduler_name=str(getattr(args, "flow_scheduler", "cosine")),
+        )
+        prior_train_losses = np.asarray(prior_train_out["train_losses"], dtype=np.float64)
+        prior_val_losses = np.asarray(prior_train_out["val_losses"], dtype=np.float64)
+        prior_val_monitor_losses = np.asarray(prior_train_out.get("val_monitor_losses", []), dtype=np.float64)
+        prior_best_epoch = int(prior_train_out["best_epoch"])
+        prior_stopped_epoch = int(prior_train_out["stopped_epoch"])
+
+        prior_loss_fig = os.path.join(args.output_dir, "prior_score_loss_vs_epoch.png")
+        epochs_prior = np.arange(1, prior_train_losses.size + 1)
+        plt.figure(figsize=(8.8, 5.0))
+        plt.plot(epochs_prior, prior_train_losses, color="#1f77b4", linewidth=2.0, label="Prior theta-flow train loss")
+        if prior_val_losses.size == prior_train_losses.size and np.any(np.isfinite(prior_val_losses)):
+            plt.plot(epochs_prior, prior_val_losses, color="#d62728", linewidth=2.0, label="Prior theta-flow val loss")
+        if prior_val_monitor_losses.size == prior_train_losses.size and np.any(np.isfinite(prior_val_monitor_losses)):
+            plt.plot(
+                epochs_prior,
+                prior_val_monitor_losses,
+                color="#ff7f0e",
+                linewidth=2.0,
+                linestyle="--",
+                label=f"Prior val EMA (α={getattr(args, 'prior_early_ema_alpha', 0.05):g})",
+            )
+        if 1 <= prior_best_epoch <= prior_train_losses.size:
+            plt.axvline(prior_best_epoch, color="#2ca02c", linestyle="--", linewidth=1.5, label=f"Best epoch {prior_best_epoch}")
+        if 1 <= prior_stopped_epoch <= prior_train_losses.size:
+            plt.axvline(
+                prior_stopped_epoch,
+                color="#9467bd",
+                linestyle=":",
+                linewidth=1.6,
+                label=f"Stop epoch {prior_stopped_epoch}",
+            )
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.title("Prior theta-flow training")
+        plt.grid(alpha=0.25, linestyle="--", linewidth=0.8)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(prior_loss_fig, dpi=180)
+        plt.close()
+
+        if args.score_fisher_eval_data == "full":
+            theta_score_fisher_eval, x_score_fisher_eval = theta_all, x_all
+        else:
+            theta_score_fisher_eval, x_score_fisher_eval = theta_score_eval, x_score_eval
+        if theta_score_fisher_eval.shape[0] == 0:
+            raise ValueError(
+                "--score-fisher-eval-data score_eval requires non-empty theta_eval/x_eval; "
+                "use --train-frac < 1 or --score-fisher-eval-data full."
+            )
+
+        h_result: HMatrixResult | None = None
+        if bool(getattr(args, "compute_h_matrix", False)):
+            h_eval = flow_eval_t
+            print(
+                "[h_matrix] "
+                f"enabled=True field=flow t_eval={h_eval:.6f} "
+                f"restore_original_order={bool(getattr(args, 'h_restore_original_order', False))} "
+                f"pair_batch_size={int(getattr(args, 'h_batch_size', 65536))}"
+            )
+            h_estimator = HMatrixEstimator(
+                model_post=post_model,
+                model_prior=prior_model_flow,
+                sigma_eval=h_eval,
+                device=device,
+                pair_batch_size=int(getattr(args, "h_batch_size", 65536)),
+                field_method="flow",
+            )
+            h_result = h_estimator.run(
+                theta=theta_score_fisher_eval,
+                x=x_score_fisher_eval,
+                restore_original_order=bool(getattr(args, "h_restore_original_order", False)),
+            )
+
+        suffix = "_non_gauss" if args.dataset_family == "gmm_non_gauss" else "_theta_cov"
+        if h_result is not None:
+            h_npz_path = os.path.join(args.output_dir, f"h_matrix_results{suffix}.npz")
+            h_payload: dict[str, Any] = {
+                "theta_used": h_result.theta_used,
+                "theta_sorted": h_result.theta_sorted,
+                "perm": h_result.perm.astype(np.int64),
+                "inv_perm": h_result.inv_perm.astype(np.int64),
+                "h_directed": h_result.h_directed,
+                "h_sym": h_result.h_sym,
+                "sigma_eval": np.asarray([h_result.sigma_eval], dtype=np.float64),
+                "h_field_method": np.asarray([h_result.field_method], dtype=object),
+                "h_eval_scalar_name": np.asarray([h_result.eval_scalar_name], dtype=object),
+                "n_samples": np.asarray([h_result.theta_used.size], dtype=np.int32),
+                "order_mode": np.asarray([h_result.order_mode], dtype=object),
+                "delta_diag_max_abs": np.asarray([h_result.delta_diag_max_abs], dtype=np.float64),
+                "h_sym_max_asym_abs": np.asarray([h_result.h_sym_max_asym_abs], dtype=np.float64),
+            }
+            if bool(getattr(args, "h_save_intermediates", False)):
+                h_payload["g_matrix"] = h_result.g_matrix
+                h_payload["c_matrix"] = h_result.c_matrix
+                h_payload["delta_l_matrix"] = h_result.delta_l_matrix
+            np.savez(h_npz_path, **h_payload)
+
+            h_summary_path = os.path.join(args.output_dir, f"h_matrix_summary{suffix}.txt")
+            with open(h_summary_path, "w", encoding="utf-8") as hf:
+                hf.write("H-matrix estimation summary\n")
+                hf.write(f"dataset_family: {args.dataset_family}\n")
+                hf.write(f"field_method: {h_result.field_method}\n")
+                hf.write(f"eval_scalar_name: {h_result.eval_scalar_name}\n")
+                hf.write(f"eval_scalar_value: {h_result.sigma_eval}\n")
+                hf.write(f"n_samples: {h_result.theta_used.size}\n")
+                hf.write(f"order_mode: {h_result.order_mode}\n")
+                hf.write(f"h_shape: {h_result.h_sym.shape}\n")
+                hf.write(f"h_sym_min: {float(np.min(h_result.h_sym))}\n")
+                hf.write(f"h_sym_max: {float(np.max(h_result.h_sym))}\n")
+                hf.write(f"h_sym_diag_max_abs: {float(np.max(np.abs(np.diag(h_result.h_sym))))}\n")
+                hf.write(f"delta_diag_max_abs: {h_result.delta_diag_max_abs}\n")
+                hf.write(f"h_sym_max_asym_abs: {h_result.h_sym_max_asym_abs}\n")
+                hf.write(f"h_save_intermediates: {bool(getattr(args, 'h_save_intermediates', False))}\n")
+
+            h_fig_path = os.path.join(args.output_dir, f"h_matrix_sym_heatmap{suffix}.png")
+            plt.figure(figsize=(6.2, 5.6))
+            im = plt.imshow(h_result.h_sym, aspect="auto", origin="lower")
+            plt.colorbar(im, fraction=0.046, pad=0.04, label=r"$H^{sym}_{ij}$")
+            plt.xlabel("j")
+            plt.ylabel("i")
+            plt.title("Symmetric H-matrix heatmap")
+            plt.tight_layout()
+            plt.savefig(h_fig_path, dpi=180)
+            plt.close()
+            print("[summary] flow mode completed (H-matrix only path).")
+            print("Saved artifacts:")
+            print(f"  - {post_loss_fig}")
+            print(f"  - {prior_loss_fig}")
+            print(f"  - {h_npz_path}")
+            print(f"  - {h_summary_path}")
+            print(f"  - {h_fig_path}")
+            return
+
+        raise RuntimeError("theta_field_method=flow requires --compute-h-matrix to produce output artifacts.")
 
     theta_std = float(np.std(theta_score_fit))
     sigma_post = float("nan")
@@ -995,6 +1253,8 @@ def run_shared_fisher_estimation(
             "h_directed": h_result.h_directed,
             "h_sym": h_result.h_sym,
             "sigma_eval": np.asarray([h_result.sigma_eval], dtype=np.float64),
+            "h_field_method": np.asarray([h_result.field_method], dtype=object),
+            "h_eval_scalar_name": np.asarray([h_result.eval_scalar_name], dtype=object),
             "n_samples": np.asarray([h_result.theta_used.size], dtype=np.int32),
             "order_mode": np.asarray([h_result.order_mode], dtype=object),
             "delta_diag_max_abs": np.asarray([h_result.delta_diag_max_abs], dtype=np.float64),
@@ -1010,8 +1270,10 @@ def run_shared_fisher_estimation(
         with open(h_summary_path, "w", encoding="utf-8") as hf:
             hf.write("H-matrix estimation summary\n")
             hf.write(f"dataset_family: {args.dataset_family}\n")
+            hf.write(f"field_method: {h_result.field_method}\n")
+            hf.write(f"eval_scalar_name: {h_result.eval_scalar_name}\n")
+            hf.write(f"eval_scalar_value: {h_result.sigma_eval}\n")
             hf.write(f"n_samples: {h_result.theta_used.size}\n")
-            hf.write(f"sigma_eval: {h_result.sigma_eval}\n")
             hf.write(f"order_mode: {h_result.order_mode}\n")
             hf.write(f"h_shape: {h_result.h_sym.shape}\n")
             hf.write(f"h_sym_min: {float(np.min(h_result.h_sym))}\n")
