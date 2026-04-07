@@ -8,10 +8,12 @@ from torch.utils.data import DataLoader, TensorDataset
 from fisher.models import (
     ConditionalScore1D,
     ConditionalXFlowVelocity,
+    ConditionalXFlowVelocityFiLMPerLayer,
     ConditionalXScore,
     LocalDecoderLogit,
     PriorScore1D,
     UnconditionalXFlowVelocity,
+    UnconditionalXFlowVelocityFiLMPerLayer,
     UnconditionalXScore,
 )
 
@@ -609,7 +611,7 @@ def _make_flow_matching_path(scheduler_name: str):
 
 
 def train_conditional_x_flow_model(
-    model: ConditionalXFlowVelocity,
+    model: ConditionalXFlowVelocity | ConditionalXFlowVelocityFiLMPerLayer,
     theta_train: np.ndarray,
     x_train: np.ndarray,
     epochs: int,
@@ -730,7 +732,7 @@ def train_conditional_x_flow_model(
 
 
 def train_unconditional_x_flow_model(
-    model: UnconditionalXFlowVelocity,
+    model: UnconditionalXFlowVelocity | UnconditionalXFlowVelocityFiLMPerLayer,
     x_train: np.ndarray,
     epochs: int,
     batch_size: int,

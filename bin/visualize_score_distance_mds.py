@@ -29,8 +29,10 @@ except ImportError as e:
 from global_setting import DATAROOT
 from fisher.models import (
     ConditionalXFlowVelocity,
+    ConditionalXFlowVelocityFiLMPerLayer,
     ConditionalXScore,
     UnconditionalXFlowVelocity,
+    UnconditionalXFlowVelocityFiLMPerLayer,
     UnconditionalXScore,
 )
 from fisher.score_distance import (
@@ -130,6 +132,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--flow-lr", type=float, default=1e-3)
     p.add_argument("--flow-hidden-dim", type=int, default=128)
     p.add_argument("--flow-depth", type=int, default=3)
+    p.add_argument(
+        "--flow-arch",
+        type=str,
+        default="plain",
+        choices=["plain", "film_per_layer"],
+        help="Flow only: plain stacked MLP on [x,theta,logit_t] or FiLM-modulate hidden layers from (theta, logit_t).",
+    )
     p.add_argument("--flow-scheduler", type=str, default="cosine", choices=["cosine", "vp", "linear_vp"])
     p.add_argument("--flow-eval-t", type=float, default=0.5)
     p.add_argument("--flow-val-frac", type=float, default=0.1)
@@ -344,18 +353,23 @@ def main() -> None:
         flow_cond = str(args.flow_conditioning)
         print(
             "[score_x:flow] "
+            f"arch={args.flow_arch} "
             f"conditioning={flow_cond} "
             f"data_split={args.data_split} n={theta_use.shape[0]} fit={theta_fit.shape[0]} val={theta_val.shape[0]} "
             f"theta_std={theta_std:.6f} scheduler={args.flow_scheduler} t_eval={float(args.flow_eval_t):.4f}"
         )
 
         if flow_cond == "unconditional":
-            model = UnconditionalXFlowVelocity(
+            flow_kw = dict(
                 x_dim=x_use.shape[1],
                 hidden_dim=int(args.flow_hidden_dim),
                 depth=int(args.flow_depth),
                 use_logit_time=True,
-            ).to(device)
+            )
+            if str(args.flow_arch) == "film_per_layer":
+                model = UnconditionalXFlowVelocityFiLMPerLayer(**flow_kw).to(device)
+            else:
+                model = UnconditionalXFlowVelocity(**flow_kw).to(device)
             train_out = train_unconditional_x_flow_model(
                 model=model,
                 x_train=x_fit,
@@ -379,17 +393,22 @@ def main() -> None:
                 row_batch_size=int(args.cross_row_batch_size),
             )
             summary_method_detail = (
-                f"flow(unconditional): scheduler={args.flow_scheduler}, t_eval={float(args.flow_eval_t):.6f}, "
+                f"flow(unconditional): arch={args.flow_arch}, scheduler={args.flow_scheduler}, "
+                f"t_eval={float(args.flow_eval_t):.6f}, "
                 f"epochs={int(args.flow_epochs)}, batch_size={int(args.flow_batch_size)}, lr={float(args.flow_lr):.6g}, "
                 "distance=pairwise_mean_over_x_dim"
             )
         else:
-            model = ConditionalXFlowVelocity(
+            flow_kw = dict(
                 x_dim=x_use.shape[1],
                 hidden_dim=int(args.flow_hidden_dim),
                 depth=int(args.flow_depth),
                 use_logit_time=True,
-            ).to(device)
+            )
+            if str(args.flow_arch) == "film_per_layer":
+                model = ConditionalXFlowVelocityFiLMPerLayer(**flow_kw).to(device)
+            else:
+                model = ConditionalXFlowVelocity(**flow_kw).to(device)
             train_out = train_conditional_x_flow_model(
                 model=model,
                 theta_train=theta_fit,
@@ -416,7 +435,8 @@ def main() -> None:
                 row_batch_size=int(args.cross_row_batch_size),
             )
             summary_method_detail = (
-                f"flow(conditional): scheduler={args.flow_scheduler}, t_eval={float(args.flow_eval_t):.6f}, "
+                f"flow(conditional): arch={args.flow_arch}, scheduler={args.flow_scheduler}, "
+                f"t_eval={float(args.flow_eval_t):.6f}, "
                 f"epochs={int(args.flow_epochs)}, batch_size={int(args.flow_batch_size)}, lr={float(args.flow_lr):.6g}, "
                 "cross_distance_x_agg=geom_mean"
             )
@@ -581,6 +601,7 @@ def main() -> None:
         "umap_min_dist": np.asarray([float(args.umap_min_dist)], dtype=np.float64),
         "umap_random_state_used": np.asarray([umap_rs], dtype=np.int64),
         "flow_eval_t": np.asarray([float(args.flow_eval_t)], dtype=np.float64),
+        "flow_arch": np.asarray([str(args.flow_arch) if args.method == "flow" else "n/a"]),
     }
     if bool(args.save_cross_scores):
         if (args.method == "dsm" and str(args.dsm_conditioning) == "unconditional") or (
@@ -605,6 +626,7 @@ def main() -> None:
             )
             f.write(f"distance_x_aggregate (dsm conditional only): {args.distance_x_aggregate}\n")
         if args.method == "flow":
+            f.write(f"flow_arch: {args.flow_arch}\n")
             f.write(
                 f"flow_conditioning: {args.flow_conditioning} "
                 f"(unconditional: pairwise mean velocity distance; conditional: cross-matrix + geom_mean)\n"

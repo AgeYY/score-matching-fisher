@@ -159,6 +159,72 @@ class ConditionalXFlowVelocity(nn.Module):
         return self.forward(x_t, theta, t)
 
 
+class ConditionalXFlowVelocityFiLMPerLayer(nn.Module):
+    """Conditional velocity v(x_t, theta, t) with per-layer FiLM from (theta, logit_time)."""
+
+    def __init__(
+        self,
+        x_dim: int = 2,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        use_logit_time: bool = True,
+    ) -> None:
+        super().__init__()
+        if x_dim < 2:
+            raise ValueError("x_dim must be >= 2.")
+        self.x_dim = int(x_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.depth = int(depth)
+        self.use_logit_time = bool(use_logit_time)
+        cond_dim = 2
+        self.in_proj = nn.Linear(int(x_dim), int(hidden_dim))
+        self.blocks = nn.ModuleList()
+        for _ in range(int(depth)):
+            self.blocks.append(
+                nn.ModuleDict(
+                    {
+                        "lin": nn.Linear(int(hidden_dim), int(hidden_dim)),
+                        "gamma": nn.Linear(cond_dim, int(hidden_dim)),
+                        "beta": nn.Linear(cond_dim, int(hidden_dim)),
+                    }
+                )
+            )
+        self.out = nn.Linear(int(hidden_dim), int(x_dim))
+
+    def _theta_feat(self, theta: torch.Tensor) -> torch.Tensor:
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        return theta
+
+    def _t_feat(self, t: torch.Tensor) -> torch.Tensor:
+        if t.ndim == 1:
+            t = t.unsqueeze(-1)
+        if self.use_logit_time:
+            t_clip = torch.clamp(t, min=1e-4, max=1.0 - 1e-4)
+            return torch.log(t_clip) - torch.log1p(-t_clip)
+        return t
+
+    def _cond(self, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        return torch.cat([self._theta_feat(theta), self._t_feat(t)], dim=-1)
+
+    def forward(self, x_t: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        cond = self._cond(theta, t)
+        h = torch.nn.functional.silu(self.in_proj(x_t))
+        for blk in self.blocks:
+            h = blk["lin"](h)
+            gamma = blk["gamma"](cond)
+            beta = blk["beta"](cond)
+            h = gamma * h + beta
+            h = torch.nn.functional.silu(h)
+        return self.out(h)
+
+    @torch.no_grad()
+    def predict_velocity(self, x_t: torch.Tensor, theta: torch.Tensor, t_eval: float) -> torch.Tensor:
+        self.eval()
+        t = torch.full((x_t.shape[0], 1), float(t_eval), device=x_t.device)
+        return self.forward(x_t, theta, t)
+
+
 class UnconditionalXFlowVelocity(nn.Module):
     """Unconditional velocity v(x_t, t) in R^{x_dim} (no parameter conditioning)."""
 
@@ -193,6 +259,64 @@ class UnconditionalXFlowVelocity(nn.Module):
             t_feat = t
         feats = torch.cat([x_t, t_feat], dim=-1)
         return self.net(feats)
+
+    @torch.no_grad()
+    def predict_velocity(self, x_t: torch.Tensor, t_eval: float) -> torch.Tensor:
+        self.eval()
+        t = torch.full((x_t.shape[0], 1), float(t_eval), device=x_t.device)
+        return self.forward(x_t, t)
+
+
+class UnconditionalXFlowVelocityFiLMPerLayer(nn.Module):
+    """Unconditional velocity v(x_t, t) with per-layer FiLM from logit_time only."""
+
+    def __init__(
+        self,
+        x_dim: int = 2,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        use_logit_time: bool = True,
+    ) -> None:
+        super().__init__()
+        if x_dim < 2:
+            raise ValueError("x_dim must be >= 2.")
+        self.x_dim = int(x_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.depth = int(depth)
+        self.use_logit_time = bool(use_logit_time)
+        cond_dim = 1
+        self.in_proj = nn.Linear(int(x_dim), int(hidden_dim))
+        self.blocks = nn.ModuleList()
+        for _ in range(int(depth)):
+            self.blocks.append(
+                nn.ModuleDict(
+                    {
+                        "lin": nn.Linear(int(hidden_dim), int(hidden_dim)),
+                        "gamma": nn.Linear(cond_dim, int(hidden_dim)),
+                        "beta": nn.Linear(cond_dim, int(hidden_dim)),
+                    }
+                )
+            )
+        self.out = nn.Linear(int(hidden_dim), int(x_dim))
+
+    def _t_feat(self, t: torch.Tensor) -> torch.Tensor:
+        if t.ndim == 1:
+            t = t.unsqueeze(-1)
+        if self.use_logit_time:
+            t_clip = torch.clamp(t, min=1e-4, max=1.0 - 1e-4)
+            return torch.log(t_clip) - torch.log1p(-t_clip)
+        return t
+
+    def forward(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        cond = self._t_feat(t)
+        h = torch.nn.functional.silu(self.in_proj(x_t))
+        for blk in self.blocks:
+            h = blk["lin"](h)
+            gamma = blk["gamma"](cond)
+            beta = blk["beta"](cond)
+            h = gamma * h + beta
+            h = torch.nn.functional.silu(h)
+        return self.out(h)
 
     @torch.no_grad()
     def predict_velocity(self, x_t: torch.Tensor, t_eval: float) -> torch.Tensor:
