@@ -39,6 +39,7 @@ from fisher.score_distance import (
     compute_cross_score_matrix,
     compute_unconditional_score_vectors,
     evaluate_distance_variants,
+    evaluate_distance_variants_theta_bin_avg,
     evaluate_pairwise_score_distance_variants,
 )
 from fisher.shared_dataset_io import load_shared_dataset_npz
@@ -105,6 +106,41 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-score-restore-best", action="store_false", dest="score_restore_best")
     p.add_argument("--cross-row-batch-size", type=int, default=128)
     p.add_argument("--save-cross-scores", action="store_true", default=False)
+    p.add_argument(
+        "--distance-definition",
+        type=str,
+        default="original",
+        choices=["original", "theta_bin_avg"],
+        help=(
+            "Conditional DSM distance backend. "
+            "original: d_ij^2 = 0.5||S_ii-S_ij||^2 + 0.5||S_ji-S_jj||^2. "
+            "theta_bin_avg: average ||s(x_k,theta_i)-s(x_k,theta_j)||^2 over k in bins(theta_i) U bins(theta_j)."
+        ),
+    )
+    p.add_argument(
+        "--distance-theta-bins",
+        type=int,
+        default=50,
+        help="Number of equal-width theta bins used by --distance-definition theta_bin_avg.",
+    )
+    p.add_argument(
+        "--distance-theta-low",
+        type=float,
+        default=None,
+        help="Lower bound for equal-width theta bins (default: min(theta_use)).",
+    )
+    p.add_argument(
+        "--distance-theta-high",
+        type=float,
+        default=None,
+        help="Upper bound for equal-width theta bins (default: max(theta_use)).",
+    )
+    p.add_argument(
+        "--distance-min-bin-count",
+        type=int,
+        default=1,
+        help="Minimum sample count for a valid theta bin in theta_bin_avg mode; sparse bins fall back to all rows.",
+    )
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument(
         "--isomap-n-neighbors",
@@ -199,6 +235,11 @@ def main() -> None:
         if theta_use.shape[0] == 0:
             raise ValueError("data_split=eval requires non-empty eval split in dataset npz.")
 
+    theta_dist_low = float(np.min(theta_use)) if args.distance_theta_low is None else float(args.distance_theta_low)
+    theta_dist_high = float(np.max(theta_use)) if args.distance_theta_high is None else float(args.distance_theta_high)
+    if theta_dist_high <= theta_dist_low:
+        raise ValueError("distance-theta-high must be > distance-theta-low.")
+
     theta_fit, x_fit, theta_val, x_val = _split_train_val(theta_use, x_use, args.score_val_frac, rng)
     theta_std = float(np.std(theta_fit))
     sigma_min = float(args.score_sigma_min_alpha * theta_std)
@@ -284,6 +325,7 @@ def main() -> None:
 
     cross_scores: np.ndarray | None = None
     score_vectors: np.ndarray | None = None
+    distance_label = "unconditional_pairwise_mean"
     if str(args.dsm_conditioning) == "unconditional":
         score_vectors = compute_unconditional_score_vectors(
             model=model,
@@ -305,8 +347,30 @@ def main() -> None:
             row_batch_size=int(args.cross_row_batch_size),
         )
         print(f"[score_matrix] shape={cross_scores.shape} (N,N,x_dim)")
-        raw = evaluate_distance_variants(cross_scores, normalize_score=False)
-        norm = evaluate_distance_variants(cross_scores, normalize_score=True)
+        if str(args.distance_definition) == "theta_bin_avg":
+            distance_label = "theta_bin_avg"
+            raw = evaluate_distance_variants_theta_bin_avg(
+                cross_scores,
+                theta=theta_use,
+                normalize_score=False,
+                theta_low=theta_dist_low,
+                theta_high=theta_dist_high,
+                n_bins=int(args.distance_theta_bins),
+                min_bin_count=int(args.distance_min_bin_count),
+            )
+            norm = evaluate_distance_variants_theta_bin_avg(
+                cross_scores,
+                theta=theta_use,
+                normalize_score=True,
+                theta_low=theta_dist_low,
+                theta_high=theta_dist_high,
+                n_bins=int(args.distance_theta_bins),
+                min_bin_count=int(args.distance_min_bin_count),
+            )
+        else:
+            distance_label = "original"
+            raw = evaluate_distance_variants(cross_scores, normalize_score=False)
+            norm = evaluate_distance_variants(cross_scores, normalize_score=True)
 
     loss_fig_path = os.path.join(args.output_dir, "score_x_loss_vs_epoch.png")
     epochs = np.arange(1, train_losses.size + 1)
@@ -354,7 +418,12 @@ def main() -> None:
     fig, axes = plt.subplots(2, 2, figsize=(12.0, 10.0), layout="constrained")
     ax_flat = np.asarray(axes).ravel()
     panels: list[tuple[np.ndarray, str, str, str]] = [
-        (primary_emb, r"Score distance $\rightarrow$ Classical MDS (raw score, $d$)", "MDS 1", "MDS 2"),
+        (
+            primary_emb,
+            rf"Score distance ({distance_label}) $\rightarrow$ Classical MDS (raw score, $d$)",
+            "MDS 1",
+            "MDS 2",
+        ),
         (emb_euclid, r"Euclidean $x$ → Classical MDS", "MDS 1", "MDS 2"),
         (emb_isomap, f"Isomap on $x$ ($k$={isomap_k})", "Isomap 1", "Isomap 2"),
         (
@@ -379,6 +448,11 @@ def main() -> None:
         "theta": theta_use.reshape(-1),
         "x": x_use,
         "dsm_conditioning": np.asarray([str(args.dsm_conditioning)]),
+        "distance_definition": np.asarray([str(distance_label)]),
+        "distance_theta_bins": np.asarray([int(args.distance_theta_bins)], dtype=np.int64),
+        "distance_theta_low": np.asarray([theta_dist_low], dtype=np.float64),
+        "distance_theta_high": np.asarray([theta_dist_high], dtype=np.float64),
+        "distance_min_bin_count": np.asarray([int(args.distance_min_bin_count)], dtype=np.int64),
         "score_arch": np.asarray([str(args.score_arch)]),
         "sigma_eval": np.asarray([sigma_eval], dtype=np.float64),
         "sigma_eval_grid": sigma_eval_grid.astype(np.float64),
@@ -428,6 +502,12 @@ def main() -> None:
         f.write(f"output_dir: {args.output_dir}\n")
         f.write(f"data_split: {args.data_split}\n")
         f.write(f"dsm_conditioning: {args.dsm_conditioning}\n")
+        f.write(f"distance_definition: {distance_label}\n")
+        f.write(
+            "theta_binning: "
+            f"bins={int(args.distance_theta_bins)}, low={theta_dist_low:.6f}, high={theta_dist_high:.6f}, "
+            f"min_bin_count={int(args.distance_min_bin_count)}\n"
+        )
         f.write(f"n_samples: {theta_use.shape[0]}\n")
         f.write(f"x_dim: {x_use.shape[1]}\n")
         f.write(f"score_arch: {args.score_arch}\n")
@@ -455,7 +535,8 @@ def main() -> None:
             )
         f.write(
             "figure score_distance_mds_theta_color.png (top-left score panel): "
-            "raw score + d (unnormalized S_ij vectors in x_dim before distances).\n"
+            f"raw score + d with distance_definition={distance_label} "
+            "(unnormalized score vectors in x_dim before distances).\n"
         )
         f.write("MDS quality (strain, lower is better):\n")
         f.write(f"  raw score + d:    strain={float(raw['strain_d']):.6f}, positive_eigs={int(raw['positive_eig_d'])}\n")

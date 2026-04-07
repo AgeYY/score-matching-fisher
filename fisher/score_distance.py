@@ -170,6 +170,111 @@ def score_distance_matrix_from_cross_scores(
     return d2
 
 
+def _theta_equal_width_bin_ids(
+    theta: np.ndarray,
+    *,
+    theta_low: float,
+    theta_high: float,
+    n_bins: int,
+) -> np.ndarray:
+    t = np.asarray(theta, dtype=np.float64).reshape(-1)
+    if n_bins < 1:
+        raise ValueError("n_bins must be >= 1.")
+    if not np.isfinite(theta_low) or not np.isfinite(theta_high) or theta_high <= theta_low:
+        raise ValueError("Require finite theta range with theta_high > theta_low.")
+    edges = np.linspace(float(theta_low), float(theta_high), int(n_bins) + 1, dtype=np.float64)
+    ids = np.digitize(t, edges, right=False) - 1
+    # Clamp out-of-range values to edge bins to keep all samples represented.
+    return np.clip(ids, 0, int(n_bins) - 1).astype(np.int64)
+
+
+def theta_bin_averaged_distance_matrix_from_cross_scores(
+    cross_scores: np.ndarray,
+    theta: np.ndarray,
+    *,
+    theta_low: float,
+    theta_high: float,
+    n_bins: int,
+    min_bin_count: int = 1,
+    use_sqrt: bool,
+) -> np.ndarray:
+    """Sample-indexed theta-bin-averaged distance from cross scores.
+
+    For i, j:
+      Delta_k(i,j) = s(x_k, theta_i) - s(x_k, theta_j)
+      d^2(i,j) = mean_{k in K(i,j)} mean_dim(Delta_k(i,j)^2),
+    where K(i,j) is the union of samples in bins(theta_i) and bins(theta_j).
+    If either bin has too few samples (< min_bin_count), falls back to all rows.
+    """
+    s = np.asarray(cross_scores, dtype=np.float64)
+    if s.ndim != 3 or s.shape[0] != s.shape[1]:
+        raise ValueError("cross_scores must have shape (N, N, x_dim).")
+    n, _, x_dim = s.shape
+    if x_dim < 1:
+        raise ValueError("cross_scores x_dim must be >= 1.")
+    if min_bin_count < 1:
+        raise ValueError("min_bin_count must be >= 1.")
+
+    bin_ids = _theta_equal_width_bin_ids(
+        theta,
+        theta_low=float(theta_low),
+        theta_high=float(theta_high),
+        n_bins=int(n_bins),
+    )
+    if bin_ids.shape[0] != n:
+        raise ValueError("theta must have the same number of rows as cross_scores.")
+
+    bin_to_idx: list[np.ndarray] = [np.where(bin_ids == b)[0].astype(np.int64) for b in range(int(n_bins))]
+    counts = np.asarray([arr.size for arr in bin_to_idx], dtype=np.int64)
+    valid_bin = counts >= int(min_bin_count)
+    all_rows = np.arange(n, dtype=np.int64)
+
+    d2 = np.zeros((n, n), dtype=np.float64)
+    for b_i in range(int(n_bins)):
+        i_idx = bin_to_idx[b_i]
+        if i_idx.size == 0:
+            continue
+        for b_j in range(b_i, int(n_bins)):
+            j_idx = bin_to_idx[b_j]
+            if j_idx.size == 0:
+                continue
+
+            # Sparse bins fallback: use all rows when any participating bin is under-populated.
+            if not (bool(valid_bin[b_i]) and bool(valid_bin[b_j])):
+                k_idx = all_rows
+            elif b_i == b_j:
+                k_idx = i_idx
+            else:
+                k_idx = np.union1d(i_idx, j_idx)
+            if k_idx.size == 0:
+                k_idx = all_rows
+
+            n_i = i_idx.size
+            n_j = j_idx.size
+            acc = np.zeros((n_i, n_j), dtype=np.float64)
+            for k in k_idx:
+                a = s[int(k), i_idx, :]  # (n_i, x_dim)
+                b = s[int(k), j_idx, :]  # (n_j, x_dim)
+                a2 = np.sum(a * a, axis=1, keepdims=True)
+                b2 = np.sum(b * b, axis=1, keepdims=True).T
+                acc += (a2 + b2 - 2.0 * (a @ b.T)) / float(x_dim)
+            block = acc / float(k_idx.size)
+
+            d2[np.ix_(i_idx, j_idx)] = block
+            if b_i != b_j:
+                d2[np.ix_(j_idx, i_idx)] = block.T
+
+    d2 = 0.5 * (d2 + d2.T)
+    np.fill_diagonal(d2, 0.0)
+    d2 = np.clip(d2, 0.0, None)
+    if use_sqrt:
+        d = np.sqrt(d2)
+        d = 0.5 * (d + d.T)
+        np.fill_diagonal(d, 0.0)
+        return d
+    return d2
+
+
 def classical_mds_from_distances(
     distance_matrix: np.ndarray,
     n_components: int = 2,
@@ -219,6 +324,51 @@ def evaluate_distance_variants(
         s,
         use_sqrt=False,
         average_over_x_dim=True,
+    )
+    mds_d = classical_mds_from_distances(d, n_components=2)
+    mds_d2 = classical_mds_from_distances(d2, n_components=2)
+    return {
+        "distance_d": d,
+        "distance_d2": d2,
+        "embedding_d": mds_d.embedding,
+        "embedding_d2": mds_d2.embedding,
+        "strain_d": float(mds_d.strain_relative),
+        "strain_d2": float(mds_d2.strain_relative),
+        "positive_eig_d": float(mds_d.positive_eig_count),
+        "positive_eig_d2": float(mds_d2.positive_eig_count),
+        "eigenvalues_d": mds_d.eigenvalues_all,
+        "eigenvalues_d2": mds_d2.eigenvalues_all,
+    }
+
+
+def evaluate_distance_variants_theta_bin_avg(
+    cross_scores: np.ndarray,
+    theta: np.ndarray,
+    *,
+    normalize_score: bool,
+    theta_low: float,
+    theta_high: float,
+    n_bins: int,
+    min_bin_count: int,
+) -> dict[str, np.ndarray | float]:
+    s = normalize_scores(cross_scores) if normalize_score else np.asarray(cross_scores, dtype=np.float64)
+    d = theta_bin_averaged_distance_matrix_from_cross_scores(
+        s,
+        theta,
+        theta_low=float(theta_low),
+        theta_high=float(theta_high),
+        n_bins=int(n_bins),
+        min_bin_count=int(min_bin_count),
+        use_sqrt=True,
+    )
+    d2 = theta_bin_averaged_distance_matrix_from_cross_scores(
+        s,
+        theta,
+        theta_low=float(theta_low),
+        theta_high=float(theta_high),
+        n_bins=int(n_bins),
+        min_bin_count=int(min_bin_count),
+        use_sqrt=False,
     )
     mds_d = classical_mds_from_distances(d, n_components=2)
     mds_d2 = classical_mds_from_distances(d2, n_components=2)
