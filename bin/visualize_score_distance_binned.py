@@ -37,8 +37,9 @@ from fisher.score_distance import (
     evaluate_distance_variants,
     evaluate_pairwise_score_distance_variants,
 )
+from fisher import sssd
 from fisher.shared_dataset_io import load_shared_dataset_npz
-from fisher.shared_fisher_est import require_device
+from fisher.shared_fisher_est import build_dataset_from_meta, require_device
 from fisher.trainers import (
     geometric_sigma_schedule,
     train_conditional_x_flow_model,
@@ -163,6 +164,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cross-row-batch-size", type=int, default=128)
     p.add_argument("--save-cross-scores", action="store_true", default=False)
     p.add_argument("--log-every", type=int, default=50)
+    sssd.add_sssd_cli_arguments(p)
+    p.add_argument(
+        "--sssd-gt-n-total",
+        type=int,
+        default=0,
+        help="If >0, draw this many joint samples for SSSD M_ij GT reference (same as h_matrix_binned GT idea).",
+    )
+    p.add_argument(
+        "--sssd-gt-seed",
+        type=int,
+        default=-1,
+        help="RNG for SSSD GT sampling; -1 uses dataset seed + 19.",
+    )
     return p.parse_args()
 
 
@@ -202,6 +216,24 @@ def theta_to_bin_index(theta: np.ndarray, edges: np.ndarray, n_bins: int) -> np.
     th = np.asarray(theta, dtype=np.float64).reshape(-1)
     idx = np.searchsorted(edges, th, side="right") - 1
     return np.clip(idx, 0, n_bins - 1).astype(np.int64)
+
+
+def matrix_corr_offdiag(a: np.ndarray, b: np.ndarray) -> float:
+    """Pearson correlation over finite off-diagonal entries; NaN if undefined."""
+    aa = np.asarray(a, dtype=np.float64)
+    bb = np.asarray(b, dtype=np.float64)
+    if aa.shape != bb.shape or aa.ndim != 2 or aa.shape[0] != aa.shape[1]:
+        raise ValueError("matrix_corr_offdiag requires equal-shape square matrices.")
+    n = aa.shape[0]
+    off = ~np.eye(n, dtype=bool)
+    mask = off & np.isfinite(aa) & np.isfinite(bb)
+    if int(np.sum(mask)) < 3:
+        return float("nan")
+    av = aa[mask]
+    bv = bb[mask]
+    if float(np.std(av)) <= 0.0 or float(np.std(bv)) <= 0.0:
+        return float("nan")
+    return float(np.corrcoef(av, bv)[0, 1])
 
 
 def average_matrix_by_bins(
@@ -246,6 +278,15 @@ def _distance_matrix_from_variant(
 
 def main() -> None:
     args = parse_args()
+    if int(args.sssd_epochs) < 1:
+        raise ValueError("--sssd-epochs must be >= 1.")
+    if int(args.sssd_patience) < 0:
+        raise ValueError("--sssd-patience must be >= 0 (0 disables early stopping).")
+    if int(args.sssd_batch_size) < 1:
+        raise ValueError("--sssd-batch-size must be >= 1.")
+    if not (0.0 < float(args.sssd_val_frac) < 1.0):
+        raise ValueError("--sssd-val-frac must be in (0, 1).")
+
     device = require_device(str(args.device))
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -467,6 +508,182 @@ def main() -> None:
     bin_idx = theta_to_bin_index(theta_use, edges, int(args.num_theta_bins))
     dist_binned, count_matrix = average_matrix_by_bins(distance, bin_idx, int(args.num_theta_bins))
 
+    n_bins_sd = int(args.num_theta_bins)
+    sssd_eval_sigmas = np.asarray([], dtype=np.float64)
+    sssd_M_stack = np.zeros((0, n_bins_sd, n_bins_sd), dtype=np.float64)
+    sssd_gt_M_stack = np.zeros((0, n_bins_sd, n_bins_sd), dtype=np.float64)
+    sssd_acc_stack = np.zeros((0, n_bins_sd, n_bins_sd), dtype=np.float64)
+    sssd_gt_acc_stack = np.zeros((0, n_bins_sd, n_bins_sd), dtype=np.float64)
+    sssd_train_losses = np.asarray([], dtype=np.float64)
+    sssd_best_epoch = -1
+    sssd_sigma_min_used = float("nan")
+    sssd_sigma_max_used = float("nan")
+    corr_sssd_M_vs_gt_M = np.asarray([], dtype=np.float64)
+    corr_sssd_acc_vs_gt_acc = np.asarray([], dtype=np.float64)
+    sssd_acc_panels_path = ""
+    sssd_acc_primary_path = ""
+
+    if not bool(args.no_sssd) and n_bins_sd >= 2:
+        span = float(edge_hi - edge_lo)
+        if span <= 0.0:
+            print("[score_distance_binned] SSSD skipped: non-positive theta span.")
+        else:
+            smin_def, smax_def = sssd.default_sigma_training_range_from_theta(theta_use.reshape(-1))
+            if args.sssd_sigma_min is not None and args.sssd_sigma_max is not None:
+                smin = float(args.sssd_sigma_min)
+                smax = float(args.sssd_sigma_max)
+            elif args.sssd_sigma_max is not None:
+                smax = float(args.sssd_sigma_max)
+                smin = smax / 8.0
+            elif args.sssd_sigma_min is not None:
+                smin = float(args.sssd_sigma_min)
+                smax = smin * 8.0
+            else:
+                smin, smax = smin_def, smax_def
+            if not (0.0 < smin < smax):
+                raise ValueError(f"SSSD sigma range invalid: sigma_min={smin} sigma_max={smax}")
+            sssd_sigma_min_used = smin
+            sssd_sigma_max_used = smax
+            sigmas_s = str(args.sssd_sigmas).strip().lower()
+            if sigmas_s == "auto":
+                n_s = max(2, int(args.sssd_n_sigmas))
+                sssd_eval_sigmas = np.geomspace(smin, smax, num=n_s, dtype=np.float64)
+            else:
+                sssd_eval_sigmas = np.asarray(sssd.parse_sigma_list(str(args.sssd_sigmas)), dtype=np.float64)
+
+            sssd_seed = seed if int(args.sssd_seed) < 0 else int(args.sssd_seed)
+            print(
+                f"[score_distance_binned] SSSD training: sigma_train=[{smin:g},{smax:g}] "
+                f"eval_sigmas={np.array2string(sssd_eval_sigmas, precision=4)} "
+                f"max_epochs={int(args.sssd_epochs)} patience={int(args.sssd_patience)}"
+            )
+            sssd_model, sssd_res = sssd.train_sssd_decoder(
+                theta_use.reshape(-1),
+                x_use,
+                edges,
+                sigma_min=smin,
+                sigma_max=smax,
+                device=device,
+                epochs=int(args.sssd_epochs),
+                batch_size=int(args.sssd_batch_size),
+                lr=float(args.sssd_lr),
+                hidden_dim=int(args.sssd_hidden_dim),
+                depth=int(args.sssd_depth),
+                val_frac=float(args.sssd_val_frac),
+                patience=int(args.sssd_patience),
+                seed=sssd_seed,
+                log_every=int(args.sssd_log_every),
+            )
+            sssd_train_losses = np.asarray(sssd_res.train_losses, dtype=np.float64)
+            sssd_best_epoch = int(sssd_res.best_epoch)
+
+            theta_gt_sd: np.ndarray | None = None
+            x_gt_sd: np.ndarray | None = None
+            gt_bin_sd: np.ndarray | None = None
+            if int(args.sssd_gt_n_total) > 0:
+                _gt_seed_sd = (seed + 19) if int(args.sssd_gt_seed) < 0 else int(args.sssd_gt_seed)
+                np.random.seed(_gt_seed_sd)
+                torch.manual_seed(_gt_seed_sd)
+                ds_gt = build_dataset_from_meta(bundle.meta)
+                theta_gt_sd, x_gt_sd = ds_gt.sample_joint(int(args.sssd_gt_n_total))
+                theta_gt_sd = np.asarray(theta_gt_sd, dtype=np.float64).reshape(-1)
+                x_gt_sd = np.asarray(x_gt_sd, dtype=np.float64)
+                gt_bin_sd = theta_to_bin_index(theta_gt_sd, edges, n_bins_sd)
+
+            S = int(sssd_eval_sigmas.shape[0])
+            sssd_M_stack = np.full((S, n_bins_sd, n_bins_sd), np.nan, dtype=np.float64)
+            sssd_gt_M_stack = np.full((S, n_bins_sd, n_bins_sd), np.nan, dtype=np.float64)
+            sssd_acc_stack = np.full((S, n_bins_sd, n_bins_sd), np.nan, dtype=np.float64)
+            sssd_gt_acc_stack = np.full((S, n_bins_sd, n_bins_sd), np.nan, dtype=np.float64)
+            corr_sssd_M_vs_gt_M = np.full(S, np.nan, dtype=np.float64)
+            corr_sssd_acc_vs_gt_acc = np.full(S, np.nan, dtype=np.float64)
+
+            for si, sig in enumerate(sssd_eval_sigmas):
+                sigf = float(sig)
+                lp_ds = sssd.decoder_log_probs(
+                    sssd_model,
+                    x_use,
+                    sigf,
+                    device,
+                    batch_size=max(512, int(args.sssd_batch_size)),
+                )
+                M_ds = sssd.symmetric_discrimination_matrix_M(lp_ds, bin_idx, n_bins_sd)
+                A_ds = sssd.symmetric_lr_accuracy_matrix(lp_ds, bin_idx, n_bins_sd)
+                sssd_M_stack[si] = M_ds
+                sssd_acc_stack[si] = A_ds
+                if theta_gt_sd is not None and x_gt_sd is not None and gt_bin_sd is not None:
+                    lp_gt = sssd.decoder_log_probs(
+                        sssd_model,
+                        x_gt_sd,
+                        sigf,
+                        device,
+                        batch_size=max(512, int(args.sssd_batch_size)),
+                    )
+                    M_gt = sssd.symmetric_discrimination_matrix_M(lp_gt, gt_bin_sd, n_bins_sd)
+                    A_gt = sssd.symmetric_lr_accuracy_matrix(lp_gt, gt_bin_sd, n_bins_sd)
+                    sssd_gt_M_stack[si] = M_gt
+                    sssd_gt_acc_stack[si] = A_gt
+                    corr_sssd_M_vs_gt_M[si] = matrix_corr_offdiag(M_ds, M_gt)
+                    corr_sssd_acc_vs_gt_acc[si] = matrix_corr_offdiag(A_ds, A_gt)
+
+            ncols = min(5, S)
+            nrows = int(np.ceil(S / ncols))
+            sssd_acc_panels_file = os.path.join(args.output_dir, "score_distance_sssd_acc_panels.png")
+            fig, axes = plt.subplots(nrows, ncols, figsize=(3.9 * ncols, 3.5 * nrows), squeeze=False)
+            last_im = None
+            for si in range(S):
+                r, c = divmod(si, ncols)
+                ax = axes[r][c]
+                last_im = ax.imshow(
+                    sssd_acc_stack[si],
+                    aspect="auto",
+                    origin="lower",
+                    interpolation="nearest",
+                    vmin=0.0,
+                    vmax=1.0,
+                )
+                ax.set_title(rf"$\sigma$={float(sssd_eval_sigmas[si]):.4g}")
+                ax.set_xlabel(r"bin $j$")
+                ax.set_ylabel(r"bin $i$")
+            for si in range(S, nrows * ncols):
+                r, c = divmod(si, ncols)
+                axes[r][c].axis("off")
+            fig.colorbar(
+                last_im,
+                ax=axes,
+                fraction=0.03,
+                pad=0.04,
+                label="symmetric LR accuracy",
+            )
+            fig.suptitle("SSSD symmetric pairwise LR accuracy (kernel-smoothed decoder)", fontsize=13)
+            plt.savefig(sssd_acc_panels_file, dpi=180, bbox_inches="tight")
+            plt.close()
+            mid = S // 2
+            sssd_acc_primary_file = os.path.join(args.output_dir, "score_distance_sssd_acc_primary.png")
+            plt.figure(figsize=(7.0, 6.0))
+            im_p = plt.imshow(
+                sssd_acc_stack[mid],
+                aspect="auto",
+                origin="lower",
+                interpolation="nearest",
+                vmin=0.0,
+                vmax=1.0,
+            )
+            plt.colorbar(im_p, fraction=0.046, pad=0.04, label="symmetric LR accuracy")
+            plt.xlabel(r"bin $j$")
+            plt.ylabel(r"bin $i$")
+            plt.title(rf"SSSD LR accuracy (primary $\sigma$={float(sssd_eval_sigmas[mid]):.4g})")
+            plt.tight_layout()
+            plt.savefig(sssd_acc_primary_file, dpi=180)
+            plt.close()
+            sssd_acc_panels_path = sssd_acc_panels_file
+            sssd_acc_primary_path = sssd_acc_primary_file
+    else:
+        if bool(args.no_sssd):
+            print("[score_distance_binned] --no-sssd: skipping SSSD.")
+        elif n_bins_sd < 2:
+            print("[score_distance_binned] SSSD requires num_theta_bins >= 2; skipped.")
+
     loss_fig_path = os.path.join(args.output_dir, "score_x_loss_vs_epoch.png")
     epochs = np.arange(1, train_losses.size + 1)
     plt.figure(figsize=(8.6, 4.8))
@@ -550,6 +767,18 @@ def main() -> None:
         "stopped_epoch": np.asarray([stopped_epoch], dtype=np.int64),
         "stopped_early": np.asarray([int(stopped_early)], dtype=np.int64),
         "dataset_npz": np.asarray([os.path.abspath(args.dataset_npz)], dtype=object),
+        "sssd_eval_sigmas": sssd_eval_sigmas.astype(np.float64),
+        "sssd_M_sym_stack": sssd_M_stack.astype(np.float64),
+        "sssd_gt_M_sym_stack": sssd_gt_M_stack.astype(np.float64),
+        "sssd_train_losses": sssd_train_losses,
+        "sssd_best_epoch": np.asarray([sssd_best_epoch], dtype=np.int64),
+        "sssd_sigma_min_used": np.asarray([sssd_sigma_min_used], dtype=np.float64),
+        "sssd_sigma_max_used": np.asarray([sssd_sigma_max_used], dtype=np.float64),
+        "corr_sssd_M_vs_gt_M": corr_sssd_M_vs_gt_M.astype(np.float64),
+        "sssd_acc_sym_stack": sssd_acc_stack.astype(np.float64),
+        "sssd_gt_acc_sym_stack": sssd_gt_acc_stack.astype(np.float64),
+        "corr_sssd_acc_vs_gt_acc": corr_sssd_acc_vs_gt_acc.astype(np.float64),
+        "sssd_gt_n_total": np.asarray([int(args.sssd_gt_n_total)], dtype=np.int64),
     }
     if bool(args.save_cross_scores):
         if (args.method == "dsm" and str(args.dsm_conditioning) == "unconditional") or (
@@ -601,6 +830,16 @@ def main() -> None:
         f.write(f"  {count_heatmap_path}\n")
         f.write(f"  {npz_path}\n")
         f.write(f"  {summary_path}\n")
+        if sssd_acc_panels_path:
+            f.write(f"  {sssd_acc_panels_path}\n")
+        if sssd_acc_primary_path:
+            f.write(f"  {sssd_acc_primary_path}\n")
+        if sssd_acc_stack.size > 0 and sssd_acc_stack.shape[0] > 0:
+            f.write(
+                f"SSSD: sigma_train=[{sssd_sigma_min_used:g},{sssd_sigma_max_used:g}] "
+                f"best_epoch={sssd_best_epoch} sssd_gt_n_total={int(args.sssd_gt_n_total)} "
+                "(primary metrics: LR accuracy matrices; M_ij log-ratio in NPZ)\n"
+            )
 
     print(f"[score_distance_binned:{args.method}] Saved:")
     print(f"  - {loss_fig_path}")
@@ -608,6 +847,10 @@ def main() -> None:
     print(f"  - {count_heatmap_path}")
     print(f"  - {npz_path}")
     print(f"  - {summary_path}")
+    if sssd_acc_panels_path:
+        print(f"  - {sssd_acc_panels_path}")
+    if sssd_acc_primary_path:
+        print(f"  - {sssd_acc_primary_path}")
 
 
 if __name__ == "__main__":

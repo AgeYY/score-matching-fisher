@@ -312,7 +312,7 @@ def parse_dataset_only_args(argv: list[str] | None = None) -> argparse.Namespace
         "--output-npz",
         type=str,
         default=str(Path(DATA_DIR) / "shared_fisher_dataset.npz"),
-        help="Path to write the shared dataset .npz (under DATAROOT/data recommended).",
+        help="Path to write the shared dataset .npz (under DATAROOT recommended).",
     )
     return p.parse_args(argv)
 

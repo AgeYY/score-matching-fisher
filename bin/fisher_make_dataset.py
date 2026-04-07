@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a shared (theta, x) dataset and save it under DATAROOT/data as a compressed .npz."""
+"""Generate a shared (theta, x) dataset and save it under DATAROOT as a compressed .npz."""
 
 from __future__ import annotations
 

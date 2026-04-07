@@ -11,8 +11,8 @@ DATAROOT = os.environ.get(
     "/data/zeyuan/score-matching-fisher",
 )
 
-# Default datasets and run outputs live here (same layout as the repo `data/` symlink).
-DATA_DIR = os.path.join(DATAROOT, "data")
+# Default datasets and run outputs live directly under DATAROOT (same tree as the repo `data/` symlink).
+DATA_DIR = DATAROOT
 
 # Score matching: when using train_split validation, this fraction of the score pool is held out for val.
 SCORE_VAL_FRACTION = 0.2

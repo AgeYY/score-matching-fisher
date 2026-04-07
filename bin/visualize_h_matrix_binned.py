@@ -2,6 +2,14 @@
 """Load a shared dataset, estimate H-matrix, bin theta, average H_sym by bins, visualize.
 
 Also builds a pairwise theta-bin logistic-regression accuracy matrix on x (same rows as H).
+
+From ``delta_l_matrix`` in the H-matrix NPZ (requires ``--h-save-intermediates`` when training),
+bins pairwise log-likelihood ratios ``ΔL_ij``, maps to symmetric accuracy
+``0.5*(f(\\Delta L)+f(\\Delta L^T))`` with ``f(z)=\\max(\\sigma(z),1-\\sigma(z))``, and adds a panel to the composite figure.
+
+SSSD (kernel-smoothed decoder): trains a sigma-conditioned softmax decoder with soft bin targets
+and reports symmetric pairwise LR decision accuracies A_ij(sigma) (primary); log-ratio M_ij in NPZ.
+
 Additionally computes a ground-truth approximation matrix by applying the same decoding scheme
 to a larger sampled dataset (default n=10000), and reports correlations against this matrix.
 """
@@ -19,6 +27,7 @@ if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 
 import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
 import numpy as np
 import torch
 from sklearn.linear_model import LogisticRegression
@@ -34,6 +43,7 @@ from fisher.shared_fisher_est import (
     run_shared_fisher_estimation,
     validate_estimation_args,
 )
+from fisher import sssd
 
 
 def parse_args() -> argparse.Namespace:
@@ -119,6 +129,7 @@ def parse_args() -> argparse.Namespace:
         default=-1,
         help="Sampling seed for GT approximation; -1 uses dataset seed + 17.",
     )
+    sssd.add_sssd_cli_arguments(p)
     add_estimation_arguments(p)
     p.set_defaults(output_dir=str(Path(DATA_DIR) / "outputs_h_matrix_binned"))
     return p.parse_args()
@@ -183,6 +194,56 @@ def average_h_by_bins(
             count_matrix[a, b] = na * nb
 
     return h_binned, count_matrix
+
+
+def average_matrix_by_bins(
+    mat: np.ndarray,
+    bin_idx: np.ndarray,
+    n_bins: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Average arbitrary square matrix entries over theta-bin pairs (a,b). Returns (binned, count_matrix)."""
+    m = np.asarray(mat, dtype=np.float64)
+    n = m.shape[0]
+    if m.ndim != 2 or m.shape != (n, n) or bin_idx.shape[0] != n:
+        raise ValueError("mat must be square (N,N) and bin_idx must have length N.")
+    out = np.full((n_bins, n_bins), np.nan, dtype=np.float64)
+    count_matrix = np.zeros((n_bins, n_bins), dtype=np.int64)
+
+    for a in range(n_bins):
+        ia = np.flatnonzero(bin_idx == a)
+        na = int(ia.size)
+        for b in range(n_bins):
+            jb = np.flatnonzero(bin_idx == b)
+            nb = int(jb.size)
+            if na == 0 or nb == 0:
+                continue
+            sub = m[np.ix_(ia, jb)]
+            out[a, b] = float(np.nanmean(sub))
+            count_matrix[a, b] = na * nb
+
+    return out, count_matrix
+
+
+def lr_symmetric_accuracy_from_binned_delta_l(delta_l_binned: np.ndarray) -> np.ndarray:
+    """Symmetric pairwise score from binned log-ratios.
+
+    Uses per-entry confidence ``f(z)=max(σ(z),1-σ(z))`` then
+    ``A_ij = 0.5*(f(ΔL_ij)+f(ΔL_ji))``. Diagonal NaN. Values lie in ``[0.5, 1]`` off-diagonal.
+    """
+    dl = np.asarray(delta_l_binned, dtype=np.float64)
+    if dl.ndim != 2 or dl.shape[0] != dl.shape[1]:
+        raise ValueError("delta_l_binned must be square.")
+    n = int(dl.shape[0])
+    z = np.clip(dl, -60.0, 60.0)
+    p = 1.0 / (1.0 + np.exp(-z))
+    conf = np.maximum(p, 1.0 - p)
+    acc = np.full((n, n), np.nan, dtype=np.float64)
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            acc[i, j] = 0.5 * (float(conf[i, j]) + float(conf[j, i]))
+    return acc
 
 
 def validate_symmetric_loss_matrix(mat: np.ndarray, name: str) -> None:
@@ -344,19 +405,30 @@ def main() -> None:
         raise ValueError("--clf-max-iter must be >= 1.")
     if int(args.gt_approx_n_total) < 2:
         raise ValueError("--gt-approx-n-total must be >= 2.")
-
+    if int(args.sssd_epochs) < 1:
+        raise ValueError("--sssd-epochs must be >= 1.")
+    if int(args.sssd_patience) < 0:
+        raise ValueError("--sssd-patience must be >= 0 (0 disables early stopping).")
+    if int(args.sssd_batch_size) < 1:
+        raise ValueError("--sssd-batch-size must be >= 1.")
+    if not (0.0 < float(args.sssd_val_frac) < 1.0):
+        raise ValueError("--sssd-val-frac must be in (0, 1).")
+    if str(args.sssd_sigmas).strip().lower() == "auto" and int(args.sssd_n_sigmas) < 2:
+        raise ValueError("--sssd-n-sigmas must be >= 2 when using --sssd-sigmas=auto.")
     bundle = load_shared_dataset_npz(dataset_npz)
     meta = bundle.meta
     full_args = merge_meta_into_args(meta, args)
 
     setattr(full_args, "compute_h_matrix", True)
     setattr(full_args, "h_restore_original_order", True)
+    # Required for binned flow ΔL → accuracy panel (delta_l_matrix in h_matrix_results*.npz).
+    setattr(full_args, "h_save_intermediates", True)
 
     np.random.seed(int(meta["seed"]))
     torch.manual_seed(int(meta["seed"]))
     rng = np.random.default_rng(int(meta["seed"]))
 
-    _ = require_device(str(full_args.device))
+    dev = require_device(str(full_args.device))
 
     dataset = build_dataset_from_meta(meta)
     os.makedirs(full_args.output_dir, exist_ok=True)
@@ -420,6 +492,18 @@ def main() -> None:
 
     validate_symmetric_loss_matrix(h_sym, "h_sym")
 
+    if "delta_l_matrix" not in h_npz.files:
+        raise ValueError(
+            "H-matrix NPZ does not contain 'delta_l_matrix'. "
+            "Re-run Fisher/H-matrix estimation with --h-save-intermediates so ΔL_ij is saved, "
+            "then re-run this script."
+        )
+    delta_l_matrix = np.asarray(h_npz["delta_l_matrix"], dtype=np.float64)
+    if delta_l_matrix.shape != h_sym.shape:
+        raise ValueError(
+            f"delta_l_matrix shape {delta_l_matrix.shape} does not match h_sym {h_sym.shape}."
+        )
+
     edges, edge_lo, edge_hi = theta_bin_edges(theta_used, meta, n_bins, bin_mode)
     bin_idx = theta_to_bin_index(theta_used, edges, n_bins)
     centers = 0.5 * (edges[:-1] + edges[1:])
@@ -453,6 +537,134 @@ def main() -> None:
     )
     corr_h_vs_gt = matrix_corr_offdiag(h_binned_sqrt, gt_acc)
     corr_clf_vs_gt = matrix_corr_offdiag(clf_acc, gt_acc)
+
+    delta_l_binned, count_matrix_dl = average_matrix_by_bins(delta_l_matrix, bin_idx, n_bins)
+    lr_acc_binned_from_delta_l = lr_symmetric_accuracy_from_binned_delta_l(delta_l_binned)
+    corr_lr_dl_vs_gt = matrix_corr_offdiag(lr_acc_binned_from_delta_l, gt_acc)
+
+    # --- SSSD: kernel-smoothed decoder + symmetric M_ij(sigma) ---
+    sssd_eval_sigmas = np.asarray([], dtype=np.float64)
+    sssd_M_stack = np.zeros((0, n_bins, n_bins), dtype=np.float64)
+    sssd_gt_M_stack = np.zeros((0, n_bins, n_bins), dtype=np.float64)
+    sssd_train_losses = np.asarray([], dtype=np.float64)
+    sssd_best_epoch = -1
+    sssd_sigma_min_used = float("nan")
+    sssd_sigma_max_used = float("nan")
+    corr_sssd_M_vs_gt_M = np.asarray([], dtype=np.float64)
+    sssd_acc_stack = np.zeros((0, n_bins, n_bins), dtype=np.float64)
+    sssd_gt_acc_stack = np.zeros((0, n_bins, n_bins), dtype=np.float64)
+    corr_sssd_acc_vs_gt_acc = np.asarray([], dtype=np.float64)
+    sssd_res = None
+
+    if not bool(args.no_sssd) and n_bins >= 2:
+        span = float(edge_hi - edge_lo)
+        if span <= 0.0:
+            print("[h_binned] SSSD skipped: non-positive theta span.")
+        else:
+            smin_def, smax_def = sssd.default_sigma_training_range_from_theta(theta_used)
+            if args.sssd_sigma_min is not None and args.sssd_sigma_max is not None:
+                smin = float(args.sssd_sigma_min)
+                smax = float(args.sssd_sigma_max)
+            elif args.sssd_sigma_max is not None:
+                smax = float(args.sssd_sigma_max)
+                smin = smax / 8.0
+            elif args.sssd_sigma_min is not None:
+                smin = float(args.sssd_sigma_min)
+                smax = smin * 8.0
+            else:
+                smin, smax = smin_def, smax_def
+            if not (0.0 < smin < smax):
+                raise ValueError(f"SSSD sigma range invalid: sigma_min={smin} sigma_max={smax}")
+            sssd_sigma_min_used = smin
+            sssd_sigma_max_used = smax
+            sigmas_s = str(args.sssd_sigmas).strip().lower()
+            if sigmas_s == "auto":
+                n_s = max(2, int(args.sssd_n_sigmas))
+                sssd_eval_sigmas = np.geomspace(smin, smax, num=n_s, dtype=np.float64)
+            else:
+                sssd_eval_sigmas = np.asarray(sssd.parse_sigma_list(str(args.sssd_sigmas)), dtype=np.float64)
+
+            sssd_seed = clf_rs if int(args.sssd_seed) < 0 else int(args.sssd_seed)
+            try:
+                sssd.sanity_check_soft_targets(
+                    theta_used[: min(50, theta_used.shape[0])],
+                    edges,
+                    sigma_small=max(smin * 0.5, 1e-12),
+                    sigma_large=smax,
+                )
+            except Exception as e:
+                print(f"[h_binned] SSSD sanity_check_soft_targets warning: {e}")
+
+            print(
+                f"[h_binned] SSSD training: sigma_train=[{smin:g},{smax:g}] "
+                f"eval_sigmas={np.array2string(sssd_eval_sigmas, precision=4)} "
+                f"max_epochs={int(args.sssd_epochs)} patience={int(args.sssd_patience)}"
+            )
+            sssd_model, sssd_res = sssd.train_sssd_decoder(
+                theta_used,
+                x_chk,
+                edges,
+                sigma_min=smin,
+                sigma_max=smax,
+                device=dev,
+                epochs=int(args.sssd_epochs),
+                batch_size=int(args.sssd_batch_size),
+                lr=float(args.sssd_lr),
+                hidden_dim=int(args.sssd_hidden_dim),
+                depth=int(args.sssd_depth),
+                val_frac=float(args.sssd_val_frac),
+                patience=int(args.sssd_patience),
+                seed=sssd_seed,
+                log_every=int(args.sssd_log_every),
+            )
+            sssd_train_losses = np.asarray(sssd_res.train_losses, dtype=np.float64)
+            sssd_best_epoch = int(sssd_res.best_epoch)
+            es = "stopped early" if sssd_res.stopped_early else "ran full"
+            print(
+                "[h_binned] SSSD training summary: "
+                f"AdamW(lr={float(args.sssd_lr):g}), "
+                f"{es} at epoch {sssd_res.stopped_epoch}/{int(args.sssd_epochs)}, "
+                f"patience={int(args.sssd_patience)} (0=off), "
+                f"val_frac={float(args.sssd_val_frac):g}, "
+                f"batch_size={int(args.sssd_batch_size)}, "
+                f"checkpoint=best val soft-CE at epoch {sssd_best_epoch}. "
+                "Each step samples σ log-uniform in [sigma_min,sigma_max] and fits soft bin targets q_σ(b|θ)."
+            )
+
+            S = int(sssd_eval_sigmas.shape[0])
+            sssd_M_stack = np.full((S, n_bins, n_bins), np.nan, dtype=np.float64)
+            sssd_gt_M_stack = np.full((S, n_bins, n_bins), np.nan, dtype=np.float64)
+            corr_sssd_M_vs_gt_M = np.full(S, np.nan, dtype=np.float64)
+            sssd_acc_stack = np.full((S, n_bins, n_bins), np.nan, dtype=np.float64)
+            sssd_gt_acc_stack = np.full((S, n_bins, n_bins), np.nan, dtype=np.float64)
+            corr_sssd_acc_vs_gt_acc = np.full(S, np.nan, dtype=np.float64)
+
+            for si, sig in enumerate(sssd_eval_sigmas):
+                sigf = float(sig)
+                lp_ds = sssd.decoder_log_probs(
+                    sssd_model, x_chk, sigf, dev, batch_size=max(512, int(args.sssd_batch_size))
+                )
+                lp_gt = sssd.decoder_log_probs(
+                    sssd_model, x_gt, sigf, dev, batch_size=max(512, int(args.sssd_batch_size))
+                )
+                M_ds = sssd.symmetric_discrimination_matrix_M(lp_ds, bin_idx, n_bins)
+                M_gt = sssd.symmetric_discrimination_matrix_M(lp_gt, gt_bin_idx, n_bins)
+                A_ds = sssd.symmetric_lr_accuracy_matrix(lp_ds, bin_idx, n_bins)
+                A_gt = sssd.symmetric_lr_accuracy_matrix(lp_gt, gt_bin_idx, n_bins)
+                sssd_M_stack[si] = M_ds
+                sssd_gt_M_stack[si] = M_gt
+                sssd_acc_stack[si] = A_ds
+                sssd_gt_acc_stack[si] = A_gt
+                corr_sssd_M_vs_gt_M[si] = matrix_corr_offdiag(M_ds, M_gt)
+                corr_sssd_acc_vs_gt_acc[si] = matrix_corr_offdiag(A_ds, A_gt)
+                asym = float(np.max(np.abs(M_ds - M_ds.T)))
+                if asym > 1e-3:
+                    print(f"[h_binned] SSSD M_ij note: max|M-M^T|={asym:.4f} at sigma={sigf:g} (MC asymmetry)")
+    else:
+        if bool(args.no_sssd):
+            print("[h_binned] --no-sssd: skipping kernel-smoothed decoder.")
+        elif n_bins < 2:
+            print("[h_binned] SSSD requires num_theta_bins >= 2; skipped.")
     out_npz = os.path.join(full_args.output_dir, "h_matrix_binned_results.npz")
     np.savez_compressed(
         out_npz,
@@ -467,6 +679,10 @@ def main() -> None:
         gt_approx_seed=np.asarray([gt_seed], dtype=np.int64),
         corr_h_binned_vs_gt_approx=np.asarray([corr_h_vs_gt], dtype=np.float64),
         corr_clf_binned_vs_gt_approx=np.asarray([corr_clf_vs_gt], dtype=np.float64),
+        delta_l_binned=delta_l_binned,
+        lr_acc_binned_from_delta_l=lr_acc_binned_from_delta_l,
+        count_matrix_delta_l=count_matrix_dl,
+        corr_lr_binned_delta_l_vs_gt_approx=np.asarray([corr_lr_dl_vs_gt], dtype=np.float64),
         clf_valid_mask=clf_valid,
         clf_pair_support=clf_support,
         clf_test_frac=np.asarray([float(args.clf_test_frac)], dtype=np.float64),
@@ -486,6 +702,17 @@ def main() -> None:
         h_eval_scalar_name=np.asarray([h_eval_scalar_name], dtype=object),
         h_eval_scalar_value=np.asarray([h_eval_scalar_value], dtype=np.float64),
         dataset_npz=np.asarray([os.path.abspath(dataset_npz)], dtype=object),
+        sssd_eval_sigmas=sssd_eval_sigmas.astype(np.float64),
+        sssd_M_sym_stack=sssd_M_stack.astype(np.float64),
+        sssd_gt_M_sym_stack=sssd_gt_M_stack.astype(np.float64),
+        sssd_train_losses=sssd_train_losses,
+        sssd_best_epoch=np.asarray([sssd_best_epoch], dtype=np.int64),
+        sssd_sigma_min_used=np.asarray([sssd_sigma_min_used], dtype=np.float64),
+        sssd_sigma_max_used=np.asarray([sssd_sigma_max_used], dtype=np.float64),
+        corr_sssd_M_vs_gt_M=corr_sssd_M_vs_gt_M.astype(np.float64),
+        sssd_acc_sym_stack=sssd_acc_stack.astype(np.float64),
+        sssd_gt_acc_sym_stack=sssd_gt_acc_stack.astype(np.float64),
+        corr_sssd_acc_vs_gt_acc=corr_sssd_acc_vs_gt_acc.astype(np.float64),
     )
 
     fig_path = os.path.join(full_args.output_dir, "h_matrix_binned_heatmap.png")
@@ -524,8 +751,20 @@ def main() -> None:
     plt.close()
 
     combo_fig_path = os.path.join(full_args.output_dir, "h_matrix_binned_and_classifier_panels.png")
-    fig, axes = plt.subplots(1, 3, figsize=(18.0, 5.8), layout="constrained")
-    ax0, ax1, ax2 = axes[0], axes[1], axes[2]
+    s_combo = int(sssd_acc_stack.shape[0]) if sssd_acc_stack.size else 0
+
+    if s_combo > 0:
+        nc = max(4, s_combo)
+        fig = plt.figure(figsize=(4.0 * nc, 10.5))
+        gs = GridSpec(2, nc, figure=fig, height_ratios=[1.0, 1.0], hspace=0.33, wspace=0.35)
+        ax0 = fig.add_subplot(gs[0, 0])
+        ax1 = fig.add_subplot(gs[0, 1])
+        ax2 = fig.add_subplot(gs[0, 2])
+        ax3 = fig.add_subplot(gs[0, 3])
+    else:
+        fig, axes = plt.subplots(1, 4, figsize=(24.0, 5.8), layout="constrained")
+        ax0, ax1, ax2, ax3 = axes[0], axes[1], axes[2], axes[3]
+
     im0 = ax0.imshow(h_binned_sqrt, aspect="auto", origin="lower", interpolation="nearest")
     fig.colorbar(im0, ax=ax0, fraction=0.046, pad=0.04, label=r"mean $\sqrt{H^{\mathrm{sym}}}$")
     ax0.set_xlabel(r"bin $j$")
@@ -533,19 +772,131 @@ def main() -> None:
     ax0.set_title(f"Binned sqrt(H)-matrix\ncorr vs GT={corr_h_vs_gt:.3f}")
 
     im1 = ax1.imshow(clf_acc, aspect="auto", origin="lower", interpolation="nearest", vmin=0.0, vmax=1.0)
-    fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04, label="accuracy")
+    fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04, label="held-out accuracy")
     ax1.set_xlabel(r"bin $j$")
     ax1.set_ylabel(r"bin $i$")
     ax1.set_title(f"Pairwise logistic accuracy (x)\ncorr vs GT={corr_clf_vs_gt:.3f}")
 
     im_gt = ax2.imshow(gt_acc, aspect="auto", origin="lower", interpolation="nearest", vmin=0.0, vmax=1.0)
-    fig.colorbar(im_gt, ax=ax2, fraction=0.046, pad=0.04, label="accuracy")
+    fig.colorbar(im_gt, ax=ax2, fraction=0.046, pad=0.04, label="held-out accuracy")
     ax2.set_xlabel(r"bin $j$")
     ax2.set_ylabel(r"bin $i$")
     ax2.set_title(f"GT approx logistic accuracy (n={int(args.gt_approx_n_total)})")
-    fig.suptitle(f"Binned matrices ({n_bins} bins, mode={bin_mode})", fontsize=13)
+
+    im_lr = ax3.imshow(
+        lr_acc_binned_from_delta_l,
+        aspect="auto",
+        origin="lower",
+        interpolation="nearest",
+        vmin=0.0,
+        vmax=1.0,
+    )
+    fig.colorbar(
+        im_lr,
+        ax=ax3,
+        fraction=0.046,
+        pad=0.04,
+        label=r"sym. $\max(\sigma,1\!-\!\sigma)$ from $\Delta L$",
+    )
+    ax3.set_xlabel(r"bin $j$")
+    ax3.set_ylabel(r"bin $i$")
+    ax3.set_title(
+        "Binned flow $\\Delta L_{ij}$ → score\n"
+        + rf"$0.5(f(\Delta L)+f(\Delta L^\top))$, $f=\max(\sigma,1-\sigma)$, corr vs GT={corr_lr_dl_vs_gt:.3f}"
+    )
+
+    if s_combo > 0:
+        for si in range(s_combo):
+            ax_s = fig.add_subplot(gs[1, si])
+            corr_acc_gt = float(corr_sssd_acc_vs_gt_acc[si])
+            sig_val = float(sssd_eval_sigmas[si])
+            im_s = ax_s.imshow(
+                sssd_acc_stack[si],
+                aspect="auto",
+                origin="lower",
+                interpolation="nearest",
+                vmin=0.0,
+                vmax=1.0,
+            )
+            fig.colorbar(im_s, ax=ax_s, fraction=0.046, pad=0.04, label="in-sample LR acc")
+            ax_s.set_xlabel(r"bin $j$")
+            ax_s.set_ylabel(r"bin $i$")
+            ax_s.set_title(
+                rf"SSSD LR acc $\sigma$={sig_val:.3g}" + "\n" + f"corr vs GT acc={corr_acc_gt:.3f}"
+            )
+        fig.suptitle(
+            f"Binned matrices + flow $\\Delta L$ acc + SSSD ({n_bins} bins, mode={bin_mode}; "
+            f"{s_combo} evaluation $\\sigma$)",
+            fontsize=13,
+        )
+    else:
+        fig.suptitle(
+            f"Binned matrices + flow $\\Delta L$ acc ({n_bins} bins, mode={bin_mode})",
+            fontsize=13,
+        )
+
     plt.savefig(combo_fig_path, dpi=180, bbox_inches="tight")
     plt.close()
+
+    sssd_acc_panels_path = ""
+    sssd_acc_primary_path = ""
+    sssd_acc_panels_file = os.path.join(full_args.output_dir, "h_matrix_sssd_acc_panels.png")
+    sssd_acc_primary_file = os.path.join(full_args.output_dir, "h_matrix_sssd_acc_primary.png")
+    if sssd_acc_stack.size > 0 and sssd_acc_stack.shape[0] > 0:
+        S = int(sssd_acc_stack.shape[0])
+        ncols = min(5, S)
+        nrows = int(np.ceil(S / ncols))
+        fig, axes = plt.subplots(nrows, ncols, figsize=(3.9 * ncols, 3.5 * nrows), squeeze=False)
+        last_im = None
+        for si in range(S):
+            r, c = divmod(si, ncols)
+            ax = axes[r][c]
+            last_im = ax.imshow(
+                sssd_acc_stack[si],
+                aspect="auto",
+                origin="lower",
+                interpolation="nearest",
+                vmin=0.0,
+                vmax=1.0,
+            )
+            ax.set_title(rf"$\sigma$={float(sssd_eval_sigmas[si]):.4g}")
+            ax.set_xlabel(r"bin $j$")
+            ax.set_ylabel(r"bin $i$")
+        for si in range(S, nrows * ncols):
+            r, c = divmod(si, ncols)
+            axes[r][c].axis("off")
+        fig.colorbar(
+            last_im,
+            ax=axes,
+            fraction=0.03,
+            pad=0.04,
+            label="symmetric LR accuracy",
+        )
+        fig.suptitle("SSSD symmetric pairwise LR accuracy (kernel-smoothed decoder)", fontsize=13)
+        plt.savefig(sssd_acc_panels_file, dpi=180, bbox_inches="tight")
+        plt.close()
+
+        mid = S // 2
+        plt.figure(figsize=(7.0, 6.0))
+        im_p = plt.imshow(
+            sssd_acc_stack[mid],
+            aspect="auto",
+            origin="lower",
+            interpolation="nearest",
+            vmin=0.0,
+            vmax=1.0,
+        )
+        plt.colorbar(im_p, fraction=0.046, pad=0.04, label="symmetric LR accuracy")
+        plt.xlabel(r"bin $j$")
+        plt.ylabel(r"bin $i$")
+        plt.title(
+            rf"SSSD LR accuracy (primary $\sigma$={float(sssd_eval_sigmas[mid]):.4g})"
+        )
+        plt.tight_layout()
+        plt.savefig(sssd_acc_primary_file, dpi=180)
+        plt.close()
+        sssd_acc_panels_path = sssd_acc_panels_file
+        sssd_acc_primary_path = sssd_acc_primary_file
 
     summary_path = os.path.join(full_args.output_dir, "h_matrix_binned_summary.txt")
     n_finite = int(np.sum(np.isfinite(h_binned)))
@@ -605,12 +956,53 @@ def main() -> None:
             )
         f.write(f"correlation_h_binned_sqrt_vs_gt_approx: {corr_h_vs_gt}\n")
         f.write(f"correlation_clf_binned_vs_gt_approx: {corr_clf_vs_gt}\n")
+        f.write(
+            "flow Delta L (from h_matrix_results*.npz delta_l_matrix): bin-average Delta L_ij over "
+            "theta-bin pairs, then f(z)=max(sigmoid(z),1-sigmoid(z)), "
+            "A_ij = 0.5*(f(Delta L_ij)+f(Delta L_ji)); diagonal NaN; off-diagonal in [0.5,1].\n"
+        )
+        f.write(f"correlation_lr_binned_delta_l_vs_gt_approx: {corr_lr_dl_vs_gt}\n")
+        if sssd_acc_stack.size > 0 and sssd_acc_stack.shape[0] > 0:
+            f.write(
+                "SSSD training (fisher/sssd.train_sssd_decoder): AdamW on soft cross-entropy vs "
+                "Gaussian bin targets q_sigma(b|theta); each batch samples sigma log-uniformly in "
+                f"[sigma_min,sigma_max] for targets and decoder conditioning. "
+                f"max_epochs={int(args.sssd_epochs)}, early_stopping_patience={int(args.sssd_patience)} "
+                "(0 disables), batch_size={int(args.sssd_batch_size)}, "
+                f"lr={float(args.sssd_lr):g}, val_frac={float(args.sssd_val_frac):g}. "
+                "Checkpoint = lowest validation soft-CE (best_epoch). "
+                + (
+                    f"Stopped at epoch {sssd_res.stopped_epoch} "
+                    f"({'early' if sssd_res.stopped_early else 'full budget'}).\n"
+                    if sssd_res is not None
+                    else "\n"
+                )
+            )
+            f.write(
+                "SSSD: sigma-conditioned softmax decoder, Gaussian soft bin targets; "
+                "primary metrics are symmetric pairwise LR decision accuracies A_ij(sigma) "
+                "(see fisher/sssd.py). Log-ratio matrices M_ij retained in NPZ for diagnostics.\n"
+            )
+            f.write(
+                f"  sigma_train=[{sssd_sigma_min_used:g},{sssd_sigma_max_used:g}] "
+                f"best_epoch={sssd_best_epoch}\n"
+            )
+            for si in range(int(sssd_eval_sigmas.shape[0])):
+                f.write(
+                    f"  sigma={float(sssd_eval_sigmas[si]):.6g} "
+                    f"corr(acc_dataset,acc_gt)={float(corr_sssd_acc_vs_gt_acc[si]):g} "
+                    f"corr(M_dataset,M_gt)={float(corr_sssd_M_vs_gt_M[si]):g}\n"
+                )
         f.write("artifacts:\n")
         f.write(f"  {out_npz}\n")
         f.write(f"  {fig_path}\n")
         f.write(f"  {clf_fig_path}\n")
         f.write(f"  {count_fig_path}\n")
         f.write(f"  {combo_fig_path}\n")
+        if sssd_acc_panels_path:
+            f.write(f"  {sssd_acc_panels_path}\n")
+        if sssd_acc_primary_path:
+            f.write(f"  {sssd_acc_primary_path}\n")
         f.write(f"  {summary_path}\n")
 
     print("[h_binned] Saved:")
@@ -619,6 +1011,10 @@ def main() -> None:
     print(f"  - {clf_fig_path}")
     print(f"  - {count_fig_path}")
     print(f"  - {combo_fig_path}")
+    if sssd_acc_panels_path:
+        print(f"  - {sssd_acc_panels_path}")
+    if sssd_acc_primary_path:
+        print(f"  - {sssd_acc_primary_path}")
     print(f"  - {summary_path}")
 
 

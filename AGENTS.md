@@ -22,7 +22,7 @@ mamba run -n geo_diffusion python run_fisher.py decoder ... --device cuda
 
 ## Data layout
 
-- Default datasets and run outputs use `DATA_DIR = os.path.join(DATAROOT, "data")` from `global_setting.py` (override `DATAROOT` via `SCORE_MATCHING_FISHER_DATAROOT`). The repo `data/` path is a symlink to that directory when present.
+- Default datasets and run outputs use `DATA_DIR = DATAROOT` from `global_setting.py` (override `DATAROOT` via `SCORE_MATCHING_FISHER_DATAROOT`). The repo `data/` path is a symlink to `DATAROOT` when present.
 
 ## Notes
 
