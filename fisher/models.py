@@ -79,6 +79,48 @@ class ConditionalXScore(nn.Module):
         return self.forward(x, theta, sigma)
 
 
+class ConditionalXFlowVelocity(nn.Module):
+    """Conditional velocity model v(x_t, theta, t) with output in R^{x_dim}."""
+
+    def __init__(
+        self,
+        x_dim: int = 2,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        use_logit_time: bool = True,
+    ) -> None:
+        super().__init__()
+        if x_dim < 2:
+            raise ValueError("x_dim must be >= 2.")
+        self.x_dim = int(x_dim)
+        self.use_logit_time = bool(use_logit_time)
+        in_dim = x_dim + 1 + 1  # x_t, theta, t
+        layers: list[nn.Module] = []
+        for _ in range(depth):
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            layers.append(nn.SiLU())
+            in_dim = hidden_dim
+        layers.append(nn.Linear(hidden_dim, x_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x_t: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        if t.ndim == 1:
+            t = t.unsqueeze(-1)
+        if self.use_logit_time:
+            t_clip = torch.clamp(t, min=1e-4, max=1.0 - 1e-4)
+            t_feat = torch.log(t_clip) - torch.log1p(-t_clip)
+        else:
+            t_feat = t
+        feats = torch.cat([x_t, theta, t_feat], dim=-1)
+        return self.net(feats)
+
+    @torch.no_grad()
+    def predict_velocity(self, x_t: torch.Tensor, theta: torch.Tensor, t_eval: float) -> torch.Tensor:
+        self.eval()
+        t = torch.full((x_t.shape[0], 1), float(t_eval), device=x_t.device)
+        return self.forward(x_t, theta, t)
+
+
 class PriorScore1D(nn.Module):
     """Unconditional score model for s(theta_tilde, sigma) approximating prior score over scalar theta."""
 

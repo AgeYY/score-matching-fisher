@@ -27,11 +27,20 @@ except ImportError as e:
     ) from e
 
 from global_setting import DATAROOT
-from fisher.models import ConditionalXScore
-from fisher.score_distance import classical_mds_from_distances, compute_cross_score_matrix, evaluate_distance_variants
+from fisher.models import ConditionalXFlowVelocity, ConditionalXScore
+from fisher.score_distance import (
+    classical_mds_from_distances,
+    compute_cross_flow_velocity_matrix,
+    compute_cross_score_matrix,
+    evaluate_distance_variants,
+)
 from fisher.shared_dataset_io import load_shared_dataset_npz
 from fisher.shared_fisher_est import require_device
-from fisher.trainers import geometric_sigma_schedule, train_conditional_x_score_model_ncsm_continuous
+from fisher.trainers import (
+    geometric_sigma_schedule,
+    train_conditional_x_flow_model,
+    train_conditional_x_score_model_ncsm_continuous,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -44,6 +53,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dataset-npz", type=str, required=True, help="Path to shared dataset .npz.")
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--output-dir", type=str, default=str(Path(DATAROOT) / "outputs_score_distance_mds"))
+    p.add_argument(
+        "--method",
+        type=str,
+        default="dsm",
+        choices=["dsm", "flow"],
+        help="Train conditional x model with denoising score matching (dsm) or flow matching (flow).",
+    )
     p.add_argument(
         "--data-split",
         type=str,
@@ -65,6 +81,26 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--score-early-ema-alpha", type=float, default=0.05)
     p.add_argument("--score-restore-best", action="store_true", default=True)
     p.add_argument("--no-score-restore-best", action="store_false", dest="score_restore_best")
+    p.add_argument(
+        "--score-norm",
+        type=str,
+        default="geom",
+        choices=["l2", "geom"],
+        help="Per-vector normalization for the 'norm' distance/MDS variant: L2 unit norm or geometric (|.|) scale.",
+    )
+    p.add_argument("--flow-epochs", type=int, default=10000)
+    p.add_argument("--flow-batch-size", type=int, default=256)
+    p.add_argument("--flow-lr", type=float, default=1e-3)
+    p.add_argument("--flow-hidden-dim", type=int, default=128)
+    p.add_argument("--flow-depth", type=int, default=3)
+    p.add_argument("--flow-scheduler", type=str, default="cosine", choices=["cosine", "vp", "linear_vp"])
+    p.add_argument("--flow-eval-t", type=float, default=0.5)
+    p.add_argument("--flow-val-frac", type=float, default=0.1)
+    p.add_argument("--flow-early-patience", type=int, default=1000)
+    p.add_argument("--flow-early-min-delta", type=float, default=1e-4)
+    p.add_argument("--flow-early-ema-alpha", type=float, default=0.05)
+    p.add_argument("--flow-restore-best", action="store_true", default=True)
+    p.add_argument("--no-flow-restore-best", action="store_false", dest="flow_restore_best")
     p.add_argument("--cross-row-batch-size", type=int, default=128)
     p.add_argument("--save-cross-scores", action="store_true", default=False)
     p.add_argument("--log-every", type=int, default=50)
@@ -161,51 +197,115 @@ def main() -> None:
         if theta_use.shape[0] == 0:
             raise ValueError("data_split=eval requires non-empty eval split in dataset npz.")
 
-    theta_fit, x_fit, theta_val, x_val = _split_train_val(theta_use, x_use, args.score_val_frac, rng)
-    theta_std = float(np.std(theta_fit))
-    sigma_min = float(args.score_sigma_min_alpha * theta_std)
-    sigma_max = float(args.score_sigma_max_alpha * theta_std)
-    if sigma_min <= 0.0 or sigma_max <= 0.0:
-        raise ValueError("sigma bounds must be positive.")
+    if args.method == "dsm":
+        theta_fit, x_fit, theta_val, x_val = _split_train_val(theta_use, x_use, args.score_val_frac, rng)
+        theta_std = float(np.std(theta_fit))
+        sigma_min = float(args.score_sigma_min_alpha * theta_std)
+        sigma_max = float(args.score_sigma_max_alpha * theta_std)
+        if sigma_min <= 0.0 or sigma_max <= 0.0:
+            raise ValueError("sigma bounds must be positive.")
 
-    sigma_eval_grid = geometric_sigma_schedule(
-        sigma_min=float(sigma_min),
-        sigma_max=float(sigma_max),
-        n_levels=int(args.score_eval_sigmas),
-        descending=True,
-    )
-    sigma_eval = float(np.min(sigma_eval_grid))
+        sigma_eval_grid = geometric_sigma_schedule(
+            sigma_min=float(sigma_min),
+            sigma_max=float(sigma_max),
+            n_levels=int(args.score_eval_sigmas),
+            descending=True,
+        )
+        sigma_eval = float(np.min(sigma_eval_grid))
 
-    print(
-        "[score_x] "
-        f"data_split={args.data_split} n={theta_use.shape[0]} fit={theta_fit.shape[0]} val={theta_val.shape[0]} "
-        f"theta_std={theta_std:.6f} sigma_min={sigma_min:.6f} sigma_max={sigma_max:.6f} sigma_eval={sigma_eval:.6f}"
-    )
+        print(
+            "[score_x:dsm] "
+            f"data_split={args.data_split} n={theta_use.shape[0]} fit={theta_fit.shape[0]} val={theta_val.shape[0]} "
+            f"theta_std={theta_std:.6f} sigma_min={sigma_min:.6f} sigma_max={sigma_max:.6f} sigma_eval={sigma_eval:.6f}"
+        )
 
-    model = ConditionalXScore(
-        x_dim=x_use.shape[1],
-        hidden_dim=int(args.score_hidden_dim),
-        depth=int(args.score_depth),
-        use_log_sigma=True,
-    ).to(device)
-    train_out = train_conditional_x_score_model_ncsm_continuous(
-        model=model,
-        theta_train=theta_fit,
-        x_train=x_fit,
-        sigma_min=sigma_min,
-        sigma_max=sigma_max,
-        epochs=int(args.score_epochs),
-        batch_size=int(args.score_batch_size),
-        lr=float(args.score_lr),
-        device=device,
-        log_every=max(1, int(args.log_every)),
-        theta_val=theta_val,
-        x_val=x_val,
-        early_stopping_patience=int(args.score_early_patience),
-        early_stopping_min_delta=float(args.score_early_min_delta),
-        early_stopping_ema_alpha=float(args.score_early_ema_alpha),
-        restore_best=bool(args.score_restore_best),
-    )
+        model = ConditionalXScore(
+            x_dim=x_use.shape[1],
+            hidden_dim=int(args.score_hidden_dim),
+            depth=int(args.score_depth),
+            use_log_sigma=True,
+        ).to(device)
+        train_out = train_conditional_x_score_model_ncsm_continuous(
+            model=model,
+            theta_train=theta_fit,
+            x_train=x_fit,
+            sigma_min=sigma_min,
+            sigma_max=sigma_max,
+            epochs=int(args.score_epochs),
+            batch_size=int(args.score_batch_size),
+            lr=float(args.score_lr),
+            device=device,
+            log_every=max(1, int(args.log_every)),
+            theta_val=theta_val,
+            x_val=x_val,
+            early_stopping_patience=int(args.score_early_patience),
+            early_stopping_min_delta=float(args.score_early_min_delta),
+            early_stopping_ema_alpha=float(args.score_early_ema_alpha),
+            restore_best=bool(args.score_restore_best),
+        )
+        cross_scores = compute_cross_score_matrix(
+            model=model,
+            theta=theta_use,
+            x=x_use,
+            sigma_eval=sigma_eval,
+            device=device,
+            row_batch_size=int(args.cross_row_batch_size),
+        )
+        summary_method_detail = (
+            f"dsm: sigma_min={sigma_min:.6f}, sigma_max={sigma_max:.6f}, sigma_eval={sigma_eval:.6f}, "
+            f"sigma_eval_levels={int(args.score_eval_sigmas)}"
+        )
+    else:
+        theta_fit, x_fit, theta_val, x_val = _split_train_val(theta_use, x_use, args.flow_val_frac, rng)
+        theta_std = float(np.std(theta_fit))
+        sigma_min = float("nan")
+        sigma_max = float("nan")
+        sigma_eval = float("nan")
+        sigma_eval_grid = np.asarray([], dtype=np.float64)
+        if not (0.0 <= float(args.flow_eval_t) <= 1.0):
+            raise ValueError("--flow-eval-t must be in [0, 1].")
+
+        print(
+            "[score_x:flow] "
+            f"data_split={args.data_split} n={theta_use.shape[0]} fit={theta_fit.shape[0]} val={theta_val.shape[0]} "
+            f"theta_std={theta_std:.6f} scheduler={args.flow_scheduler} t_eval={float(args.flow_eval_t):.4f}"
+        )
+
+        model = ConditionalXFlowVelocity(
+            x_dim=x_use.shape[1],
+            hidden_dim=int(args.flow_hidden_dim),
+            depth=int(args.flow_depth),
+            use_logit_time=True,
+        ).to(device)
+        train_out = train_conditional_x_flow_model(
+            model=model,
+            theta_train=theta_fit,
+            x_train=x_fit,
+            epochs=int(args.flow_epochs),
+            batch_size=int(args.flow_batch_size),
+            lr=float(args.flow_lr),
+            device=device,
+            log_every=max(1, int(args.log_every)),
+            theta_val=theta_val,
+            x_val=x_val,
+            early_stopping_patience=int(args.flow_early_patience),
+            early_stopping_min_delta=float(args.flow_early_min_delta),
+            early_stopping_ema_alpha=float(args.flow_early_ema_alpha),
+            restore_best=bool(args.flow_restore_best),
+            scheduler_name=str(args.flow_scheduler),
+        )
+        cross_scores = compute_cross_flow_velocity_matrix(
+            model=model,
+            theta=theta_use,
+            x=x_use,
+            t_eval=float(args.flow_eval_t),
+            device=device,
+            row_batch_size=int(args.cross_row_batch_size),
+        )
+        summary_method_detail = (
+            f"flow: scheduler={args.flow_scheduler}, t_eval={float(args.flow_eval_t):.6f}, "
+            f"epochs={int(args.flow_epochs)}, batch_size={int(args.flow_batch_size)}, lr={float(args.flow_lr):.6g}"
+        )
 
     train_losses = np.asarray(train_out["train_losses"], dtype=np.float64)
     val_losses = np.asarray(train_out["val_losses"], dtype=np.float64)
@@ -214,18 +314,10 @@ def main() -> None:
     stopped_epoch = int(train_out["stopped_epoch"])
     stopped_early = bool(train_out["stopped_early"])
 
-    cross_scores = compute_cross_score_matrix(
-        model=model,
-        theta=theta_use,
-        x=x_use,
-        sigma_eval=sigma_eval,
-        device=device,
-        row_batch_size=int(args.cross_row_batch_size),
-    )
-    print(f"[score_matrix] shape={cross_scores.shape} (N,N,x_dim)")
+    print(f"[cross_matrix:{args.method}] shape={cross_scores.shape} (N,N,x_dim)")
 
-    raw = evaluate_distance_variants(cross_scores, normalize_score=False)
-    norm = evaluate_distance_variants(cross_scores, normalize_score=True)
+    raw = evaluate_distance_variants(cross_scores, score_normalize="none")
+    norm = evaluate_distance_variants(cross_scores, score_normalize=str(args.score_norm))
 
     loss_fig_path = os.path.join(args.output_dir, "score_x_loss_vs_epoch.png")
     epochs = np.arange(1, train_losses.size + 1)
@@ -241,7 +333,8 @@ def main() -> None:
         plt.axvline(stopped_epoch, color="#9467bd", linestyle=":", linewidth=1.2, label=f"stop={stopped_epoch}")
     plt.xlabel("epoch")
     plt.ylabel("loss")
-    plt.title("Conditional x-score NCSM training")
+    train_title = "Conditional x-score NCSM training" if args.method == "dsm" else "Conditional x-velocity flow-matching training"
+    plt.title(train_title)
     plt.grid(alpha=0.25, linestyle="--")
     plt.legend()
     plt.tight_layout()
@@ -263,14 +356,19 @@ def main() -> None:
     umap_rs = seed if int(args.umap_random_state) < 0 else int(args.umap_random_state)
     emb_umap = fit_umap_2d(x_use, n_neighbors=umap_k, min_dist=float(args.umap_min_dist), random_state=umap_rs)
 
-    # Primary: L2-normalized per (i,j) score vectors, then distance d (sqrt form).
-    primary_emb = np.asarray(norm["embedding_d"], dtype=np.float64)
+    # Primary: raw (unnormalized) vectors, then distance d (sqrt form).
+    primary_emb = np.asarray(raw["embedding_d"], dtype=np.float64)
 
     emb_fig_path = os.path.join(args.output_dir, "score_distance_mds_theta_color.png")
     fig, axes = plt.subplots(2, 2, figsize=(12.0, 10.0), layout="constrained")
     ax_flat = np.asarray(axes).ravel()
+    primary_title = (
+        r"Score distance $\rightarrow$ Classical MDS (raw score, $d$)"
+        if args.method == "dsm"
+        else r"Flow-velocity distance $\rightarrow$ Classical MDS (raw velocity, $d$)"
+    )
     panels: list[tuple[np.ndarray, str, str, str]] = [
-        (primary_emb, r"Score distance $\rightarrow$ Classical MDS (norm score, $d$)", "MDS 1", "MDS 2"),
+        (primary_emb, primary_title, "MDS 1", "MDS 2"),
         (emb_euclid, r"Euclidean $x$ → Classical MDS", "MDS 1", "MDS 2"),
         (emb_isomap, f"Isomap on $x$ ($k$={isomap_k})", "Isomap 1", "Isomap 2"),
         (
@@ -292,6 +390,8 @@ def main() -> None:
     plt.close()
 
     npz_payload: dict[str, object] = {
+        "method": np.asarray([str(args.method)]),
+        "score_vector_norm": np.asarray([str(args.score_norm)]),
         "theta": theta_use.reshape(-1),
         "x": x_use,
         "sigma_eval": np.asarray([sigma_eval], dtype=np.float64),
@@ -326,6 +426,7 @@ def main() -> None:
         "umap_n_neighbors_used": np.asarray([umap_k], dtype=np.int64),
         "umap_min_dist": np.asarray([float(args.umap_min_dist)], dtype=np.float64),
         "umap_random_state_used": np.asarray([umap_rs], dtype=np.int64),
+        "flow_eval_t": np.asarray([float(args.flow_eval_t)], dtype=np.float64),
     }
     if bool(args.save_cross_scores):
         npz_payload["cross_scores"] = cross_scores.astype(np.float32)
@@ -334,36 +435,54 @@ def main() -> None:
 
     summary_path = os.path.join(args.output_dir, "score_distance_mds_summary.txt")
     with open(summary_path, "w", encoding="utf-8") as f:
-        f.write("Conditional score distance + MDS summary\n")
+        f.write("Conditional vector-field distance + MDS summary\n")
         f.write(f"dataset_npz: {args.dataset_npz}\n")
         f.write(f"output_dir: {args.output_dir}\n")
+        f.write(f"method: {args.method}\n")
+        f.write(f"score_norm_variant: {args.score_norm} (per-vector norm for norm_* strains; raw_* uses none)\n")
+        f.write(f"method_detail: {summary_method_detail}\n")
         f.write(f"data_split: {args.data_split}\n")
         f.write(f"n_samples: {theta_use.shape[0]}\n")
         f.write(f"x_dim: {x_use.shape[1]}\n")
+        if args.method == "dsm":
+            f.write(
+                "training: "
+                f"epochs={args.score_epochs}, batch_size={args.score_batch_size}, lr={args.score_lr}, "
+                f"best_epoch={best_epoch}, stopped_epoch={stopped_epoch}, stopped_early={stopped_early}\n"
+            )
+            f.write(
+                "sigma_schedule: "
+                f"theta_std={theta_std:.6f}, sigma_min={sigma_min:.6f}, sigma_max={sigma_max:.6f}, "
+                f"sigma_eval(min)={sigma_eval:.6f}\n"
+            )
+        else:
+            f.write(
+                "training: "
+                f"epochs={args.flow_epochs}, batch_size={args.flow_batch_size}, lr={args.flow_lr}, "
+                f"scheduler={args.flow_scheduler}, t_eval={float(args.flow_eval_t):.6f}, "
+                f"best_epoch={best_epoch}, stopped_epoch={stopped_epoch}, stopped_early={stopped_early}\n"
+            )
+            f.write(f"theta_std={theta_std:.6f}\n")
         f.write(
-            "training: "
-            f"epochs={args.score_epochs}, batch_size={args.score_batch_size}, lr={args.score_lr}, "
-            f"best_epoch={best_epoch}, stopped_epoch={stopped_epoch}, stopped_early={stopped_early}\n"
-        )
-        f.write(
-            "sigma_schedule: "
-            f"theta_std={theta_std:.6f}, sigma_min={sigma_min:.6f}, sigma_max={sigma_max:.6f}, "
-            f"sigma_eval(min)={sigma_eval:.6f}\n"
-        )
-        f.write(
-            "cross_score: "
+            "cross_vectors: "
             f"S shape={cross_scores.shape}, row_batch_size={args.cross_row_batch_size}, "
             f"save_cross_scores={bool(args.save_cross_scores)}\n"
         )
         f.write(
             "figure score_distance_mds_theta_color.png (top-left score panel): "
-            "norm score + d (each S_ij vector L2-normalized in x_dim before distances).\n"
+            "raw vector + d (no per-vector normalization before distances).\n"
         )
         f.write("MDS quality (strain, lower is better):\n")
         f.write(f"  raw score + d:    strain={float(raw['strain_d']):.6f}, positive_eigs={int(raw['positive_eig_d'])}\n")
         f.write(f"  raw score + d^2:  strain={float(raw['strain_d2']):.6f}, positive_eigs={int(raw['positive_eig_d2'])}\n")
-        f.write(f"  norm score + d:   strain={float(norm['strain_d']):.6f}, positive_eigs={int(norm['positive_eig_d'])}\n")
-        f.write(f"  norm score + d^2: strain={float(norm['strain_d2']):.6f}, positive_eigs={int(norm['positive_eig_d2'])}\n")
+        f.write(
+            f"  norm ({args.score_norm}) + d:   strain={float(norm['strain_d']):.6f}, "
+            f"positive_eigs={int(norm['positive_eig_d'])}\n"
+        )
+        f.write(
+            f"  norm ({args.score_norm}) + d^2: strain={float(norm['strain_d2']):.6f}, "
+            f"positive_eigs={int(norm['positive_eig_d2'])}\n"
+        )
         f.write(
             "Baselines on x: "
             f"Euclidean MDS strain={float(mds_euclid.strain_relative):.6f}, "
@@ -375,7 +494,7 @@ def main() -> None:
         f.write(f"  {npz_path}\n")
         f.write(f"  {summary_path}\n")
 
-    print("[score_distance_mds] Saved:")
+    print(f"[score_distance_mds:{args.method}] Saved:")
     print(f"  - {loss_fig_path}")
     print(f"  - {emb_fig_path}")
     print(f"  - {npz_path}")
@@ -384,8 +503,8 @@ def main() -> None:
         "[score_distance_mds] strains: "
         f"raw_d={float(raw['strain_d']):.6f}, "
         f"raw_d2={float(raw['strain_d2']):.6f}, "
-        f"norm_d={float(norm['strain_d']):.6f}, "
-        f"norm_d2={float(norm['strain_d2']):.6f}"
+        f"norm({args.score_norm})_d={float(norm['strain_d']):.6f}, "
+        f"norm({args.score_norm})_d2={float(norm['strain_d2']):.6f}"
     )
 
 

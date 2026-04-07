@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from fisher.models import ConditionalXScore
+from fisher.models import ConditionalXFlowVelocity, ConditionalXScore
 
 
 @dataclass
@@ -53,6 +53,44 @@ def compute_cross_score_matrix(
     return s
 
 
+def compute_cross_flow_velocity_matrix(
+    model: ConditionalXFlowVelocity,
+    theta: np.ndarray,
+    x: np.ndarray,
+    t_eval: float,
+    device: torch.device,
+    row_batch_size: int = 128,
+) -> np.ndarray:
+    """Compute V_ij = v_phi(x_i, theta_j, t_eval) with output shape (N, N, x_dim)."""
+    theta2 = np.asarray(theta, dtype=np.float64).reshape(-1, 1)
+    x2 = np.asarray(x, dtype=np.float64)
+    if x2.ndim != 2:
+        raise ValueError("x must be a 2D array.")
+    n = int(theta2.shape[0])
+    if n != int(x2.shape[0]):
+        raise ValueError("theta and x must have the same number of rows.")
+    if row_batch_size < 1:
+        raise ValueError("row_batch_size must be >= 1.")
+    if not (0.0 <= float(t_eval) <= 1.0):
+        raise ValueError("t_eval must be in [0, 1].")
+
+    model.eval()
+    v = np.zeros((n, n, x2.shape[1]), dtype=np.float64)
+    theta_grid = np.asarray(theta2, dtype=np.float32)
+    with torch.no_grad():
+        for i0 in range(0, n, row_batch_size):
+            i1 = min(n, i0 + row_batch_size)
+            xb = np.asarray(x2[i0:i1], dtype=np.float32)
+            b = int(i1 - i0)
+            x_rep = np.repeat(xb, repeats=n, axis=0)
+            theta_tile = np.tile(theta_grid, (b, 1))
+            x_t = torch.from_numpy(x_rep).to(device)
+            theta_t = torch.from_numpy(theta_tile).to(device)
+            pred = model.predict_velocity(x_t=x_t, theta=theta_t, t_eval=float(t_eval))
+            v[i0:i1, :, :] = pred.cpu().numpy().reshape(b, n, x2.shape[1]).astype(np.float64)
+    return v
+
+
 def normalize_scores(scores: np.ndarray, eps: float = 1e-8) -> np.ndarray:
     s = np.asarray(scores, dtype=np.float64)
     if s.ndim != 3:
@@ -61,23 +99,52 @@ def normalize_scores(scores: np.ndarray, eps: float = 1e-8) -> np.ndarray:
     return s / np.maximum(denom, eps)
 
 
+def normalize_scores_geom(scores: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    """Per (i,j) vector: scale so geometric mean of |component| equals 1."""
+    s = np.asarray(scores, dtype=np.float64)
+    if s.ndim != 3:
+        raise ValueError("scores must have shape (N, N, x_dim).")
+    abs_s = np.abs(s)
+    gm = np.exp(np.mean(np.log(np.maximum(abs_s, eps)), axis=-1, keepdims=True))
+    denom = np.maximum(gm, eps)
+    out = s / denom
+    near_zero = np.all(abs_s <= eps, axis=-1, keepdims=True)
+    return np.where(near_zero, 0.0, out)
+
+
 def score_distance_matrix_from_cross_scores(
     cross_scores: np.ndarray,
     *,
     use_sqrt: bool,
-    average_over_x_dim: bool = True,
+    x_dim_aggregate: str = "geom_mean",
+    geom_mean_eps: float = 1e-12,
 ) -> np.ndarray:
     """Distance from S_ij using:
     d_ij^2 = 0.5 ||S_ii - S_ij||^2 + 0.5 ||S_ji - S_jj||^2.
+
+    Per-pair squared differences along x_dim are aggregated with ``x_dim_aggregate``:
+    ``sum`` (full squared norm), ``mean`` (mean squared difference per dim), or
+    ``geom_mean`` (geometric mean of per-dimension squared differences).
     """
     s = np.asarray(cross_scores, dtype=np.float64)
     if s.ndim != 3 or s.shape[0] != s.shape[1]:
         raise ValueError("cross_scores must have shape (N, N, x_dim).")
     n, _, x_dim = s.shape
+    mode = str(x_dim_aggregate).strip().lower()
+    if mode not in ("sum", "mean", "geom_mean"):
+        raise ValueError("x_dim_aggregate must be one of: sum, mean, geom_mean.")
+
     s_diag = s[np.arange(n), np.arange(n), :]  # (N, x_dim)
-    a = np.sum((s_diag[:, None, :] - s) ** 2, axis=-1)  # (N, N)
-    if average_over_x_dim:
-        a = a / float(x_dim)
+    diff_sq = (s_diag[:, None, :] - s) ** 2  # (N, N, x_dim)
+    if mode == "sum":
+        a = np.sum(diff_sq, axis=-1)
+    elif mode == "mean":
+        a = np.mean(diff_sq, axis=-1)
+    else:
+        eps = float(geom_mean_eps)
+        if eps <= 0.0:
+            raise ValueError("geom_mean_eps must be positive.")
+        a = np.exp(np.mean(np.log(np.maximum(diff_sq, eps)), axis=-1))
     d2 = 0.5 * (a + a.T)
     d2 = 0.5 * (d2 + d2.T)
     np.fill_diagonal(d2, 0.0)
@@ -127,18 +194,28 @@ def classical_mds_from_distances(
 
 def evaluate_distance_variants(
     cross_scores: np.ndarray,
-    normalize_score: bool,
+    *,
+    score_normalize: str = "none",
 ) -> dict[str, np.ndarray | float]:
-    s = normalize_scores(cross_scores) if normalize_score else np.asarray(cross_scores, dtype=np.float64)
+    """score_normalize: none | l2 | geom (L2 unit vectors vs geometric mean |component| scale)."""
+    mode = str(score_normalize).strip().lower()
+    if mode not in ("none", "l2", "geom"):
+        raise ValueError("score_normalize must be one of: none, l2, geom.")
+    if mode == "none":
+        s = np.asarray(cross_scores, dtype=np.float64)
+    elif mode == "l2":
+        s = normalize_scores(cross_scores)
+    else:
+        s = normalize_scores_geom(cross_scores)
     d = score_distance_matrix_from_cross_scores(
         s,
         use_sqrt=True,
-        average_over_x_dim=True,
+        x_dim_aggregate="geom_mean",
     )
     d2 = score_distance_matrix_from_cross_scores(
         s,
         use_sqrt=False,
-        average_over_x_dim=True,
+        x_dim_aggregate="geom_mean",
     )
     mds_d = classical_mds_from_distances(d, n_components=2)
     mds_d2 = classical_mds_from_distances(d2, n_components=2)

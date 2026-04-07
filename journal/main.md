@@ -18,3 +18,4 @@ Collected markdown notes in `journal/notes/`: long-form chapters (moved from the
 
 - [2026-04-05 Fisher estimation: Gaussian $x \in \mathbb{R}^2$, $N=4000$](notes/2026-04-05-fisher-gaussian-xdim2-n4000.md)
 - [2026-04-05 Fisher at high dimension: Gaussian $x \in \mathbb{R}^{100}$, $N=4000$ (poor fit)](notes/2026-04-05-fisher-gaussian-xdim100-n4000.md)
+- [2026-04-06 Score distance + MDS: Gaussian–von Mises (2D vs 10D, noise sweep)](notes/2026-04-06-score-distance-mds-comparison.md)
