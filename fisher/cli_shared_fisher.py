@@ -45,7 +45,7 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--theta-high", type=float, default=3.0)
     p.add_argument("--x-dim", type=int, default=2)
     p.add_argument("--sigma-x1", type=float, default=0.30)
-    p.add_argument("--sigma-x2", type=float, default=0.22)
+    p.add_argument("--sigma-x2", type=float, default=0.30, help="Default matches --sigma-x1 so baseline noise is constant across dims.")
     p.add_argument("--rho", type=float, default=0.15)
     p.add_argument("--cov-theta-amp1", type=float, default=0.35)
     p.add_argument("--cov-theta-amp2", type=float, default=0.30)
@@ -65,7 +65,12 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--gmm-mix-freq", type=float, default=0.95)
     p.add_argument("--gmm-mix-phase", type=float, default=-0.20)
     p.add_argument("--n-total", type=int, default=3000)
-    p.add_argument("--train-frac", type=float, default=0.7)
+    p.add_argument(
+        "--train-frac",
+        type=float,
+        default=1.0,
+        help="Fraction of n_total in train_idx; 1.0 means no held-out theta_eval/x_eval split.",
+    )
 
 
 def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
@@ -77,7 +82,13 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--score-lr", type=float, default=1e-3)
     p.add_argument("--score-hidden-dim", type=int, default=128)
     p.add_argument("--score-depth", type=int, default=3)
-    p.add_argument("--score-data-mode", type=str, default="split", choices=["split", "full"])
+    p.add_argument(
+        "--score-data-mode",
+        type=str,
+        default="full",
+        choices=["split", "full"],
+        help="split: train score on theta_train only; full: train score on all (theta_all, x_all).",
+    )
     p.add_argument(
         "--score-fisher-eval-data",
         type=str,
@@ -85,10 +96,8 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         choices=["score_eval", "full"],
         help="Data split used for score-based Fisher evaluation after training.",
     )
-    p.add_argument("--score-val-frac", type=float, default=0.15)
-    p.add_argument("--score-min-val-size", type=int, default=256)
     p.add_argument("--score-val-source", type=str, default="train_split", choices=["train_split", "eval_set"])
-    p.add_argument("--score-early-patience", type=int, default=1000)
+    p.add_argument("--score-early-patience", type=int, default=2000)
     p.add_argument("--score-early-min-delta", type=float, default=1e-4)
     p.add_argument(
         "--score-early-ema-alpha",

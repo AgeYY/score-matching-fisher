@@ -10,3 +10,6 @@ DATAROOT = os.environ.get(
     "SCORE_MATCHING_FISHER_DATAROOT",
     "/data/zeyuan/score-matching-fisher",
 )
+
+# Score matching: when using train_split validation, this fraction of the score pool is held out for val.
+SCORE_VAL_FRACTION = 0.2

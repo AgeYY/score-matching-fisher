@@ -30,12 +30,24 @@ def main() -> None:
     n_total = int(args.n_total)
     theta_all, x_all = dataset.sample_joint(n_total)
     perm = rng.permutation(n_total)
-    n_train = int(args.train_frac * n_total)
-    n_train = min(max(n_train, 1), n_total - 1)
-    tr_idx = perm[:n_train]
-    ev_idx = perm[n_train:]
-    theta_train, x_train = theta_all[tr_idx], x_all[tr_idx]
-    theta_eval, x_eval = theta_all[ev_idx], x_all[ev_idx]
+    tf = float(args.train_frac)
+    if tf >= 1.0:
+        n_train = n_total
+    else:
+        n_train = int(tf * n_total)
+        n_train = min(max(n_train, 1), n_total - 1)
+    if n_train >= n_total:
+        tr_idx = perm
+        ev_idx = np.empty((0,), dtype=np.int64)
+        theta_train, x_train = theta_all, x_all
+        x_dim = int(x_all.shape[1])
+        theta_eval = np.zeros((0, 1), dtype=np.float64)
+        x_eval = np.zeros((0, x_dim), dtype=np.float64)
+    else:
+        tr_idx = perm[:n_train]
+        ev_idx = perm[n_train:]
+        theta_train, x_train = theta_all[tr_idx], x_all[tr_idx]
+        theta_eval, x_eval = theta_all[ev_idx], x_all[ev_idx]
 
     meta = meta_dict_from_args(args)
     save_shared_dataset_npz(

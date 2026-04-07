@@ -217,7 +217,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--theta-high", type=float, default=3.0)
     parser.add_argument("--x-dim", type=int, default=2)
     parser.add_argument("--sigma-x1", type=float, default=0.30)
-    parser.add_argument("--sigma-x2", type=float, default=0.22)
+    parser.add_argument("--sigma-x2", type=float, default=0.30)
     parser.add_argument("--rho", type=float, default=0.15)
     parser.add_argument("--cov-theta-amp1", type=float, default=0.35)
     parser.add_argument("--cov-theta-amp2", type=float, default=0.30)

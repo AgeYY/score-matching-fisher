@@ -24,9 +24,10 @@ class ToyConditionalGaussianDataset:
     vm_kappa: float = 1.0
     vm_omega: float = 1.0
     sigma_x1: float = 0.30
-    sigma_x2: float = 0.22
+    sigma_x2: float = 0.30
     rho: float = 0.15
-    # Theta-dependent covariance parameters.
+    # Activity coupling for diagonal variance: Var_j = sigma_base_j^2 * (1 + alpha_j * |mu_j|).
+    # Per-dimension alpha_j interpolates between these endpoints (also used in dataset .npz meta).
     cov_theta_amp1: float = 0.35
     cov_theta_amp2: float = 0.30
     cov_theta_amp_rho: float = 0.30
@@ -61,38 +62,20 @@ class ToyConditionalGaussianDataset:
                 raise ValueError("vm_mu_amp must be positive for von_mises_raw.")
 
         self.rng = np.random.default_rng(self.seed)
-        idx = np.arange(1, self.x_dim + 1, dtype=np.float64)
 
         # Cosine tuning curves: mu_j(theta) = A * cos(omega * theta + phi_j)
         # Von Mises (raw): mu_j(theta) = A * exp(kappa * cos(omega * theta - phi_j))
         self._mu_amp = 1.0
         self._mu_omega = 1.0
+        # phi_j = 2*pi*(j-1)/d. For d=2, mu(theta)=mu(-theta) (cosine or von_mises_raw), hence
+        # p(x|theta)=p(x|-theta) under diagonal Var_j(|mu|). For d>=3, mu(theta) != mu(-theta) in general.
         self._mu_phases = 2.0 * np.pi * np.arange(self.x_dim, dtype=np.float64) / float(self.x_dim)
 
-        # Theta-dependent per-dimension covariance scales.
         self._sigma_base = np.linspace(self.sigma_x1, self.sigma_x2, self.x_dim, dtype=np.float64)
-        self._sigma_amp1 = np.clip(
-            self.cov_theta_amp1 * (0.72 + 0.22 * np.sin(0.45 * idx + 0.10)),
-            0.0,
-            0.95,
-        )
-        self._sigma_amp2 = np.clip(
-            self.cov_theta_amp2 * (0.68 + 0.25 * np.cos(0.40 * idx - 0.20)),
-            0.0,
-            0.95,
-        )
-        self._sigma_freq1 = self.cov_theta_freq1 + 0.08 * (idx - 1.0)
-        self._sigma_freq2 = self.cov_theta_freq2 + 0.06 * (idx - 1.0)
-        self._sigma_phase1 = self.cov_theta_phase1 + 0.13 * (idx - 1.0)
-        self._sigma_phase2 = self.cov_theta_phase2 - 0.11 * (idx - 1.0)
+        self._sigma_activity_alpha = np.linspace(self.cov_theta_amp1, self.cov_theta_amp2, self.x_dim, dtype=np.float64)
 
-        # Kept for backward compatibility with summary/prints as baseline covariance.
-        self.cov = np.diag(self._sigma_base**2)
-        if self.x_dim == 2:
-            off_diag = self.rho * self._sigma_base[0] * self._sigma_base[1]
-            self.cov[0, 1] = off_diag
-            self.cov[1, 0] = off_diag
-        self.cov = self.cov + 1e-8 * np.eye(self.x_dim, dtype=np.float64)
+        # Kept for backward compatibility with summary/prints as baseline (diagonal) covariance.
+        self.cov = np.diag(self._sigma_base**2) + 1e-8 * np.eye(self.x_dim, dtype=np.float64)
         self.cov_chol = np.linalg.cholesky(self.cov)
 
     def sample_theta(self, n: int) -> np.ndarray:
@@ -121,76 +104,50 @@ class ToyConditionalGaussianDataset:
             * np.sin(z)
         )
 
+    def _variance_diag_from_mu(self, mu: np.ndarray) -> np.ndarray:
+        """Var_j = sigma_base_j^2 * (1 + alpha_j * |mu_j|) + eps (diagonal Gaussian noise)."""
+        mu = np.asarray(mu, dtype=np.float64)
+        sb = self._sigma_base.reshape(1, -1)
+        alpha = self._sigma_activity_alpha.reshape(1, -1)
+        return sb**2 * (1.0 + alpha * np.abs(mu)) + 1e-8
+
     def covariance_scales(self, theta: np.ndarray) -> np.ndarray:
-        t = _theta_col(theta)
-        scales = self._sigma_base.reshape(1, -1) * (
-            1.0
-            + self._sigma_amp1.reshape(1, -1) * np.sin(t * self._sigma_freq1.reshape(1, -1) + self._sigma_phase1)
-            + self._sigma_amp2.reshape(1, -1) * np.cos(t * self._sigma_freq2.reshape(1, -1) + self._sigma_phase2)
-        )
-        return np.maximum(scales, 0.05 * self._sigma_base.reshape(1, -1))
+        """Per-dimension standard deviations sqrt(Var_j)."""
+        mu = self.tuning_curve(theta)
+        v = self._variance_diag_from_mu(mu)
+        return np.sqrt(np.maximum(v, 1e-12))
 
     def covariance_scales_derivative(self, theta: np.ndarray) -> np.ndarray:
-        t = _theta_col(theta)
-        dscale = self._sigma_base.reshape(1, -1) * (
-            self._sigma_amp1.reshape(1, -1)
-            * self._sigma_freq1.reshape(1, -1)
-            * np.cos(t * self._sigma_freq1.reshape(1, -1) + self._sigma_phase1)
-            - self._sigma_amp2.reshape(1, -1)
-            * self._sigma_freq2.reshape(1, -1)
-            * np.sin(t * self._sigma_freq2.reshape(1, -1) + self._sigma_phase2)
-        )
-        return dscale
-
-    def covariance_components(self, theta: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        scales = self.covariance_scales(theta)
-        t = _theta_col(theta)
-        rho_raw = self.rho + self.cov_theta_amp_rho * np.sin(self.cov_theta_freq_rho * t + self.cov_theta_phase_rho)
-        rho_t = np.clip(rho_raw, -self.rho_clip, self.rho_clip).reshape(-1)
-        return scales[:, 0], scales[:, 1], rho_t
+        """d(sigma_j)/dtheta where sigma_j = sqrt(Var_j)."""
+        mu = self.tuning_curve(theta)
+        dmu = self.tuning_curve_derivative(theta)
+        sb = self._sigma_base.reshape(1, -1)
+        alpha = self._sigma_activity_alpha.reshape(1, -1)
+        v = self._variance_diag_from_mu(mu)
+        sgn = np.sign(mu)
+        dv = sb**2 * alpha * sgn * dmu
+        return dv / (2.0 * np.sqrt(np.maximum(v, 1e-12)))
 
     def covariance(self, theta: np.ndarray) -> np.ndarray:
-        scales = self.covariance_scales(theta)
-        n = scales.shape[0]
+        mu = self.tuning_curve(theta)
+        v = self._variance_diag_from_mu(mu)
+        n = v.shape[0]
         cov = np.zeros((n, self.x_dim, self.x_dim), dtype=np.float64)
-        diag_vals = scales**2 + 1e-8
         for j in range(self.x_dim):
-            cov[:, j, j] = diag_vals[:, j]
-
-        # Keep 2D behavior for backward compatibility.
-        if self.x_dim == 2:
-            _, _, rho_t = self.covariance_components(theta)
-            cov12 = rho_t * scales[:, 0] * scales[:, 1]
-            cov[:, 0, 1] = cov12
-            cov[:, 1, 0] = cov12
+            cov[:, j, j] = v[:, j]
         return cov
 
     def covariance_derivative(self, theta: np.ndarray) -> np.ndarray:
-        scales = self.covariance_scales(theta)
-        dscale = self.covariance_scales_derivative(theta)
-        n = scales.shape[0]
+        mu = self.tuning_curve(theta)
+        dmu = self.tuning_curve_derivative(theta)
+        sb = self._sigma_base.reshape(1, -1)
+        alpha = self._sigma_activity_alpha.reshape(1, -1)
+        sgn = np.sign(mu)
+        dv = sb**2 * alpha * sgn * dmu
+        n = dv.shape[0]
         dcov = np.zeros((n, self.x_dim, self.x_dim), dtype=np.float64)
         for j in range(self.x_dim):
-            dcov[:, j, j] = 2.0 * scales[:, j] * dscale[:, j]
-
-        if self.x_dim == 2:
-            t = _theta_col(theta)
-            _, _, rho_t = self.covariance_components(theta)
-            rho_raw = self.rho + self.cov_theta_amp_rho * np.sin(self.cov_theta_freq_rho * t + self.cov_theta_phase_rho)
-            drho_raw = (
-                self.cov_theta_amp_rho
-                * self.cov_theta_freq_rho
-                * np.cos(self.cov_theta_freq_rho * t + self.cov_theta_phase_rho)
-            ).reshape(-1)
-            unclipped = (rho_raw.reshape(-1) > -self.rho_clip) & (rho_raw.reshape(-1) < self.rho_clip)
-            drho = np.where(unclipped, drho_raw, 0.0)
-            d12 = (
-                drho * scales[:, 0] * scales[:, 1]
-                + rho_t * dscale[:, 0] * scales[:, 1]
-                + rho_t * scales[:, 0] * dscale[:, 1]
-            )
-            dcov[:, 0, 1] = d12
-            dcov[:, 1, 0] = d12
+            dcov[:, j, j] = dv[:, j]
         return dcov
 
     def sample_x(self, theta: np.ndarray) -> np.ndarray:
@@ -217,7 +174,7 @@ class ToyConditionalGMMNonGaussianDataset:
     vm_kappa: float = 1.0
     vm_omega: float = 1.0
     sigma_x1: float = 0.30
-    sigma_x2: float = 0.22
+    sigma_x2: float = 0.30
     rho: float = 0.15
     sep_scale: float = 1.10
     sep_freq: float = 0.85
@@ -263,12 +220,9 @@ class ToyConditionalGMMNonGaussianDataset:
 
         self._sigma1_base = np.linspace(self.sigma_x1, self.sigma_x2, self.x_dim, dtype=np.float64)
         self._sigma2_base = np.linspace(1.15 * self.sigma_x1, 0.85 * self.sigma_x2, self.x_dim, dtype=np.float64)
+        # Per-dimension activity weights alpha_j for Var_j = sigma_base_j^2 * (1 + alpha_j * |mu_j|).
         self._cov1_amp = np.clip(self.cov1_amp * (0.70 + 0.25 * np.sin(0.50 * idx)), 0.0, 0.95)
         self._cov2_amp = np.clip(self.cov2_amp * (0.70 + 0.25 * np.cos(0.40 * idx + 0.15)), 0.0, 0.95)
-        self._cov1_freq = 0.90 + 0.05 * (idx - 1.0)
-        self._cov2_freq = 0.65 + 0.07 * (idx - 1.0)
-        self._cov1_phase = 0.20 + 0.10 * (idx - 1.0)
-        self._cov2_phase = -0.15 - 0.12 * (idx - 1.0)
 
     def sample_theta(self, n: int) -> np.ndarray:
         theta = self.rng.uniform(self.theta_low, self.theta_high, size=(n, 1))
@@ -332,52 +286,45 @@ class ToyConditionalGMMNonGaussianDataset:
         sep, _ = self._separation(theta)
         return base + sep, base - sep
 
+    def _component_var_diag(
+        self, mu: np.ndarray, sigma_base: np.ndarray, alpha: np.ndarray
+    ) -> np.ndarray:
+        """Var_j = sigma_base_j^2 * (1 + alpha_j * |mu_j|) + eps (diagonal Gaussian noise)."""
+        sb = sigma_base.reshape(1, -1)
+        a = alpha.reshape(1, -1)
+        return sb**2 * (1.0 + a * np.abs(mu)) + 1e-8
+
     def component_covariances(self, theta: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        t = _theta_col(theta)
-
-        s1 = self._sigma1_base.reshape(1, -1) * (
-            1.0 + self._cov1_amp.reshape(1, -1) * np.sin(t * self._cov1_freq.reshape(1, -1) + self._cov1_phase)
-        )
-        s2 = self._sigma2_base.reshape(1, -1) * (
-            1.0 + self._cov2_amp.reshape(1, -1) * np.cos(t * self._cov2_freq.reshape(1, -1) + self._cov2_phase)
-        )
-        s1 = np.maximum(s1, 0.05 * self._sigma1_base.reshape(1, -1))
-        s2 = np.maximum(s2, 0.05 * self._sigma2_base.reshape(1, -1))
-
+        mu1, mu2 = self.component_means(theta)
+        v1 = self._component_var_diag(mu1, self._sigma1_base, self._cov1_amp)
+        v2 = self._component_var_diag(mu2, self._sigma2_base, self._cov2_amp)
+        s1 = np.sqrt(np.maximum(v1, 1e-12))
+        s2 = np.sqrt(np.maximum(v2, 1e-12))
         cov1, inv1 = self._diag_cov_and_inv(s1)
         cov2, inv2 = self._diag_cov_and_inv(s2)
         return cov1, cov2, inv1, inv2
 
     def _component_cov_derivatives(self, theta: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        t = _theta_col(theta)
+        mu1, mu2 = self.component_means(theta)
+        dmu_base = self.tuning_curve_derivative(theta)
+        _, dsep = self._separation(theta)
+        dmu1 = dmu_base + dsep
+        dmu2 = dmu_base - dsep
 
-        s1 = self._sigma1_base.reshape(1, -1) * (
-            1.0 + self._cov1_amp.reshape(1, -1) * np.sin(t * self._cov1_freq.reshape(1, -1) + self._cov1_phase)
-        )
-        ds1 = self._sigma1_base.reshape(1, -1) * (
-            self._cov1_amp.reshape(1, -1)
-            * self._cov1_freq.reshape(1, -1)
-            * np.cos(t * self._cov1_freq.reshape(1, -1) + self._cov1_phase)
-        )
+        sb1 = self._sigma1_base.reshape(1, -1)
+        a1 = self._cov1_amp.reshape(1, -1)
+        dv1 = sb1**2 * a1 * np.sign(mu1) * dmu1
 
-        s2 = self._sigma2_base.reshape(1, -1) * (
-            1.0 + self._cov2_amp.reshape(1, -1) * np.cos(t * self._cov2_freq.reshape(1, -1) + self._cov2_phase)
-        )
-        ds2 = self._sigma2_base.reshape(1, -1) * (
-            -self._cov2_amp.reshape(1, -1)
-            * self._cov2_freq.reshape(1, -1)
-            * np.sin(t * self._cov2_freq.reshape(1, -1) + self._cov2_phase)
-        )
+        sb2 = self._sigma2_base.reshape(1, -1)
+        a2 = self._cov2_amp.reshape(1, -1)
+        dv2 = sb2**2 * a2 * np.sign(mu2) * dmu2
 
-        s1 = np.maximum(s1, 0.05 * self._sigma1_base.reshape(1, -1))
-        s2 = np.maximum(s2, 0.05 * self._sigma2_base.reshape(1, -1))
-
-        n, d = s1.shape
+        n, d = dv1.shape
         dcov1 = np.zeros((n, d, d), dtype=np.float64)
         dcov2 = np.zeros((n, d, d), dtype=np.float64)
         for j in range(d):
-            dcov1[:, j, j] = 2.0 * s1[:, j] * ds1[:, j]
-            dcov2[:, j, j] = 2.0 * s2[:, j] * ds2[:, j]
+            dcov1[:, j, j] = dv1[:, j]
+            dcov2[:, j, j] = dv2[:, j]
         return dcov1, dcov2
 
     def sample_x(self, theta: np.ndarray) -> np.ndarray:

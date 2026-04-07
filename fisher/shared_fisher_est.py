@@ -10,6 +10,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
+from global_setting import SCORE_VAL_FRACTION
+
 from fisher.data import ToyConditionalGMMNonGaussianDataset, ToyConditionalGaussianDataset
 from fisher.evaluation import evaluate_score_fisher, evaluate_score_fisher_with_prior, parse_sigma_alpha_list
 from fisher.h_matrix import HMatrixEstimator, HMatrixResult
@@ -444,17 +446,13 @@ def validate_dataset_sample_args(args: Any) -> None:
         raise ValueError("--x-dim must be >= 2.")
     if int(args.n_total) < 2:
         raise ValueError("--n-total must be >= 2 for train/eval split.")
-    if not (0.0 < float(args.train_frac) < 1.0):
-        raise ValueError("--train-frac must be in (0, 1).")
+    if not (0.0 < float(args.train_frac) <= 1.0):
+        raise ValueError("--train-frac must be in (0, 1].")
 
 
 def validate_estimation_args(args: Any) -> None:
     if args.score_eval_sigmas < 1:
         raise ValueError("--score-eval-sigmas must be >= 1.")
-    if args.score_val_source == "train_split" and not (0.0 < args.score_val_frac < 1.0):
-        raise ValueError("--score-val-frac must be in (0, 1) when --score-val-source=train_split.")
-    if args.score_min_val_size < 1:
-        raise ValueError("--score-min-val-size must be >= 1.")
     if args.score_early_patience < 1:
         raise ValueError("--score-early-patience must be >= 1.")
     if args.score_early_min_delta < 0.0:
@@ -547,9 +545,8 @@ def run_shared_fisher_estimation(
         n_score_total = theta_score_train.shape[0]
         if n_score_total < 2:
             raise ValueError("score training requires at least 2 samples for train/validation split.")
-        n_score_val = int(round(args.score_val_frac * n_score_total))
-        n_score_val = max(n_score_val, args.score_min_val_size)
-        n_score_val = min(n_score_val, n_score_total - 1)
+        n_score_val = int(round(SCORE_VAL_FRACTION * n_score_total))
+        n_score_val = max(1, min(n_score_val, n_score_total - 1))
         score_perm = rng.permutation(n_score_total)
         score_val_idx = score_perm[:n_score_val]
         score_fit_idx = score_perm[n_score_val:]
@@ -560,6 +557,7 @@ def run_shared_fisher_estimation(
         print(
             "[score_train] "
             f"val_source=train_split fit={theta_score_fit.shape[0]} val={theta_score_val.shape[0]} "
+            f"val_target_frac={SCORE_VAL_FRACTION} "
             f"val_frac_eff={theta_score_val.shape[0]/n_score_total:.4f}"
         )
 
@@ -705,6 +703,11 @@ def run_shared_fisher_estimation(
         theta_score_fisher_eval, x_score_fisher_eval = theta_all, x_all
     else:
         theta_score_fisher_eval, x_score_fisher_eval = theta_score_eval, x_score_eval
+    if theta_score_fisher_eval.shape[0] == 0:
+        raise ValueError(
+            "--score-fisher-eval-data score_eval requires non-empty theta_eval/x_eval; "
+            "use --train-frac < 1 or --score-fisher-eval-data full."
+        )
     print(
         "[score_fisher_eval] "
         f"data={args.score_fisher_eval_data} n={theta_score_fisher_eval.shape[0]}"
@@ -881,12 +884,22 @@ def run_shared_fisher_estimation(
             f"h_sym_max_asym_abs={h_result.h_sym_max_asym_abs:.3e}"
         )
 
+    dec_theta_eval = theta_eval
+    dec_x_eval = x_eval
+    if dec_theta_eval.shape[0] == 0:
+        dec_theta_eval = theta_train
+        dec_x_eval = x_train
+        print(
+            "[decoder] theta_eval empty; using theta_train/x_train for decoder eval windows "
+            "(train_frac=1 has no held-out split)."
+        )
+
     decoder_fisher, decoder_se, decoder_valid, decoder_diag = fit_decoder_from_shared_data(
         centers=centers,
         theta_train=theta_train,
         x_train=x_train,
-        theta_eval=theta_eval,
-        x_eval=x_eval,
+        theta_eval=dec_theta_eval,
+        x_eval=dec_x_eval,
         epsilon=args.decoder_epsilon,
         bandwidth=args.decoder_bandwidth,
         min_class_count=args.decoder_min_class_count,
@@ -1213,9 +1226,15 @@ def run_shared_fisher_estimation(
         f.write(
             "score_fit_val_counts: "
             f"fit={theta_score_fit.shape[0]}, val={theta_score_val.shape[0]}, "
-            f"val_source={args.score_val_source}, "
-            f"val_frac={args.score_val_frac}, min_val_size={args.score_min_val_size}\n"
+            f"val_source={args.score_val_source}"
         )
+        if args.score_val_source == "train_split":
+            f.write(
+                f", val_target_frac={SCORE_VAL_FRACTION}, "
+                f"val_frac_eff={theta_score_val.shape[0] / max(theta_score_train.shape[0], 1):.6f}\n"
+            )
+        else:
+            f.write("\n")
         f.write(f"gt_mc_samples_per_bin: {args.gt_mc_samples_per_bin}\n")
         f.write(
             "score_early_stopping: "
