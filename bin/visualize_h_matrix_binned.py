@@ -6,6 +6,7 @@ Also builds a pairwise theta-bin logistic-regression accuracy matrix on x (same 
 From ``delta_l_matrix`` in the H-matrix NPZ (requires ``--h-save-intermediates`` when training),
 bins pairwise log-likelihood ratios ``ΔL_ij``, maps to symmetric accuracy
 ``0.5*(f(\\Delta L)+f(\\Delta L^T))`` with ``f(z)=\\max(\\sigma(z),1-\\sigma(z))``, and adds a panel to the composite figure.
+Panel titles follow ``h_field_method`` in the NPZ (DSM: denoising score / ``\\nabla_\\theta \\log p(\\theta|x)``; flow: velocity field at ``t``).
 
 SSSD (kernel-smoothed decoder): trains a sigma-conditioned softmax decoder with soft bin targets
 and reports symmetric pairwise LR decision accuracies A_ij(sigma) (primary); log-ratio M_ij in NPZ.
@@ -246,6 +247,28 @@ def lr_symmetric_accuracy_from_binned_delta_l(delta_l_binned: np.ndarray) -> np.
     return acc
 
 
+def delta_l_figure_labels(h_field_method: str) -> tuple[str, str, str]:
+    """Return (panel_title_top, suptitle_delta_l_fragment, summary_line_prefix) for ΔL panel text.
+
+    ``h_field_method`` comes from ``h_matrix_results*.npz`` (``dsm`` vs ``flow``).
+    """
+    m = str(h_field_method).strip().lower()
+    if m == "flow":
+        return (
+            r"Binned flow $\Delta L_{ij}$ → score",
+            r"flow $\Delta L$",
+            "Flow velocity field: Delta L (from h_matrix_results*.npz delta_l_matrix): ",
+        )
+    return (
+        r"Binned DSM $\Delta L_{ij}$ → score"
+        + "\n"
+        + r"(denoising score matching: $\nabla_\theta \log p(\theta \mid x)$)",
+        r"DSM $\Delta L$",
+        "DSM score-field Delta L (from h_matrix_results*.npz delta_l_matrix; "
+        "posterior/prior denoising scores, not flow velocity): ",
+    )
+
+
 def validate_symmetric_loss_matrix(mat: np.ndarray, name: str) -> None:
     m = np.asarray(mat, dtype=np.float64)
     if m.ndim != 2 or m.shape[0] != m.shape[1]:
@@ -421,7 +444,7 @@ def main() -> None:
 
     setattr(full_args, "compute_h_matrix", True)
     setattr(full_args, "h_restore_original_order", True)
-    # Required for binned flow ΔL → accuracy panel (delta_l_matrix in h_matrix_results*.npz).
+    # Required for binned ΔL → accuracy panel (delta_l_matrix in h_matrix_results*.npz).
     setattr(full_args, "h_save_intermediates", True)
 
     np.random.seed(int(meta["seed"]))
@@ -435,7 +458,8 @@ def main() -> None:
 
     print(
         f"[h_binned] dataset_npz={dataset_npz} output_dir={full_args.output_dir} "
-        f"num_theta_bins={n_bins} theta_bin_mode={bin_mode} h_only={bool(args.h_only)}"
+        f"num_theta_bins={n_bins} theta_bin_mode={bin_mode} h_only={bool(args.h_only)} "
+        f"theta_field_method={str(getattr(full_args, 'theta_field_method', 'dsm'))}"
     )
 
     if not bool(args.h_only):
@@ -472,6 +496,9 @@ def main() -> None:
         float(np.asarray(h_npz["sigma_eval"], dtype=np.float64).reshape(-1)[0])
         if "sigma_eval" in h_npz.files
         else float("nan")
+    )
+    dl_panel_title_top, dl_suptitle_delta_l_tag, dl_summary_delta_l_prefix = delta_l_figure_labels(
+        h_field_method
     )
 
     theta_chk = theta_for_fisher_alignment(bundle, full_args)
@@ -801,7 +828,7 @@ def main() -> None:
     ax3.set_xlabel(r"bin $j$")
     ax3.set_ylabel(r"bin $i$")
     ax3.set_title(
-        "Binned flow $\\Delta L_{ij}$ → score\n"
+        f"{dl_panel_title_top}\n"
         + rf"$0.5(f(\Delta L)+f(\Delta L^\top))$, $f=\max(\sigma,1-\sigma)$, corr vs GT={corr_lr_dl_vs_gt:.3f}"
     )
 
@@ -825,13 +852,13 @@ def main() -> None:
                 rf"SSSD LR acc $\sigma$={sig_val:.3g}" + "\n" + f"corr vs GT acc={corr_acc_gt:.3f}"
             )
         fig.suptitle(
-            f"Binned matrices + flow $\\Delta L$ acc + SSSD ({n_bins} bins, mode={bin_mode}; "
+            f"Binned matrices + {dl_suptitle_delta_l_tag} acc + SSSD ({n_bins} bins, mode={bin_mode}; "
             f"{s_combo} evaluation $\\sigma$)",
             fontsize=13,
         )
     else:
         fig.suptitle(
-            f"Binned matrices + flow $\\Delta L$ acc ({n_bins} bins, mode={bin_mode})",
+            f"Binned matrices + {dl_suptitle_delta_l_tag} acc ({n_bins} bins, mode={bin_mode})",
             fontsize=13,
         )
 
@@ -957,10 +984,16 @@ def main() -> None:
         f.write(f"correlation_h_binned_sqrt_vs_gt_approx: {corr_h_vs_gt}\n")
         f.write(f"correlation_clf_binned_vs_gt_approx: {corr_clf_vs_gt}\n")
         f.write(
-            "flow Delta L (from h_matrix_results*.npz delta_l_matrix): bin-average Delta L_ij over "
-            "theta-bin pairs, then f(z)=max(sigmoid(z),1-sigmoid(z)), "
+            dl_summary_delta_l_prefix
+            + "bin-average Delta L_ij over theta-bin pairs, then f(z)=max(sigmoid(z),1-sigmoid(z)), "
             "A_ij = 0.5*(f(Delta L_ij)+f(Delta L_ji)); diagonal NaN; off-diagonal in [0.5,1].\n"
         )
+        if str(h_field_method).strip().lower() != "flow":
+            f.write(
+                "  DSM note: the trained fields are denoising scores; "
+                "∇_θ log p(θ|x) is the standard score target, and "
+                "∇_θ p(θ|x) = p(θ|x) ∇_θ log p(θ|x) on the support of p.\n"
+            )
         f.write(f"correlation_lr_binned_delta_l_vs_gt_approx: {corr_lr_dl_vs_gt}\n")
         if sssd_acc_stack.size > 0 and sssd_acc_stack.shape[0] > 0:
             f.write(

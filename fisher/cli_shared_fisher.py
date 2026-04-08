@@ -157,8 +157,18 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         choices=["theta_std", "posterior_proxy", "fixed"],
     )
     p.add_argument("--score-sigma-alpha-list", type=float, nargs="+", default=[0.08, 0.06, 0.045, 0.03, 0.02])
-    p.add_argument("--score-sigma-min-alpha", type=float, default=0.01)
-    p.add_argument("--score-sigma-max-alpha", type=float, default=0.25)
+    p.add_argument(
+        "--score-sigma-min-alpha",
+        type=float,
+        default=0.05,
+        help="With --score-sigma-scale-mode theta_std: sigma_min = this × std(theta on score fit). Default 0.05 (5%%).",
+    )
+    p.add_argument(
+        "--score-sigma-max-alpha",
+        type=float,
+        default=1.0,
+        help="With --score-sigma-scale-mode theta_std: sigma_max = this × std(theta on score fit). Default 1.0 (100%%).",
+    )
     p.add_argument("--score-eval-sigmas", type=int, default=12)
     p.add_argument("--score-proxy-l2", type=float, default=1e-3)
     p.add_argument("--score-proxy-min-mult", type=float, default=0.1)

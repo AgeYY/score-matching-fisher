@@ -27,7 +27,7 @@ from fisher.models import (
     PriorScore1D,
     PriorThetaFlowVelocity,
 )
-from fisher.shared_dataset_io import meta_dict_from_args
+from fisher.shared_dataset_io import SHARED_DATASET_META_KEYS, meta_dict_from_args
 from fisher.trainers import (
     geometric_sigma_schedule,
     train_conditional_theta_flow_model,
@@ -572,11 +572,18 @@ def validate_estimation_args(args: Any) -> None:
 
 
 def merge_meta_into_args(meta: dict[str, Any], est_ns: Any) -> Any:
+    """Merge dataset ``meta`` into CLI args.
+
+    Only keys that belong to shared-dataset metadata (see ``SHARED_DATASET_META_KEYS``)
+    may override argparse defaults; other keys in ``meta`` are ignored so estimation
+    flags like ``theta_field_method`` cannot be accidentally overwritten.
+    """
     out = vars(est_ns).copy()
     for k, v in meta.items():
         if k == "version":
             continue
-        out[k] = v
+        if k in SHARED_DATASET_META_KEYS:
+            out[k] = v
     return SimpleNamespace(**out)
 
 
