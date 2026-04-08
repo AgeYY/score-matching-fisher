@@ -64,18 +64,7 @@ def parse_args() -> argparse.Namespace:
         "--num-theta-bins",
         type=int,
         default=15,
-        help="Number of equal-width theta bins (default 15).",
-    )
-    p.add_argument(
-        "--theta-bin-mode",
-        type=str,
-        default="range",
-        choices=["range", "meta_range"],
-        help=(
-            "How to set theta bin edges: "
-            "'range' uses min/max of theta_used from H-matrix; "
-            "'meta_range' uses theta_low/theta_high from dataset meta."
-        ),
+        help="Number of equal-width theta bins (default 15) for RDM; edges use min/max of theta_used from H-matrix.",
     )
     p.add_argument(
         "--h-only",
@@ -138,22 +127,14 @@ def parse_args() -> argparse.Namespace:
 
 def theta_bin_edges(
     theta_used: np.ndarray,
-    meta: dict,
     n_bins: int,
-    mode: str,
 ) -> tuple[np.ndarray, float, float]:
-    """Return (edges length n_bins+1, theta_low_used, theta_high_used)."""
+    """Return (edges length n_bins+1, theta_low_used, theta_high_used) from min/max of theta_used."""
     th = np.asarray(theta_used, dtype=np.float64).reshape(-1)
     if n_bins < 1:
         raise ValueError("--num-theta-bins must be >= 1.")
-    if mode == "range":
-        lo = float(np.min(th))
-        hi = float(np.max(th))
-    elif mode == "meta_range":
-        lo = float(meta["theta_low"])
-        hi = float(meta["theta_high"])
-    else:
-        raise ValueError(f"Unknown theta-bin-mode: {mode}")
+    lo = float(np.min(th))
+    hi = float(np.max(th))
     if hi <= lo:
         raise ValueError(f"Invalid theta range for binning: [{lo}, {hi}]")
     edges = np.linspace(lo, hi, n_bins + 1, dtype=np.float64)
@@ -415,7 +396,6 @@ def main() -> None:
     args = parse_args()
     dataset_npz = args.dataset_npz
     n_bins = int(args.num_theta_bins)
-    bin_mode = str(args.theta_bin_mode)
 
     validate_estimation_args(args)
     if n_bins < 1:
@@ -458,7 +438,7 @@ def main() -> None:
 
     print(
         f"[h_binned] dataset_npz={dataset_npz} output_dir={full_args.output_dir} "
-        f"num_theta_bins={n_bins} theta_bin_mode={bin_mode} h_only={bool(args.h_only)} "
+        f"num_theta_bins={n_bins} h_only={bool(args.h_only)} "
         f"theta_field_method={str(getattr(full_args, 'theta_field_method', 'dsm'))}"
     )
 
@@ -531,7 +511,7 @@ def main() -> None:
             f"delta_l_matrix shape {delta_l_matrix.shape} does not match h_sym {h_sym.shape}."
         )
 
-    edges, edge_lo, edge_hi = theta_bin_edges(theta_used, meta, n_bins, bin_mode)
+    edges, edge_lo, edge_hi = theta_bin_edges(theta_used, n_bins)
     bin_idx = theta_to_bin_index(theta_used, edges, n_bins)
     centers = 0.5 * (edges[:-1] + edges[1:])
 
@@ -722,7 +702,6 @@ def main() -> None:
         theta_used=theta_used,
         x_aligned=x_chk,
         num_theta_bins=np.asarray([n_bins], dtype=np.int64),
-        theta_bin_mode=np.asarray([bin_mode], dtype=object),
         theta_bin_edge_lo=np.asarray([edge_lo], dtype=np.float64),
         theta_bin_edge_hi=np.asarray([edge_hi], dtype=np.float64),
         h_field_method=np.asarray([h_field_method], dtype=object),
@@ -748,7 +727,7 @@ def main() -> None:
     plt.colorbar(im, fraction=0.046, pad=0.04, label=r"mean $\sqrt{H^{\mathrm{sym}}}$ in bin pair")
     plt.xlabel(r"bin $j$")
     plt.ylabel(r"bin $i$")
-    plt.title(f"Binned sqrt(H)-matrix ({n_bins} bins, mode={bin_mode})")
+    plt.title(f"Binned sqrt(H)-matrix ({n_bins} bins)")
     plt.tight_layout()
     plt.savefig(fig_path, dpi=180)
     plt.close()
@@ -852,13 +831,13 @@ def main() -> None:
                 rf"SSSD LR acc $\sigma$={sig_val:.3g}" + "\n" + f"corr vs GT acc={corr_acc_gt:.3f}"
             )
         fig.suptitle(
-            f"Binned matrices + {dl_suptitle_delta_l_tag} acc + SSSD ({n_bins} bins, mode={bin_mode}; "
+            f"Binned matrices + {dl_suptitle_delta_l_tag} acc + SSSD ({n_bins} bins; "
             f"{s_combo} evaluation $\\sigma$)",
             fontsize=13,
         )
     else:
         fig.suptitle(
-            f"Binned matrices + {dl_suptitle_delta_l_tag} acc ({n_bins} bins, mode={bin_mode})",
+            f"Binned matrices + {dl_suptitle_delta_l_tag} acc ({n_bins} bins)",
             fontsize=13,
         )
 
@@ -939,8 +918,7 @@ def main() -> None:
         f.write(f"h_field_method: {h_field_method}\n")
         f.write(f"{h_eval_scalar_name}: {h_eval_scalar_value}\n")
         f.write(f"num_theta_bins: {n_bins}\n")
-        f.write(f"theta_bin_mode: {bin_mode}\n")
-        f.write(f"theta_bin_edges: [{edge_lo}, {edge_hi}] (mode-dependent)\n")
+        f.write(f"theta_bin_edges: [{edge_lo}, {edge_hi}] (min/max of theta_used from H-matrix)\n")
         f.write(f"h_binned finite cells: {n_finite} nan cells: {n_nan}\n")
         if n_finite > 0:
             f.write(

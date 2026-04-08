@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a shared (theta, x) dataset and save it under DATAROOT as a compressed .npz."""
+"""Generate a shared (theta, x) dataset, save .npz, and write diagnostic figures (same dataset object)."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ if str(_repo_root) not in sys.path:
 import numpy as np
 
 from fisher.cli_shared_fisher import parse_dataset_only_args
+from fisher.dataset_visualization import plot_joint_and_tuning, summarize_dataset
 from fisher.shared_dataset_io import meta_dict_from_args, save_shared_dataset_npz
 from fisher.shared_fisher_est import build_dataset_from_args, validate_dataset_sample_args
 
@@ -36,18 +37,11 @@ def main() -> None:
     else:
         n_train = int(tf * n_total)
         n_train = min(max(n_train, 1), n_total - 1)
-    if n_train >= n_total:
-        tr_idx = perm
-        ev_idx = np.empty((0,), dtype=np.int64)
-        theta_train, x_train = theta_all, x_all
-        x_dim = int(x_all.shape[1])
-        theta_eval = np.zeros((0, 1), dtype=np.float64)
-        x_eval = np.zeros((0, x_dim), dtype=np.float64)
-    else:
-        tr_idx = perm[:n_train]
-        ev_idx = perm[n_train:]
-        theta_train, x_train = theta_all[tr_idx], x_all[tr_idx]
-        theta_eval, x_eval = theta_all[ev_idx], x_all[ev_idx]
+
+    tr_idx = perm[:n_train]
+    ev_idx = perm[n_train:]
+    theta_train, x_train = theta_all[tr_idx], x_all[tr_idx]
+    theta_eval, x_eval = theta_all[ev_idx], x_all[ev_idx]
 
     meta = meta_dict_from_args(args)
     save_shared_dataset_npz(
@@ -65,6 +59,12 @@ def main() -> None:
 
     print(f"[data] total={n_total} train={theta_train.shape[0]} eval={theta_eval.shape[0]}")
     print(f"Saved shared dataset: {args.output_npz}")
+
+    out_dir = Path(args.output_npz).resolve().parent
+    joint_tuning_path = out_dir / "joint_scatter_and_tuning_curve.png"
+    summarize_dataset(theta_all, x_all, dataset)
+    plot_joint_and_tuning(theta_all, x_all, dataset, str(joint_tuning_path))
+    print(f"Saved visualization: {joint_tuning_path}")
 
 
 if __name__ == "__main__":
