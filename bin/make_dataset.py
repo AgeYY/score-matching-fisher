@@ -185,6 +185,7 @@ def main() -> None:
     summarize_dataset(theta_all, x_all, dataset)
     plot_joint_and_tuning(theta_all, x_all, dataset, str(joint_tuning_path))
     print(f"Saved visualization: {joint_tuning_path}")
+    print(f"Saved visualization: {joint_tuning_path.with_suffix('.svg')}")
 
 
 if __name__ == "__main__":

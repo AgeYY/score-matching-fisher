@@ -345,6 +345,14 @@ def _estimate_one(
     return loaded, x_aligned, ctx.device
 
 
+def _save_figure_png_svg(fig: plt.Figure, path_png: str, *, dpi: int = 160) -> str:
+    """Write PNG and a sibling .svg (vector) for the same figure."""
+    fig.savefig(path_png, dpi=dpi)
+    path_svg = str(Path(path_png).with_suffix(".svg"))
+    fig.savefig(path_svg)
+    return path_svg
+
+
 def _finite_min_max(matrices: list[np.ndarray]) -> tuple[float, float]:
     """Shared color scale from stacked finite values (ignores NaN)."""
     parts: list[np.ndarray] = []
@@ -455,7 +463,7 @@ def _render_matrix_panel(
         fontsize=11,
     )
     fig.tight_layout()
-    fig.savefig(out_path, dpi=160)
+    _save_figure_png_svg(fig, out_path, dpi=160)
     plt.close(fig)
 
 
@@ -744,7 +752,7 @@ def main(argv: list[str] | None = None) -> None:
     ax.legend(loc="best", fontsize=9)
     ax.grid(True, alpha=0.35)
     fig.tight_layout()
-    fig.savefig(fig_path, dpi=160)
+    conv_svg = _save_figure_png_svg(fig, fig_path, dpi=160)
     plt.close(fig)
 
     matrix_panel_path = os.path.join(args.output_dir, "h_decoding_matrices_panel.png")
@@ -774,7 +782,9 @@ def main(argv: list[str] | None = None) -> None:
         "results_npz": out_npz,
         "results_csv": csv_path,
         "figure": fig_path,
+        "figure_svg": conv_svg,
         "matrix_panel": matrix_panel_path,
+        "matrix_panel_svg": str(Path(matrix_panel_path).with_suffix(".svg")),
         "reference_npz": os.path.join(args.output_dir, "h_decoding_convergence_reference.npz"),
         "training_losses_dir": loss_dir,
         "training_losses_manifest": manifest_path,
@@ -787,7 +797,9 @@ def main(argv: list[str] | None = None) -> None:
     print(f"  - {out_npz}")
     print(f"  - {csv_path}")
     print(f"  - {fig_path}")
+    print(f"  - {conv_svg}")
     print(f"  - {matrix_panel_path}")
+    print(f"  - {paths_out['matrix_panel_svg']}")
     print(f"  - {loss_dir}/ (per-n training loss .npz + manifest.txt)")
     print(f"  - {summary_path}")
 

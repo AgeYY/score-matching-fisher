@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -122,4 +124,6 @@ def plot_joint_and_tuning(
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=180, bbox_inches="tight")
+    svg_path = str(Path(out_path).with_suffix(".svg"))
+    fig.savefig(svg_path, bbox_inches="tight")
     plt.close(fig)

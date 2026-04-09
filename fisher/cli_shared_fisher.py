@@ -412,8 +412,8 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--score-sigma-min-alpha",
         type=float,
-        default=0.01,
-        help="With --score-sigma-scale-mode theta_std: sigma_min = this × std(theta on score fit). Default 0.01 (1%%).",
+        default=0.05,
+        help="With --score-sigma-scale-mode theta_std: sigma_min = this × std(theta on score fit). Default 0.05 (5%%).",
     )
     p.add_argument(
         "--score-sigma-max-alpha",
