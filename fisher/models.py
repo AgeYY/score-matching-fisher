@@ -13,6 +13,8 @@ class ConditionalScore1D(nn.Module):
         hidden_dim: int = 128,
         depth: int = 3,
         use_log_sigma: bool = False,
+        use_layer_norm: bool = False,
+        zero_out_init: bool = False,
     ) -> None:
         super().__init__()
         if x_dim < 2:
@@ -22,9 +24,15 @@ class ConditionalScore1D(nn.Module):
         layers: list[nn.Module] = []
         for _ in range(depth):
             layers.append(nn.Linear(in_dim, hidden_dim))
+            if use_layer_norm:
+                layers.append(nn.LayerNorm(hidden_dim))
             layers.append(nn.SiLU())
             in_dim = hidden_dim
-        layers.append(nn.Linear(hidden_dim, 1))
+        out = nn.Linear(hidden_dim, 1)
+        if zero_out_init:
+            nn.init.zeros_(out.weight)
+            nn.init.zeros_(out.bias)
+        layers.append(out)
         self.net = nn.Sequential(*layers)
 
     def forward(self, theta_tilde: torch.Tensor, x: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
@@ -55,6 +63,9 @@ class ConditionalScore1DFiLMPerLayer(nn.Module):
         hidden_dim: int = 128,
         depth: int = 3,
         use_log_sigma: bool = False,
+        use_layer_norm: bool = False,
+        gated_film: bool = False,
+        zero_out_init: bool = False,
     ) -> None:
         super().__init__()
         if x_dim < 2:
@@ -63,8 +74,10 @@ class ConditionalScore1DFiLMPerLayer(nn.Module):
         self.hidden_dim = int(hidden_dim)
         self.depth = int(depth)
         self.use_log_sigma = bool(use_log_sigma)
+        self.gated_film = bool(gated_film)
         cond_dim = 2  # theta_tilde, sigma_feat (scalars)
         self.in_proj = nn.Linear(int(x_dim), int(hidden_dim))
+        self.in_norm = nn.LayerNorm(int(hidden_dim)) if use_layer_norm else nn.Identity()
         # Additive residual from (noisy theta, sigma) into the x trunk (same hidden_dim).
         self.cond_residual = nn.Linear(cond_dim, int(hidden_dim))
         nn.init.zeros_(self.cond_residual.weight)
@@ -77,10 +90,14 @@ class ConditionalScore1DFiLMPerLayer(nn.Module):
                         "lin": nn.Linear(int(hidden_dim), int(hidden_dim)),
                         "gamma": nn.Linear(cond_dim, int(hidden_dim)),
                         "beta": nn.Linear(cond_dim, int(hidden_dim)),
+                        "norm": (nn.LayerNorm(int(hidden_dim)) if use_layer_norm else nn.Identity()),
                     }
                 )
             )
         self.out = nn.Linear(int(hidden_dim), 1)
+        if zero_out_init:
+            nn.init.zeros_(self.out.weight)
+            nn.init.zeros_(self.out.bias)
 
     def _sigma_feat(self, sigma: torch.Tensor) -> torch.Tensor:
         if sigma.ndim == 1:
@@ -92,12 +109,18 @@ class ConditionalScore1DFiLMPerLayer(nn.Module):
             theta_tilde = theta_tilde.unsqueeze(-1)
         sigma_feat = self._sigma_feat(sigma)
         cond = torch.cat([theta_tilde, sigma_feat], dim=-1)
-        h = torch.nn.functional.silu(self.in_proj(x)) + self.cond_residual(cond)
+        h = self.in_norm(self.in_proj(x))
+        h = torch.nn.functional.silu(h) + self.cond_residual(cond)
         for blk in self.blocks:
             y = blk["lin"](h)
             gamma = blk["gamma"](cond)
             beta = blk["beta"](cond)
-            y = gamma * y + beta
+            if self.gated_film:
+                # Bounded multiplicative modulation for stability.
+                y = (1.0 + 0.5 * torch.tanh(gamma)) * y + beta
+            else:
+                y = gamma * y + beta
+            y = blk["norm"](y)
             h = h + torch.nn.functional.silu(y)
         return self.out(h)
 
@@ -479,6 +502,8 @@ class PriorScore1D(nn.Module):
         hidden_dim: int = 128,
         depth: int = 3,
         use_log_sigma: bool = False,
+        use_layer_norm: bool = False,
+        zero_out_init: bool = False,
     ) -> None:
         super().__init__()
         self.use_log_sigma = use_log_sigma
@@ -486,9 +511,15 @@ class PriorScore1D(nn.Module):
         layers: list[nn.Module] = []
         for _ in range(depth):
             layers.append(nn.Linear(in_dim, hidden_dim))
+            if use_layer_norm:
+                layers.append(nn.LayerNorm(hidden_dim))
             layers.append(nn.SiLU())
             in_dim = hidden_dim
-        layers.append(nn.Linear(hidden_dim, 1))
+        out = nn.Linear(hidden_dim, 1)
+        if zero_out_init:
+            nn.init.zeros_(out.weight)
+            nn.init.zeros_(out.bias)
+        layers.append(out)
         self.net = nn.Sequential(*layers)
 
     def forward(self, theta_tilde: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
@@ -518,13 +549,18 @@ class PriorScore1DFiLMPerLayer(nn.Module):
         hidden_dim: int = 128,
         depth: int = 3,
         use_log_sigma: bool = False,
+        use_layer_norm: bool = False,
+        gated_film: bool = False,
+        zero_out_init: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_dim = int(hidden_dim)
         self.depth = int(depth)
         self.use_log_sigma = bool(use_log_sigma)
+        self.gated_film = bool(gated_film)
         cond_dim = 2  # theta_tilde, sigma_feat
         self.in_proj = nn.Linear(1, int(hidden_dim))
+        self.in_norm = nn.LayerNorm(int(hidden_dim)) if use_layer_norm else nn.Identity()
         self.blocks = nn.ModuleList()
         for _ in range(int(depth)):
             self.blocks.append(
@@ -533,10 +569,14 @@ class PriorScore1DFiLMPerLayer(nn.Module):
                         "lin": nn.Linear(int(hidden_dim), int(hidden_dim)),
                         "gamma": nn.Linear(cond_dim, int(hidden_dim)),
                         "beta": nn.Linear(cond_dim, int(hidden_dim)),
+                        "norm": (nn.LayerNorm(int(hidden_dim)) if use_layer_norm else nn.Identity()),
                     }
                 )
             )
         self.out = nn.Linear(int(hidden_dim), 1)
+        if zero_out_init:
+            nn.init.zeros_(self.out.weight)
+            nn.init.zeros_(self.out.bias)
 
     def _sigma_feat(self, sigma: torch.Tensor) -> torch.Tensor:
         if sigma.ndim == 1:
@@ -548,12 +588,17 @@ class PriorScore1DFiLMPerLayer(nn.Module):
             theta_tilde = theta_tilde.unsqueeze(-1)
         sigma_feat = self._sigma_feat(sigma)
         cond = torch.cat([theta_tilde, sigma_feat], dim=-1)
-        h = torch.nn.functional.silu(self.in_proj(theta_tilde))
+        h = self.in_norm(self.in_proj(theta_tilde))
+        h = torch.nn.functional.silu(h)
         for blk in self.blocks:
             y = blk["lin"](h)
             gamma = blk["gamma"](cond)
             beta = blk["beta"](cond)
-            y = gamma * y + beta
+            if self.gated_film:
+                y = (1.0 + 0.5 * torch.tanh(gamma)) * y + beta
+            else:
+                y = gamma * y + beta
+            y = blk["norm"](y)
             h = h + torch.nn.functional.silu(y)
         return self.out(h)
 

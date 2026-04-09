@@ -86,14 +86,136 @@ def sample_continuous_geometric_sigmas(
     sigma_min: float,
     sigma_max: float,
     device: torch.device,
+    *,
+    mode: str = "uniform_log",
+    beta_param: float = 2.0,
 ) -> torch.Tensor:
     if sigma_min <= 0.0 or sigma_max <= 0.0:
         raise ValueError("sigma_min and sigma_max must be positive.")
     lo = min(float(sigma_min), float(sigma_max))
     hi = max(float(sigma_min), float(sigma_max))
-    u = torch.rand((batch_size, 1), device=device)
+    _mode = str(mode).lower()
+    if _mode not in ("uniform_log", "beta_log"):
+        raise ValueError("mode must be one of {'uniform_log', 'beta_log'}.")
+    if _mode == "beta_log":
+        if float(beta_param) <= 0.0:
+            raise ValueError("beta_param must be positive for beta_log sigma sampling.")
+        # u in (0,1): Beta(beta, 1) biases toward larger log-sigmas when beta>1.
+        dist = torch.distributions.Beta(
+            torch.tensor(float(beta_param), device=device),
+            torch.tensor(1.0, device=device),
+        )
+        u = dist.sample((batch_size, 1))
+    else:
+        u = torch.rand((batch_size, 1), device=device)
     log_sigma = np.log(lo) + u * (np.log(hi) - np.log(lo))
     return torch.exp(log_sigma)
+
+
+def _build_optimizer(
+    model: nn.Module,
+    lr: float,
+    optimizer_name: str,
+    weight_decay: float,
+) -> torch.optim.Optimizer:
+    name = str(optimizer_name).lower()
+    if name == "adamw":
+        return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=float(weight_decay))
+    if name == "adam":
+        return torch.optim.Adam(model.parameters(), lr=lr, weight_decay=float(weight_decay))
+    raise ValueError("optimizer_name must be one of {'adam', 'adamw'}.")
+
+
+def _build_scheduler(
+    optimizer: torch.optim.Optimizer,
+    *,
+    scheduler_name: str,
+    epochs: int,
+    warmup_frac: float,
+) -> torch.optim.lr_scheduler._LRScheduler | None:
+    name = str(scheduler_name).lower()
+    if name == "none":
+        return None
+    if not (0.0 <= float(warmup_frac) < 1.0):
+        raise ValueError("lr_warmup_frac must be in [0,1).")
+    warmup_epochs = int(max(0, round(float(warmup_frac) * int(epochs))))
+    if name == "cosine":
+        if warmup_epochs <= 0:
+            return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, int(epochs)))
+
+        def _lr_lambda(ep: int) -> float:
+            e = int(ep) + 1
+            if e <= warmup_epochs:
+                return float(e) / float(max(1, warmup_epochs))
+            rem = max(1, int(epochs) - warmup_epochs)
+            p = float(e - warmup_epochs) / float(rem)
+            p = min(max(p, 0.0), 1.0)
+            return 0.5 * (1.0 + np.cos(np.pi * p))
+
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
+    raise ValueError("lr_scheduler must be one of {'none', 'cosine'}.")
+
+
+def _loss_reduce(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    loss_type: str,
+    huber_delta: float,
+) -> torch.Tensor:
+    typ = str(loss_type).lower()
+    if typ == "mse":
+        return torch.mean((pred - target) ** 2)
+    if typ == "huber":
+        if float(huber_delta) <= 0.0:
+            raise ValueError("huber_delta must be positive when loss_type='huber'.")
+        return torch.nn.functional.huber_loss(pred, target, delta=float(huber_delta), reduction="mean")
+    raise ValueError("loss_type must be one of {'mse', 'huber'}.")
+
+
+def _score_matching_loss(
+    pred: torch.Tensor,
+    eps: torch.Tensor,
+    sigma: torch.Tensor,
+    *,
+    loss_type: str,
+    huber_delta: float,
+    normalize_by_sigma: bool,
+) -> torch.Tensor:
+    # Continuous NCSM target: sigma * score + eps -> 0.
+    residual = sigma * pred + eps
+    if normalize_by_sigma:
+        residual = residual / torch.clamp(sigma, min=1e-6)
+    return _loss_reduce(
+        residual,
+        torch.zeros_like(residual),
+        loss_type=loss_type,
+        huber_delta=huber_delta,
+    )
+
+
+def _finite_grad_norm(model: nn.Module) -> float:
+    vals: list[float] = []
+    for p in model.parameters():
+        if p.grad is None:
+            continue
+        g = p.grad.detach()
+        if torch.isfinite(g).all():
+            vals.append(float(torch.linalg.vector_norm(g).item()))
+    if not vals:
+        return float("nan")
+    return float(np.sqrt(np.sum(np.asarray(vals, dtype=np.float64) ** 2)))
+
+
+def _param_norm(model: nn.Module) -> float:
+    vals: list[float] = []
+    for p in model.parameters():
+        v = p.detach()
+        if torch.isfinite(v).all():
+            vals.append(float(torch.linalg.vector_norm(v).item()))
+    if not vals:
+        return float("nan")
+    return float(np.sqrt(np.sum(np.asarray(vals, dtype=np.float64) ** 2)))
 
 
 def train_score_model(
@@ -113,11 +235,26 @@ def train_score_model(
     early_stopping_ema_alpha: float = 0.05,
     early_stopping_ema_warmup_epochs: int = 0,
     restore_best: bool = True,
+    optimizer_name: str = "adamw",
+    weight_decay: float = 1e-4,
+    max_grad_norm: float = 1.0,
+    lr_scheduler: str = "cosine",
+    lr_warmup_frac: float = 0.05,
+    loss_type: str = "huber",
+    huber_delta: float = 1.0,
+    normalize_by_sigma: bool = False,
+    abort_on_nonfinite: bool = True,
 ) -> dict[str, float | int | bool | list[float]]:
     if int(early_stopping_ema_warmup_epochs) < 0:
         raise ValueError("early_stopping_ema_warmup_epochs must be >= 0.")
     loader = to_score_loader(theta_train, x_train, batch_size=batch_size, shuffle=True)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    optimizer = _build_optimizer(model, lr=lr, optimizer_name=optimizer_name, weight_decay=weight_decay)
+    scheduler = _build_scheduler(
+        optimizer,
+        scheduler_name=lr_scheduler,
+        epochs=epochs,
+        warmup_frac=lr_warmup_frac,
+    )
     sigma_values_t = torch.from_numpy(sigma_values.astype(np.float32)).to(device)
     has_val = theta_val is not None and x_val is not None and len(theta_val) > 0
     val_loader = (
@@ -139,6 +276,10 @@ def train_score_model(
     ema_warmup = int(early_stopping_ema_warmup_epochs)
     if not (0.0 < alpha <= 1.0):
         raise ValueError("early_stopping_ema_alpha must be in (0, 1].")
+    grad_norms: list[float] = []
+    n_clipped_steps = 0
+    total_steps = 0
+    has_nonfinite = False
 
     for epoch in range(1, epochs + 1):
         epoch_losses: list[float] = []
@@ -152,11 +293,32 @@ def train_score_model(
             theta_tilde = tb + sigma * eps
             target = -(theta_tilde - tb) / (sigma**2)
             pred = model(theta_tilde, xb, sigma)
-            loss = torch.mean((pred - target) ** 2)
+            residual = pred - target
+            if normalize_by_sigma:
+                residual = sigma * residual
+            loss = _loss_reduce(residual, torch.zeros_like(residual), loss_type=loss_type, huber_delta=huber_delta)
+            if not torch.isfinite(loss):
+                has_nonfinite = True
+                if abort_on_nonfinite:
+                    print(f"[nonfinite] score train loss became non-finite at epoch={epoch}")
+                    break
+                continue
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
+            if float(max_grad_norm) > 0.0:
+                gn_before = _finite_grad_norm(model)
+                if np.isfinite(gn_before):
+                    grad_norms.append(float(gn_before))
+                    if gn_before > float(max_grad_norm):
+                        n_clipped_steps += 1
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(max_grad_norm))
             optimizer.step()
+            total_steps += 1
             epoch_losses.append(float(loss.item()))
+        if has_nonfinite and abort_on_nonfinite:
+            stopped_early = True
+            stopped_epoch = epoch
+            break
         mean_train_loss = float(np.mean(epoch_losses))
         train_losses.append(mean_train_loss)
 
@@ -174,8 +336,26 @@ def train_score_model(
                     theta_tilde = tb + sigma * eps
                     target = -(theta_tilde - tb) / (sigma**2)
                     pred = model(theta_tilde, xb, sigma)
-                    val_loss = torch.mean((pred - target) ** 2)
+                    residual = pred - target
+                    if normalize_by_sigma:
+                        residual = sigma * residual
+                    val_loss = _loss_reduce(
+                        residual,
+                        torch.zeros_like(residual),
+                        loss_type=loss_type,
+                        huber_delta=huber_delta,
+                    )
+                    if not torch.isfinite(val_loss):
+                        has_nonfinite = True
+                        if abort_on_nonfinite:
+                            print(f"[nonfinite] score val loss became non-finite at epoch={epoch}")
+                            break
+                        continue
                     val_epoch_losses.append(float(val_loss.item()))
+            if has_nonfinite and abort_on_nonfinite:
+                stopped_early = True
+                stopped_epoch = epoch
+                break
             mean_val_loss = float(np.mean(val_epoch_losses))
             smooth_val_loss, val_ema = _early_stop_val_smooth(
                 epoch, mean_val_loss, val_ema, alpha, ema_warmup
@@ -191,6 +371,8 @@ def train_score_model(
         else:
             val_monitor_losses.append(float("nan"))
         val_losses.append(mean_val_loss)
+        if scheduler is not None:
+            scheduler.step()
 
         if epoch == 1 or epoch % log_every == 0 or epoch == epochs:
             if has_val:
@@ -223,6 +405,13 @@ def train_score_model(
         "best_epoch": int(best_epoch),
         "stopped_epoch": int(stopped_epoch),
         "stopped_early": bool(stopped_early),
+        "has_nonfinite": bool(has_nonfinite),
+        "grad_norm_mean": float(np.nanmean(np.asarray(grad_norms, dtype=np.float64))) if grad_norms else float("nan"),
+        "grad_norm_max": float(np.nanmax(np.asarray(grad_norms, dtype=np.float64))) if grad_norms else float("nan"),
+        "param_norm_final": float(_param_norm(model)),
+        "n_clipped_steps": int(n_clipped_steps),
+        "n_total_steps": int(total_steps),
+        "lr_last": float(optimizer.param_groups[0]["lr"]),
     }
 
 
@@ -244,11 +433,28 @@ def train_score_model_ncsm_continuous(
     early_stopping_ema_alpha: float = 0.05,
     early_stopping_ema_warmup_epochs: int = 0,
     restore_best: bool = True,
+    optimizer_name: str = "adamw",
+    weight_decay: float = 1e-4,
+    max_grad_norm: float = 1.0,
+    lr_scheduler: str = "cosine",
+    lr_warmup_frac: float = 0.05,
+    loss_type: str = "huber",
+    huber_delta: float = 1.0,
+    normalize_by_sigma: bool = False,
+    abort_on_nonfinite: bool = True,
+    sigma_sample_mode: str = "uniform_log",
+    sigma_sample_beta: float = 2.0,
 ) -> dict[str, float | int | bool | list[float]]:
     if int(early_stopping_ema_warmup_epochs) < 0:
         raise ValueError("early_stopping_ema_warmup_epochs must be >= 0.")
     loader = to_score_loader(theta_train, x_train, batch_size=batch_size, shuffle=True)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    optimizer = _build_optimizer(model, lr=lr, optimizer_name=optimizer_name, weight_decay=weight_decay)
+    scheduler = _build_scheduler(
+        optimizer,
+        scheduler_name=lr_scheduler,
+        epochs=epochs,
+        warmup_frac=lr_warmup_frac,
+    )
     has_val = theta_val is not None and x_val is not None and len(theta_val) > 0
     val_loader = (
         to_score_loader(theta_val, x_val, batch_size=batch_size, shuffle=False)
@@ -269,6 +475,10 @@ def train_score_model_ncsm_continuous(
     ema_warmup = int(early_stopping_ema_warmup_epochs)
     if not (0.0 < alpha <= 1.0):
         raise ValueError("early_stopping_ema_alpha must be in (0, 1].")
+    grad_norms: list[float] = []
+    n_clipped_steps = 0
+    total_steps = 0
+    has_nonfinite = False
 
     for epoch in range(1, epochs + 1):
         epoch_losses: list[float] = []
@@ -281,15 +491,42 @@ def train_score_model_ncsm_continuous(
                 sigma_min=sigma_min,
                 sigma_max=sigma_max,
                 device=tb.device,
+                mode=sigma_sample_mode,
+                beta_param=sigma_sample_beta,
             )
             eps = torch.randn_like(tb)
             theta_tilde = tb + sigma * eps
             pred = model(theta_tilde, xb, sigma)
-            loss = torch.mean((sigma * pred + eps) ** 2)
+            loss = _score_matching_loss(
+                pred,
+                eps,
+                sigma,
+                loss_type=loss_type,
+                huber_delta=huber_delta,
+                normalize_by_sigma=normalize_by_sigma,
+            )
+            if not torch.isfinite(loss):
+                has_nonfinite = True
+                if abort_on_nonfinite:
+                    print(f"[nonfinite] score ncsm train loss became non-finite at epoch={epoch}")
+                    break
+                continue
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
+            if float(max_grad_norm) > 0.0:
+                gn_before = _finite_grad_norm(model)
+                if np.isfinite(gn_before):
+                    grad_norms.append(float(gn_before))
+                    if gn_before > float(max_grad_norm):
+                        n_clipped_steps += 1
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(max_grad_norm))
             optimizer.step()
+            total_steps += 1
             epoch_losses.append(float(loss.item()))
+        if has_nonfinite and abort_on_nonfinite:
+            stopped_early = True
+            stopped_epoch = epoch
+            break
         mean_train_loss = float(np.mean(epoch_losses))
         train_losses.append(mean_train_loss)
 
@@ -306,12 +543,31 @@ def train_score_model_ncsm_continuous(
                         sigma_min=sigma_min,
                         sigma_max=sigma_max,
                         device=tb.device,
+                        mode=sigma_sample_mode,
+                        beta_param=sigma_sample_beta,
                     )
                     eps = torch.randn_like(tb)
                     theta_tilde = tb + sigma * eps
                     pred = model(theta_tilde, xb, sigma)
-                    val_loss = torch.mean((sigma * pred + eps) ** 2)
+                    val_loss = _score_matching_loss(
+                        pred,
+                        eps,
+                        sigma,
+                        loss_type=loss_type,
+                        huber_delta=huber_delta,
+                        normalize_by_sigma=normalize_by_sigma,
+                    )
+                    if not torch.isfinite(val_loss):
+                        has_nonfinite = True
+                        if abort_on_nonfinite:
+                            print(f"[nonfinite] score ncsm val loss became non-finite at epoch={epoch}")
+                            break
+                        continue
                     val_epoch_losses.append(float(val_loss.item()))
+            if has_nonfinite and abort_on_nonfinite:
+                stopped_early = True
+                stopped_epoch = epoch
+                break
             mean_val_loss = float(np.mean(val_epoch_losses))
             smooth_val_loss, val_ema = _early_stop_val_smooth(
                 epoch, mean_val_loss, val_ema, alpha, ema_warmup
@@ -327,6 +583,8 @@ def train_score_model_ncsm_continuous(
         else:
             val_monitor_losses.append(float("nan"))
         val_losses.append(mean_val_loss)
+        if scheduler is not None:
+            scheduler.step()
 
         if epoch == 1 or epoch % log_every == 0 or epoch == epochs:
             if has_val:
@@ -359,6 +617,13 @@ def train_score_model_ncsm_continuous(
         "best_epoch": int(best_epoch),
         "stopped_epoch": int(stopped_epoch),
         "stopped_early": bool(stopped_early),
+        "has_nonfinite": bool(has_nonfinite),
+        "grad_norm_mean": float(np.nanmean(np.asarray(grad_norms, dtype=np.float64))) if grad_norms else float("nan"),
+        "grad_norm_max": float(np.nanmax(np.asarray(grad_norms, dtype=np.float64))) if grad_norms else float("nan"),
+        "param_norm_final": float(_param_norm(model)),
+        "n_clipped_steps": int(n_clipped_steps),
+        "n_total_steps": int(total_steps),
+        "lr_last": float(optimizer.param_groups[0]["lr"]),
     }
 
 
@@ -1123,11 +1388,26 @@ def train_prior_score_model(
     early_stopping_ema_alpha: float = 0.05,
     early_stopping_ema_warmup_epochs: int = 0,
     restore_best: bool = True,
+    optimizer_name: str = "adamw",
+    weight_decay: float = 1e-4,
+    max_grad_norm: float = 1.0,
+    lr_scheduler: str = "cosine",
+    lr_warmup_frac: float = 0.05,
+    loss_type: str = "huber",
+    huber_delta: float = 1.0,
+    normalize_by_sigma: bool = False,
+    abort_on_nonfinite: bool = True,
 ) -> dict[str, float | int | bool | list[float]]:
     if int(early_stopping_ema_warmup_epochs) < 0:
         raise ValueError("early_stopping_ema_warmup_epochs must be >= 0.")
     loader = to_prior_loader(theta_train, batch_size=batch_size, shuffle=True)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    optimizer = _build_optimizer(model, lr=lr, optimizer_name=optimizer_name, weight_decay=weight_decay)
+    scheduler = _build_scheduler(
+        optimizer,
+        scheduler_name=lr_scheduler,
+        epochs=epochs,
+        warmup_frac=lr_warmup_frac,
+    )
     sigma_values_t = torch.from_numpy(sigma_values.astype(np.float32)).to(device)
     has_val = theta_val is not None and len(theta_val) > 0
     val_loader = to_prior_loader(theta_val, batch_size=batch_size, shuffle=False) if has_val else None
@@ -1145,6 +1425,10 @@ def train_prior_score_model(
     ema_warmup = int(early_stopping_ema_warmup_epochs)
     if not (0.0 < alpha <= 1.0):
         raise ValueError("early_stopping_ema_alpha must be in (0, 1].")
+    grad_norms: list[float] = []
+    n_clipped_steps = 0
+    total_steps = 0
+    has_nonfinite = False
 
     for epoch in range(1, epochs + 1):
         epoch_losses: list[float] = []
@@ -1157,11 +1441,32 @@ def train_prior_score_model(
             theta_tilde = tb + sigma * eps
             target = -(theta_tilde - tb) / (sigma**2)
             pred = model(theta_tilde, sigma)
-            loss = torch.mean((pred - target) ** 2)
+            residual = pred - target
+            if normalize_by_sigma:
+                residual = sigma * residual
+            loss = _loss_reduce(residual, torch.zeros_like(residual), loss_type=loss_type, huber_delta=huber_delta)
+            if not torch.isfinite(loss):
+                has_nonfinite = True
+                if abort_on_nonfinite:
+                    print(f"[nonfinite] prior train loss became non-finite at epoch={epoch}")
+                    break
+                continue
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
+            if float(max_grad_norm) > 0.0:
+                gn_before = _finite_grad_norm(model)
+                if np.isfinite(gn_before):
+                    grad_norms.append(float(gn_before))
+                    if gn_before > float(max_grad_norm):
+                        n_clipped_steps += 1
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(max_grad_norm))
             optimizer.step()
+            total_steps += 1
             epoch_losses.append(float(loss.item()))
+        if has_nonfinite and abort_on_nonfinite:
+            stopped_early = True
+            stopped_epoch = epoch
+            break
         mean_train_loss = float(np.mean(epoch_losses))
         train_losses.append(mean_train_loss)
 
@@ -1178,8 +1483,26 @@ def train_prior_score_model(
                     theta_tilde = tb + sigma * eps
                     target = -(theta_tilde - tb) / (sigma**2)
                     pred = model(theta_tilde, sigma)
-                    val_loss = torch.mean((pred - target) ** 2)
+                    residual = pred - target
+                    if normalize_by_sigma:
+                        residual = sigma * residual
+                    val_loss = _loss_reduce(
+                        residual,
+                        torch.zeros_like(residual),
+                        loss_type=loss_type,
+                        huber_delta=huber_delta,
+                    )
+                    if not torch.isfinite(val_loss):
+                        has_nonfinite = True
+                        if abort_on_nonfinite:
+                            print(f"[nonfinite] prior val loss became non-finite at epoch={epoch}")
+                            break
+                        continue
                     val_epoch_losses.append(float(val_loss.item()))
+            if has_nonfinite and abort_on_nonfinite:
+                stopped_early = True
+                stopped_epoch = epoch
+                break
             mean_val_loss = float(np.mean(val_epoch_losses))
             smooth_val_loss, val_ema = _early_stop_val_smooth(
                 epoch, mean_val_loss, val_ema, alpha, ema_warmup
@@ -1195,6 +1518,8 @@ def train_prior_score_model(
         else:
             val_monitor_losses.append(float("nan"))
         val_losses.append(mean_val_loss)
+        if scheduler is not None:
+            scheduler.step()
 
         if epoch == 1 or epoch % log_every == 0 or epoch == epochs:
             if has_val:
@@ -1227,6 +1552,13 @@ def train_prior_score_model(
         "best_epoch": int(best_epoch),
         "stopped_epoch": int(stopped_epoch),
         "stopped_early": bool(stopped_early),
+        "has_nonfinite": bool(has_nonfinite),
+        "grad_norm_mean": float(np.nanmean(np.asarray(grad_norms, dtype=np.float64))) if grad_norms else float("nan"),
+        "grad_norm_max": float(np.nanmax(np.asarray(grad_norms, dtype=np.float64))) if grad_norms else float("nan"),
+        "param_norm_final": float(_param_norm(model)),
+        "n_clipped_steps": int(n_clipped_steps),
+        "n_total_steps": int(total_steps),
+        "lr_last": float(optimizer.param_groups[0]["lr"]),
     }
 
 
@@ -1246,11 +1578,28 @@ def train_prior_score_model_ncsm_continuous(
     early_stopping_ema_alpha: float = 0.05,
     early_stopping_ema_warmup_epochs: int = 0,
     restore_best: bool = True,
+    optimizer_name: str = "adamw",
+    weight_decay: float = 1e-4,
+    max_grad_norm: float = 1.0,
+    lr_scheduler: str = "cosine",
+    lr_warmup_frac: float = 0.05,
+    loss_type: str = "huber",
+    huber_delta: float = 1.0,
+    normalize_by_sigma: bool = False,
+    abort_on_nonfinite: bool = True,
+    sigma_sample_mode: str = "uniform_log",
+    sigma_sample_beta: float = 2.0,
 ) -> dict[str, float | int | bool | list[float]]:
     if int(early_stopping_ema_warmup_epochs) < 0:
         raise ValueError("early_stopping_ema_warmup_epochs must be >= 0.")
     loader = to_prior_loader(theta_train, batch_size=batch_size, shuffle=True)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    optimizer = _build_optimizer(model, lr=lr, optimizer_name=optimizer_name, weight_decay=weight_decay)
+    scheduler = _build_scheduler(
+        optimizer,
+        scheduler_name=lr_scheduler,
+        epochs=epochs,
+        warmup_frac=lr_warmup_frac,
+    )
     has_val = theta_val is not None and len(theta_val) > 0
     val_loader = to_prior_loader(theta_val, batch_size=batch_size, shuffle=False) if has_val else None
     train_losses: list[float] = []
@@ -1267,6 +1616,10 @@ def train_prior_score_model_ncsm_continuous(
     ema_warmup = int(early_stopping_ema_warmup_epochs)
     if not (0.0 < alpha <= 1.0):
         raise ValueError("early_stopping_ema_alpha must be in (0, 1].")
+    grad_norms: list[float] = []
+    n_clipped_steps = 0
+    total_steps = 0
+    has_nonfinite = False
 
     for epoch in range(1, epochs + 1):
         epoch_losses: list[float] = []
@@ -1278,15 +1631,42 @@ def train_prior_score_model_ncsm_continuous(
                 sigma_min=sigma_min,
                 sigma_max=sigma_max,
                 device=tb.device,
+                mode=sigma_sample_mode,
+                beta_param=sigma_sample_beta,
             )
             eps = torch.randn_like(tb)
             theta_tilde = tb + sigma * eps
             pred = model(theta_tilde, sigma)
-            loss = torch.mean((sigma * pred + eps) ** 2)
+            loss = _score_matching_loss(
+                pred,
+                eps,
+                sigma,
+                loss_type=loss_type,
+                huber_delta=huber_delta,
+                normalize_by_sigma=normalize_by_sigma,
+            )
+            if not torch.isfinite(loss):
+                has_nonfinite = True
+                if abort_on_nonfinite:
+                    print(f"[nonfinite] prior ncsm train loss became non-finite at epoch={epoch}")
+                    break
+                continue
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
+            if float(max_grad_norm) > 0.0:
+                gn_before = _finite_grad_norm(model)
+                if np.isfinite(gn_before):
+                    grad_norms.append(float(gn_before))
+                    if gn_before > float(max_grad_norm):
+                        n_clipped_steps += 1
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(max_grad_norm))
             optimizer.step()
+            total_steps += 1
             epoch_losses.append(float(loss.item()))
+        if has_nonfinite and abort_on_nonfinite:
+            stopped_early = True
+            stopped_epoch = epoch
+            break
         mean_train_loss = float(np.mean(epoch_losses))
         train_losses.append(mean_train_loss)
 
@@ -1302,12 +1682,31 @@ def train_prior_score_model_ncsm_continuous(
                         sigma_min=sigma_min,
                         sigma_max=sigma_max,
                         device=tb.device,
+                        mode=sigma_sample_mode,
+                        beta_param=sigma_sample_beta,
                     )
                     eps = torch.randn_like(tb)
                     theta_tilde = tb + sigma * eps
                     pred = model(theta_tilde, sigma)
-                    val_loss = torch.mean((sigma * pred + eps) ** 2)
+                    val_loss = _score_matching_loss(
+                        pred,
+                        eps,
+                        sigma,
+                        loss_type=loss_type,
+                        huber_delta=huber_delta,
+                        normalize_by_sigma=normalize_by_sigma,
+                    )
+                    if not torch.isfinite(val_loss):
+                        has_nonfinite = True
+                        if abort_on_nonfinite:
+                            print(f"[nonfinite] prior ncsm val loss became non-finite at epoch={epoch}")
+                            break
+                        continue
                     val_epoch_losses.append(float(val_loss.item()))
+            if has_nonfinite and abort_on_nonfinite:
+                stopped_early = True
+                stopped_epoch = epoch
+                break
             mean_val_loss = float(np.mean(val_epoch_losses))
             smooth_val_loss, val_ema = _early_stop_val_smooth(
                 epoch, mean_val_loss, val_ema, alpha, ema_warmup
@@ -1323,6 +1722,8 @@ def train_prior_score_model_ncsm_continuous(
         else:
             val_monitor_losses.append(float("nan"))
         val_losses.append(mean_val_loss)
+        if scheduler is not None:
+            scheduler.step()
 
         if epoch == 1 or epoch % log_every == 0 or epoch == epochs:
             if has_val:
@@ -1355,6 +1756,13 @@ def train_prior_score_model_ncsm_continuous(
         "best_epoch": int(best_epoch),
         "stopped_epoch": int(stopped_epoch),
         "stopped_early": bool(stopped_early),
+        "has_nonfinite": bool(has_nonfinite),
+        "grad_norm_mean": float(np.nanmean(np.asarray(grad_norms, dtype=np.float64))) if grad_norms else float("nan"),
+        "grad_norm_max": float(np.nanmax(np.asarray(grad_norms, dtype=np.float64))) if grad_norms else float("nan"),
+        "param_norm_final": float(_param_norm(model)),
+        "n_clipped_steps": int(n_clipped_steps),
+        "n_total_steps": int(total_steps),
+        "lr_last": float(optimizer.param_groups[0]["lr"]),
     }
 
 

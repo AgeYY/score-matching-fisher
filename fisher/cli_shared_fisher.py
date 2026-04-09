@@ -281,6 +281,13 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--score-hidden-dim", type=int, default=128)
     p.add_argument("--score-depth", type=int, default=3)
     p.add_argument(
+        "--dsm-stability-preset",
+        type=str,
+        default="stable_v1",
+        choices=["legacy", "stable_v1"],
+        help="Preset for DSM stability knobs (optimizer/scheduler/clipping/loss). Default stable_v1.",
+    )
+    p.add_argument(
         "--score-arch",
         type=str,
         default="film",
@@ -291,6 +298,26 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
             "Default: film."
         ),
     )
+    p.add_argument(
+        "--score-sigma-feature-mode",
+        type=str,
+        default="auto",
+        choices=["auto", "log", "linear"],
+        help="Feature transform for sigma in posterior DSM input. auto: log for continuous noise, linear otherwise.",
+    )
+    p.add_argument(
+        "--prior-sigma-feature-mode",
+        type=str,
+        default="auto",
+        choices=["auto", "log", "linear"],
+        help="Feature transform for sigma in prior DSM input. auto: log for continuous noise, linear otherwise.",
+    )
+    p.add_argument("--score-use-layer-norm", action="store_true", default=False)
+    p.add_argument("--prior-use-layer-norm", action="store_true", default=False)
+    p.add_argument("--score-gated-film", action="store_true", default=False)
+    p.add_argument("--prior-gated-film", action="store_true", default=False)
+    p.add_argument("--score-zero-out-init", action="store_true", default=False)
+    p.add_argument("--prior-zero-out-init", action="store_true", default=False)
     p.add_argument(
         "--prior-score-arch",
         type=str,
@@ -336,6 +363,44 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument("--score-restore-best", action="store_true", default=True)
     p.add_argument("--no-score-restore-best", action="store_false", dest="score_restore_best")
+    p.add_argument("--score-optimizer", type=str, default="adam", choices=["adam", "adamw"])
+    p.add_argument("--prior-optimizer", type=str, default="adam", choices=["adam", "adamw"])
+    p.add_argument("--score-weight-decay", type=float, default=0.0)
+    p.add_argument("--prior-weight-decay", type=float, default=0.0)
+    p.add_argument(
+        "--score-lr-scheduler",
+        type=str,
+        default="none",
+        choices=["none", "cosine"],
+    )
+    p.add_argument(
+        "--prior-lr-scheduler",
+        type=str,
+        default="none",
+        choices=["none", "cosine"],
+    )
+    p.add_argument("--score-lr-warmup-frac", type=float, default=0.0)
+    p.add_argument("--prior-lr-warmup-frac", type=float, default=0.0)
+    p.add_argument("--score-max-grad-norm", type=float, default=0.0)
+    p.add_argument("--prior-max-grad-norm", type=float, default=0.0)
+    p.add_argument("--score-abort-on-nonfinite", action="store_true", default=False)
+    p.add_argument("--no-score-abort-on-nonfinite", action="store_false", dest="score_abort_on_nonfinite")
+    p.add_argument("--prior-abort-on-nonfinite", action="store_true", default=False)
+    p.add_argument("--no-prior-abort-on-nonfinite", action="store_false", dest="prior_abort_on_nonfinite")
+    p.add_argument("--score-loss-type", type=str, default="mse", choices=["mse", "huber"])
+    p.add_argument("--prior-loss-type", type=str, default="mse", choices=["mse", "huber"])
+    p.add_argument("--score-huber-delta", type=float, default=1.0)
+    p.add_argument("--prior-huber-delta", type=float, default=1.0)
+    p.add_argument("--score-normalize-by-sigma", action="store_true", default=False)
+    p.add_argument("--prior-normalize-by-sigma", action="store_true", default=False)
+    p.add_argument(
+        "--score-sigma-sample-mode",
+        type=str,
+        default="uniform_log",
+        choices=["uniform_log", "beta_log"],
+        help="Continuous DSM sigma sampling mode in log-space.",
+    )
+    p.add_argument("--score-sigma-sample-beta", type=float, default=2.0)
     p.add_argument("--score-noise-mode", type=str, default="continuous", choices=["discrete", "continuous"])
     p.add_argument(
         "--score-sigma-scale-mode",

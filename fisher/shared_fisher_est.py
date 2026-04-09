@@ -52,15 +52,29 @@ def build_posterior_score_model(
     args: Any, device: torch.device
 ) -> ConditionalScore1D | ConditionalScore1DFiLMPerLayer:
     """Instantiate posterior DSM (theta score) as MLP or FiLM (x-trunk + residual FiLM)."""
+    sigma_mode = str(getattr(args, "score_sigma_feature_mode", "auto")).lower()
+    if sigma_mode == "auto":
+        use_log_sigma = bool(getattr(args, "score_noise_mode", "continuous") == "continuous")
+    elif sigma_mode == "log":
+        use_log_sigma = True
+    elif sigma_mode == "linear":
+        use_log_sigma = False
+    else:
+        raise ValueError("--score-sigma-feature-mode must be one of {'auto','log','linear'}.")
     arch = str(getattr(args, "score_arch", "mlp")).lower()
     common = dict(
         x_dim=int(args.x_dim),
         hidden_dim=int(args.score_hidden_dim),
         depth=int(args.score_depth),
-        use_log_sigma=(args.score_noise_mode == "continuous"),
+        use_log_sigma=use_log_sigma,
+        use_layer_norm=bool(getattr(args, "score_use_layer_norm", False)),
+        zero_out_init=bool(getattr(args, "score_zero_out_init", False)),
     )
     if arch == "film":
-        return ConditionalScore1DFiLMPerLayer(**common).to(device)
+        return ConditionalScore1DFiLMPerLayer(
+            **common,
+            gated_film=bool(getattr(args, "score_gated_film", False)),
+        ).to(device)
     if arch == "mlp":
         return ConditionalScore1D(**common).to(device)
     raise ValueError(f"Unknown --score-arch: {arch!r} (expected 'mlp' or 'film').")
@@ -68,17 +82,65 @@ def build_posterior_score_model(
 
 def build_prior_score_model(args: Any, device: torch.device) -> PriorScore1D | PriorScore1DFiLMPerLayer:
     """Instantiate prior DSM as MLP or FiLM (theta-trunk + residual FiLM from theta_tilde,sigma)."""
+    sigma_mode = str(getattr(args, "prior_sigma_feature_mode", "auto")).lower()
+    if sigma_mode == "auto":
+        use_log_sigma = bool(getattr(args, "score_noise_mode", "continuous") == "continuous")
+    elif sigma_mode == "log":
+        use_log_sigma = True
+    elif sigma_mode == "linear":
+        use_log_sigma = False
+    else:
+        raise ValueError("--prior-sigma-feature-mode must be one of {'auto','log','linear'}.")
     arch = str(getattr(args, "prior_score_arch", "mlp")).lower()
     common = dict(
         hidden_dim=int(getattr(args, "prior_hidden_dim", 128)),
         depth=int(getattr(args, "prior_depth", 3)),
-        use_log_sigma=(args.score_noise_mode == "continuous"),
+        use_log_sigma=use_log_sigma,
+        use_layer_norm=bool(getattr(args, "prior_use_layer_norm", False)),
+        zero_out_init=bool(getattr(args, "prior_zero_out_init", False)),
     )
     if arch == "film":
-        return PriorScore1DFiLMPerLayer(**common).to(device)
+        return PriorScore1DFiLMPerLayer(
+            **common,
+            gated_film=bool(getattr(args, "prior_gated_film", False)),
+        ).to(device)
     if arch == "mlp":
         return PriorScore1D(**common).to(device)
     raise ValueError(f"Unknown --prior-score-arch: {arch!r} (expected 'mlp' or 'film').")
+
+
+def _apply_dsm_stability_preset(args: Any) -> None:
+    preset = str(getattr(args, "dsm_stability_preset", "stable_v1")).lower()
+    if preset == "legacy":
+        return
+    if preset != "stable_v1":
+        raise ValueError("--dsm-stability-preset must be one of {'legacy','stable_v1'}.")
+    # Conservative defaults aimed at robust convergence.
+    # Only override values still at legacy defaults so explicit CLI values are respected.
+    legacy_to_stable = {
+        "score_optimizer": ("adam", "adamw"),
+        "prior_optimizer": ("adam", "adamw"),
+        "score_weight_decay": (0.0, 1e-4),
+        "prior_weight_decay": (0.0, 1e-4),
+        "score_lr_scheduler": ("none", "cosine"),
+        "prior_lr_scheduler": ("none", "cosine"),
+        "score_lr_warmup_frac": (0.0, 0.05),
+        "prior_lr_warmup_frac": (0.0, 0.05),
+        "score_max_grad_norm": (0.0, 1.0),
+        "prior_max_grad_norm": (0.0, 1.0),
+        "score_abort_on_nonfinite": (False, True),
+        "prior_abort_on_nonfinite": (False, True),
+        "score_loss_type": ("mse", "huber"),
+        "prior_loss_type": ("mse", "huber"),
+        "score_huber_delta": (1.0, 1.0),
+        "prior_huber_delta": (1.0, 1.0),
+        "score_sigma_sample_mode": ("uniform_log", "uniform_log"),
+        "score_sigma_sample_beta": (2.0, 2.0),
+    }
+    for key, (legacy_val, stable_val) in legacy_to_stable.items():
+        cur = getattr(args, key, legacy_val)
+        if cur == legacy_val:
+            setattr(args, key, stable_val)
 
 
 def analytic_fisher_curve(
@@ -625,6 +687,7 @@ def validate_dataset_sample_args(args: Any) -> None:
 
 
 def validate_estimation_args(args: Any) -> None:
+    _apply_dsm_stability_preset(args)
     if str(getattr(args, "theta_field_method", "dsm")) not in ("dsm", "flow"):
         raise ValueError("--theta-field-method must be one of {'dsm', 'flow'}.")
     if args.score_eval_sigmas < 1:
@@ -647,6 +710,42 @@ def validate_estimation_args(args: Any) -> None:
         raise ValueError("--score-arch must be one of {'mlp','film'}.")
     if _pa not in ("mlp", "film"):
         raise ValueError("--prior-score-arch must be one of {'mlp','film'}.")
+    if str(getattr(args, "score_sigma_feature_mode", "auto")).lower() not in ("auto", "log", "linear"):
+        raise ValueError("--score-sigma-feature-mode must be one of {'auto','log','linear'}.")
+    if str(getattr(args, "prior_sigma_feature_mode", "auto")).lower() not in ("auto", "log", "linear"):
+        raise ValueError("--prior-sigma-feature-mode must be one of {'auto','log','linear'}.")
+    if str(getattr(args, "score_optimizer", "adamw")).lower() not in ("adam", "adamw"):
+        raise ValueError("--score-optimizer must be one of {'adam','adamw'}.")
+    if str(getattr(args, "prior_optimizer", "adamw")).lower() not in ("adam", "adamw"):
+        raise ValueError("--prior-optimizer must be one of {'adam','adamw'}.")
+    if float(getattr(args, "score_weight_decay", 0.0)) < 0.0:
+        raise ValueError("--score-weight-decay must be >= 0.")
+    if float(getattr(args, "prior_weight_decay", 0.0)) < 0.0:
+        raise ValueError("--prior-weight-decay must be >= 0.")
+    if str(getattr(args, "score_lr_scheduler", "none")).lower() not in ("none", "cosine"):
+        raise ValueError("--score-lr-scheduler must be one of {'none','cosine'}.")
+    if str(getattr(args, "prior_lr_scheduler", "none")).lower() not in ("none", "cosine"):
+        raise ValueError("--prior-lr-scheduler must be one of {'none','cosine'}.")
+    if not (0.0 <= float(getattr(args, "score_lr_warmup_frac", 0.0)) < 1.0):
+        raise ValueError("--score-lr-warmup-frac must be in [0,1).")
+    if not (0.0 <= float(getattr(args, "prior_lr_warmup_frac", 0.0)) < 1.0):
+        raise ValueError("--prior-lr-warmup-frac must be in [0,1).")
+    if float(getattr(args, "score_huber_delta", 1.0)) <= 0.0:
+        raise ValueError("--score-huber-delta must be positive.")
+    if float(getattr(args, "prior_huber_delta", 1.0)) <= 0.0:
+        raise ValueError("--prior-huber-delta must be positive.")
+    if float(getattr(args, "score_max_grad_norm", 1.0)) < 0.0:
+        raise ValueError("--score-max-grad-norm must be >= 0 (0 disables clipping).")
+    if float(getattr(args, "prior_max_grad_norm", 1.0)) < 0.0:
+        raise ValueError("--prior-max-grad-norm must be >= 0 (0 disables clipping).")
+    if str(getattr(args, "score_loss_type", "mse")).lower() not in ("mse", "huber"):
+        raise ValueError("--score-loss-type must be one of {'mse','huber'}.")
+    if str(getattr(args, "prior_loss_type", "mse")).lower() not in ("mse", "huber"):
+        raise ValueError("--prior-loss-type must be one of {'mse','huber'}.")
+    if str(getattr(args, "score_sigma_sample_mode", "uniform_log")).lower() not in ("uniform_log", "beta_log"):
+        raise ValueError("--score-sigma-sample-mode must be one of {'uniform_log','beta_log'}.")
+    if float(getattr(args, "score_sigma_sample_beta", 2.0)) <= 0.0:
+        raise ValueError("--score-sigma-sample-beta must be positive.")
     if args.score_proxy_min_mult <= 0.0 or args.score_proxy_max_mult <= 0.0:
         raise ValueError("--score-proxy-min-mult and --score-proxy-max-mult must be positive.")
     if args.score_proxy_min_mult > args.score_proxy_max_mult:
@@ -724,6 +823,20 @@ def _save_dsm_score_prior_training_losses_npz(
     prior_stopped_epoch: int,
     prior_stopped_early: bool,
     prior_best_val_loss: float,
+    score_has_nonfinite: bool = False,
+    score_grad_norm_mean: float = float("nan"),
+    score_grad_norm_max: float = float("nan"),
+    score_param_norm_final: float = float("nan"),
+    score_n_clipped_steps: int = 0,
+    score_n_total_steps: int = 0,
+    score_lr_last: float = float("nan"),
+    prior_has_nonfinite: bool = False,
+    prior_grad_norm_mean: float = float("nan"),
+    prior_grad_norm_max: float = float("nan"),
+    prior_param_norm_final: float = float("nan"),
+    prior_n_clipped_steps: int = 0,
+    prior_n_total_steps: int = 0,
+    prior_lr_last: float = float("nan"),
 ) -> str:
     """Write per-run DSM training curves for posterior (score) and optional prior models."""
     path = os.path.join(output_dir, "score_prior_training_losses.npz")
@@ -741,6 +854,13 @@ def _save_dsm_score_prior_training_losses_npz(
         score_stopped_epoch=np.int64(score_stopped_epoch),
         score_stopped_early=np.bool_(score_stopped_early),
         score_best_val_smooth=np.float64(score_best_val_loss),
+        score_has_nonfinite=np.bool_(score_has_nonfinite),
+        score_grad_norm_mean=np.float64(score_grad_norm_mean),
+        score_grad_norm_max=np.float64(score_grad_norm_max),
+        score_param_norm_final=np.float64(score_param_norm_final),
+        score_n_clipped_steps=np.int64(score_n_clipped_steps),
+        score_n_total_steps=np.int64(score_n_total_steps),
+        score_lr_last=np.float64(score_lr_last),
         prior_enable=np.bool_(prior_enable),
         prior_train_losses=np.asarray(prior_train_losses, dtype=np.float64),
         prior_val_losses=np.asarray(prior_val_losses, dtype=np.float64),
@@ -749,6 +869,13 @@ def _save_dsm_score_prior_training_losses_npz(
         prior_stopped_epoch=np.int64(prior_stopped_epoch),
         prior_stopped_early=np.bool_(prior_stopped_early),
         prior_best_val_smooth=np.float64(prior_best_val_loss),
+        prior_has_nonfinite=np.bool_(prior_has_nonfinite),
+        prior_grad_norm_mean=np.float64(prior_grad_norm_mean),
+        prior_grad_norm_max=np.float64(prior_grad_norm_max),
+        prior_param_norm_final=np.float64(prior_param_norm_final),
+        prior_n_clipped_steps=np.int64(prior_n_clipped_steps),
+        prior_n_total_steps=np.int64(prior_n_total_steps),
+        prior_lr_last=np.float64(prior_lr_last),
     )
     return path
 
@@ -784,6 +911,10 @@ def run_shared_fisher_estimation(
     x_eval: np.ndarray,
     rng: np.random.Generator,
 ) -> None:
+    _apply_dsm_stability_preset(args)
+    run_seed = int(getattr(args, "seed", 7))
+    np.random.seed(run_seed)
+    torch.manual_seed(run_seed)
     device = require_device(args.device)
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -1090,6 +1221,17 @@ def run_shared_fisher_estimation(
             early_stopping_ema_alpha=float(args.score_early_ema_alpha),
             early_stopping_ema_warmup_epochs=int(getattr(args, "score_early_ema_warmup_epochs", 0)),
             restore_best=args.score_restore_best,
+            optimizer_name=str(getattr(args, "score_optimizer", "adamw")),
+            weight_decay=float(getattr(args, "score_weight_decay", 1e-4)),
+            max_grad_norm=float(getattr(args, "score_max_grad_norm", 1.0)),
+            lr_scheduler=str(getattr(args, "score_lr_scheduler", "cosine")),
+            lr_warmup_frac=float(getattr(args, "score_lr_warmup_frac", 0.05)),
+            loss_type=str(getattr(args, "score_loss_type", "huber")),
+            huber_delta=float(getattr(args, "score_huber_delta", 1.0)),
+            normalize_by_sigma=bool(getattr(args, "score_normalize_by_sigma", False)),
+            abort_on_nonfinite=bool(getattr(args, "score_abort_on_nonfinite", True)),
+            sigma_sample_mode=str(getattr(args, "score_sigma_sample_mode", "uniform_log")),
+            sigma_sample_beta=float(getattr(args, "score_sigma_sample_beta", 2.0)),
         )
     else:
         if args.score_sigma_scale_mode == "fixed":
@@ -1115,6 +1257,15 @@ def run_shared_fisher_estimation(
             early_stopping_ema_alpha=float(args.score_early_ema_alpha),
             early_stopping_ema_warmup_epochs=int(getattr(args, "score_early_ema_warmup_epochs", 0)),
             restore_best=args.score_restore_best,
+            optimizer_name=str(getattr(args, "score_optimizer", "adamw")),
+            weight_decay=float(getattr(args, "score_weight_decay", 1e-4)),
+            max_grad_norm=float(getattr(args, "score_max_grad_norm", 1.0)),
+            lr_scheduler=str(getattr(args, "score_lr_scheduler", "cosine")),
+            lr_warmup_frac=float(getattr(args, "score_lr_warmup_frac", 0.05)),
+            loss_type=str(getattr(args, "score_loss_type", "huber")),
+            huber_delta=float(getattr(args, "score_huber_delta", 1.0)),
+            normalize_by_sigma=bool(getattr(args, "score_normalize_by_sigma", False)),
+            abort_on_nonfinite=bool(getattr(args, "score_abort_on_nonfinite", True)),
         )
     score_train_losses = np.asarray(score_train_out["train_losses"], dtype=np.float64)
     score_val_losses = np.asarray(score_train_out["val_losses"], dtype=np.float64)
@@ -1188,6 +1339,13 @@ def run_shared_fisher_estimation(
             prior_stopped_epoch=0,
             prior_stopped_early=False,
             prior_best_val_loss=float("nan"),
+            score_has_nonfinite=bool(score_train_out.get("has_nonfinite", False)),
+            score_grad_norm_mean=float(score_train_out.get("grad_norm_mean", float("nan"))),
+            score_grad_norm_max=float(score_train_out.get("grad_norm_max", float("nan"))),
+            score_param_norm_final=float(score_train_out.get("param_norm_final", float("nan"))),
+            score_n_clipped_steps=int(score_train_out.get("n_clipped_steps", 0)),
+            score_n_total_steps=int(score_train_out.get("n_total_steps", 0)),
+            score_lr_last=float(score_train_out.get("lr_last", float("nan"))),
         )
         print(f"[training_losses] saved {tnpz}")
     eval_low = args.theta_low + args.eval_margin
@@ -1258,6 +1416,17 @@ def run_shared_fisher_estimation(
                 early_stopping_ema_alpha=float(getattr(args, "prior_early_ema_alpha", 0.05)),
                 early_stopping_ema_warmup_epochs=int(getattr(args, "prior_early_ema_warmup_epochs", 0)),
                 restore_best=bool(getattr(args, "prior_restore_best", True)),
+                optimizer_name=str(getattr(args, "prior_optimizer", "adamw")),
+                weight_decay=float(getattr(args, "prior_weight_decay", 1e-4)),
+                max_grad_norm=float(getattr(args, "prior_max_grad_norm", 1.0)),
+                lr_scheduler=str(getattr(args, "prior_lr_scheduler", "cosine")),
+                lr_warmup_frac=float(getattr(args, "prior_lr_warmup_frac", 0.05)),
+                loss_type=str(getattr(args, "prior_loss_type", "huber")),
+                huber_delta=float(getattr(args, "prior_huber_delta", 1.0)),
+                normalize_by_sigma=bool(getattr(args, "prior_normalize_by_sigma", False)),
+                abort_on_nonfinite=bool(getattr(args, "prior_abort_on_nonfinite", True)),
+                sigma_sample_mode=str(getattr(args, "score_sigma_sample_mode", "uniform_log")),
+                sigma_sample_beta=float(getattr(args, "score_sigma_sample_beta", 2.0)),
             )
         else:
             prior_train_out = train_prior_score_model(
@@ -1275,6 +1444,15 @@ def run_shared_fisher_estimation(
                 early_stopping_ema_alpha=float(getattr(args, "prior_early_ema_alpha", 0.05)),
                 early_stopping_ema_warmup_epochs=int(getattr(args, "prior_early_ema_warmup_epochs", 0)),
                 restore_best=bool(getattr(args, "prior_restore_best", True)),
+                optimizer_name=str(getattr(args, "prior_optimizer", "adamw")),
+                weight_decay=float(getattr(args, "prior_weight_decay", 1e-4)),
+                max_grad_norm=float(getattr(args, "prior_max_grad_norm", 1.0)),
+                lr_scheduler=str(getattr(args, "prior_lr_scheduler", "cosine")),
+                lr_warmup_frac=float(getattr(args, "prior_lr_warmup_frac", 0.05)),
+                loss_type=str(getattr(args, "prior_loss_type", "huber")),
+                huber_delta=float(getattr(args, "prior_huber_delta", 1.0)),
+                normalize_by_sigma=bool(getattr(args, "prior_normalize_by_sigma", False)),
+                abort_on_nonfinite=bool(getattr(args, "prior_abort_on_nonfinite", True)),
             )
         prior_train_losses = np.asarray(prior_train_out["train_losses"], dtype=np.float64)
         prior_val_losses = np.asarray(prior_train_out["val_losses"], dtype=np.float64)
@@ -1345,6 +1523,20 @@ def run_shared_fisher_estimation(
             prior_stopped_epoch=prior_stopped_epoch,
             prior_stopped_early=prior_stopped_early,
             prior_best_val_loss=prior_best_val_loss,
+            score_has_nonfinite=bool(score_train_out.get("has_nonfinite", False)),
+            score_grad_norm_mean=float(score_train_out.get("grad_norm_mean", float("nan"))),
+            score_grad_norm_max=float(score_train_out.get("grad_norm_max", float("nan"))),
+            score_param_norm_final=float(score_train_out.get("param_norm_final", float("nan"))),
+            score_n_clipped_steps=int(score_train_out.get("n_clipped_steps", 0)),
+            score_n_total_steps=int(score_train_out.get("n_total_steps", 0)),
+            score_lr_last=float(score_train_out.get("lr_last", float("nan"))),
+            prior_has_nonfinite=bool(prior_train_out.get("has_nonfinite", False)),
+            prior_grad_norm_mean=float(prior_train_out.get("grad_norm_mean", float("nan"))),
+            prior_grad_norm_max=float(prior_train_out.get("grad_norm_max", float("nan"))),
+            prior_param_norm_final=float(prior_train_out.get("param_norm_final", float("nan"))),
+            prior_n_clipped_steps=int(prior_train_out.get("n_clipped_steps", 0)),
+            prior_n_total_steps=int(prior_train_out.get("n_total_steps", 0)),
+            prior_lr_last=float(prior_train_out.get("lr_last", float("nan"))),
         )
         print(f"[training_losses] saved {tnpz}")
 
@@ -1700,6 +1892,12 @@ def run_shared_fisher_estimation(
             score_stopped_epoch=np.asarray([stopped_epoch], dtype=np.int32),
             score_stopped_early=np.asarray([int(stopped_early)], dtype=np.int32),
             score_best_val_loss=np.asarray([best_val_loss], dtype=np.float64),
+            score_has_nonfinite=np.asarray([int(bool(score_train_out.get("has_nonfinite", False)))], dtype=np.int32),
+            score_grad_norm_mean=np.asarray([float(score_train_out.get("grad_norm_mean", float("nan")))], dtype=np.float64),
+            score_grad_norm_max=np.asarray([float(score_train_out.get("grad_norm_max", float("nan")))], dtype=np.float64),
+            score_param_norm_final=np.asarray([float(score_train_out.get("param_norm_final", float("nan")))], dtype=np.float64),
+            score_n_clipped_steps=np.asarray([int(score_train_out.get("n_clipped_steps", 0))], dtype=np.int32),
+            score_n_total_steps=np.asarray([int(score_train_out.get("n_total_steps", 0))], dtype=np.int32),
             prior_train_losses=prior_train_losses,
             prior_val_losses=prior_val_losses,
             prior_val_smooth_losses=prior_val_monitor_losses,
@@ -1707,6 +1905,12 @@ def run_shared_fisher_estimation(
             prior_stopped_epoch=np.asarray([prior_stopped_epoch], dtype=np.int32),
             prior_stopped_early=np.asarray([int(prior_stopped_early)], dtype=np.int32),
             prior_best_val_loss=np.asarray([prior_best_val_loss], dtype=np.float64),
+            prior_has_nonfinite=np.asarray([int(bool(prior_train_out.get("has_nonfinite", False)))], dtype=np.int32),
+            prior_grad_norm_mean=np.asarray([float(prior_train_out.get("grad_norm_mean", float("nan")))], dtype=np.float64),
+            prior_grad_norm_max=np.asarray([float(prior_train_out.get("grad_norm_max", float("nan")))], dtype=np.float64),
+            prior_param_norm_final=np.asarray([float(prior_train_out.get("param_norm_final", float("nan")))], dtype=np.float64),
+            prior_n_clipped_steps=np.asarray([int(prior_train_out.get("n_clipped_steps", 0))], dtype=np.int32),
+            prior_n_total_steps=np.asarray([int(prior_train_out.get("n_total_steps", 0))], dtype=np.int32),
         )
     else:
         assert score_eval is not None
@@ -1731,6 +1935,12 @@ def run_shared_fisher_estimation(
             score_stopped_epoch=np.asarray([stopped_epoch], dtype=np.int32),
             score_stopped_early=np.asarray([int(stopped_early)], dtype=np.int32),
             score_best_val_loss=np.asarray([best_val_loss], dtype=np.float64),
+            score_has_nonfinite=np.asarray([int(bool(score_train_out.get("has_nonfinite", False)))], dtype=np.int32),
+            score_grad_norm_mean=np.asarray([float(score_train_out.get("grad_norm_mean", float("nan")))], dtype=np.float64),
+            score_grad_norm_max=np.asarray([float(score_train_out.get("grad_norm_max", float("nan")))], dtype=np.float64),
+            score_param_norm_final=np.asarray([float(score_train_out.get("param_norm_final", float("nan")))], dtype=np.float64),
+            score_n_clipped_steps=np.asarray([int(score_train_out.get("n_clipped_steps", 0))], dtype=np.int32),
+            score_n_total_steps=np.asarray([int(score_train_out.get("n_total_steps", 0))], dtype=np.int32),
         )
 
     metrics_path = os.path.join(args.output_dir, f"metrics_vs_gt{suffix}.txt")
@@ -1766,6 +1976,25 @@ def run_shared_fisher_estimation(
             f"restore_best={args.score_restore_best}, stopped_early={stopped_early}, "
             f"best_epoch={best_epoch}, stopped_epoch={stopped_epoch}, best_val_smooth={best_val_loss}\n"
         )
+        f.write(
+            "score_stability: "
+            f"preset={getattr(args, 'dsm_stability_preset', 'stable_v1')}, "
+            f"optimizer={getattr(args, 'score_optimizer', 'adamw')}, "
+            f"wd={getattr(args, 'score_weight_decay', 0.0)}, "
+            f"scheduler={getattr(args, 'score_lr_scheduler', 'none')}, "
+            f"warmup_frac={getattr(args, 'score_lr_warmup_frac', 0.0)}, "
+            f"max_grad_norm={getattr(args, 'score_max_grad_norm', 0.0)}, "
+            f"loss_type={getattr(args, 'score_loss_type', 'mse')}, "
+            f"huber_delta={getattr(args, 'score_huber_delta', 1.0)}, "
+            f"normalize_by_sigma={getattr(args, 'score_normalize_by_sigma', False)}, "
+            f"sigma_sample_mode={getattr(args, 'score_sigma_sample_mode', 'uniform_log')}, "
+            f"sigma_sample_beta={getattr(args, 'score_sigma_sample_beta', 2.0)}, "
+            f"has_nonfinite={bool(score_train_out.get('has_nonfinite', False))}, "
+            f"grad_norm_mean={float(score_train_out.get('grad_norm_mean', float('nan'))):.6g}, "
+            f"grad_norm_max={float(score_train_out.get('grad_norm_max', float('nan'))):.6g}, "
+            f"n_clipped_steps={int(score_train_out.get('n_clipped_steps', 0))}/"
+            f"{int(score_train_out.get('n_total_steps', 0))}\n"
+        )
         f.write(f"score_noise_mode: {args.score_noise_mode}\n")
         f.write(f"score_sigma_scale_mode: {args.score_sigma_scale_mode}\n")
         f.write(
@@ -1783,6 +2012,22 @@ def run_shared_fisher_estimation(
                 f"restore_best={getattr(args, 'prior_restore_best', True)}, "
                 f"stopped_early={prior_stopped_early}, best_epoch={prior_best_epoch}, "
                 f"stopped_epoch={prior_stopped_epoch}, best_val_smooth={prior_best_val_loss}\n"
+            )
+            f.write(
+                "prior_stability: "
+                f"optimizer={getattr(args, 'prior_optimizer', 'adamw')}, "
+                f"wd={getattr(args, 'prior_weight_decay', 0.0)}, "
+                f"scheduler={getattr(args, 'prior_lr_scheduler', 'none')}, "
+                f"warmup_frac={getattr(args, 'prior_lr_warmup_frac', 0.0)}, "
+                f"max_grad_norm={getattr(args, 'prior_max_grad_norm', 0.0)}, "
+                f"loss_type={getattr(args, 'prior_loss_type', 'mse')}, "
+                f"huber_delta={getattr(args, 'prior_huber_delta', 1.0)}, "
+                f"normalize_by_sigma={getattr(args, 'prior_normalize_by_sigma', False)}, "
+                f"has_nonfinite={bool(prior_train_out.get('has_nonfinite', False))}, "
+                f"grad_norm_mean={float(prior_train_out.get('grad_norm_mean', float('nan'))):.6g}, "
+                f"grad_norm_max={float(prior_train_out.get('grad_norm_max', float('nan'))):.6g}, "
+                f"n_clipped_steps={int(prior_train_out.get('n_clipped_steps', 0))}/"
+                f"{int(prior_train_out.get('n_total_steps', 0))}\n"
             )
             f.write(
                 "score_posterior_vs_gt: "
