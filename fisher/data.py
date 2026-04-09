@@ -169,8 +169,8 @@ class ToyCosSinPiecewiseNoiseDataset:
     theta_low: float = -np.pi - 0.5
     theta_high: float = np.pi + 0.5
     x_dim: int = 2
-    sigma_piecewise_low: float = 0.30
-    sigma_piecewise_high: float = 0.90
+    sigma_piecewise_low: float = 0.5
+    sigma_piecewise_high: float = 4.0
     theta_zero_to_low: bool = True
     seed: int = 42
 
@@ -248,8 +248,8 @@ class ToyLinearPiecewiseNoiseDataset:
     theta_high: float = np.pi + 0.5
     x_dim: int = 2
     linear_k: float = 1.0
-    sigma_piecewise_low: float = 0.30
-    sigma_piecewise_high: float = 0.90
+    sigma_piecewise_low: float = 0.5
+    sigma_piecewise_high: float = 4.0
     theta_zero_to_low: bool = True
     seed: int = 42
 

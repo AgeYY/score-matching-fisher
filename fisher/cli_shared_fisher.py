@@ -14,12 +14,22 @@ from global_setting import DATA_DIR
 
 
 def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--seed", type=int, default=7)
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=7,
+        help="Integer seed for NumPy RNG (joint sampling and train/eval split permutation).",
+    )
     p.add_argument(
         "--dataset-family",
         type=str,
-        default="gmm_non_gauss",
+        default="gaussian",
         choices=["gaussian", "gmm_non_gauss", "cos_sin_piecewise_noise", "linear_piecewise_noise"],
+        help=(
+            "Generative family: 'gaussian' (theta-modulated Gaussian obs. noise); "
+            "'gmm_non_gauss' (theta-dependent 2-component mixture); "
+            "'cos_sin_piecewise_noise' / 'linear_piecewise_noise' (piecewise obs. std vs theta)."
+        ),
     )
     p.add_argument(
         "--tuning-curve-family",
@@ -46,39 +56,144 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
         default=1.0,
         help="Angular frequency omega for von_mises_raw tuning curves (ignored for cosine).",
     )
-    p.add_argument("--theta-low", type=float, default=-3.0)
-    p.add_argument("--theta-high", type=float, default=3.0)
-    p.add_argument("--x-dim", type=int, default=2)
-    p.add_argument("--sigma-x1", type=float, default=0.30)
+    p.add_argument(
+        "--theta-low",
+        type=float,
+        default=-3.0,
+        help="Lower bound of theta; samples are drawn uniformly on [theta-low, theta-high].",
+    )
+    p.add_argument(
+        "--theta-high",
+        type=float,
+        default=3.0,
+        help="Upper bound of theta (see --theta-low).",
+    )
+    p.add_argument("--x-dim", type=int, default=2, help="Observation dimension (length of x).")
+    p.add_argument(
+        "--sigma-x1",
+        type=float,
+        default=0.30,
+        help="Baseline std of observation noise along axis 1 (Gaussian / GMM branches).",
+    )
     p.add_argument("--sigma-x2", type=float, default=0.30, help="Default matches --sigma-x1 so baseline noise is constant across dims.")
-    p.add_argument("--rho", type=float, default=0.15)
-    p.add_argument("--cov-theta-amp1", type=float, default=0.35)
-    p.add_argument("--cov-theta-amp2", type=float, default=0.30)
-    p.add_argument("--cov-theta-amp-rho", type=float, default=0.30)
-    p.add_argument("--cov-theta-freq1", type=float, default=0.90)
-    p.add_argument("--cov-theta-freq2", type=float, default=0.75)
-    p.add_argument("--cov-theta-freq-rho", type=float, default=1.10)
-    p.add_argument("--cov-theta-phase1", type=float, default=0.20)
-    p.add_argument("--cov-theta-phase2", type=float, default=-0.35)
-    p.add_argument("--cov-theta-phase-rho", type=float, default=0.40)
-    p.add_argument("--rho-clip", type=float, default=0.85)
-    p.add_argument("--gmm-sep-scale", type=float, default=1.10)
-    p.add_argument("--gmm-sep-freq", type=float, default=0.85)
-    p.add_argument("--gmm-sep-phase", type=float, default=0.35)
-    p.add_argument("--gmm-mix-logit-scale", type=float, default=1.40)
-    p.add_argument("--gmm-mix-bias", type=float, default=0.00)
-    p.add_argument("--gmm-mix-freq", type=float, default=0.95)
-    p.add_argument("--gmm-mix-phase", type=float, default=-0.20)
+    p.add_argument(
+        "--rho",
+        type=float,
+        default=0.15,
+        help="Base correlation between noise components before theta-dependent modulation (clipped by --rho-clip).",
+    )
+    p.add_argument(
+        "--cov-theta-amp1",
+        type=float,
+        default=0.35,
+        help="Gaussian family: amplitude of theta-driven variation for variance term 1.",
+    )
+    p.add_argument(
+        "--cov-theta-amp2",
+        type=float,
+        default=0.30,
+        help="Gaussian family: amplitude of theta-driven variation for variance term 2.",
+    )
+    p.add_argument(
+        "--cov-theta-amp-rho",
+        type=float,
+        default=0.30,
+        help="Gaussian family: amplitude of theta-driven variation for correlation term.",
+    )
+    p.add_argument(
+        "--cov-theta-freq1",
+        type=float,
+        default=0.90,
+        help="Gaussian family: angular frequency for theta modulation of variance 1.",
+    )
+    p.add_argument(
+        "--cov-theta-freq2",
+        type=float,
+        default=0.75,
+        help="Gaussian family: angular frequency for theta modulation of variance 2.",
+    )
+    p.add_argument(
+        "--cov-theta-freq-rho",
+        type=float,
+        default=1.10,
+        help="Gaussian family: angular frequency for theta modulation of correlation.",
+    )
+    p.add_argument(
+        "--cov-theta-phase1",
+        type=float,
+        default=0.20,
+        help="Gaussian family: phase offset for variance 1 modulation.",
+    )
+    p.add_argument(
+        "--cov-theta-phase2",
+        type=float,
+        default=-0.35,
+        help="Gaussian family: phase offset for variance 2 modulation.",
+    )
+    p.add_argument(
+        "--cov-theta-phase-rho",
+        type=float,
+        default=0.40,
+        help="Gaussian family: phase offset for correlation modulation.",
+    )
+    p.add_argument(
+        "--rho-clip",
+        type=float,
+        default=0.85,
+        help="Clamp |rho(theta)| at this value after theta-dependent terms (Gaussian and GMM).",
+    )
+    p.add_argument(
+        "--gmm-sep-scale",
+        type=float,
+        default=1.10,
+        help="GMM: scale of theta-dependent separation between mixture component means.",
+    )
+    p.add_argument(
+        "--gmm-sep-freq",
+        type=float,
+        default=0.85,
+        help="GMM: angular frequency for separation-vs-theta.",
+    )
+    p.add_argument(
+        "--gmm-sep-phase",
+        type=float,
+        default=0.35,
+        help="GMM: phase for separation-vs-theta.",
+    )
+    p.add_argument(
+        "--gmm-mix-logit-scale",
+        type=float,
+        default=1.40,
+        help="GMM: scale of theta-dependent mixture logit modulation.",
+    )
+    p.add_argument(
+        "--gmm-mix-bias",
+        type=float,
+        default=0.00,
+        help="GMM: bias term in mixture logit.",
+    )
+    p.add_argument(
+        "--gmm-mix-freq",
+        type=float,
+        default=0.95,
+        help="GMM: angular frequency for mixture logit-vs-theta.",
+    )
+    p.add_argument(
+        "--gmm-mix-phase",
+        type=float,
+        default=-0.20,
+        help="GMM: phase for mixture logit-vs-theta.",
+    )
     p.add_argument(
         "--sigma-piecewise-low",
         type=float,
-        default=0.30,
+        default=0.5,
         help="Piecewise scalar std for cos_sin/linear piecewise_noise when theta is on the low-noise side.",
     )
     p.add_argument(
         "--sigma-piecewise-high",
         type=float,
-        default=0.90,
+        default=4.0,
         help="Piecewise scalar std for cos_sin/linear piecewise_noise when theta is on the high-noise side.",
     )
     p.add_argument(
@@ -99,7 +214,17 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
         dest="theta_zero_to_low",
         help="For cos_sin/linear piecewise_noise: put theta=0 in the high-noise side (theta<0 low, theta>=0 high).",
     )
-    p.add_argument("--n-total", type=int, default=3000)
+    p.add_argument(
+        "--n-total",
+        "--num-samples",
+        type=int,
+        default=3000,
+        metavar="N",
+        help=(
+            "Total number of data points: joint (theta, x) samples drawn before the train/eval split. "
+            "Same as --num-samples."
+        ),
+    )
     p.add_argument(
         "--train-frac",
         type=float,
@@ -125,6 +250,26 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--score-hidden-dim", type=int, default=128)
     p.add_argument("--score-depth", type=int, default=3)
     p.add_argument(
+        "--score-arch",
+        type=str,
+        default="film",
+        choices=["mlp", "film"],
+        help=(
+            "Posterior DSM architecture: mlp concatenates [theta, x, sigma]; "
+            "film applies FiLM modulation from (x, sigma_feat) on a theta_tilde trunk. Default: film."
+        ),
+    )
+    p.add_argument(
+        "--prior-score-arch",
+        type=str,
+        default="film",
+        choices=["mlp", "film"],
+        help=(
+            "Prior DSM architecture: mlp concatenates [theta, sigma]; "
+            "film applies FiLM modulation from sigma_feat on a theta_tilde trunk. Default: film."
+        ),
+    )
+    p.add_argument(
         "--score-data-mode",
         type=str,
         default="full",
@@ -139,7 +284,7 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         help="Data split used for score-based Fisher evaluation after training.",
     )
     p.add_argument("--score-val-source", type=str, default="train_split", choices=["train_split", "eval_set"])
-    p.add_argument("--score-early-patience", type=int, default=2000)
+    p.add_argument("--score-early-patience", type=int, default=1500)
     p.add_argument("--score-early-min-delta", type=float, default=1e-4)
     p.add_argument(
         "--score-early-ema-alpha",
@@ -160,14 +305,14 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--score-sigma-min-alpha",
         type=float,
-        default=0.05,
-        help="With --score-sigma-scale-mode theta_std: sigma_min = this × std(theta on score fit). Default 0.05 (5%%).",
+        default=0.01,
+        help="With --score-sigma-scale-mode theta_std: sigma_min = this × std(theta on score fit). Default 0.01 (1%%).",
     )
     p.add_argument(
         "--score-sigma-max-alpha",
         type=float,
-        default=1.0,
-        help="With --score-sigma-scale-mode theta_std: sigma_max = this × std(theta on score fit). Default 1.0 (100%%).",
+        default=0.25,
+        help="With --score-sigma-scale-mode theta_std: sigma_max = this × std(theta on score fit). Default 0.25 (25%%).",
     )
     p.add_argument("--score-eval-sigmas", type=int, default=12)
     p.add_argument("--score-proxy-l2", type=float, default=1e-3)
@@ -305,6 +450,16 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         action="store_true",
         default=False,
         help="Save intermediate matrices G, C, and DeltaL to h-matrix npz output.",
+    )
+    p.add_argument(
+        "--skip-shared-fisher-gt-compare",
+        action="store_true",
+        default=False,
+        help=(
+            "DSM only: after training score and prior, estimate and save the H-matrix only; "
+            "skip binned Fisher evaluation, decoder training, analytic/MC GT Fisher, and "
+            "Fisher-vs-GT comparison artifacts."
+        ),
     )
 
 

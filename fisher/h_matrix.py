@@ -7,7 +7,14 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from fisher.models import ConditionalScore1D, ConditionalThetaFlowVelocity, PriorScore1D, PriorThetaFlowVelocity
+from fisher.models import (
+    ConditionalScore1D,
+    ConditionalScore1DFiLMPerLayer,
+    ConditionalThetaFlowVelocity,
+    PriorScore1D,
+    PriorScore1DFiLMPerLayer,
+    PriorThetaFlowVelocity,
+)
 
 
 @dataclass
@@ -35,8 +42,8 @@ class HMatrixEstimator:
     def __init__(
         self,
         *,
-        model_post: ConditionalScore1D | ConditionalThetaFlowVelocity,
-        model_prior: PriorScore1D | PriorThetaFlowVelocity,
+        model_post: ConditionalScore1D | ConditionalScore1DFiLMPerLayer | ConditionalThetaFlowVelocity,
+        model_prior: PriorScore1D | PriorScore1DFiLMPerLayer | PriorThetaFlowVelocity,
         sigma_eval: float,
         device: torch.device,
         pair_batch_size: int = 65536,

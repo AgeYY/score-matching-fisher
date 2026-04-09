@@ -11,7 +11,13 @@ from fisher.data import (
     ToyCosSinPiecewiseNoiseDataset,
     ToyLinearPiecewiseNoiseDataset,
 )
-from fisher.models import ConditionalScore1D, LocalDecoderLogit, PriorScore1D
+from fisher.models import (
+    ConditionalScore1D,
+    ConditionalScore1DFiLMPerLayer,
+    LocalDecoderLogit,
+    PriorScore1D,
+    PriorScore1DFiLMPerLayer,
+)
 
 
 def parse_sigma_alpha_list(items: list[float]) -> np.ndarray:
@@ -187,7 +193,7 @@ class ScoreEvalResult:
 
 
 def evaluate_score_fisher(
-    model: ConditionalScore1D,
+    model: ConditionalScore1D | ConditionalScore1DFiLMPerLayer,
     theta_eval: np.ndarray,
     x_eval: np.ndarray,
     dataset: ToyConditionalGaussianDataset
@@ -288,8 +294,8 @@ class ScoreEvalWithPriorResult:
 
 
 def evaluate_score_fisher_with_prior(
-    model_post: ConditionalScore1D,
-    model_prior: PriorScore1D,
+    model_post: ConditionalScore1D | ConditionalScore1DFiLMPerLayer,
+    model_prior: PriorScore1D | PriorScore1DFiLMPerLayer,
     theta_eval: np.ndarray,
     x_eval: np.ndarray,
     dataset: ToyConditionalGaussianDataset

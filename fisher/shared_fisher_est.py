@@ -22,9 +22,11 @@ from fisher.evaluation import evaluate_score_fisher, evaluate_score_fisher_with_
 from fisher.h_matrix import HMatrixEstimator, HMatrixResult
 from fisher.models import (
     ConditionalScore1D,
+    ConditionalScore1DFiLMPerLayer,
     ConditionalThetaFlowVelocity,
     LocalDecoderLogit,
     PriorScore1D,
+    PriorScore1DFiLMPerLayer,
     PriorThetaFlowVelocity,
 )
 from fisher.shared_dataset_io import SHARED_DATASET_META_KEYS, meta_dict_from_args
@@ -44,6 +46,39 @@ def require_device(name: str) -> torch.device:
     if name == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but unavailable. Per repo policy, do not fallback silently.")
     return torch.device(name)
+
+
+def build_posterior_score_model(
+    args: Any, device: torch.device
+) -> ConditionalScore1D | ConditionalScore1DFiLMPerLayer:
+    """Instantiate posterior DSM (theta score) as MLP or FiLM trunk."""
+    arch = str(getattr(args, "score_arch", "film")).lower()
+    common = dict(
+        x_dim=int(args.x_dim),
+        hidden_dim=int(args.score_hidden_dim),
+        depth=int(args.score_depth),
+        use_log_sigma=(args.score_noise_mode == "continuous"),
+    )
+    if arch == "film":
+        return ConditionalScore1DFiLMPerLayer(**common).to(device)
+    if arch == "mlp":
+        return ConditionalScore1D(**common).to(device)
+    raise ValueError(f"Unknown --score-arch: {arch!r} (expected 'mlp' or 'film').")
+
+
+def build_prior_score_model(args: Any, device: torch.device) -> PriorScore1D | PriorScore1DFiLMPerLayer:
+    """Instantiate prior DSM as MLP or FiLM trunk."""
+    arch = str(getattr(args, "prior_score_arch", "film")).lower()
+    common = dict(
+        hidden_dim=int(getattr(args, "prior_hidden_dim", 128)),
+        depth=int(getattr(args, "prior_depth", 3)),
+        use_log_sigma=(args.score_noise_mode == "continuous"),
+    )
+    if arch == "film":
+        return PriorScore1DFiLMPerLayer(**common).to(device)
+    if arch == "mlp":
+        return PriorScore1D(**common).to(device)
+    raise ValueError(f"Unknown --prior-score-arch: {arch!r} (expected 'mlp' or 'film').")
 
 
 def analytic_fisher_curve(
@@ -90,6 +125,78 @@ def compute_metrics(pred: np.ndarray, gt: np.ndarray, valid: np.ndarray) -> dict
     mae = float(np.mean(np.abs(a - b)))
     corr = float(np.corrcoef(a, b)[0, 1]) if a.size >= 2 else float("nan")
     return {"n_valid": float(a.size), "rmse": rmse, "mae": mae, "corr": corr}
+
+
+def _save_h_matrix_dsm_artifacts(
+    args: Any,
+    h_result: HMatrixResult,
+    suffix: str,
+) -> tuple[str, str, str, str]:
+    """Write h_matrix_results*.npz, summary txt, symmetric heatmap, optional DeltaL heatmap."""
+    h_npz_path = os.path.join(args.output_dir, f"h_matrix_results{suffix}.npz")
+    h_payload: dict[str, Any] = {
+        "theta_used": h_result.theta_used,
+        "theta_sorted": h_result.theta_sorted,
+        "perm": h_result.perm.astype(np.int64),
+        "inv_perm": h_result.inv_perm.astype(np.int64),
+        "h_directed": h_result.h_directed,
+        "h_sym": h_result.h_sym,
+        "sigma_eval": np.asarray([h_result.sigma_eval], dtype=np.float64),
+        "h_field_method": np.asarray([h_result.field_method], dtype=object),
+        "h_eval_scalar_name": np.asarray([h_result.eval_scalar_name], dtype=object),
+        "n_samples": np.asarray([h_result.theta_used.size], dtype=np.int32),
+        "order_mode": np.asarray([h_result.order_mode], dtype=object),
+        "delta_diag_max_abs": np.asarray([h_result.delta_diag_max_abs], dtype=np.float64),
+        "h_sym_max_asym_abs": np.asarray([h_result.h_sym_max_asym_abs], dtype=np.float64),
+    }
+    if bool(getattr(args, "h_save_intermediates", False)):
+        h_payload["g_matrix"] = h_result.g_matrix
+        h_payload["c_matrix"] = h_result.c_matrix
+        h_payload["delta_l_matrix"] = h_result.delta_l_matrix
+    np.savez(h_npz_path, **h_payload)
+
+    h_summary_path = os.path.join(args.output_dir, f"h_matrix_summary{suffix}.txt")
+    with open(h_summary_path, "w", encoding="utf-8") as hf:
+        hf.write("H-matrix estimation summary\n")
+        hf.write(f"dataset_family: {args.dataset_family}\n")
+        hf.write(f"field_method: {h_result.field_method}\n")
+        hf.write(f"eval_scalar_name: {h_result.eval_scalar_name}\n")
+        hf.write(f"eval_scalar_value: {h_result.sigma_eval}\n")
+        hf.write(f"n_samples: {h_result.theta_used.size}\n")
+        hf.write(f"order_mode: {h_result.order_mode}\n")
+        hf.write(f"h_shape: {h_result.h_sym.shape}\n")
+        hf.write(f"h_sym_min: {float(np.min(h_result.h_sym))}\n")
+        hf.write(f"h_sym_max: {float(np.max(h_result.h_sym))}\n")
+        hf.write(f"h_sym_diag_max_abs: {float(np.max(np.abs(np.diag(h_result.h_sym))))}\n")
+        hf.write(f"delta_diag_max_abs: {h_result.delta_diag_max_abs}\n")
+        hf.write(f"h_sym_max_asym_abs: {h_result.h_sym_max_asym_abs}\n")
+        hf.write(f"h_save_intermediates: {bool(getattr(args, 'h_save_intermediates', False))}\n")
+
+    h_fig_path = os.path.join(args.output_dir, f"h_matrix_sym_heatmap{suffix}.png")
+    plt.figure(figsize=(6.2, 5.6))
+    im = plt.imshow(h_result.h_sym, aspect="auto", origin="lower")
+    plt.colorbar(im, fraction=0.046, pad=0.04, label=r"$H^{sym}_{ij}$")
+    plt.xlabel("j")
+    plt.ylabel("i")
+    plt.title("Symmetric H-matrix heatmap")
+    plt.tight_layout()
+    plt.savefig(h_fig_path, dpi=180)
+    plt.close()
+
+    h_delta_fig_path = ""
+    if bool(getattr(args, "h_save_intermediates", False)):
+        h_delta_fig_path = os.path.join(args.output_dir, f"delta_l_heatmap{suffix}.png")
+        plt.figure(figsize=(6.2, 5.6))
+        im = plt.imshow(h_result.delta_l_matrix, aspect="auto", origin="lower")
+        plt.colorbar(im, fraction=0.046, pad=0.04, label=r"$\Delta L_{ij}$")
+        plt.xlabel("j")
+        plt.ylabel("i")
+        plt.title("Directed log-ratio heatmap")
+        plt.tight_layout()
+        plt.savefig(h_delta_fig_path, dpi=180)
+        plt.close()
+
+    return h_npz_path, h_summary_path, h_fig_path, h_delta_fig_path
 
 
 def posterior_proxy_sigma(theta: np.ndarray, x: np.ndarray, l2: float) -> float:
@@ -455,8 +562,8 @@ def build_dataset_from_meta(
             theta_low=float(meta["theta_low"]),
             theta_high=float(meta["theta_high"]),
             x_dim=int(meta["x_dim"]),
-            sigma_piecewise_low=float(meta.get("sigma_piecewise_low", 0.30)),
-            sigma_piecewise_high=float(meta.get("sigma_piecewise_high", 0.90)),
+            sigma_piecewise_low=float(meta.get("sigma_piecewise_low", 0.5)),
+            sigma_piecewise_high=float(meta.get("sigma_piecewise_high", 4.0)),
             theta_zero_to_low=bool(meta.get("theta_zero_to_low", True)),
             seed=seed,
         )
@@ -466,8 +573,8 @@ def build_dataset_from_meta(
             theta_high=float(meta["theta_high"]),
             x_dim=int(meta["x_dim"]),
             linear_k=float(meta.get("linear_k", 1.0)),
-            sigma_piecewise_low=float(meta.get("sigma_piecewise_low", 0.30)),
-            sigma_piecewise_high=float(meta.get("sigma_piecewise_high", 0.90)),
+            sigma_piecewise_low=float(meta.get("sigma_piecewise_low", 0.5)),
+            sigma_piecewise_high=float(meta.get("sigma_piecewise_high", 4.0)),
             theta_zero_to_low=bool(meta.get("theta_zero_to_low", True)),
             seed=seed,
         )
@@ -523,6 +630,14 @@ def validate_estimation_args(args: Any) -> None:
         raise ValueError("--score-early-ema-alpha must be in (0, 1].")
     if args.score_sigma_min_alpha <= 0.0 or args.score_sigma_max_alpha <= 0.0:
         raise ValueError("--score-sigma-min-alpha and --score-sigma-max-alpha must be positive.")
+    if float(args.score_sigma_min_alpha) > float(args.score_sigma_max_alpha):
+        raise ValueError("--score-sigma-min-alpha must be <= --score-sigma-max-alpha.")
+    _sa = str(getattr(args, "score_arch", "film")).lower()
+    _pa = str(getattr(args, "prior_score_arch", "film")).lower()
+    if _sa not in ("mlp", "film"):
+        raise ValueError("--score-arch must be one of {'mlp','film'}.")
+    if _pa not in ("mlp", "film"):
+        raise ValueError("--prior-score-arch must be one of {'mlp','film'}.")
     if args.score_proxy_min_mult <= 0.0 or args.score_proxy_max_mult <= 0.0:
         raise ValueError("--score-proxy-min-mult and --score-proxy-max-mult must be positive.")
     if args.score_proxy_min_mult > args.score_proxy_max_mult:
@@ -569,6 +684,11 @@ def validate_estimation_args(args: Any) -> None:
         raise ValueError("--flow-eval-t must be in [0, 1].")
     if bool(getattr(args, "compute_h_matrix", False)) and not bool(getattr(args, "prior_enable", True)):
         raise ValueError("--compute-h-matrix requires prior score; do not use --no-prior-score.")
+    if bool(getattr(args, "skip_shared_fisher_gt_compare", False)):
+        if not bool(getattr(args, "compute_h_matrix", False)):
+            raise ValueError("--skip-shared-fisher-gt-compare requires --compute-h-matrix.")
+        if not bool(getattr(args, "prior_enable", True)):
+            raise ValueError("--skip-shared-fisher-gt-compare requires prior score; do not use --no-prior-score.")
 
 
 def merge_meta_into_args(meta: dict[str, Any], est_ns: Any) -> Any:
@@ -821,55 +941,9 @@ def run_shared_fisher_estimation(
 
         suffix = "_non_gauss" if args.dataset_family == "gmm_non_gauss" else "_theta_cov"
         if h_result is not None:
-            h_npz_path = os.path.join(args.output_dir, f"h_matrix_results{suffix}.npz")
-            h_payload: dict[str, Any] = {
-                "theta_used": h_result.theta_used,
-                "theta_sorted": h_result.theta_sorted,
-                "perm": h_result.perm.astype(np.int64),
-                "inv_perm": h_result.inv_perm.astype(np.int64),
-                "h_directed": h_result.h_directed,
-                "h_sym": h_result.h_sym,
-                "sigma_eval": np.asarray([h_result.sigma_eval], dtype=np.float64),
-                "h_field_method": np.asarray([h_result.field_method], dtype=object),
-                "h_eval_scalar_name": np.asarray([h_result.eval_scalar_name], dtype=object),
-                "n_samples": np.asarray([h_result.theta_used.size], dtype=np.int32),
-                "order_mode": np.asarray([h_result.order_mode], dtype=object),
-                "delta_diag_max_abs": np.asarray([h_result.delta_diag_max_abs], dtype=np.float64),
-                "h_sym_max_asym_abs": np.asarray([h_result.h_sym_max_asym_abs], dtype=np.float64),
-            }
-            if bool(getattr(args, "h_save_intermediates", False)):
-                h_payload["g_matrix"] = h_result.g_matrix
-                h_payload["c_matrix"] = h_result.c_matrix
-                h_payload["delta_l_matrix"] = h_result.delta_l_matrix
-            np.savez(h_npz_path, **h_payload)
-
-            h_summary_path = os.path.join(args.output_dir, f"h_matrix_summary{suffix}.txt")
-            with open(h_summary_path, "w", encoding="utf-8") as hf:
-                hf.write("H-matrix estimation summary\n")
-                hf.write(f"dataset_family: {args.dataset_family}\n")
-                hf.write(f"field_method: {h_result.field_method}\n")
-                hf.write(f"eval_scalar_name: {h_result.eval_scalar_name}\n")
-                hf.write(f"eval_scalar_value: {h_result.sigma_eval}\n")
-                hf.write(f"n_samples: {h_result.theta_used.size}\n")
-                hf.write(f"order_mode: {h_result.order_mode}\n")
-                hf.write(f"h_shape: {h_result.h_sym.shape}\n")
-                hf.write(f"h_sym_min: {float(np.min(h_result.h_sym))}\n")
-                hf.write(f"h_sym_max: {float(np.max(h_result.h_sym))}\n")
-                hf.write(f"h_sym_diag_max_abs: {float(np.max(np.abs(np.diag(h_result.h_sym))))}\n")
-                hf.write(f"delta_diag_max_abs: {h_result.delta_diag_max_abs}\n")
-                hf.write(f"h_sym_max_asym_abs: {h_result.h_sym_max_asym_abs}\n")
-                hf.write(f"h_save_intermediates: {bool(getattr(args, 'h_save_intermediates', False))}\n")
-
-            h_fig_path = os.path.join(args.output_dir, f"h_matrix_sym_heatmap{suffix}.png")
-            plt.figure(figsize=(6.2, 5.6))
-            im = plt.imshow(h_result.h_sym, aspect="auto", origin="lower")
-            plt.colorbar(im, fraction=0.046, pad=0.04, label=r"$H^{sym}_{ij}$")
-            plt.xlabel("j")
-            plt.ylabel("i")
-            plt.title("Symmetric H-matrix heatmap")
-            plt.tight_layout()
-            plt.savefig(h_fig_path, dpi=180)
-            plt.close()
+            h_npz_path, h_summary_path, h_fig_path, h_delta_fig_path = _save_h_matrix_dsm_artifacts(
+                args, h_result, suffix
+            )
             print("[summary] flow mode completed (H-matrix only path).")
             print("Saved artifacts:")
             print(f"  - {post_loss_fig}")
@@ -877,6 +951,8 @@ def run_shared_fisher_estimation(
             print(f"  - {h_npz_path}")
             print(f"  - {h_summary_path}")
             print(f"  - {h_fig_path}")
+            if h_delta_fig_path:
+                print(f"  - {h_delta_fig_path}")
             return
 
         raise RuntimeError("theta_field_method=flow requires --compute-h-matrix to produce output artifacts.")
@@ -908,12 +984,13 @@ def run_shared_fisher_estimation(
         sigma_base = args.score_fixed_sigma
         print(f"[sigma_scale] mode=fixed sigma={args.score_fixed_sigma:.6f} theta_std={theta_std:.6f}")
 
-    score_model = ConditionalScore1D(
-        x_dim=args.x_dim,
-        hidden_dim=args.score_hidden_dim,
-        depth=args.score_depth,
-        use_log_sigma=(args.score_noise_mode == "continuous"),
-    ).to(device)
+    score_model = build_posterior_score_model(args, device)
+    print(
+        "[score_model] "
+        f"arch={str(getattr(args, 'score_arch', 'film')).lower()} "
+        f"hidden_dim={int(args.score_hidden_dim)} depth={int(args.score_depth)} "
+        f"noise_mode={args.score_noise_mode}"
+    )
     if args.score_noise_mode == "continuous":
         sigma_values = geometric_sigma_schedule(
             sigma_min=float(sigma_min),
@@ -1047,16 +1124,17 @@ def run_shared_fisher_estimation(
     prior_fig_path = ""
     score_eval_wp: Any | None = None
     score_eval: Any | None = None
-    prior_model: PriorScore1D | None = None
+    prior_model: PriorScore1D | PriorScore1DFiLMPerLayer | None = None
     h_result: HMatrixResult | None = None
     h_sigma_eval = float("nan")
 
     if prior_enable:
-        prior_model = PriorScore1D(
-            hidden_dim=int(getattr(args, "prior_hidden_dim", 128)),
-            depth=int(getattr(args, "prior_depth", 3)),
-            use_log_sigma=(args.score_noise_mode == "continuous"),
-        ).to(device)
+        prior_model = build_prior_score_model(args, device)
+        print(
+            "[prior_model] "
+            f"arch={str(getattr(args, 'prior_score_arch', 'film')).lower()} "
+            f"hidden_dim={int(getattr(args, 'prior_hidden_dim', 128))} depth={int(getattr(args, 'prior_depth', 3))}"
+        )
         print(
             "[prior_train] "
             f"fit={theta_score_fit.shape[0]} val={theta_score_val.shape[0]} "
@@ -1143,6 +1221,53 @@ def run_shared_fisher_estimation(
         plt.savefig(prior_fig_path, dpi=180)
         plt.close()
 
+        if bool(getattr(args, "skip_shared_fisher_gt_compare", False)):
+            if not bool(getattr(args, "compute_h_matrix", False)):
+                raise RuntimeError("skip_shared_fisher_gt_compare requires compute_h_matrix")
+            suffix = "_non_gauss" if args.dataset_family == "gmm_non_gauss" else "_theta_cov"
+            sigma_min_eval = float(np.min(np.asarray(sigma_values, dtype=np.float64)))
+            h_sigma_eval = float(args.h_sigma_eval) if float(args.h_sigma_eval) > 0.0 else sigma_min_eval
+            print(
+                "[h_matrix] "
+                f"enabled=True sigma_eval={h_sigma_eval:.6f} "
+                f"restore_original_order={bool(getattr(args, 'h_restore_original_order', False))} "
+                f"pair_batch_size={int(getattr(args, 'h_batch_size', 65536))}"
+            )
+            h_estimator = HMatrixEstimator(
+                model_post=score_model,
+                model_prior=prior_model,
+                sigma_eval=h_sigma_eval,
+                device=device,
+                pair_batch_size=int(getattr(args, "h_batch_size", 65536)),
+            )
+            h_result_skip = h_estimator.run(
+                theta=theta_score_fisher_eval,
+                x=x_score_fisher_eval,
+                restore_original_order=bool(getattr(args, "h_restore_original_order", False)),
+            )
+            print(
+                "[h_matrix] "
+                f"done n={h_result_skip.theta_used.size} "
+                f"delta_diag_max_abs={h_result_skip.delta_diag_max_abs:.3e} "
+                f"h_sym_max_asym_abs={h_result_skip.h_sym_max_asym_abs:.3e}"
+            )
+            h_npz_path, h_summary_path, h_fig_path, h_delta_fig_path = _save_h_matrix_dsm_artifacts(
+                args, h_result_skip, suffix
+            )
+            print(
+                "[summary] DSM skip_shared_fisher_gt_compare: H-matrix only; "
+                "skipped Fisher curves, decoder training, and GT Fisher comparison artifacts."
+            )
+            print("Saved artifacts:")
+            print(f"  - {loss_fig_path}")
+            print(f"  - {prior_fig_path}")
+            print(f"  - {h_npz_path}")
+            print(f"  - {h_summary_path}")
+            print(f"  - {h_fig_path}")
+            if h_delta_fig_path:
+                print(f"  - {h_delta_fig_path}")
+            return
+
         score_eval_wp = evaluate_score_fisher_with_prior(
             model_post=score_model,
             model_prior=prior_model,
@@ -1159,6 +1284,10 @@ def run_shared_fisher_estimation(
         )
         centers = score_eval_wp.curves_combined.centers
     else:
+        if bool(getattr(args, "skip_shared_fisher_gt_compare", False)):
+            raise ValueError(
+                "--skip-shared-fisher-gt-compare requires prior score training (cannot estimate H without prior)."
+            )
         score_eval = evaluate_score_fisher(
             model=score_model,
             theta_eval=theta_score_fisher_eval,
@@ -1306,67 +1435,9 @@ def run_shared_fisher_estimation(
     h_fig_path = ""
     h_delta_fig_path = ""
     if h_result is not None:
-        h_npz_path = os.path.join(args.output_dir, f"h_matrix_results{suffix}.npz")
-        h_payload: dict[str, Any] = {
-            "theta_used": h_result.theta_used,
-            "theta_sorted": h_result.theta_sorted,
-            "perm": h_result.perm.astype(np.int64),
-            "inv_perm": h_result.inv_perm.astype(np.int64),
-            "h_directed": h_result.h_directed,
-            "h_sym": h_result.h_sym,
-            "sigma_eval": np.asarray([h_result.sigma_eval], dtype=np.float64),
-            "h_field_method": np.asarray([h_result.field_method], dtype=object),
-            "h_eval_scalar_name": np.asarray([h_result.eval_scalar_name], dtype=object),
-            "n_samples": np.asarray([h_result.theta_used.size], dtype=np.int32),
-            "order_mode": np.asarray([h_result.order_mode], dtype=object),
-            "delta_diag_max_abs": np.asarray([h_result.delta_diag_max_abs], dtype=np.float64),
-            "h_sym_max_asym_abs": np.asarray([h_result.h_sym_max_asym_abs], dtype=np.float64),
-        }
-        if bool(getattr(args, "h_save_intermediates", False)):
-            h_payload["g_matrix"] = h_result.g_matrix
-            h_payload["c_matrix"] = h_result.c_matrix
-            h_payload["delta_l_matrix"] = h_result.delta_l_matrix
-        np.savez(h_npz_path, **h_payload)
-
-        h_summary_path = os.path.join(args.output_dir, f"h_matrix_summary{suffix}.txt")
-        with open(h_summary_path, "w", encoding="utf-8") as hf:
-            hf.write("H-matrix estimation summary\n")
-            hf.write(f"dataset_family: {args.dataset_family}\n")
-            hf.write(f"field_method: {h_result.field_method}\n")
-            hf.write(f"eval_scalar_name: {h_result.eval_scalar_name}\n")
-            hf.write(f"eval_scalar_value: {h_result.sigma_eval}\n")
-            hf.write(f"n_samples: {h_result.theta_used.size}\n")
-            hf.write(f"order_mode: {h_result.order_mode}\n")
-            hf.write(f"h_shape: {h_result.h_sym.shape}\n")
-            hf.write(f"h_sym_min: {float(np.min(h_result.h_sym))}\n")
-            hf.write(f"h_sym_max: {float(np.max(h_result.h_sym))}\n")
-            hf.write(f"h_sym_diag_max_abs: {float(np.max(np.abs(np.diag(h_result.h_sym))))}\n")
-            hf.write(f"delta_diag_max_abs: {h_result.delta_diag_max_abs}\n")
-            hf.write(f"h_sym_max_asym_abs: {h_result.h_sym_max_asym_abs}\n")
-            hf.write(f"h_save_intermediates: {bool(getattr(args, 'h_save_intermediates', False))}\n")
-
-        h_fig_path = os.path.join(args.output_dir, f"h_matrix_sym_heatmap{suffix}.png")
-        plt.figure(figsize=(6.2, 5.6))
-        im = plt.imshow(h_result.h_sym, aspect="auto", origin="lower")
-        plt.colorbar(im, fraction=0.046, pad=0.04, label=r"$H^{sym}_{ij}$")
-        plt.xlabel("j")
-        plt.ylabel("i")
-        plt.title("Symmetric H-matrix heatmap")
-        plt.tight_layout()
-        plt.savefig(h_fig_path, dpi=180)
-        plt.close()
-
-        if bool(getattr(args, "h_save_intermediates", False)):
-            h_delta_fig_path = os.path.join(args.output_dir, f"delta_l_heatmap{suffix}.png")
-            plt.figure(figsize=(6.2, 5.6))
-            im = plt.imshow(h_result.delta_l_matrix, aspect="auto", origin="lower")
-            plt.colorbar(im, fraction=0.046, pad=0.04, label=r"$\Delta L_{ij}$")
-            plt.xlabel("j")
-            plt.ylabel("i")
-            plt.title("Directed log-ratio heatmap")
-            plt.tight_layout()
-            plt.savefig(h_delta_fig_path, dpi=180)
-            plt.close()
+        h_npz_path, h_summary_path, h_fig_path, h_delta_fig_path = _save_h_matrix_dsm_artifacts(
+            args, h_result, suffix
+        )
 
     fig_path = os.path.join(args.output_dir, f"fisher_curve_shared_dataset_vs_gt{suffix}.png")
     plt.figure(figsize=(9.0, 5.6))

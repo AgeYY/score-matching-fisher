@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
-"""Generate a shared (theta, x) dataset, save .npz, and write diagnostic figures (same dataset object)."""
+"""Generate a shared (theta, x) dataset, save .npz, and write diagnostic figures (same dataset object).
+
+Dataset CLI flags (including sample count --n-total / --num-samples) are defined in
+fisher.cli_shared_fisher.add_dataset_arguments; run this script with --help for the full list.
+"""
 
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 from pathlib import Path
@@ -13,14 +18,122 @@ if str(_repo_root) not in sys.path:
 
 import numpy as np
 
-from fisher.cli_shared_fisher import parse_dataset_only_args
+from global_setting import DATA_DIR
+from fisher.cli_shared_fisher import add_dataset_arguments
 from fisher.dataset_visualization import plot_joint_and_tuning, summarize_dataset
 from fisher.shared_dataset_io import meta_dict_from_args, save_shared_dataset_npz
 from fisher.shared_fisher_est import build_dataset_from_args, validate_dataset_sample_args
 
+_MAKE_DATASET_PARAMETER_REFERENCE = """
+Parameter reference (all available flags in this script):
+
+  Randomness / size / split:
+    --seed
+      RNG seed used for joint sampling and train/eval permutation. Default: 7.
+    --n-total, --num-samples
+      Number of joint (theta, x) samples before split. Default: 3000.
+    --train-frac
+      Fraction assigned to training; if < 1, a held-out eval split is created. Default: 1.0.
+
+  Core domain / shape:
+    --theta-low, --theta-high
+      Uniform theta sampling range [theta-low, theta-high]. Defaults: -3.0, 3.0.
+    --x-dim
+      Observation dimension. Default: 2.
+
+  Family selection:
+    --dataset-family
+      One of:
+      gaussian
+        Conditional Gaussian x|theta with theta-modulated covariance.
+      gmm_non_gauss
+        Theta-dependent two-component GMM (non-Gaussian conditional).
+      cos_sin_piecewise_noise
+        Cosine or von-Mises tuning means + piecewise noise std by theta sign.
+      linear_piecewise_noise
+        Linear tuning means + piecewise noise std by theta sign.
+      Default: gaussian.
+
+  Tuning-curve mean (used where applicable):
+    --tuning-curve-family
+      cosine or von_mises_raw. Default: cosine.
+    --vm-mu-amp, --vm-kappa, --vm-omega
+      Von-Mises parameters (used only for --tuning-curve-family von_mises_raw).
+      Defaults: 1.0, 1.0, 1.0.
+      Not used for --dataset-family linear_piecewise_noise, whose tuning curve is fixed linear
+      (controlled by --linear-k). Also not used for --dataset-family cos_sin_piecewise_noise.
+
+  Baseline covariance/noise (Gaussian and GMM families):
+    --sigma-x1, --sigma-x2
+      Baseline per-axis observation std. Defaults: 0.30, 0.30.
+    --rho
+      Baseline correlation before theta modulation. Default: 0.15.
+    --rho-clip
+      Clamp on |rho(theta)| after modulation for numerical stability. Default: 0.85.
+
+  Theta-modulated covariance (gaussian family):
+    --cov-theta-amp1, --cov-theta-amp2, --cov-theta-amp-rho
+      Modulation amplitudes for variance1, variance2, and correlation.
+      Defaults: 0.35, 0.30, 0.30.
+    --cov-theta-freq1, --cov-theta-freq2, --cov-theta-freq-rho
+      Modulation angular frequencies. Defaults: 0.90, 0.75, 1.10.
+    --cov-theta-phase1, --cov-theta-phase2, --cov-theta-phase-rho
+      Modulation phase offsets. Defaults: 0.20, -0.35, 0.40.
+
+  Mixture controls (gmm_non_gauss family):
+    --gmm-sep-scale, --gmm-sep-freq, --gmm-sep-phase
+      Theta-dependent component-mean separation controls.
+      Defaults: 1.10, 0.85, 0.35.
+    --gmm-mix-logit-scale, --gmm-mix-bias, --gmm-mix-freq, --gmm-mix-phase
+      Theta-dependent mixture weight/logit controls.
+      Defaults: 1.40, 0.00, 0.95, -0.20.
+
+  Piecewise noise controls (cos_sin_piecewise_noise / linear_piecewise_noise):
+    --sigma-piecewise-low, --sigma-piecewise-high
+      Observation std on low-noise vs high-noise side of theta split.
+      Defaults: 0.5, 4.0.
+    --theta-zero-to-low / --no-theta-zero-to-low
+      Whether theta=0 belongs to low-noise side or high-noise side.
+      Default behavior: --theta-zero-to-low (True).
+    --linear-k
+      Linear slope parameter for linear_piecewise_noise mean construction. Default: 1.0.
+
+  Output:
+    --output-npz
+      Output archive path containing all/eval/train arrays and meta.
+      Default: DATA_DIR/shared_fisher_dataset.npz (resolved from global_setting.DATA_DIR).
+
+Notes:
+  - Flags that are not relevant to the selected --dataset-family are accepted but ignored.
+  - Saved meta stores the effective flag values for reproducibility.
+"""
+
+def parse_make_dataset_args(argv: list[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description=(
+            "Sample a synthetic conditional dataset (theta, x), save a shared .npz for Fisher/score "
+            "pipelines, and emit joint scatter + tuning-curve figures. "
+            "Set the number of samples with --n-total / --num-samples. "
+            "All sampling hyperparameters are recorded in the NPZ meta. "
+            "Run with --help to view per-argument defaults."
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    add_dataset_arguments(p)
+    p.add_argument(
+        "--output-npz",
+        type=str,
+        default=str(Path(DATA_DIR) / "shared_fisher_dataset.npz"),
+        help=(
+            "Path for the shared dataset archive (theta_all, x_all, train/eval indices, meta). "
+            "Prefer a path under your DATAROOT data directory."
+        ),
+    )
+    return p.parse_args(argv)
+
 
 def main() -> None:
-    args = parse_dataset_only_args()
+    args = parse_make_dataset_args()
     validate_dataset_sample_args(args)
     os.makedirs(os.path.dirname(os.path.abspath(args.output_npz)) or ".", exist_ok=True)
 

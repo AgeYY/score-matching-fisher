@@ -41,6 +41,68 @@ class ConditionalScore1D(nn.Module):
         return self.forward(theta, x, sigma)
 
 
+class ConditionalScore1DFiLMPerLayer(nn.Module):
+    """Posterior DSM score s(theta_tilde, x, sigma) with per-layer FiLM from (x, sigma_feat).
+
+    The main stream operates on scalar theta_tilde; gamma/beta are predicted from
+    concatenated observation x and sigma (log-sigma when ``use_log_sigma``).
+    """
+
+    def __init__(
+        self,
+        x_dim: int = 2,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        use_log_sigma: bool = False,
+    ) -> None:
+        super().__init__()
+        if x_dim < 2:
+            raise ValueError("x_dim must be >= 2.")
+        self.x_dim = int(x_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.depth = int(depth)
+        self.use_log_sigma = bool(use_log_sigma)
+        cond_dim = int(x_dim) + 1  # x, sigma_feat
+        self.in_proj = nn.Linear(1, int(hidden_dim))
+        self.blocks = nn.ModuleList()
+        for _ in range(int(depth)):
+            self.blocks.append(
+                nn.ModuleDict(
+                    {
+                        "lin": nn.Linear(int(hidden_dim), int(hidden_dim)),
+                        "gamma": nn.Linear(cond_dim, int(hidden_dim)),
+                        "beta": nn.Linear(cond_dim, int(hidden_dim)),
+                    }
+                )
+            )
+        self.out = nn.Linear(int(hidden_dim), 1)
+
+    def _sigma_feat(self, sigma: torch.Tensor) -> torch.Tensor:
+        if sigma.ndim == 1:
+            sigma = sigma.unsqueeze(-1)
+        return torch.log(torch.clamp(sigma, min=1e-8)) if self.use_log_sigma else sigma
+
+    def forward(self, theta_tilde: torch.Tensor, x: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+        if theta_tilde.ndim == 1:
+            theta_tilde = theta_tilde.unsqueeze(-1)
+        sigma_feat = self._sigma_feat(sigma)
+        cond = torch.cat([x, sigma_feat], dim=-1)
+        h = torch.nn.functional.silu(self.in_proj(theta_tilde))
+        for blk in self.blocks:
+            h = blk["lin"](h)
+            gamma = blk["gamma"](cond)
+            beta = blk["beta"](cond)
+            h = gamma * h + beta
+            h = torch.nn.functional.silu(h)
+        return self.out(h)
+
+    @torch.no_grad()
+    def predict_score(self, theta: torch.Tensor, x: torch.Tensor, sigma_eval: float) -> torch.Tensor:
+        self.eval()
+        sigma = torch.full((theta.shape[0], 1), sigma_eval, device=theta.device)
+        return self.forward(theta, x, sigma)
+
+
 class ConditionalThetaFlowVelocity(nn.Module):
     """Conditional theta-velocity model v(theta_t, x, t) with scalar output."""
 
@@ -430,6 +492,59 @@ class PriorScore1D(nn.Module):
         sigma_feat = torch.log(torch.clamp(sigma, min=1e-8)) if self.use_log_sigma else sigma
         feats = torch.cat([theta_tilde, sigma_feat], dim=-1)
         return self.net(feats)
+
+    @torch.no_grad()
+    def predict_score(self, theta: torch.Tensor, sigma_eval: float) -> torch.Tensor:
+        self.eval()
+        sigma = torch.full((theta.shape[0], 1), sigma_eval, device=theta.device)
+        return self.forward(theta, sigma)
+
+
+class PriorScore1DFiLMPerLayer(nn.Module):
+    """Prior DSM score s(theta_tilde, sigma) with per-layer FiLM from sigma (or log-sigma)."""
+
+    def __init__(
+        self,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        use_log_sigma: bool = False,
+    ) -> None:
+        super().__init__()
+        self.hidden_dim = int(hidden_dim)
+        self.depth = int(depth)
+        self.use_log_sigma = bool(use_log_sigma)
+        cond_dim = 1
+        self.in_proj = nn.Linear(1, int(hidden_dim))
+        self.blocks = nn.ModuleList()
+        for _ in range(int(depth)):
+            self.blocks.append(
+                nn.ModuleDict(
+                    {
+                        "lin": nn.Linear(int(hidden_dim), int(hidden_dim)),
+                        "gamma": nn.Linear(cond_dim, int(hidden_dim)),
+                        "beta": nn.Linear(cond_dim, int(hidden_dim)),
+                    }
+                )
+            )
+        self.out = nn.Linear(int(hidden_dim), 1)
+
+    def _sigma_feat(self, sigma: torch.Tensor) -> torch.Tensor:
+        if sigma.ndim == 1:
+            sigma = sigma.unsqueeze(-1)
+        return torch.log(torch.clamp(sigma, min=1e-8)) if self.use_log_sigma else sigma
+
+    def forward(self, theta_tilde: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+        if theta_tilde.ndim == 1:
+            theta_tilde = theta_tilde.unsqueeze(-1)
+        cond = self._sigma_feat(sigma)
+        h = torch.nn.functional.silu(self.in_proj(theta_tilde))
+        for blk in self.blocks:
+            h = blk["lin"](h)
+            gamma = blk["gamma"](cond)
+            beta = blk["beta"](cond)
+            h = gamma * h + beta
+            h = torch.nn.functional.silu(h)
+        return self.out(h)
 
     @torch.no_grad()
     def predict_score(self, theta: torch.Tensor, sigma_eval: float) -> torch.Tensor:

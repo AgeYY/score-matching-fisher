@@ -7,6 +7,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from fisher.models import (
     ConditionalScore1D,
+    ConditionalScore1DFiLMPerLayer,
     ConditionalThetaFlowVelocity,
     ConditionalXFlowVelocity,
     ConditionalXFlowVelocityFiLMPerLayer,
@@ -14,6 +15,7 @@ from fisher.models import (
     LocalDecoderLogit,
     PriorThetaFlowVelocity,
     PriorScore1D,
+    PriorScore1DFiLMPerLayer,
     UnconditionalXFlowVelocity,
     UnconditionalXFlowVelocityFiLMPerLayer,
     UnconditionalXScore,
@@ -80,7 +82,7 @@ def sample_continuous_geometric_sigmas(
 
 
 def train_score_model(
-    model: ConditionalScore1D,
+    model: ConditionalScore1D | ConditionalScore1DFiLMPerLayer,
     theta_train: np.ndarray,
     x_train: np.ndarray,
     sigma_values: np.ndarray,
@@ -205,7 +207,7 @@ def train_score_model(
 
 
 def train_score_model_ncsm_continuous(
-    model: ConditionalScore1D,
+    model: ConditionalScore1D | ConditionalScore1DFiLMPerLayer,
     theta_train: np.ndarray,
     x_train: np.ndarray,
     sigma_min: float,
@@ -1082,7 +1084,7 @@ def train_unconditional_x_flow_model(
 
 
 def train_prior_score_model(
-    model: PriorScore1D,
+    model: PriorScore1D | PriorScore1DFiLMPerLayer,
     theta_train: np.ndarray,
     sigma_values: np.ndarray,
     epochs: int,
@@ -1199,7 +1201,7 @@ def train_prior_score_model(
 
 
 def train_prior_score_model_ncsm_continuous(
-    model: PriorScore1D,
+    model: PriorScore1D | PriorScore1DFiLMPerLayer,
     theta_train: np.ndarray,
     sigma_min: float,
     sigma_max: float,
