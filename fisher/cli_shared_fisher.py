@@ -28,7 +28,8 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
         help=(
             "Generative family: 'gaussian' (theta-modulated Gaussian obs. noise); "
             "'gmm_non_gauss' (theta-dependent 2-component mixture); "
-            "'cos_sin_piecewise_noise' / 'linear_piecewise_noise' (piecewise obs. std vs theta)."
+            "'cos_sin_piecewise_noise' (piecewise obs. std vs theta sign) / "
+            "'linear_piecewise_noise' (linear or sigmoid obs. std vs theta)."
         ),
     )
     p.add_argument(
@@ -187,13 +188,13 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--sigma-piecewise-low",
         type=float,
-        default=0.5,
+        default=0.1,
         help="Piecewise scalar std for cos_sin/linear piecewise_noise when theta is on the low-noise side.",
     )
     p.add_argument(
         "--sigma-piecewise-high",
         type=float,
-        default=4.0,
+        default=2.0,
         help="Piecewise scalar std for cos_sin/linear piecewise_noise when theta is on the high-noise side.",
     )
     p.add_argument(
@@ -201,6 +202,36 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
         type=float,
         default=1.0,
         help="For linear_piecewise_noise: first component mean is linear_k * theta (second is theta).",
+    )
+    p.add_argument(
+        "--linear-sigma-schedule",
+        type=str,
+        default="linear",
+        choices=["linear", "sigmoid"],
+        help=(
+            "For linear_piecewise_noise: how observation std varies with theta. "
+            "'linear': linear from --sigma-piecewise-low at --theta-low to --sigma-piecewise-high at "
+            "--theta-high (flip with --no-theta-zero-to-low). "
+            "'sigmoid': smooth transition centered at --linear-sigma-sigmoid-center."
+        ),
+    )
+    p.add_argument(
+        "--linear-sigma-sigmoid-center",
+        type=float,
+        default=0.0,
+        help=(
+            "For linear_piecewise_noise with --linear-sigma-schedule sigmoid: center theta where "
+            "observation noise is halfway between --sigma-piecewise-low and --sigma-piecewise-high."
+        ),
+    )
+    p.add_argument(
+        "--linear-sigma-sigmoid-steepness",
+        type=float,
+        default=2.0,
+        help=(
+            "For linear_piecewise_noise with --linear-sigma-schedule sigmoid: positive steepness "
+            "in noise vs theta (larger = sharper transition near the center)."
+        ),
     )
     p.add_argument(
         "--theta-zero-to-low",
@@ -245,7 +276,7 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
     )
 
     p.add_argument("--score-epochs", type=int, default=10000)
-    p.add_argument("--score-batch-size", type=int, default=256)
+    p.add_argument("--score-batch-size", type=int, default=1024)
     p.add_argument("--score-lr", type=float, default=1e-3)
     p.add_argument("--score-hidden-dim", type=int, default=128)
     p.add_argument("--score-depth", type=int, default=3)
@@ -256,17 +287,19 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         choices=["mlp", "film"],
         help=(
             "Posterior DSM architecture: mlp concatenates [theta, x, sigma]; "
-            "film applies FiLM modulation from (x, sigma_feat) on a theta_tilde trunk. Default: film."
+            "film uses an x-input trunk with residual FiLM blocks conditioned on (theta_tilde, sigma). "
+            "Default: film."
         ),
     )
     p.add_argument(
         "--prior-score-arch",
         type=str,
-        default="film",
+        default="mlp",
         choices=["mlp", "film"],
         help=(
             "Prior DSM architecture: mlp concatenates [theta, sigma]; "
-            "film applies FiLM modulation from sigma_feat on a theta_tilde trunk. Default: film."
+            "film uses a theta_tilde trunk with residual FiLM blocks conditioned on (theta_tilde, sigma). "
+            "Default: mlp."
         ),
     )
     p.add_argument(
@@ -291,6 +324,15 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         type=float,
         default=0.05,
         help="EMA smoothing factor α in (0,1] for validation loss monitor used by score early stopping.",
+    )
+    p.add_argument(
+        "--score-early-ema-warmup-epochs",
+        type=int,
+        default=0,
+        help=(
+            "Score early stopping: for epochs 1..N use raw validation loss as the monitor (no EMA); "
+            "EMA accumulation starts after epoch N. Default 0 (no warmup)."
+        ),
     )
     p.add_argument("--score-restore-best", action="store_true", default=True)
     p.add_argument("--no-score-restore-best", action="store_false", dest="score_restore_best")
@@ -357,7 +399,7 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         help="When prior score is trained: which curve to treat as primary vs GT (combined uses s_post - s_prior).",
     )
     p.add_argument("--prior-epochs", type=int, default=10000)
-    p.add_argument("--prior-batch-size", type=int, default=256)
+    p.add_argument("--prior-batch-size", type=int, default=1024)
     p.add_argument("--prior-lr", type=float, default=1e-3)
     p.add_argument("--prior-hidden-dim", type=int, default=128)
     p.add_argument("--prior-depth", type=int, default=3)
@@ -368,6 +410,15 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         type=float,
         default=0.05,
         help="EMA α for prior model validation monitor (early stopping).",
+    )
+    p.add_argument(
+        "--prior-early-ema-warmup-epochs",
+        type=int,
+        default=0,
+        help=(
+            "Prior early stopping: for epochs 1..N use raw validation loss as the monitor (no EMA); "
+            "EMA starts after epoch N. Default 0."
+        ),
     )
     p.add_argument("--prior-restore-best", action="store_true", default=True)
     p.add_argument("--no-prior-restore-best", action="store_false", dest="prior_restore_best")

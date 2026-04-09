@@ -42,10 +42,11 @@ class ConditionalScore1D(nn.Module):
 
 
 class ConditionalScore1DFiLMPerLayer(nn.Module):
-    """Posterior DSM score s(theta_tilde, x, sigma) with per-layer FiLM from (x, sigma_feat).
+    """Posterior DSM score s(theta_tilde, x, sigma) with x-input trunk and residual FiLM blocks.
 
-    The main stream operates on scalar theta_tilde; gamma/beta are predicted from
-    concatenated observation x and sigma (log-sigma when ``use_log_sigma``).
+    The main stream starts from ``silu(in_proj(x))`` plus an **additive** ``cond_residual([theta_tilde, sigma])``
+    into ``hidden_dim``. Stacked FiLM blocks then refine ``h``. Each block applies a linear map on ``h``,
+    FiLM modulation from ``(theta_tilde, sigma_feat)``, SiLU, and a residual add back to ``h``.
     """
 
     def __init__(
@@ -62,8 +63,12 @@ class ConditionalScore1DFiLMPerLayer(nn.Module):
         self.hidden_dim = int(hidden_dim)
         self.depth = int(depth)
         self.use_log_sigma = bool(use_log_sigma)
-        cond_dim = int(x_dim) + 1  # x, sigma_feat
-        self.in_proj = nn.Linear(1, int(hidden_dim))
+        cond_dim = 2  # theta_tilde, sigma_feat (scalars)
+        self.in_proj = nn.Linear(int(x_dim), int(hidden_dim))
+        # Additive residual from (noisy theta, sigma) into the x trunk (same hidden_dim).
+        self.cond_residual = nn.Linear(cond_dim, int(hidden_dim))
+        nn.init.zeros_(self.cond_residual.weight)
+        nn.init.zeros_(self.cond_residual.bias)
         self.blocks = nn.ModuleList()
         for _ in range(int(depth)):
             self.blocks.append(
@@ -86,14 +91,14 @@ class ConditionalScore1DFiLMPerLayer(nn.Module):
         if theta_tilde.ndim == 1:
             theta_tilde = theta_tilde.unsqueeze(-1)
         sigma_feat = self._sigma_feat(sigma)
-        cond = torch.cat([x, sigma_feat], dim=-1)
-        h = torch.nn.functional.silu(self.in_proj(theta_tilde))
+        cond = torch.cat([theta_tilde, sigma_feat], dim=-1)
+        h = torch.nn.functional.silu(self.in_proj(x)) + self.cond_residual(cond)
         for blk in self.blocks:
-            h = blk["lin"](h)
+            y = blk["lin"](h)
             gamma = blk["gamma"](cond)
             beta = blk["beta"](cond)
-            h = gamma * h + beta
-            h = torch.nn.functional.silu(h)
+            y = gamma * y + beta
+            h = h + torch.nn.functional.silu(y)
         return self.out(h)
 
     @torch.no_grad()
@@ -501,7 +506,12 @@ class PriorScore1D(nn.Module):
 
 
 class PriorScore1DFiLMPerLayer(nn.Module):
-    """Prior DSM score s(theta_tilde, sigma) with per-layer FiLM from sigma (or log-sigma)."""
+    """Prior DSM score s(theta_tilde, sigma) with theta_tilde trunk and residual FiLM blocks.
+
+    There is no observation ``x``; the main stream starts from a projection of
+    ``theta_tilde`` to ``hidden_dim`` (analogous to the x-trunk in the posterior FiLM).
+    FiLM modulation uses ``(theta_tilde, sigma_feat)`` with residual connections.
+    """
 
     def __init__(
         self,
@@ -513,7 +523,7 @@ class PriorScore1DFiLMPerLayer(nn.Module):
         self.hidden_dim = int(hidden_dim)
         self.depth = int(depth)
         self.use_log_sigma = bool(use_log_sigma)
-        cond_dim = 1
+        cond_dim = 2  # theta_tilde, sigma_feat
         self.in_proj = nn.Linear(1, int(hidden_dim))
         self.blocks = nn.ModuleList()
         for _ in range(int(depth)):
@@ -536,14 +546,15 @@ class PriorScore1DFiLMPerLayer(nn.Module):
     def forward(self, theta_tilde: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
         if theta_tilde.ndim == 1:
             theta_tilde = theta_tilde.unsqueeze(-1)
-        cond = self._sigma_feat(sigma)
+        sigma_feat = self._sigma_feat(sigma)
+        cond = torch.cat([theta_tilde, sigma_feat], dim=-1)
         h = torch.nn.functional.silu(self.in_proj(theta_tilde))
         for blk in self.blocks:
-            h = blk["lin"](h)
+            y = blk["lin"](h)
             gamma = blk["gamma"](cond)
             beta = blk["beta"](cond)
-            h = gamma * h + beta
-            h = torch.nn.functional.silu(h)
+            y = gamma * y + beta
+            h = h + torch.nn.functional.silu(y)
         return self.out(h)
 
     @torch.no_grad()

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
-from scipy.special import logsumexp
+from scipy.special import expit, logsumexp
 
 
 def set_seed(seed: int) -> None:
@@ -169,8 +169,8 @@ class ToyCosSinPiecewiseNoiseDataset:
     theta_low: float = -np.pi - 0.5
     theta_high: float = np.pi + 0.5
     x_dim: int = 2
-    sigma_piecewise_low: float = 0.5
-    sigma_piecewise_high: float = 4.0
+    sigma_piecewise_low: float = 0.1
+    sigma_piecewise_high: float = 2.0
     theta_zero_to_low: bool = True
     seed: int = 42
 
@@ -242,14 +242,19 @@ class ToyCosSinPiecewiseNoiseDataset:
 
 @dataclass
 class ToyLinearPiecewiseNoiseDataset:
-    """2D observations x = (k*theta, theta) + noise with piecewise scalar noise vs theta (same regime as cos/sin toy)."""
+    """2D observations x = (k*theta, theta) + isotropic noise with std vs theta."""
 
     theta_low: float = -np.pi - 0.5
     theta_high: float = np.pi + 0.5
     x_dim: int = 2
     linear_k: float = 1.0
-    sigma_piecewise_low: float = 0.5
-    sigma_piecewise_high: float = 4.0
+    sigma_piecewise_low: float = 0.1
+    sigma_piecewise_high: float = 2.0
+    # "linear": sigma linear in theta from low at theta_low to high at theta_high (see theta_zero_to_low).
+    # "sigmoid": smooth transition centered at linear_sigma_sigmoid_center.
+    linear_sigma_schedule: str = "linear"
+    linear_sigma_sigmoid_center: float = 0.0
+    linear_sigma_sigmoid_steepness: float = 2.0
     theta_zero_to_low: bool = True
     seed: int = 42
 
@@ -260,6 +265,12 @@ class ToyLinearPiecewiseNoiseDataset:
             raise ValueError("ToyLinearPiecewiseNoiseDataset requires x_dim == 2.")
         if self.sigma_piecewise_low <= 0.0 or self.sigma_piecewise_high <= 0.0:
             raise ValueError("sigma_piecewise_low and sigma_piecewise_high must be positive.")
+        _sched = str(self.linear_sigma_schedule).lower()
+        if _sched not in ("linear", "sigmoid"):
+            raise ValueError('linear_sigma_schedule must be "linear" or "sigmoid".')
+        self.linear_sigma_schedule = _sched
+        if _sched == "sigmoid" and self.linear_sigma_sigmoid_steepness <= 0.0:
+            raise ValueError("linear_sigma_sigmoid_steepness must be positive when linear_sigma_schedule is sigmoid.")
         self.rng = np.random.default_rng(self.seed)
 
     def sample_theta(self, n: int) -> np.ndarray:
@@ -276,13 +287,37 @@ class ToyLinearPiecewiseNoiseDataset:
         d1 = np.ones_like(t, dtype=np.float64)
         return np.concatenate([d0, d1], axis=1).astype(np.float64)
 
-    def _sigma_from_theta(self, theta: np.ndarray) -> np.ndarray:
+    def _noise_weight_and_derivative(self, theta: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Weight w in [0,1] and dw/dtheta for sigma = low + (high-low)*w."""
+        if self.linear_sigma_schedule == "linear":
+            return self._noise_weight_linear(theta)
         t = _theta_col(theta).reshape(-1)
-        if self.theta_zero_to_low:
-            low_mask = t <= 0.0
-        else:
-            low_mask = t < 0.0
-        sigma = np.where(low_mask, self.sigma_piecewise_low, self.sigma_piecewise_high)
+        z = self.linear_sigma_sigmoid_steepness * (t - self.linear_sigma_sigmoid_center)
+        w = expit(z)
+        dw = self.linear_sigma_sigmoid_steepness * w * (1.0 - w)
+        if not self.theta_zero_to_low:
+            w = 1.0 - w
+            dw = -dw
+        return w.astype(np.float64), dw.astype(np.float64)
+
+    def _noise_weight_linear(self, theta: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Linear w from theta_low (0) to theta_high (1); optional flip via theta_zero_to_low."""
+        t = _theta_col(theta).reshape(-1)
+        span = float(self.theta_high - self.theta_low)
+        w = (t - float(self.theta_low)) / span
+        w = np.clip(w, 0.0, 1.0)
+        if not self.theta_zero_to_low:
+            w = 1.0 - w
+        # dw/dtheta: 1/span on (theta_low, theta_high), 0 when clipped outside.
+        inside = (t > float(self.theta_low)) & (t < float(self.theta_high))
+        dw = np.where(inside, 1.0 / span, 0.0)
+        if not self.theta_zero_to_low:
+            dw = -dw
+        return w.astype(np.float64), dw.astype(np.float64)
+
+    def _sigma_from_theta(self, theta: np.ndarray) -> np.ndarray:
+        w, _ = self._noise_weight_and_derivative(theta)
+        sigma = self.sigma_piecewise_low + (self.sigma_piecewise_high - self.sigma_piecewise_low) * w
         return sigma.astype(np.float64)
 
     def covariance_scales(self, theta: np.ndarray) -> np.ndarray:
@@ -290,8 +325,10 @@ class ToyLinearPiecewiseNoiseDataset:
         return np.repeat(sigma, repeats=2, axis=1).astype(np.float64)
 
     def covariance_scales_derivative(self, theta: np.ndarray) -> np.ndarray:
-        n = _theta_col(theta).shape[0]
-        return np.zeros((n, 2), dtype=np.float64)
+        _, dw = self._noise_weight_and_derivative(theta)
+        dsigma = (self.sigma_piecewise_high - self.sigma_piecewise_low) * dw
+        dsigma = dsigma.reshape(-1, 1)
+        return np.repeat(dsigma, repeats=2, axis=1).astype(np.float64)
 
     def covariance(self, theta: np.ndarray) -> np.ndarray:
         sigma = self._sigma_from_theta(theta)
@@ -303,8 +340,15 @@ class ToyLinearPiecewiseNoiseDataset:
         return cov
 
     def covariance_derivative(self, theta: np.ndarray) -> np.ndarray:
-        n = _theta_col(theta).shape[0]
-        return np.zeros((n, 2, 2), dtype=np.float64)
+        sigma = self._sigma_from_theta(theta)
+        _, dw = self._noise_weight_and_derivative(theta)
+        dsigma = (self.sigma_piecewise_high - self.sigma_piecewise_low) * dw
+        dvar = 2.0 * sigma * dsigma
+        n = dvar.shape[0]
+        dcov = np.zeros((n, 2, 2), dtype=np.float64)
+        dcov[:, 0, 0] = dvar
+        dcov[:, 1, 1] = dvar
+        return dcov
 
     def sample_x(self, theta: np.ndarray) -> np.ndarray:
         mu = self.tuning_curve(theta)

@@ -51,8 +51,8 @@ def require_device(name: str) -> torch.device:
 def build_posterior_score_model(
     args: Any, device: torch.device
 ) -> ConditionalScore1D | ConditionalScore1DFiLMPerLayer:
-    """Instantiate posterior DSM (theta score) as MLP or FiLM trunk."""
-    arch = str(getattr(args, "score_arch", "film")).lower()
+    """Instantiate posterior DSM (theta score) as MLP or FiLM (x-trunk + residual FiLM)."""
+    arch = str(getattr(args, "score_arch", "mlp")).lower()
     common = dict(
         x_dim=int(args.x_dim),
         hidden_dim=int(args.score_hidden_dim),
@@ -67,8 +67,8 @@ def build_posterior_score_model(
 
 
 def build_prior_score_model(args: Any, device: torch.device) -> PriorScore1D | PriorScore1DFiLMPerLayer:
-    """Instantiate prior DSM as MLP or FiLM trunk."""
-    arch = str(getattr(args, "prior_score_arch", "film")).lower()
+    """Instantiate prior DSM as MLP or FiLM (theta-trunk + residual FiLM from theta_tilde,sigma)."""
+    arch = str(getattr(args, "prior_score_arch", "mlp")).lower()
     common = dict(
         hidden_dim=int(getattr(args, "prior_hidden_dim", 128)),
         depth=int(getattr(args, "prior_depth", 3)),
@@ -562,8 +562,8 @@ def build_dataset_from_meta(
             theta_low=float(meta["theta_low"]),
             theta_high=float(meta["theta_high"]),
             x_dim=int(meta["x_dim"]),
-            sigma_piecewise_low=float(meta.get("sigma_piecewise_low", 0.5)),
-            sigma_piecewise_high=float(meta.get("sigma_piecewise_high", 4.0)),
+            sigma_piecewise_low=float(meta.get("sigma_piecewise_low", 0.1)),
+            sigma_piecewise_high=float(meta.get("sigma_piecewise_high", 2.0)),
             theta_zero_to_low=bool(meta.get("theta_zero_to_low", True)),
             seed=seed,
         )
@@ -573,8 +573,11 @@ def build_dataset_from_meta(
             theta_high=float(meta["theta_high"]),
             x_dim=int(meta["x_dim"]),
             linear_k=float(meta.get("linear_k", 1.0)),
-            sigma_piecewise_low=float(meta.get("sigma_piecewise_low", 0.5)),
-            sigma_piecewise_high=float(meta.get("sigma_piecewise_high", 4.0)),
+            sigma_piecewise_low=float(meta.get("sigma_piecewise_low", 0.1)),
+            sigma_piecewise_high=float(meta.get("sigma_piecewise_high", 2.0)),
+            linear_sigma_schedule=str(meta.get("linear_sigma_schedule", "sigmoid")),
+            linear_sigma_sigmoid_center=float(meta.get("linear_sigma_sigmoid_center", 0.0)),
+            linear_sigma_sigmoid_steepness=float(meta.get("linear_sigma_sigmoid_steepness", 2.0)),
             theta_zero_to_low=bool(meta.get("theta_zero_to_low", True)),
             seed=seed,
         )
@@ -611,6 +614,10 @@ def validate_dataset_sample_args(args: Any) -> None:
         raise ValueError("--sigma-piecewise-low must be positive.")
     if float(getattr(args, "sigma_piecewise_high", 0.0)) <= 0.0:
         raise ValueError("--sigma-piecewise-high must be positive.")
+    if str(getattr(args, "dataset_family", "")) == "linear_piecewise_noise":
+        if str(getattr(args, "linear_sigma_schedule", "linear")).lower() == "sigmoid":
+            if float(getattr(args, "linear_sigma_sigmoid_steepness", 0.0)) <= 0.0:
+                raise ValueError("--linear-sigma-sigmoid-steepness must be positive when --linear-sigma-schedule is sigmoid.")
     if int(args.n_total) < 2:
         raise ValueError("--n-total must be >= 2 for train/eval split.")
     if not (0.0 < float(args.train_frac) <= 1.0):
@@ -628,12 +635,14 @@ def validate_estimation_args(args: Any) -> None:
         raise ValueError("--score-early-min-delta must be non-negative.")
     if not (0.0 < float(args.score_early_ema_alpha) <= 1.0):
         raise ValueError("--score-early-ema-alpha must be in (0, 1].")
+    if int(getattr(args, "score_early_ema_warmup_epochs", 0)) < 0:
+        raise ValueError("--score-early-ema-warmup-epochs must be >= 0.")
     if args.score_sigma_min_alpha <= 0.0 or args.score_sigma_max_alpha <= 0.0:
         raise ValueError("--score-sigma-min-alpha and --score-sigma-max-alpha must be positive.")
     if float(args.score_sigma_min_alpha) > float(args.score_sigma_max_alpha):
         raise ValueError("--score-sigma-min-alpha must be <= --score-sigma-max-alpha.")
-    _sa = str(getattr(args, "score_arch", "film")).lower()
-    _pa = str(getattr(args, "prior_score_arch", "film")).lower()
+    _sa = str(getattr(args, "score_arch", "mlp")).lower()
+    _pa = str(getattr(args, "prior_score_arch", "mlp")).lower()
     if _sa not in ("mlp", "film"):
         raise ValueError("--score-arch must be one of {'mlp','film'}.")
     if _pa not in ("mlp", "film"):
@@ -664,6 +673,8 @@ def validate_estimation_args(args: Any) -> None:
         raise ValueError("--prior-early-min-delta must be non-negative.")
     if not (0.0 < float(getattr(args, "prior_early_ema_alpha", 0.05)) <= 1.0):
         raise ValueError("--prior-early-ema-alpha must be in (0, 1].")
+    if int(getattr(args, "prior_early_ema_warmup_epochs", 0)) < 0:
+        raise ValueError("--prior-early-ema-warmup-epochs must be >= 0.")
     if int(getattr(args, "h_batch_size", 1)) < 1:
         raise ValueError("--h-batch-size must be >= 1.")
     if float(getattr(args, "h_sigma_eval", -1.0)) == 0.0:
@@ -689,6 +700,57 @@ def validate_estimation_args(args: Any) -> None:
             raise ValueError("--skip-shared-fisher-gt-compare requires --compute-h-matrix.")
         if not bool(getattr(args, "prior_enable", True)):
             raise ValueError("--skip-shared-fisher-gt-compare requires prior score; do not use --no-prior-score.")
+
+
+def _save_dsm_score_prior_training_losses_npz(
+    output_dir: str,
+    *,
+    theta_all: np.ndarray,
+    theta_score_fit: np.ndarray,
+    theta_score_val: np.ndarray,
+    score_data_mode: str,
+    score_train_losses: np.ndarray,
+    score_val_losses: np.ndarray,
+    score_val_monitor_losses: np.ndarray,
+    score_best_epoch: int,
+    score_stopped_epoch: int,
+    score_stopped_early: bool,
+    score_best_val_loss: float,
+    prior_enable: bool,
+    prior_train_losses: np.ndarray,
+    prior_val_losses: np.ndarray,
+    prior_val_monitor_losses: np.ndarray,
+    prior_best_epoch: int,
+    prior_stopped_epoch: int,
+    prior_stopped_early: bool,
+    prior_best_val_loss: float,
+) -> str:
+    """Write per-run DSM training curves for posterior (score) and optional prior models."""
+    path = os.path.join(output_dir, "score_prior_training_losses.npz")
+    np.savez_compressed(
+        path,
+        theta_field_method=np.asarray(["dsm"], dtype=object),
+        n_theta_all=np.int64(np.asarray(theta_all).shape[0]),
+        n_score_fit=np.int64(theta_score_fit.shape[0]),
+        n_score_val=np.int64(theta_score_val.shape[0]),
+        score_data_mode=np.asarray([str(score_data_mode)], dtype=object),
+        score_train_losses=np.asarray(score_train_losses, dtype=np.float64),
+        score_val_losses=np.asarray(score_val_losses, dtype=np.float64),
+        score_val_monitor_losses=np.asarray(score_val_monitor_losses, dtype=np.float64),
+        score_best_epoch=np.int64(score_best_epoch),
+        score_stopped_epoch=np.int64(score_stopped_epoch),
+        score_stopped_early=np.bool_(score_stopped_early),
+        score_best_val_smooth=np.float64(score_best_val_loss),
+        prior_enable=np.bool_(prior_enable),
+        prior_train_losses=np.asarray(prior_train_losses, dtype=np.float64),
+        prior_val_losses=np.asarray(prior_val_losses, dtype=np.float64),
+        prior_val_monitor_losses=np.asarray(prior_val_monitor_losses, dtype=np.float64),
+        prior_best_epoch=np.int64(prior_best_epoch),
+        prior_stopped_epoch=np.int64(prior_stopped_epoch),
+        prior_stopped_early=np.bool_(prior_stopped_early),
+        prior_best_val_smooth=np.float64(prior_best_val_loss),
+    )
+    return path
 
 
 def merge_meta_into_args(meta: dict[str, Any], est_ns: Any) -> Any:
@@ -985,11 +1047,17 @@ def run_shared_fisher_estimation(
         print(f"[sigma_scale] mode=fixed sigma={args.score_fixed_sigma:.6f} theta_std={theta_std:.6f}")
 
     score_model = build_posterior_score_model(args, device)
+    _sa = str(getattr(args, "score_arch", "mlp")).lower()
     print(
         "[score_model] "
-        f"arch={str(getattr(args, 'score_arch', 'film')).lower()} "
+        f"arch={_sa} "
         f"hidden_dim={int(args.score_hidden_dim)} depth={int(args.score_depth)} "
         f"noise_mode={args.score_noise_mode}"
+        + (
+            " film=x_trunk_residual_film(theta_tilde,sigma)"
+            if _sa == "film"
+            else ""
+        )
     )
     if args.score_noise_mode == "continuous":
         sigma_values = geometric_sigma_schedule(
@@ -1020,6 +1088,7 @@ def run_shared_fisher_estimation(
             early_stopping_patience=args.score_early_patience,
             early_stopping_min_delta=args.score_early_min_delta,
             early_stopping_ema_alpha=float(args.score_early_ema_alpha),
+            early_stopping_ema_warmup_epochs=int(getattr(args, "score_early_ema_warmup_epochs", 0)),
             restore_best=args.score_restore_best,
         )
     else:
@@ -1044,6 +1113,7 @@ def run_shared_fisher_estimation(
             early_stopping_patience=args.score_early_patience,
             early_stopping_min_delta=args.score_early_min_delta,
             early_stopping_ema_alpha=float(args.score_early_ema_alpha),
+            early_stopping_ema_warmup_epochs=int(getattr(args, "score_early_ema_warmup_epochs", 0)),
             restore_best=args.score_restore_best,
         )
     score_train_losses = np.asarray(score_train_out["train_losses"], dtype=np.float64)
@@ -1053,11 +1123,13 @@ def run_shared_fisher_estimation(
     stopped_epoch = int(score_train_out["stopped_epoch"])
     stopped_early = bool(score_train_out["stopped_early"])
     best_val_loss = float(score_train_out["best_val_loss"])
+    prior_enable = bool(getattr(args, "prior_enable", True))
     print(
         "[score_early_stop] "
         f"stopped_early={stopped_early} stopped_epoch={stopped_epoch} "
         f"best_epoch={best_epoch} best_val_smooth={best_val_loss:.6f} "
         f"ema_alpha={args.score_early_ema_alpha} "
+        f"ema_warmup_epochs={int(getattr(args, 'score_early_ema_warmup_epochs', 0))} "
         f"restore_best={args.score_restore_best}"
     )
 
@@ -1094,6 +1166,30 @@ def run_shared_fisher_estimation(
     plt.tight_layout()
     plt.savefig(loss_fig_path, dpi=180)
     plt.close()
+    if not prior_enable:
+        tnpz = _save_dsm_score_prior_training_losses_npz(
+            args.output_dir,
+            theta_all=theta_all,
+            theta_score_fit=theta_score_fit,
+            theta_score_val=theta_score_val,
+            score_data_mode=str(args.score_data_mode),
+            score_train_losses=score_train_losses,
+            score_val_losses=score_val_losses,
+            score_val_monitor_losses=score_val_monitor_losses,
+            score_best_epoch=best_epoch,
+            score_stopped_epoch=stopped_epoch,
+            score_stopped_early=stopped_early,
+            score_best_val_loss=best_val_loss,
+            prior_enable=False,
+            prior_train_losses=np.empty(0, dtype=np.float64),
+            prior_val_losses=np.empty(0, dtype=np.float64),
+            prior_val_monitor_losses=np.empty(0, dtype=np.float64),
+            prior_best_epoch=0,
+            prior_stopped_epoch=0,
+            prior_stopped_early=False,
+            prior_best_val_loss=float("nan"),
+        )
+        print(f"[training_losses] saved {tnpz}")
     eval_low = args.theta_low + args.eval_margin
     eval_high = args.theta_high - args.eval_margin
     if args.score_fisher_eval_data == "full":
@@ -1110,7 +1206,6 @@ def run_shared_fisher_estimation(
         f"data={args.score_fisher_eval_data} n={theta_score_fisher_eval.shape[0]}"
     )
 
-    prior_enable = bool(getattr(args, "prior_enable", True))
     fisher_mode = str(getattr(args, "fisher_score_mode", "posterior_minus_prior"))
     fisher_mode_display = fisher_mode if prior_enable else "posterior_only (prior disabled)"
     prior_train_out: dict[str, Any] | None = None
@@ -1130,10 +1225,16 @@ def run_shared_fisher_estimation(
 
     if prior_enable:
         prior_model = build_prior_score_model(args, device)
+        _pa = str(getattr(args, "prior_score_arch", "mlp")).lower()
         print(
             "[prior_model] "
-            f"arch={str(getattr(args, 'prior_score_arch', 'film')).lower()} "
+            f"arch={_pa} "
             f"hidden_dim={int(getattr(args, 'prior_hidden_dim', 128))} depth={int(getattr(args, 'prior_depth', 3))}"
+            + (
+                " film=theta_trunk_residual_film(theta_tilde,sigma)"
+                if _pa == "film"
+                else ""
+            )
         )
         print(
             "[prior_train] "
@@ -1155,6 +1256,7 @@ def run_shared_fisher_estimation(
                 early_stopping_patience=int(getattr(args, "prior_early_patience", 1000)),
                 early_stopping_min_delta=float(getattr(args, "prior_early_min_delta", 1e-4)),
                 early_stopping_ema_alpha=float(getattr(args, "prior_early_ema_alpha", 0.05)),
+                early_stopping_ema_warmup_epochs=int(getattr(args, "prior_early_ema_warmup_epochs", 0)),
                 restore_best=bool(getattr(args, "prior_restore_best", True)),
             )
         else:
@@ -1171,6 +1273,7 @@ def run_shared_fisher_estimation(
                 early_stopping_patience=int(getattr(args, "prior_early_patience", 1000)),
                 early_stopping_min_delta=float(getattr(args, "prior_early_min_delta", 1e-4)),
                 early_stopping_ema_alpha=float(getattr(args, "prior_early_ema_alpha", 0.05)),
+                early_stopping_ema_warmup_epochs=int(getattr(args, "prior_early_ema_warmup_epochs", 0)),
                 restore_best=bool(getattr(args, "prior_restore_best", True)),
             )
         prior_train_losses = np.asarray(prior_train_out["train_losses"], dtype=np.float64)
@@ -1185,6 +1288,7 @@ def run_shared_fisher_estimation(
             f"stopped_early={prior_stopped_early} stopped_epoch={prior_stopped_epoch} "
             f"best_epoch={prior_best_epoch} best_val_smooth={prior_best_val_loss:.6f} "
             f"ema_alpha={getattr(args, 'prior_early_ema_alpha', 0.05)} "
+            f"ema_warmup_epochs={int(getattr(args, 'prior_early_ema_warmup_epochs', 0))} "
             f"restore_best={getattr(args, 'prior_restore_best', True)}"
         )
         prior_fig_path = os.path.join(args.output_dir, "prior_score_loss_vs_epoch.png")
@@ -1220,6 +1324,29 @@ def run_shared_fisher_estimation(
         plt.tight_layout()
         plt.savefig(prior_fig_path, dpi=180)
         plt.close()
+        tnpz = _save_dsm_score_prior_training_losses_npz(
+            args.output_dir,
+            theta_all=theta_all,
+            theta_score_fit=theta_score_fit,
+            theta_score_val=theta_score_val,
+            score_data_mode=str(args.score_data_mode),
+            score_train_losses=score_train_losses,
+            score_val_losses=score_val_losses,
+            score_val_monitor_losses=score_val_monitor_losses,
+            score_best_epoch=best_epoch,
+            score_stopped_epoch=stopped_epoch,
+            score_stopped_early=stopped_early,
+            score_best_val_loss=best_val_loss,
+            prior_enable=True,
+            prior_train_losses=prior_train_losses,
+            prior_val_losses=prior_val_losses,
+            prior_val_monitor_losses=prior_val_monitor_losses,
+            prior_best_epoch=prior_best_epoch,
+            prior_stopped_epoch=prior_stopped_epoch,
+            prior_stopped_early=prior_stopped_early,
+            prior_best_val_loss=prior_best_val_loss,
+        )
+        print(f"[training_losses] saved {tnpz}")
 
         if bool(getattr(args, "skip_shared_fisher_gt_compare", False)):
             if not bool(getattr(args, "compute_h_matrix", False)):
@@ -1259,6 +1386,7 @@ def run_shared_fisher_estimation(
                 "skipped Fisher curves, decoder training, and GT Fisher comparison artifacts."
             )
             print("Saved artifacts:")
+            print(f"  - {tnpz}")
             print(f"  - {loss_fig_path}")
             print(f"  - {prior_fig_path}")
             print(f"  - {h_npz_path}")
@@ -1731,6 +1859,9 @@ def run_shared_fisher_estimation(
                 f"linear_k={args.linear_k}, "
                 f"sigma_piecewise_low={args.sigma_piecewise_low}, "
                 f"sigma_piecewise_high={args.sigma_piecewise_high}, "
+                f"linear_sigma_schedule={getattr(args, 'linear_sigma_schedule', 'linear')}, "
+                f"linear_sigma_sigmoid_center={getattr(args, 'linear_sigma_sigmoid_center', 0.0)}, "
+                f"linear_sigma_sigmoid_steepness={getattr(args, 'linear_sigma_sigmoid_steepness', 2.0)}, "
                 f"theta_zero_to_low={args.theta_zero_to_low}\n"
             )
         else:

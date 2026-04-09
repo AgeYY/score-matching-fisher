@@ -51,7 +51,8 @@ Parameter reference (all available flags in this script):
       cos_sin_piecewise_noise
         Cosine or von-Mises tuning means + piecewise noise std by theta sign.
       linear_piecewise_noise
-        Linear tuning means + piecewise noise std by theta sign.
+        Linear tuning means + observation std vs theta (default: linear from low to high across
+        [theta-low, theta-high]; optional sigmoid schedule).
       Default: gaussian.
 
   Tuning-curve mean (used where applicable):
@@ -90,13 +91,19 @@ Parameter reference (all available flags in this script):
 
   Piecewise noise controls (cos_sin_piecewise_noise / linear_piecewise_noise):
     --sigma-piecewise-low, --sigma-piecewise-high
-      Observation std on low-noise vs high-noise side of theta split.
-      Defaults: 0.5, 4.0.
+      Endpoints for observation std (cos_sin: low/high sides of theta=0; linear: std at theta-low
+      and theta-high when using --linear-sigma-schedule linear, or sigmoid endpoints when sigmoid).
+      Defaults: 0.1, 2.0.
     --theta-zero-to-low / --no-theta-zero-to-low
-      Whether theta=0 belongs to low-noise side or high-noise side.
-      Default behavior: --theta-zero-to-low (True).
+      cos_sin: whether theta=0 is on the low-noise side. linear: if False, flip which end of the
+      theta range gets low vs high noise. Default: --theta-zero-to-low (True).
     --linear-k
       Linear slope parameter for linear_piecewise_noise mean construction. Default: 1.0.
+    --linear-sigma-schedule
+      linear_piecewise_noise: linear or sigmoid std vs theta. Default: linear.
+    --linear-sigma-sigmoid-center, --linear-sigma-sigmoid-steepness
+      linear_piecewise_noise with --linear-sigma-schedule sigmoid: center and steepness.
+      Defaults: 0.0, 2.0.
 
   Output:
     --output-npz
