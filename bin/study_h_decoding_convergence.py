@@ -54,7 +54,8 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Load a shared dataset .npz, build a large-n reference (binned H + Hellinger LB + "
             "pairwise logistic + Bayes-opt accuracy from C-matrix bin means), then sweep nested "
-            "subset sizes and plot off-diagonal correlation to the reference."
+            "subset sizes and plot off-diagonal correlation to the reference. Also writes "
+            "h_decoding_convergence_combined.{png,svg} (line plot + matrix panel side-by-side)."
         )
     )
     p.add_argument(
@@ -350,6 +351,42 @@ def _save_figure_png_svg(fig: plt.Figure, path_png: str, *, dpi: int = 160) -> s
     fig.savefig(path_png, dpi=dpi)
     path_svg = str(Path(path_png).with_suffix(".svg"))
     fig.savefig(path_svg)
+    return path_svg
+
+
+def _save_combined_convergence_figure(
+    left_png_path: str,
+    right_png_path: str,
+    out_png_path: str,
+    *,
+    dpi: int = 160,
+) -> str:
+    """Side-by-side: left = corr vs n, right = matrix panel; same height as the journal combined figure."""
+    from PIL import Image
+
+    left = Image.open(left_png_path).convert("RGB")
+    right = Image.open(right_png_path).convert("RGB")
+    h = max(left.height, right.height)
+
+    def _scale_to_height(im: Image.Image, target_h: int) -> Image.Image:
+        w = int(round(im.width * target_h / im.height))
+        return im.resize((w, target_h), Image.Resampling.LANCZOS)
+
+    l2 = _scale_to_height(left, h)
+    r2 = _scale_to_height(right, h)
+    combined = Image.new("RGB", (l2.width + r2.width, h), (255, 255, 255))
+    combined.paste(l2, (0, 0))
+    combined.paste(r2, (l2.width, 0))
+    combined.save(out_png_path, dpi=(dpi, dpi))
+
+    arr = np.asarray(combined)
+    fig = plt.figure(figsize=(arr.shape[1] / dpi, arr.shape[0] / dpi), dpi=dpi)
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.imshow(arr)
+    ax.axis("off")
+    path_svg = str(Path(out_png_path).with_suffix(".svg"))
+    fig.savefig(path_svg, pad_inches=0)
+    plt.close(fig)
     return path_svg
 
 
@@ -767,6 +804,9 @@ def main(argv: list[str] | None = None) -> None:
         n_bins=n_bins,
     )
 
+    combined_path = os.path.join(args.output_dir, "h_decoding_convergence_combined.png")
+    combined_svg = _save_combined_convergence_figure(fig_path, matrix_panel_path, combined_path, dpi=160)
+
     manifest_lines = [
         f"n_ref_{int(args.n_ref)}\ttraining_losses/n_ref_{int(args.n_ref)}.npz",
         *[f"{n}\ttraining_losses/n_{n:06d}.npz" for n in ns],
@@ -785,6 +825,8 @@ def main(argv: list[str] | None = None) -> None:
         "figure_svg": conv_svg,
         "matrix_panel": matrix_panel_path,
         "matrix_panel_svg": str(Path(matrix_panel_path).with_suffix(".svg")),
+        "combined_figure": combined_path,
+        "combined_figure_svg": combined_svg,
         "reference_npz": os.path.join(args.output_dir, "h_decoding_convergence_reference.npz"),
         "training_losses_dir": loss_dir,
         "training_losses_manifest": manifest_path,
@@ -800,6 +842,8 @@ def main(argv: list[str] | None = None) -> None:
     print(f"  - {conv_svg}")
     print(f"  - {matrix_panel_path}")
     print(f"  - {paths_out['matrix_panel_svg']}")
+    print(f"  - {combined_path}")
+    print(f"  - {combined_svg}")
     print(f"  - {loss_dir}/ (per-n training loss .npz + manifest.txt)")
     print(f"  - {summary_path}")
 
