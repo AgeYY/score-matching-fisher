@@ -16,8 +16,8 @@ def _theta_col(theta: np.ndarray) -> np.ndarray:
 
 @dataclass
 class ToyConditionalGaussianDataset:
-    theta_low: float = -3.0
-    theta_high: float = 3.0
+    theta_low: float = -6.0
+    theta_high: float = 6.0
     x_dim: int = 2
     tuning_curve_family: str = "cosine"  # "cosine" | "von_mises_raw"
     vm_mu_amp: float = 1.0
@@ -166,11 +166,11 @@ class ToyConditionalGaussianDataset:
 
 @dataclass
 class ToyCosSinPiecewiseNoiseDataset:
-    theta_low: float = -np.pi - 0.5
-    theta_high: float = np.pi + 0.5
+    theta_low: float = -6.0
+    theta_high: float = 6.0
     x_dim: int = 2
     sigma_piecewise_low: float = 0.1
-    sigma_piecewise_high: float = 2.0
+    sigma_piecewise_high: float = 0.1
     theta_zero_to_low: bool = True
     seed: int = 42
 
@@ -244,12 +244,12 @@ class ToyCosSinPiecewiseNoiseDataset:
 class ToyLinearPiecewiseNoiseDataset:
     """2D observations x = (k*theta, theta) + isotropic noise with std vs theta."""
 
-    theta_low: float = -np.pi - 0.5
-    theta_high: float = np.pi + 0.5
+    theta_low: float = -6.0
+    theta_high: float = 6.0
     x_dim: int = 2
     linear_k: float = 1.0
     sigma_piecewise_low: float = 0.1
-    sigma_piecewise_high: float = 2.0
+    sigma_piecewise_high: float = 0.1
     # "linear": sigma linear in theta from low at theta_low to high at theta_high (see theta_zero_to_low).
     # "sigmoid": smooth transition centered at linear_sigma_sigmoid_center.
     linear_sigma_schedule: str = "linear"
@@ -365,8 +365,8 @@ class ToyLinearPiecewiseNoiseDataset:
 
 @dataclass
 class ToyConditionalGMMNonGaussianDataset:
-    theta_low: float = -3.0
-    theta_high: float = 3.0
+    theta_low: float = -6.0
+    theta_high: float = 6.0
     x_dim: int = 2
     tuning_curve_family: str = "cosine"  # "cosine" | "von_mises_raw"
     vm_mu_amp: float = 1.0

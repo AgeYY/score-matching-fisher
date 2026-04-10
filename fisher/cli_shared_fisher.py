@@ -60,13 +60,13 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--theta-low",
         type=float,
-        default=-3.0,
+        default=-6.0,
         help="Lower bound of theta; samples are drawn uniformly on [theta-low, theta-high].",
     )
     p.add_argument(
         "--theta-high",
         type=float,
-        default=3.0,
+        default=6.0,
         help="Upper bound of theta (see --theta-low).",
     )
     p.add_argument("--x-dim", type=int, default=2, help="Observation dimension (length of x).")
@@ -194,7 +194,7 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--sigma-piecewise-high",
         type=float,
-        default=2.0,
+        default=0.1,
         help="Piecewise scalar std for cos_sin/linear piecewise_noise when theta is on the high-noise side.",
     )
     p.add_argument(

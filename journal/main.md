@@ -16,6 +16,7 @@ Collected markdown notes in `journal/notes/`: long-form chapters (moved from the
 
 ## 2026-04
 
+- [2026-04-10 H-decoding convergence: circular `cos_sin_piecewise_noise` (weak binned-H agreement)](notes/2026-04-10-h-decoding-convergence-cos-sin-piecewise.md)
 - [2026-04-09 H-decoding convergence: linear piecewise dataset, DSM $\sigma_{\min}$ at 5%](notes/2026-04-09-h-decoding-convergence-linear-piecewise-minalpha05.md)
 - [2026-04-05 Fisher estimation: Gaussian $x \in \mathbb{R}^2$, $N=4000$](notes/2026-04-05-fisher-gaussian-xdim2-n4000.md)
 - [2026-04-05 Fisher at high dimension: Gaussian $x \in \mathbb{R}^{100}$, $N=4000$ (poor fit)](notes/2026-04-05-fisher-gaussian-xdim100-n4000.md)

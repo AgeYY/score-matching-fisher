@@ -37,7 +37,7 @@ Parameter reference (all available flags in this script):
 
   Core domain / shape:
     --theta-low, --theta-high
-      Uniform theta sampling range [theta-low, theta-high]. Defaults: -3.0, 3.0.
+      Uniform theta sampling range [theta-low, theta-high]. Defaults: -6.0, 6.0.
     --x-dim
       Observation dimension. Default: 2.
 
@@ -93,7 +93,7 @@ Parameter reference (all available flags in this script):
     --sigma-piecewise-low, --sigma-piecewise-high
       Endpoints for observation std (cos_sin: low/high sides of theta=0; linear: std at theta-low
       and theta-high when using --linear-sigma-schedule linear, or sigmoid endpoints when sigmoid).
-      Defaults: 0.1, 2.0.
+      Defaults: 0.1, 0.1.
     --theta-zero-to-low / --no-theta-zero-to-low
       cos_sin: whether theta=0 is on the low-noise side. linear: if False, flip which end of the
       theta range gets low vs high noise. Default: --theta-zero-to-low (True).

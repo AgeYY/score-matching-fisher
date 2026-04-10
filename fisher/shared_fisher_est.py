@@ -625,7 +625,7 @@ def build_dataset_from_meta(
             theta_high=float(meta["theta_high"]),
             x_dim=int(meta["x_dim"]),
             sigma_piecewise_low=float(meta.get("sigma_piecewise_low", 0.1)),
-            sigma_piecewise_high=float(meta.get("sigma_piecewise_high", 2.0)),
+            sigma_piecewise_high=float(meta.get("sigma_piecewise_high", 0.1)),
             theta_zero_to_low=bool(meta.get("theta_zero_to_low", True)),
             seed=seed,
         )
@@ -636,7 +636,7 @@ def build_dataset_from_meta(
             x_dim=int(meta["x_dim"]),
             linear_k=float(meta.get("linear_k", 1.0)),
             sigma_piecewise_low=float(meta.get("sigma_piecewise_low", 0.1)),
-            sigma_piecewise_high=float(meta.get("sigma_piecewise_high", 2.0)),
+            sigma_piecewise_high=float(meta.get("sigma_piecewise_high", 0.1)),
             linear_sigma_schedule=str(meta.get("linear_sigma_schedule", "sigmoid")),
             linear_sigma_sigmoid_center=float(meta.get("linear_sigma_sigmoid_center", 0.0)),
             linear_sigma_sigmoid_steepness=float(meta.get("linear_sigma_sigmoid_steepness", 2.0)),
