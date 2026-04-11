@@ -57,12 +57,18 @@ Parameter reference (all available flags in this script):
 
   Tuning-curve mean (used where applicable):
     --tuning-curve-family
-      cosine or von_mises_raw. Default: cosine.
+      cosine, von_mises_raw, or gaussian_raw. Default: cosine.
     --vm-mu-amp, --vm-kappa, --vm-omega
-      Von-Mises parameters (used only for --tuning-curve-family von_mises_raw).
-      Defaults: 1.0, 1.0, 1.0.
-      Not used for --dataset-family linear_piecewise_noise, whose tuning curve is fixed linear
-      (controlled by --linear-k). Also not used for --dataset-family cos_sin_piecewise_noise.
+      von_mises_raw only: amplitude A, concentration kappa, and omega in
+      A*exp(kappa*cos(omega*(theta-theta_j))). Centers theta_j are uniform on [theta-low, theta-high].
+      Ignored for cosine and gaussian_raw. Defaults: 1, 1, 1.
+    --gauss-mu-amp, --gauss-kappa, --gauss-omega
+      gaussian_raw only: amplitude A, precision kappa, and omega in
+      A*exp(-kappa*(omega*(theta-theta_j))^2). Centers theta_j uniform on [theta-low, theta-high].
+      Ignored for cosine and von_mises_raw.
+      Defaults: 1, 0.2, 1.
+      Not used for --dataset-family linear_piecewise_noise (fixed linear tuning) or
+      cos_sin_piecewise_noise.
 
   Baseline covariance/noise (Gaussian and GMM families):
     --sigma-x1, --sigma-x2

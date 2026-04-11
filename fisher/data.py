@@ -14,15 +14,23 @@ def _theta_col(theta: np.ndarray) -> np.ndarray:
     return np.asarray(theta, dtype=np.float64).reshape(-1, 1)
 
 
+def _tuning_centers_uniform_theta(theta_low: float, theta_high: float, x_dim: int) -> np.ndarray:
+    """Per-dimension centers in theta, uniform on [theta_low, theta_high] (inclusive endpoints)."""
+    return np.linspace(theta_low, theta_high, x_dim, dtype=np.float64)
+
+
 @dataclass
 class ToyConditionalGaussianDataset:
     theta_low: float = -6.0
     theta_high: float = 6.0
     x_dim: int = 2
-    tuning_curve_family: str = "cosine"  # "cosine" | "von_mises_raw"
+    tuning_curve_family: str = "cosine"  # "cosine" | "von_mises_raw" | "gaussian_raw"
     vm_mu_amp: float = 1.0
     vm_kappa: float = 1.0
     vm_omega: float = 1.0
+    gauss_mu_amp: float = 1.0
+    gauss_kappa: float = 0.2
+    gauss_omega: float = 1.0
     sigma_x1: float = 0.30
     sigma_x2: float = 0.30
     rho: float = 0.15
@@ -53,23 +61,29 @@ class ToyConditionalGaussianDataset:
             raise ValueError("cov_theta_amp_rho must be in [0, 1].")
         if not (0.1 <= self.rho_clip <= 0.95):
             raise ValueError("rho_clip must be in [0.1, 0.95].")
-        if self.tuning_curve_family not in ("cosine", "von_mises_raw"):
-            raise ValueError('tuning_curve_family must be "cosine" or "von_mises_raw".')
+        if self.tuning_curve_family not in ("cosine", "von_mises_raw", "gaussian_raw"):
+            raise ValueError('tuning_curve_family must be "cosine", "von_mises_raw", or "gaussian_raw".')
         if self.tuning_curve_family == "von_mises_raw":
             if self.vm_kappa < 0.0:
                 raise ValueError("vm_kappa must be non-negative for von_mises_raw.")
             if self.vm_mu_amp <= 0.0:
                 raise ValueError("vm_mu_amp must be positive for von_mises_raw.")
+        elif self.tuning_curve_family == "gaussian_raw":
+            if self.gauss_kappa < 0.0:
+                raise ValueError("gauss_kappa must be non-negative for gaussian_raw.")
+            if self.gauss_mu_amp <= 0.0:
+                raise ValueError("gauss_mu_amp must be positive for gaussian_raw.")
 
         self.rng = np.random.default_rng(self.seed)
 
         # Cosine tuning curves: mu_j(theta) = A * cos(omega * theta + phi_j)
-        # Von Mises (raw): mu_j(theta) = A * exp(kappa * cos(omega * theta - phi_j))
+        # phi_j = 2*pi*j/d (periodic phases; cosine only).
         self._mu_amp = 1.0
         self._mu_omega = 1.0
-        # phi_j = 2*pi*(j-1)/d. For d=2, mu(theta)=mu(-theta) (cosine or von_mises_raw), hence
-        # p(x|theta)=p(x|-theta) under diagonal Var_j(|mu|). For d>=3, mu(theta) != mu(-theta) in general.
         self._mu_phases = 2.0 * np.pi * np.arange(self.x_dim, dtype=np.float64) / float(self.x_dim)
+        # Von Mises / Gaussian (raw): peak centers theta_j uniform on [theta_low, theta_high];
+        # z_j = omega * (theta - theta_j). Same centers for both families.
+        self._tuning_centers_theta = _tuning_centers_uniform_theta(self.theta_low, self.theta_high, self.x_dim)
 
         self._sigma_base = np.linspace(self.sigma_x1, self.sigma_x2, self.x_dim, dtype=np.float64)
         self._sigma_activity_alpha = np.linspace(self.cov_theta_amp1, self.cov_theta_amp2, self.x_dim, dtype=np.float64)
@@ -85,24 +99,37 @@ class ToyConditionalGaussianDataset:
     def tuning_curve(self, theta: np.ndarray) -> np.ndarray:
         t = _theta_col(theta)
         ph = self._mu_phases.reshape(1, -1)
+        tc = self._tuning_centers_theta.reshape(1, -1)
         if self.tuning_curve_family == "cosine":
             return self._mu_amp * np.cos(self._mu_omega * t + ph)
-        z = self.vm_omega * t - ph
-        return self.vm_mu_amp * np.exp(self.vm_kappa * np.cos(z))
+        if self.tuning_curve_family == "von_mises_raw":
+            z = self.vm_omega * (t - tc)
+            return self.vm_mu_amp * np.exp(self.vm_kappa * np.cos(z))
+        if self.tuning_curve_family == "gaussian_raw":
+            z = self.gauss_omega * (t - tc)
+            return self.gauss_mu_amp * np.exp(-self.gauss_kappa * (z**2))
+        raise ValueError(f"Unknown tuning_curve_family: {self.tuning_curve_family!r}")
 
     def tuning_curve_derivative(self, theta: np.ndarray) -> np.ndarray:
         t = _theta_col(theta)
         ph = self._mu_phases.reshape(1, -1)
+        tc = self._tuning_centers_theta.reshape(1, -1)
         if self.tuning_curve_family == "cosine":
             return -self._mu_amp * self._mu_omega * np.sin(self._mu_omega * t + ph)
-        z = self.vm_omega * t - ph
-        return (
-            -self.vm_mu_amp
-            * np.exp(self.vm_kappa * np.cos(z))
-            * self.vm_kappa
-            * self.vm_omega
-            * np.sin(z)
-        )
+        if self.tuning_curve_family == "von_mises_raw":
+            z = self.vm_omega * (t - tc)
+            return (
+                -self.vm_mu_amp
+                * np.exp(self.vm_kappa * np.cos(z))
+                * self.vm_kappa
+                * self.vm_omega
+                * np.sin(z)
+            )
+        if self.tuning_curve_family == "gaussian_raw":
+            z = self.gauss_omega * (t - tc)
+            g = self.gauss_mu_amp * np.exp(-self.gauss_kappa * (z**2))
+            return -2.0 * self.gauss_kappa * self.gauss_omega * z * g
+        raise ValueError(f"Unknown tuning_curve_family: {self.tuning_curve_family!r}")
 
     def _variance_diag_from_mu(self, mu: np.ndarray) -> np.ndarray:
         """Var_j = sigma_base_j^2 * (1 + alpha_j * |mu_j|) + eps (diagonal Gaussian noise)."""
@@ -368,10 +395,13 @@ class ToyConditionalGMMNonGaussianDataset:
     theta_low: float = -6.0
     theta_high: float = 6.0
     x_dim: int = 2
-    tuning_curve_family: str = "cosine"  # "cosine" | "von_mises_raw"
+    tuning_curve_family: str = "cosine"  # "cosine" | "von_mises_raw" | "gaussian_raw"
     vm_mu_amp: float = 1.0
     vm_kappa: float = 1.0
     vm_omega: float = 1.0
+    gauss_mu_amp: float = 1.0
+    gauss_kappa: float = 0.2
+    gauss_omega: float = 1.0
     sigma_x1: float = 0.30
     sigma_x2: float = 0.30
     rho: float = 0.15
@@ -398,13 +428,18 @@ class ToyConditionalGMMNonGaussianDataset:
             raise ValueError("sep_scale must be positive.")
         if not (0.1 <= self.rho_clip <= 0.95):
             raise ValueError("rho_clip must be in [0.1, 0.95].")
-        if self.tuning_curve_family not in ("cosine", "von_mises_raw"):
-            raise ValueError('tuning_curve_family must be "cosine" or "von_mises_raw".')
+        if self.tuning_curve_family not in ("cosine", "von_mises_raw", "gaussian_raw"):
+            raise ValueError('tuning_curve_family must be "cosine", "von_mises_raw", or "gaussian_raw".')
         if self.tuning_curve_family == "von_mises_raw":
             if self.vm_kappa < 0.0:
                 raise ValueError("vm_kappa must be non-negative for von_mises_raw.")
             if self.vm_mu_amp <= 0.0:
                 raise ValueError("vm_mu_amp must be positive for von_mises_raw.")
+        elif self.tuning_curve_family == "gaussian_raw":
+            if self.gauss_kappa < 0.0:
+                raise ValueError("gauss_kappa must be non-negative for gaussian_raw.")
+            if self.gauss_mu_amp <= 0.0:
+                raise ValueError("gauss_mu_amp must be positive for gaussian_raw.")
 
         self.rng = np.random.default_rng(self.seed)
         idx = np.arange(1, self.x_dim + 1, dtype=np.float64)
@@ -412,6 +447,7 @@ class ToyConditionalGMMNonGaussianDataset:
         self._mu_amp = 1.0
         self._mu_omega = 1.0
         self._mu_phases = 2.0 * np.pi * np.arange(self.x_dim, dtype=np.float64) / float(self.x_dim)
+        self._tuning_centers_theta = _tuning_centers_uniform_theta(self.theta_low, self.theta_high, self.x_dim)
 
         self._sep_weight = 0.95 / (1.0 + 0.05 * (idx - 1.0))
         self._sep_freq = 0.72 + 0.09 * (idx - 1.0)
@@ -430,24 +466,37 @@ class ToyConditionalGMMNonGaussianDataset:
     def tuning_curve(self, theta: np.ndarray) -> np.ndarray:
         t = _theta_col(theta)
         ph = self._mu_phases.reshape(1, -1)
+        tc = self._tuning_centers_theta.reshape(1, -1)
         if self.tuning_curve_family == "cosine":
             return self._mu_amp * np.cos(self._mu_omega * t + ph)
-        z = self.vm_omega * t - ph
-        return self.vm_mu_amp * np.exp(self.vm_kappa * np.cos(z))
+        if self.tuning_curve_family == "von_mises_raw":
+            z = self.vm_omega * (t - tc)
+            return self.vm_mu_amp * np.exp(self.vm_kappa * np.cos(z))
+        if self.tuning_curve_family == "gaussian_raw":
+            z = self.gauss_omega * (t - tc)
+            return self.gauss_mu_amp * np.exp(-self.gauss_kappa * (z**2))
+        raise ValueError(f"Unknown tuning_curve_family: {self.tuning_curve_family!r}")
 
     def tuning_curve_derivative(self, theta: np.ndarray) -> np.ndarray:
         t = _theta_col(theta)
         ph = self._mu_phases.reshape(1, -1)
+        tc = self._tuning_centers_theta.reshape(1, -1)
         if self.tuning_curve_family == "cosine":
             return -self._mu_amp * self._mu_omega * np.sin(self._mu_omega * t + ph)
-        z = self.vm_omega * t - ph
-        return (
-            -self.vm_mu_amp
-            * np.exp(self.vm_kappa * np.cos(z))
-            * self.vm_kappa
-            * self.vm_omega
-            * np.sin(z)
-        )
+        if self.tuning_curve_family == "von_mises_raw":
+            z = self.vm_omega * (t - tc)
+            return (
+                -self.vm_mu_amp
+                * np.exp(self.vm_kappa * np.cos(z))
+                * self.vm_kappa
+                * self.vm_omega
+                * np.sin(z)
+            )
+        if self.tuning_curve_family == "gaussian_raw":
+            z = self.gauss_omega * (t - tc)
+            g = self.gauss_mu_amp * np.exp(-self.gauss_kappa * (z**2))
+            return -2.0 * self.gauss_kappa * self.gauss_omega * z * g
+        raise ValueError(f"Unknown tuning_curve_family: {self.tuning_curve_family!r}")
 
     def _mix_weight(self, theta: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         t = _theta_col(theta)

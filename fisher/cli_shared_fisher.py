@@ -36,26 +36,62 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
         "--tuning-curve-family",
         type=str,
         default="cosine",
-        choices=["cosine", "von_mises_raw"],
-        help="Mean tuning curve: cosine (default) or raw Von Mises form A*exp(kappa*cos(omega*theta-phi_j)).",
+        choices=["cosine", "von_mises_raw", "gaussian_raw"],
+        help=(
+            "Mean tuning curve: cosine (default); raw Von Mises A*exp(kappa*cos(omega*theta-phi_j)); "
+            "or Gaussian bump A*exp(-kappa*(omega*theta-phi_j)^2) (gaussian_raw)."
+        ),
     )
     p.add_argument(
         "--vm-mu-amp",
         type=float,
         default=1.0,
-        help="Amplitude A for von_mises_raw tuning curves (ignored for cosine).",
+        help=(
+            "von_mises_raw only: amplitude A in A*exp(kappa*cos(omega*(theta-theta_j))). "
+            "Centers theta_j are uniform on [theta-low, theta-high]. Ignored for cosine / gaussian_raw."
+        ),
     )
     p.add_argument(
         "--vm-kappa",
         type=float,
         default=1.0,
-        help="Concentration kappa >= 0 for von_mises_raw tuning curves (ignored for cosine).",
+        help="von_mises_raw only: concentration kappa >= 0 in exp(kappa*cos(...)). Ignored for cosine / gaussian_raw.",
     )
     p.add_argument(
         "--vm-omega",
         type=float,
         default=1.0,
-        help="Angular frequency omega for von_mises_raw tuning curves (ignored for cosine).",
+        help=(
+            "von_mises_raw only: scales (theta-theta_j) in the Von Mises phase; theta_j uniform on [theta-low, theta-high]. "
+            "Ignored for cosine / gaussian_raw."
+        ),
+    )
+    p.add_argument(
+        "--gauss-mu-amp",
+        type=float,
+        default=1.0,
+        help=(
+            "gaussian_raw only: amplitude A in A*exp(-kappa*(omega*(theta-theta_j))^2). "
+            "Centers theta_j uniform on [theta-low, theta-high]. Ignored for cosine / von_mises_raw."
+        ),
+    )
+    p.add_argument(
+        "--gauss-kappa",
+        type=float,
+        default=0.2,
+        help=(
+            "gaussian_raw only: non-negative precision kappa in exp(-kappa*(omega*(theta-theta_j))^2) "
+            "(larger = narrower bump). Ignored for cosine / von_mises_raw."
+        ),
+    )
+    p.add_argument(
+        "--gauss-omega",
+        type=float,
+        default=1.0,
+        help=(
+            "gaussian_raw only: scales (theta-theta_j) in the Gaussian bump; theta_j uniform on [theta-low, theta-high]. "
+            "Ignored for cosine / von_mises_raw."
+        ),
     )
     p.add_argument(
         "--theta-low",

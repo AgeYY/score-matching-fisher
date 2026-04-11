@@ -583,6 +583,9 @@ def build_dataset_from_meta(
             vm_mu_amp=float(meta.get("vm_mu_amp", 1.0)),
             vm_kappa=float(meta.get("vm_kappa", 1.0)),
             vm_omega=float(meta.get("vm_omega", 1.0)),
+            gauss_mu_amp=float(meta.get("gauss_mu_amp", 1.0)),
+            gauss_kappa=float(meta.get("gauss_kappa", 0.2)),
+            gauss_omega=float(meta.get("gauss_omega", 1.0)),
             sigma_x1=float(meta["sigma_x1"]),
             sigma_x2=float(meta["sigma_x2"]),
             rho=float(meta["rho"]),
@@ -607,6 +610,9 @@ def build_dataset_from_meta(
             vm_mu_amp=float(meta.get("vm_mu_amp", 1.0)),
             vm_kappa=float(meta.get("vm_kappa", 1.0)),
             vm_omega=float(meta.get("vm_omega", 1.0)),
+            gauss_mu_amp=float(meta.get("gauss_mu_amp", 1.0)),
+            gauss_kappa=float(meta.get("gauss_kappa", 0.2)),
+            gauss_omega=float(meta.get("gauss_omega", 1.0)),
             sigma_x1=float(meta["sigma_x1"]),
             sigma_x2=float(meta["sigma_x2"]),
             rho=float(meta["rho"]),
@@ -658,13 +664,18 @@ def build_dataset_from_args(
 
 
 def validate_dataset_sample_args(args: Any) -> None:
-    if getattr(args, "tuning_curve_family", "cosine") not in ("cosine", "von_mises_raw"):
-        raise ValueError('--tuning-curve-family must be "cosine" or "von_mises_raw".')
+    if getattr(args, "tuning_curve_family", "cosine") not in ("cosine", "von_mises_raw", "gaussian_raw"):
+        raise ValueError('--tuning-curve-family must be "cosine", "von_mises_raw", or "gaussian_raw".')
     if getattr(args, "tuning_curve_family", "cosine") == "von_mises_raw":
         if float(getattr(args, "vm_kappa", 0.0)) < 0.0:
             raise ValueError("--vm-kappa must be non-negative for von_mises_raw.")
         if float(getattr(args, "vm_mu_amp", 0.0)) <= 0.0:
             raise ValueError("--vm-mu-amp must be positive for von_mises_raw.")
+    elif getattr(args, "tuning_curve_family", "cosine") == "gaussian_raw":
+        if float(getattr(args, "gauss_kappa", 0.0)) < 0.0:
+            raise ValueError("--gauss-kappa must be non-negative for gaussian_raw.")
+        if float(getattr(args, "gauss_mu_amp", 0.0)) <= 0.0:
+            raise ValueError("--gauss-mu-amp must be positive for gaussian_raw.")
     if args.x_dim < 2:
         raise ValueError("--x-dim must be >= 2.")
     if str(getattr(args, "dataset_family", "")) in (

@@ -27,3 +27,7 @@ mamba run -n geo_diffusion python run_fisher.py decoder ... --device cuda
 ## Notes
 
 - If CUDA is unavailable on the current machine, stop and report that constraint instead of silently switching to CPU.
+
+## Output paths (agent replies)
+
+- When reporting where a script wrote files (datasets, figures, logs, run directories, NPZ/CSV/PNG, etc.), **always state the full absolute path** to the artifact or directory (e.g. `/grad/zeyuan/score-matching-fisher/data/...` or the resolved `DATAROOT` path from `global_setting.py`). Do not rely on repo-relative paths alone (`data/foo`) as the only location the user sees.
