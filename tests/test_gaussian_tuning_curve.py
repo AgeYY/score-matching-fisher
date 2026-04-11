@@ -12,6 +12,8 @@ import numpy as np
 from fisher.cli_shared_fisher import add_dataset_arguments
 from fisher.data import (
     ToyConditionalGaussianDataset,
+    ToyConditionalGaussianRandampDataset,
+    ToyConditionalGaussianRandampSqrtdDataset,
     ToyConditionalGaussianSqrtdDataset,
     _tuning_centers_uniform_theta,
 )
@@ -226,6 +228,63 @@ class TestGaussianTuningCurve(unittest.TestCase):
         sgs = gs.covariance_scales(t0)
         np.testing.assert_allclose(sgs / sg, float(np.sqrt(d)), rtol=1e-7)
 
+    def test_gaussian_randamp_same_seed_same_amps(self) -> None:
+        d1 = ToyConditionalGaussianRandampDataset(x_dim=5, seed=123)
+        d2 = ToyConditionalGaussianRandampDataset(x_dim=5, seed=123)
+        np.testing.assert_allclose(d1._randamp_amp, d2._randamp_amp)
+
+    def test_build_gaussian_randamp_family_samples(self) -> None:
+        ns = _ns(
+            dataset_family="gaussian_randamp",
+            x_dim=4,
+            n_total=64,
+            train_frac=1.0,
+            seed=0,
+            randamp_kappa=0.3,
+            randamp_omega=0.8,
+        )
+        validate_dataset_sample_args(ns)
+        ds = build_dataset_from_args(ns)
+        self.assertIsInstance(ds, ToyConditionalGaussianRandampDataset)
+        theta, x = ds.sample_joint(32)
+        self.assertEqual(theta.shape, (32, 1))
+        self.assertEqual(x.shape, (32, 4))
+        self.assertTrue(np.isfinite(x).all())
+
+    def test_build_gaussian_randamp_sqrtd_family_samples(self) -> None:
+        ns = _ns(
+            dataset_family="gaussian_randamp_sqrtd",
+            x_dim=4,
+            n_total=32,
+            train_frac=1.0,
+            seed=1,
+        )
+        validate_dataset_sample_args(ns)
+        ds = build_dataset_from_args(ns)
+        self.assertIsInstance(ds, ToyConditionalGaussianRandampSqrtdDataset)
+        theta, x = ds.sample_joint(16)
+        self.assertEqual(x.shape, (16, 4))
+        self.assertTrue(np.isfinite(x).all())
+
+    def test_meta_roundtrip_gaussian_randamp(self) -> None:
+        ns = _ns(
+            dataset_family="gaussian_randamp",
+            x_dim=4,
+            n_total=10,
+            train_frac=1.0,
+            seed=42,
+            randamp_kappa=0.25,
+            randamp_omega=0.9,
+        )
+        validate_dataset_sample_args(ns)
+        ds0 = build_dataset_from_args(ns)
+        meta = meta_dict_from_args(ns)
+        meta["randamp_mu_amp_per_dim"] = ds0._randamp_amp.tolist()
+        ds = build_dataset_from_meta(meta)
+        self.assertIsInstance(ds, ToyConditionalGaussianRandampDataset)
+        t0 = np.array([[0.1]])
+        np.testing.assert_allclose(ds.tuning_curve(t0), ds0.tuning_curve(t0), rtol=0, atol=1e-15)
+
     def test_build_gaussian_sqrtd_family_samples(self) -> None:
         ns = _ns(
             dataset_family="gaussian_sqrtd",
@@ -296,6 +355,42 @@ class TestGaussianTuningCurve(unittest.TestCase):
         self.assertEqual(bundle.meta["dataset_family"], "gaussian_sqrtd")
         ds2 = build_dataset_from_meta(bundle.meta)
         self.assertIsInstance(ds2, ToyConditionalGaussianSqrtdDataset)
+        np.testing.assert_allclose(bundle.x_all, x_all)
+
+    def test_npz_save_load_gaussian_randamp(self) -> None:
+        ns = _ns(
+            dataset_family="gaussian_randamp",
+            tuning_curve_family="cosine",
+            x_dim=4,
+            n_total=20,
+            train_frac=1.0,
+            seed=7,
+        )
+        validate_dataset_sample_args(ns)
+        ds = build_dataset_from_args(ns)
+        theta_all, x_all = ds.sample_joint(20)
+        meta = meta_dict_from_args(ns)
+        meta["randamp_mu_amp_per_dim"] = ds._randamp_amp.tolist()
+        tr = np.arange(20, dtype=np.int64)
+        ev = np.array([], dtype=np.int64)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ds.npz"
+            save_shared_dataset_npz(
+                path,
+                meta=meta,
+                theta_all=theta_all,
+                x_all=x_all,
+                train_idx=tr,
+                eval_idx=ev,
+                theta_train=theta_all,
+                x_train=x_all,
+                theta_eval=np.empty((0, 1), dtype=np.float64),
+                x_eval=np.empty((0, 4), dtype=np.float64),
+            )
+            bundle = load_shared_dataset_npz(path)
+        self.assertEqual(bundle.meta["dataset_family"], "gaussian_randamp")
+        ds2 = build_dataset_from_meta(bundle.meta)
+        self.assertIsInstance(ds2, ToyConditionalGaussianRandampDataset)
         np.testing.assert_allclose(bundle.x_all, x_all)
 
 

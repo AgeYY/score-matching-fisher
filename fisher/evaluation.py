@@ -8,6 +8,8 @@ import torch
 from fisher.data import (
     ToyConditionalGMMNonGaussianDataset,
     ToyConditionalGaussianDataset,
+    ToyConditionalGaussianRandampDataset,
+    ToyConditionalGaussianRandampSqrtdDataset,
     ToyConditionalGaussianSqrtdDataset,
     ToyCosSinPiecewiseNoiseDataset,
     ToyLinearPiecewiseNoiseDataset,
@@ -35,6 +37,8 @@ def log_p_x_given_theta(
     theta: np.ndarray,
     dataset: ToyConditionalGaussianDataset
     | ToyConditionalGaussianSqrtdDataset
+    | ToyConditionalGaussianRandampDataset
+    | ToyConditionalGaussianRandampSqrtdDataset
     | ToyCosSinPiecewiseNoiseDataset
     | ToyLinearPiecewiseNoiseDataset,
 ) -> np.ndarray:

@@ -16,11 +16,17 @@ SHARED_DATASET_NPZ_VERSION = 1
 def apply_sigma_defaults_for_dataset_family(ns: Any) -> None:
     """Set ``sigma_x1`` / ``sigma_x2`` when omitted (``None``) on the argparse namespace.
 
-    ``gaussian_sqrtd`` defaults to 0.1; other Gaussian/GMM families default to 0.30.
-    If only one of the two is omitted, it is set to match the resolved ``sigma_x1``.
+    ``gaussian_sqrtd`` defaults to 0.1; ``gaussian_randamp_sqrtd`` defaults to 0.2; other Gaussian/GMM
+    families default to 0.30. If only one of the two is omitted, it is set to match the resolved
+    ``sigma_x1``.
     """
     fam = str(getattr(ns, "dataset_family", "gaussian"))
-    default_sigma = 0.1 if fam == "gaussian_sqrtd" else 0.30
+    if fam == "gaussian_sqrtd":
+        default_sigma = 0.1
+    elif fam == "gaussian_randamp_sqrtd":
+        default_sigma = 0.2
+    else:
+        default_sigma = 0.30
     if getattr(ns, "sigma_x1", None) is None:
         ns.sigma_x1 = default_sigma
     if getattr(ns, "sigma_x2", None) is None:
@@ -43,7 +49,7 @@ class SharedDatasetBundle:
 def meta_dict_from_args(ns: Any) -> dict[str, Any]:
     """Build JSON-serializable metadata from an argparse-like namespace (dataset fields)."""
     apply_sigma_defaults_for_dataset_family(ns)
-    return {
+    out: dict[str, Any] = {
         "version": SHARED_DATASET_NPZ_VERSION,
         "dataset_family": str(ns.dataset_family),
         "tuning_curve_family": str(ns.tuning_curve_family),
@@ -53,6 +59,10 @@ def meta_dict_from_args(ns: Any) -> dict[str, Any]:
         "gauss_mu_amp": float(getattr(ns, "gauss_mu_amp", 1.0)),
         "gauss_kappa": float(getattr(ns, "gauss_kappa", 0.2)),
         "gauss_omega": float(getattr(ns, "gauss_omega", 1.0)),
+        "randamp_mu_low": float(getattr(ns, "randamp_mu_low", 0.5)),
+        "randamp_mu_high": float(getattr(ns, "randamp_mu_high", 1.5)),
+        "randamp_kappa": float(getattr(ns, "randamp_kappa", 0.2)),
+        "randamp_omega": float(getattr(ns, "randamp_omega", 1.0)),
         "seed": int(ns.seed),
         "theta_low": float(ns.theta_low),
         "theta_high": float(ns.theta_high),
@@ -87,6 +97,12 @@ def meta_dict_from_args(ns: Any) -> dict[str, Any]:
         "n_total": int(ns.n_total),
         "train_frac": float(ns.train_frac),
     }
+    _ra = getattr(ns, "randamp_mu_amp_per_dim", None)
+    if _ra is not None:
+        out["randamp_mu_amp_per_dim"] = np.asarray(_ra, dtype=np.float64).reshape(-1).tolist()
+    else:
+        out["randamp_mu_amp_per_dim"] = None
+    return out
 
 
 def _shared_dataset_meta_keys() -> frozenset[str]:
@@ -104,6 +120,10 @@ def _shared_dataset_meta_keys() -> frozenset[str]:
         gauss_mu_amp=1.0,
         gauss_kappa=0.2,
         gauss_omega=1.0,
+        randamp_mu_low=0.5,
+        randamp_mu_high=1.5,
+        randamp_kappa=0.2,
+        randamp_omega=1.0,
         seed=0,
         theta_low=-6.0,
         theta_high=6.0,

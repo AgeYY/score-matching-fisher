@@ -15,6 +15,8 @@ from global_setting import SCORE_VAL_FRACTION
 from fisher.data import (
     ToyConditionalGMMNonGaussianDataset,
     ToyConditionalGaussianDataset,
+    ToyConditionalGaussianRandampDataset,
+    ToyConditionalGaussianRandampSqrtdDataset,
     ToyConditionalGaussianSqrtdDataset,
     ToyCosSinPiecewiseNoiseDataset,
     ToyLinearPiecewiseNoiseDataset,
@@ -574,6 +576,8 @@ def build_dataset_from_meta(
 ) -> (
     ToyConditionalGaussianDataset
     | ToyConditionalGaussianSqrtdDataset
+    | ToyConditionalGaussianRandampDataset
+    | ToyConditionalGaussianRandampSqrtdDataset
     | ToyCosSinPiecewiseNoiseDataset
     | ToyLinearPiecewiseNoiseDataset
     | ToyConditionalGMMNonGaussianDataset
@@ -634,6 +638,82 @@ def build_dataset_from_meta(
             rho_clip=float(meta["rho_clip"]),
             seed=seed,
         )
+    if family == "gaussian_randamp":
+        amps_raw = meta.get("randamp_mu_amp_per_dim")
+        amps: np.ndarray | None
+        if amps_raw is not None:
+            amps = np.asarray(amps_raw, dtype=np.float64).reshape(-1)
+        else:
+            amps = None
+        return ToyConditionalGaussianRandampDataset(
+            theta_low=float(meta["theta_low"]),
+            theta_high=float(meta["theta_high"]),
+            x_dim=int(meta["x_dim"]),
+            tuning_curve_family=str(meta.get("tuning_curve_family", "cosine")),
+            vm_mu_amp=float(meta.get("vm_mu_amp", 1.0)),
+            vm_kappa=float(meta.get("vm_kappa", 1.0)),
+            vm_omega=float(meta.get("vm_omega", 1.0)),
+            gauss_mu_amp=float(meta.get("gauss_mu_amp", 1.0)),
+            gauss_kappa=float(meta.get("gauss_kappa", 0.2)),
+            gauss_omega=float(meta.get("gauss_omega", 1.0)),
+            sigma_x1=float(meta["sigma_x1"]),
+            sigma_x2=float(meta["sigma_x2"]),
+            rho=float(meta["rho"]),
+            cov_theta_amp1=float(meta["cov_theta_amp1"]),
+            cov_theta_amp2=float(meta["cov_theta_amp2"]),
+            cov_theta_amp_rho=float(meta["cov_theta_amp_rho"]),
+            cov_theta_freq1=float(meta["cov_theta_freq1"]),
+            cov_theta_freq2=float(meta["cov_theta_freq2"]),
+            cov_theta_freq_rho=float(meta["cov_theta_freq_rho"]),
+            cov_theta_phase1=float(meta["cov_theta_phase1"]),
+            cov_theta_phase2=float(meta["cov_theta_phase2"]),
+            cov_theta_phase_rho=float(meta["cov_theta_phase_rho"]),
+            rho_clip=float(meta["rho_clip"]),
+            randamp_mu_low=float(meta.get("randamp_mu_low", 0.5)),
+            randamp_mu_high=float(meta.get("randamp_mu_high", 1.5)),
+            randamp_kappa=float(meta.get("randamp_kappa", 0.2)),
+            randamp_omega=float(meta.get("randamp_omega", 1.0)),
+            randamp_mu_amp_per_dim=amps,
+            seed=seed,
+        )
+    if family == "gaussian_randamp_sqrtd":
+        amps_raw = meta.get("randamp_mu_amp_per_dim")
+        amps_sqrt: np.ndarray | None
+        if amps_raw is not None:
+            amps_sqrt = np.asarray(amps_raw, dtype=np.float64).reshape(-1)
+        else:
+            amps_sqrt = None
+        return ToyConditionalGaussianRandampSqrtdDataset(
+            theta_low=float(meta["theta_low"]),
+            theta_high=float(meta["theta_high"]),
+            x_dim=int(meta["x_dim"]),
+            tuning_curve_family=str(meta.get("tuning_curve_family", "cosine")),
+            vm_mu_amp=float(meta.get("vm_mu_amp", 1.0)),
+            vm_kappa=float(meta.get("vm_kappa", 1.0)),
+            vm_omega=float(meta.get("vm_omega", 1.0)),
+            gauss_mu_amp=float(meta.get("gauss_mu_amp", 1.0)),
+            gauss_kappa=float(meta.get("gauss_kappa", 0.2)),
+            gauss_omega=float(meta.get("gauss_omega", 1.0)),
+            sigma_x1=float(meta["sigma_x1"]),
+            sigma_x2=float(meta["sigma_x2"]),
+            rho=float(meta["rho"]),
+            cov_theta_amp1=float(meta["cov_theta_amp1"]),
+            cov_theta_amp2=float(meta["cov_theta_amp2"]),
+            cov_theta_amp_rho=float(meta["cov_theta_amp_rho"]),
+            cov_theta_freq1=float(meta["cov_theta_freq1"]),
+            cov_theta_freq2=float(meta["cov_theta_freq2"]),
+            cov_theta_freq_rho=float(meta["cov_theta_freq_rho"]),
+            cov_theta_phase1=float(meta["cov_theta_phase1"]),
+            cov_theta_phase2=float(meta["cov_theta_phase2"]),
+            cov_theta_phase_rho=float(meta["cov_theta_phase_rho"]),
+            rho_clip=float(meta["rho_clip"]),
+            randamp_mu_low=float(meta.get("randamp_mu_low", 0.5)),
+            randamp_mu_high=float(meta.get("randamp_mu_high", 1.5)),
+            randamp_kappa=float(meta.get("randamp_kappa", 0.2)),
+            randamp_omega=float(meta.get("randamp_omega", 1.0)),
+            randamp_mu_amp_per_dim=amps_sqrt,
+            seed=seed,
+        )
     if family == "gmm_non_gauss":
         return ToyConditionalGMMNonGaussianDataset(
             theta_low=float(meta["theta_low"]),
@@ -690,6 +770,8 @@ def build_dataset_from_args(
 ) -> (
     ToyConditionalGaussianDataset
     | ToyConditionalGaussianSqrtdDataset
+    | ToyConditionalGaussianRandampDataset
+    | ToyConditionalGaussianRandampSqrtdDataset
     | ToyCosSinPiecewiseNoiseDataset
     | ToyLinearPiecewiseNoiseDataset
     | ToyConditionalGMMNonGaussianDataset
@@ -711,6 +793,15 @@ def validate_dataset_sample_args(args: Any) -> None:
             raise ValueError("--gauss-kappa must be non-negative for gaussian_raw.")
         if float(getattr(args, "gauss_mu_amp", 0.0)) <= 0.0:
             raise ValueError("--gauss-mu-amp must be positive for gaussian_raw.")
+    if str(getattr(args, "dataset_family", "")) in ("gaussian_randamp", "gaussian_randamp_sqrtd"):
+        _rlo = float(getattr(args, "randamp_mu_low", 0.5))
+        _rhi = float(getattr(args, "randamp_mu_high", 1.5))
+        if not (_rlo < _rhi):
+            raise ValueError(
+                "gaussian_randamp / gaussian_randamp_sqrtd require --randamp-mu-low < --randamp-mu-high."
+            )
+        if float(getattr(args, "randamp_kappa", 0.0)) < 0.0:
+            raise ValueError("--randamp-kappa must be non-negative for gaussian_randamp families.")
     if args.x_dim < 2:
         raise ValueError("--x-dim must be >= 2.")
     if str(getattr(args, "dataset_family", "")) in (
@@ -836,7 +927,7 @@ def validate_estimation_args(args: Any) -> None:
         raise ValueError("--flow-early-min-delta must be non-negative.")
     if not (0.0 < float(getattr(args, "flow_early_ema_alpha", 0.05)) <= 1.0):
         raise ValueError("--flow-early-ema-alpha must be in (0, 1].")
-    if not (0.0 <= float(getattr(args, "flow_eval_t", 0.5)) <= 1.0):
+    if not (0.0 <= float(getattr(args, "flow_eval_t", 0.9)) <= 1.0):
         raise ValueError("--flow-eval-t must be in [0, 1].")
     if bool(getattr(args, "compute_h_matrix", False)) and not bool(getattr(args, "prior_enable", True)):
         raise ValueError("--compute-h-matrix requires prior score; do not use --no-prior-score.")
@@ -1010,7 +1101,7 @@ def run_shared_fisher_estimation(
     if theta_field_method == "flow":
         if not bool(getattr(args, "prior_enable", True)):
             raise ValueError("theta_field_method=flow currently requires prior model enabled.")
-        flow_eval_t = float(getattr(args, "flow_eval_t", 0.5))
+        flow_eval_t = float(getattr(args, "flow_eval_t", 0.9))
         if not (0.0 <= flow_eval_t <= 1.0):
             raise ValueError("--flow-eval-t must be in [0, 1].")
         theta_std = float(np.std(theta_score_fit))
@@ -1737,7 +1828,14 @@ def run_shared_fisher_estimation(
         debug_bins=bool(getattr(args, "decoder_debug_bins", False)),
     )
 
-    if args.dataset_family in ("gaussian", "gaussian_sqrtd", "cos_sin_piecewise_noise", "linear_piecewise_noise"):
+    if args.dataset_family in (
+        "gaussian",
+        "gaussian_sqrtd",
+        "gaussian_randamp",
+        "gaussian_randamp_sqrtd",
+        "cos_sin_piecewise_noise",
+        "linear_piecewise_noise",
+    ):
         gt = analytic_fisher_curve(centers, dataset)
         gt_se = np.full_like(gt, np.nan)
     else:
@@ -2129,7 +2227,7 @@ def run_shared_fisher_estimation(
             f.write(f"h_matrix_heatmap: {h_fig_path}\n")
             if h_delta_fig_path:
                 f.write(f"delta_l_heatmap: {h_delta_fig_path}\n")
-        if args.dataset_family in ("gaussian", "gaussian_sqrtd"):
+        if args.dataset_family in ("gaussian", "gaussian_sqrtd", "gaussian_randamp", "gaussian_randamp_sqrtd"):
             _a = 0.5 * (float(args.cov_theta_amp1) + float(args.cov_theta_amp2))
             f.write(
                 "cov_theta: "

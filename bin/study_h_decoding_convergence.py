@@ -5,19 +5,20 @@
 estimated by Monte Carlo from the known toy likelihood (see ``fisher/hellinger_gt.py`` and
 ``report/notes/hellinger_idea.tex``). With ``n_bins`` = ``--num-theta-bins``, the MC count per
 bin row is ``n_mc = n_ref // n_bins`` (integer floor); ``n_bins * n_mc`` may be less than ``n_ref``.
-Reference **training** still uses the full ``--n-ref`` subset.
+Nested subset training for each ``n`` in ``--n-list`` uses up to ``n`` samples; the ``n_ref`` column does not train a model.
 
-**Pairwise decoding:** off-diagonal correlation vs the decoding matrix from the large-$n$
-reference run (``--n-ref``), unchanged.
+**Pairwise decoding:** off-diagonal correlation vs the decoding matrix from the ``--n-ref``
+subset (same bin edges as GT), unchanged.
 
 **Dataset:** the loaded NPZ must match ``--dataset-family`` (default ``gaussian_sqrtd`` with
 ``gaussian_raw`` tuning from ``make_dataset.py``). Regenerate the NPZ if the family does not match.
 
-The H matrix is computed from trained **posterior** and **prior** denoising score models
-(DSM). This script defaults to **multi-layer FiLM** for the posterior (``--score-arch film``,
-``--score-depth 3``) and a **3-layer MLP** prior (``--prior-score-arch mlp``). After training,
-``HMatrixEstimator`` combines score evaluations into
-the sample H matrix, which is then theta-binned for comparison.
+For each ``n`` in ``--n-list``, the H matrix is computed from trained **posterior** and **prior**
+models (``--theta-field-method dsm`` or ``flow``). This script defaults to **multi-layer FiLM**
+for the posterior (``--score-arch film``, ``--score-depth 3``) and a **3-layer MLP** prior
+(``--prior-score-arch mlp``). The **reference column** (``n_ref``) does **not** run DSM/flow: the
+matrix-panel top row uses the **MC generative GT** Hellinger matrix (same as the correlation
+target), while the bottom row still shows pairwise decoding on the ``n_ref`` data subset.
 """
 
 from __future__ import annotations
@@ -52,7 +53,6 @@ from fisher.shared_fisher_est import (
     build_dataset_from_meta,
     merge_meta_into_args,
     require_device,
-    run_shared_fisher_estimation,
     validate_estimation_args,
 )
 
@@ -60,8 +60,9 @@ from fisher.shared_fisher_est import (
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
-            "Load a shared dataset .npz, train score models per subset, then compare binned H to a "
-            "Monte Carlo generative Hellinger GT and pairwise decoding to the n_ref decoding matrix. "
+            "Load a shared dataset .npz, train score models for each n in --n-list, then compare binned H to a "
+            "Monte Carlo generative Hellinger GT and pairwise decoding to the n_ref-subset decoding matrix. "
+            "The n_ref matrix-panel column uses MC GT for the top row (no n_ref model training). "
             "Also writes h_decoding_convergence_combined.{png,svg} (line plot + matrix panel side-by-side)."
         )
     )
@@ -78,6 +79,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=[
             "gaussian",
             "gaussian_sqrtd",
+            "gaussian_randamp",
+            "gaussian_randamp_sqrtd",
             "gmm_non_gauss",
             "cos_sin_piecewise_noise",
             "linear_piecewise_noise",
@@ -295,6 +298,39 @@ def _metrics_fixed_edges(
     return h_binned, clf_acc
 
 
+def _pairwise_clf_from_bundle(
+    *,
+    args: argparse.Namespace,
+    meta: dict,
+    bundle: SharedDatasetBundle,
+    output_dir: str,
+    edges: np.ndarray,
+    n_bins: int,
+    clf_test_frac: float,
+    clf_min_class_count: int,
+    clf_random_state: int,
+) -> np.ndarray:
+    """Pairwise bin decoding matrix without training or loading an H-matrix (same split as H path)."""
+    d = vars(args).copy()
+    d.setdefault("h_matrix_npz", None)
+    d.setdefault("h_only", False)
+    args2 = argparse.Namespace(**d)
+    args2.output_dir = output_dir
+    full_args = _make_full_args(args2, meta)
+    theta = vhb.theta_for_h_matrix_alignment(bundle, full_args)
+    x = vhb.x_for_h_matrix_alignment(bundle, full_args)
+    bin_idx = vhb.theta_to_bin_index(theta, edges, n_bins)
+    clf_acc, _, _, _ = vhb.pairwise_bin_logistic_accuracy_matrix(
+        x,
+        bin_idx,
+        n_bins,
+        test_frac=float(clf_test_frac),
+        min_class_count=int(clf_min_class_count),
+        random_state=int(clf_random_state),
+    )
+    return clf_acc
+
+
 def _estimate_one(
     *,
     args: argparse.Namespace,
@@ -422,7 +458,7 @@ def _render_matrix_panel(
         axes[0, c].set_yticks(range(n_bins))
         axes[0, c].tick_params(labelsize=7)
         if c == 0:
-            axes[0, c].set_ylabel("Binned H", fontsize=11)
+            axes[0, c].set_ylabel("Binned H / GT (n_ref)", fontsize=11)
         plt.colorbar(im0, ax=axes[0, c], fraction=0.046, pad=0.04)
 
         im1 = axes[1, c].imshow(
@@ -441,8 +477,9 @@ def _render_matrix_panel(
         plt.colorbar(im1, ax=axes[1, c], fraction=0.046, pad=0.04)
 
     fig.suptitle(
-        "Binned H and pairwise decoding (rows 1–2) by nested subset size",
-        fontsize=11,
+        "Top: learned binned H for each n; last column n_ref shows MC GT H². "
+        "Bottom: pairwise decoding (rows 1–2) by nested subset size.",
+        fontsize=10,
     )
     fig.tight_layout()
     _save_figure_png_svg(fig, out_path, dpi=160)
@@ -543,48 +580,45 @@ def main(argv: list[str] | None = None) -> None:
 
     ref_dir = os.path.join(args.output_dir, "reference")
     os.makedirs(ref_dir, exist_ok=True)
+    tfm = str(getattr(args, "theta_field_method", "dsm")).strip().lower()
     print(
-        "[convergence] H from DSM: posterior + prior score nets "
+        f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
         f"(score_arch={getattr(args, 'score_arch', 'mlp')}, "
         f"prior_arch={getattr(args, 'prior_score_arch', 'mlp')})",
         flush=True,
     )
-    print(f"[convergence] reference n={args.n_ref} -> {ref_dir}", flush=True)
+    print(
+        "[convergence] n_ref reference: no DSM/flow training; matrix-panel top row = MC GT H^2; "
+        "pairwise decoding from n_ref subset only.",
+        flush=True,
+    )
+    print(f"[convergence] reference dir (decoding-only artifacts) n={args.n_ref} -> {ref_dir}", flush=True)
     print(f"[convergence] n_list={ns}", flush=True)
     t0 = time.time()
     bundle_ref = _subset_bundle(bundle, perm, int(args.n_ref), meta)
-    loaded_ref, x_ref, _ = _estimate_one(
+    h_ref = np.asarray(h_gt_mc, dtype=np.float64)
+    clf_ref = _pairwise_clf_from_bundle(
         args=args,
         meta=meta,
         bundle=bundle_ref,
         output_dir=ref_dir,
+        edges=edges,
         n_bins=n_bins,
+        clf_test_frac=float(args.clf_test_frac),
+        clf_min_class_count=int(args.clf_min_class_count),
+        clf_random_state=clf_rs,
     )
-    h_ref, clf_ref = _metrics_fixed_edges(
-        loaded_ref,
-        x_ref,
-        edges,
-        n_bins,
-        float(args.clf_test_frac),
-        int(args.clf_min_class_count),
-        clf_rs,
-    )
-    print(f"[convergence] reference wall time: {time.time() - t0:.1f}s")
+    print(f"[convergence] reference (GT + decoding) wall time: {time.time() - t0:.1f}s")
 
     loss_dir = os.path.join(args.output_dir, "training_losses")
     os.makedirs(loss_dir, exist_ok=True)
-    ref_loss_npz = os.path.join(ref_dir, "score_prior_training_losses.npz")
-    if os.path.isfile(ref_loss_npz):
-        shutil.copy2(
-            ref_loss_npz,
-            os.path.join(loss_dir, f"n_ref_{int(args.n_ref)}.npz"),
-        )
 
     np.savez_compressed(
         os.path.join(args.output_dir, "h_decoding_convergence_reference.npz"),
         h_binned_ref=h_ref,
         clf_acc_ref=clf_ref,
         hellinger_gt_sq_mc=h_gt_mc,
+        h_binned_ref_is_gt_mc=np.int32(1),
         theta_bin_centers=centers,
         gt_hellinger_n_mc=np.int64(gt_n_mc),
         gt_hellinger_n_ref_budget=np.int64(args.n_ref),
@@ -684,6 +718,7 @@ def main(argv: list[str] | None = None) -> None:
         gt_hellinger_n_ref_budget=np.int64(args.n_ref),
         gt_hellinger_seed=np.int64(gt_seed),
         gt_hellinger_symmetrize=np.int32(1 if bool(args.gt_hellinger_symmetrize) else 0),
+        h_binned_ref_is_gt_mc=np.int32(1),
         h_binned_columns=h_cols,
         clf_acc_columns=clf_cols,
         column_n=column_n,
@@ -737,7 +772,7 @@ def main(argv: list[str] | None = None) -> None:
     plt.close(fig)
 
     matrix_panel_path = os.path.join(args.output_dir, "h_decoding_matrices_panel.png")
-    col_labels = [f"n={n}" for n in ns] + [f"n_ref={int(args.n_ref)}"]
+    col_labels = [f"n={n}" for n in ns] + [f"n_ref={int(args.n_ref)} (GT MC)"]
     _render_matrix_panel(
         h_mats=list(h_cols),
         clf_mats=list(clf_cols),
@@ -749,13 +784,10 @@ def main(argv: list[str] | None = None) -> None:
     combined_path = os.path.join(args.output_dir, "h_decoding_convergence_combined.png")
     combined_svg = _save_combined_convergence_figure(fig_path, matrix_panel_path, combined_path, dpi=160)
 
-    manifest_lines = [
-        f"n_ref_{int(args.n_ref)}\ttraining_losses/n_ref_{int(args.n_ref)}.npz",
-        *[f"{n}\ttraining_losses/n_{n:06d}.npz" for n in ns],
-    ]
+    manifest_lines = [f"{n}\ttraining_losses/n_{n:06d}.npz" for n in ns]
     manifest_path = os.path.join(loss_dir, "manifest.txt")
     with open(manifest_path, "w", encoding="utf-8") as mf:
-        mf.write("# n_or_nref_label\trelative_path (score_prior_training_losses copies)\n")
+        mf.write("# n_label\trelative_path (score_prior_training_losses copies; n_ref has no model run)\n")
         for line in manifest_lines:
             mf.write(line + "\n")
 
@@ -779,10 +811,13 @@ def main(argv: list[str] | None = None) -> None:
     with open(summary_path, "a", encoding="utf-8") as sf:
         sf.write("\n# Correlation targets\n")
         sf.write(
-            "# corr_h_binned_vs_gt_mc: binned DSM H-matrix vs generative GT (MC one-sided Hellinger).\n"
+            "# corr_h_binned_vs_gt_mc: binned learned H vs generative GT (MC one-sided Hellinger).\n"
         )
         sf.write(
-            "# corr_clf_vs_ref: pairwise decoding vs n_ref decoding matrix from reference run.\n"
+            "# corr_clf_vs_ref: pairwise decoding vs n_ref subset decoding matrix (same bin edges).\n"
+        )
+        sf.write(
+            "# h_binned_columns last column: MC GT H^2 (not DSM/flow); see h_binned_ref_is_gt_mc=1.\n"
         )
         sf.write(
             f"gt_hellinger_n_mc: {int(gt_n_mc)}  # MC samples per bin row; floor(n_ref / num_theta_bins)\n"

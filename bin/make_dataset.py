@@ -49,6 +49,12 @@ Parameter reference (all available flags in this script):
       gaussian_sqrtd
         Same generative structure as gaussian, but observation noise std scales by sqrt(x_dim)
         (variance scaled by x_dim) to avoid extreme SNR when dimension is large.
+      gaussian_randamp
+        Gaussian bumps (same centers as gaussian_raw) with per-dimension amplitude a_j sampled once
+        from Uniform(randamp-mu-low, randamp-mu-high); width via --randamp-kappa and --randamp-omega.
+        NPZ meta stores the sampled per-dim amplitudes. Ignores --tuning-curve-family / --gauss-*.
+      gaussian_randamp_sqrtd
+        Same as gaussian_randamp, but observation noise std scales by sqrt(x_dim) (variance times x_dim).
       gmm_non_gauss
         Theta-dependent two-component GMM (non-Gaussian conditional).
       cos_sin_piecewise_noise
@@ -73,16 +79,22 @@ Parameter reference (all available flags in this script):
       Not used for --dataset-family linear_piecewise_noise (fixed linear tuning) or
       cos_sin_piecewise_noise.
 
+  Random-amplitude Gaussian bumps (gaussian_randamp only):
+    --randamp-mu-low, --randamp-mu-high
+      Bounds for per-dimension amplitude a_j (uniform). Defaults: 0.5, 1.5.
+    --randamp-kappa, --randamp-omega
+      Precision and scale in a_j*exp(-kappa*(omega*(theta-theta_j))^2). Defaults: 0.2, 1.0.
+
   Baseline covariance/noise (Gaussian and GMM families):
     --sigma-x1, --sigma-x2
-      Baseline per-axis observation std. Defaults: 0.30 for gaussian / gmm_non_gauss; 0.10 for
-      gaussian_sqrtd (omit both to use the family default).
+      Baseline per-axis observation std. Defaults: 0.30 for gaussian / gmm_non_gauss / gaussian_randamp;
+      0.10 for gaussian_sqrtd; 0.20 for gaussian_randamp_sqrtd (omit both to use the family default).
     --rho
       Baseline correlation before theta modulation. Default: 0.15.
     --rho-clip
       Clamp on |rho(theta)| after modulation for numerical stability. Default: 0.85.
 
-  Theta-modulated covariance (gaussian / gaussian_sqrtd families):
+  Theta-modulated covariance (gaussian / gaussian_sqrtd / gaussian_randamp / gaussian_randamp_sqrtd families):
     --cov-theta-amp1, --cov-theta-amp2, --cov-theta-amp-rho
       Mean–activity coupling uses alpha = (amp1+amp2)/2 (same for every dimension) in
       Var_j = sigma_base_j^2 * (1 + alpha*|mu_j|). amp_rho is reserved for correlation (not used in
@@ -175,6 +187,8 @@ def main() -> None:
     theta_eval, x_eval = theta_all[ev_idx], x_all[ev_idx]
 
     meta = meta_dict_from_args(args)
+    if str(args.dataset_family) in ("gaussian_randamp", "gaussian_randamp_sqrtd"):
+        meta["randamp_mu_amp_per_dim"] = dataset._randamp_amp.tolist()
     save_shared_dataset_npz(
         args.output_npz,
         meta=meta,

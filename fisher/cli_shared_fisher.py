@@ -27,6 +27,8 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
         choices=[
             "gaussian",
             "gaussian_sqrtd",
+            "gaussian_randamp",
+            "gaussian_randamp_sqrtd",
             "gmm_non_gauss",
             "cos_sin_piecewise_noise",
             "linear_piecewise_noise",
@@ -34,6 +36,8 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
         help=(
             "Generative family: 'gaussian' (theta-modulated Gaussian obs. noise); "
             "'gaussian_sqrtd' (same as gaussian but obs. noise std scales by sqrt(x_dim)); "
+            "'gaussian_randamp' (Gaussian bumps with per-dim random amplitudes, see --randamp-*); "
+            "'gaussian_randamp_sqrtd' (same as gaussian_randamp but obs. noise std scales by sqrt(x_dim)); "
             "'gmm_non_gauss' (theta-dependent 2-component mixture); "
             "'cos_sin_piecewise_noise' (piecewise obs. std vs theta sign) / "
             "'linear_piecewise_noise' (linear or sigmoid obs. std vs theta)."
@@ -101,6 +105,39 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
         ),
     )
     p.add_argument(
+        "--randamp-mu-low",
+        type=float,
+        default=0.5,
+        help=(
+            "gaussian_randamp only: lower bound for per-dimension bump amplitude a_j "
+            "(uniform on [randamp-mu-low, randamp-mu-high]). Ignored for other families."
+        ),
+    )
+    p.add_argument(
+        "--randamp-mu-high",
+        type=float,
+        default=1.5,
+        help="gaussian_randamp only: upper bound for amplitude a_j (see --randamp-mu-low). Ignored for other families.",
+    )
+    p.add_argument(
+        "--randamp-kappa",
+        type=float,
+        default=0.2,
+        help=(
+            "gaussian_randamp only: non-negative precision kappa in "
+            "a_j*exp(-kappa*(omega*(theta-theta_j))^2). Ignored for other families."
+        ),
+    )
+    p.add_argument(
+        "--randamp-omega",
+        type=float,
+        default=1.0,
+        help=(
+            "gaussian_randamp only: scales (theta-theta_j) in the Gaussian bump. "
+            "Ignored for other families."
+        ),
+    )
+    p.add_argument(
         "--theta-low",
         type=float,
         default=-6.0,
@@ -119,7 +156,8 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
         default=None,
         help=(
             "Baseline std of observation noise along axis 1 (Gaussian / GMM branches). "
-            "Default: 0.30 for gaussian / gmm_non_gauss; 0.10 for gaussian_sqrtd (omit to use the family default)."
+            "Default: 0.30 for gaussian / gmm_non_gauss / gaussian_randamp; 0.10 for gaussian_sqrtd; "
+            "0.20 for gaussian_randamp_sqrtd (omit to use the family default)."
         ),
     )
     p.add_argument(
@@ -492,7 +530,7 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--flow-eval-t",
         type=float,
-        default=0.5,
+        default=0.9,
         help="Fixed time t used to evaluate theta-flow velocity field for H-matrix (flow mode).",
     )
     p.add_argument("--flow-early-patience", type=int, default=1000)

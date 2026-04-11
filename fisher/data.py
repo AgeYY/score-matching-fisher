@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 from scipy.special import expit, logsumexp
@@ -207,6 +207,80 @@ class ToyConditionalGaussianSqrtdDataset(ToyConditionalGaussianDataset):
 
     sigma_x1: float = 0.1
     sigma_x2: float = 0.1
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        d = float(self.x_dim)
+        self.cov = np.diag(self._sigma_base**2 * d) + 1e-8 * np.eye(self.x_dim, dtype=np.float64)
+        self.cov_chol = np.linalg.cholesky(self.cov)
+
+    def _variance_diag_from_mu(self, mu: np.ndarray) -> np.ndarray:
+        v = super()._variance_diag_from_mu(mu)
+        return v * float(self.x_dim)
+
+
+@dataclass
+class ToyConditionalGaussianRandampDataset(ToyConditionalGaussianDataset):
+    """Gaussian bump tuning with per-dimension random amplitudes (fixed across samples).
+
+    For each coordinate ``j``, ``a_j ~ Uniform(randamp_mu_low, randamp_mu_high)`` is sampled once
+    at initialization (unless ``randamp_mu_amp_per_dim`` is supplied, e.g. from saved NPZ meta).
+
+    Mean: ``mu_j(theta) = a_j * exp(-randamp_kappa * (randamp_omega * (theta - theta_j))^2)``.
+
+    Centers ``theta_j`` are uniform on ``[theta_low, theta_high]`` (same as ``gaussian_raw``).
+    Observation noise matches the parent Gaussian diagonal covariance (not ``gaussian_sqrtd``).
+    """
+
+    tuning_curve_family: str = "cosine"  # unused; tuning is overridden below
+    randamp_mu_low: float = 0.5
+    randamp_mu_high: float = 1.5
+    randamp_kappa: float = 0.2
+    randamp_omega: float = 1.0
+    randamp_mu_amp_per_dim: np.ndarray | None = field(default=None)
+
+    def __post_init__(self) -> None:
+        if not (self.randamp_mu_low < self.randamp_mu_high):
+            raise ValueError("randamp_mu_low must be < randamp_mu_high.")
+        if self.randamp_kappa < 0.0:
+            raise ValueError("randamp_kappa must be non-negative.")
+        super().__post_init__()
+        if self.randamp_mu_amp_per_dim is not None:
+            self._randamp_amp = np.asarray(self.randamp_mu_amp_per_dim, dtype=np.float64).reshape(-1)
+            if self._randamp_amp.shape[0] != self.x_dim:
+                raise ValueError(
+                    f"randamp_mu_amp_per_dim length {self._randamp_amp.shape[0]} != x_dim {self.x_dim}."
+                )
+        else:
+            self._randamp_amp = self.rng.uniform(
+                self.randamp_mu_low, self.randamp_mu_high, size=(self.x_dim,)
+            ).astype(np.float64)
+
+    def tuning_curve(self, theta: np.ndarray) -> np.ndarray:
+        t = _theta_col(theta)
+        tc = self._tuning_centers_theta.reshape(1, -1)
+        z = self.randamp_omega * (t - tc)
+        return self._randamp_amp.reshape(1, -1) * np.exp(-self.randamp_kappa * (z**2))
+
+    def tuning_curve_derivative(self, theta: np.ndarray) -> np.ndarray:
+        t = _theta_col(theta)
+        tc = self._tuning_centers_theta.reshape(1, -1)
+        z = self.randamp_omega * (t - tc)
+        g = self._randamp_amp.reshape(1, -1) * np.exp(-self.randamp_kappa * (z**2))
+        return -2.0 * self.randamp_kappa * self.randamp_omega * z * g
+
+
+@dataclass
+class ToyConditionalGaussianRandampSqrtdDataset(ToyConditionalGaussianRandampDataset):
+    """Same tuning as :class:`ToyConditionalGaussianRandampDataset`, but observation variance is
+    scaled by ``x_dim`` (noise std scales like ``sqrt(d)``), matching :class:`ToyConditionalGaussianSqrtdDataset`.
+
+    Baseline ``sigma_x1``/``sigma_x2`` default to ``0.2`` (CLI ``make_dataset.py`` matches via
+    ``apply_sigma_defaults_for_dataset_family`` when sigmas are omitted).
+    """
+
+    sigma_x1: float = 0.2
+    sigma_x2: float = 0.2
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -694,6 +768,8 @@ def make_theta_grid(theta_low: float, theta_high: float, eval_margin: float, n_b
 def make_local_decoder_data(
     dataset: ToyConditionalGaussianDataset
     | ToyConditionalGaussianSqrtdDataset
+    | ToyConditionalGaussianRandampDataset
+    | ToyConditionalGaussianRandampSqrtdDataset
     | ToyCosSinPiecewiseNoiseDataset
     | ToyLinearPiecewiseNoiseDataset
     | ToyConditionalGMMNonGaussianDataset,
