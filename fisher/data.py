@@ -34,8 +34,8 @@ class ToyConditionalGaussianDataset:
     sigma_x1: float = 0.30
     sigma_x2: float = 0.30
     rho: float = 0.15
-    # Activity coupling for diagonal variance: Var_j = sigma_base_j^2 * (1 + alpha_j * |mu_j|).
-    # Per-dimension alpha_j interpolates between these endpoints (also used in dataset .npz meta).
+    # Activity coupling for diagonal variance: Var_j = sigma_base_j^2 * (1 + alpha * |mu_j|).
+    # alpha is constant across dimensions: (cov_theta_amp1 + cov_theta_amp2) / 2 (both stored in .npz meta).
     cov_theta_amp1: float = 0.35
     cov_theta_amp2: float = 0.30
     cov_theta_amp_rho: float = 0.30
@@ -86,7 +86,8 @@ class ToyConditionalGaussianDataset:
         self._tuning_centers_theta = _tuning_centers_uniform_theta(self.theta_low, self.theta_high, self.x_dim)
 
         self._sigma_base = np.linspace(self.sigma_x1, self.sigma_x2, self.x_dim, dtype=np.float64)
-        self._sigma_activity_alpha = np.linspace(self.cov_theta_amp1, self.cov_theta_amp2, self.x_dim, dtype=np.float64)
+        _alpha = 0.5 * (float(self.cov_theta_amp1) + float(self.cov_theta_amp2))
+        self._sigma_activity_alpha = np.full(self.x_dim, _alpha, dtype=np.float64)
 
         # Kept for backward compatibility with summary/prints as baseline (diagonal) covariance.
         self.cov = np.diag(self._sigma_base**2) + 1e-8 * np.eye(self.x_dim, dtype=np.float64)
@@ -199,7 +200,13 @@ class ToyConditionalGaussianSqrtdDataset(ToyConditionalGaussianDataset):
     activity-coupled diagonal variance), but each per-coordinate variance is multiplied
     by ``x_dim`` so that noise std scales like ``sqrt(d)`` relative to the base family.
     This avoids pathological high-SNR / near-diagonal distance structure when ``d`` is large.
+
+    Defaults for `sigma_x1` / `sigma_x2` are ``0.1`` (tighter than the base ``0.3``); CLI
+    ``make_dataset.py`` applies the same family default when ``--sigma-x1``/``--sigma-x2`` are omitted.
     """
+
+    sigma_x1: float = 0.1
+    sigma_x2: float = 0.1
 
     def __post_init__(self) -> None:
         super().__post_init__()

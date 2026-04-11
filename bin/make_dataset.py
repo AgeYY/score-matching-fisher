@@ -75,7 +75,8 @@ Parameter reference (all available flags in this script):
 
   Baseline covariance/noise (Gaussian and GMM families):
     --sigma-x1, --sigma-x2
-      Baseline per-axis observation std. Defaults: 0.30, 0.30.
+      Baseline per-axis observation std. Defaults: 0.30 for gaussian / gmm_non_gauss; 0.10 for
+      gaussian_sqrtd (omit both to use the family default).
     --rho
       Baseline correlation before theta modulation. Default: 0.15.
     --rho-clip
@@ -83,8 +84,9 @@ Parameter reference (all available flags in this script):
 
   Theta-modulated covariance (gaussian / gaussian_sqrtd families):
     --cov-theta-amp1, --cov-theta-amp2, --cov-theta-amp-rho
-      Modulation amplitudes for variance1, variance2, and correlation.
-      Defaults: 0.35, 0.30, 0.30.
+      Mean–activity coupling uses alpha = (amp1+amp2)/2 (same for every dimension) in
+      Var_j = sigma_base_j^2 * (1 + alpha*|mu_j|). amp_rho is reserved for correlation (not used in
+      current diagonal Gaussian sampling). Defaults: 0.35, 0.30, 0.30.
     --cov-theta-freq1, --cov-theta-freq2, --cov-theta-freq-rho
       Modulation angular frequencies. Defaults: 0.90, 0.75, 1.10.
     --cov-theta-phase1, --cov-theta-phase2, --cov-theta-phase-rho

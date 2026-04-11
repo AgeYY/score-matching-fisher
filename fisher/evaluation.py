@@ -8,6 +8,7 @@ import torch
 from fisher.data import (
     ToyConditionalGMMNonGaussianDataset,
     ToyConditionalGaussianDataset,
+    ToyConditionalGaussianSqrtdDataset,
     ToyCosSinPiecewiseNoiseDataset,
     ToyLinearPiecewiseNoiseDataset,
 )
@@ -32,7 +33,10 @@ def parse_sigma_alpha_list(items: list[float]) -> np.ndarray:
 def log_p_x_given_theta(
     x: np.ndarray,
     theta: np.ndarray,
-    dataset: ToyConditionalGaussianDataset | ToyCosSinPiecewiseNoiseDataset | ToyLinearPiecewiseNoiseDataset,
+    dataset: ToyConditionalGaussianDataset
+    | ToyConditionalGaussianSqrtdDataset
+    | ToyCosSinPiecewiseNoiseDataset
+    | ToyLinearPiecewiseNoiseDataset,
 ) -> np.ndarray:
     if hasattr(dataset, "log_p_x_given_theta"):
         return dataset.log_p_x_given_theta(x, theta)

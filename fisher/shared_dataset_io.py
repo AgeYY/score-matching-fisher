@@ -13,6 +13,20 @@ import numpy as np
 SHARED_DATASET_NPZ_VERSION = 1
 
 
+def apply_sigma_defaults_for_dataset_family(ns: Any) -> None:
+    """Set ``sigma_x1`` / ``sigma_x2`` when omitted (``None``) on the argparse namespace.
+
+    ``gaussian_sqrtd`` defaults to 0.1; other Gaussian/GMM families default to 0.30.
+    If only one of the two is omitted, it is set to match the resolved ``sigma_x1``.
+    """
+    fam = str(getattr(ns, "dataset_family", "gaussian"))
+    default_sigma = 0.1 if fam == "gaussian_sqrtd" else 0.30
+    if getattr(ns, "sigma_x1", None) is None:
+        ns.sigma_x1 = default_sigma
+    if getattr(ns, "sigma_x2", None) is None:
+        ns.sigma_x2 = float(ns.sigma_x1)
+
+
 @dataclass(frozen=True)
 class SharedDatasetBundle:
     meta: dict[str, Any]
@@ -28,6 +42,7 @@ class SharedDatasetBundle:
 
 def meta_dict_from_args(ns: Any) -> dict[str, Any]:
     """Build JSON-serializable metadata from an argparse-like namespace (dataset fields)."""
+    apply_sigma_defaults_for_dataset_family(ns)
     return {
         "version": SHARED_DATASET_NPZ_VERSION,
         "dataset_family": str(ns.dataset_family),

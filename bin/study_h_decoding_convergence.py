@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
-"""Convergence of binned H, Hellinger LB from binned H, pairwise decoding, and L/C Bayes accuracy.
+"""Convergence of binned H and pairwise decoding vs references.
 
-Tracks off-diagonal correlation to a reference run for: **binned H**, **Hellinger accuracy lower
-bound** (treating binned symmetric H as H², matching ``visualize_h_matrix_binned``),
-**pairwise logistic decoding** accuracy, and **pairwise Bayesian-optimal accuracy** estimated from
-the score-matching **C-matrix** (integrated log-ratio / L pipeline) via bin-mean differences.
+**Binned H:** off-diagonal correlation vs a **generative ground-truth** squared Hellinger matrix
+estimated by Monte Carlo from the known toy likelihood (see ``fisher/hellinger_gt.py`` and
+``report/notes/hellinger_idea.tex``). With ``n_bins`` = ``--num-theta-bins``, the MC count per
+bin row is ``n_mc = n_ref // n_bins`` (integer floor); ``n_bins * n_mc`` may be less than ``n_ref``.
+Reference **training** still uses the full ``--n-ref`` subset.
+
+**Pairwise decoding:** off-diagonal correlation vs the decoding matrix from the large-$n$
+reference run (``--n-ref``), unchanged.
+
+**Dataset:** the loaded NPZ must match ``--dataset-family`` (default ``gaussian_sqrtd`` with
+``gaussian_raw`` tuning from ``make_dataset.py``). Regenerate the NPZ if the family does not match.
 
 The H matrix is computed from trained **posterior** and **prior** denoising score models
 (DSM). This script defaults to **multi-layer FiLM** for the posterior (``--score-arch film``,
@@ -39,6 +46,7 @@ import torch
 import visualize_h_matrix_binned as vhb
 from global_setting import DATA_DIR
 from fisher.cli_shared_fisher import add_estimation_arguments
+from fisher.hellinger_gt import bin_centers_from_edges, estimate_hellinger_sq_one_sided_mc
 from fisher.shared_dataset_io import SharedDatasetBundle, load_shared_dataset_npz
 from fisher.shared_fisher_est import (
     build_dataset_from_meta,
@@ -52,23 +60,42 @@ from fisher.shared_fisher_est import (
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
-            "Load a shared dataset .npz, build a large-n reference (binned H + Hellinger LB + "
-            "pairwise logistic + Bayes-opt accuracy from C-matrix bin means), then sweep nested "
-            "subset sizes and plot off-diagonal correlation to the reference. Also writes "
-            "h_decoding_convergence_combined.{png,svg} (line plot + matrix panel side-by-side)."
+            "Load a shared dataset .npz, train score models per subset, then compare binned H to a "
+            "Monte Carlo generative Hellinger GT and pairwise decoding to the n_ref decoding matrix. "
+            "Also writes h_decoding_convergence_combined.{png,svg} (line plot + matrix panel side-by-side)."
         )
     )
     p.add_argument(
         "--dataset-npz",
         type=str,
         required=True,
-        help="Path to shared dataset .npz from make_dataset.py.",
+        help="Path to shared dataset .npz from make_dataset.py (must match --dataset-family).",
+    )
+    p.add_argument(
+        "--dataset-family",
+        type=str,
+        default="gaussian_sqrtd",
+        choices=[
+            "gaussian",
+            "gaussian_sqrtd",
+            "gmm_non_gauss",
+            "cos_sin_piecewise_noise",
+            "linear_piecewise_noise",
+        ],
+        help=(
+            "Expected generative family stored in the NPZ meta; must match make_dataset.py "
+            "when the archive was created. Default: gaussian_sqrtd (Gaussian bump tuning + "
+            "sqrt(x_dim) observation-noise scaling)."
+        ),
     )
     p.add_argument(
         "--n-ref",
         type=int,
         default=5000,
-        help="Reference subset size (default 5000). Requires len(dataset) >= n_ref and max(n-list) <= n_ref.",
+        help=(
+            "Reference subset size (default 5000). Requires len(dataset) >= n_ref and max(n-list) <= n_ref. "
+            "GT Hellinger MC uses n_mc = n_ref // num_theta_bins samples per bin row (floor division)."
+        ),
     )
     p.add_argument(
         "--n-list",
@@ -89,7 +116,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--num-theta-bins",
         type=int,
         default=10,
-        help="Number of equal-width theta bins (default 10).",
+        help=(
+            "Number of equal-width theta bins (default 10). GT Hellinger MC uses "
+            "n_mc = n_ref // num_theta_bins (floor) samples per bin row."
+        ),
     )
     p.add_argument(
         "--clf-test-frac",
@@ -113,6 +143,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--keep-intermediate",
         action="store_true",
         help="Keep per-n training output directories under output-dir/sweep_runs/ (default: temp dirs).",
+    )
+    p.add_argument(
+        "--gt-hellinger-seed",
+        type=int,
+        default=-1,
+        help="RNG seed for GT Hellinger MC; -1 uses dataset meta seed.",
+    )
+    p.add_argument(
+        "--gt-hellinger-symmetrize",
+        action="store_true",
+        help="If set, symmetrize GT H^2 matrix as (H^2 + H^2.T) / 2 after one-sided MC estimation.",
     )
     add_estimation_arguments(p)
     p.set_defaults(
@@ -144,8 +185,15 @@ def _validate_cli(args: argparse.Namespace) -> None:
         raise ValueError("--clf-test-frac must be in (0, 1).")
     if int(args.clf_min_class_count) < 1:
         raise ValueError("--clf-min-class-count must be >= 1.")
-    if int(args.n_ref) < 2:
+    n_ref = int(args.n_ref)
+    n_bins_cli = int(args.num_theta_bins)
+    if n_ref < 2:
         raise ValueError("--n-ref must be >= 2.")
+    if n_ref // n_bins_cli < 1:
+        raise ValueError(
+            "GT Hellinger requires n_mc = n_ref // num_theta_bins >= 1 "
+            f"(got n_ref={n_ref} num_theta_bins={n_bins_cli})."
+        )
     _parse_n_list(args.n_list)  # syntax check only; pool size checked in main
 
 
@@ -196,8 +244,6 @@ def _make_full_args(args: argparse.Namespace, meta: dict) -> SimpleNamespace:
     setattr(full_args, "compute_h_matrix", True)
     setattr(full_args, "h_restore_original_order", True)
     setattr(full_args, "skip_shared_fisher_gt_compare", True)
-    # Persist C-matrix for Bayes-opt row (bin-mean Δℓ from score-matching L pipeline).
-    setattr(full_args, "h_save_intermediates", True)
     validate_estimation_args(full_args)
     return full_args
 
@@ -227,61 +273,6 @@ def _run_ctx_for_bundle(
     )
 
 
-def _load_c_matrix_from_h_npz(h_path: str) -> np.ndarray:
-    """Load integrated C matrix from h_matrix_results*.npz (requires h_save_intermediates)."""
-    z = np.load(h_path, allow_pickle=True)
-    if "c_matrix" not in z.files:
-        raise FileNotFoundError(
-            f"c_matrix not found in {h_path}. "
-            "Convergence study forces --h-save-intermediates when estimating H."
-        )
-    return np.asarray(z["c_matrix"], dtype=np.float64)
-
-
-def _c_matrix_bayes_opt_accuracy_matrix(
-    c_matrix: np.ndarray,
-    bin_idx: np.ndarray,
-    n_bins: int,
-) -> np.ndarray:
-    """Bayes-opt pairwise accuracy from bin-mean C differences (score-matching L pipeline).
-
-    For sample row ``r``, ``mu_b(r) = mean_{k : bin_idx[k] == b} C[r, k]``.
-    ``Delta_ij(r) = mu_i(r) - mu_j(r)``.
-    ``A*_ij = 0.5 * P_{r in bin i}[Delta_ij > 0] + 0.5 * P_{r in bin j}[Delta_ij < 0]``.
-    Diagonal NaN; empty-bin pairs skipped (NaN).
-    """
-    c = np.asarray(c_matrix, dtype=np.float64)
-    bi = np.asarray(bin_idx, dtype=np.int64).reshape(-1)
-    n = int(c.shape[0])
-    if c.ndim != 2 or c.shape[0] != c.shape[1]:
-        raise ValueError(f"c_matrix must be square; got {c.shape}")
-    if bi.shape[0] != n:
-        raise ValueError("bin_idx length must match c_matrix order.")
-    if n_bins < 2:
-        return np.full((n_bins, n_bins), np.nan, dtype=np.float64)
-
-    cols_in_bin = [np.flatnonzero(bi == b) for b in range(n_bins)]
-    a = np.full((n_bins, n_bins), np.nan, dtype=np.float64)
-    for i in range(n_bins):
-        for j in range(n_bins):
-            if i == j:
-                continue
-            ci, cj = cols_in_bin[i], cols_in_bin[j]
-            if ci.size == 0 or cj.size == 0:
-                continue
-            mu_i = np.mean(c[:, ci], axis=1)
-            mu_j = np.mean(c[:, cj], axis=1)
-            d = mu_i - mu_j
-            ri = np.flatnonzero(bi == i)
-            rj = np.flatnonzero(bi == j)
-            if ri.size == 0 or rj.size == 0:
-                continue
-            p_i = float(np.mean(d[ri] > 0.0))
-            p_j = float(np.mean(d[rj] < 0.0))
-            a[i, j] = 0.5 * (p_i + p_j)
-    return a
-
-
 def _metrics_fixed_edges(
     loaded: vhb.LoadedHMatrix,
     x_aligned: np.ndarray,
@@ -290,7 +281,7 @@ def _metrics_fixed_edges(
     clf_test_frac: float,
     clf_min_class_count: int,
     clf_random_state: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     bin_idx = vhb.theta_to_bin_index(loaded.theta_used, edges, n_bins)
     h_binned, _ = vhb.average_matrix_by_bins(loaded.h_sym, bin_idx, n_bins)
     clf_acc, _, _, _ = vhb.pairwise_bin_logistic_accuracy_matrix(
@@ -301,14 +292,7 @@ def _metrics_fixed_edges(
         min_class_count=int(clf_min_class_count),
         random_state=int(clf_random_state),
     )
-    hell_lb = vhb.hellinger_acc_lb_from_binned_h_squared(h_binned)
-    c_mat = _load_c_matrix_from_h_npz(loaded.h_path)
-    if c_mat.shape[0] != loaded.theta_used.shape[0]:
-        raise ValueError(
-            f"c_matrix rows {c_mat.shape[0]} != theta_used {loaded.theta_used.shape[0]}"
-        )
-    bayes_c = _c_matrix_bayes_opt_accuracy_matrix(c_mat, bin_idx, n_bins)
-    return h_binned, clf_acc, hell_lb, bayes_c
+    return h_binned, clf_acc
 
 
 def _estimate_one(
@@ -408,29 +392,20 @@ def _render_matrix_panel(
     *,
     h_mats: list[np.ndarray],
     clf_mats: list[np.ndarray],
-    hell_mats: list[np.ndarray],
-    bayes_c_mats: list[np.ndarray],
     col_labels: list[str],
     out_path: str,
     n_bins: int,
 ) -> None:
-    """Four rows: binned H, pairwise decoding, Hellinger LB, Bayes-opt acc from C-matrix."""
+    """Two rows: binned H, pairwise decoding."""
     n_cols = len(h_mats)
-    if (
-        n_cols != len(clf_mats)
-        or n_cols != len(hell_mats)
-        or n_cols != len(bayes_c_mats)
-        or n_cols != len(col_labels)
-    ):
-        raise ValueError("h_mats, clf_mats, hell_mats, bayes_c_mats, col_labels length mismatch.")
-    fig, axes = plt.subplots(4, n_cols, figsize=(2.8 * n_cols, 10.4), squeeze=False)
+    if n_cols != len(clf_mats) or n_cols != len(col_labels):
+        raise ValueError("h_mats, clf_mats, col_labels length mismatch.")
+    fig, axes = plt.subplots(2, n_cols, figsize=(2.8 * n_cols, 5.6), squeeze=False)
     # Binned H is treated on [0, 1] for a consistent cross-column color scale.
     vmin_h, vmax_h = 0.0, 1.0
     vmin_c, vmax_c = _finite_min_max(clf_mats)
     if vmin_c >= vmax_c:
         vmax_c = vmin_c + 1e-12
-    vmin_hell, vmax_hell = 0.0, 1.0
-    vmin_bayes, vmax_bayes = 0.0, 1.0
     cmap = "viridis"
 
     for c in range(n_cols):
@@ -465,38 +440,8 @@ def _render_matrix_panel(
             axes[1, c].set_ylabel("Pairwise decoding", fontsize=11)
         plt.colorbar(im1, ax=axes[1, c], fraction=0.046, pad=0.04)
 
-        im2 = axes[2, c].imshow(
-            hell_mats[c],
-            vmin=vmin_hell,
-            vmax=vmax_hell,
-            cmap=cmap,
-            aspect="equal",
-            origin="lower",
-        )
-        axes[2, c].set_xticks(range(n_bins))
-        axes[2, c].set_yticks(range(n_bins))
-        axes[2, c].tick_params(labelsize=7)
-        if c == 0:
-            axes[2, c].set_ylabel("Hellinger LB (H)", fontsize=11)
-        plt.colorbar(im2, ax=axes[2, c], fraction=0.046, pad=0.04)
-
-        im3 = axes[3, c].imshow(
-            bayes_c_mats[c],
-            vmin=vmin_bayes,
-            vmax=vmax_bayes,
-            cmap=cmap,
-            aspect="equal",
-            origin="lower",
-        )
-        axes[3, c].set_xticks(range(n_bins))
-        axes[3, c].set_yticks(range(n_bins))
-        axes[3, c].tick_params(labelsize=7)
-        if c == 0:
-            axes[3, c].set_ylabel("Bayes-opt acc (C / L)", fontsize=11)
-        plt.colorbar(im3, ax=axes[3, c], fraction=0.046, pad=0.04)
-
     fig.suptitle(
-        "Binned H, pairwise decoding, Hellinger LB, Bayes-opt acc from C (rows 1–4) by nested subset size",
+        "Binned H and pairwise decoding (rows 1–2) by nested subset size",
         fontsize=11,
     )
     fig.tight_layout()
@@ -516,6 +461,7 @@ def _write_summary(
     with open(path, "w", encoding="utf-8") as f:
         f.write("study_h_decoding_convergence\n")
         f.write(f"dataset_npz: {args.dataset_npz}\n")
+        f.write(f"dataset_family: {meta.get('dataset_family')}  # matches --dataset-family={args.dataset_family}\n")
         f.write(f"output_dir: {args.output_dir}\n")
         f.write(f"n_ref: {args.n_ref}  n_list: {args.n_list}\n")
         f.write(f"num_theta_bins: {args.num_theta_bins}\n")
@@ -543,6 +489,12 @@ def main(argv: list[str] | None = None) -> None:
     os.makedirs(args.output_dir, exist_ok=True)
     bundle = load_shared_dataset_npz(args.dataset_npz)
     meta = bundle.meta
+    meta_family = str(meta.get("dataset_family", ""))
+    if meta_family != str(args.dataset_family):
+        raise ValueError(
+            f"NPZ meta dataset_family={meta_family!r} does not match --dataset-family={str(args.dataset_family)!r}. "
+            "Regenerate with matching make_dataset.py --dataset-family, or pass --dataset-family to match the NPZ."
+        )
     n_pool = int(bundle.theta_all.shape[0])
     need = max(int(args.n_ref), max(ns))
     if n_pool < need:
@@ -570,6 +522,25 @@ def main(argv: list[str] | None = None) -> None:
 
     clf_rs = int(meta["seed"]) if int(args.clf_random_state) < 0 else int(args.clf_random_state)
 
+    dataset_for_gt = build_dataset_from_meta(meta)
+    gt_seed = int(meta["seed"]) if int(args.gt_hellinger_seed) < 0 else int(args.gt_hellinger_seed)
+    if hasattr(dataset_for_gt, "rng"):
+        dataset_for_gt.rng = np.random.default_rng(gt_seed)
+    centers = bin_centers_from_edges(edges)
+    gt_n_mc = int(args.n_ref) // n_bins
+    t_gt0 = time.time()
+    h_gt_mc = estimate_hellinger_sq_one_sided_mc(
+        dataset_for_gt,
+        centers,
+        n_mc=gt_n_mc,
+        symmetrize=bool(args.gt_hellinger_symmetrize),
+    )
+    print(
+        f"[convergence] GT Hellinger (MC likelihood) n_bins={n_bins} n_mc={gt_n_mc} "
+        f"(n_bins*n_mc={n_bins * gt_n_mc} <= n_ref={int(args.n_ref)}) wall time: {time.time() - t_gt0:.1f}s",
+        flush=True,
+    )
+
     ref_dir = os.path.join(args.output_dir, "reference")
     os.makedirs(ref_dir, exist_ok=True)
     print(
@@ -589,7 +560,7 @@ def main(argv: list[str] | None = None) -> None:
         output_dir=ref_dir,
         n_bins=n_bins,
     )
-    h_ref, clf_ref, hell_ref, bayes_ref = _metrics_fixed_edges(
+    h_ref, clf_ref = _metrics_fixed_edges(
         loaded_ref,
         x_ref,
         edges,
@@ -613,8 +584,12 @@ def main(argv: list[str] | None = None) -> None:
         os.path.join(args.output_dir, "h_decoding_convergence_reference.npz"),
         h_binned_ref=h_ref,
         clf_acc_ref=clf_ref,
-        hellinger_lb_ref=hell_ref,
-        bayes_c_acc_ref=bayes_ref,
+        hellinger_gt_sq_mc=h_gt_mc,
+        theta_bin_centers=centers,
+        gt_hellinger_n_mc=np.int64(gt_n_mc),
+        gt_hellinger_n_ref_budget=np.int64(args.n_ref),
+        gt_hellinger_seed=np.int64(gt_seed),
+        gt_hellinger_symmetrize=np.int32(1 if bool(args.gt_hellinger_symmetrize) else 0),
         theta_bin_edges=edges,
         edge_lo=np.float64(edge_lo),
         edge_hi=np.float64(edge_hi),
@@ -624,14 +599,10 @@ def main(argv: list[str] | None = None) -> None:
 
     corr_h = np.full(len(ns), np.nan, dtype=np.float64)
     corr_clf = np.full(len(ns), np.nan, dtype=np.float64)
-    corr_hell_lb = np.full(len(ns), np.nan, dtype=np.float64)
-    corr_bayes_c = np.full(len(ns), np.nan, dtype=np.float64)
     wall_s = np.full(len(ns), np.nan, dtype=np.float64)
     err_msg: list[str] = []
     h_sweep: list[np.ndarray] = []
     clf_sweep: list[np.ndarray] = []
-    hell_sweep: list[np.ndarray] = []
-    bayes_sweep: list[np.ndarray] = []
 
     sweep_root = os.path.join(args.output_dir, "sweep_runs")
     if bool(args.keep_intermediate):
@@ -657,7 +628,7 @@ def main(argv: list[str] | None = None) -> None:
                 output_dir=run_dir,
                 n_bins=n_bins,
             )
-            h_n, clf_n, hell_n, bayes_n = _metrics_fixed_edges(
+            h_n, clf_n = _metrics_fixed_edges(
                 loaded_n,
                 x_n,
                 edges,
@@ -666,18 +637,13 @@ def main(argv: list[str] | None = None) -> None:
                 int(args.clf_min_class_count),
                 clf_rs,
             )
-            corr_h[k] = vhb.matrix_corr_offdiag(h_n, h_ref)
+            corr_h[k] = vhb.matrix_corr_offdiag(h_n, h_gt_mc)
             corr_clf[k] = vhb.matrix_corr_offdiag(clf_n, clf_ref)
-            corr_hell_lb[k] = vhb.matrix_corr_offdiag(hell_n, hell_ref)
-            corr_bayes_c[k] = vhb.matrix_corr_offdiag(bayes_n, bayes_ref)
             wall_s[k] = time.time() - t1
             h_sweep.append(np.asarray(h_n, dtype=np.float64))
             clf_sweep.append(np.asarray(clf_n, dtype=np.float64))
-            hell_sweep.append(np.asarray(hell_n, dtype=np.float64))
-            bayes_sweep.append(np.asarray(bayes_n, dtype=np.float64))
             print(
                 f"[convergence] n={n}  corr_h={corr_h[k]:.4f}  corr_clf={corr_clf[k]:.4f}  "
-                f"corr_hell_lb={corr_hell_lb[k]:.4f}  corr_bayes_c={corr_bayes_c[k]:.4f}  "
                 f"wall={wall_s[k]:.1f}s",
                 flush=True,
             )
@@ -693,38 +659,33 @@ def main(argv: list[str] | None = None) -> None:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    if (
-        len(h_sweep) != len(ns)
-        or len(clf_sweep) != len(ns)
-        or len(hell_sweep) != len(ns)
-        or len(bayes_sweep) != len(ns)
-    ):
+    if len(h_sweep) != len(ns) or len(clf_sweep) != len(ns):
         raise RuntimeError(
             "Missing binned matrices for some n (partial failures). "
             "Fix errors above or re-run with a smaller n-list."
         )
     h_cols = np.stack(h_sweep + [h_ref], axis=0)
     clf_cols = np.stack(clf_sweep + [clf_ref], axis=0)
-    hell_cols = np.stack(hell_sweep + [hell_ref], axis=0)
-    bayes_cols = np.stack(bayes_sweep + [bayes_ref], axis=0)
     column_n = np.asarray(list(ns) + [int(args.n_ref)], dtype=np.int64)
 
     out_npz = os.path.join(args.output_dir, "h_decoding_convergence_results.npz")
     np.savez_compressed(
         out_npz,
         n=np.asarray(ns, dtype=np.int64),
-        corr_h_binned_vs_ref=corr_h,
+        corr_h_binned_vs_gt_mc=corr_h,
         corr_clf_vs_ref=corr_clf,
-        corr_hell_lb_vs_ref=corr_hell_lb,
-        corr_bayes_c_vs_ref=corr_bayes_c,
         wall_seconds=wall_s,
         n_ref=np.int64(args.n_ref),
         perm_seed=np.int64(perm_seed),
         theta_bin_edges=edges,
+        theta_bin_centers=centers,
+        hellinger_gt_sq_mc=h_gt_mc,
+        gt_hellinger_n_mc=np.int64(gt_n_mc),
+        gt_hellinger_n_ref_budget=np.int64(args.n_ref),
+        gt_hellinger_seed=np.int64(gt_seed),
+        gt_hellinger_symmetrize=np.int32(1 if bool(args.gt_hellinger_symmetrize) else 0),
         h_binned_columns=h_cols,
         clf_acc_columns=clf_cols,
-        hell_lb_columns=hell_cols,
-        bayes_c_acc_columns=bayes_cols,
         column_n=column_n,
     )
 
@@ -734,15 +695,13 @@ def main(argv: list[str] | None = None) -> None:
         w.writerow(
             [
                 "n",
-                "corr_h_binned_vs_ref",
+                "corr_h_binned_vs_gt_mc",
                 "corr_clf_vs_ref",
-                "corr_hell_lb_vs_ref",
-                "corr_bayes_c_vs_ref",
                 "wall_seconds",
             ]
         )
         for i, n in enumerate(ns):
-            w.writerow([n, corr_h[i], corr_clf[i], corr_hell_lb[i], corr_bayes_c[i], wall_s[i]])
+            w.writerow([n, corr_h[i], corr_clf[i], wall_s[i]])
 
     fig_path = os.path.join(args.output_dir, "h_decoding_convergence.png")
     fig, ax = plt.subplots(1, 1, figsize=(9.0, 4.8))
@@ -753,7 +712,7 @@ def main(argv: list[str] | None = None) -> None:
         linewidth=1.8,
         marker="o",
         markersize=6,
-        label="Binned H vs ref",
+        label="Binned H vs GT (MC likelihood)",
     )
     ax.plot(
         ns,
@@ -762,29 +721,14 @@ def main(argv: list[str] | None = None) -> None:
         linewidth=1.8,
         marker="s",
         markersize=5,
-        label="Pairwise decoding vs ref",
-    )
-    ax.plot(
-        ns,
-        corr_hell_lb,
-        color="#2ca02c",
-        linewidth=1.8,
-        marker="^",
-        markersize=6,
-        label="Hellinger LB (from binned H) vs ref",
-    )
-    ax.plot(
-        ns,
-        corr_bayes_c,
-        color="#9467bd",
-        linewidth=1.8,
-        marker="D",
-        markersize=5,
-        label="Bayes-opt acc (C / L est.) vs ref",
+        label="Pairwise decoding vs n_ref decoding",
     )
     ax.set_xlabel("dataset size n (nested subset)")
     ax.set_ylabel("corr (off-diag)")
-    ax.set_title("Convergence to n_ref=%d reference" % int(args.n_ref))
+    ax.set_title(
+        "Convergence: H vs generative GT; decoding vs n_ref=%d"
+        % int(args.n_ref)
+    )
     ax.set_xticks(ns)
     ax.legend(loc="best", fontsize=9)
     ax.grid(True, alpha=0.35)
@@ -797,8 +741,6 @@ def main(argv: list[str] | None = None) -> None:
     _render_matrix_panel(
         h_mats=list(h_cols),
         clf_mats=list(clf_cols),
-        hell_mats=list(hell_cols),
-        bayes_c_mats=list(bayes_cols),
         col_labels=col_labels,
         out_path=matrix_panel_path,
         n_bins=n_bins,
@@ -834,6 +776,25 @@ def main(argv: list[str] | None = None) -> None:
     if err_msg:
         paths_out["errors"] = "; ".join(err_msg[:20])
     _write_summary(summary_path, args, meta, perm_seed, n_pool, ref_dir, paths_out)
+    with open(summary_path, "a", encoding="utf-8") as sf:
+        sf.write("\n# Correlation targets\n")
+        sf.write(
+            "# corr_h_binned_vs_gt_mc: binned DSM H-matrix vs generative GT (MC one-sided Hellinger).\n"
+        )
+        sf.write(
+            "# corr_clf_vs_ref: pairwise decoding vs n_ref decoding matrix from reference run.\n"
+        )
+        sf.write(
+            f"gt_hellinger_n_mc: {int(gt_n_mc)}  # MC samples per bin row; floor(n_ref / num_theta_bins)\n"
+        )
+        sf.write(
+            f"gt_hellinger_n_ref_budget: {int(args.n_ref)}  # reference training subset size (--n-ref)\n"
+        )
+        sf.write(
+            f"gt_hellinger_n_bins_times_n_mc: {int(n_bins * gt_n_mc)}  # n_bins * n_mc (may be < n_ref)\n"
+        )
+        sf.write(f"gt_hellinger_seed: {int(gt_seed)}\n")
+        sf.write(f"gt_hellinger_symmetrize: {bool(args.gt_hellinger_symmetrize)}\n")
 
     print("[convergence] Saved:")
     print(f"  - {out_npz}")

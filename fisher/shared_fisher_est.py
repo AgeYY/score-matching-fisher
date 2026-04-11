@@ -30,7 +30,11 @@ from fisher.models import (
     PriorScore1DFiLMPerLayer,
     PriorThetaFlowVelocity,
 )
-from fisher.shared_dataset_io import SHARED_DATASET_META_KEYS, meta_dict_from_args
+from fisher.shared_dataset_io import (
+    SHARED_DATASET_META_KEYS,
+    apply_sigma_defaults_for_dataset_family,
+    meta_dict_from_args,
+)
 from fisher.trainers import (
     geometric_sigma_schedule,
     train_conditional_theta_flow_model,
@@ -694,6 +698,7 @@ def build_dataset_from_args(
 
 
 def validate_dataset_sample_args(args: Any) -> None:
+    apply_sigma_defaults_for_dataset_family(args)
     if getattr(args, "tuning_curve_family", "cosine") not in ("cosine", "von_mises_raw", "gaussian_raw"):
         raise ValueError('--tuning-curve-family must be "cosine", "von_mises_raw", or "gaussian_raw".')
     if getattr(args, "tuning_curve_family", "cosine") == "von_mises_raw":
@@ -2125,9 +2130,11 @@ def run_shared_fisher_estimation(
             if h_delta_fig_path:
                 f.write(f"delta_l_heatmap: {h_delta_fig_path}\n")
         if args.dataset_family in ("gaussian", "gaussian_sqrtd"):
+            _a = 0.5 * (float(args.cov_theta_amp1) + float(args.cov_theta_amp2))
             f.write(
                 "cov_theta: "
-                f"amp1={args.cov_theta_amp1}, amp2={args.cov_theta_amp2}, amp_rho={args.cov_theta_amp_rho}, "
+                f"alpha_mean_activity=({args.cov_theta_amp1}+{args.cov_theta_amp2})/2={_a:.6g}, "
+                f"amp_rho={args.cov_theta_amp_rho}, "
                 f"freq1={args.cov_theta_freq1}, freq2={args.cov_theta_freq2}, freq_rho={args.cov_theta_freq_rho}, "
                 f"phase1={args.cov_theta_phase1}, phase2={args.cov_theta_phase2}, phase_rho={args.cov_theta_phase_rho}, "
                 f"rho_clip={args.rho_clip}\n"

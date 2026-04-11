@@ -116,10 +116,21 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--sigma-x1",
         type=float,
-        default=0.30,
-        help="Baseline std of observation noise along axis 1 (Gaussian / GMM branches).",
+        default=None,
+        help=(
+            "Baseline std of observation noise along axis 1 (Gaussian / GMM branches). "
+            "Default: 0.30 for gaussian / gmm_non_gauss; 0.10 for gaussian_sqrtd (omit to use the family default)."
+        ),
     )
-    p.add_argument("--sigma-x2", type=float, default=0.30, help="Default matches --sigma-x1 so baseline noise is constant across dims.")
+    p.add_argument(
+        "--sigma-x2",
+        type=float,
+        default=None,
+        help=(
+            "Baseline std along axis 2 (default: same as --sigma-x1 when omitted). "
+            "See --sigma-x1 for family-dependent defaults."
+        ),
+    )
     p.add_argument(
         "--rho",
         type=float,
@@ -130,13 +141,16 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
         "--cov-theta-amp1",
         type=float,
         default=0.35,
-        help="Gaussian family: amplitude of theta-driven variation for variance term 1.",
+        help=(
+            "Gaussian family: with --cov-theta-amp2, sets shared mean–activity coupling "
+            "alpha = (amp1+amp2)/2 in Var_j = sigma_base_j^2 * (1 + alpha*|mu_j|) (same alpha every dim)."
+        ),
     )
     p.add_argument(
         "--cov-theta-amp2",
         type=float,
         default=0.30,
-        help="Gaussian family: amplitude of theta-driven variation for variance term 2.",
+        help="Gaussian family: paired with --cov-theta-amp1 for alpha = (amp1+amp2)/2 (see --cov-theta-amp1).",
     )
     p.add_argument(
         "--cov-theta-amp-rho",
