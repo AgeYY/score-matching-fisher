@@ -1,5 +1,5 @@
-% Included by ../main.tex — full report body (sections only)
-\section{Introduction}
+\section{Fisher information estimation}
+\subsection{Introduction}
 The brain represents the external world through internal neural representations. For example, while driving, our brain represents the surrounding spatial environment and the positions of nearby cars. Forming internal representations is a fundamental ability of the brain and serves as the basis for other cognitive functions.
 
 This internal representation is recently referred to as a \emph{cognitive map}. Importantly, a cognitive map is usually different from the corresponding physical map. In spatial navigation, for instance, the physical environment may be a square with a uniform spatial layout. However, the corresponding cognitive map need not be uniform: animals often form biased representations of locations associated with their own niches. The idea of a cognitive map is not limited to spatial locations. Another example is the neural representation of grating orientation. In the physical world, grating images with orientations $\theta$ and $\theta + \Delta\theta$ differ only by a rotation. If one measures the Euclidean distance between such images, that distance is independent of $\theta$, reflecting the rotational symmetry of the stimulus space. In this sense, no orientation is intrinsically more special than another in the physical world. In contrast, animals often show better perceptual discrimination for vertical and horizontal orientations than for oblique ones. This suggests that the cognitive map of grating orientation differs from the physical map.
@@ -18,8 +18,8 @@ More recently, score-matching-based methods have been proposed for Fisher inform
 
 In this manuscript, we propose a simple alternative. Using Bayes' rule, we express the Fisher score in terms of Stein score which can be directly estimated by score-matching methods without any modification. In this way, our approach can immediately benefit from the broad and rapidly advancing score-matching literature. Moreover, the proposed method can be applied directly to spiking data, without converting spikes into continuous firing rates or imposing a Poisson assumption.
 
-\section{Preliminary results}
-\subsection{Bayes' rule to express Fisher score in terms of Stein score}
+\subsection{Preliminary results}
+\subsubsection{Bayes' rule to express Fisher score in terms of Stein score}
 
 Score matching is a method to estimate the Stein score, however, is different from Fisher score. Therefore we express Fisher score in terms of Stein score using Bayes' rule.
 \begin{equation}
@@ -28,7 +28,7 @@ Score matching is a method to estimate the Stein score, however, is different fr
 \end{equation}
 where $\theta \in \mathbb{R}^d$ is the stimulus parameter, such as grating orientation or spatial position; $x \in \mathbb{R}^n$ is the neural population activity; $\nabla_\theta \log p(x\mid\theta)$ is the Fisher score, $\nabla_\theta \log p(\theta\mid x)$ is the Stein score, and $\nabla_\theta \log p(\theta)$ is the score of the stimulus prior. In controlled experiments the prior may be known (e.g.\ uniform orientations); otherwise it can be learned from samples of $\theta$ alone. When $d\ll n$, the posterior score $\nabla_\theta \log p(\theta\mid x)$ can be estimated with conditional score matching; the prior score $\nabla_\theta \log p(\theta)$ can be estimated with a separate unconditional score model on $\theta$.
 
-\subsection{Conditional denoising score matching}
+\subsubsection{Conditional denoising score matching}
 Here we focus on describing conditional denoising score matching for estimating $\nabla_\theta \log p(\theta \mid x)$. A typical way of using conditional denoising score matching is to let it learn and generate high-dimensional data; however, here we use it in an opposite way, the condition $x$ is high-dimensional and the target $\theta$ is typically low-dimensional. Though, this does not change the mathematical nature of the problem -- any conditional score matching method can be used to estimate $\nabla_\theta \log p(\theta \mid x)$. It is a plug-in component of our Fisher information estimation framework.
 
 For better understanding, here we describe a concrete implementation of conditional denoising score matching. The spirit of denoising score matching is denoising. One adds Gaussian noise to a variable of interest and fits a network so that its output matches the noise that was injected; equivalently, the trained network approximates the Stein score---the gradient of the log-density---of a slightly smoothed distribution.
@@ -40,7 +40,7 @@ Let $\theta$ denote the stimulus parameter and let $x$ denote an observation dra
 \end{equation}
 where the expectation is taken over $(\theta,x)$ drawn from the generative process, over the random choice of $\sigma$, and over $z$. Here $\mathcal{L}(\phi)$ is the scalar loss to be minimized, $\phi$ collects all network parameters, and $s_\phi(\tilde\theta,x,\sigma)$ is the network output intended to approximate the score of a $\sigma$-smoothed conditional posterior, in the $\theta$-direction, at $(\tilde\theta,x,\sigma)$: namely $\nabla_{\tilde{\theta}} \log p_\sigma(\tilde{\theta}\mid x)$, where $p_\sigma(\cdot\mid x)$ is the density of $\tilde\theta=\theta+\sigma z$. As $\sigma \rightarrow 0$, $p_\sigma(\cdot\mid x)$ converges to $p(\cdot\mid x)$ and $\nabla_{\tilde{\theta}} \log p_\sigma(\tilde{\theta}\mid x)$ converges to the Stein score $\nabla_{\theta} \log p(\theta\mid x)$. Together with $\nabla_\theta \log p(\theta)$, estimated by a second denoising score model on $\theta$ alone (see Method), we obtain the Fisher score via equation~\ref{eq:fisher-stein}.
 
-\subsection{Preliminary experiments}
+\subsubsection{Preliminary experiments}
 We illustrate the full pipeline on a Gaussian toy model with scalar $\theta$ and two-dimensional observations $x\in\mathbb{R}^2$: cosine tuning means $\mu(\theta)$ and a $\theta$-dependent covariance (heteroscedastic, correlated noise). We draw $n_{\text{total}}=4000$ pairs with $\theta\sim\mathrm{Uniform}[-3,3]$, use a 70/30 train/eval split (2800/1200), and train (i)~a conditional score network $s_\phi(\tilde\theta,x,\sigma)$ for the posterior score, (ii)~an unconditional score network $s_\psi(\tilde\theta,\sigma)$ for the prior on $\theta$, and (iii)~local decoder baselines per $\theta$ bin. Figure~\ref{fig:gaussian_results} compares Fisher information vs.\ $\theta$ for analytic ground truth, posterior-only score at $\sigma_{\min}$, likelihood score $s_\phi-s_\psi$ at $\sigma_{\min}$, and the decoder (shaded bands: reported uncertainty).
 
 \begin{figure}[t]
@@ -63,10 +63,10 @@ Decoder & 21.417 & 13.738 & 0.727 \\
 \end{tabular}
 \end{center}
 
-\section{Future possible extensions}
+\subsection{Future possible extensions}
 Planned directions include comparisons on additional toy models with known ground truth (including spiking observations), and applications to neural data in visual and navigation tasks to characterize representation bias in cognitive-map terms.
 
-\section{Method}
+\subsection{Method}
 \subsection*{Data-generating model}
 The latent parameter is sampled as
 \[
@@ -78,7 +78,7 @@ x\mid \theta\sim \mathcal N\!\bigl(\mu(\theta),\Sigma(\theta)\bigr),\qquad x\in\
 \]
 Each coordinate of $\mu(\theta)$ uses a cosine tuning curve with a fixed phase; the covariance $\Sigma(\theta)$ varies smoothly with $\theta$ (coordinate-wise standard deviations and correlation), yielding heteroscedastic correlated Gaussian observations. The experiment in Section~2 uses $n_{\text{total}}=4000$, seed 7, and train fraction $0.7$ (2800 train, 1200 eval).
 
-\subsection*{Posterior and prior score models}
+\subsubsection*{Posterior and prior score models}
 \paragraph{Posterior (conditional) score.}
 We train $s_\phi(\tilde\theta,x,\sigma)$ with continuous noise-conditional denoising score matching. For each pair $(\theta,x)$ from the data-generating process,
 \[
@@ -102,7 +102,7 @@ We train a separate network $s_\psi(\tilde\theta,\sigma)$ on $\theta$ samples on
 \]
 and analogous early stopping (same patience, tolerance, EMA $\alpha=0.05$). This approximates the prior score $\nabla_\theta\log p(\theta)$ in the smoothed sense used by DSM.
 
-\subsection*{Score-based Fisher estimators}
+\subsubsection*{Score-based Fisher estimators}
 Let $\sigma_\ast$ denote the smallest evaluation noise level (here $0.01727$). For each evaluation pair $(\theta,x)$ we form posterior and prior score predictions at $\sigma_\ast$ and define the likelihood score $\hat s_{\mathrm{lik}}=s_\phi(\theta,x,\sigma_\ast)-s_\psi(\theta,\sigma_\ast)$. Fisher is estimated by binning $\theta$ into 35 equal-width bins on $[\theta_{\mathrm{low}}+m,\theta_{\mathrm{high}}-m]$ with margin $m=0.30$, requiring at least 10 points per bin, and averaging squared scores within bins:
 \[
 \widehat I_{\mathrm{post}}(\theta_0)=\mathbb E\!\left[s_\phi(\theta,x,\sigma_\ast)^2\,\middle|\,\theta\in\mathrm{bin}(\theta_0)\right],\qquad
@@ -110,7 +110,7 @@ Let $\sigma_\ast$ denote the smallest evaluation noise level (here $0.01727$). F
 \]
 The primary reported score curve is $\widehat I_{\mathrm{lik}}$ (posterior minus prior); $\widehat I_{\mathrm{post}}$ is kept as an ablation.
 
-\subsection*{Decoder Fisher baseline}
+\subsubsection*{Decoder Fisher baseline}
 For each bin center $\theta_0$, define two nearby parameters
 \[
 \theta_+=\theta_0+\frac{\varepsilon}{2},\qquad \theta_-=\theta_0-\frac{\varepsilon}{2},\qquad \varepsilon=0.12.
@@ -125,7 +125,7 @@ and the decoder-based Fisher estimator is
 \]
 Decoder training uses validation fraction 0.15, minimum validation class size 10, patience 100, minimum improvement $10^{-4}$, EMA smoothing with $\alpha=0.2$, up to 80 epochs, and best-epoch restoration.
 
-\subsection*{Ground-truth Fisher and evaluation protocol}
+\subsubsection*{Ground-truth Fisher and evaluation protocol}
 For the Gaussian conditional model, we evaluate ground truth analytically,
 \[
 I_{\mathrm{gt}}(\theta)=\mu'(\theta)^\top\Sigma(\theta)^{-1}\mu'(\theta)
