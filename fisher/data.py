@@ -192,6 +192,27 @@ class ToyConditionalGaussianDataset:
 
 
 @dataclass
+class ToyConditionalGaussianSqrtdDataset(ToyConditionalGaussianDataset):
+    """Gaussian observation noise with per-coordinate std scaled by ``sqrt(x_dim)``.
+
+    Same generative structure as :class:`ToyConditionalGaussianDataset` (tuning curve,
+    activity-coupled diagonal variance), but each per-coordinate variance is multiplied
+    by ``x_dim`` so that noise std scales like ``sqrt(d)`` relative to the base family.
+    This avoids pathological high-SNR / near-diagonal distance structure when ``d`` is large.
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        d = float(self.x_dim)
+        self.cov = np.diag(self._sigma_base**2 * d) + 1e-8 * np.eye(self.x_dim, dtype=np.float64)
+        self.cov_chol = np.linalg.cholesky(self.cov)
+
+    def _variance_diag_from_mu(self, mu: np.ndarray) -> np.ndarray:
+        v = super()._variance_diag_from_mu(mu)
+        return v * float(self.x_dim)
+
+
+@dataclass
 class ToyCosSinPiecewiseNoiseDataset:
     theta_low: float = -6.0
     theta_high: float = 6.0
@@ -665,6 +686,7 @@ def make_theta_grid(theta_low: float, theta_high: float, eval_margin: float, n_b
 
 def make_local_decoder_data(
     dataset: ToyConditionalGaussianDataset
+    | ToyConditionalGaussianSqrtdDataset
     | ToyCosSinPiecewiseNoiseDataset
     | ToyLinearPiecewiseNoiseDataset
     | ToyConditionalGMMNonGaussianDataset,

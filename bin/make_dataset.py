@@ -46,6 +46,9 @@ Parameter reference (all available flags in this script):
       One of:
       gaussian
         Conditional Gaussian x|theta with theta-modulated covariance.
+      gaussian_sqrtd
+        Same generative structure as gaussian, but observation noise std scales by sqrt(x_dim)
+        (variance scaled by x_dim) to avoid extreme SNR when dimension is large.
       gmm_non_gauss
         Theta-dependent two-component GMM (non-Gaussian conditional).
       cos_sin_piecewise_noise
@@ -78,7 +81,7 @@ Parameter reference (all available flags in this script):
     --rho-clip
       Clamp on |rho(theta)| after modulation for numerical stability. Default: 0.85.
 
-  Theta-modulated covariance (gaussian family):
+  Theta-modulated covariance (gaussian / gaussian_sqrtd families):
     --cov-theta-amp1, --cov-theta-amp2, --cov-theta-amp-rho
       Modulation amplitudes for variance1, variance2, and correlation.
       Defaults: 0.35, 0.30, 0.30.

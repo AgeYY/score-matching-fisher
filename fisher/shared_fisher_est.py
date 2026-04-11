@@ -15,6 +15,7 @@ from global_setting import SCORE_VAL_FRACTION
 from fisher.data import (
     ToyConditionalGMMNonGaussianDataset,
     ToyConditionalGaussianDataset,
+    ToyConditionalGaussianSqrtdDataset,
     ToyCosSinPiecewiseNoiseDataset,
     ToyLinearPiecewiseNoiseDataset,
 )
@@ -568,6 +569,7 @@ def build_dataset_from_meta(
     meta: dict[str, Any],
 ) -> (
     ToyConditionalGaussianDataset
+    | ToyConditionalGaussianSqrtdDataset
     | ToyCosSinPiecewiseNoiseDataset
     | ToyLinearPiecewiseNoiseDataset
     | ToyConditionalGMMNonGaussianDataset
@@ -576,6 +578,33 @@ def build_dataset_from_meta(
     seed = int(meta["seed"])
     if family == "gaussian":
         return ToyConditionalGaussianDataset(
+            theta_low=float(meta["theta_low"]),
+            theta_high=float(meta["theta_high"]),
+            x_dim=int(meta["x_dim"]),
+            tuning_curve_family=str(meta.get("tuning_curve_family", "cosine")),
+            vm_mu_amp=float(meta.get("vm_mu_amp", 1.0)),
+            vm_kappa=float(meta.get("vm_kappa", 1.0)),
+            vm_omega=float(meta.get("vm_omega", 1.0)),
+            gauss_mu_amp=float(meta.get("gauss_mu_amp", 1.0)),
+            gauss_kappa=float(meta.get("gauss_kappa", 0.2)),
+            gauss_omega=float(meta.get("gauss_omega", 1.0)),
+            sigma_x1=float(meta["sigma_x1"]),
+            sigma_x2=float(meta["sigma_x2"]),
+            rho=float(meta["rho"]),
+            cov_theta_amp1=float(meta["cov_theta_amp1"]),
+            cov_theta_amp2=float(meta["cov_theta_amp2"]),
+            cov_theta_amp_rho=float(meta["cov_theta_amp_rho"]),
+            cov_theta_freq1=float(meta["cov_theta_freq1"]),
+            cov_theta_freq2=float(meta["cov_theta_freq2"]),
+            cov_theta_freq_rho=float(meta["cov_theta_freq_rho"]),
+            cov_theta_phase1=float(meta["cov_theta_phase1"]),
+            cov_theta_phase2=float(meta["cov_theta_phase2"]),
+            cov_theta_phase_rho=float(meta["cov_theta_phase_rho"]),
+            rho_clip=float(meta["rho_clip"]),
+            seed=seed,
+        )
+    if family == "gaussian_sqrtd":
+        return ToyConditionalGaussianSqrtdDataset(
             theta_low=float(meta["theta_low"]),
             theta_high=float(meta["theta_high"]),
             x_dim=int(meta["x_dim"]),
@@ -656,6 +685,7 @@ def build_dataset_from_args(
     ns: Any,
 ) -> (
     ToyConditionalGaussianDataset
+    | ToyConditionalGaussianSqrtdDataset
     | ToyCosSinPiecewiseNoiseDataset
     | ToyLinearPiecewiseNoiseDataset
     | ToyConditionalGMMNonGaussianDataset
@@ -1702,7 +1732,7 @@ def run_shared_fisher_estimation(
         debug_bins=bool(getattr(args, "decoder_debug_bins", False)),
     )
 
-    if args.dataset_family in ("gaussian", "cos_sin_piecewise_noise", "linear_piecewise_noise"):
+    if args.dataset_family in ("gaussian", "gaussian_sqrtd", "cos_sin_piecewise_noise", "linear_piecewise_noise"):
         gt = analytic_fisher_curve(centers, dataset)
         gt_se = np.full_like(gt, np.nan)
     else:
@@ -2094,7 +2124,7 @@ def run_shared_fisher_estimation(
             f.write(f"h_matrix_heatmap: {h_fig_path}\n")
             if h_delta_fig_path:
                 f.write(f"delta_l_heatmap: {h_delta_fig_path}\n")
-        if args.dataset_family == "gaussian":
+        if args.dataset_family in ("gaussian", "gaussian_sqrtd"):
             f.write(
                 "cov_theta: "
                 f"amp1={args.cov_theta_amp1}, amp2={args.cov_theta_amp2}, amp_rho={args.cov_theta_amp_rho}, "

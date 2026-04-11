@@ -24,9 +24,16 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
         "--dataset-family",
         type=str,
         default="gaussian",
-        choices=["gaussian", "gmm_non_gauss", "cos_sin_piecewise_noise", "linear_piecewise_noise"],
+        choices=[
+            "gaussian",
+            "gaussian_sqrtd",
+            "gmm_non_gauss",
+            "cos_sin_piecewise_noise",
+            "linear_piecewise_noise",
+        ],
         help=(
             "Generative family: 'gaussian' (theta-modulated Gaussian obs. noise); "
+            "'gaussian_sqrtd' (same as gaussian but obs. noise std scales by sqrt(x_dim)); "
             "'gmm_non_gauss' (theta-dependent 2-component mixture); "
             "'cos_sin_piecewise_noise' (piecewise obs. std vs theta sign) / "
             "'linear_piecewise_noise' (linear or sigmoid obs. std vs theta)."
