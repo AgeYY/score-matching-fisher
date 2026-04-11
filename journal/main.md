@@ -16,6 +16,8 @@ Collected markdown notes in `journal/notes/`: long-form chapters (moved from the
 
 ## 2026-04
 
+- [2026-04-11 EDM vs NCSM: synthetic score fit and 50D H-decoding (EDM underperforms)](notes/2026-04-11-edm-underperforms-ncsm-hdecoding-synthetic.md)
+- [2026-04-11 EDM vs NCSM benchmark: synthetic conditional theta-score (Layer A sanity check)](notes/2026-04-11-edm-vs-ncsm-synthetic-theta-score.md)
 - [2026-04-11 DSM vs flow on H-decoding convergence: `gaussian_randamp_sqrtd` in 2D vs 50D (fresh runs)](notes/2026-04-11-dsm-vs-flow-hdecoding-randamp-sqrtd-2d-50d.md)
 - [2026-04-11 H-decoding convergence (Exp. 1): Gaussian tuning — 2D, 10D, and 50D with $\sqrt{d}$-scaled observation noise (`gaussian_sqrtd`)](notes/2026-04-11-h-decoding-convergence-gaussian-tuning-exp1.md)
 - [2026-04-10 H-decoding convergence: circular `cos_sin_piecewise_noise` (weak binned-H agreement)](notes/2026-04-10-h-decoding-convergence-cos-sin-piecewise.md)
