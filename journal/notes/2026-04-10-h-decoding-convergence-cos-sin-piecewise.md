@@ -28,7 +28,7 @@ mamba run -n geo_diffusion python bin/make_dataset.py \
 ## 2. Convergence study (same script / defaults as linear note)
 
 **Script:** `bin/study_h_decoding_convergence.py`  
-**Reference:** $n_{\mathrm{ref}}=5000$, **sweep:** $n\in\{80,160,240,320,400\}$, **bins:** 10, permutation seed = dataset meta seed $7$.
+**Reference:** $n_{\mathrm{ref}}=5000$, **sweep:** $n\in80,160,240,320,400$, **bins:** 10, permutation seed = dataset meta seed $7$.
 
 ```bash
 mamba run -n geo_diffusion python bin/study_h_decoding_convergence.py \
@@ -45,13 +45,15 @@ mamba run -n geo_diffusion python bin/study_h_decoding_convergence.py \
 
 From `h_decoding_convergence_results.csv`:
 
+
 | $n$ | corr binned H | corr pairwise decoding | corr Hellinger LB | corr Bayes (C) |
-|----:|---------------:|------------------------:|------------------:|---------------:|
-| 80 | 0.639 | 0.807 | 0.639 | 0.925 |
-| 160 | 0.748 | 0.809 | 0.748 | 0.942 |
-| 240 | 0.858 | 0.850 | 0.858 | 0.978 |
-| 320 | 0.903 | 0.935 | 0.903 | 0.987 |
-| 400 | 0.929 | 0.956 | 0.929 | 0.980 |
+| --- | ------------- | ---------------------- | ----------------- | -------------- |
+| 80  | 0.639         | 0.807                  | 0.639             | 0.925          |
+| 160 | 0.748         | 0.809                  | 0.748             | 0.942          |
+| 240 | 0.858         | 0.850                  | 0.858             | 0.978          |
+| 320 | 0.903         | 0.935                  | 0.903             | 0.987          |
+| 400 | 0.929         | 0.956                  | 0.929             | 0.980          |
+
 
 **Contrast (same metric, linear piecewise run at $n=80$):** binned H $\approx 0.97$ vs **0.64** here — the circular setting is **much worse** for H-alignment at small $n$.
 
@@ -61,6 +63,13 @@ From `h_decoding_convergence_results.csv`:
 
 Combined line plot + matrix panel written by the script:
 
+H-decoding convergence on cos_sin_piecewise_noise: panel A = off-diagonal correlation vs n for four metrics; panel B = heatmaps across nested n and n_ref reference.
+
+**Panel A.** Off-diagonal Pearson correlation to the $n_{\mathrm{ref}}=5000$ reference vs nested subset size $n$ for: binned H, pairwise logistic decoding, Hellinger LB from binned $H^2$, and Bayes-opt accuracy from C-matrix bin means.
+
+**Panel B.** Four rows (binned H, pairwise decoding, Hellinger LB, Bayes-opt from C) and columns $n=80,\ldots,400$ plus reference column $n_{\mathrm{ref}}=5000$; viridis color scales per row block in the script output.
+
+Source PNG (same file as study output): `journal/notes/figs/2026-04-10-h-decoding-convergence-cos-sin-piecewise/h_decoding_convergence_combined.png`. Original path:  
 `/grad/zeyuan/score-matching-fisher/data/h_decoding_convergence_cos_sin_piecewise/h_decoding_convergence_combined.png`
 
 ---

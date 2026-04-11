@@ -1,16 +1,34 @@
 # 2026-04-09 H-decoding convergence: linear piecewise dataset, DSM $\sigma_{\min}$ at 5% of $\mathrm{std}(\theta)$
 
-This note documents the **H-matrix decoding convergence** pipeline on a **linear piecewise noise** synthetic dataset, with continuous denoising score matching (DSM) using **`--score-sigma-min-alpha 0.05`** (σ range low end = 5% of $\mathrm{std}(\theta)$ on the score fit pool; default max remains 25%). We compare nested subset sizes $n \in \{80,160,240,320,400\}$ to a **reference** run of size $n_{\mathrm{ref}}=5000$ by **off-diagonal Pearson correlation** of several matrices derived from binned $\theta$ and trained scores. The combined figure below matches the panel layout produced by the study script (line plot + matrix panel).
+This note documents the **H-matrix decoding convergence** pipeline on a **linear piecewise noise** synthetic dataset, with continuous denoising score matching (DSM) using `**--score-sigma-min-alpha 0.05`** (σ range low end = 5% of $\mathrm{std}(\theta)$ on the score fit pool; default max remains 25%). We compare nested subset sizes $n \in 80,160,240,320,400$ to a **reference** run of size $n_{\mathrm{ref}}=5000$ by **off-diagonal Pearson correlation** of several matrices derived from binned $\theta$ and trained scores. The combined figure below matches the panel layout produced by the study script (line plot + matrix panel).
 
 ---
 
 ## 1. Data: linear piecewise noise
 
 - **Family:** `linear_piecewise_noise` (`bin/make_dataset.py`).
-- **Observation noise:** scalar std $\sigma(\theta)$ per axis, linear in $\theta$ from **`--sigma-piecewise-low 0.1`** at **`--theta-low`** to **`--sigma-piecewise-high 2.0`** at **`--theta-high`** (defaults; endpoints are the **dataset** observation noise, unrelated to DSM score-matching $\sigma$).
+- **Observation noise:** scalar std $\sigma(\theta)$ per axis, linear in $\theta$ from `**--sigma-piecewise-low 0.1`** at `**--theta-low**` to `**--sigma-piecewise-high 2.0**` at `**--theta-high**` (defaults; endpoints are the **dataset** observation noise, unrelated to DSM score-matching $\sigma$).
 - **Means:** first component mean $\propto \theta$ (`--linear-k 1.0`), second component tracks $\theta$ as in the toy `ToyLinearPiecewiseNoiseDataset` implementation.
 - **Size / split:** `--n-total 6000`, `--train-frac 1.0` (all samples in train for this NPZ; the convergence script re-splits subsets internally).
+2026-04-10 21:41:05.317 [info] Using configured platform linux for remote host xuexin-gpu
+2026-04-10 21:41:05.318 [info] Using askpass script: c:\Users\Zeyuacursor\extensions\anysphere.remote-ssh-1.0.48\dist\scripts\launchSSHAskpass.bat with javascript file c:\Users\Zeyuacursor\extensions\anysphere.remote-ssh-1.0.48\dist\scripts\sshAskClient.js. Askpass handle: 60148
+2026-04-10 21:41:05.341 [info] Launching SSH server via shell with command: type "C:\Users\Zeyua\AppData\Local\Temp\cursor_remote_install_5b635d56-91e6-4856-89eb-449b537d30c2.sh" | ssh -T -D 60149 xuexin-gpu bash --login -c bash
+2026-04-10 21:41:05.341 [info] Establishing SSH connection: type "C:\Users\Zeyua\AppData\Local\Temp\cursor_remote_install_5b635d56-91e6-4856-89eb-449b537d30c2.sh" | ssh -T -D 60149 xuexin-gpu bash --login -c bash
+2026-04-10 21:41:05.342 [info] Started installation script. Waiting for it to finish...
+2026-04-10 21:41:05.342 [info] Waiting for SSH handshake (timeout: 120s). Install timeout: 30s.
+2026-04-10 21:41:05.399 [info] (ssh_tunnel) stderr: C:UsersZeyua/.ssh/config: line 17: Bad configuration option: part
+C:UsersZeyua/.ssh/config: terminating, 1 bad configuration options
 
+2026-04-10 21:41:05.400 [info] (ssh_tunnel) stderr: The process tried to write to a nonexistent pipe.
+
+2026-04-10 21:41:05.409 [error] SSH process exited (code 255) before connection was established (after 65ms)
+2026-04-10 21:41:05.409 [error] Pre-connection stderr: C:UsersZeyua/.ssh/config: line 17: Bad configuration option: part
+C:UsersZeyua/.ssh/config: terminating, 1 bad configuration options
+The process tried to write to a nonexistent pipe.
+
+2026-04-10 21:41:05.412 [error] Error installing server: Failed to connect to the remote SSH host. Please check the logs for more details.
+2026-04-10 21:41:05.412 [info] Deleting local script C:\Users\Zeyua\AppData\Local\Temp\cursor_remote_install_5b635d56-91e6-4856-89eb-449b537d30c2.sh
+2026-04-10 21:41:05.422 [error] Error resolving SSH authority Failed to connect to the remote SSH host. Please check the logs for more details.
 **Reproduction (dataset NPZ + joint scatter):**
 
 ```bash
@@ -30,9 +48,9 @@ Saved dataset used here:
 - **Posterior score:** FiLM architecture (`--score-arch film`, `--score-depth 3`), continuous noise-conditioned score matching (NCSM).
 - **Prior score:** MLP (`--prior-score-arch mlp`, `--prior-depth 3`).
 - **Noise schedule (training):** `--score-noise-mode continuous` with **log-uniform** $\sigma$ in $[\sigma_{\min}, \sigma_{\max}]$, where  
-  $\sigma_{\min} = \alpha_{\min}\,\mathrm{std}(\theta_{\mathrm{fit}})$,  
-  $\sigma_{\max} = \alpha_{\max}\,\mathrm{std}(\theta_{\mathrm{fit}})$,  
-  with **`--score-sigma-scale-mode theta_std`**, **`--score-sigma-min-alpha 0.05`**, **`--score-sigma-max-alpha 0.25`** (this experiment explicitly sets 5% for the low end).
+$\sigma_{\min} = \alpha_{\min}\mathrm{std}(\theta_{\mathrm{fit}})$,  
+$\sigma_{\max} = \alpha_{\max}\mathrm{std}(\theta_{\mathrm{fit}})$,  
+with `**--score-sigma-scale-mode theta_std`**, `**--score-sigma-min-alpha 0.05**`, `**--score-sigma-max-alpha 0.25**` (this experiment explicitly sets 5% for the low end).
 
 **Reproduction (full convergence study):**
 
@@ -65,7 +83,7 @@ Train posterior and prior DSMs, evaluate the **sample H matrix** $H_{ij}$ (symme
 Treat binned symmetric entries as $H^2$ and map to a Hellinger accuracy **lower bound** matrix:
 
 $$
-A^{\mathrm{H\text{-}LB}}_{ab} = \tfrac{1}{2}\bigl(1 + \mathrm{clip}((\bar H^2)_{ab},\,0,\,1)\bigr),\quad a\neq b
+A^{\mathrm{H\text{-}LB}}*{ab} = \tfrac{1}{2}\bigl(1 + \mathrm{clip}((\bar H^2)*{ab},0,1)\bigr),\quad a\neq b
 $$
 
 (diagonal set to NaN). Implementation: `hellinger_acc_lb_from_binned_h_squared` in `bin/visualize_h_matrix_binned.py`.
@@ -76,14 +94,14 @@ For each bin pair $(a,b)$ with enough samples, fit a **logistic regression** on 
 
 ### 3.4 Bayes-opt accuracy from C-matrix bin means
 
-With **`h_save_intermediates`**, the H pipeline saves the integrated **C matrix** from the score-matching construction. Bin-mean differences induce a pairwise **Bayes-optimal** accuracy matrix (see docstring in `_c_matrix_bayes_opt_accuracy_matrix` in `study_h_decoding_convergence.py`).
+With `**h_save_intermediates`**, the H pipeline saves the integrated **C matrix** from the score-matching construction. Bin-mean differences induce a pairwise **Bayes-optimal** accuracy matrix (see docstring in `_c_matrix_bayes_opt_accuracy_matrix` in `study_h_decoding_convergence.py`).
 
 ### 3.5 Convergence score: off-diagonal correlation
 
 For each metric matrix $M^{(n)}$ at subset size $n$ and reference $M^{(\mathrm{ref})}$:
 
 $$
-\rho_{\mathrm{off}}(M^{(n)}, M^{(\mathrm{ref})}) = \mathrm{corr}\bigl( M^{(n)}_{ab},\, M^{(\mathrm{ref})}_{ab} \bigr)_{(a,b): a\neq b,\ \text{both finite}}
+\rho_{\mathrm{off}}(M^{(n)}, M^{(\mathrm{ref})}) = \mathrm{corr}\bigl( M^{(n)}*{ab}, M^{(\mathrm{ref})}*{ab} \bigr)_{(a,b): a\neq b,\ \text{both finite}}
 $$
 
 Implementation: `matrix_corr_offdiag` (Pearson correlation over off-diagonal entries where both matrices are finite).
@@ -94,13 +112,15 @@ Implementation: `matrix_corr_offdiag` (Pearson correlation over off-diagonal ent
 
 From `h_decoding_convergence_results.csv` in the output directory:
 
+
 | $n$ | corr binned H | corr pairwise decoding | corr Hellinger LB | corr Bayes (C) |
-|----:|---------------:|------------------------:|------------------:|---------------:|
-| 80 | 0.967 | 0.712 | 0.967 | 0.882 |
-| 160 | 0.944 | 0.884 | 0.944 | 0.953 |
-| 240 | 0.984 | 0.864 | 0.984 | 0.941 |
-| 320 | 0.978 | 0.901 | 0.978 | 0.968 |
-| 400 | 0.982 | 0.930 | 0.982 | 0.972 |
+| --- | ------------- | ---------------------- | ----------------- | -------------- |
+| 80  | 0.967         | 0.712                  | 0.967             | 0.882          |
+| 160 | 0.944         | 0.884                  | 0.944             | 0.953          |
+| 240 | 0.984         | 0.864                  | 0.984             | 0.941          |
+| 320 | 0.978         | 0.901                  | 0.978             | 0.968          |
+| 400 | 0.982         | 0.930                  | 0.982             | 0.972          |
+
 
 **Qualitative:** Binned H and Hellinger LB track the reference very closely (correlation $\gtrsim 0.94$). Pairwise decoding converges more slowly from $n=80$ but improves toward $\sim 0.93$ at $n=400$. Bayes-opt (C) correlation is high throughout and ends near $0.97$.
 
@@ -108,13 +128,7 @@ From `h_decoding_convergence_results.csv` in the output directory:
 
 ## 5. Figure (combined panel A + B)
 
-<figure id="fig:h-decoding-linear-minalpha05-combined">
-<img src="figs/2026-04-09-h-decoding-linear-minalpha05/h_decoding_convergence_combined.png" style="width:95%" alt="Panel A: off-diagonal correlation vs n for four metrics. Panel B: heatmaps of binned H rows and pairwise decoding rows across n and n_ref reference." />
-<figcaption>
-<strong>Panel A.</strong> Off-diagonal Pearson correlation to the $n_{\mathrm{ref}}=5000$ reference vs nested subset size $n$ for: binned H, pairwise logistic decoding, Hellinger LB from binned $H^2$, and Bayes-opt accuracy from C-matrix bin means.
-<strong>Panel B.</strong> Four rows (binned H, pairwise decoding, Hellinger LB, Bayes-opt from C) and columns $n=80,\ldots,400$ plus reference column $n_{\mathrm{ref}}=5000$; viridis color scales per row block in the script output.
-</figcaption>
-</figure>
+**Panel A.** Off-diagonal Pearson correlation to the $n_{\mathrm{ref}}=5000$ reference vs nested subset size $n$ for: binned H, pairwise logistic decoding, Hellinger LB from binned $H^2$, and Bayes-opt accuracy from C-matrix bin means. **Panel B.** Four rows (binned H, pairwise decoding, Hellinger LB, Bayes-opt from C) and columns $n=80,\ldots,400$ plus reference column $n_{\mathrm{ref}}=5000$; viridis color scales per row block in the script output.
 
 Source PNG (user-composed side-by-side from the study outputs): copied to `journal/notes/figs/2026-04-09-h-decoding-linear-minalpha05/h_decoding_convergence_combined.png`. Individual script outputs (PNG/SVG):  
 `/grad/zeyuan/score-matching-fisher/data/h_decoding_convergence_linear_piecewise_minalpha05/`.
