@@ -131,6 +131,53 @@ class ConditionalScore1DFiLMPerLayer(nn.Module):
         return self.forward(theta, x, sigma)
 
 
+class ConditionalThetaEDM(nn.Module):
+    """EDM-style conditional denoiser D(theta_tilde, x, sigma) with score conversion helper."""
+
+    def __init__(self, backbone: ConditionalScore1D | ConditionalScore1DFiLMPerLayer, sigma_data: float = 0.5) -> None:
+        super().__init__()
+        if float(sigma_data) <= 0.0:
+            raise ValueError("sigma_data must be positive.")
+        self.backbone = backbone
+        self.sigma_data = float(sigma_data)
+
+    def _ensure_sigma(self, sigma: torch.Tensor, n: int, device: torch.device) -> torch.Tensor:
+        if sigma.ndim == 1:
+            sigma = sigma.unsqueeze(-1)
+        if sigma.shape != (n, 1):
+            raise ValueError(f"sigma must have shape ({n}, 1), got {tuple(sigma.shape)}.")
+        if torch.any(sigma <= 0):
+            raise ValueError("sigma must be strictly positive for EDM preconditioning.")
+        return sigma.to(device=device)
+
+    def _preconditioning(
+        self, sigma: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        sigma2 = sigma**2
+        ns2 = sigma.new_full((1,), self.sigma_data**2)
+        den = torch.sqrt(sigma2 + ns2)
+        c_in = 1.0 / den
+        c_skip = ns2 / (sigma2 + ns2)
+        c_out = sigma * self.sigma_data / den
+        c_noise = 0.25 * torch.log(torch.clamp(sigma, min=1e-8))
+        return c_in, c_skip, c_out, c_noise
+
+    def forward(self, theta_tilde: torch.Tensor, x: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+        if theta_tilde.ndim == 1:
+            theta_tilde = theta_tilde.unsqueeze(-1)
+        sigma = self._ensure_sigma(sigma, theta_tilde.shape[0], theta_tilde.device)
+        c_in, c_skip, c_out, c_noise = self._preconditioning(sigma)
+        backbone_out = self.backbone(c_in * theta_tilde, x, c_noise)
+        return c_skip * theta_tilde + c_out * backbone_out
+
+    @torch.no_grad()
+    def predict_score(self, theta: torch.Tensor, x: torch.Tensor, sigma_eval: float) -> torch.Tensor:
+        self.eval()
+        sigma = torch.full((theta.shape[0], 1), float(sigma_eval), device=theta.device)
+        denoised = self.forward(theta, x, sigma)
+        return (denoised - theta) / torch.clamp(sigma**2, min=1e-8)
+
+
 class ConditionalThetaFlowVelocity(nn.Module):
     """Conditional theta-velocity model v(theta_t, x, t) with scalar output."""
 
@@ -607,6 +654,53 @@ class PriorScore1DFiLMPerLayer(nn.Module):
         self.eval()
         sigma = torch.full((theta.shape[0], 1), sigma_eval, device=theta.device)
         return self.forward(theta, sigma)
+
+
+class PriorThetaEDM(nn.Module):
+    """EDM-style prior denoiser D(theta_tilde, sigma) with score conversion helper."""
+
+    def __init__(self, backbone: PriorScore1D | PriorScore1DFiLMPerLayer, sigma_data: float = 0.5) -> None:
+        super().__init__()
+        if float(sigma_data) <= 0.0:
+            raise ValueError("sigma_data must be positive.")
+        self.backbone = backbone
+        self.sigma_data = float(sigma_data)
+
+    def _ensure_sigma(self, sigma: torch.Tensor, n: int, device: torch.device) -> torch.Tensor:
+        if sigma.ndim == 1:
+            sigma = sigma.unsqueeze(-1)
+        if sigma.shape != (n, 1):
+            raise ValueError(f"sigma must have shape ({n}, 1), got {tuple(sigma.shape)}.")
+        if torch.any(sigma <= 0):
+            raise ValueError("sigma must be strictly positive for EDM preconditioning.")
+        return sigma.to(device=device)
+
+    def _preconditioning(
+        self, sigma: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        sigma2 = sigma**2
+        ns2 = sigma.new_full((1,), self.sigma_data**2)
+        den = torch.sqrt(sigma2 + ns2)
+        c_in = 1.0 / den
+        c_skip = ns2 / (sigma2 + ns2)
+        c_out = sigma * self.sigma_data / den
+        c_noise = 0.25 * torch.log(torch.clamp(sigma, min=1e-8))
+        return c_in, c_skip, c_out, c_noise
+
+    def forward(self, theta_tilde: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+        if theta_tilde.ndim == 1:
+            theta_tilde = theta_tilde.unsqueeze(-1)
+        sigma = self._ensure_sigma(sigma, theta_tilde.shape[0], theta_tilde.device)
+        c_in, c_skip, c_out, c_noise = self._preconditioning(sigma)
+        backbone_out = self.backbone(c_in * theta_tilde, c_noise)
+        return c_skip * theta_tilde + c_out * backbone_out
+
+    @torch.no_grad()
+    def predict_score(self, theta: torch.Tensor, sigma_eval: float) -> torch.Tensor:
+        self.eval()
+        sigma = torch.full((theta.shape[0], 1), float(sigma_eval), device=theta.device)
+        denoised = self.forward(theta, sigma)
+        return (denoised - theta) / torch.clamp(sigma**2, min=1e-8)
 
 
 class LocalDecoderLogit(nn.Module):

@@ -369,6 +369,16 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         choices=["dsm", "flow"],
         help="Scalar field for theta-derivative pipeline: denoising score model (dsm) or flow velocity model (flow).",
     )
+    p.add_argument(
+        "--score-train-objective",
+        type=str,
+        default="ncsm",
+        choices=["ncsm", "edm"],
+        help=(
+            "DSM training objective: ncsm (score target) or edm (denoised-theta target with EDM preconditioning). "
+            "Default ncsm."
+        ),
+    )
 
     p.add_argument("--score-epochs", type=int, default=10000)
     p.add_argument("--score-batch-size", type=int, default=1024)
@@ -496,6 +506,24 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         help="Continuous DSM sigma sampling mode in log-space.",
     )
     p.add_argument("--score-sigma-sample-beta", type=float, default=2.0)
+    p.add_argument(
+        "--edm-p-mean",
+        type=float,
+        default=-1.2,
+        help="EDM-only: log-normal sigma sampler mean in log-space.",
+    )
+    p.add_argument(
+        "--edm-p-std",
+        type=float,
+        default=1.2,
+        help="EDM-only: log-normal sigma sampler std in log-space.",
+    )
+    p.add_argument(
+        "--edm-sigma-data",
+        type=float,
+        default=0.5,
+        help="EDM-only preconditioning hyperparameter sigma_data (>0).",
+    )
     p.add_argument("--score-noise-mode", type=str, default="continuous", choices=["discrete", "continuous"])
     p.add_argument(
         "--score-sigma-scale-mode",

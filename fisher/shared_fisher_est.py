@@ -26,8 +26,10 @@ from fisher.h_matrix import HMatrixEstimator, HMatrixResult
 from fisher.models import (
     ConditionalScore1D,
     ConditionalScore1DFiLMPerLayer,
+    ConditionalThetaEDM,
     ConditionalThetaFlowVelocity,
     LocalDecoderLogit,
+    PriorThetaEDM,
     PriorScore1D,
     PriorScore1DFiLMPerLayer,
     PriorThetaFlowVelocity,
@@ -41,10 +43,12 @@ from fisher.trainers import (
     geometric_sigma_schedule,
     train_conditional_theta_flow_model,
     train_local_decoder,
+    train_prior_theta_edm_model,
     train_prior_theta_flow_model,
     train_prior_score_model,
     train_prior_score_model_ncsm_continuous,
     train_score_model,
+    train_theta_edm_model,
     train_score_model_ncsm_continuous,
 )
 
@@ -57,10 +61,14 @@ def require_device(name: str) -> torch.device:
 
 def build_posterior_score_model(
     args: Any, device: torch.device
-) -> ConditionalScore1D | ConditionalScore1DFiLMPerLayer:
+) -> ConditionalScore1D | ConditionalScore1DFiLMPerLayer | ConditionalThetaEDM:
     """Instantiate posterior DSM (theta score) as MLP or FiLM (x-trunk + residual FiLM)."""
+    score_objective = str(getattr(args, "score_train_objective", "ncsm")).lower()
     sigma_mode = str(getattr(args, "score_sigma_feature_mode", "auto")).lower()
-    if sigma_mode == "auto":
+    if score_objective == "edm":
+        # EDM wrapper passes c_noise = 0.25 * log(sigma), so the backbone should consume this directly.
+        use_log_sigma = False
+    elif sigma_mode == "auto":
         use_log_sigma = bool(getattr(args, "score_noise_mode", "continuous") == "continuous")
     elif sigma_mode == "log":
         use_log_sigma = True
@@ -78,19 +86,31 @@ def build_posterior_score_model(
         zero_out_init=bool(getattr(args, "score_zero_out_init", False)),
     )
     if arch == "film":
-        return ConditionalScore1DFiLMPerLayer(
+        backbone = ConditionalScore1DFiLMPerLayer(
             **common,
             gated_film=bool(getattr(args, "score_gated_film", False)),
         ).to(device)
-    if arch == "mlp":
-        return ConditionalScore1D(**common).to(device)
-    raise ValueError(f"Unknown --score-arch: {arch!r} (expected 'mlp' or 'film').")
+    elif arch == "mlp":
+        backbone = ConditionalScore1D(**common).to(device)
+    else:
+        raise ValueError(f"Unknown --score-arch: {arch!r} (expected 'mlp' or 'film').")
+    if score_objective == "edm":
+        return ConditionalThetaEDM(
+            backbone=backbone,
+            sigma_data=float(getattr(args, "edm_sigma_data", 0.5)),
+        ).to(device)
+    if score_objective == "ncsm":
+        return backbone
+    raise ValueError("--score-train-objective must be one of {'ncsm','edm'}.")
 
 
-def build_prior_score_model(args: Any, device: torch.device) -> PriorScore1D | PriorScore1DFiLMPerLayer:
+def build_prior_score_model(args: Any, device: torch.device) -> PriorScore1D | PriorScore1DFiLMPerLayer | PriorThetaEDM:
     """Instantiate prior DSM as MLP or FiLM (theta-trunk + residual FiLM from theta_tilde,sigma)."""
+    score_objective = str(getattr(args, "score_train_objective", "ncsm")).lower()
     sigma_mode = str(getattr(args, "prior_sigma_feature_mode", "auto")).lower()
-    if sigma_mode == "auto":
+    if score_objective == "edm":
+        use_log_sigma = False
+    elif sigma_mode == "auto":
         use_log_sigma = bool(getattr(args, "score_noise_mode", "continuous") == "continuous")
     elif sigma_mode == "log":
         use_log_sigma = True
@@ -107,13 +127,22 @@ def build_prior_score_model(args: Any, device: torch.device) -> PriorScore1D | P
         zero_out_init=bool(getattr(args, "prior_zero_out_init", False)),
     )
     if arch == "film":
-        return PriorScore1DFiLMPerLayer(
+        backbone = PriorScore1DFiLMPerLayer(
             **common,
             gated_film=bool(getattr(args, "prior_gated_film", False)),
         ).to(device)
-    if arch == "mlp":
-        return PriorScore1D(**common).to(device)
-    raise ValueError(f"Unknown --prior-score-arch: {arch!r} (expected 'mlp' or 'film').")
+    elif arch == "mlp":
+        backbone = PriorScore1D(**common).to(device)
+    else:
+        raise ValueError(f"Unknown --prior-score-arch: {arch!r} (expected 'mlp' or 'film').")
+    if score_objective == "edm":
+        return PriorThetaEDM(
+            backbone=backbone,
+            sigma_data=float(getattr(args, "edm_sigma_data", 0.5)),
+        ).to(device)
+    if score_objective == "ncsm":
+        return backbone
+    raise ValueError("--score-train-objective must be one of {'ncsm','edm'}.")
 
 
 def _apply_dsm_stability_preset(args: Any) -> None:
@@ -879,10 +908,23 @@ def validate_estimation_args(args: Any) -> None:
         raise ValueError("--score-loss-type must be one of {'mse','huber'}.")
     if str(getattr(args, "prior_loss_type", "mse")).lower() not in ("mse", "huber"):
         raise ValueError("--prior-loss-type must be one of {'mse','huber'}.")
+    objective = str(getattr(args, "score_train_objective", "ncsm")).lower()
+    if objective not in ("ncsm", "edm"):
+        raise ValueError("--score-train-objective must be one of {'ncsm','edm'}.")
     if str(getattr(args, "score_sigma_sample_mode", "uniform_log")).lower() not in ("uniform_log", "beta_log"):
         raise ValueError("--score-sigma-sample-mode must be one of {'uniform_log','beta_log'}.")
     if float(getattr(args, "score_sigma_sample_beta", 2.0)) <= 0.0:
         raise ValueError("--score-sigma-sample-beta must be positive.")
+    if float(getattr(args, "edm_sigma_data", 0.5)) <= 0.0:
+        raise ValueError("--edm-sigma-data must be positive.")
+    if float(getattr(args, "edm_p_std", 1.2)) <= 0.0:
+        raise ValueError("--edm-p-std must be positive.")
+    if objective == "edm" and str(getattr(args, "score_noise_mode", "continuous")).lower() != "continuous":
+        raise ValueError("EDM objective requires --score-noise-mode continuous.")
+    if objective == "edm" and bool(getattr(args, "score_normalize_by_sigma", False)):
+        raise ValueError("--score-normalize-by-sigma is NCSM-only; disable it for EDM.")
+    if objective == "edm" and bool(getattr(args, "prior_normalize_by_sigma", False)):
+        raise ValueError("--prior-normalize-by-sigma is NCSM-only; disable it for EDM.")
     if args.score_proxy_min_mult <= 0.0 or args.score_proxy_max_mult <= 0.0:
         raise ValueError("--score-proxy-min-mult and --score-proxy-max-mult must be positive.")
     if args.score_proxy_min_mult > args.score_proxy_max_mult:
@@ -1315,9 +1357,11 @@ def run_shared_fisher_estimation(
         print(f"[sigma_scale] mode=fixed sigma={args.score_fixed_sigma:.6f} theta_std={theta_std:.6f}")
 
     score_model = build_posterior_score_model(args, device)
+    score_objective = str(getattr(args, "score_train_objective", "ncsm")).lower()
     _sa = str(getattr(args, "score_arch", "mlp")).lower()
     print(
         "[score_model] "
+        f"objective={score_objective} "
         f"arch={_sa} "
         f"hidden_dim={int(args.score_hidden_dim)} depth={int(args.score_depth)} "
         f"noise_mode={args.score_noise_mode}"
@@ -1340,36 +1384,66 @@ def run_shared_fisher_estimation(
             f"sigma_max={max(float(sigma_min), float(sigma_max)):.6f}, "
             f"eval_sigma_values={sigma_values.tolist()}"
         )
-        score_train_out = train_score_model_ncsm_continuous(
-            model=score_model,
-            theta_train=theta_score_fit,
-            x_train=x_score_fit,
-            sigma_min=float(sigma_min),
-            sigma_max=float(sigma_max),
-            epochs=args.score_epochs,
-            batch_size=args.score_batch_size,
-            lr=args.score_lr,
-            device=device,
-            log_every=max(1, args.log_every),
-            theta_val=theta_score_val,
-            x_val=x_score_val,
-            early_stopping_patience=args.score_early_patience,
-            early_stopping_min_delta=args.score_early_min_delta,
-            early_stopping_ema_alpha=float(args.score_early_ema_alpha),
-            early_stopping_ema_warmup_epochs=int(getattr(args, "score_early_ema_warmup_epochs", 0)),
-            restore_best=args.score_restore_best,
-            optimizer_name=str(getattr(args, "score_optimizer", "adamw")),
-            weight_decay=float(getattr(args, "score_weight_decay", 1e-4)),
-            max_grad_norm=float(getattr(args, "score_max_grad_norm", 1.0)),
-            lr_scheduler=str(getattr(args, "score_lr_scheduler", "cosine")),
-            lr_warmup_frac=float(getattr(args, "score_lr_warmup_frac", 0.05)),
-            loss_type=str(getattr(args, "score_loss_type", "huber")),
-            huber_delta=float(getattr(args, "score_huber_delta", 1.0)),
-            normalize_by_sigma=bool(getattr(args, "score_normalize_by_sigma", False)),
-            abort_on_nonfinite=bool(getattr(args, "score_abort_on_nonfinite", True)),
-            sigma_sample_mode=str(getattr(args, "score_sigma_sample_mode", "uniform_log")),
-            sigma_sample_beta=float(getattr(args, "score_sigma_sample_beta", 2.0)),
-        )
+        if score_objective == "edm":
+            score_train_out = train_theta_edm_model(
+                model=score_model,
+                theta_train=theta_score_fit,
+                x_train=x_score_fit,
+                epochs=args.score_epochs,
+                batch_size=args.score_batch_size,
+                lr=args.score_lr,
+                device=device,
+                log_every=max(1, args.log_every),
+                theta_val=theta_score_val,
+                x_val=x_score_val,
+                early_stopping_patience=args.score_early_patience,
+                early_stopping_min_delta=args.score_early_min_delta,
+                early_stopping_ema_alpha=float(args.score_early_ema_alpha),
+                early_stopping_ema_warmup_epochs=int(getattr(args, "score_early_ema_warmup_epochs", 0)),
+                restore_best=args.score_restore_best,
+                optimizer_name=str(getattr(args, "score_optimizer", "adamw")),
+                weight_decay=float(getattr(args, "score_weight_decay", 1e-4)),
+                max_grad_norm=float(getattr(args, "score_max_grad_norm", 1.0)),
+                lr_scheduler=str(getattr(args, "score_lr_scheduler", "cosine")),
+                lr_warmup_frac=float(getattr(args, "score_lr_warmup_frac", 0.05)),
+                loss_type=str(getattr(args, "score_loss_type", "mse")),
+                huber_delta=float(getattr(args, "score_huber_delta", 1.0)),
+                abort_on_nonfinite=bool(getattr(args, "score_abort_on_nonfinite", True)),
+                p_mean=float(getattr(args, "edm_p_mean", -1.2)),
+                p_std=float(getattr(args, "edm_p_std", 1.2)),
+                sigma_data=float(getattr(args, "edm_sigma_data", 0.5)),
+            )
+        else:
+            score_train_out = train_score_model_ncsm_continuous(
+                model=score_model,
+                theta_train=theta_score_fit,
+                x_train=x_score_fit,
+                sigma_min=float(sigma_min),
+                sigma_max=float(sigma_max),
+                epochs=args.score_epochs,
+                batch_size=args.score_batch_size,
+                lr=args.score_lr,
+                device=device,
+                log_every=max(1, args.log_every),
+                theta_val=theta_score_val,
+                x_val=x_score_val,
+                early_stopping_patience=args.score_early_patience,
+                early_stopping_min_delta=args.score_early_min_delta,
+                early_stopping_ema_alpha=float(args.score_early_ema_alpha),
+                early_stopping_ema_warmup_epochs=int(getattr(args, "score_early_ema_warmup_epochs", 0)),
+                restore_best=args.score_restore_best,
+                optimizer_name=str(getattr(args, "score_optimizer", "adamw")),
+                weight_decay=float(getattr(args, "score_weight_decay", 1e-4)),
+                max_grad_norm=float(getattr(args, "score_max_grad_norm", 1.0)),
+                lr_scheduler=str(getattr(args, "score_lr_scheduler", "cosine")),
+                lr_warmup_frac=float(getattr(args, "score_lr_warmup_frac", 0.05)),
+                loss_type=str(getattr(args, "score_loss_type", "huber")),
+                huber_delta=float(getattr(args, "score_huber_delta", 1.0)),
+                normalize_by_sigma=bool(getattr(args, "score_normalize_by_sigma", False)),
+                abort_on_nonfinite=bool(getattr(args, "score_abort_on_nonfinite", True)),
+                sigma_sample_mode=str(getattr(args, "score_sigma_sample_mode", "uniform_log")),
+                sigma_sample_beta=float(getattr(args, "score_sigma_sample_beta", 2.0)),
+            )
     else:
         if args.score_sigma_scale_mode == "fixed":
             sigma_values = np.full((args.score_eval_sigmas,), fill_value=float(sigma_base), dtype=np.float64)
@@ -1514,7 +1588,7 @@ def run_shared_fisher_estimation(
     prior_fig_path = ""
     score_eval_wp: Any | None = None
     score_eval: Any | None = None
-    prior_model: PriorScore1D | PriorScore1DFiLMPerLayer | None = None
+    prior_model: PriorScore1D | PriorScore1DFiLMPerLayer | PriorThetaEDM | None = None
     h_result: HMatrixResult | None = None
     h_sigma_eval = float("nan")
 
@@ -1537,34 +1611,62 @@ def run_shared_fisher_estimation(
             f"noise_mode={args.score_noise_mode} (same σ schedule as posterior)"
         )
         if args.score_noise_mode == "continuous":
-            prior_train_out = train_prior_score_model_ncsm_continuous(
-                model=prior_model,
-                theta_train=theta_score_fit,
-                sigma_min=float(sigma_min),
-                sigma_max=float(sigma_max),
-                epochs=int(getattr(args, "prior_epochs", 10000)),
-                batch_size=int(getattr(args, "prior_batch_size", 256)),
-                lr=float(getattr(args, "prior_lr", 1e-3)),
-                device=device,
-                log_every=max(1, args.log_every),
-                theta_val=theta_score_val,
-                early_stopping_patience=int(getattr(args, "prior_early_patience", 1000)),
-                early_stopping_min_delta=float(getattr(args, "prior_early_min_delta", 1e-4)),
-                early_stopping_ema_alpha=float(getattr(args, "prior_early_ema_alpha", 0.05)),
-                early_stopping_ema_warmup_epochs=int(getattr(args, "prior_early_ema_warmup_epochs", 0)),
-                restore_best=bool(getattr(args, "prior_restore_best", True)),
-                optimizer_name=str(getattr(args, "prior_optimizer", "adamw")),
-                weight_decay=float(getattr(args, "prior_weight_decay", 1e-4)),
-                max_grad_norm=float(getattr(args, "prior_max_grad_norm", 1.0)),
-                lr_scheduler=str(getattr(args, "prior_lr_scheduler", "cosine")),
-                lr_warmup_frac=float(getattr(args, "prior_lr_warmup_frac", 0.05)),
-                loss_type=str(getattr(args, "prior_loss_type", "huber")),
-                huber_delta=float(getattr(args, "prior_huber_delta", 1.0)),
-                normalize_by_sigma=bool(getattr(args, "prior_normalize_by_sigma", False)),
-                abort_on_nonfinite=bool(getattr(args, "prior_abort_on_nonfinite", True)),
-                sigma_sample_mode=str(getattr(args, "score_sigma_sample_mode", "uniform_log")),
-                sigma_sample_beta=float(getattr(args, "score_sigma_sample_beta", 2.0)),
-            )
+            if score_objective == "edm":
+                prior_train_out = train_prior_theta_edm_model(
+                    model=prior_model,
+                    theta_train=theta_score_fit,
+                    epochs=int(getattr(args, "prior_epochs", 10000)),
+                    batch_size=int(getattr(args, "prior_batch_size", 256)),
+                    lr=float(getattr(args, "prior_lr", 1e-3)),
+                    device=device,
+                    log_every=max(1, args.log_every),
+                    theta_val=theta_score_val,
+                    early_stopping_patience=int(getattr(args, "prior_early_patience", 1000)),
+                    early_stopping_min_delta=float(getattr(args, "prior_early_min_delta", 1e-4)),
+                    early_stopping_ema_alpha=float(getattr(args, "prior_early_ema_alpha", 0.05)),
+                    early_stopping_ema_warmup_epochs=int(getattr(args, "prior_early_ema_warmup_epochs", 0)),
+                    restore_best=bool(getattr(args, "prior_restore_best", True)),
+                    optimizer_name=str(getattr(args, "prior_optimizer", "adamw")),
+                    weight_decay=float(getattr(args, "prior_weight_decay", 1e-4)),
+                    max_grad_norm=float(getattr(args, "prior_max_grad_norm", 1.0)),
+                    lr_scheduler=str(getattr(args, "prior_lr_scheduler", "cosine")),
+                    lr_warmup_frac=float(getattr(args, "prior_lr_warmup_frac", 0.05)),
+                    loss_type=str(getattr(args, "prior_loss_type", "mse")),
+                    huber_delta=float(getattr(args, "prior_huber_delta", 1.0)),
+                    abort_on_nonfinite=bool(getattr(args, "prior_abort_on_nonfinite", True)),
+                    p_mean=float(getattr(args, "edm_p_mean", -1.2)),
+                    p_std=float(getattr(args, "edm_p_std", 1.2)),
+                    sigma_data=float(getattr(args, "edm_sigma_data", 0.5)),
+                )
+            else:
+                prior_train_out = train_prior_score_model_ncsm_continuous(
+                    model=prior_model,
+                    theta_train=theta_score_fit,
+                    sigma_min=float(sigma_min),
+                    sigma_max=float(sigma_max),
+                    epochs=int(getattr(args, "prior_epochs", 10000)),
+                    batch_size=int(getattr(args, "prior_batch_size", 256)),
+                    lr=float(getattr(args, "prior_lr", 1e-3)),
+                    device=device,
+                    log_every=max(1, args.log_every),
+                    theta_val=theta_score_val,
+                    early_stopping_patience=int(getattr(args, "prior_early_patience", 1000)),
+                    early_stopping_min_delta=float(getattr(args, "prior_early_min_delta", 1e-4)),
+                    early_stopping_ema_alpha=float(getattr(args, "prior_early_ema_alpha", 0.05)),
+                    early_stopping_ema_warmup_epochs=int(getattr(args, "prior_early_ema_warmup_epochs", 0)),
+                    restore_best=bool(getattr(args, "prior_restore_best", True)),
+                    optimizer_name=str(getattr(args, "prior_optimizer", "adamw")),
+                    weight_decay=float(getattr(args, "prior_weight_decay", 1e-4)),
+                    max_grad_norm=float(getattr(args, "prior_max_grad_norm", 1.0)),
+                    lr_scheduler=str(getattr(args, "prior_lr_scheduler", "cosine")),
+                    lr_warmup_frac=float(getattr(args, "prior_lr_warmup_frac", 0.05)),
+                    loss_type=str(getattr(args, "prior_loss_type", "huber")),
+                    huber_delta=float(getattr(args, "prior_huber_delta", 1.0)),
+                    normalize_by_sigma=bool(getattr(args, "prior_normalize_by_sigma", False)),
+                    abort_on_nonfinite=bool(getattr(args, "prior_abort_on_nonfinite", True)),
+                    sigma_sample_mode=str(getattr(args, "score_sigma_sample_mode", "uniform_log")),
+                    sigma_sample_beta=float(getattr(args, "score_sigma_sample_beta", 2.0)),
+                )
         else:
             prior_train_out = train_prior_score_model(
                 model=prior_model,
@@ -2123,6 +2225,7 @@ def run_shared_fisher_estimation(
         f.write(
             "score_stability: "
             f"preset={getattr(args, 'dsm_stability_preset', 'stable_v1')}, "
+            f"objective={score_objective}, "
             f"optimizer={getattr(args, 'score_optimizer', 'adamw')}, "
             f"wd={getattr(args, 'score_weight_decay', 0.0)}, "
             f"scheduler={getattr(args, 'score_lr_scheduler', 'none')}, "
@@ -2133,6 +2236,9 @@ def run_shared_fisher_estimation(
             f"normalize_by_sigma={getattr(args, 'score_normalize_by_sigma', False)}, "
             f"sigma_sample_mode={getattr(args, 'score_sigma_sample_mode', 'uniform_log')}, "
             f"sigma_sample_beta={getattr(args, 'score_sigma_sample_beta', 2.0)}, "
+            f"edm_p_mean={getattr(args, 'edm_p_mean', -1.2)}, "
+            f"edm_p_std={getattr(args, 'edm_p_std', 1.2)}, "
+            f"edm_sigma_data={getattr(args, 'edm_sigma_data', 0.5)}, "
             f"has_nonfinite={bool(score_train_out.get('has_nonfinite', False))}, "
             f"grad_norm_mean={float(score_train_out.get('grad_norm_mean', float('nan'))):.6g}, "
             f"grad_norm_max={float(score_train_out.get('grad_norm_max', float('nan'))):.6g}, "
@@ -2159,6 +2265,7 @@ def run_shared_fisher_estimation(
             )
             f.write(
                 "prior_stability: "
+                f"objective={score_objective}, "
                 f"optimizer={getattr(args, 'prior_optimizer', 'adamw')}, "
                 f"wd={getattr(args, 'prior_weight_decay', 0.0)}, "
                 f"scheduler={getattr(args, 'prior_lr_scheduler', 'none')}, "

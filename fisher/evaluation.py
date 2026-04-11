@@ -17,7 +17,9 @@ from fisher.data import (
 from fisher.models import (
     ConditionalScore1D,
     ConditionalScore1DFiLMPerLayer,
+    ConditionalThetaEDM,
     LocalDecoderLogit,
+    PriorThetaEDM,
     PriorScore1D,
     PriorScore1DFiLMPerLayer,
 )
@@ -201,7 +203,7 @@ class ScoreEvalResult:
 
 
 def evaluate_score_fisher(
-    model: ConditionalScore1D | ConditionalScore1DFiLMPerLayer,
+    model: ConditionalScore1D | ConditionalScore1DFiLMPerLayer | ConditionalThetaEDM,
     theta_eval: np.ndarray,
     x_eval: np.ndarray,
     dataset: ToyConditionalGaussianDataset
@@ -302,8 +304,8 @@ class ScoreEvalWithPriorResult:
 
 
 def evaluate_score_fisher_with_prior(
-    model_post: ConditionalScore1D | ConditionalScore1DFiLMPerLayer,
-    model_prior: PriorScore1D | PriorScore1DFiLMPerLayer,
+    model_post: ConditionalScore1D | ConditionalScore1DFiLMPerLayer | ConditionalThetaEDM,
+    model_prior: PriorScore1D | PriorScore1DFiLMPerLayer | PriorThetaEDM,
     theta_eval: np.ndarray,
     x_eval: np.ndarray,
     dataset: ToyConditionalGaussianDataset
