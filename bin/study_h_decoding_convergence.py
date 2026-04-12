@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Convergence of binned H and pairwise decoding vs references.
 
-**Binned H:** off-diagonal correlation vs a **generative ground-truth** squared Hellinger matrix
+**Binned H:** off-diagonal correlation vs a **generative ground-truth** Hellinger matrix
 estimated by Monte Carlo from the known toy likelihood (see ``fisher/hellinger_gt.py`` and
-``report/notes/hellinger_idea.tex``). With ``n_bins`` = ``--num-theta-bins``, the MC count per
+``report/notes/hellinger_idea.tex``). The MC routine returns squared Hellinger **H^2**; this
+script compares and visualizes **elementwise square roots** ``sqrt(H^2)`` (GT) and
+``sqrt(H^sym)`` (learned binned symmetric ``h_sym``), both clipped to ``[0, 1]`` before the
+square root. With ``n_bins`` = ``--num-theta-bins``, the MC count per
 bin row is ``n_mc = n_ref // n_bins`` (integer floor); ``n_bins * n_mc`` may be less than ``n_ref``.
 Nested subset training for each ``n`` in ``--n-list`` uses up to ``n`` samples; the ``n_ref`` column does not train a model.
 
@@ -14,11 +17,17 @@ subset (same bin edges as GT), unchanged.
 ``gaussian_raw`` tuning from ``make_dataset.py``). Regenerate the NPZ if the family does not match.
 
 For each ``n`` in ``--n-list``, the H matrix is computed from trained **posterior** and **prior**
-models (``--theta-field-method dsm`` or ``flow``). This script defaults to **multi-layer FiLM**
+models (``--theta-field-method dsm`` or ``flow``). In ``flow`` mode, H uses the
+**flow-derived score** (velocity-to-epsilon conversion and ``s = -eps/sigma_t``), not raw velocity.
+This script defaults to **multi-layer FiLM**
 for the posterior (``--score-arch film``, ``--score-depth 3``) and a **3-layer MLP** prior
 (``--prior-score-arch mlp``). The **reference column** (``n_ref``) does **not** run DSM/flow: the
-matrix-panel top row uses the **MC generative GT** Hellinger matrix (same as the correlation
+matrix-panel top row shows **MC generative** ``sqrt(H^2)`` (same as the H correlation
 target), while the bottom row still shows pairwise decoding on the ``n_ref`` data subset.
+
+**NPZ semantics:** Arrays ``h_binned_columns``, ``h_binned_ref``, and the key ``hellinger_gt_sq_mc``
+hold **square-root** matrices for this study (legacy key name ``hellinger_gt_sq_mc``; values are
+``sqrt(H^2)``, not ``H^2``).
 """
 
 from __future__ import annotations
@@ -32,6 +41,7 @@ import tempfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 _repo_root = Path(__file__).resolve().parent.parent
 _bin_dir = Path(__file__).resolve().parent
@@ -57,13 +67,23 @@ from fisher.shared_fisher_est import (
 )
 
 
+def _sqrt_h_like(mat: np.ndarray) -> np.ndarray:
+    """Elementwise sqrt for H^2- or H_sym-like matrices in [0, 1]; preserves NaN positions."""
+    h = np.asarray(mat, dtype=np.float64)
+    out = np.full_like(h, np.nan, dtype=np.float64)
+    finite = np.isfinite(h)
+    out[finite] = np.sqrt(np.clip(h[finite], 0.0, 1.0))
+    return out
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
-            "Load a shared dataset .npz, train score models for each n in --n-list, then compare binned H to a "
-            "Monte Carlo generative Hellinger GT and pairwise decoding to the n_ref-subset decoding matrix. "
-            "The n_ref matrix-panel column uses MC GT for the top row (no n_ref model training). "
-            "Also writes h_decoding_convergence_combined.{png,svg} (line plot + matrix panel side-by-side)."
+            "Load a shared dataset .npz, train score models for each n in --n-list, then compare "
+            "sqrt(binned H_sym) to sqrt(MC generative H^2) and pairwise decoding to the n_ref-subset decoding matrix. "
+            "The n_ref matrix-panel column uses MC GT sqrt(H^2) for the top row (no n_ref model training). "
+            "Also writes h_decoding_convergence_combined.{png,svg} (line plot + matrix panel side-by-side) "
+            "and h_decoding_training_losses_panel.{png,svg} (score/prior loss vs epoch, one column per n)."
         )
     )
     p.add_argument(
@@ -113,7 +133,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--subset-seed-offset",
         type=int,
         default=0,
-        help="Added to dataset meta seed for the global permutation (default 0).",
+        help=(
+            "Added to the convergence base seed for the global permutation (default 0). "
+            "The base seed is --run-seed when set, otherwise the dataset meta seed from the NPZ."
+        ),
+    )
+    p.add_argument(
+        "--run-seed",
+        type=int,
+        default=None,
+        help=(
+            "If set, use this as the base RNG seed for this study (global permutation uses "
+            "run_seed + --subset-seed-offset; shared Fisher training uses this via merged args.seed; "
+            "default clf / GT Hellinger MC seeds use this when their dedicated flags are -1). "
+            "Omit to keep the dataset meta seed from the NPZ (same behavior as before)."
+        ),
     )
     p.add_argument(
         "--num-theta-bins",
@@ -244,6 +278,9 @@ def _subset_bundle(
 
 def _make_full_args(args: argparse.Namespace, meta: dict) -> SimpleNamespace:
     full_args = merge_meta_into_args(meta, args)
+    rs = getattr(args, "run_seed", None)
+    if rs is not None:
+        setattr(full_args, "seed", int(rs))
     setattr(full_args, "compute_h_matrix", True)
     setattr(full_args, "h_restore_original_order", True)
     setattr(full_args, "skip_shared_fisher_gt_compare", True)
@@ -258,9 +295,10 @@ def _run_ctx_for_bundle(
     full_args: SimpleNamespace,
     n_bins: int,
 ) -> vhb.RunContext:
-    np.random.seed(int(meta["seed"]))
-    torch.manual_seed(int(meta["seed"]))
-    rng = np.random.default_rng(int(meta["seed"]))
+    run_seed = int(getattr(full_args, "seed", meta["seed"]))
+    np.random.seed(run_seed)
+    torch.manual_seed(run_seed)
+    rng = np.random.default_rng(run_seed)
     dev = require_device(str(full_args.device))
     dataset = build_dataset_from_meta(meta)
     cfg = vhb.BinnedVizConfig(args=args, dataset_npz=str(args.dataset_npz), n_bins=n_bins, h_only=False)
@@ -374,6 +412,181 @@ def _save_figure_png_svg(fig: plt.Figure, path_png: str, *, dpi: int = 160) -> s
     return path_svg
 
 
+def _load_per_n_training_loss_npz(path: str) -> dict[str, Any]:
+    """Load arrays from ``score_prior_training_losses.npz`` (DSM or flow)."""
+    # Object arrays (e.g. ``theta_field_method``) require allow_pickle=True.
+    z = np.load(path, allow_pickle=True)
+
+    def _arr(name: str) -> np.ndarray:
+        if name not in z.files:
+            return np.asarray([], dtype=np.float64)
+        return np.asarray(z[name], dtype=np.float64).ravel()
+
+    prior_enable = True
+    if "prior_enable" in z.files:
+        pv = z["prior_enable"]
+        prior_enable = bool(np.asarray(pv).reshape(-1)[0])
+
+    tfm = "dsm"
+    if "theta_field_method" in z.files:
+        raw = z["theta_field_method"]
+        if raw.dtype == object or raw.dtype.kind in ("U", "S"):
+            tfm = str(np.asarray(raw).reshape(-1)[0])
+        else:
+            tfm = str(raw)
+
+    return {
+        "theta_field_method": tfm,
+        "prior_enable": prior_enable,
+        "score_train_losses": _arr("score_train_losses"),
+        "score_val_losses": _arr("score_val_losses"),
+        "score_val_monitor_losses": _arr("score_val_monitor_losses"),
+        "prior_train_losses": _arr("prior_train_losses"),
+        "prior_val_losses": _arr("prior_val_losses"),
+        "prior_val_monitor_losses": _arr("prior_val_monitor_losses"),
+    }
+
+
+def _plot_loss_triplet(
+    ax: plt.Axes,
+    train: np.ndarray,
+    val: np.ndarray,
+    ema: np.ndarray,
+    *,
+    ylabel: str,
+    title: str | None,
+    show_legend: bool,
+    score_like: bool,
+) -> None:
+    """Plot train / val / EMA monitor curves on one axis."""
+    train = np.asarray(train, dtype=np.float64).ravel()
+    val = np.asarray(val, dtype=np.float64).ravel()
+    ema = np.asarray(ema, dtype=np.float64).ravel()
+    lengths = [s.size for s in (train, val, ema) if s.size > 0]
+    if not lengths:
+        ax.text(0.5, 0.5, "no loss data", ha="center", va="center", transform=ax.transAxes, fontsize=9)
+        ax.set_axis_off()
+        return
+    n_epoch = int(max(lengths))
+    epochs = np.arange(1, n_epoch + 1, dtype=np.float64)
+    if train.size > 0:
+        m = min(train.size, n_epoch)
+        ax.plot(epochs[:m], train[:m], color="#1f77b4", linewidth=1.6, label="train")
+    if val.size > 0 and np.any(np.isfinite(val)):
+        m = min(val.size, n_epoch)
+        ax.plot(epochs[:m], val[:m], color="#d62728", linewidth=1.6, label="val")
+    if ema.size > 0 and np.any(np.isfinite(ema)):
+        m = min(ema.size, n_epoch)
+        label = "val EMA (early-stop)" if score_like else "prior val EMA"
+        ax.plot(epochs[:m], ema[:m], color="#ff7f0e", linewidth=1.4, linestyle="--", label=label)
+    ax.set_xlabel("epoch", fontsize=9)
+    ax.set_ylabel(ylabel, fontsize=9)
+    if title:
+        ax.set_title(title, fontsize=10)
+    ax.grid(True, alpha=0.35)
+    if show_legend:
+        ax.legend(loc="upper right", fontsize=7)
+
+
+def _render_training_losses_panel(
+    *,
+    ns: list[int],
+    loss_dir: str,
+    out_png_path: str,
+    dpi: int = 160,
+) -> str:
+    """Two rows (score, prior), one column per ``n``; save PNG + SVG."""
+    n_cols = len(ns)
+    if n_cols < 1:
+        raise ValueError("n-list must be non-empty for training loss panel.")
+    w = max(2.6 * n_cols, 6.0)
+    h = 5.8
+    fig, axes = plt.subplots(2, n_cols, figsize=(w, h), squeeze=False, sharex="col")
+
+    row0_ylabel = "score / posterior loss"
+    row1_ylabel = "prior loss"
+
+    for j, n in enumerate(ns):
+        path = os.path.join(loss_dir, f"n_{int(n):06d}.npz")
+        if not os.path.isfile(path):
+            for r in (0, 1):
+                axes[r, j].text(
+                    0.5,
+                    0.5,
+                    f"missing\n{path}",
+                    ha="center",
+                    va="center",
+                    transform=axes[r, j].transAxes,
+                    fontsize=8,
+                    color="crimson",
+                )
+                axes[r, j].set_axis_off()
+            continue
+
+        try:
+            bundle = _load_per_n_training_loss_npz(path)
+        except Exception as e:
+            for r in (0, 1):
+                axes[r, j].text(
+                    0.5,
+                    0.5,
+                    f"load error:\n{e!s}"[:200],
+                    ha="center",
+                    va="center",
+                    transform=axes[r, j].transAxes,
+                    fontsize=7,
+                    color="crimson",
+                )
+                axes[r, j].set_axis_off()
+            continue
+
+        tfm = str(bundle.get("theta_field_method", "dsm")).strip().lower()
+        post_lab = "theta-flow" if tfm == "flow" else "score (DSM)"
+        _plot_loss_triplet(
+            axes[0, j],
+            bundle["score_train_losses"],
+            bundle["score_val_losses"],
+            bundle["score_val_monitor_losses"],
+            ylabel=row0_ylabel if j == 0 else "",
+            title=f"n={n} ({post_lab})",
+            show_legend=(j == 0),
+            score_like=True,
+        )
+
+        if bundle["prior_enable"]:
+            _plot_loss_triplet(
+                axes[1, j],
+                bundle["prior_train_losses"],
+                bundle["prior_val_losses"],
+                bundle["prior_val_monitor_losses"],
+                ylabel=row1_ylabel if j == 0 else "",
+                title=None,
+                show_legend=(j == 0),
+                score_like=False,
+            )
+        else:
+            axes[1, j].text(
+                0.5,
+                0.5,
+                "prior disabled",
+                ha="center",
+                va="center",
+                transform=axes[1, j].transAxes,
+                fontsize=10,
+            )
+            axes[1, j].set_axis_off()
+
+    fig.suptitle(
+        "Training loss vs epoch (top: posterior; bottom: prior). Columns: nested subset sizes n.",
+        fontsize=11,
+        y=1.02,
+    )
+    fig.tight_layout()
+    svg = _save_figure_png_svg(fig, out_png_path, dpi=dpi)
+    plt.close(fig)
+    return svg
+
+
 def _save_combined_convergence_figure(
     left_png_path: str,
     right_png_path: str,
@@ -432,12 +645,12 @@ def _render_matrix_panel(
     out_path: str,
     n_bins: int,
 ) -> None:
-    """Two rows: binned H, pairwise decoding."""
+    """Two rows: sqrt(binned H_sym) vs sqrt(GT H^2), pairwise decoding."""
     n_cols = len(h_mats)
     if n_cols != len(clf_mats) or n_cols != len(col_labels):
         raise ValueError("h_mats, clf_mats, col_labels length mismatch.")
     fig, axes = plt.subplots(2, n_cols, figsize=(2.8 * n_cols, 5.6), squeeze=False)
-    # Binned H is treated on [0, 1] for a consistent cross-column color scale.
+    # sqrt(H) entries lie in [0, 1]; use [0, 1] for a consistent cross-column color scale.
     vmin_h, vmax_h = 0.0, 1.0
     vmin_c, vmax_c = _finite_min_max(clf_mats)
     if vmin_c >= vmax_c:
@@ -458,7 +671,7 @@ def _render_matrix_panel(
         axes[0, c].set_yticks(range(n_bins))
         axes[0, c].tick_params(labelsize=7)
         if c == 0:
-            axes[0, c].set_ylabel("Binned H / GT (n_ref)", fontsize=11)
+            axes[0, c].set_ylabel(r"Binned $\sqrt{H^{\mathrm{sym}}}$ / GT $\sqrt{H^2}$ (n_ref)", fontsize=11)
         plt.colorbar(im0, ax=axes[0, c], fraction=0.046, pad=0.04)
 
         im1 = axes[1, c].imshow(
@@ -477,7 +690,7 @@ def _render_matrix_panel(
         plt.colorbar(im1, ax=axes[1, c], fraction=0.046, pad=0.04)
 
     fig.suptitle(
-        "Top: learned binned H for each n; last column n_ref shows MC GT H². "
+        "Top: sqrt(binned H_sym) for each n; last column n_ref shows MC GT sqrt(H^2). "
         "Bottom: pairwise decoding (rows 1–2) by nested subset size.",
         fontsize=10,
     )
@@ -494,6 +707,7 @@ def _write_summary(
     n_pool: int,
     ref_dir: str,
     paths_out: dict[str, str],
+    per_n_loss_rows: list[dict[str, str]],
 ) -> None:
     with open(path, "w", encoding="utf-8") as f:
         f.write("study_h_decoding_convergence\n")
@@ -509,6 +723,18 @@ def _write_summary(
         f.write(f"meta seed: {meta.get('seed')}\n")
         for k, v in paths_out.items():
             f.write(f"{k}: {v}\n")
+        f.write("\n# Per-n training-loss artifacts\n")
+        for row in per_n_loss_rows:
+            f.write(
+                "n={n} status={status} run_dir={run_dir} src={src} dst={dst} note={note}\n".format(
+                    n=row["n"],
+                    status=row["status"],
+                    run_dir=row["run_dir"],
+                    src=row["src"],
+                    dst=row["dst"],
+                    note=row["note"],
+                )
+            )
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -520,6 +746,8 @@ def main(argv: list[str] | None = None) -> None:
             pass
     p = build_parser()
     args = p.parse_args(argv)
+    args.output_dir = os.path.abspath(str(args.output_dir))
+    args.dataset_npz = os.path.abspath(str(args.dataset_npz))
     _validate_cli(args)
     ns = _parse_n_list(args.n_list)
 
@@ -550,17 +778,24 @@ def main(argv: list[str] | None = None) -> None:
         )
 
     n_bins = int(args.num_theta_bins)
-    perm_seed = int(meta["seed"]) + int(args.subset_seed_offset)
+    base_seed = int(args.run_seed) if args.run_seed is not None else int(meta["seed"])
+    perm_seed = base_seed + int(args.subset_seed_offset)
     rng_perm = np.random.default_rng(perm_seed)
     perm = rng_perm.permutation(n_pool)
+    if args.run_seed is not None:
+        print(
+            f"[convergence] --run-seed={int(args.run_seed)} "
+            f"(dataset meta seed={int(meta['seed'])}; perm_seed={perm_seed})",
+            flush=True,
+        )
 
     theta_ref = np.asarray(bundle.theta_all[perm[: int(args.n_ref)]], dtype=np.float64).reshape(-1)
     edges, edge_lo, edge_hi = vhb.theta_bin_edges(theta_ref, n_bins)
 
-    clf_rs = int(meta["seed"]) if int(args.clf_random_state) < 0 else int(args.clf_random_state)
+    clf_rs = base_seed if int(args.clf_random_state) < 0 else int(args.clf_random_state)
 
     dataset_for_gt = build_dataset_from_meta(meta)
-    gt_seed = int(meta["seed"]) if int(args.gt_hellinger_seed) < 0 else int(args.gt_hellinger_seed)
+    gt_seed = base_seed if int(args.gt_hellinger_seed) < 0 else int(args.gt_hellinger_seed)
     if hasattr(dataset_for_gt, "rng"):
         dataset_for_gt.rng = np.random.default_rng(gt_seed)
     centers = bin_centers_from_edges(edges)
@@ -572,9 +807,11 @@ def main(argv: list[str] | None = None) -> None:
         n_mc=gt_n_mc,
         symmetrize=bool(args.gt_hellinger_symmetrize),
     )
+    h_gt_sqrt = _sqrt_h_like(h_gt_mc)
     print(
         f"[convergence] GT Hellinger (MC likelihood) n_bins={n_bins} n_mc={gt_n_mc} "
-        f"(n_bins*n_mc={n_bins * gt_n_mc} <= n_ref={int(args.n_ref)}) wall time: {time.time() - t_gt0:.1f}s",
+        f"(n_bins*n_mc={n_bins * gt_n_mc} <= n_ref={int(args.n_ref)}) wall time: {time.time() - t_gt0:.1f}s "
+        f"(H track uses sqrt(H^2) vs sqrt(binned h_sym))",
         flush=True,
     )
 
@@ -587,8 +824,14 @@ def main(argv: list[str] | None = None) -> None:
         f"prior_arch={getattr(args, 'prior_score_arch', 'mlp')})",
         flush=True,
     )
+    if tfm == "flow":
+        print(
+            "[convergence] flow mode uses score-from-velocity conversion "
+            "(path.velocity_to_epsilon then s=-eps/sigma_t).",
+            flush=True,
+        )
     print(
-        "[convergence] n_ref reference: no DSM/flow training; matrix-panel top row = MC GT H^2; "
+        "[convergence] n_ref reference: no DSM/flow training; matrix-panel top row = MC GT sqrt(H^2); "
         "pairwise decoding from n_ref subset only.",
         flush=True,
     )
@@ -596,7 +839,7 @@ def main(argv: list[str] | None = None) -> None:
     print(f"[convergence] n_list={ns}", flush=True)
     t0 = time.time()
     bundle_ref = _subset_bundle(bundle, perm, int(args.n_ref), meta)
-    h_ref = np.asarray(h_gt_mc, dtype=np.float64)
+    h_ref = np.asarray(h_gt_sqrt, dtype=np.float64)
     clf_ref = _pairwise_clf_from_bundle(
         args=args,
         meta=meta,
@@ -617,7 +860,8 @@ def main(argv: list[str] | None = None) -> None:
         os.path.join(args.output_dir, "h_decoding_convergence_reference.npz"),
         h_binned_ref=h_ref,
         clf_acc_ref=clf_ref,
-        hellinger_gt_sq_mc=h_gt_mc,
+        # Legacy key name: stores sqrt(H^2) from MC (not raw H^2); see module docstring.
+        hellinger_gt_sq_mc=h_gt_sqrt,
         h_binned_ref_is_gt_mc=np.int32(1),
         theta_bin_centers=centers,
         gt_hellinger_n_mc=np.int64(gt_n_mc),
@@ -628,6 +872,8 @@ def main(argv: list[str] | None = None) -> None:
         edge_lo=np.float64(edge_lo),
         edge_hi=np.float64(edge_hi),
         perm_seed=np.int64(perm_seed),
+        convergence_base_seed=np.int64(base_seed),
+        dataset_meta_seed=np.int64(meta["seed"]),
         n_ref=np.int64(args.n_ref),
     )
 
@@ -637,10 +883,15 @@ def main(argv: list[str] | None = None) -> None:
     err_msg: list[str] = []
     h_sweep: list[np.ndarray] = []
     clf_sweep: list[np.ndarray] = []
+    per_n_loss_rows: list[dict[str, str]] = []
 
     sweep_root = os.path.join(args.output_dir, "sweep_runs")
     if bool(args.keep_intermediate):
         os.makedirs(sweep_root, exist_ok=True)
+    print(
+        "[convergence] per-n training sweep is enabled; collecting training_losses from each run artifact.",
+        flush=True,
+    )
 
     for k, n in enumerate(ns):
         run_dir: str
@@ -671,10 +922,11 @@ def main(argv: list[str] | None = None) -> None:
                 int(args.clf_min_class_count),
                 clf_rs,
             )
-            corr_h[k] = vhb.matrix_corr_offdiag(h_n, h_gt_mc)
+            h_n_sqrt = _sqrt_h_like(h_n)
+            corr_h[k] = vhb.matrix_corr_offdiag(h_n_sqrt, h_gt_sqrt)
             corr_clf[k] = vhb.matrix_corr_offdiag(clf_n, clf_ref)
             wall_s[k] = time.time() - t1
-            h_sweep.append(np.asarray(h_n, dtype=np.float64))
+            h_sweep.append(np.asarray(h_n_sqrt, dtype=np.float64))
             clf_sweep.append(np.asarray(clf_n, dtype=np.float64))
             print(
                 f"[convergence] n={n}  corr_h={corr_h[k]:.4f}  corr_clf={corr_clf[k]:.4f}  "
@@ -682,17 +934,52 @@ def main(argv: list[str] | None = None) -> None:
                 flush=True,
             )
             run_loss_npz = os.path.join(run_dir, "score_prior_training_losses.npz")
-            if os.path.isfile(run_loss_npz):
-                shutil.copy2(run_loss_npz, os.path.join(loss_dir, f"n_{n:06d}.npz"))
+            run_loss_npz_abs = os.path.abspath(run_loss_npz)
+            if not os.path.isfile(run_loss_npz_abs):
+                raise FileNotFoundError(
+                    f"Expected per-n training loss artifact is missing: {run_loss_npz_abs}"
+                )
+            dst_loss_npz_abs = os.path.abspath(os.path.join(loss_dir, f"n_{n:06d}.npz"))
+            shutil.copy2(run_loss_npz_abs, dst_loss_npz_abs)
+            per_n_loss_rows.append(
+                {
+                    "n": str(n),
+                    "status": "copied",
+                    "run_dir": os.path.abspath(run_dir),
+                    "src": run_loss_npz_abs,
+                    "dst": dst_loss_npz_abs,
+                    "note": "from per-n training sweep run",
+                }
+            )
+            print(
+                f"[convergence] n={n} training_loss copied -> {dst_loss_npz_abs}",
+                flush=True,
+            )
         except Exception as e:
             err_msg.append(f"n={n}: {e!r}")
             print(f"[convergence] ERROR n={n}: {e}")
+            per_n_loss_rows.append(
+                {
+                    "n": str(n),
+                    "status": "error",
+                    "run_dir": os.path.abspath(run_dir),
+                    "src": os.path.abspath(os.path.join(run_dir, "score_prior_training_losses.npz")),
+                    "dst": os.path.abspath(os.path.join(loss_dir, f"n_{n:06d}.npz")),
+                    "note": repr(e),
+                }
+            )
         finally:
             if tmp_ctx is not None:
                 tmp_ctx.cleanup()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    if err_msg:
+        msg = "\n".join([f"  - {m}" for m in err_msg[:20]])
+        raise RuntimeError(
+            "Per-n sweep failed (including required training-loss collection).\n"
+            f"{msg}"
+        )
     if len(h_sweep) != len(ns) or len(clf_sweep) != len(ns):
         raise RuntimeError(
             "Missing binned matrices for some n (partial failures). "
@@ -711,9 +998,12 @@ def main(argv: list[str] | None = None) -> None:
         wall_seconds=wall_s,
         n_ref=np.int64(args.n_ref),
         perm_seed=np.int64(perm_seed),
+        convergence_base_seed=np.int64(base_seed),
+        dataset_meta_seed=np.int64(meta["seed"]),
         theta_bin_edges=edges,
         theta_bin_centers=centers,
-        hellinger_gt_sq_mc=h_gt_mc,
+        # Legacy key name: sqrt(H^2) from MC; see module docstring.
+        hellinger_gt_sq_mc=h_gt_sqrt,
         gt_hellinger_n_mc=np.int64(gt_n_mc),
         gt_hellinger_n_ref_budget=np.int64(args.n_ref),
         gt_hellinger_seed=np.int64(gt_seed),
@@ -747,7 +1037,7 @@ def main(argv: list[str] | None = None) -> None:
         linewidth=1.8,
         marker="o",
         markersize=6,
-        label="Binned H vs GT (MC likelihood)",
+        label=r"Binned $\sqrt{H^{\mathrm{sym}}}$ vs GT $\sqrt{H^2}$ (MC likelihood)",
     )
     ax.plot(
         ns,
@@ -761,7 +1051,7 @@ def main(argv: list[str] | None = None) -> None:
     ax.set_xlabel("dataset size n (nested subset)")
     ax.set_ylabel("corr (off-diag)")
     ax.set_title(
-        "Convergence: H vs generative GT; decoding vs n_ref=%d"
+        "Convergence: sqrt(H) vs generative sqrt(H^2); decoding vs n_ref=%d"
         % int(args.n_ref)
     )
     ax.set_xticks(ns)
@@ -772,7 +1062,7 @@ def main(argv: list[str] | None = None) -> None:
     plt.close(fig)
 
     matrix_panel_path = os.path.join(args.output_dir, "h_decoding_matrices_panel.png")
-    col_labels = [f"n={n}" for n in ns] + [f"n_ref={int(args.n_ref)} (GT MC)"]
+    col_labels = [f"n={n}" for n in ns] + [f"n_ref={int(args.n_ref)} (GT MC sqrt(H^2))"]
     _render_matrix_panel(
         h_mats=list(h_cols),
         clf_mats=list(clf_cols),
@@ -784,12 +1074,28 @@ def main(argv: list[str] | None = None) -> None:
     combined_path = os.path.join(args.output_dir, "h_decoding_convergence_combined.png")
     combined_svg = _save_combined_convergence_figure(fig_path, matrix_panel_path, combined_path, dpi=160)
 
-    manifest_lines = [f"{n}\ttraining_losses/n_{n:06d}.npz" for n in ns]
     manifest_path = os.path.join(loss_dir, "manifest.txt")
     with open(manifest_path, "w", encoding="utf-8") as mf:
-        mf.write("# n_label\trelative_path (score_prior_training_losses copies; n_ref has no model run)\n")
-        for line in manifest_lines:
-            mf.write(line + "\n")
+        mf.write("# n\tstatus\trun_dir\tsrc_loss_npz\tdst_loss_npz\tnote\n")
+        for row in per_n_loss_rows:
+            mf.write(
+                "{n}\t{status}\t{run_dir}\t{src}\t{dst}\t{note}\n".format(
+                    n=row["n"],
+                    status=row["status"],
+                    run_dir=row["run_dir"],
+                    src=row["src"],
+                    dst=row["dst"],
+                    note=row["note"],
+                )
+            )
+
+    loss_panel_png = os.path.join(args.output_dir, "h_decoding_training_losses_panel.png")
+    loss_panel_svg = _render_training_losses_panel(
+        ns=list(ns),
+        loss_dir=loss_dir,
+        out_png_path=loss_panel_png,
+        dpi=160,
+    )
 
     summary_path = os.path.join(args.output_dir, "h_decoding_convergence_summary.txt")
     paths_out = {
@@ -801,23 +1107,25 @@ def main(argv: list[str] | None = None) -> None:
         "matrix_panel_svg": str(Path(matrix_panel_path).with_suffix(".svg")),
         "combined_figure": combined_path,
         "combined_figure_svg": combined_svg,
+        "training_losses_panel": loss_panel_png,
+        "training_losses_panel_svg": loss_panel_svg,
         "reference_npz": os.path.join(args.output_dir, "h_decoding_convergence_reference.npz"),
         "training_losses_dir": loss_dir,
         "training_losses_manifest": manifest_path,
     }
     if err_msg:
         paths_out["errors"] = "; ".join(err_msg[:20])
-    _write_summary(summary_path, args, meta, perm_seed, n_pool, ref_dir, paths_out)
+    _write_summary(summary_path, args, meta, perm_seed, n_pool, ref_dir, paths_out, per_n_loss_rows)
     with open(summary_path, "a", encoding="utf-8") as sf:
         sf.write("\n# Correlation targets\n")
         sf.write(
-            "# corr_h_binned_vs_gt_mc: binned learned H vs generative GT (MC one-sided Hellinger).\n"
+            "# corr_h_binned_vs_gt_mc: binned sqrt(H_sym) vs sqrt(generative GT H^2) (MC one-sided Hellinger).\n"
         )
         sf.write(
             "# corr_clf_vs_ref: pairwise decoding vs n_ref subset decoding matrix (same bin edges).\n"
         )
         sf.write(
-            "# h_binned_columns last column: MC GT H^2 (not DSM/flow); see h_binned_ref_is_gt_mc=1.\n"
+            "# h_binned_columns last column: MC GT sqrt(H^2) (not DSM/flow); hellinger_gt_sq_mc key stores sqrt(H^2).\n"
         )
         sf.write(
             f"gt_hellinger_n_mc: {int(gt_n_mc)}  # MC samples per bin row; floor(n_ref / num_theta_bins)\n"
@@ -840,6 +1148,8 @@ def main(argv: list[str] | None = None) -> None:
     print(f"  - {paths_out['matrix_panel_svg']}")
     print(f"  - {combined_path}")
     print(f"  - {combined_svg}")
+    print(f"  - {loss_panel_png}")
+    print(f"  - {loss_panel_svg}")
     print(f"  - {loss_dir}/ (per-n training loss .npz + manifest.txt)")
     print(f"  - {summary_path}")
 

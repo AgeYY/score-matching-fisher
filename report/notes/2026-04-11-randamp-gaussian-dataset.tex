@@ -1,0 +1,62 @@
+\section{Estimating Hellinger distance RDM using Flow Matching}
+
+In previous section, we showed that denoising score matching method is able to estimate the Hellinger distance well (Figure \ref{fig:rsa_nested_subset_convergence}). The dataset we used is, however, a simple line manifold in a two dimensional space. Here we test our method using a high dimensional toy dataset.
+
+\subsection{Toy dataset}
+
+We use a synthetic conditional model for a scalar stimulus $\theta$ and a multivariate observation $x \in \mathbb{R}^{d}$ with $d \ge 2$.
+Stimuli are drawn independently from a uniform density on a bounded interval,
+\begin{equation}
+  \theta \sim \mathrm{Uniform}(\theta_{\mathrm{low}}, \theta_{\mathrm{high}}).
+\end{equation}
+For each neuron $j \in \{1,\ldots,d\}$ we fix a \emph{tuning center} $\theta_j$ by placing $d$ equally spaced points on $[\theta_{\mathrm{low}}, \theta_{\mathrm{high}}]$ (endpoints included).
+
+\paragraph{Random bump amplitudes.}
+Before drawing joint samples $(\theta, x)$, we sample one amplitude per neuron,
+\begin{equation}
+  a_j \sim \mathrm{Uniform}(a_{\mathrm{low}}, a_{\mathrm{high}}),
+  \qquad j = 1,\ldots,d,
+\end{equation}
+independently across $j$.
+The vector $(a_1,\ldots,a_d)$ is then held fixed.
+
+\paragraph{Conditional mean (tuning curve).}
+Given $\theta$, the mean of $x_j$ is a Gaussian bump in $\theta$ centered at $\theta_j$:
+\begin{equation}
+  \mu_j(\theta) = a_j \exp\!\bigl(-\kappa\,\bigl(\omega\,(\theta - \theta_j)\bigr)^2\bigr),
+  \qquad j = 1,\ldots,d,
+\end{equation}
+with bump precision $\kappa \ge 0$ and stimulus-axis scale $\omega$.
+The conditional mean vector is $\mu(\theta) = (\mu_1(\theta),\ldots,\mu_d(\theta))^{\mathsf{T}}$.
+
+\paragraph{Observation noise.}
+Conditionally on $\theta$, the observation is multivariate Gaussian with diagonal covariance.
+Let $\sigma > 0$ be a constant baseline noise scale shared across all neurons, and let $\alpha$ be a fixed activity--variance coupling strength (the arithmetic mean of two nonnegative hyperparameters in the implementation).
+The per-neuron conditional variances are
+\begin{equation}
+  v_j(\theta) = d\,\sigma^{2}\,\bigl(1 + \alpha\,|\mu_j(\theta)|\bigr),
+  \qquad j = 1,\ldots,d,
+\end{equation}
+with independence across neurons,
+\begin{equation}
+  x \mid \theta \sim \mathcal{N}\!\bigl(\mu(\theta),\,\mathrm{diag}(v_1(\theta),\ldots,v_d(\theta))\bigr).
+\end{equation}
+Thus noise magnitude increases with the absolute tuned response $|\mu_j(\theta)|$, and each neuron's noise standard deviation scales proportionally to $\sqrt{d}$ for fixed $\sigma$, $\alpha$, and $\mu_j(\theta)$.
+The leading factor~$d$ ties per-neuron variance to the population size~$d$: as more neurons are observed, each carries proportionally larger variance so that increasing dimension alone does not drive the joint observation toward an effectively noiseless, trivially informative regime for~$\theta$.
+
+\subsection{Ground truth RDM computation}
+
+\paragraph{Hellinger distance.}
+We discretize the stimulus range into $B$ bins. For bins $i,j$, write $p_i(x)=p(x\mid\bar{\theta}_i)$ and $p_j(x)=p(x\mid\bar{\theta}_j)$ for the conditional observation density implied by the toy generative model (Gaussian mean $\mu(\theta)$ and diagonal variances $v_j(\theta)$ as above). We estimate the squared Hellinger $H^2_{ij}$ using the one-sided identity:
+\begin{equation}
+  H^2_{ij}
+  = 1 - \mathbb{E}_{x\sim p_i}\!\left[
+    \exp\!\Bigl(\tfrac{1}{2}\bigl(\log p_j(x)-\log p_i(x)\bigr)\Bigr)
+  \right],
+\end{equation}
+and the expectation is replaced by a sample mean. Specifically, draw $m$ samples from $p(\cdot\mid\bar{\theta}_i)$ for each row~$i$, evaluate $\log p(x\mid\bar{\theta}_i)$ and $\log p(x\mid\bar{\theta}_j)$ under the closed-form Gaussian likelihood, and average the exponentials (implemented with a stabilized log-mean-exp). The result is clipped to $[0,1]$. The squared-root of this $B \times B$ matrix is the ground truth Hellinger distance matrix. Non-diagonal entries are used for computing correlation with the estimated RDM.
+
+\paragraph{Pairwise decoding.}
+The GT of pairwise decoding is estimated by binning the data and using logistic regression to estimate decoding accuracy with large $n_{\mathrm{ref}} = 5000$ datapoints.
+
+\subsection{Denoising score matching does not work very well for high-dimensional dataset}

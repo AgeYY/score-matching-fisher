@@ -103,6 +103,8 @@ class LoadedHMatrix:
     hell_panel_title_top: str
     hell_suptitle_tag: str
     hell_summary_prefix: str
+    flow_scheduler: str | None
+    flow_score_mode: str | None
 
 
 @dataclass(frozen=True)
@@ -318,9 +320,9 @@ def hellinger_figure_labels(h_field_method: str) -> tuple[str, str, str]:
     m = str(h_field_method).strip().lower()
     if m == "flow":
         return (
-            r"Binned $H_{ij}^2$ → Hellinger LB on $A^*_{ij}$",
+            r"Binned $H_{ij}^2$ (flow-derived score) → Hellinger LB on $A^*_{ij}$",
             r"Hellinger LB ($H^2$)",
-            "Flow velocity field: binned symmetric H treated as H^2; ",
+            "Flow-derived score field (from velocity): binned symmetric H treated as H^2; ",
         )
     return (
         r"Binned $H_{ij}^2$ → Hellinger LB on $A^*_{ij}$"
@@ -533,6 +535,8 @@ def load_h_matrix(ctx: RunContext) -> LoadedHMatrix:
         if "sigma_eval" in h_npz.files
         else float("nan")
     )
+    flow_scheduler = str(h_npz["h_flow_scheduler"][0]) if "h_flow_scheduler" in h_npz.files else None
+    flow_score_mode = str(h_npz["h_flow_score_mode"][0]) if "h_flow_score_mode" in h_npz.files else None
     hell_panel_title_top, hell_suptitle_tag, hell_summary_prefix = hellinger_figure_labels(h_field_method)
     return LoadedHMatrix(
         h_path=h_path,
@@ -544,6 +548,8 @@ def load_h_matrix(ctx: RunContext) -> LoadedHMatrix:
         hell_panel_title_top=hell_panel_title_top,
         hell_suptitle_tag=hell_suptitle_tag,
         hell_summary_prefix=hell_summary_prefix,
+        flow_scheduler=flow_scheduler,
+        flow_score_mode=flow_score_mode,
     )
 
 
@@ -1143,6 +1149,16 @@ def write_summary(
                 "∇_θ log p(θ|x) is the standard score target, and "
                 "∇_θ p(θ|x) = p(θ|x) ∇_θ log p(θ|x) on the support of p.\n"
             )
+        else:
+            f.write(
+                "  Flow note: H uses score recovered from velocity via the affine path conversion "
+                "(path.velocity_to_epsilon followed by s = -eps / sigma_t), "
+                "not raw velocity-as-score.\n"
+            )
+            if loaded.flow_scheduler is not None:
+                f.write(f"  flow_scheduler: {loaded.flow_scheduler}\n")
+            if loaded.flow_score_mode is not None:
+                f.write(f"  flow_score_mode: {loaded.flow_score_mode}\n")
         f.write(f"correlation_hellinger_acc_lb_vs_gt_approx: {metrics.corr_hellinger_lb_vs_gt}\n")
         f.write(f"correlation_hellinger_acc_ub_vs_gt_approx: {metrics.corr_hellinger_ub_vs_gt}\n")
 

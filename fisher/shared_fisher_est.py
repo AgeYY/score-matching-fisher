@@ -218,6 +218,10 @@ def _save_h_matrix_dsm_artifacts(
         "delta_diag_max_abs": np.asarray([h_result.delta_diag_max_abs], dtype=np.float64),
         "h_sym_max_asym_abs": np.asarray([h_result.h_sym_max_asym_abs], dtype=np.float64),
     }
+    if h_result.flow_scheduler is not None:
+        h_payload["h_flow_scheduler"] = np.asarray([h_result.flow_scheduler], dtype=object)
+    if h_result.flow_score_mode is not None:
+        h_payload["h_flow_score_mode"] = np.asarray([h_result.flow_score_mode], dtype=object)
     if bool(getattr(args, "h_save_intermediates", False)):
         h_payload["g_matrix"] = h_result.g_matrix
         h_payload["c_matrix"] = h_result.c_matrix
@@ -239,6 +243,10 @@ def _save_h_matrix_dsm_artifacts(
         hf.write(f"h_sym_diag_max_abs: {float(np.max(np.abs(np.diag(h_result.h_sym))))}\n")
         hf.write(f"delta_diag_max_abs: {h_result.delta_diag_max_abs}\n")
         hf.write(f"h_sym_max_asym_abs: {h_result.h_sym_max_asym_abs}\n")
+        if h_result.flow_scheduler is not None:
+            hf.write(f"flow_scheduler: {h_result.flow_scheduler}\n")
+        if h_result.flow_score_mode is not None:
+            hf.write(f"flow_score_mode: {h_result.flow_score_mode}\n")
         hf.write(f"h_save_intermediates: {bool(getattr(args, 'h_save_intermediates', False))}\n")
 
     h_fig_path = os.path.join(args.output_dir, f"h_matrix_sym_heatmap{suffix}.png")
@@ -974,12 +982,14 @@ def _save_dsm_score_prior_training_losses_npz(
     prior_n_clipped_steps: int = 0,
     prior_n_total_steps: int = 0,
     prior_lr_last: float = float("nan"),
+    theta_field_method: str = "dsm",
 ) -> str:
-    """Write per-run DSM training curves for posterior (score) and optional prior models."""
+    """Write per-run training curves for posterior and optional prior (DSM score or theta-flow)."""
     path = os.path.join(output_dir, "score_prior_training_losses.npz")
+    tfm = str(theta_field_method).strip().lower()
     np.savez_compressed(
         path,
-        theta_field_method=np.asarray(["dsm"], dtype=object),
+        theta_field_method=np.asarray([tfm], dtype=object),
         n_theta_all=np.int64(np.asarray(theta_all).shape[0]),
         n_score_fit=np.int64(theta_score_fit.shape[0]),
         n_score_val=np.int64(theta_score_val.shape[0]),
@@ -1141,6 +1151,7 @@ def run_shared_fisher_estimation(
         post_best_epoch = int(post_train_out["best_epoch"])
         post_stopped_epoch = int(post_train_out["stopped_epoch"])
         post_stopped_early = bool(post_train_out["stopped_early"])
+        post_best_val_loss = float(post_train_out["best_val_loss"])
 
         post_loss_fig = os.path.join(args.output_dir, "score_loss_vs_epoch.png")
         epochs_arr = np.arange(1, post_train_losses.size + 1)
@@ -1201,6 +1212,8 @@ def run_shared_fisher_estimation(
         prior_val_monitor_losses = np.asarray(prior_train_out.get("val_monitor_losses", []), dtype=np.float64)
         prior_best_epoch = int(prior_train_out["best_epoch"])
         prior_stopped_epoch = int(prior_train_out["stopped_epoch"])
+        prior_stopped_early = bool(prior_train_out["stopped_early"])
+        prior_best_val_loss = float(prior_train_out["best_val_loss"])
 
         prior_loss_fig = os.path.join(args.output_dir, "prior_score_loss_vs_epoch.png")
         epochs_prior = np.arange(1, prior_train_losses.size + 1)
@@ -1262,6 +1275,7 @@ def run_shared_fisher_estimation(
                 device=device,
                 pair_batch_size=int(getattr(args, "h_batch_size", 65536)),
                 field_method="flow",
+                flow_scheduler=str(getattr(args, "flow_scheduler", "cosine")),
             )
             h_result = h_estimator.run(
                 theta=theta_score_fisher_eval,
@@ -1274,7 +1288,10 @@ def run_shared_fisher_estimation(
             h_npz_path, h_summary_path, h_fig_path, h_delta_fig_path = _save_h_matrix_dsm_artifacts(
                 args, h_result, suffix
             )
-            print("[summary] flow mode completed (H-matrix only path).")
+            print(
+                "[summary] flow mode completed (H-matrix only path; "
+                "velocity converted to score via path.velocity_to_epsilon and s=-eps/sigma_t)."
+            )
             print("Saved artifacts:")
             print(f"  - {post_loss_fig}")
             print(f"  - {prior_loss_fig}")
@@ -1283,6 +1300,44 @@ def run_shared_fisher_estimation(
             print(f"  - {h_fig_path}")
             if h_delta_fig_path:
                 print(f"  - {h_delta_fig_path}")
+            tnpz = _save_dsm_score_prior_training_losses_npz(
+                args.output_dir,
+                theta_all=theta_all,
+                theta_score_fit=theta_score_fit,
+                theta_score_val=theta_score_val,
+                score_data_mode=str(args.score_data_mode),
+                score_train_losses=post_train_losses,
+                score_val_losses=post_val_losses,
+                score_val_monitor_losses=post_val_monitor_losses,
+                score_best_epoch=post_best_epoch,
+                score_stopped_epoch=post_stopped_epoch,
+                score_stopped_early=post_stopped_early,
+                score_best_val_loss=post_best_val_loss,
+                prior_enable=True,
+                prior_train_losses=prior_train_losses,
+                prior_val_losses=prior_val_losses,
+                prior_val_monitor_losses=prior_val_monitor_losses,
+                prior_best_epoch=prior_best_epoch,
+                prior_stopped_epoch=prior_stopped_epoch,
+                prior_stopped_early=prior_stopped_early,
+                prior_best_val_loss=prior_best_val_loss,
+                score_has_nonfinite=bool(post_train_out.get("has_nonfinite", False)),
+                score_grad_norm_mean=float(post_train_out.get("grad_norm_mean", float("nan"))),
+                score_grad_norm_max=float(post_train_out.get("grad_norm_max", float("nan"))),
+                score_param_norm_final=float(post_train_out.get("param_norm_final", float("nan"))),
+                score_n_clipped_steps=int(post_train_out.get("n_clipped_steps", 0)),
+                score_n_total_steps=int(post_train_out.get("n_total_steps", 0)),
+                score_lr_last=float(post_train_out.get("lr_last", float("nan"))),
+                prior_has_nonfinite=bool(prior_train_out.get("has_nonfinite", False)),
+                prior_grad_norm_mean=float(prior_train_out.get("grad_norm_mean", float("nan"))),
+                prior_grad_norm_max=float(prior_train_out.get("grad_norm_max", float("nan"))),
+                prior_param_norm_final=float(prior_train_out.get("param_norm_final", float("nan"))),
+                prior_n_clipped_steps=int(prior_train_out.get("n_clipped_steps", 0)),
+                prior_n_total_steps=int(prior_train_out.get("n_total_steps", 0)),
+                prior_lr_last=float(prior_train_out.get("lr_last", float("nan"))),
+                theta_field_method="flow",
+            )
+            print(f"[training_losses] saved {tnpz}")
             return
 
         raise RuntimeError("theta_field_method=flow requires --compute-h-matrix to produce output artifacts.")

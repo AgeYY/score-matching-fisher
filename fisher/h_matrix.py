@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import torch
@@ -34,6 +35,30 @@ class HMatrixResult:
     order_mode: str
     delta_diag_max_abs: float
     h_sym_max_asym_abs: float
+    flow_scheduler: str | None
+    flow_score_mode: str | None
+
+
+def _make_flow_matching_path(scheduler_name: str) -> Any:
+    name = str(scheduler_name).strip().lower()
+    try:
+        from flow_matching.path import AffineProbPath
+        from flow_matching.path.scheduler import CosineScheduler, LinearVPScheduler, VPScheduler
+    except ImportError as e:
+        raise ImportError(
+            "Flow score conversion requires the `flow_matching` package. "
+            "Install it in your environment before using --theta-field-method flow."
+        ) from e
+
+    scheduler_lookup = {
+        "cosine": CosineScheduler,
+        "vp": VPScheduler,
+        "linear_vp": LinearVPScheduler,
+    }
+    if name not in scheduler_lookup:
+        supported = ", ".join(sorted(scheduler_lookup.keys()))
+        raise ValueError(f"Unknown flow scheduler '{scheduler_name}'. Supported: {supported}.")
+    return AffineProbPath(scheduler=scheduler_lookup[name]())
 
 
 class HMatrixEstimator:
@@ -48,11 +73,10 @@ class HMatrixEstimator:
         device: torch.device,
         pair_batch_size: int = 65536,
         field_method: str = "dsm",
+        flow_scheduler: str = "cosine",
     ) -> None:
         if pair_batch_size < 1:
             raise ValueError("pair_batch_size must be >= 1.")
-        if sigma_eval <= 0.0:
-            raise ValueError("sigma_eval must be positive.")
         self.model_post = model_post
         self.model_prior = model_prior
         self.sigma_eval = float(sigma_eval)
@@ -61,7 +85,29 @@ class HMatrixEstimator:
         method = str(field_method).strip().lower()
         if method not in ("dsm", "flow"):
             raise ValueError("field_method must be one of {'dsm', 'flow'}.")
+        if method == "dsm" and sigma_eval <= 0.0:
+            raise ValueError("sigma_eval must be positive for DSM mode.")
+        if method == "flow" and not (0.0 <= sigma_eval <= 1.0):
+            raise ValueError("For flow mode, t_eval (passed via sigma_eval) must be in [0, 1].")
         self.field_method = method
+        self.flow_scheduler = str(flow_scheduler).strip().lower()
+        self.flow_score_mode = "velocity_to_epsilon"
+        self._flow_path = _make_flow_matching_path(self.flow_scheduler) if self.field_method == "flow" else None
+
+    def _velocity_to_score(self, velocity: torch.Tensor, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        if self._flow_path is None:
+            raise RuntimeError("_velocity_to_score called outside flow mode.")
+        try:
+            eps = self._flow_path.velocity_to_epsilon(velocity=velocity, x_t=x_t, t=t)
+        except TypeError:
+            eps = self._flow_path.velocity_to_epsilon(velocity, x_t, t)
+        schedule_state = self._flow_path.scheduler(t)
+        sigma_t = getattr(schedule_state, "sigma_t", None)
+        if sigma_t is None:
+            raise RuntimeError("Flow scheduler state is missing sigma_t for velocity-to-score conversion.")
+        while sigma_t.ndim < x_t.ndim:
+            sigma_t = sigma_t.unsqueeze(-1)
+        return -eps / torch.clamp(sigma_t, min=1e-8)
 
     @staticmethod
     def sort_by_theta(theta: np.ndarray, x: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -97,18 +143,16 @@ class HMatrixEstimator:
                 theta_t = torch.from_numpy(theta_tile).to(self.device)
                 x_t = torch.from_numpy(x_rep).to(self.device)
                 if self.field_method == "flow":
-                    f_post = (
-                        self.model_post.predict_velocity(theta_t, x_t, t_eval=self.sigma_eval)
-                        .cpu()
-                        .numpy()
-                        .reshape(b, n)
+                    t_eval = torch.full(
+                        (theta_t.shape[0], 1),
+                        fill_value=float(self.sigma_eval),
+                        dtype=theta_t.dtype,
+                        device=theta_t.device,
                     )
-                    f_prior = (
-                        self.model_prior.predict_velocity(theta_t, t_eval=self.sigma_eval)
-                        .cpu()
-                        .numpy()
-                        .reshape(b, n)
-                    )
+                    v_post = self.model_post.predict_velocity(theta_t, x_t, t_eval=float(self.sigma_eval))
+                    v_prior = self.model_prior.predict_velocity(theta_t, t_eval=float(self.sigma_eval))
+                    f_post = self._velocity_to_score(v_post, theta_t, t_eval).cpu().numpy().reshape(b, n)
+                    f_prior = self._velocity_to_score(v_prior, theta_t, t_eval).cpu().numpy().reshape(b, n)
                 else:
                     f_post = (
                         self.model_post.predict_score(theta_t, x_t, sigma_eval=self.sigma_eval)
@@ -208,4 +252,6 @@ class HMatrixEstimator:
             order_mode=order_mode,
             delta_diag_max_abs=delta_diag_max_abs,
             h_sym_max_asym_abs=h_sym_max_asym_abs,
+            flow_scheduler=(self.flow_scheduler if self.field_method == "flow" else None),
+            flow_score_mode=(self.flow_score_mode if self.field_method == "flow" else None),
         )
