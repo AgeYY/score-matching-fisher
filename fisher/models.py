@@ -238,6 +238,178 @@ class PriorThetaFlowVelocity(nn.Module):
         return self.forward(theta, t)
 
 
+class ConditionalThetaFlowVelocityThetaFourierMLP(nn.Module):
+    """Conditional theta-flow velocity v(theta_t, x, t) with theta features [1, theta] plus sin/cos harmonics.
+
+    Same scalar theta encoding as ``ConditionalXFlowVelocityThetaFourierMLP``, but the MLP input is
+    ``[theta_feats, x, t_feat]`` with scalar output (theta dimension 1).
+    """
+
+    def __init__(
+        self,
+        x_dim: int = 2,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        use_logit_time: bool = True,
+        *,
+        theta_fourier_k: int = 4,
+        theta_fourier_omega: float = 1.0,
+        theta_fourier_include_linear: bool = True,
+        theta_fourier_include_bias: bool = True,
+    ) -> None:
+        super().__init__()
+        if x_dim < 2:
+            raise ValueError("x_dim must be >= 2.")
+        self.x_dim = int(x_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.depth = int(depth)
+        self.use_logit_time = bool(use_logit_time)
+        self.theta_fourier_k = int(theta_fourier_k)
+        self.theta_fourier_omega = float(theta_fourier_omega)
+        self.theta_fourier_include_linear = bool(theta_fourier_include_linear)
+        self.theta_fourier_include_bias = bool(theta_fourier_include_bias)
+        if self.theta_fourier_k < 0:
+            raise ValueError("theta_fourier_k must be >= 0.")
+        if self.theta_fourier_k > 0 and abs(self.theta_fourier_omega) < 1e-12:
+            raise ValueError("theta_fourier_omega must be non-zero when theta_fourier_k > 0.")
+        theta_feat_dim = 0
+        if self.theta_fourier_include_bias:
+            theta_feat_dim += 1
+        if self.theta_fourier_include_linear:
+            theta_feat_dim += 1
+        theta_feat_dim += 2 * self.theta_fourier_k
+        if theta_feat_dim < 1:
+            raise ValueError(
+                "Theta feature dim is 0: enable bias and/or linear term, or set theta_fourier_k >= 1."
+            )
+        self._theta_feat_dim = int(theta_feat_dim)
+        in_dim = self._theta_feat_dim + int(x_dim) + 1  # theta_feats, x, t
+        layers: list[nn.Module] = []
+        for _ in range(int(depth)):
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            layers.append(nn.SiLU())
+            in_dim = hidden_dim
+        layers.append(nn.Linear(hidden_dim, 1))
+        self.net = nn.Sequential(*layers)
+
+    def _theta_features(self, theta: torch.Tensor) -> torch.Tensor:
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        parts: list[torch.Tensor] = []
+        if self.theta_fourier_include_bias:
+            parts.append(torch.ones_like(theta))
+        if self.theta_fourier_include_linear:
+            parts.append(theta)
+        w = float(self.theta_fourier_omega)
+        for k in range(1, self.theta_fourier_k + 1):
+            ang = float(k) * w * theta
+            parts.append(torch.sin(ang))
+            parts.append(torch.cos(ang))
+        return torch.cat(parts, dim=-1)
+
+    def _t_feat(self, t: torch.Tensor) -> torch.Tensor:
+        if t.ndim == 1:
+            t = t.unsqueeze(-1)
+        if self.use_logit_time:
+            t_clip = torch.clamp(t, min=1e-4, max=1.0 - 1e-4)
+            return torch.log(t_clip) - torch.log1p(-t_clip)
+        return t
+
+    def forward(self, theta_t: torch.Tensor, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        theta_feat = self._theta_features(theta_t)
+        t_feat = self._t_feat(t)
+        feats = torch.cat([theta_feat, x, t_feat], dim=-1)
+        return self.net(feats)
+
+    @torch.no_grad()
+    def predict_velocity(self, theta: torch.Tensor, x: torch.Tensor, t_eval: float) -> torch.Tensor:
+        self.eval()
+        t = torch.full((theta.shape[0], 1), float(t_eval), device=theta.device)
+        return self.forward(theta, x, t)
+
+
+class PriorThetaFlowVelocityThetaFourierMLP(nn.Module):
+    """Prior theta-flow velocity v(theta_t, t) with theta features [1, theta] plus sin/cos harmonics."""
+
+    def __init__(
+        self,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        use_logit_time: bool = True,
+        *,
+        theta_fourier_k: int = 4,
+        theta_fourier_omega: float = 1.0,
+        theta_fourier_include_linear: bool = True,
+        theta_fourier_include_bias: bool = True,
+    ) -> None:
+        super().__init__()
+        self.hidden_dim = int(hidden_dim)
+        self.depth = int(depth)
+        self.use_logit_time = bool(use_logit_time)
+        self.theta_fourier_k = int(theta_fourier_k)
+        self.theta_fourier_omega = float(theta_fourier_omega)
+        self.theta_fourier_include_linear = bool(theta_fourier_include_linear)
+        self.theta_fourier_include_bias = bool(theta_fourier_include_bias)
+        if self.theta_fourier_k < 0:
+            raise ValueError("theta_fourier_k must be >= 0.")
+        if self.theta_fourier_k > 0 and abs(self.theta_fourier_omega) < 1e-12:
+            raise ValueError("theta_fourier_omega must be non-zero when theta_fourier_k > 0.")
+        theta_feat_dim = 0
+        if self.theta_fourier_include_bias:
+            theta_feat_dim += 1
+        if self.theta_fourier_include_linear:
+            theta_feat_dim += 1
+        theta_feat_dim += 2 * self.theta_fourier_k
+        if theta_feat_dim < 1:
+            raise ValueError(
+                "Theta feature dim is 0: enable bias and/or linear term, or set theta_fourier_k >= 1."
+            )
+        self._theta_feat_dim = int(theta_feat_dim)
+        in_dim = self._theta_feat_dim + 1  # theta_feats, t
+        layers: list[nn.Module] = []
+        for _ in range(int(depth)):
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            layers.append(nn.SiLU())
+            in_dim = hidden_dim
+        layers.append(nn.Linear(hidden_dim, 1))
+        self.net = nn.Sequential(*layers)
+
+    def _theta_features(self, theta: torch.Tensor) -> torch.Tensor:
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        parts: list[torch.Tensor] = []
+        if self.theta_fourier_include_bias:
+            parts.append(torch.ones_like(theta))
+        if self.theta_fourier_include_linear:
+            parts.append(theta)
+        w = float(self.theta_fourier_omega)
+        for k in range(1, self.theta_fourier_k + 1):
+            ang = float(k) * w * theta
+            parts.append(torch.sin(ang))
+            parts.append(torch.cos(ang))
+        return torch.cat(parts, dim=-1)
+
+    def _t_feat(self, t: torch.Tensor) -> torch.Tensor:
+        if t.ndim == 1:
+            t = t.unsqueeze(-1)
+        if self.use_logit_time:
+            t_clip = torch.clamp(t, min=1e-4, max=1.0 - 1e-4)
+            return torch.log(t_clip) - torch.log1p(-t_clip)
+        return t
+
+    def forward(self, theta_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        theta_feat = self._theta_features(theta_t)
+        t_feat = self._t_feat(t)
+        feats = torch.cat([theta_feat, t_feat], dim=-1)
+        return self.net(feats)
+
+    @torch.no_grad()
+    def predict_velocity(self, theta: torch.Tensor, t_eval: float) -> torch.Tensor:
+        self.eval()
+        t = torch.full((theta.shape[0], 1), float(t_eval), device=theta.device)
+        return self.forward(theta, t)
+
+
 class ConditionalThetaFlowVelocityFiLMPerLayer(nn.Module):
     """Theta-flow velocity v(theta_t, x, t): x-trunk + residual FiLM from embedded (theta_t, logit t)."""
 
@@ -516,6 +688,98 @@ class ConditionalXFlowVelocity(nn.Module):
         else:
             t_feat = t
         feats = torch.cat([x_t, theta, t_feat], dim=-1)
+        return self.net(feats)
+
+    @torch.no_grad()
+    def predict_velocity(self, x_t: torch.Tensor, theta: torch.Tensor, t_eval: float) -> torch.Tensor:
+        self.eval()
+        t = torch.full((x_t.shape[0], 1), float(t_eval), device=x_t.device)
+        return self.forward(x_t, theta, t)
+
+
+class ConditionalXFlowVelocityThetaFourierMLP(nn.Module):
+    """Conditional velocity v(x_t, theta, t) with theta features [1, theta] plus sin/cos harmonics.
+
+    The scalar theta is encoded as an optional constant 1, optional linear theta, and for k = 1..K
+    pairs ``sin(k * omega * theta)``, ``cos(k * omega * theta)``. This keeps a non-periodic path while
+    giving the MLP periodic inductive bias for circular structure in theta.
+    """
+
+    def __init__(
+        self,
+        x_dim: int = 2,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        use_logit_time: bool = True,
+        *,
+        theta_fourier_k: int = 4,
+        theta_fourier_omega: float = 1.0,
+        theta_fourier_include_linear: bool = True,
+        theta_fourier_include_bias: bool = True,
+    ) -> None:
+        super().__init__()
+        if x_dim < 2:
+            raise ValueError("x_dim must be >= 2.")
+        self.x_dim = int(x_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.depth = int(depth)
+        self.use_logit_time = bool(use_logit_time)
+        self.theta_fourier_k = int(theta_fourier_k)
+        # Scalar omega in sin(k*omega*theta); training code may set this from (2*pi/span)*mult.
+        self.theta_fourier_omega = float(theta_fourier_omega)
+        self.theta_fourier_include_linear = bool(theta_fourier_include_linear)
+        self.theta_fourier_include_bias = bool(theta_fourier_include_bias)
+        if self.theta_fourier_k < 0:
+            raise ValueError("theta_fourier_k must be >= 0.")
+        if self.theta_fourier_k > 0 and abs(self.theta_fourier_omega) < 1e-12:
+            raise ValueError("theta_fourier_omega must be non-zero when theta_fourier_k > 0.")
+        theta_feat_dim = 0
+        if self.theta_fourier_include_bias:
+            theta_feat_dim += 1
+        if self.theta_fourier_include_linear:
+            theta_feat_dim += 1
+        theta_feat_dim += 2 * self.theta_fourier_k
+        if theta_feat_dim < 1:
+            raise ValueError(
+                "Theta feature dim is 0: enable bias and/or linear term, or set theta_fourier_k >= 1."
+            )
+        self._theta_feat_dim = int(theta_feat_dim)
+        in_dim = int(x_dim) + self._theta_feat_dim + 1  # x_t, theta_feats, t
+        layers: list[nn.Module] = []
+        for _ in range(int(depth)):
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            layers.append(nn.SiLU())
+            in_dim = hidden_dim
+        layers.append(nn.Linear(hidden_dim, int(x_dim)))
+        self.net = nn.Sequential(*layers)
+
+    def _theta_features(self, theta: torch.Tensor) -> torch.Tensor:
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        parts: list[torch.Tensor] = []
+        if self.theta_fourier_include_bias:
+            parts.append(torch.ones_like(theta))
+        if self.theta_fourier_include_linear:
+            parts.append(theta)
+        w = float(self.theta_fourier_omega)
+        for k in range(1, self.theta_fourier_k + 1):
+            ang = float(k) * w * theta
+            parts.append(torch.sin(ang))
+            parts.append(torch.cos(ang))
+        return torch.cat(parts, dim=-1)
+
+    def _t_feat(self, t: torch.Tensor) -> torch.Tensor:
+        if t.ndim == 1:
+            t = t.unsqueeze(-1)
+        if self.use_logit_time:
+            t_clip = torch.clamp(t, min=1e-4, max=1.0 - 1e-4)
+            return torch.log(t_clip) - torch.log1p(-t_clip)
+        return t
+
+    def forward(self, x_t: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        theta_feat = self._theta_features(theta)
+        t_feat = self._t_feat(t)
+        feats = torch.cat([x_t, theta_feat, t_feat], dim=-1)
         return self.net(feats)
 
     @torch.no_grad()

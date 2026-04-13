@@ -8,6 +8,7 @@ import torch
 from fisher.models import (
     ConditionalXFlowVelocity,
     ConditionalXFlowVelocityFiLMPerLayer,
+    ConditionalXFlowVelocityThetaFourierMLP,
     ConditionalXScore,
     UnconditionalXFlowVelocity,
     UnconditionalXFlowVelocityFiLMPerLayer,
@@ -117,7 +118,7 @@ def compute_unconditional_flow_velocity_vectors(
 
 
 def compute_cross_flow_velocity_matrix(
-    model: ConditionalXFlowVelocity | ConditionalXFlowVelocityFiLMPerLayer,
+    model: ConditionalXFlowVelocity | ConditionalXFlowVelocityFiLMPerLayer | ConditionalXFlowVelocityThetaFourierMLP,
     theta: np.ndarray,
     x: np.ndarray,
     t_eval: float,

@@ -325,6 +325,15 @@ def hellinger_figure_labels(h_field_method: str) -> tuple[str, str, str]:
             r"Hellinger LB ($H^2$)",
             "Flow-derived score field (from velocity): binned symmetric H treated as H^2; ",
         )
+    if m in ("flow_likelihood", "flow_x_likelihood"):
+        tag = "theta-space ODE likelihood" if m == "flow_likelihood" else "x-space ODE log p(x|θ)"
+        return (
+            r"Binned $H_{ij}^2$ → Hellinger LB on $A^*_{ij}$"
+            + "\n"
+            + f"({tag})",
+            r"Hellinger LB ($H^2$)",
+            f"Flow ODE likelihood field ({tag}): binned symmetric H treated as H^2; ",
+        )
     return (
         r"Binned $H_{ij}^2$ → Hellinger LB on $A^*_{ij}$"
         + "\n"

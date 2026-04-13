@@ -10,12 +10,15 @@ from fisher.models import (
     ConditionalScore1DFiLMPerLayer,
     ConditionalThetaFlowVelocity,
     ConditionalThetaFlowVelocityFiLMPerLayer,
+    ConditionalThetaFlowVelocityThetaFourierMLP,
     ConditionalXFlowVelocity,
     ConditionalXFlowVelocityFiLMPerLayer,
+    ConditionalXFlowVelocityThetaFourierMLP,
     ConditionalXScore,
     LocalDecoderLogit,
     PriorThetaFlowVelocity,
     PriorThetaFlowVelocityFiLMPerLayer,
+    PriorThetaFlowVelocityThetaFourierMLP,
     PriorScore1D,
     PriorScore1DFiLMPerLayer,
     UnconditionalXFlowVelocity,
@@ -907,7 +910,7 @@ def _make_flow_matching_path(scheduler_name: str):
 
 
 def train_conditional_x_flow_model(
-    model: ConditionalXFlowVelocity | ConditionalXFlowVelocityFiLMPerLayer,
+    model: ConditionalXFlowVelocity | ConditionalXFlowVelocityFiLMPerLayer | ConditionalXFlowVelocityThetaFourierMLP,
     theta_train: np.ndarray,
     x_train: np.ndarray,
     epochs: int,
@@ -1028,7 +1031,9 @@ def train_conditional_x_flow_model(
 
 
 def train_conditional_theta_flow_model(
-    model: ConditionalThetaFlowVelocity | ConditionalThetaFlowVelocityFiLMPerLayer,
+    model: ConditionalThetaFlowVelocity
+    | ConditionalThetaFlowVelocityFiLMPerLayer
+    | ConditionalThetaFlowVelocityThetaFourierMLP,
     theta_train: np.ndarray,
     x_train: np.ndarray,
     epochs: int,
@@ -1149,7 +1154,7 @@ def train_conditional_theta_flow_model(
 
 
 def train_prior_theta_flow_model(
-    model: PriorThetaFlowVelocity | PriorThetaFlowVelocityFiLMPerLayer,
+    model: PriorThetaFlowVelocity | PriorThetaFlowVelocityFiLMPerLayer | PriorThetaFlowVelocityThetaFourierMLP,
     theta_train: np.ndarray,
     epochs: int,
     batch_size: int,

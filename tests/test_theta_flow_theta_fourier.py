@@ -1,0 +1,146 @@
+from __future__ import annotations
+
+import argparse
+import math
+import unittest
+from types import SimpleNamespace
+
+import numpy as np
+import torch
+
+from fisher.cli_shared_fisher import add_estimation_arguments
+from fisher.h_matrix import HMatrixEstimator
+from fisher.models import ConditionalThetaFlowVelocityThetaFourierMLP, PriorThetaFlowVelocityThetaFourierMLP
+from fisher.shared_fisher_est import (
+    effective_flow_theta_fourier_omega_post,
+    effective_flow_theta_fourier_omega_prior,
+    validate_estimation_args,
+)
+
+
+class TestThetaFlowThetaFourier(unittest.TestCase):
+    def test_conditional_forward_shape(self) -> None:
+        m = ConditionalThetaFlowVelocityThetaFourierMLP(
+            x_dim=4,
+            hidden_dim=16,
+            depth=2,
+            theta_fourier_k=3,
+            theta_fourier_omega=0.7,
+        )
+        b = 5
+        theta_t = torch.randn(b, 1)
+        x = torch.randn(b, 4)
+        t = torch.rand(b, 1)
+        out = m(theta_t, x, t)
+        self.assertEqual(tuple(out.shape), (b, 1))
+        self.assertTrue(torch.isfinite(out).all())
+
+    def test_prior_forward_shape(self) -> None:
+        m = PriorThetaFlowVelocityThetaFourierMLP(
+            hidden_dim=16,
+            depth=2,
+            theta_fourier_k=3,
+            theta_fourier_omega=0.7,
+        )
+        b = 5
+        theta_t = torch.randn(b, 1)
+        t = torch.rand(b, 1)
+        out = m(theta_t, t)
+        self.assertEqual(tuple(out.shape), (b, 1))
+        self.assertTrue(torch.isfinite(out).all())
+
+    def test_effective_omega_theta_range_post_and_prior(self) -> None:
+        ns = SimpleNamespace(
+            flow_theta_fourier_omega_mode="theta_range",
+            flow_theta_fourier_omega=1.0,
+            theta_low=-2.0,
+            theta_high=4.0,
+        )
+        om, _ = effective_flow_theta_fourier_omega_post(ns)
+        self.assertAlmostEqual(float(om), 2.0 * math.pi / 6.0, places=10)
+        ns2 = SimpleNamespace(
+            flow_prior_theta_fourier_omega_mode="theta_range",
+            flow_prior_theta_fourier_omega=2.0,
+            theta_low=0.0,
+            theta_high=10.0,
+        )
+        om2, _ = effective_flow_theta_fourier_omega_prior(ns2)
+        self.assertAlmostEqual(float(om2), 2.0 * (2.0 * math.pi / 10.0), places=10)
+
+    def test_validate_accepts_flow_likelihood_theta_fourier(self) -> None:
+        parser = argparse.ArgumentParser()
+        add_estimation_arguments(parser)
+        args = parser.parse_args(
+            [
+                "--theta-field-method",
+                "flow_likelihood",
+                "--flow-score-arch",
+                "theta_fourier_mlp",
+                "--flow-prior-arch",
+                "theta_fourier_mlp",
+            ]
+        )
+        validate_estimation_args(args)
+
+    def test_validate_rejects_empty_theta_fourier_features_posterior(self) -> None:
+        parser = argparse.ArgumentParser()
+        add_estimation_arguments(parser)
+        args = parser.parse_args(
+            [
+                "--theta-field-method",
+                "flow",
+                "--flow-score-arch",
+                "theta_fourier_mlp",
+                "--flow-theta-fourier-k",
+                "0",
+                "--flow-theta-fourier-no-linear",
+                "--flow-theta-fourier-no-bias",
+            ]
+        )
+        with self.assertRaises(ValueError):
+            validate_estimation_args(args)
+
+    def test_validate_rejects_theta_fourier_mlp_for_dsm(self) -> None:
+        parser = argparse.ArgumentParser()
+        add_estimation_arguments(parser)
+        args = parser.parse_args([])
+        args.theta_field_method = "dsm"
+        args.flow_score_arch = "theta_fourier_mlp"
+        with self.assertRaises(ValueError):
+            validate_estimation_args(args)
+
+    def test_flow_likelihood_h_matrix_smoke_fourier_models(self) -> None:
+        torch.manual_seed(0)
+        post = ConditionalThetaFlowVelocityThetaFourierMLP(
+            x_dim=2,
+            hidden_dim=16,
+            depth=2,
+            theta_fourier_k=2,
+            theta_fourier_omega=1.0,
+        )
+        prior = PriorThetaFlowVelocityThetaFourierMLP(
+            hidden_dim=16,
+            depth=2,
+            theta_fourier_k=2,
+            theta_fourier_omega=1.0,
+        )
+        est = HMatrixEstimator(
+            model_post=post,
+            model_prior=prior,
+            sigma_eval=1.0,
+            device=torch.device("cpu"),
+            pair_batch_size=32,
+            field_method="flow_likelihood",
+            flow_scheduler="cosine",
+            flow_ode_steps=16,
+        )
+        theta = np.linspace(-0.5, 0.5, 4, dtype=np.float64).reshape(-1, 1)
+        x = np.stack([np.sin(theta.reshape(-1)), np.cos(theta.reshape(-1))], axis=1).astype(np.float64)
+        out = est.run(theta=theta, x=x, restore_original_order=False)
+        self.assertTrue(np.isfinite(out.c_matrix).all())
+        self.assertTrue(np.isfinite(out.delta_l_matrix).all())
+        self.assertTrue(np.isfinite(out.h_sym).all())
+
+
+if __name__ == "__main__":
+    unittest.main()
