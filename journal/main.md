@@ -16,7 +16,7 @@ Collected markdown notes in `journal/notes/`: long-form chapters (moved from the
 
 ## 2026-04
 
-- [2026-04-13 `theta_fourier_mlp`: Fourier + linear $\theta$ features for conditional x-flow (`flow_x_likelihood`) + cosine $\sqrt{d}$ benchmarks; addendum: same idea for **theta-space** `flow` / `flow_likelihood`](notes/2026-04-13-flow-x-likelihood-h-matrix-randamp-sqrtd-50d.md)
+- [2026-04-13 `theta_fourier_mlp`: Fourier + linear $\theta$ features for conditional x-flow (`flow_x_likelihood`) + cosine $\sqrt{d}$ benchmarks; addendum: theta-space **theta_fourier_mlp** for **`flow`** (`velocity`→score) vs **`flow_likelihood`** (ODE log-density)](notes/2026-04-13-flow-x-likelihood-h-matrix-randamp-sqrtd-50d.md)
 - [2026-04-13 `flow_x_likelihood`: x-space ODE $\log p(x\mid\theta)$ for H-matrix + `randamp_gaussian_sqrtd` 50D & 2D convergence](notes/2026-04-13-flow-x-likelihood-h-matrix-randamp-sqrtd-50d.md)
 - [2026-04-13 Cosine Gaussian noise: base vs $\sqrt{d}$ scaling (`cosine_gaussian` / `cosine_gaussian_sqrtd`) + dataset figure](notes/2026-04-13-cosine-gaussian-noise-sqrtd-vs-base.md)
 - [2026-04-13 `flow_likelihood`: direct flow ODE log-density for $\theta$ H-matrix (math + algorithm)](notes/2026-04-13-flow-ode-direct-likelihood-theta-h-matrix.md)

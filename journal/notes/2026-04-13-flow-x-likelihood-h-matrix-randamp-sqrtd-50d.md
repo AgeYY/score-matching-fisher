@@ -483,3 +483,75 @@ mamba run -n geo_diffusion python bin/study_h_decoding_convergence.py \
   --output-dir /data/zeyuan/score-matching-fisher/h_decoding_conv_cosine_sqrtd_xdim50_flow_likelihood_theta_fourier_2026-04-13 \
   --device cuda
 ```
+
+---
+
+## Addendum: **`flow`** (path-integration) + theta-space `theta_fourier_mlp` vs **`flow_likelihood`** (ODE log-density)
+
+**Method.** With **`--theta-field-method flow`**, trained theta velocities are converted to scores via the FM path (`velocity_to_epsilon`, then $s=-\epsilon/\sigma_t$) at **`--flow-eval-t`** (default $0.8$), then the usual H-matrix pipeline from scores. This is **not** the same as **`flow_likelihood`**, which uses **`ODESolver.compute_likelihood`** on $\theta$ for posterior and prior log-densities.
+
+**Protocol.** Same nested-$n$ study as the full **`flow_likelihood` + `theta_fourier_mlp`** runs: $N_{\mathrm{pool}}=6000$, **`n_ref=5000`**, **`n_list=80,200,400,600`**, **`num_theta_bins=10`**, permutation seed **7** (dataset meta), **`--flow-score-arch theta_fourier_mlp --flow-prior-arch theta_fourier_mlp`** (default **`theta_range`** $\omega$). Script: [`bin/study_h_decoding_convergence.py`](../../bin/study_h_decoding_convergence.py).
+
+### Per-$n$ off-diagonal Pearson $r$ (binned $\sqrt{H_{\mathrm{sym}}}$ vs MC GT; decoding vs $n_{\mathrm{ref}}$ ref)
+
+| $n$ | `flow` 2D `corr_h` | `flow_likelihood` 2D `corr_h` | `flow` 50D `corr_h` | `flow_likelihood` 50D `corr_h` |
+|-----|-------------------:|--------------------------------:|--------------------:|---------------------------------:|
+| 80  | 0.021 | 0.807 | −0.111 | −0.055 |
+| 200 | 0.054 | 0.875 | −0.124 | −0.173 |
+| 400 | 0.598 | 0.942 | −0.068 | −0.203 |
+| 600 | 0.191 | 0.951 | −0.045 | −0.102 |
+
+**Decoding** (`corr_clf_vs_ref`) is **identical** between `flow` and `flow_likelihood` at each $(d_x,n)$ in this setup (same bin edges and reference subset), so only the **H track** differs.
+
+**Run directories (absolute paths).**
+
+| Mode | $d_x$ | Directory |
+|------|--------|-----------|
+| `flow` | 2 | `/data/zeyuan/score-matching-fisher/h_decoding_conv_cosine_gaussian_sqrtd_xdim2_flow_theta_fourier_mlp_n6000/` |
+| `flow` | 50 | `/data/zeyuan/score-matching-fisher/h_decoding_conv_cosine_gaussian_sqrtd_xdim50_flow_theta_fourier_mlp_n6000/` |
+| `flow_likelihood` | 2 | `/data/zeyuan/score-matching-fisher/h_decoding_conv_cosine_gaussian_sqrtd_xdim2_flow_likelihood_theta_fourier_mlp_n6000/` |
+| `flow_likelihood` | 50 | `/data/zeyuan/score-matching-fisher/h_decoding_conv_cosine_gaussian_sqrtd_xdim50_flow_likelihood_theta_fourier_mlp_n6000/` |
+
+Artifacts in each directory: `run.log`, `h_decoding_convergence_results.csv` / `.npz`, `h_decoding_convergence_combined.{png,svg}`, `h_decoding_training_losses_panel.{png,svg}`, `training_losses/n_*.npz`.
+
+**Takeaway.** On **2D cosine $\sqrt{d}$**, **`flow_likelihood` + `theta_fourier_mlp`** gives **strong** binned-$H$ vs GT (up to $\approx 0.95$ at $n=600$), while **`flow` + `theta_fourier_mlp`** is **much weaker** and **non-monotone** in $n$ here—velocity-to-score at a fixed evaluation time is a different object than ODE log-density ratios. On **50D**, both modes stay **weakly negative** on **`corr_h`** (similar to baseline **`flow_likelihood`** MLP stories in this note), while **decoding** still improves with $n$.
+
+### Figures (`flow`, theta-flow `theta_fourier_mlp`)
+
+![2D `cosine_gaussian_sqrtd`, `flow`, theta-flow `theta_fourier_mlp`: combined panel.](figs/2026-04-13-flow-theta-fourier-sqrtd/h_decoding_convergence_combined_xdim2.png)
+
+![50D `cosine_gaussian_sqrtd`, `flow`, theta-flow `theta_fourier_mlp`: combined panel.](figs/2026-04-13-flow-theta-fourier-sqrtd/h_decoding_convergence_combined_xdim50.png)
+
+### Reproduction (full protocol, absolute paths)
+
+**2D:**
+
+```bash
+mamba run -n geo_diffusion python bin/study_h_decoding_convergence.py \
+  --dataset-npz /data/zeyuan/score-matching-fisher/shared_fisher_dataset_cosine_gaussian_sqrtd_xdim2_n6000.npz \
+  --dataset-family cosine_gaussian_sqrtd \
+  --theta-field-method flow \
+  --flow-score-arch theta_fourier_mlp \
+  --flow-prior-arch theta_fourier_mlp \
+  --n-ref 5000 \
+  --n-list 80,200,400,600 \
+  --num-theta-bins 10 \
+  --output-dir /data/zeyuan/score-matching-fisher/h_decoding_conv_cosine_gaussian_sqrtd_xdim2_flow_theta_fourier_mlp_n6000 \
+  --device cuda
+```
+
+**50D:**
+
+```bash
+mamba run -n geo_diffusion python bin/study_h_decoding_convergence.py \
+  --dataset-npz /data/zeyuan/score-matching-fisher/shared_fisher_dataset_cosine_gaussian_sqrtd_xdim50_n6000.npz \
+  --dataset-family cosine_gaussian_sqrtd \
+  --theta-field-method flow \
+  --flow-score-arch theta_fourier_mlp \
+  --flow-prior-arch theta_fourier_mlp \
+  --n-ref 5000 \
+  --n-list 80,200,400,600 \
+  --num-theta-bins 10 \
+  --output-dir /data/zeyuan/score-matching-fisher/h_decoding_conv_cosine_gaussian_sqrtd_xdim50_flow_theta_fourier_mlp_n6000 \
+  --device cuda
+```
