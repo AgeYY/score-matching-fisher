@@ -15,6 +15,8 @@ _repo_root = Path(__file__).resolve().parent.parent
 if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 
+from global_setting import DATA_DIR  # import before pyplot so matplotlib rcParams apply
+
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 import numpy as np
@@ -22,8 +24,6 @@ from scipy.ndimage import gaussian_filter
 import torch
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
-
-from global_setting import DATA_DIR
 from fisher import sssd
 from fisher.cli_shared_fisher import add_estimation_arguments
 from fisher.shared_dataset_io import SharedDatasetBundle, load_shared_dataset_npz

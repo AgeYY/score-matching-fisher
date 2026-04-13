@@ -87,20 +87,40 @@ def plot_joint_and_tuning(
     | ToyCosSinPiecewiseNoiseDataset
     | ToyLinearPiecewiseNoiseDataset,
     out_path: str,
+    *,
+    scatter_max_points: int | None = 1000,
+    scatter_subsample_seed: int = 0,
 ) -> None:
-    """Single figure: left = joint scatter (PCA if x_dim>2), right = tuning curves."""
+    """Single figure: left = joint scatter (PCA if x_dim>2), right = tuning curves.
+
+    The scatter uses at most ``scatter_max_points`` rows (uniform random subset without
+    replacement when there are more rows). Pass ``None`` to plot every point. The tuning-curve
+    panel is model-based and unchanged by subsampling.
+    """
+    theta_plot = np.asarray(theta, dtype=np.float64)
+    x_plot = np.asarray(x, dtype=np.float64)
+    n = int(theta_plot.shape[0])
+    if scatter_max_points is not None and n > int(scatter_max_points):
+        k = int(scatter_max_points)
+        rng = np.random.default_rng(int(scatter_subsample_seed))
+        pick = rng.choice(n, size=k, replace=False)
+        theta_plot = theta_plot[pick]
+        x_plot = x_plot[pick]
+
     fig, (ax_scatter, ax_tune) = plt.subplots(1, 2, figsize=(14.5, 5.2))
 
-    if x.shape[1] == 2:
-        proj = x
+    if x_plot.shape[1] == 2:
+        proj = x_plot
         xlabel, ylabel = "x1", "x2"
         title_s = r"Joint Samples of $x$ Colored by $\theta$"
     else:
-        proj, _, _ = pca_project(x, n_components=2)
+        proj, _, _ = pca_project(x_plot, n_components=2)
         xlabel, ylabel = "PC1", "PC2"
-        title_s = rf"Joint Samples (PCA Projection, x_dim={x.shape[1]}) Colored by $\theta$"
+        title_s = rf"Joint Samples (PCA Projection, x_dim={x_plot.shape[1]}) Colored by $\theta$"
 
-    sc = ax_scatter.scatter(proj[:, 0], proj[:, 1], c=theta.ravel(), s=8, alpha=0.55, cmap="viridis")
+    sc = ax_scatter.scatter(
+        proj[:, 0], proj[:, 1], c=theta_plot.ravel(), s=8, alpha=0.55, cmap="viridis"
+    )
     ax_scatter.set_xlabel(xlabel)
     ax_scatter.set_ylabel(ylabel)
     ax_scatter.set_title(title_s)

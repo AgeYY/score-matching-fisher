@@ -60,3 +60,313 @@ and the expectation is replaced by a sample mean. Specifically, draw $m$ samples
 The GT of pairwise decoding is estimated by binning the data and using logistic regression to estimate decoding accuracy with large $n_{\mathrm{ref}} = 5000$ datapoints.
 
 \subsection{Denoising score matching does not work very well for high-dimensional dataset}
+
+In two dimensions, the learned Hellinger RDM tracks the Monte Carlo target closely as the nested training size~$n$ increases, outperforming the binning-based decoding baseline (Figure \ref{fig:high_d_dsm}).
+At $d=100$, however, neither the DSM-based Hellinger estimate nor the binned decoding matrix matches to approximated GT well at comparable~$n$. I also tried 50D example, the result is similar, both method does not work very well. 
+
+In particular, for $d=100$ the DSM estimate exhibits a false signal of artificially low squared region in the middle of the matrix, which raises concerns for practical use of the method in high dimension.
+
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\linewidth]{notes/figures/high-d-dsm.pdf}
+  \caption{%
+  DSM method does not perform well in high dimensional dataset. (A) 2D toy dataset. (B) Estimated RDM with different dataset size. GT of Hellinger distance was estimated by Monte Carlo sampling, while GT decoding acc matrix was estimated by decoding large dataset (5000). (C) Correlation from estimation to approximated GT.(D, E, F) Same as (A, B, C) but for 100D dataset. Note that dsm estimation of Hellinger distance matrix yield robust false signal across different dataset size: a large low-distance square region in the middle.}
+  \label{fig:high_d_dsm}
+\end{figure}
+
+
+I tried to add hacks to DSM method but failed. Therefore I decided to switch using flow matching estimating the fisher score which according to my experience, flow matching is a more robust, easier to use method.
+
+\pagebreak
+
+\subsection{Flow matching: a short introduction}
+
+Flow matching learns a time-dependent vector field that transports samples from a simple base distribution to a target distribution by integrating an ordinary differential equation (ODE).
+Let $t \in [0,1]$ and let $p_0$ denote a tractable reference on $\mathbb{R}^{d}$ (for example, a standard Gaussian).
+The goal is to construct a velocity field $v_{\phi}(x,t)$ such that trajectories solving
+\begin{equation}
+  \frac{\mathrm{d}}{\mathrm{d}t} x_t = v_{\phi}(x_t,t), \qquad x_0 \sim p_0,
+\end{equation}
+induce $x_1$ to be close to a target $p_1$ (in our case, the model distribution or a conditional $p_1(\cdot\mid\theta)$).
+
+To obtain the regression objective of velocity field, one needs to first define a probability path from $x_0$ to $x_1$. A concrete construction is affine path. Fix scalar functions $\alpha,\beta : [0,1] \to \mathbb{R}$ with $\alpha(0)=1$, $\beta(0)=0$, $\alpha(1)=0$, and $\beta(1)=1$, and define the affine path
+\begin{equation}
+  x_t = \alpha(t)\,x_0 + \beta(t)\,x_1,
+  \label{eq:flow_affine_bridge}
+\end{equation}
+so that $x_t=x_0$ at $t=0$ and $x_t=x_1$ at $t=1$.
+Holding $(x_0,x_1)$ fixed, the induced velocity is
+\begin{equation}
+  u_t := \frac{\mathrm{d}}{\mathrm{d}t} x_t = \alpha'(t)\,x_0 + \beta'(t)\,x_1.
+  \label{eq:flow_affine_velocity}
+\end{equation}
+Given $t$ sampled uniformly on $[0,1]$, a simple Monte Carlo flow-matching objective matches the network prediction to this bridge velocity:
+\begin{equation}
+  \mathcal{L}_{\mathrm{FM}}(\phi)
+  =
+  \mathbb{E}_{t \sim \mathcal{U}[0,1]}\,
+  \mathbb{E}_{x_0 \sim p_0,\; x_1 \sim p_1}
+  \Bigl[
+    \bigl\lVert v_{\phi}(x_t,t) - u_t \bigr\rVert_2^2
+  \Bigr].
+\end{equation}
+Minimizing $\mathcal{L}_{\mathrm{FM}}$ encourages $v_{\phi}$ to realize the same time evolution as the chosen coupling, so integrating the learned ODE from $p_0$ pushes mass toward~$p_1$.
+
+\paragraph{Conditional flow matching.}
+In the setting of this note, the target is conditional on the stimulus $\theta$.
+One trains $v_{\phi}(x,t\mid\theta)$ by replacing $p_1$ with $p(\cdot\mid\theta)$ in the expectation over~$x_1$:
+\begin{equation}
+  \mathcal{L}_{\mathrm{CFM}}(\phi)
+  =
+  \mathbb{E}_{\theta}\,
+  \mathbb{E}_{t \sim \mathcal{U}[0,1]}\,
+  \mathbb{E}_{x_0 \sim p_0,\; x_1 \sim p(\cdot\mid\theta)}
+  \Bigl[
+    \bigl\lVert v_{\phi}(x_t,t\mid\theta) - u_t \bigr\rVert_2^2
+  \Bigr],
+\end{equation}
+with $x_t$ as in \eqref{eq:flow_affine_bridge} and $u_t$ as in \eqref{eq:flow_affine_velocity} along each sampled bridge (we use the same symbols for both objectives). In this note, we used affine path with cosine scheduler and used a MLP to parameterize the velocity field, see Supplementary information.
+
+\subsection{Estimating the score from flow matching}
+
+The result of this subection is included in Yaron Lipman \emph{et al.}, \emph{Flow Matching Guide and Code} (preprint, 2024), \url{https://doi.org/10.48550/arXiv.2412.06264} (equation~4.78). The following is a self-contained derivation.
+
+Denoising score matching learns the score function $\nabla_x \log p(x)$ directly (or a noisy version of it). Flow matching, by contrast, learns a velocity field. For Gaussian probability paths, these two quantities are closely related: the score can be recovered from the velocity by a simple analytic transformation.
+
+Consider the Gaussian path
+\begin{equation}
+  x_t = \beta(t)\,x_1 + \alpha(t)\,\varepsilon,
+  \qquad
+  \varepsilon \sim \mathcal{N}(0,I),
+  \label{eq:gaussian_prob_path}
+\end{equation}
+where $\alpha(t)$ and $\beta(t)$ are scalar schedules. This Gaussian path is the affine path \eqref{eq:flow_affine_bridge} when the base draw $x_0$ is isotropic normal. Conditionally on $x_1$, this defines a Gaussian perturbation of the data. Averaging over $x_1$ gives a noisy marginal density $p_t(x_t)$. Our ultimate goal is the data score $\nabla_x \log p(x)$, but when $t$ is close to $1$, the noisy density $p_t$ is close to the data density $p$, so it is often enough to estimate the noisy score
+\[
+s_t(x_t) := \nabla_{x_t}\log p_t(x_t),
+\]
+which converges to the data score as $t\to 1$.
+
+The key observation is that, under the Gaussian path, the conditional score has a very simple form (see Subsection~\ref{subsec:si-gaussian-conditional-score}):
+\begin{equation}
+  s_t(x_t \mid x_1)
+  =
+  -\frac{x_t-\beta(t)x_1}{\alpha(t)^2}
+  =
+  -\frac{\varepsilon}{\alpha(t)}.
+  \label{eq:conditional_score_simple}
+\end{equation}
+Taking conditional expectation over $x_1$ given $x_t$ yields
+\begin{equation}
+  s_t(x_t)
+  =
+  -\frac{1}{\alpha(t)}\,\mathbb{E}[\varepsilon \mid x_t].
+  \label{eq:score_from_eps_mean}
+\end{equation}
+Therefore, estimating the noisy score reduces to estimating the posterior mean of the (unknown) Gaussian noise.
+
+To connect this quantity to flow matching, we differentiate the path \eqref{eq:gaussian_prob_path} with respect to time. This gives the conditional velocity
+\[
+u_t = \dot{\beta}(t)\,x_1 + \dot{\alpha}(t)\,\varepsilon.
+\]
+Now combine this expression with the path equation itself. Since both involve the same unknowns, $x_1$ and $\varepsilon$, we can eliminate $x_1$ and solve for $\varepsilon$ in terms of $x_t$ and $u_t$. This gives
+\begin{equation}
+  \varepsilon
+  =
+  \frac{
+    u_t - \frac{\dot{\beta}(t)}{\beta(t)}x_t
+  }{
+    \dot{\alpha}(t)-\alpha(t)\frac{\dot{\beta}(t)}{\beta(t)}
+  }.
+  \label{eq:eps_from_velocity_short}
+\end{equation}
+
+Finally, take conditional expectation given $x_t$. If we define the marginal velocity field by
+\[
+v_t(x_t) := \mathbb{E}[u_t \mid x_t],
+\]
+then \eqref{eq:eps_from_velocity_short} immediately implies
+\[
+\mathbb{E}[\varepsilon \mid x_t]
+=
+\frac{
+  v_t(x_t) - \frac{\dot{\beta}(t)}{\beta(t)}x_t
+}{
+  \dot{\alpha}(t)-\alpha(t)\frac{\dot{\beta}(t)}{\beta(t)}
+}.
+\]
+Substituting this into \eqref{eq:score_from_eps_mean}, we obtain the noisy score in terms of the velocity field:
+\begin{equation}
+  s_t(x_t)
+  =
+  \frac{
+    \frac{\dot{\beta}(t)}{\beta(t)}x_t - v_t(x_t)
+  }{
+    \alpha(t)\left(
+      \dot{\alpha}(t)-\alpha(t)\frac{\dot{\beta}(t)}{\beta(t)}
+    \right)
+  }.
+  \label{eq:score_from_velocity_clean}
+\end{equation}
+
+Finally, a well-trained flow matching velocity network $v_\phi(x_t,t)$ learns the marginal velocity field $v_t(x_t)$. By replacing $v_t$ with $v_\phi(x_t,t)$, we are able to compute the noisy score $s_t(x_t)$ which is an approximation of the data score. Since $x_1$ is given in the data rather than $x_t$, therefore the score we in practice computed is $s_t(x_1)$ where we fix $t = 0.8$ in this note.
+
+\subsection{Flow matching works well for high-dimensional dataset}
+
+See Figure \ref{fig:flow_matching_high_d}.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\linewidth]{notes/figures/flow-matching-high-d.pdf}
+  \caption{%
+    Flow matching for Fisher score estimation in the random-amplitude Gaussian toy model (same protocol as Figure~\ref{fig:high_d_dsm}).
+    Estimated Hellinger RDMs and decoding matrices stay much closer to the Monte Carlo and high-$n$ decoding ground truths at $d=100$ than DSM, without the spurious low-distance block in the RDM middle as seen in Figure~\ref{fig:high_d_dsm}.}
+  \label{fig:flow_matching_high_d}
+\end{figure}
+
+\pagebreak
+
+\subsection{Discussion: The next few important things}
+
+\begin{enumerate}
+  \item What is the effect of $t$ value? How to choose it?
+  \item Can we interpret the choice of $t$ value as adding noise to data and measures the robustness of representation to noise attack?
+  \item How to estimate the RDM estimation uncertainty empirically or theoretically?
+  \item Path integration may fail for periodic manifold since path integration makes "detours".
+  \item Whether the current method works well for discrete label?
+\end{enumerate}
+
+\subsection{Supplementary information: velocity network in flow matching.}
+In the experiments reported here, the conditional (posterior) velocity is parameterized as a fully connected network (MLP): the input is $(\theta_t, x, \psi(t)) \in \mathbb{R}^{1 + d + 1}$, where $\theta_t$ is the scalar state along the flow bridge, $x \in \mathbb{R}^{d}$ is the observation, and $\psi(t)=\log t - \log(1-t)$ is a logit-time feature (with $t$ restricted to a compact subinterval of $(0,1)$ so that $\psi$ is finite).
+The map consists of three hidden layers of width $128$ with SiLU activations, followed by a linear readout to a scalar velocity.
+The prior velocity uses the same MLP pattern on $(\theta_t, \psi(t)) \in \mathbb{R}^{2}$ with hidden width $128$ and three hidden layers.
+
+\subsection{Supplementary information: cosine scheduler in flow matching.}
+With $t \in [0,1]$, the cosine choice for the affine path \eqref{eq:flow_affine_bridge} is
+\begin{equation}
+  \alpha(t) = \cos\!\Bigl(\frac{\pi}{2}\,t\Bigr),
+  \qquad
+  \beta(t) = \sin\!\Bigl(\frac{\pi}{2}\,t\Bigr).
+\end{equation}
+
+\subsection{Supplementary information: conditional score under the Gaussian path}
+\label{subsec:si-gaussian-conditional-score}
+
+We consider the Gaussian probability path
+\begin{equation}
+  x_t = \beta(t)\,x_1 + \alpha(t)\,\varepsilon,
+  \qquad
+  \varepsilon \sim \mathcal{N}(0,I).
+  \label{eq:gaussian_prob_path_appendix}
+\end{equation}
+Conditioned on $x_1$, the randomness comes only from $\varepsilon$, so $x_t \mid x_1$ is Gaussian with mean $\beta(t)x_1$ and covariance $\alpha(t)^2 I$:
+\begin{equation}
+  p_t(x_t \mid x_1)
+  =
+  \mathcal{N}\!\bigl(x_t;\beta(t)x_1,\alpha(t)^2 I\bigr).
+\end{equation}
+Therefore,
+\begin{equation}
+  \log p_t(x_t \mid x_1)
+  =
+  -\frac{d}{2}\log\!\bigl(2\pi \alpha(t)^2\bigr)
+  -\frac{1}{2\alpha(t)^2}\,
+  \|x_t-\beta(t)x_1\|^2,
+\end{equation}
+where $d$ is the dimension of $x_t$. Since the first term does not depend on $x_t$, differentiating with respect to $x_t$ gives
+\begin{equation}
+  \nabla_{x_t}\log p_t(x_t \mid x_1)
+  =
+  -\frac{1}{2\alpha(t)^2}\,
+  \nabla_{x_t}\|x_t-\beta(t)x_1\|^2.
+\end{equation}
+Using the identity
+\[
+\nabla_x \|x-a\|^2 = 2(x-a),
+\]
+we obtain
+\begin{equation}
+  s_t(x_t \mid x_1)
+  :=
+  \nabla_{x_t}\log p_t(x_t \mid x_1)
+  =
+  -\frac{x_t-\beta(t)x_1}{\alpha(t)^2}.
+  \label{eq:conditional_score_first_form}
+\end{equation}
+
+Finally, from the path definition \eqref{eq:gaussian_prob_path_appendix},
+\[
+x_t-\beta(t)x_1=\alpha(t)\varepsilon.
+\]
+Substituting this into \eqref{eq:conditional_score_first_form} yields
+\begin{equation}
+  s_t(x_t \mid x_1)
+  =
+  -\frac{\alpha(t)\varepsilon}{\alpha(t)^2}
+  =
+  -\frac{\varepsilon}{\alpha(t)}.
+  \label{eq:conditional_score_simple_appendix}
+\end{equation}
+
+Thus, under the Gaussian path, the conditional score has a particularly simple interpretation: it is just the negative latent noise, rescaled by the noise level $\alpha(t)$.
+
+\subsection{Supplementary information: the marginal score as the expectation of the conditional score}
+
+We now explain why the noisy marginal score
+\[
+s_t(x_t) := \nabla_{x_t}\log p_t(x_t)
+\]
+can be written as the conditional expectation of the conditional score
+\[
+s_t(x_t\mid x_1) := \nabla_{x_t}\log p_t(x_t\mid x_1).
+\]
+
+Recall that the noisy marginal density is obtained by averaging the conditional density over the data distribution:
+\begin{equation}
+  p_t(x_t)
+  =
+  \int p_t(x_t\mid x_1)\,p(x_1)\,dx_1.
+  \label{eq:marginal_density}
+\end{equation}
+Differentiating both sides with respect to $x_t$ gives
+\begin{equation}
+  \nabla_{x_t} p_t(x_t)
+  =
+  \int \nabla_{x_t} p_t(x_t\mid x_1)\,p(x_1)\,dx_1.
+\end{equation}
+Using the identity
+\[
+\nabla_{x_t} p_t(x_t\mid x_1)
+=
+p_t(x_t\mid x_1)\,\nabla_{x_t}\log p_t(x_t\mid x_1),
+\]
+we obtain
+\begin{equation}
+  \nabla_{x_t} p_t(x_t)
+  =
+  \int p_t(x_t\mid x_1)\,p(x_1)\,
+  \nabla_{x_t}\log p_t(x_t\mid x_1)\,dx_1.
+\end{equation}
+Now divide both sides by $p_t(x_t)$. By definition of the score,
+\begin{equation}
+  s_t(x_t)
+  =
+  \nabla_{x_t}\log p_t(x_t)
+  =
+  \frac{1}{p_t(x_t)}
+  \int p_t(x_t\mid x_1)\,p(x_1)\,
+  \nabla_{x_t}\log p_t(x_t\mid x_1)\,dx_1.
+\end{equation}
+The factor
+\[
+\frac{p_t(x_t\mid x_1)\,p(x_1)}{p_t(x_t)}
+\]
+is exactly the posterior density $p(x_1\mid x_t)$. Therefore,
+\begin{equation}
+  s_t(x_t)
+  =
+  \int p(x_1\mid x_t)\,s_t(x_t\mid x_1)\,dx_1
+  =
+  \mathbb{E}\!\left[s_t(x_t\mid x_1)\mid x_t\right].
+  \label{eq:marginal_score_as_expectation}
+\end{equation}

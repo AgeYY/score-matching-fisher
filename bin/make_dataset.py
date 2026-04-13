@@ -16,6 +16,9 @@ _repo_root = Path(__file__).resolve().parent.parent
 if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 
+# Matplotlib rcParams (tick sizes, spines) apply when ``global_setting`` is imported — before pyplot.
+import global_setting  # noqa: F401
+
 import numpy as np
 
 from global_setting import DATA_DIR

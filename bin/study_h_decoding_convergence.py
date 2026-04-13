@@ -13,8 +13,9 @@ Nested subset training for each ``n`` in ``--n-list`` uses up to ``n`` samples; 
 **Pairwise decoding:** off-diagonal correlation vs the decoding matrix from the ``--n-ref``
 subset (same bin edges as GT), unchanged.
 
-**Dataset:** the loaded NPZ must match ``--dataset-family`` (default ``gaussian_sqrtd`` with
-``gaussian_raw`` tuning from ``make_dataset.py``). Regenerate the NPZ if the family does not match.
+**Dataset:** the loaded NPZ must match ``--dataset-family`` (default ``gaussian_randamp_sqrtd``:
+random-amplitude Gaussian bumps plus ``sqrt(x_dim)`` observation-noise scaling; see ``make_dataset.py``).
+Regenerate the NPZ if the family does not match.
 
 For each ``n`` in ``--n-list``, the H matrix is computed from trained **posterior** and **prior**
 models (``--theta-field-method dsm`` or ``flow``). In ``flow`` mode, H uses the
@@ -24,6 +25,10 @@ for the posterior (``--score-arch film``, ``--score-depth 3``) and a **3-layer M
 (``--prior-score-arch mlp``). The **reference column** (``n_ref``) does **not** run DSM/flow: the
 matrix-panel top row shows **MC generative** ``sqrt(H^2)`` (same as the H correlation
 target), while the bottom row still shows pairwise decoding on the ``n_ref`` data subset.
+
+**Visualization-only:** Pass ``--visualization-only`` to reload ``h_decoding_convergence_results.npz``
+from ``--output-dir`` and regenerate figures/CSV/summary without retraining (requires a prior full run
+and ``training_losses/n_*.npz`` for the loss panel).
 
 **NPZ semantics:** Arrays ``h_binned_columns``, ``h_binned_ref``, and the key ``hellinger_gt_sq_mc``
 hold **square-root** matrices for this study (legacy key name ``hellinger_gt_sq_mc``; values are
@@ -41,7 +46,7 @@ import tempfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, TypedDict
 
 _repo_root = Path(__file__).resolve().parent.parent
 _bin_dir = Path(__file__).resolve().parent
@@ -50,12 +55,14 @@ if str(_repo_root) not in sys.path:
 if str(_bin_dir) not in sys.path:
     sys.path.insert(0, str(_bin_dir))
 
+# Matplotlib rcParams (tick size, spines) apply when ``global_setting`` is imported — before pyplot.
+from global_setting import DATA_DIR
+
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
 import visualize_h_matrix_binned as vhb
-from global_setting import DATA_DIR
 from fisher.cli_shared_fisher import add_estimation_arguments
 from fisher.hellinger_gt import bin_centers_from_edges, estimate_hellinger_sq_one_sided_mc
 from fisher.shared_dataset_io import SharedDatasetBundle, load_shared_dataset_npz
@@ -65,6 +72,11 @@ from fisher.shared_fisher_est import (
     require_device,
     validate_estimation_args,
 )
+
+
+# Isolated ``h_decoding_convergence.{png,svg}`` size; combined figure uses the same width/height
+# ratio for the right-hand curve column (column height matches the matrix panel height).
+_H_DECODING_CURVE_FIGSIZE_IN: tuple[float, float] = (3.5, 3.5)
 
 
 def _sqrt_h_like(mat: np.ndarray) -> np.ndarray:
@@ -95,7 +107,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--dataset-family",
         type=str,
-        default="gaussian_sqrtd",
+        default="gaussian_randamp_sqrtd",
         choices=[
             "gaussian",
             "gaussian_sqrtd",
@@ -107,8 +119,8 @@ def build_parser() -> argparse.ArgumentParser:
         ],
         help=(
             "Expected generative family stored in the NPZ meta; must match make_dataset.py "
-            "when the archive was created. Default: gaussian_sqrtd (Gaussian bump tuning + "
-            "sqrt(x_dim) observation-noise scaling)."
+            "when the archive was created. Default: gaussian_randamp_sqrtd (random-amplitude "
+            "Gaussian bumps + sqrt(x_dim) observation-noise scaling)."
         ),
     )
     p.add_argument(
@@ -123,7 +135,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--n-list",
         type=str,
-        default="80,160,240,320,400",
+        default="80,200,400,600",
         help=(
             "Comma-separated nested subset sizes n to compare to the reference (default: "
             "80,160,240,320,400 — min 80, max 400, four equal steps of 80). Each n must be <= --n-ref."
@@ -180,6 +192,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--keep-intermediate",
         action="store_true",
         help="Keep per-n training output directories under output-dir/sweep_runs/ (default: temp dirs).",
+    )
+    p.add_argument(
+        "--visualization-only",
+        action="store_true",
+        help=(
+            "Skip dataset sweep, GT Hellinger MC, and per-n training. Load "
+            "h_decoding_convergence_results.npz from --output-dir and regenerate figures, CSV, "
+            "and summary only. Requires a prior full run in that directory; "
+            "training_losses/n_*.npz must exist for the loss panel."
+        ),
     )
     p.add_argument(
         "--gt-hellinger-seed",
@@ -588,37 +610,62 @@ def _render_training_losses_panel(
 
 
 def _save_combined_convergence_figure(
-    left_png_path: str,
-    right_png_path: str,
-    out_png_path: str,
     *,
+    h_mats: list[np.ndarray],
+    clf_mats: list[np.ndarray],
+    col_labels: list[str],
+    n_bins: int,
+    theta_centers: np.ndarray,
+    ns: list[int],
+    corr_h: np.ndarray,
+    corr_clf: np.ndarray,
+    out_png_path: str,
     dpi: int = 160,
 ) -> str:
-    """Side-by-side: left = corr vs n, right = matrix panel; same height as the journal combined figure."""
-    from PIL import Image
+    """Side-by-side matrix panel and correlation curves using one matplotlib figure.
 
-    left = Image.open(left_png_path).convert("RGB")
-    right = Image.open(right_png_path).convert("RGB")
-    h = max(left.height, right.height)
+    PNG is raster as usual. SVG keeps the right-hand curve as vector paths (not a single
+    embedded screenshot); heatmaps still use matplotlib's normal SVG image handling for ``imshow``.
 
-    def _scale_to_height(im: Image.Image, target_h: int) -> Image.Image:
-        w = int(round(im.width * target_h / im.height))
-        return im.resize((w, target_h), Image.Resampling.LANCZOS)
-
-    l2 = _scale_to_height(left, h)
-    r2 = _scale_to_height(right, h)
-    combined = Image.new("RGB", (l2.width + r2.width, h), (255, 255, 255))
-    combined.paste(l2, (0, 0))
-    combined.paste(r2, (l2.width, 0))
-    combined.save(out_png_path, dpi=(dpi, dpi))
-
-    arr = np.asarray(combined)
-    fig = plt.figure(figsize=(arr.shape[1] / dpi, arr.shape[0] / dpi), dpi=dpi)
-    ax = fig.add_axes([0, 0, 1, 1])
-    ax.imshow(arr)
-    ax.axis("off")
-    path_svg = str(Path(out_png_path).with_suffix(".svg"))
-    fig.savefig(path_svg, pad_inches=0)
+    Figure height matches the matrix panel (``m_h``). The right column width is chosen so its
+    aspect ratio matches ``_H_DECODING_CURVE_FIGSIZE_IN`` (default square 3.5×3.5 like the
+    isolated curve figure).
+    """
+    crv_w, crv_h = _H_DECODING_CURVE_FIGSIZE_IN
+    if crv_h <= 0:
+        raise ValueError("_H_DECODING_CURVE_FIGSIZE_IN height must be > 0.")
+    n_cols = len(h_mats)
+    m_w, m_h = 2.8 * n_cols, 5.0
+    H = float(m_h)
+    Wm = m_w * H / m_h
+    Wc = H * (float(crv_w) / float(crv_h))
+    # Constrained layout: colorbars make tight_layout warn and mis-place panels.
+    fig = plt.figure(figsize=(Wm + Wc, H), dpi=dpi, layout="constrained")
+    gs0 = fig.add_gridspec(1, 2, width_ratios=[Wm, Wc])
+    gs_left = gs0[0, 0].subgridspec(2, n_cols)
+    axes_m = np.empty((2, n_cols), dtype=object)
+    for c in range(n_cols):
+        axes_m[0, c] = fig.add_subplot(gs_left[0, c])
+        axes_m[1, c] = fig.add_subplot(gs_left[1, c])
+    _populate_matrix_panel_axes(
+        axes_m,
+        h_mats=h_mats,
+        clf_mats=clf_mats,
+        col_labels=col_labels,
+        n_bins=n_bins,
+        theta_centers=theta_centers,
+    )
+    ax_c = fig.add_subplot(gs0[0, 1])
+    _populate_convergence_curve_ax(
+        ax_c,
+        list(ns),
+        corr_h,
+        corr_clf,
+        tick_labelsize=13.0,
+        axis_labelsize=13.0,
+        legend_fontsize=10.0,
+    )
+    path_svg = _save_figure_png_svg(fig, out_png_path, dpi=dpi)
     plt.close(fig)
     return path_svg
 
@@ -637,20 +684,55 @@ def _finite_min_max(matrices: list[np.ndarray]) -> tuple[float, float]:
     return float(np.min(v)), float(np.max(v))
 
 
-def _render_matrix_panel(
+def _format_theta_tick_labels(theta_centers: np.ndarray) -> list[str]:
+    """String tick labels from bin-center θ values (matches ``imshow`` index ticks 0..n_bins-1)."""
+    tc = np.asarray(theta_centers, dtype=np.float64).ravel()
+    return [f"{float(v):.1f}" for v in tc]
+
+
+def _matrix_panel_tick_indices(n_bins: int, *, max_ticks: int = 5) -> np.ndarray:
+    """Sparse integer bin indices (inclusive ends) so matrix panels show fewer ticks."""
+    nb = int(n_bins)
+    if nb < 1:
+        raise ValueError("n_bins must be >= 1.")
+    k = min(max(2, int(max_ticks)), nb)
+    if nb <= k:
+        return np.arange(nb, dtype=np.int64)
+    return np.unique(np.round(np.linspace(0, nb - 1, k)).astype(np.int64))
+
+
+def _matrix_axes_show_top_right_spines(ax: Any) -> None:
+    """Override global_setting spine defaults for matrix heatmaps."""
+    ax.spines["top"].set_visible(True)
+    ax.spines["right"].set_visible(True)
+
+
+def _populate_matrix_panel_axes(
+    axes: np.ndarray,
     *,
     h_mats: list[np.ndarray],
     clf_mats: list[np.ndarray],
     col_labels: list[str],
-    out_path: str,
     n_bins: int,
+    theta_centers: np.ndarray,
 ) -> None:
-    """Two rows: sqrt(binned H_sym) vs sqrt(GT H^2), pairwise decoding."""
+    """Draw 2 × n_cols heatmaps on existing axes (shared with standalone matrix panel + combined figure)."""
+    tc = np.asarray(theta_centers, dtype=np.float64).ravel()
+    if int(tc.size) != int(n_bins):
+        raise ValueError(f"theta_centers length {tc.size} must match n_bins={n_bins}.")
+    tick_labs_full = _format_theta_tick_labels(tc)
+    tick_idx = _matrix_panel_tick_indices(n_bins, max_ticks=5)
+    tick_pos = tick_idx.tolist()
+    tick_labs = [tick_labs_full[int(i)] for i in tick_idx]
+    x_rot = 45 if len(tick_pos) > 6 else 0
+    _matrix_tick_labelsize = 11
+    _matrix_colorbar_tick_labelsize = 11
     n_cols = len(h_mats)
     if n_cols != len(clf_mats) or n_cols != len(col_labels):
         raise ValueError("h_mats, clf_mats, col_labels length mismatch.")
-    fig, axes = plt.subplots(2, n_cols, figsize=(2.8 * n_cols, 5.6), squeeze=False)
-    # sqrt(H) entries lie in [0, 1]; use [0, 1] for a consistent cross-column color scale.
+    if axes.shape != (2, n_cols):
+        raise ValueError(f"axes must be shape (2, {n_cols}); got {axes.shape}.")
+
     vmin_h, vmax_h = 0.0, 1.0
     vmin_c, vmax_c = _finite_min_max(clf_mats)
     if vmin_c >= vmax_c:
@@ -658,7 +740,8 @@ def _render_matrix_panel(
     cmap = "viridis"
 
     for c in range(n_cols):
-        im0 = axes[0, c].imshow(
+        ax0 = axes[0, c]
+        im0 = ax0.imshow(
             h_mats[c],
             vmin=vmin_h,
             vmax=vmax_h,
@@ -666,15 +749,20 @@ def _render_matrix_panel(
             aspect="equal",
             origin="lower",
         )
-        axes[0, c].set_title(col_labels[c], fontsize=10)
-        axes[0, c].set_xticks(range(n_bins))
-        axes[0, c].set_yticks(range(n_bins))
-        axes[0, c].tick_params(labelsize=7)
+        ax0.set_title(col_labels[c], fontsize=10)
+        ax0.set_xticks(tick_pos)
+        ax0.set_xticklabels(tick_labs, rotation=x_rot, ha="right" if x_rot else "center", fontsize=_matrix_tick_labelsize)
+        ax0.set_yticks(tick_pos)
+        ax0.set_yticklabels(tick_labs, fontsize=_matrix_tick_labelsize)
+        ax0.tick_params(axis="both", labelsize=_matrix_tick_labelsize)
+        _matrix_axes_show_top_right_spines(ax0)
         if c == 0:
-            axes[0, c].set_ylabel(r"Binned $\sqrt{H^{\mathrm{sym}}}$ / GT $\sqrt{H^2}$ (n_ref)", fontsize=11)
-        plt.colorbar(im0, ax=axes[0, c], fraction=0.046, pad=0.04)
+            ax0.set_ylabel(r"$\sqrt{H^2}$", fontsize=11)
+        _cb0 = plt.colorbar(im0, ax=ax0, fraction=0.046, pad=0.04)
+        _cb0.ax.tick_params(labelsize=_matrix_colorbar_tick_labelsize)
 
-        im1 = axes[1, c].imshow(
+        ax1 = axes[1, c]
+        im1 = ax1.imshow(
             clf_mats[c],
             vmin=vmin_c,
             vmax=vmax_c,
@@ -682,19 +770,92 @@ def _render_matrix_panel(
             aspect="equal",
             origin="lower",
         )
-        axes[1, c].set_xticks(range(n_bins))
-        axes[1, c].set_yticks(range(n_bins))
-        axes[1, c].tick_params(labelsize=7)
+        ax1.set_xticks(tick_pos)
+        ax1.set_xticklabels(tick_labs, rotation=x_rot, ha="right" if x_rot else "center", fontsize=_matrix_tick_labelsize)
+        ax1.set_yticks(tick_pos)
+        ax1.set_yticklabels(tick_labs, fontsize=_matrix_tick_labelsize)
+        ax1.tick_params(axis="both", labelsize=_matrix_tick_labelsize)
+        _matrix_axes_show_top_right_spines(ax1)
         if c == 0:
-            axes[1, c].set_ylabel("Pairwise decoding", fontsize=11)
-        plt.colorbar(im1, ax=axes[1, c], fraction=0.046, pad=0.04)
+            ax1.set_ylabel("Pairwise decoding", fontsize=11)
+        ax1.set_xlabel(r"$\theta$", fontsize=11)
+        _cb1 = plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+        _cb1.ax.tick_params(labelsize=_matrix_colorbar_tick_labelsize)
 
-    fig.suptitle(
-        "Top: sqrt(binned H_sym) for each n; last column n_ref shows MC GT sqrt(H^2). "
-        "Bottom: pairwise decoding (rows 1–2) by nested subset size.",
-        fontsize=10,
+
+def _populate_convergence_curve_ax(
+    ax: plt.Axes,
+    ns: list[int],
+    corr_h: np.ndarray,
+    corr_clf: np.ndarray,
+    *,
+    tick_labelsize: float = 11.0,
+    axis_labelsize: float = 12.0,
+    legend_fontsize: float = 9.0,
+) -> None:
+    """Correlation vs n on a single axis (shared with standalone curve figure + combined figure).
+
+    Tick sizes default to ``global_setting``-style values (11 pt ticks, 12 pt axis labels).
+    The combined figure passes larger values so the right panel stays readable at reduced width.
+    """
+    ns_list = [int(x) for x in ns]
+    ch = np.asarray(corr_h, dtype=np.float64).ravel()
+    cc = np.asarray(corr_clf, dtype=np.float64).ravel()
+    ax.plot(
+        ns_list,
+        ch,
+        color="#1f77b4",
+        linewidth=1.8,
+        marker="o",
+        markersize=6,
+        label="H matrix",
+    )
+    ax.plot(
+        ns_list,
+        cc,
+        color="#d62728",
+        linewidth=1.8,
+        marker="s",
+        markersize=5,
+        label="decoding acc matrix",
+    )
+    ax.axhline(
+        1.0,
+        color="0.45",
+        linestyle="--",
+        linewidth=1.0,
+        zorder=0,
+        clip_on=False,
+    )
+    ax.set_xlabel("dataset size n", fontsize=axis_labelsize)
+    ax.set_ylabel("Correlation(off-diagonal estimated, off-diagonal approx GT)", fontsize=axis_labelsize)
+    ax.set_xticks(ns_list)
+    ax.tick_params(axis="both", labelsize=tick_labelsize)
+    ax.legend(loc="best", fontsize=legend_fontsize)
+
+
+def _render_matrix_panel(
+    *,
+    h_mats: list[np.ndarray],
+    clf_mats: list[np.ndarray],
+    col_labels: list[str],
+    out_path: str,
+    n_bins: int,
+    theta_centers: np.ndarray,
+) -> None:
+    """Two rows: sqrt(binned H_sym) vs sqrt(GT H^2), pairwise decoding."""
+    n_cols = len(h_mats)
+    fig, axes = plt.subplots(2, n_cols, figsize=(2.8 * n_cols, 5.0), squeeze=False)
+    _populate_matrix_panel_axes(
+        axes,
+        h_mats=h_mats,
+        clf_mats=clf_mats,
+        col_labels=col_labels,
+        n_bins=n_bins,
+        theta_centers=theta_centers,
     )
     fig.tight_layout()
+    fig.subplots_adjust(hspace=0.12)
     _save_figure_png_svg(fig, out_path, dpi=160)
     plt.close(fig)
 
@@ -737,6 +898,272 @@ def _write_summary(
             )
 
 
+class CachedConvergenceBundle(TypedDict):
+    """Arrays loaded from ``h_decoding_convergence_results.npz`` for visualization-only mode."""
+
+    n: np.ndarray
+    corr_h: np.ndarray
+    corr_clf: np.ndarray
+    wall_s: np.ndarray
+    h_cols: np.ndarray
+    clf_cols: np.ndarray
+    n_ref: int
+    perm_seed: int
+    base_seed: int
+    meta_seed: int
+    edges: np.ndarray
+    centers: np.ndarray
+    gt_n_mc: int
+    gt_seed: int
+    gt_symmetrize: bool
+    out_npz: str
+
+
+def _load_cached_convergence_results(output_dir: str) -> CachedConvergenceBundle:
+    """Load metrics and matrices from a prior full run."""
+    out_npz = os.path.join(output_dir, "h_decoding_convergence_results.npz")
+    if not os.path.isfile(out_npz):
+        raise FileNotFoundError(
+            f"Visualization-only mode requires prior results; missing file:\n  {out_npz}\n"
+            "Run once without --visualization-only to generate h_decoding_convergence_results.npz."
+        )
+    z = np.load(out_npz, allow_pickle=True)
+    required = (
+        "n",
+        "corr_h_binned_vs_gt_mc",
+        "corr_clf_vs_ref",
+        "wall_seconds",
+        "h_binned_columns",
+        "clf_acc_columns",
+        "n_ref",
+        "theta_bin_edges",
+    )
+    missing = [k for k in required if k not in z.files]
+    if missing:
+        raise KeyError(f"{out_npz} missing keys: {missing}")
+
+    h_cols = np.asarray(z["h_binned_columns"], dtype=np.float64)
+    clf_cols = np.asarray(z["clf_acc_columns"], dtype=np.float64)
+    if h_cols.ndim != 3 or clf_cols.ndim != 3:
+        raise ValueError("h_binned_columns / clf_acc_columns must be 3D (columns, bins, bins).")
+    if h_cols.shape != clf_cols.shape:
+        raise ValueError("h_binned_columns and clf_acc_columns shape mismatch.")
+
+    edges = np.asarray(z["theta_bin_edges"], dtype=np.float64).ravel()
+    n_bins_file = int(h_cols.shape[1])
+    if edges.size != n_bins_file + 1:
+        raise ValueError(
+            f"theta_bin_edges length {edges.size} inconsistent with matrix dim {n_bins_file} (expected n_bins+1 edges)."
+        )
+
+    if "theta_bin_centers" in z.files:
+        centers = np.asarray(z["theta_bin_centers"], dtype=np.float64).ravel()
+    else:
+        centers = bin_centers_from_edges(edges)
+
+    gt_n_mc = int(np.asarray(z["gt_hellinger_n_mc"]).reshape(-1)[0]) if "gt_hellinger_n_mc" in z.files else 0
+    gt_seed = int(np.asarray(z["gt_hellinger_seed"]).reshape(-1)[0]) if "gt_hellinger_seed" in z.files else 0
+    sym_raw = z["gt_hellinger_symmetrize"] if "gt_hellinger_symmetrize" in z.files else np.int32(0)
+    gt_symmetrize = bool(int(np.asarray(sym_raw).reshape(-1)[0]))
+
+    return CachedConvergenceBundle(
+        n=np.asarray(z["n"], dtype=np.int64).ravel(),
+        corr_h=np.asarray(z["corr_h_binned_vs_gt_mc"], dtype=np.float64).ravel(),
+        corr_clf=np.asarray(z["corr_clf_vs_ref"], dtype=np.float64).ravel(),
+        wall_s=np.asarray(z["wall_seconds"], dtype=np.float64).ravel(),
+        h_cols=h_cols,
+        clf_cols=clf_cols,
+        n_ref=int(np.asarray(z["n_ref"]).reshape(-1)[0]),
+        perm_seed=int(np.asarray(z["perm_seed"]).reshape(-1)[0]) if "perm_seed" in z.files else 0,
+        base_seed=int(np.asarray(z["convergence_base_seed"]).reshape(-1)[0]) if "convergence_base_seed" in z.files else 0,
+        meta_seed=int(np.asarray(z["dataset_meta_seed"]).reshape(-1)[0]) if "dataset_meta_seed" in z.files else 0,
+        edges=np.asarray(z["theta_bin_edges"], dtype=np.float64),
+        centers=np.asarray(centers, dtype=np.float64).ravel(),
+        gt_n_mc=gt_n_mc,
+        gt_seed=gt_seed,
+        gt_symmetrize=gt_symmetrize,
+        out_npz=os.path.abspath(out_npz),
+    )
+
+
+def _validate_cached_matches_cli(args: argparse.Namespace, cached: CachedConvergenceBundle, ns: list[int]) -> None:
+    n_arr = np.asarray(cached["n"], dtype=np.int64).ravel()
+    if n_arr.size != len(ns) or not np.array_equal(n_arr, np.asarray(ns, dtype=np.int64)):
+        raise ValueError(
+            f"--n-list {ns} does not match cached results n={n_arr.tolist()}. "
+            "Use the same --n-list as the run that produced h_decoding_convergence_results.npz."
+        )
+    if int(cached["n_ref"]) != int(args.n_ref):
+        raise ValueError(
+            f"Cached n_ref={cached['n_ref']} does not match --n-ref={int(args.n_ref)}."
+        )
+    n_bins_h = int(cached["h_cols"].shape[1])
+    if n_bins_h != int(args.num_theta_bins):
+        raise ValueError(
+            f"Cached matrices imply num_theta_bins={n_bins_h} but CLI has --num-theta-bins={args.num_theta_bins}."
+        )
+    n_cols = int(cached["h_cols"].shape[0])
+    if n_cols != len(ns) + 1:
+        raise ValueError(
+            f"Expected h_binned_columns to have {len(ns) + 1} columns (n sweep + n_ref); got {n_cols}."
+        )
+
+
+def _render_convergence_figures_and_summary(
+    *,
+    args: argparse.Namespace,
+    meta: dict,
+    perm_seed: int,
+    n_pool: int,
+    ref_dir: str,
+    ns: list[int],
+    n_bins: int,
+    theta_centers: np.ndarray,
+    gt_n_mc: int,
+    gt_seed: int,
+    gt_symmetrize_effective: bool,
+    corr_h: np.ndarray,
+    corr_clf: np.ndarray,
+    wall_s: np.ndarray,
+    h_cols: np.ndarray,
+    clf_cols: np.ndarray,
+    out_npz: str,
+    per_n_loss_rows: list[dict[str, str]],
+    err_msg: list[str],
+    visualization_only: bool,
+) -> None:
+    """Write CSV, figures, manifest, training-loss panel, summary, and print artifact paths."""
+    csv_path = os.path.join(args.output_dir, "h_decoding_convergence_results.csv")
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(
+            [
+                "n",
+                "corr_h_binned_vs_gt_mc",
+                "corr_clf_vs_ref",
+                "wall_seconds",
+            ]
+        )
+        for i, n in enumerate(ns):
+            w.writerow([n, corr_h[i], corr_clf[i], wall_s[i]])
+
+    fig_path = os.path.join(args.output_dir, "h_decoding_convergence.png")
+    fig, ax = plt.subplots(1, 1, figsize=_H_DECODING_CURVE_FIGSIZE_IN)
+    _populate_convergence_curve_ax(ax, list(ns), corr_h, corr_clf)
+    fig.tight_layout()
+    conv_svg = _save_figure_png_svg(fig, fig_path, dpi=160)
+    plt.close(fig)
+
+    matrix_panel_path = os.path.join(args.output_dir, "h_decoding_matrices_panel.png")
+    col_labels = [f"n={n}" for n in ns] + [f"Approx GT, n_ref={int(args.n_ref)}"]
+    _render_matrix_panel(
+        h_mats=list(h_cols),
+        clf_mats=list(clf_cols),
+        col_labels=col_labels,
+        out_path=matrix_panel_path,
+        n_bins=n_bins,
+        theta_centers=theta_centers,
+    )
+
+    combined_path = os.path.join(args.output_dir, "h_decoding_convergence_combined.png")
+    combined_svg = _save_combined_convergence_figure(
+        h_mats=list(h_cols),
+        clf_mats=list(clf_cols),
+        col_labels=col_labels,
+        n_bins=n_bins,
+        theta_centers=theta_centers,
+        ns=list(ns),
+        corr_h=corr_h,
+        corr_clf=corr_clf,
+        out_png_path=combined_path,
+        dpi=160,
+    )
+
+    loss_dir = os.path.join(args.output_dir, "training_losses")
+    os.makedirs(loss_dir, exist_ok=True)
+    manifest_path = os.path.join(loss_dir, "manifest.txt")
+    with open(manifest_path, "w", encoding="utf-8") as mf:
+        mf.write("# n\tstatus\trun_dir\tsrc_loss_npz\tdst_loss_npz\tnote\n")
+        for row in per_n_loss_rows:
+            mf.write(
+                "{n}\t{status}\t{run_dir}\t{src}\t{dst}\t{note}\n".format(
+                    n=row["n"],
+                    status=row["status"],
+                    run_dir=row["run_dir"],
+                    src=row["src"],
+                    dst=row["dst"],
+                    note=row["note"],
+                )
+            )
+
+    loss_panel_png = os.path.join(args.output_dir, "h_decoding_training_losses_panel.png")
+    loss_panel_svg = _render_training_losses_panel(
+        ns=list(ns),
+        loss_dir=loss_dir,
+        out_png_path=loss_panel_png,
+        dpi=160,
+    )
+
+    summary_path = os.path.join(args.output_dir, "h_decoding_convergence_summary.txt")
+    paths_out = {
+        "results_npz": out_npz,
+        "results_csv": csv_path,
+        "figure": fig_path,
+        "figure_svg": conv_svg,
+        "matrix_panel": matrix_panel_path,
+        "matrix_panel_svg": str(Path(matrix_panel_path).with_suffix(".svg")),
+        "combined_figure": combined_path,
+        "combined_figure_svg": combined_svg,
+        "training_losses_panel": loss_panel_png,
+        "training_losses_panel_svg": loss_panel_svg,
+        "reference_npz": os.path.join(args.output_dir, "h_decoding_convergence_reference.npz"),
+        "training_losses_dir": loss_dir,
+        "training_losses_manifest": manifest_path,
+    }
+    if visualization_only:
+        paths_out["mode"] = "visualization-only (figures/csv/summary regenerated from cached NPZ)"
+    if err_msg:
+        paths_out["errors"] = "; ".join(err_msg[:20])
+    _write_summary(summary_path, args, meta, perm_seed, n_pool, ref_dir, paths_out, per_n_loss_rows)
+    with open(summary_path, "a", encoding="utf-8") as sf:
+        sf.write("\n# Correlation targets\n")
+        sf.write(
+            "# corr_h_binned_vs_gt_mc: binned sqrt(H_sym) vs sqrt(generative GT H^2) (MC one-sided Hellinger).\n"
+        )
+        sf.write(
+            "# corr_clf_vs_ref: pairwise decoding vs n_ref subset decoding matrix (same bin edges).\n"
+        )
+        sf.write(
+            "# h_binned_columns last column: MC GT sqrt(H^2) (not DSM/flow); hellinger_gt_sq_mc key stores sqrt(H^2).\n"
+        )
+        sf.write(
+            f"gt_hellinger_n_mc: {int(gt_n_mc)}  # MC samples per bin row; floor(n_ref / num_theta_bins)\n"
+        )
+        sf.write(
+            f"gt_hellinger_n_ref_budget: {int(args.n_ref)}  # reference training subset size (--n-ref)\n"
+        )
+        sf.write(
+            f"gt_hellinger_n_bins_times_n_mc: {int(n_bins * gt_n_mc)}  # n_bins * n_mc (may be < n_ref)\n"
+        )
+        sf.write(f"gt_hellinger_seed: {int(gt_seed)}\n")
+        sf.write(f"gt_hellinger_symmetrize: {bool(gt_symmetrize_effective)}\n")
+
+    tag = "[convergence] Saved (visualization-only):" if visualization_only else "[convergence] Saved:"
+    print(tag)
+    print(f"  - {out_npz}")
+    print(f"  - {csv_path}")
+    print(f"  - {fig_path}")
+    print(f"  - {conv_svg}")
+    print(f"  - {matrix_panel_path}")
+    print(f"  - {paths_out['matrix_panel_svg']}")
+    print(f"  - {combined_path}")
+    print(f"  - {combined_svg}")
+    print(f"  - {loss_panel_png}")
+    print(f"  - {loss_panel_svg}")
+    print(f"  - {loss_dir}/ (per-n training loss .npz + manifest.txt)")
+    print(f"  - {summary_path}")
+
+
 def main(argv: list[str] | None = None) -> None:
     # When stdout is redirected (e.g. nohup), default block buffering delays run.log updates.
     if hasattr(sys.stdout, "reconfigure"):
@@ -776,6 +1203,64 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError(
             f"Require max(n-list) <= n-ref for nested subsets; got max(n_list)={max(ns)} n_ref={args.n_ref}."
         )
+
+    if bool(getattr(args, "visualization_only", False)):
+        cached = _load_cached_convergence_results(args.output_dir)
+        _validate_cached_matches_cli(args, cached, ns)
+        if int(cached["meta_seed"]) != 0 and int(meta["seed"]) != int(cached["meta_seed"]):
+            raise ValueError(
+                f"Dataset NPZ meta seed={meta['seed']} does not match cached results dataset_meta_seed={cached['meta_seed']}. "
+                "Use the same --dataset-npz as the run that produced the cached results."
+            )
+        ref_dir_v = os.path.join(args.output_dir, "reference")
+        n_bins_v = int(args.num_theta_bins)
+        per_n_loss_rows_viz: list[dict[str, str]] = []
+        for n in ns:
+            loss_npz = os.path.join(args.output_dir, "training_losses", f"n_{int(n):06d}.npz")
+            if not os.path.isfile(loss_npz):
+                raise FileNotFoundError(
+                    f"Visualization-only mode requires per-n training loss NPZ (for loss panel):\n  {loss_npz}\n"
+                    "Run a full study first so training_losses/n_*.npz exists, or copy artifacts from a prior run."
+                )
+            loss_abs = os.path.abspath(loss_npz)
+            per_n_loss_rows_viz.append(
+                {
+                    "n": str(n),
+                    "status": "cached",
+                    "run_dir": "",
+                    "src": loss_abs,
+                    "dst": loss_abs,
+                    "note": "visualization-only (no re-training)",
+                }
+            )
+        print(
+            "[convergence] --visualization-only: skipping GT MC, reference sweep, and per-n training; "
+            "regenerating figures from cached NPZ.",
+            flush=True,
+        )
+        _render_convergence_figures_and_summary(
+            args=args,
+            meta=meta,
+            perm_seed=int(cached["perm_seed"]),
+            n_pool=n_pool,
+            ref_dir=ref_dir_v,
+            ns=ns,
+            n_bins=n_bins_v,
+            theta_centers=cached["centers"],
+            gt_n_mc=int(cached["gt_n_mc"]),
+            gt_seed=int(cached["gt_seed"]),
+            gt_symmetrize_effective=bool(cached["gt_symmetrize"]),
+            corr_h=cached["corr_h"],
+            corr_clf=cached["corr_clf"],
+            wall_s=cached["wall_s"],
+            h_cols=cached["h_cols"],
+            clf_cols=cached["clf_cols"],
+            out_npz=cached["out_npz"],
+            per_n_loss_rows=per_n_loss_rows_viz,
+            err_msg=[],
+            visualization_only=True,
+        )
+        return
 
     n_bins = int(args.num_theta_bins)
     base_seed = int(args.run_seed) if args.run_seed is not None else int(meta["seed"])
@@ -1014,144 +1499,28 @@ def main(argv: list[str] | None = None) -> None:
         column_n=column_n,
     )
 
-    csv_path = os.path.join(args.output_dir, "h_decoding_convergence_results.csv")
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(
-            [
-                "n",
-                "corr_h_binned_vs_gt_mc",
-                "corr_clf_vs_ref",
-                "wall_seconds",
-            ]
-        )
-        for i, n in enumerate(ns):
-            w.writerow([n, corr_h[i], corr_clf[i], wall_s[i]])
-
-    fig_path = os.path.join(args.output_dir, "h_decoding_convergence.png")
-    fig, ax = plt.subplots(1, 1, figsize=(9.0, 4.8))
-    ax.plot(
-        ns,
-        corr_h,
-        color="#1f77b4",
-        linewidth=1.8,
-        marker="o",
-        markersize=6,
-        label=r"Binned $\sqrt{H^{\mathrm{sym}}}$ vs GT $\sqrt{H^2}$ (MC likelihood)",
-    )
-    ax.plot(
-        ns,
-        corr_clf,
-        color="#d62728",
-        linewidth=1.8,
-        marker="s",
-        markersize=5,
-        label="Pairwise decoding vs n_ref decoding",
-    )
-    ax.set_xlabel("dataset size n (nested subset)")
-    ax.set_ylabel("corr (off-diag)")
-    ax.set_title(
-        "Convergence: sqrt(H) vs generative sqrt(H^2); decoding vs n_ref=%d"
-        % int(args.n_ref)
-    )
-    ax.set_xticks(ns)
-    ax.legend(loc="best", fontsize=9)
-    ax.grid(True, alpha=0.35)
-    fig.tight_layout()
-    conv_svg = _save_figure_png_svg(fig, fig_path, dpi=160)
-    plt.close(fig)
-
-    matrix_panel_path = os.path.join(args.output_dir, "h_decoding_matrices_panel.png")
-    col_labels = [f"n={n}" for n in ns] + [f"n_ref={int(args.n_ref)} (GT MC sqrt(H^2))"]
-    _render_matrix_panel(
-        h_mats=list(h_cols),
-        clf_mats=list(clf_cols),
-        col_labels=col_labels,
-        out_path=matrix_panel_path,
+    _render_convergence_figures_and_summary(
+        args=args,
+        meta=meta,
+        perm_seed=int(perm_seed),
+        n_pool=n_pool,
+        ref_dir=ref_dir,
+        ns=ns,
         n_bins=n_bins,
+        theta_centers=centers,
+        gt_n_mc=int(gt_n_mc),
+        gt_seed=int(gt_seed),
+        gt_symmetrize_effective=bool(args.gt_hellinger_symmetrize),
+        corr_h=corr_h,
+        corr_clf=corr_clf,
+        wall_s=wall_s,
+        h_cols=h_cols,
+        clf_cols=clf_cols,
+        out_npz=out_npz,
+        per_n_loss_rows=per_n_loss_rows,
+        err_msg=err_msg,
+        visualization_only=False,
     )
-
-    combined_path = os.path.join(args.output_dir, "h_decoding_convergence_combined.png")
-    combined_svg = _save_combined_convergence_figure(fig_path, matrix_panel_path, combined_path, dpi=160)
-
-    manifest_path = os.path.join(loss_dir, "manifest.txt")
-    with open(manifest_path, "w", encoding="utf-8") as mf:
-        mf.write("# n\tstatus\trun_dir\tsrc_loss_npz\tdst_loss_npz\tnote\n")
-        for row in per_n_loss_rows:
-            mf.write(
-                "{n}\t{status}\t{run_dir}\t{src}\t{dst}\t{note}\n".format(
-                    n=row["n"],
-                    status=row["status"],
-                    run_dir=row["run_dir"],
-                    src=row["src"],
-                    dst=row["dst"],
-                    note=row["note"],
-                )
-            )
-
-    loss_panel_png = os.path.join(args.output_dir, "h_decoding_training_losses_panel.png")
-    loss_panel_svg = _render_training_losses_panel(
-        ns=list(ns),
-        loss_dir=loss_dir,
-        out_png_path=loss_panel_png,
-        dpi=160,
-    )
-
-    summary_path = os.path.join(args.output_dir, "h_decoding_convergence_summary.txt")
-    paths_out = {
-        "results_npz": out_npz,
-        "results_csv": csv_path,
-        "figure": fig_path,
-        "figure_svg": conv_svg,
-        "matrix_panel": matrix_panel_path,
-        "matrix_panel_svg": str(Path(matrix_panel_path).with_suffix(".svg")),
-        "combined_figure": combined_path,
-        "combined_figure_svg": combined_svg,
-        "training_losses_panel": loss_panel_png,
-        "training_losses_panel_svg": loss_panel_svg,
-        "reference_npz": os.path.join(args.output_dir, "h_decoding_convergence_reference.npz"),
-        "training_losses_dir": loss_dir,
-        "training_losses_manifest": manifest_path,
-    }
-    if err_msg:
-        paths_out["errors"] = "; ".join(err_msg[:20])
-    _write_summary(summary_path, args, meta, perm_seed, n_pool, ref_dir, paths_out, per_n_loss_rows)
-    with open(summary_path, "a", encoding="utf-8") as sf:
-        sf.write("\n# Correlation targets\n")
-        sf.write(
-            "# corr_h_binned_vs_gt_mc: binned sqrt(H_sym) vs sqrt(generative GT H^2) (MC one-sided Hellinger).\n"
-        )
-        sf.write(
-            "# corr_clf_vs_ref: pairwise decoding vs n_ref subset decoding matrix (same bin edges).\n"
-        )
-        sf.write(
-            "# h_binned_columns last column: MC GT sqrt(H^2) (not DSM/flow); hellinger_gt_sq_mc key stores sqrt(H^2).\n"
-        )
-        sf.write(
-            f"gt_hellinger_n_mc: {int(gt_n_mc)}  # MC samples per bin row; floor(n_ref / num_theta_bins)\n"
-        )
-        sf.write(
-            f"gt_hellinger_n_ref_budget: {int(args.n_ref)}  # reference training subset size (--n-ref)\n"
-        )
-        sf.write(
-            f"gt_hellinger_n_bins_times_n_mc: {int(n_bins * gt_n_mc)}  # n_bins * n_mc (may be < n_ref)\n"
-        )
-        sf.write(f"gt_hellinger_seed: {int(gt_seed)}\n")
-        sf.write(f"gt_hellinger_symmetrize: {bool(args.gt_hellinger_symmetrize)}\n")
-
-    print("[convergence] Saved:")
-    print(f"  - {out_npz}")
-    print(f"  - {csv_path}")
-    print(f"  - {fig_path}")
-    print(f"  - {conv_svg}")
-    print(f"  - {matrix_panel_path}")
-    print(f"  - {paths_out['matrix_panel_svg']}")
-    print(f"  - {combined_path}")
-    print(f"  - {combined_svg}")
-    print(f"  - {loss_panel_png}")
-    print(f"  - {loss_panel_svg}")
-    print(f"  - {loss_dir}/ (per-n training loss .npz + manifest.txt)")
-    print(f"  - {summary_path}")
 
 
 if __name__ == "__main__":
