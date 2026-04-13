@@ -14,6 +14,11 @@ from global_setting import DATA_DIR
 
 
 def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
+    """Public dataset CLI: only `--dataset-family` plus generic sampling/shape controls.
+
+    Tuning-curve shape, noise covariance details, randamp bounds, GMM/piecewise hyperparameters, etc.
+    are fixed per family in ``fisher.dataset_family_recipes`` (not user-configurable).
+    """
     p.add_argument(
         "--seed",
         type=int,
@@ -23,118 +28,25 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--dataset-family",
         type=str,
-        default="gaussian",
+        default="cosine_gaussian",
         choices=[
-            "gaussian",
-            "gaussian_sqrtd",
-            "gaussian_randamp",
-            "gaussian_randamp_sqrtd",
-            "gmm_non_gauss",
-            "cos_sin_piecewise_noise",
-            "linear_piecewise_noise",
+            "cosine_gaussian",
+            "cosine_gaussian_sqrtd",
+            "randamp_gaussian",
+            "randamp_gaussian_sqrtd",
+            "cosine_gmm",
+            "cos_sin_piecewise",
+            "linear_piecewise",
         ],
         help=(
-            "Generative family: 'gaussian' (theta-modulated Gaussian obs. noise); "
-            "'gaussian_sqrtd' (same as gaussian but obs. noise std scales by sqrt(x_dim)); "
-            "'gaussian_randamp' (Gaussian bumps with per-dim random amplitudes, see --randamp-*); "
-            "'gaussian_randamp_sqrtd' (same as gaussian_randamp but obs. noise std scales by sqrt(x_dim)); "
-            "'gmm_non_gauss' (theta-dependent 2-component mixture); "
-            "'cos_sin_piecewise_noise' (piecewise obs. std vs theta sign) / "
-            "'linear_piecewise_noise' (linear or sigmoid obs. std vs theta)."
-        ),
-    )
-    p.add_argument(
-        "--tuning-curve-family",
-        type=str,
-        default="cosine",
-        choices=["cosine", "von_mises_raw", "gaussian_raw"],
-        help=(
-            "Mean tuning curve: cosine (default); raw Von Mises A*exp(kappa*cos(omega*theta-phi_j)); "
-            "or Gaussian bump A*exp(-kappa*(omega*theta-phi_j)^2) (gaussian_raw)."
-        ),
-    )
-    p.add_argument(
-        "--vm-mu-amp",
-        type=float,
-        default=1.0,
-        help=(
-            "von_mises_raw only: amplitude A in A*exp(kappa*cos(omega*(theta-theta_j))). "
-            "Centers theta_j are uniform on [theta-low, theta-high]. Ignored for cosine / gaussian_raw."
-        ),
-    )
-    p.add_argument(
-        "--vm-kappa",
-        type=float,
-        default=1.0,
-        help="von_mises_raw only: concentration kappa >= 0 in exp(kappa*cos(...)). Ignored for cosine / gaussian_raw.",
-    )
-    p.add_argument(
-        "--vm-omega",
-        type=float,
-        default=1.0,
-        help=(
-            "von_mises_raw only: scales (theta-theta_j) in the Von Mises phase; theta_j uniform on [theta-low, theta-high]. "
-            "Ignored for cosine / gaussian_raw."
-        ),
-    )
-    p.add_argument(
-        "--gauss-mu-amp",
-        type=float,
-        default=1.0,
-        help=(
-            "gaussian_raw only: amplitude A in A*exp(-kappa*(omega*(theta-theta_j))^2). "
-            "Centers theta_j uniform on [theta-low, theta-high]. Ignored for cosine / von_mises_raw."
-        ),
-    )
-    p.add_argument(
-        "--gauss-kappa",
-        type=float,
-        default=0.2,
-        help=(
-            "gaussian_raw only: non-negative precision kappa in exp(-kappa*(omega*(theta-theta_j))^2) "
-            "(larger = narrower bump). Ignored for cosine / von_mises_raw."
-        ),
-    )
-    p.add_argument(
-        "--gauss-omega",
-        type=float,
-        default=1.0,
-        help=(
-            "gaussian_raw only: scales (theta-theta_j) in the Gaussian bump; theta_j uniform on [theta-low, theta-high]. "
-            "Ignored for cosine / von_mises_raw."
-        ),
-    )
-    p.add_argument(
-        "--randamp-mu-low",
-        type=float,
-        default=0.5,
-        help=(
-            "gaussian_randamp only: lower bound for per-dimension bump amplitude a_j "
-            "(uniform on [randamp-mu-low, randamp-mu-high]). Ignored for other families."
-        ),
-    )
-    p.add_argument(
-        "--randamp-mu-high",
-        type=float,
-        default=1.5,
-        help="gaussian_randamp only: upper bound for amplitude a_j (see --randamp-mu-low). Ignored for other families.",
-    )
-    p.add_argument(
-        "--randamp-kappa",
-        type=float,
-        default=0.2,
-        help=(
-            "gaussian_randamp only: non-negative precision kappa in "
-            "a_j*exp(-kappa*(omega*(theta-theta_j))^2). Ignored for other families."
-        ),
-    )
-    p.add_argument(
-        "--randamp-omega",
-        type=float,
-        default=1.0,
-        help=(
-            "gaussian_randamp only: scales (theta-theta_j) in the Gaussian bump. "
-            "Ignored for other families."
+            "Generative family (selects fixed tuning + noise internally). Options: "
+            "'cosine_gaussian' (theta-modulated Gaussian obs. noise, cosine means); "
+            "'cosine_gaussian_sqrtd' (same means; obs. noise std scales by sqrt(x_dim)); "
+            "'randamp_gaussian' (random-amplitude Gaussian bumps + Gaussian obs. noise); "
+            "'randamp_gaussian_sqrtd' (same as randamp_gaussian with sqrt(x_dim) noise scaling); "
+            "'cosine_gmm' (theta-dependent 2-component mixture); "
+            "'cos_sin_piecewise' (cos/sin means + piecewise obs. std vs theta sign); "
+            "'linear_piecewise' (linear means + piecewise obs. std vs theta)."
         ),
     )
     p.add_argument(
@@ -150,196 +62,6 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
         help="Upper bound of theta (see --theta-low).",
     )
     p.add_argument("--x-dim", type=int, default=2, help="Observation dimension (length of x).")
-    p.add_argument(
-        "--sigma-x1",
-        type=float,
-        default=None,
-        help=(
-            "Baseline std of observation noise along axis 1 (Gaussian / GMM branches). "
-            "Default: 0.30 for gaussian / gmm_non_gauss / gaussian_randamp; 0.10 for gaussian_sqrtd; "
-            "0.20 for gaussian_randamp_sqrtd (omit to use the family default)."
-        ),
-    )
-    p.add_argument(
-        "--sigma-x2",
-        type=float,
-        default=None,
-        help=(
-            "Baseline std along axis 2 (default: same as --sigma-x1 when omitted). "
-            "See --sigma-x1 for family-dependent defaults."
-        ),
-    )
-    p.add_argument(
-        "--rho",
-        type=float,
-        default=0.15,
-        help="Base correlation between noise components before theta-dependent modulation (clipped by --rho-clip).",
-    )
-    p.add_argument(
-        "--cov-theta-amp1",
-        type=float,
-        default=0.35,
-        help=(
-            "Gaussian family: with --cov-theta-amp2, sets shared mean–activity coupling "
-            "alpha = (amp1+amp2)/2 in Var_j = sigma_base_j^2 * (1 + alpha*|mu_j|) (same alpha every dim)."
-        ),
-    )
-    p.add_argument(
-        "--cov-theta-amp2",
-        type=float,
-        default=0.30,
-        help="Gaussian family: paired with --cov-theta-amp1 for alpha = (amp1+amp2)/2 (see --cov-theta-amp1).",
-    )
-    p.add_argument(
-        "--cov-theta-amp-rho",
-        type=float,
-        default=0.30,
-        help="Gaussian family: amplitude of theta-driven variation for correlation term.",
-    )
-    p.add_argument(
-        "--cov-theta-freq1",
-        type=float,
-        default=0.90,
-        help="Gaussian family: angular frequency for theta modulation of variance 1.",
-    )
-    p.add_argument(
-        "--cov-theta-freq2",
-        type=float,
-        default=0.75,
-        help="Gaussian family: angular frequency for theta modulation of variance 2.",
-    )
-    p.add_argument(
-        "--cov-theta-freq-rho",
-        type=float,
-        default=1.10,
-        help="Gaussian family: angular frequency for theta modulation of correlation.",
-    )
-    p.add_argument(
-        "--cov-theta-phase1",
-        type=float,
-        default=0.20,
-        help="Gaussian family: phase offset for variance 1 modulation.",
-    )
-    p.add_argument(
-        "--cov-theta-phase2",
-        type=float,
-        default=-0.35,
-        help="Gaussian family: phase offset for variance 2 modulation.",
-    )
-    p.add_argument(
-        "--cov-theta-phase-rho",
-        type=float,
-        default=0.40,
-        help="Gaussian family: phase offset for correlation modulation.",
-    )
-    p.add_argument(
-        "--rho-clip",
-        type=float,
-        default=0.85,
-        help="Clamp |rho(theta)| at this value after theta-dependent terms (Gaussian and GMM).",
-    )
-    p.add_argument(
-        "--gmm-sep-scale",
-        type=float,
-        default=1.10,
-        help="GMM: scale of theta-dependent separation between mixture component means.",
-    )
-    p.add_argument(
-        "--gmm-sep-freq",
-        type=float,
-        default=0.85,
-        help="GMM: angular frequency for separation-vs-theta.",
-    )
-    p.add_argument(
-        "--gmm-sep-phase",
-        type=float,
-        default=0.35,
-        help="GMM: phase for separation-vs-theta.",
-    )
-    p.add_argument(
-        "--gmm-mix-logit-scale",
-        type=float,
-        default=1.40,
-        help="GMM: scale of theta-dependent mixture logit modulation.",
-    )
-    p.add_argument(
-        "--gmm-mix-bias",
-        type=float,
-        default=0.00,
-        help="GMM: bias term in mixture logit.",
-    )
-    p.add_argument(
-        "--gmm-mix-freq",
-        type=float,
-        default=0.95,
-        help="GMM: angular frequency for mixture logit-vs-theta.",
-    )
-    p.add_argument(
-        "--gmm-mix-phase",
-        type=float,
-        default=-0.20,
-        help="GMM: phase for mixture logit-vs-theta.",
-    )
-    p.add_argument(
-        "--sigma-piecewise-low",
-        type=float,
-        default=0.1,
-        help="Piecewise scalar std for cos_sin/linear piecewise_noise when theta is on the low-noise side.",
-    )
-    p.add_argument(
-        "--sigma-piecewise-high",
-        type=float,
-        default=0.1,
-        help="Piecewise scalar std for cos_sin/linear piecewise_noise when theta is on the high-noise side.",
-    )
-    p.add_argument(
-        "--linear-k",
-        type=float,
-        default=1.0,
-        help="For linear_piecewise_noise: first component mean is linear_k * theta (second is theta).",
-    )
-    p.add_argument(
-        "--linear-sigma-schedule",
-        type=str,
-        default="linear",
-        choices=["linear", "sigmoid"],
-        help=(
-            "For linear_piecewise_noise: how observation std varies with theta. "
-            "'linear': linear from --sigma-piecewise-low at --theta-low to --sigma-piecewise-high at "
-            "--theta-high (flip with --no-theta-zero-to-low). "
-            "'sigmoid': smooth transition centered at --linear-sigma-sigmoid-center."
-        ),
-    )
-    p.add_argument(
-        "--linear-sigma-sigmoid-center",
-        type=float,
-        default=0.0,
-        help=(
-            "For linear_piecewise_noise with --linear-sigma-schedule sigmoid: center theta where "
-            "observation noise is halfway between --sigma-piecewise-low and --sigma-piecewise-high."
-        ),
-    )
-    p.add_argument(
-        "--linear-sigma-sigmoid-steepness",
-        type=float,
-        default=2.0,
-        help=(
-            "For linear_piecewise_noise with --linear-sigma-schedule sigmoid: positive steepness "
-            "in noise vs theta (larger = sharper transition near the center)."
-        ),
-    )
-    p.add_argument(
-        "--theta-zero-to-low",
-        action="store_true",
-        default=True,
-        help="For cos_sin/linear piecewise_noise: include theta=0 in the low-noise side (theta<=0 low, theta>0 high).",
-    )
-    p.add_argument(
-        "--no-theta-zero-to-low",
-        action="store_false",
-        dest="theta_zero_to_low",
-        help="For cos_sin/linear piecewise_noise: put theta=0 in the high-noise side (theta<0 low, theta>=0 high).",
-    )
     p.add_argument(
         "--n-total",
         "--num-samples",

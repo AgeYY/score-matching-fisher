@@ -13,7 +13,7 @@ Nested subset training for each ``n`` in ``--n-list`` uses up to ``n`` samples; 
 **Pairwise decoding:** off-diagonal Spearman correlation vs the decoding matrix from the ``--n-ref``
 subset (same bin edges as GT), unchanged.
 
-**Dataset:** the loaded NPZ must match ``--dataset-family`` (default ``gaussian_randamp_sqrtd``:
+**Dataset:** the loaded NPZ must match ``--dataset-family`` (default ``randamp_gaussian_sqrtd``:
 random-amplitude Gaussian bumps plus ``sqrt(x_dim)`` observation-noise scaling; see ``make_dataset.py``).
 Regenerate the NPZ if the family does not match.
 
@@ -107,19 +107,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--dataset-family",
         type=str,
-        default="gaussian_randamp_sqrtd",
+        default="randamp_gaussian_sqrtd",
         choices=[
-            "gaussian",
-            "gaussian_sqrtd",
-            "gaussian_randamp",
-            "gaussian_randamp_sqrtd",
-            "gmm_non_gauss",
-            "cos_sin_piecewise_noise",
-            "linear_piecewise_noise",
+            "cosine_gaussian",
+            "cosine_gaussian_sqrtd",
+            "randamp_gaussian",
+            "randamp_gaussian_sqrtd",
+            "cosine_gmm",
+            "cos_sin_piecewise",
+            "linear_piecewise",
         ],
         help=(
             "Expected generative family stored in the NPZ meta; must match make_dataset.py "
-            "when the archive was created. Default: gaussian_randamp_sqrtd (random-amplitude "
+            "when the archive was created. Default: randamp_gaussian_sqrtd (random-amplitude "
             "Gaussian bumps + sqrt(x_dim) observation-noise scaling)."
         ),
     )

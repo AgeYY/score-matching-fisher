@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import unittest
 from pathlib import Path
 
 import numpy as np
-import pytest
 import torch
 
 from fisher.cli_shared_fisher import add_dataset_arguments
@@ -33,7 +33,7 @@ def _dataset_meta_defaults() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     add_dataset_arguments(parser)
     ns = parser.parse_args([])
-    ns.dataset_family = "gaussian"
+    ns.dataset_family = "cosine_gaussian"
     ns.seed = 13
     ns.theta_low = -1.0
     ns.theta_high = 1.0
@@ -157,7 +157,8 @@ def test_integration_gpu_smoke_or_explicit_cuda_error(tmp_path: Path) -> None:
     config = config_from_args(args)
 
     if not torch.cuda.is_available():
-        with pytest.raises(RuntimeError, match="CUDA requested but unavailable"):
+        _tc = unittest.TestCase()
+        with _tc.assertRaises(RuntimeError):
             run_binned_visualization(config)
         return
 

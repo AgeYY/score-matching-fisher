@@ -37,8 +37,7 @@ class TestStudyHDecodingConvergenceVizOnly(unittest.TestCase):
         seed = 7
 
         ns_ds = _ns(
-            dataset_family="gaussian_sqrtd",
-            tuning_curve_family="cosine",
+            dataset_family="cosine_gaussian_sqrtd",
             x_dim=4,
             n_total=n_total,
             train_frac=1.0,
@@ -120,7 +119,7 @@ class TestStudyHDecodingConvergenceVizOnly(unittest.TestCase):
                 "--dataset-npz",
                 str(ds_path),
                 "--dataset-family",
-                "gaussian_sqrtd",
+                "cosine_gaussian_sqrtd",
                 "--n-ref",
                 str(n_ref),
                 "--n-list",

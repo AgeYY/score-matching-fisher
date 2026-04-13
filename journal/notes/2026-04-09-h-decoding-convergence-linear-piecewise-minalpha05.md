@@ -6,7 +6,7 @@ This note documents the **H-matrix decoding convergence** pipeline on a **linear
 
 ## 1. Data: linear piecewise noise
 
-- **Family:** `linear_piecewise_noise` (`bin/make_dataset.py`).
+- **Family:** `linear_piecewise` (`bin/make_dataset.py`).
 - **Observation noise:** scalar std $\sigma(\theta)$ per axis, linear in $\theta$ from `**--sigma-piecewise-low 0.1`** at `**--theta-low**` to `**--sigma-piecewise-high 2.0**` at `**--theta-high**` (defaults; endpoints are the **dataset** observation noise, unrelated to DSM score-matching $\sigma$).
 - **Means:** first component mean $\propto \theta$ (`--linear-k 1.0`), second component tracks $\theta$ as in the toy `ToyLinearPiecewiseNoiseDataset` implementation.
 - **Size / split:** `--n-total 6000`, `--train-frac 1.0` (all samples in train for this NPZ; the convergence script re-splits subsets internally).
@@ -33,7 +33,7 @@ The process tried to write to a nonexistent pipe.
 
 ```bash
 mamba run -n geo_diffusion python bin/make_dataset.py \
-  --dataset-family linear_piecewise_noise \
+  --dataset-family linear_piecewise \
   --n-total 6000 \
   --output-npz /path/to/linear_piecewise_h_decoding_n6000/shared_fisher_dataset.npz
 ```

@@ -1,4 +1,4 @@
-# DSM vs flow ($\theta$-field): H-decoding convergence in 2D vs 50D (`gaussian_randamp_sqrtd`)
+# DSM vs flow ($\theta$-field): H-decoding convergence in 2D vs 50D (`randamp_gaussian_sqrtd`)
 
 ## Question / context
 
@@ -8,7 +8,7 @@ We ask how this comparison behaves in **low dimension (2D)** vs **higher dimensi
 
 ## Method (short)
 
-- **Dataset family:** `gaussian_randamp_sqrtd` (NPZ from `bin/make_dataset.py`).
+- **Dataset family:** `randamp_gaussian_sqrtd` (NPZ from `bin/make_dataset.py`).
 - **Convergence script:** `bin/study_h_decoding_convergence.py` with `--theta-field-method dsm` or `flow`, `--n-ref 5000`, default `--n-list 80,160,240,320,400`.
 - **Left panel of the combined figure:** curves are **corr (off-diagonal)** of **binned learned $H$** vs **MC GT $H^2$** (not DSM/flow for the GT).
 - **Matrix panel:** top row uses **learned** binned $H$ for each $n$; the **last column (`n_ref`)** shows **MC GT** on the top row (no $n_\mathrm{ref}$ model run), pairwise decoding on the bottom row.
@@ -24,13 +24,13 @@ mamba run -n geo_diffusion python bin/study_h_decoding_convergence.py ... --devi
 **50D NPZ** (same file for both methods in this note):
 
 ```bash
-/data/zeyuan/score-matching-fisher/randamp_sqrtd_figs/xdim50_sigma020/shared_fisher_dataset_gaussian_randamp_sqrtd_n5000.npz
+/data/zeyuan/score-matching-fisher/randamp_sqrtd_figs/xdim50_sigma020/shared_fisher_dataset_randamp_gaussian_sqrtd_n5000.npz
 ```
 
 **2D NPZ:**
 
 ```bash
-/data/zeyuan/score-matching-fisher/shared_fisher_dataset_gaussian_randamp_sqrtd_xdim2_n5000.npz
+/data/zeyuan/score-matching-fisher/shared_fisher_dataset_randamp_gaussian_sqrtd_xdim2_n5000.npz
 ```
 
 **Runs executed for this note (2026-04-11, fresh outputs):**
@@ -40,29 +40,29 @@ cd /grad/zeyuan/score-matching-fisher
 
 # 50D DSM
 mamba run -n geo_diffusion python bin/study_h_decoding_convergence.py \
-  --dataset-npz /data/zeyuan/score-matching-fisher/randamp_sqrtd_figs/xdim50_sigma020/shared_fisher_dataset_gaussian_randamp_sqrtd_n5000.npz \
-  --dataset-family gaussian_randamp_sqrtd \
+  --dataset-npz /data/zeyuan/score-matching-fisher/randamp_sqrtd_figs/xdim50_sigma020/shared_fisher_dataset_randamp_gaussian_sqrtd_n5000.npz \
+  --dataset-family randamp_gaussian_sqrtd \
   --output-dir /data/zeyuan/score-matching-fisher/h_decoding_journal_2026-04-11_randamp_sqrtd_xdim50_dsm \
   --n-ref 5000 --theta-field-method dsm --device cuda
 
 # 50D flow
 mamba run -n geo_diffusion python bin/study_h_decoding_convergence.py \
-  --dataset-npz /data/zeyuan/score-matching-fisher/randamp_sqrtd_figs/xdim50_sigma020/shared_fisher_dataset_gaussian_randamp_sqrtd_n5000.npz \
-  --dataset-family gaussian_randamp_sqrtd \
+  --dataset-npz /data/zeyuan/score-matching-fisher/randamp_sqrtd_figs/xdim50_sigma020/shared_fisher_dataset_randamp_gaussian_sqrtd_n5000.npz \
+  --dataset-family randamp_gaussian_sqrtd \
   --output-dir /data/zeyuan/score-matching-fisher/h_decoding_journal_2026-04-11_randamp_sqrtd_xdim50_flow \
   --n-ref 5000 --theta-field-method flow --device cuda
 
 # 2D DSM
 mamba run -n geo_diffusion python bin/study_h_decoding_convergence.py \
-  --dataset-npz /data/zeyuan/score-matching-fisher/shared_fisher_dataset_gaussian_randamp_sqrtd_xdim2_n5000.npz \
-  --dataset-family gaussian_randamp_sqrtd \
+  --dataset-npz /data/zeyuan/score-matching-fisher/shared_fisher_dataset_randamp_gaussian_sqrtd_xdim2_n5000.npz \
+  --dataset-family randamp_gaussian_sqrtd \
   --output-dir /data/zeyuan/score-matching-fisher/h_decoding_journal_2026-04-11_randamp_sqrtd_xdim2_dsm \
   --n-ref 5000 --theta-field-method dsm --device cuda
 
 # 2D flow
 mamba run -n geo_diffusion python bin/study_h_decoding_convergence.py \
-  --dataset-npz /data/zeyuan/score-matching-fisher/shared_fisher_dataset_gaussian_randamp_sqrtd_xdim2_n5000.npz \
-  --dataset-family gaussian_randamp_sqrtd \
+  --dataset-npz /data/zeyuan/score-matching-fisher/shared_fisher_dataset_randamp_gaussian_sqrtd_xdim2_n5000.npz \
+  --dataset-family randamp_gaussian_sqrtd \
   --output-dir /data/zeyuan/score-matching-fisher/h_decoding_journal_2026-04-11_randamp_sqrtd_xdim2_flow \
   --n-ref 5000 --theta-field-method flow --device cuda
 ```

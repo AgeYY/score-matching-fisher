@@ -34,6 +34,7 @@ from fisher.models import (
     PriorThetaFlowVelocity,
     PriorThetaFlowVelocityFiLMPerLayer,
 )
+from fisher.dataset_family_recipes import raise_if_legacy_dataset_family
 from fisher.shared_dataset_io import (
     SHARED_DATASET_META_KEYS,
     apply_sigma_defaults_for_dataset_family,
@@ -593,8 +594,9 @@ def build_dataset_from_meta(
     | ToyConditionalGMMNonGaussianDataset
 ):
     family = str(meta["dataset_family"])
+    raise_if_legacy_dataset_family(family)
     seed = int(meta["seed"])
-    if family == "gaussian":
+    if family == "cosine_gaussian":
         return ToyConditionalGaussianDataset(
             theta_low=float(meta["theta_low"]),
             theta_high=float(meta["theta_high"]),
@@ -621,7 +623,7 @@ def build_dataset_from_meta(
             rho_clip=float(meta["rho_clip"]),
             seed=seed,
         )
-    if family == "gaussian_sqrtd":
+    if family == "cosine_gaussian_sqrtd":
         return ToyConditionalGaussianSqrtdDataset(
             theta_low=float(meta["theta_low"]),
             theta_high=float(meta["theta_high"]),
@@ -648,7 +650,7 @@ def build_dataset_from_meta(
             rho_clip=float(meta["rho_clip"]),
             seed=seed,
         )
-    if family == "gaussian_randamp":
+    if family == "randamp_gaussian":
         amps_raw = meta.get("randamp_mu_amp_per_dim")
         amps: np.ndarray | None
         if amps_raw is not None:
@@ -686,7 +688,7 @@ def build_dataset_from_meta(
             randamp_mu_amp_per_dim=amps,
             seed=seed,
         )
-    if family == "gaussian_randamp_sqrtd":
+    if family == "randamp_gaussian_sqrtd":
         amps_raw = meta.get("randamp_mu_amp_per_dim")
         amps_sqrt: np.ndarray | None
         if amps_raw is not None:
@@ -724,7 +726,7 @@ def build_dataset_from_meta(
             randamp_mu_amp_per_dim=amps_sqrt,
             seed=seed,
         )
-    if family == "gmm_non_gauss":
+    if family == "cosine_gmm":
         return ToyConditionalGMMNonGaussianDataset(
             theta_low=float(meta["theta_low"]),
             theta_high=float(meta["theta_high"]),
@@ -748,7 +750,7 @@ def build_dataset_from_meta(
             mix_phase=float(meta["gmm_mix_phase"]),
             seed=seed,
         )
-    if family == "cos_sin_piecewise_noise":
+    if family == "cos_sin_piecewise":
         return ToyCosSinPiecewiseNoiseDataset(
             theta_low=float(meta["theta_low"]),
             theta_high=float(meta["theta_high"]),
@@ -758,7 +760,7 @@ def build_dataset_from_meta(
             theta_zero_to_low=bool(meta.get("theta_zero_to_low", True)),
             seed=seed,
         )
-    if family == "linear_piecewise_noise":
+    if family == "linear_piecewise":
         return ToyLinearPiecewiseNoiseDataset(
             theta_low=float(meta["theta_low"]),
             theta_high=float(meta["theta_high"]),
@@ -790,43 +792,15 @@ def build_dataset_from_args(
 
 
 def validate_dataset_sample_args(args: Any) -> None:
+    """Validate generic dataset args; per-family tuning/noise is fixed via ``apply_family_recipe_to_namespace``."""
     apply_sigma_defaults_for_dataset_family(args)
-    if getattr(args, "tuning_curve_family", "cosine") not in ("cosine", "von_mises_raw", "gaussian_raw"):
-        raise ValueError('--tuning-curve-family must be "cosine", "von_mises_raw", or "gaussian_raw".')
-    if getattr(args, "tuning_curve_family", "cosine") == "von_mises_raw":
-        if float(getattr(args, "vm_kappa", 0.0)) < 0.0:
-            raise ValueError("--vm-kappa must be non-negative for von_mises_raw.")
-        if float(getattr(args, "vm_mu_amp", 0.0)) <= 0.0:
-            raise ValueError("--vm-mu-amp must be positive for von_mises_raw.")
-    elif getattr(args, "tuning_curve_family", "cosine") == "gaussian_raw":
-        if float(getattr(args, "gauss_kappa", 0.0)) < 0.0:
-            raise ValueError("--gauss-kappa must be non-negative for gaussian_raw.")
-        if float(getattr(args, "gauss_mu_amp", 0.0)) <= 0.0:
-            raise ValueError("--gauss-mu-amp must be positive for gaussian_raw.")
-    if str(getattr(args, "dataset_family", "")) in ("gaussian_randamp", "gaussian_randamp_sqrtd"):
-        _rlo = float(getattr(args, "randamp_mu_low", 0.5))
-        _rhi = float(getattr(args, "randamp_mu_high", 1.5))
-        if not (_rlo < _rhi):
-            raise ValueError(
-                "gaussian_randamp / gaussian_randamp_sqrtd require --randamp-mu-low < --randamp-mu-high."
-            )
-        if float(getattr(args, "randamp_kappa", 0.0)) < 0.0:
-            raise ValueError("--randamp-kappa must be non-negative for gaussian_randamp families.")
     if args.x_dim < 2:
         raise ValueError("--x-dim must be >= 2.")
     if str(getattr(args, "dataset_family", "")) in (
-        "cos_sin_piecewise_noise",
-        "linear_piecewise_noise",
+        "cos_sin_piecewise",
+        "linear_piecewise",
     ) and int(args.x_dim) != 2:
-        raise ValueError("--dataset-family cos_sin_piecewise_noise / linear_piecewise_noise requires --x-dim 2.")
-    if float(getattr(args, "sigma_piecewise_low", 0.0)) <= 0.0:
-        raise ValueError("--sigma-piecewise-low must be positive.")
-    if float(getattr(args, "sigma_piecewise_high", 0.0)) <= 0.0:
-        raise ValueError("--sigma-piecewise-high must be positive.")
-    if str(getattr(args, "dataset_family", "")) == "linear_piecewise_noise":
-        if str(getattr(args, "linear_sigma_schedule", "linear")).lower() == "sigmoid":
-            if float(getattr(args, "linear_sigma_sigmoid_steepness", 0.0)) <= 0.0:
-                raise ValueError("--linear-sigma-sigmoid-steepness must be positive when --linear-sigma-schedule is sigmoid.")
+        raise ValueError("--dataset-family cos_sin_piecewise / linear_piecewise requires --x-dim 2.")
     if int(args.n_total) < 2:
         raise ValueError("--n-total must be >= 2 for train/eval split.")
     if not (0.0 < float(args.train_frac) <= 1.0):
@@ -1351,7 +1325,7 @@ def run_shared_fisher_estimation(
                 restore_original_order=bool(getattr(args, "h_restore_original_order", False)),
             )
 
-        suffix = "_non_gauss" if args.dataset_family == "gmm_non_gauss" else "_theta_cov"
+        suffix = "_non_gauss" if args.dataset_family == "cosine_gmm" else "_theta_cov"
         if h_result is not None:
             h_npz_path, h_summary_path, h_fig_path, h_delta_fig_path = _save_h_matrix_dsm_artifacts(
                 args, h_result, suffix
@@ -1803,7 +1777,7 @@ def run_shared_fisher_estimation(
         if bool(getattr(args, "skip_shared_fisher_gt_compare", False)):
             if not bool(getattr(args, "compute_h_matrix", False)):
                 raise RuntimeError("skip_shared_fisher_gt_compare requires compute_h_matrix")
-            suffix = "_non_gauss" if args.dataset_family == "gmm_non_gauss" else "_theta_cov"
+            suffix = "_non_gauss" if args.dataset_family == "cosine_gmm" else "_theta_cov"
             sigma_min_eval = float(np.min(np.asarray(sigma_values, dtype=np.float64)))
             h_sigma_eval = float(args.h_sigma_eval) if float(args.h_sigma_eval) > 0.0 else sigma_min_eval
             print(
@@ -1952,12 +1926,12 @@ def run_shared_fisher_estimation(
     )
 
     if args.dataset_family in (
-        "gaussian",
-        "gaussian_sqrtd",
-        "gaussian_randamp",
-        "gaussian_randamp_sqrtd",
-        "cos_sin_piecewise_noise",
-        "linear_piecewise_noise",
+        "cosine_gaussian",
+        "cosine_gaussian_sqrtd",
+        "randamp_gaussian",
+        "randamp_gaussian_sqrtd",
+        "cos_sin_piecewise",
+        "linear_piecewise",
     ):
         gt = analytic_fisher_curve(centers, dataset)
         gt_se = np.full_like(gt, np.nan)
@@ -2016,7 +1990,7 @@ def run_shared_fisher_estimation(
                 f"{int(decoder_valid[i])}\n"
             )
 
-    suffix = "_non_gauss" if args.dataset_family == "gmm_non_gauss" else "_theta_cov"
+    suffix = "_non_gauss" if args.dataset_family == "cosine_gmm" else "_theta_cov"
     h_npz_path = ""
     h_summary_path = ""
     h_fig_path = ""
@@ -2350,7 +2324,12 @@ def run_shared_fisher_estimation(
             f.write(f"h_matrix_heatmap: {h_fig_path}\n")
             if h_delta_fig_path:
                 f.write(f"delta_l_heatmap: {h_delta_fig_path}\n")
-        if args.dataset_family in ("gaussian", "gaussian_sqrtd", "gaussian_randamp", "gaussian_randamp_sqrtd"):
+        if args.dataset_family in (
+            "cosine_gaussian",
+            "cosine_gaussian_sqrtd",
+            "randamp_gaussian",
+            "randamp_gaussian_sqrtd",
+        ):
             _a = 0.5 * (float(args.cov_theta_amp1) + float(args.cov_theta_amp2))
             f.write(
                 "cov_theta: "
@@ -2360,16 +2339,16 @@ def run_shared_fisher_estimation(
                 f"phase1={args.cov_theta_phase1}, phase2={args.cov_theta_phase2}, phase_rho={args.cov_theta_phase_rho}, "
                 f"rho_clip={args.rho_clip}\n"
             )
-        elif args.dataset_family == "cos_sin_piecewise_noise":
+        elif args.dataset_family == "cos_sin_piecewise":
             f.write(
-                "cos_sin_piecewise_noise: "
+                "cos_sin_piecewise: "
                 f"sigma_piecewise_low={args.sigma_piecewise_low}, "
                 f"sigma_piecewise_high={args.sigma_piecewise_high}, "
                 f"theta_zero_to_low={args.theta_zero_to_low}\n"
             )
-        elif args.dataset_family == "linear_piecewise_noise":
+        elif args.dataset_family == "linear_piecewise":
             f.write(
-                "linear_piecewise_noise: "
+                "linear_piecewise: "
                 f"linear_k={args.linear_k}, "
                 f"sigma_piecewise_low={args.sigma_piecewise_low}, "
                 f"sigma_piecewise_high={args.sigma_piecewise_high}, "

@@ -13,7 +13,7 @@ The score-based method in this run uses **direct evaluation at $\sigma_{\min}$**
 
 ```bash
 mamba run -n geo_diffusion python bin/fisher_make_dataset.py \
-  --dataset-family gaussian \
+  --dataset-family cosine_gaussian \
   --x-dim 10 \
   --sigma-x1 2.40 \
   --sigma-x2 1.76 \

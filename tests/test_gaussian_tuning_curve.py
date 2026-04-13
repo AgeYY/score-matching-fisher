@@ -1,4 +1,4 @@
-"""Tests for gaussian_raw vs von_mises_raw tuning (separate --gauss-* vs --vm-* flags)."""
+"""Tests for Gaussian tuning curves (direct dataset classes) and dataset-family-only CLI."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from fisher.data import (
     ToyConditionalGaussianSqrtdDataset,
     _tuning_centers_uniform_theta,
 )
+from fisher.dataset_family_recipes import assert_no_legacy_dataset_cli_flags
 from fisher.shared_dataset_io import load_shared_dataset_npz, meta_dict_from_args, save_shared_dataset_npz
 from fisher.shared_fisher_est import build_dataset_from_args, build_dataset_from_meta, validate_dataset_sample_args
 
@@ -47,7 +48,6 @@ class TestGaussianTuningCurve(unittest.TestCase):
         ds = ToyConditionalGaussianDataset(tuning_curve_family="cosine", x_dim=2, seed=0)
         t0 = np.array([[0.0]])
         mu = ds.tuning_curve(t0)
-        # phi_j = 2*pi*j/d => [0, pi]; cos(0+0)=1, cos(0+pi)=-1
         np.testing.assert_allclose(mu[0], np.array([1.0, -1.0]), rtol=0, atol=1e-15)
 
     def test_gaussian_peak_at_uniform_centers(self) -> None:
@@ -66,122 +66,14 @@ class TestGaussianTuningCurve(unittest.TestCase):
             mu = ds.tuning_curve(t)
             self.assertAlmostEqual(float(mu[0, j]), 1.25, places=12)
 
-    def test_validate_accepts_gaussian_raw(self) -> None:
-        ns = _ns(tuning_curve_family="gaussian_raw", gauss_kappa=0.5, gauss_mu_amp=1.0)
-        validate_dataset_sample_args(ns)
-
-    def test_validate_rejects_negative_gauss_kappa(self) -> None:
-        ns = _ns(tuning_curve_family="gaussian_raw", gauss_kappa=-0.1, gauss_mu_amp=1.0)
-        with self.assertRaisesRegex(ValueError, "gauss-kappa"):
-            validate_dataset_sample_args(ns)
-
-    def test_validate_accepts_von_mises_raw(self) -> None:
-        ns = _ns(tuning_curve_family="von_mises_raw", vm_kappa=0.5, vm_mu_amp=1.0)
-        validate_dataset_sample_args(ns)
-
-    def test_build_gaussian_family_gaussian_raw_samples(self) -> None:
-        ns = _ns(
-            dataset_family="gaussian",
-            tuning_curve_family="gaussian_raw",
-            gauss_mu_amp=1.2,
-            gauss_kappa=0.3,
-            gauss_omega=0.8,
-            n_total=64,
-            train_frac=1.0,
-            seed=0,
-        )
-        validate_dataset_sample_args(ns)
-        ds = build_dataset_from_args(ns)
-        theta, x = ds.sample_joint(32)
-        self.assertEqual(theta.shape, (32, 1))
-        self.assertEqual(x.shape, (32, int(ns.x_dim)))
-        self.assertTrue(np.isfinite(x).all())
-
-    def test_build_gmm_family_gaussian_raw_samples(self) -> None:
-        ns = _ns(
-            dataset_family="gmm_non_gauss",
-            tuning_curve_family="gaussian_raw",
-            gauss_mu_amp=1.0,
-            gauss_kappa=0.5,
-            gauss_omega=1.0,
-            n_total=64,
-            train_frac=1.0,
-            seed=1,
-        )
-        validate_dataset_sample_args(ns)
-        ds = build_dataset_from_args(ns)
-        theta, x = ds.sample_joint(20)
-        self.assertEqual(theta.shape, (20, 1))
-        self.assertEqual(x.shape, (20, int(ns.x_dim)))
-        self.assertTrue(np.isfinite(x).all())
-
-    def test_gaussian_raw_ignores_vm_flags(self) -> None:
-        t0 = np.array([[0.2]])
-        ns1 = _ns(
-            dataset_family="gaussian",
-            tuning_curve_family="gaussian_raw",
-            gauss_mu_amp=1.0,
-            gauss_kappa=0.4,
-            gauss_omega=1.1,
-            vm_mu_amp=999.0,
-            vm_kappa=50.0,
-            vm_omega=-3.0,
-            seed=2,
-        )
-        ns2 = _ns(
-            dataset_family="gaussian",
-            tuning_curve_family="gaussian_raw",
-            gauss_mu_amp=1.0,
-            gauss_kappa=0.4,
-            gauss_omega=1.1,
-            vm_mu_amp=1e-6,
-            vm_kappa=0.0,
-            vm_omega=0.0,
-            seed=2,
-        )
-        d1 = build_dataset_from_args(ns1)
-        d2 = build_dataset_from_args(ns2)
-        np.testing.assert_allclose(d1.tuning_curve(t0), d2.tuning_curve(t0), rtol=0, atol=1e-15)
-        np.testing.assert_allclose(d1.tuning_curve_derivative(t0), d2.tuning_curve_derivative(t0), rtol=0, atol=1e-15)
-
-    def test_von_mises_raw_ignores_gauss_flags(self) -> None:
-        t0 = np.array([[-0.15]])
-        ns1 = _ns(
-            dataset_family="gaussian",
-            tuning_curve_family="von_mises_raw",
-            vm_mu_amp=1.0,
-            vm_kappa=0.7,
-            vm_omega=1.0,
-            gauss_mu_amp=999.0,
-            gauss_kappa=888.0,
-            gauss_omega=-2.0,
-            seed=3,
-        )
-        ns2 = _ns(
-            dataset_family="gaussian",
-            tuning_curve_family="von_mises_raw",
-            vm_mu_amp=1.0,
-            vm_kappa=0.7,
-            vm_omega=1.0,
-            gauss_mu_amp=0.01,
-            gauss_kappa=0.01,
-            gauss_omega=0.01,
-            seed=3,
-        )
-        d1 = build_dataset_from_args(ns1)
-        d2 = build_dataset_from_args(ns2)
-        np.testing.assert_allclose(d1.tuning_curve(t0), d2.tuning_curve(t0), rtol=0, atol=1e-15)
-
     def test_gaussian_raw_derivative_matches_finite_difference(self) -> None:
-        ns = _ns(
-            dataset_family="gaussian",
+        ds = ToyConditionalGaussianDataset(
             tuning_curve_family="gaussian_raw",
             gauss_mu_amp=1.0,
             gauss_kappa=0.4,
             gauss_omega=1.1,
             seed=2,
         )
-        ds = build_dataset_from_args(ns)
         t0 = np.array([[0.37]])
         h = 1e-6
         d_analytic = ds.tuning_curve_derivative(t0)
@@ -190,22 +82,20 @@ class TestGaussianTuningCurve(unittest.TestCase):
         d_fd = (mu_p - mu_m) / (2.0 * h)
         np.testing.assert_allclose(d_analytic, d_fd, rtol=1e-4, atol=1e-5)
 
-    def test_meta_roundtrip_gaussian_raw(self) -> None:
-        ns = _ns(
-            dataset_family="gaussian",
-            tuning_curve_family="gaussian_raw",
-            gauss_mu_amp=1.1,
-            gauss_kappa=0.25,
-            gauss_omega=0.9,
-            n_total=10,
-            train_frac=1.0,
-            seed=42,
-        )
-        meta = meta_dict_from_args(ns)
-        ds = build_dataset_from_meta(meta)
-        t0 = np.array([[0.1]])
-        ds2 = build_dataset_from_args(ns)
-        np.testing.assert_allclose(ds.tuning_curve(t0), ds2.tuning_curve(t0), rtol=0, atol=1e-15)
+    def test_cli_build_dataset_uses_cosine_recipe(self) -> None:
+        ns = _ns(dataset_family="cosine_gaussian", n_total=64, train_frac=1.0, seed=0, x_dim=3)
+        validate_dataset_sample_args(ns)
+        ds = build_dataset_from_args(ns)
+        self.assertEqual(ds.tuning_curve_family, "cosine")
+        theta, x = ds.sample_joint(32)
+        self.assertEqual(theta.shape, (32, 1))
+        self.assertEqual(x.shape, (32, 3))
+        self.assertTrue(np.isfinite(x).all())
+
+    def test_legacy_cli_flag_rejected(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            assert_no_legacy_dataset_cli_flags(["--tuning-curve-family", "gaussian_raw"])
+        self.assertIn("Removed CLI option", str(ctx.exception))
 
     def test_sqrtd_covariance_scales_by_sqrt_dim(self) -> None:
         d = 10
@@ -235,13 +125,11 @@ class TestGaussianTuningCurve(unittest.TestCase):
 
     def test_build_gaussian_randamp_family_samples(self) -> None:
         ns = _ns(
-            dataset_family="gaussian_randamp",
+            dataset_family="randamp_gaussian",
             x_dim=4,
             n_total=64,
             train_frac=1.0,
             seed=0,
-            randamp_kappa=0.3,
-            randamp_omega=0.8,
         )
         validate_dataset_sample_args(ns)
         ds = build_dataset_from_args(ns)
@@ -253,7 +141,7 @@ class TestGaussianTuningCurve(unittest.TestCase):
 
     def test_build_gaussian_randamp_sqrtd_family_samples(self) -> None:
         ns = _ns(
-            dataset_family="gaussian_randamp_sqrtd",
+            dataset_family="randamp_gaussian_sqrtd",
             x_dim=4,
             n_total=32,
             train_frac=1.0,
@@ -268,13 +156,11 @@ class TestGaussianTuningCurve(unittest.TestCase):
 
     def test_meta_roundtrip_gaussian_randamp(self) -> None:
         ns = _ns(
-            dataset_family="gaussian_randamp",
+            dataset_family="randamp_gaussian",
             x_dim=4,
             n_total=10,
             train_frac=1.0,
             seed=42,
-            randamp_kappa=0.25,
-            randamp_omega=0.9,
         )
         validate_dataset_sample_args(ns)
         ds0 = build_dataset_from_args(ns)
@@ -287,11 +173,8 @@ class TestGaussianTuningCurve(unittest.TestCase):
 
     def test_build_gaussian_sqrtd_family_samples(self) -> None:
         ns = _ns(
-            dataset_family="gaussian_sqrtd",
-            tuning_curve_family="gaussian_raw",
-            gauss_mu_amp=1.2,
-            gauss_kappa=0.3,
-            gauss_omega=0.8,
+            dataset_family="cosine_gaussian_sqrtd",
+            x_dim=4,
             n_total=64,
             train_frac=1.0,
             seed=0,
@@ -306,17 +189,14 @@ class TestGaussianTuningCurve(unittest.TestCase):
 
     def test_meta_roundtrip_gaussian_sqrtd(self) -> None:
         ns = _ns(
-            dataset_family="gaussian_sqrtd",
-            tuning_curve_family="gaussian_raw",
-            gauss_mu_amp=1.1,
-            gauss_kappa=0.25,
-            gauss_omega=0.9,
+            dataset_family="cosine_gaussian_sqrtd",
+            x_dim=4,
             n_total=10,
             train_frac=1.0,
             seed=42,
         )
         meta = meta_dict_from_args(ns)
-        self.assertEqual(meta["dataset_family"], "gaussian_sqrtd")
+        self.assertEqual(meta["dataset_family"], "cosine_gaussian_sqrtd")
         ds = build_dataset_from_meta(meta)
         self.assertIsInstance(ds, ToyConditionalGaussianSqrtdDataset)
         t0 = np.array([[0.1]])
@@ -325,8 +205,7 @@ class TestGaussianTuningCurve(unittest.TestCase):
 
     def test_npz_save_load_gaussian_sqrtd(self) -> None:
         ns = _ns(
-            dataset_family="gaussian_sqrtd",
-            tuning_curve_family="cosine",
+            dataset_family="cosine_gaussian_sqrtd",
             x_dim=4,
             n_total=20,
             train_frac=1.0,
@@ -352,15 +231,14 @@ class TestGaussianTuningCurve(unittest.TestCase):
                 x_eval=np.empty((0, 4), dtype=np.float64),
             )
             bundle = load_shared_dataset_npz(path)
-        self.assertEqual(bundle.meta["dataset_family"], "gaussian_sqrtd")
+        self.assertEqual(bundle.meta["dataset_family"], "cosine_gaussian_sqrtd")
         ds2 = build_dataset_from_meta(bundle.meta)
         self.assertIsInstance(ds2, ToyConditionalGaussianSqrtdDataset)
         np.testing.assert_allclose(bundle.x_all, x_all)
 
     def test_npz_save_load_gaussian_randamp(self) -> None:
         ns = _ns(
-            dataset_family="gaussian_randamp",
-            tuning_curve_family="cosine",
+            dataset_family="randamp_gaussian",
             x_dim=4,
             n_total=20,
             train_frac=1.0,
@@ -388,10 +266,18 @@ class TestGaussianTuningCurve(unittest.TestCase):
                 x_eval=np.empty((0, 4), dtype=np.float64),
             )
             bundle = load_shared_dataset_npz(path)
-        self.assertEqual(bundle.meta["dataset_family"], "gaussian_randamp")
+        self.assertEqual(bundle.meta["dataset_family"], "randamp_gaussian")
         ds2 = build_dataset_from_meta(bundle.meta)
         self.assertIsInstance(ds2, ToyConditionalGaussianRandampDataset)
         np.testing.assert_allclose(bundle.x_all, x_all)
+
+    def test_legacy_dataset_family_meta_rejected(self) -> None:
+        ns = _ns(dataset_family="cosine_gaussian", n_total=64, train_frac=1.0, seed=0, x_dim=3)
+        meta = meta_dict_from_args(ns)
+        meta["dataset_family"] = "gaussian"
+        with self.assertRaises(ValueError) as ctx:
+            build_dataset_from_meta(meta)
+        self.assertIn("cosine_gaussian", str(ctx.exception))
 
 
 if __name__ == "__main__":

@@ -258,7 +258,7 @@ class ToyConditionalGaussianRandampDataset(ToyConditionalGaussianDataset):
     Mean: ``mu_j(theta) = a_j * exp(-randamp_kappa * (randamp_omega * (theta - theta_j))^2)``.
 
     Centers ``theta_j`` are uniform on ``[theta_low, theta_high]`` (same as ``gaussian_raw``).
-    Observation noise matches the parent Gaussian diagonal covariance (not ``gaussian_sqrtd``).
+    Observation noise matches the parent Gaussian diagonal covariance (not ``cosine_gaussian_sqrtd``).
     """
 
     tuning_curve_family: str = "cosine"  # unused; tuning is overridden below

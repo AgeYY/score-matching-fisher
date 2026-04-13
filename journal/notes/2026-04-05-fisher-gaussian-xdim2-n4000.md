@@ -14,7 +14,7 @@ This note records a single full pipeline run at **$n_{\text{total}}=4000$**: sam
 
 ```bash
 mamba run -n geo_diffusion python bin/fisher_make_dataset.py \
-  --dataset-family gaussian \
+  --dataset-family cosine_gaussian \
   --x-dim 2 \
   --n-total 4000 \
   --output-npz data/fisher_gaussian_xdim2_n4000.npz

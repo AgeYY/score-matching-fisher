@@ -8,7 +8,7 @@ Colloquially people sometimes say “DSM” or “DCSM” for the **NCSM score-t
 
 **Question:** Does switching to EDM improve practical quality of the learned field, relative to NCSM, on (i) direct score prediction against an analytic benchmark and (ii) the **H-decoding convergence** study?
 
-**Short answer:** On the **synthetic conditional theta-score** benchmark, EDM is **much worse** than NCSM at comparable evaluation noise levels (especially small $\sigma_{\mathrm{eval}}$). On **50D `gaussian_randamp_sqrtd` H-decoding** with $\sigma_{\min} = 0.10 \times \mathrm{std}(\theta)$, EDM **does not show a consistent win**; it is **clearly weaker at small training budgets** ($n=80$), while at $n=400$ headline correlations can look similar. Overall, EDM does **not** look like a drop-in improvement over the NCSM baseline in these checks.
+**Short answer:** On the **synthetic conditional theta-score** benchmark, EDM is **much worse** than NCSM at comparable evaluation noise levels (especially small $\sigma_{\mathrm{eval}}$). On **50D `randamp_gaussian_sqrtd` H-decoding** with $\sigma_{\min} = 0.10 \times \mathrm{std}(\theta)$, EDM **does not show a consistent win**; it is **clearly weaker at small training budgets** ($n=80$), while at $n=400$ headline correlations can look similar. Overall, EDM does **not** look like a drop-in improvement over the NCSM baseline in these checks.
 
 ## NCSM vs EDM (definitions in this codebase)
 
@@ -62,13 +62,13 @@ mamba run -n geo_diffusion python … --device cuda
 
 ### 50D H-decoding — NCSM baseline (default objective)
 
-Dataset: `gaussian_randamp_sqrtd`, $d=50$, NPZ with 5000 pooled samples.
+Dataset: `randamp_gaussian_sqrtd`, $d=50$, NPZ with 5000 pooled samples.
 
 ```bash
 cd /grad/zeyuan/score-matching-fisher
 mamba run -n geo_diffusion python bin/study_h_decoding_convergence.py \
-  --dataset-npz /data/zeyuan/score-matching-fisher/randamp_sqrtd_figs/xdim50_sigma020/shared_fisher_dataset_gaussian_randamp_sqrtd_n5000.npz \
-  --dataset-family gaussian_randamp_sqrtd \
+  --dataset-npz /data/zeyuan/score-matching-fisher/randamp_sqrtd_figs/xdim50_sigma020/shared_fisher_dataset_randamp_gaussian_sqrtd_n5000.npz \
+  --dataset-family randamp_gaussian_sqrtd \
   --output-dir /data/zeyuan/score-matching-fisher/h_decoding_conv_randamp_sqrtd_xdim50_dsm_sigma_min10pct_20260411_151911 \
   --n-ref 5000 \
   --theta-field-method dsm \

@@ -1,8 +1,65 @@
 #!/usr/bin/env python3
 """Generate a shared (theta, x) dataset, save .npz, and write diagnostic figures (same dataset object).
 
-Dataset CLI flags (including sample count --n-total / --num-samples) are defined in
-fisher.cli_shared_fisher.add_dataset_arguments; run this script with --help for the full list.
+CLI reference (this script only)
+==================================
+Arguments come from ``fisher.cli_shared_fisher.add_dataset_arguments`` plus ``--output-npz`` below.
+Run ``python bin/make_dataset.py --help`` for argparse defaults and exact wording.
+
+**What you can set (user-facing)**
+
+- ``--dataset-family`` (required behavior choice; default ``cosine_gaussian``)
+    Selects a *fixed* generative recipe. Names follow ``{tuning_curve}_{noise_model}``. Full numerics
+    live in ``fisher.dataset_family_recipes.family_recipe_dict`` / ``apply_family_recipe_to_namespace``.
+
+    Choices (``--dataset-family`` token — summary):
+
+    - ``cosine_gaussian`` — Cosine means; theta-modulated diagonal Gaussian noise (baseline sigmas 0.30).
+    - ``cosine_gaussian_sqrtd`` — Same cosine means; noise variance scaled by ``x_dim`` (baseline
+      sigmas 0.10) so std ~ sqrt(d).
+    - ``randamp_gaussian`` — Random-amplitude Gaussian bump means (per-dim amplitudes drawn once);
+      Gaussian observation noise (baseline 0.30). Realized amplitudes in NPZ meta as
+      ``randamp_mu_amp_per_dim``.
+    - ``randamp_gaussian_sqrtd`` — Same bump tuning as ``randamp_gaussian`` with sqrt-d noise scaling
+      (baseline 0.20).
+    - ``cosine_gmm`` — Cosine-like mean branch inside a theta-dependent two-component mixture (see
+      ``ToyConditionalGMMNonGaussianDataset``).
+    - ``cos_sin_piecewise`` — Means ``(cos θ, sin θ)``; scalar observation std piecewise in ``θ``
+      (sign-based). **Requires** ``--x-dim 2``.
+    - ``linear_piecewise`` — Linear mean construction in 2D; observation std vs ``θ`` (piecewise /
+      scheduled). **Requires** ``--x-dim 2``.
+
+- ``--seed`` (default 7) — NumPy RNG seed for joint sampling and for the train/eval permutation.
+
+- ``--theta-low``, ``--theta-high`` (defaults -6.0, 6.0) — θ is uniform on ``[theta-low, theta-high]``.
+
+- ``--x-dim`` (default 2) — Observation dimension (length of ``x``). Must be ≥ 2; piecewise
+  families above must use ``x_dim == 2``.
+
+- ``--n-total`` / ``--num-samples`` (default 3000) — Number of joint ``(θ, x)`` draws before splitting.
+
+- ``--train-frac`` (default 1.0) — Fraction of indices assigned to ``train_idx``. If ``< 1``,
+  the remainder is ``eval_idx`` (held-out). Must be in ``(0, 1]``.
+
+- ``--output-npz`` — Path to the written archive (default under ``global_setting.DATA_DIR`` /
+  ``SCORE_MATCHING_FISHER_DATAROOT``). Contains ``theta_all``, ``x_all``, indices, splits, and
+  ``meta_json_utf8`` with the *resolved* recipe fields for reproducibility.
+
+**What you cannot set here**
+
+Older composition flags (e.g. ``--tuning-curve-family``, ``--sigma-x1``, ``--randamp-*``,
+``--cov-theta-*``, piecewise/GMM knobs) were removed from the public CLI. Passing them raises
+``ValueError`` from ``assert_no_legacy_dataset_cli_flags`` with remediation text.
+
+**Outputs**
+
+- NPZ at ``--output-npz``.
+- ``joint_scatter_and_tuning_curve.png`` and ``.svg`` next to that NPZ (same directory).
+
+**Implementation notes**
+
+- Before sampling, this script prints ``format_resolved_family_summary`` so the effective internal
+  recipe is visible in the log.
 """
 
 from __future__ import annotations
@@ -23,123 +80,14 @@ import numpy as np
 
 from global_setting import DATA_DIR
 from fisher.cli_shared_fisher import add_dataset_arguments
+from fisher.dataset_family_recipes import (
+    assert_no_legacy_dataset_cli_flags,
+    format_resolved_family_summary,
+)
 from fisher.dataset_visualization import plot_joint_and_tuning, summarize_dataset
 from fisher.shared_dataset_io import meta_dict_from_args, save_shared_dataset_npz
 from fisher.shared_fisher_est import build_dataset_from_args, validate_dataset_sample_args
 
-_MAKE_DATASET_PARAMETER_REFERENCE = """
-Parameter reference (all available flags in this script):
-
-  Randomness / size / split:
-    --seed
-      RNG seed used for joint sampling and train/eval permutation. Default: 7.
-    --n-total, --num-samples
-      Number of joint (theta, x) samples before split. Default: 3000.
-    --train-frac
-      Fraction assigned to training; if < 1, a held-out eval split is created. Default: 1.0.
-
-  Core domain / shape:
-    --theta-low, --theta-high
-      Uniform theta sampling range [theta-low, theta-high]. Defaults: -6.0, 6.0.
-    --x-dim
-      Observation dimension. Default: 2.
-
-  Family selection:
-    --dataset-family
-      One of:
-      gaussian
-        Conditional Gaussian x|theta with theta-modulated covariance.
-      gaussian_sqrtd
-        Same generative structure as gaussian, but observation noise std scales by sqrt(x_dim)
-        (variance scaled by x_dim) to avoid extreme SNR when dimension is large.
-      gaussian_randamp
-        Gaussian bumps (same centers as gaussian_raw) with per-dimension amplitude a_j sampled once
-        from Uniform(randamp-mu-low, randamp-mu-high); width via --randamp-kappa and --randamp-omega.
-        NPZ meta stores the sampled per-dim amplitudes. Ignores --tuning-curve-family / --gauss-*.
-      gaussian_randamp_sqrtd
-        Same as gaussian_randamp, but observation noise std scales by sqrt(x_dim) (variance times x_dim).
-      gmm_non_gauss
-        Theta-dependent two-component GMM (non-Gaussian conditional).
-      cos_sin_piecewise_noise
-        Cosine or von-Mises tuning means + piecewise noise std by theta sign.
-      linear_piecewise_noise
-        Linear tuning means + observation std vs theta (default: linear from low to high across
-        [theta-low, theta-high]; optional sigmoid schedule).
-      Default: gaussian.
-
-  Tuning-curve mean (used where applicable):
-    --tuning-curve-family
-      cosine, von_mises_raw, or gaussian_raw. Default: cosine.
-    --vm-mu-amp, --vm-kappa, --vm-omega
-      von_mises_raw only: amplitude A, concentration kappa, and omega in
-      A*exp(kappa*cos(omega*(theta-theta_j))). Centers theta_j are uniform on [theta-low, theta-high].
-      Ignored for cosine and gaussian_raw. Defaults: 1, 1, 1.
-    --gauss-mu-amp, --gauss-kappa, --gauss-omega
-      gaussian_raw only: amplitude A, precision kappa, and omega in
-      A*exp(-kappa*(omega*(theta-theta_j))^2). Centers theta_j uniform on [theta-low, theta-high].
-      Ignored for cosine and von_mises_raw.
-      Defaults: 1, 0.2, 1.
-      Not used for --dataset-family linear_piecewise_noise (fixed linear tuning) or
-      cos_sin_piecewise_noise.
-
-  Random-amplitude Gaussian bumps (gaussian_randamp only):
-    --randamp-mu-low, --randamp-mu-high
-      Bounds for per-dimension amplitude a_j (uniform). Defaults: 0.5, 1.5.
-    --randamp-kappa, --randamp-omega
-      Precision and scale in a_j*exp(-kappa*(omega*(theta-theta_j))^2). Defaults: 0.2, 1.0.
-
-  Baseline covariance/noise (Gaussian and GMM families):
-    --sigma-x1, --sigma-x2
-      Baseline per-axis observation std. Defaults: 0.30 for gaussian / gmm_non_gauss / gaussian_randamp;
-      0.10 for gaussian_sqrtd; 0.20 for gaussian_randamp_sqrtd (omit both to use the family default).
-    --rho
-      Baseline correlation before theta modulation. Default: 0.15.
-    --rho-clip
-      Clamp on |rho(theta)| after modulation for numerical stability. Default: 0.85.
-
-  Theta-modulated covariance (gaussian / gaussian_sqrtd / gaussian_randamp / gaussian_randamp_sqrtd families):
-    --cov-theta-amp1, --cov-theta-amp2, --cov-theta-amp-rho
-      Mean–activity coupling uses alpha = (amp1+amp2)/2 (same for every dimension) in
-      Var_j = sigma_base_j^2 * (1 + alpha*|mu_j|). amp_rho is reserved for correlation (not used in
-      current diagonal Gaussian sampling). Defaults: 0.35, 0.30, 0.30.
-    --cov-theta-freq1, --cov-theta-freq2, --cov-theta-freq-rho
-      Modulation angular frequencies. Defaults: 0.90, 0.75, 1.10.
-    --cov-theta-phase1, --cov-theta-phase2, --cov-theta-phase-rho
-      Modulation phase offsets. Defaults: 0.20, -0.35, 0.40.
-
-  Mixture controls (gmm_non_gauss family):
-    --gmm-sep-scale, --gmm-sep-freq, --gmm-sep-phase
-      Theta-dependent component-mean separation controls.
-      Defaults: 1.10, 0.85, 0.35.
-    --gmm-mix-logit-scale, --gmm-mix-bias, --gmm-mix-freq, --gmm-mix-phase
-      Theta-dependent mixture weight/logit controls.
-      Defaults: 1.40, 0.00, 0.95, -0.20.
-
-  Piecewise noise controls (cos_sin_piecewise_noise / linear_piecewise_noise):
-    --sigma-piecewise-low, --sigma-piecewise-high
-      Endpoints for observation std (cos_sin: low/high sides of theta=0; linear: std at theta-low
-      and theta-high when using --linear-sigma-schedule linear, or sigmoid endpoints when sigmoid).
-      Defaults: 0.1, 0.1.
-    --theta-zero-to-low / --no-theta-zero-to-low
-      cos_sin: whether theta=0 is on the low-noise side. linear: if False, flip which end of the
-      theta range gets low vs high noise. Default: --theta-zero-to-low (True).
-    --linear-k
-      Linear slope parameter for linear_piecewise_noise mean construction. Default: 1.0.
-    --linear-sigma-schedule
-      linear_piecewise_noise: linear or sigmoid std vs theta. Default: linear.
-    --linear-sigma-sigmoid-center, --linear-sigma-sigmoid-steepness
-      linear_piecewise_noise with --linear-sigma-schedule sigmoid: center and steepness.
-      Defaults: 0.0, 2.0.
-
-  Output:
-    --output-npz
-      Output archive path containing all/eval/train arrays and meta.
-      Default: DATA_DIR/shared_fisher_dataset.npz (resolved from global_setting.DATA_DIR).
-
-Notes:
-  - Flags that are not relevant to the selected --dataset-family are accepted but ignored.
-  - Saved meta stores the effective flag values for reproducibility.
-"""
 
 def parse_make_dataset_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -147,7 +95,7 @@ def parse_make_dataset_args(argv: list[str] | None = None) -> argparse.Namespace
             "Sample a synthetic conditional dataset (theta, x), save a shared .npz for Fisher/score "
             "pipelines, and emit joint scatter + tuning-curve figures. "
             "Set the number of samples with --n-total / --num-samples. "
-            "All sampling hyperparameters are recorded in the NPZ meta. "
+            "Choose the generative model with --dataset-family only; tuning and noise are fixed internally. "
             "Run with --help to view per-argument defaults."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -166,9 +114,14 @@ def parse_make_dataset_args(argv: list[str] | None = None) -> argparse.Namespace
 
 
 def main() -> None:
-    args = parse_make_dataset_args()
+    argv = sys.argv[1:]
+    assert_no_legacy_dataset_cli_flags(argv)
+    args = parse_make_dataset_args(argv)
     validate_dataset_sample_args(args)
     os.makedirs(os.path.dirname(os.path.abspath(args.output_npz)) or ".", exist_ok=True)
+
+    print("[data] Resolved family configuration:")
+    print(format_resolved_family_summary(args))
 
     np.random.seed(args.seed)
     rng = np.random.default_rng(args.seed)
@@ -190,7 +143,7 @@ def main() -> None:
     theta_eval, x_eval = theta_all[ev_idx], x_all[ev_idx]
 
     meta = meta_dict_from_args(args)
-    if str(args.dataset_family) in ("gaussian_randamp", "gaussian_randamp_sqrtd"):
+    if str(args.dataset_family) in ("randamp_gaussian", "randamp_gaussian_sqrtd"):
         meta["randamp_mu_amp_per_dim"] = dataset._randamp_amp.tolist()
     save_shared_dataset_npz(
         args.output_npz,

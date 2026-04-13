@@ -1,14 +1,14 @@
-# 2026-04-10 H-decoding convergence: circular (`cos_sin_piecewise_noise`) dataset — weak agreement with reference
+# 2026-04-10 H-decoding convergence: circular (`cos_sin_piecewise`) dataset — weak agreement with reference
 
-This note records the same **H-matrix decoding convergence** protocol as the linear piecewise run ([2026-04-09 note](2026-04-09-h-decoding-convergence-linear-piecewise-minalpha05.md)), but on the **circular** synthetic family `cos_sin_piecewise_noise`: mean $(\cos\theta,\sin\theta)$ with **isotropic** observation noise. Here the **default dataset settings** use uniform $\theta\in[-6,6]$ and **constant** observation std (`--sigma-piecewise-low` = `--sigma-piecewise-high` = $0.1$), so the conditional is single-mode and the geometry is a noisy ring; there is no cross-theta noise contrast.
+This note records the same **H-matrix decoding convergence** protocol as the linear piecewise run ([2026-04-09 note](2026-04-09-h-decoding-convergence-linear-piecewise-minalpha05.md)), but on the **circular** synthetic family `cos_sin_piecewise`: mean $(\cos\theta,\sin\theta)$ with **isotropic** observation noise. Here the **default dataset settings** use uniform $\theta\in[-6,6]$ and **constant** observation std (`--sigma-piecewise-low` = `--sigma-piecewise-high` = $0.1$), so the conditional is single-mode and the geometry is a noisy ring; there is no cross-theta noise contrast.
 
 **Bottom line:** Relative to the large-$n$ reference, **binned H** and **Hellinger LB** (which tracks binned H by construction) show **poor** off-diagonal correlation at small and moderate nested sizes $n$, and only approach the reference toward the **largest** sweep size. This is much weaker than on the **linear piecewise** dataset at the same $n$ (see comparison below). Pairwise decoding and Bayes-opt (C) correlations are higher throughout, so the failure mode is concentrated in the **H-derived** rows of the study, not in every metric.
 
 ---
 
-## 1. Data: `cos_sin_piecewise_noise`
+## 1. Data: `cos_sin_piecewise`
 
-- **Family:** `cos_sin_piecewise_noise` (`ToyCosSinPiecewiseNoiseDataset` in `fisher/data.py`).
+- **Family:** `cos_sin_piecewise` (`ToyCosSinPiecewiseNoiseDataset` in `fisher/data.py`).
 - **Means:** $(\cos\theta,\sin\theta)$.
 - **Noise:** scalar std $\sigma(\theta)$ per axis; with defaults above, $\sigma$ is **constant** $0.1$ on $[-6,6]$.
 - **Size / split:** `--n-total 6000`, `--train-frac 1.0` (full pool in NPZ; convergence script builds nested subsets internally).
@@ -17,7 +17,7 @@ This note records the same **H-matrix decoding convergence** protocol as the lin
 
 ```bash
 mamba run -n geo_diffusion python bin/make_dataset.py \
-  --dataset-family cos_sin_piecewise_noise \
+  --dataset-family cos_sin_piecewise \
   --n-total 6000 \
   --train-frac 1.0 \
   --output-npz /grad/zeyuan/score-matching-fisher/data/cos_sin_piecewise_h_decoding_n6000/shared_fisher_dataset.npz
@@ -63,7 +63,7 @@ From `h_decoding_convergence_results.csv`:
 
 Combined line plot + matrix panel written by the script:
 
-H-decoding convergence on cos_sin_piecewise_noise: panel A = off-diagonal correlation vs n for four metrics; panel B = heatmaps across nested n and n_ref reference.
+H-decoding convergence on cos_sin_piecewise: panel A = off-diagonal correlation vs n for four metrics; panel B = heatmaps across nested n and n_ref reference.
 
 **Panel A.** Off-diagonal Pearson correlation to the $n_{\mathrm{ref}}=5000$ reference vs nested subset size $n$ for: binned H, pairwise logistic decoding, Hellinger LB from binned $H^2$, and Bayes-opt accuracy from C-matrix bin means.
 

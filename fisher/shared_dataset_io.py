@@ -10,27 +10,17 @@ from typing import Any
 
 import numpy as np
 
+from fisher.dataset_family_recipes import apply_family_recipe_to_namespace
+
 SHARED_DATASET_NPZ_VERSION = 1
 
 
 def apply_sigma_defaults_for_dataset_family(ns: Any) -> None:
-    """Set ``sigma_x1`` / ``sigma_x2`` when omitted (``None``) on the argparse namespace.
+    """Deprecated: sigma defaults are fixed per ``dataset_family`` via ``apply_family_recipe_to_namespace``.
 
-    ``gaussian_sqrtd`` defaults to 0.1; ``gaussian_randamp_sqrtd`` defaults to 0.2; other Gaussian/GMM
-    families default to 0.30. If only one of the two is omitted, it is set to match the resolved
-    ``sigma_x1``.
+    Kept as a no-op for backwards compatibility with callers that still invoke it.
     """
-    fam = str(getattr(ns, "dataset_family", "gaussian"))
-    if fam == "gaussian_sqrtd":
-        default_sigma = 0.1
-    elif fam == "gaussian_randamp_sqrtd":
-        default_sigma = 0.2
-    else:
-        default_sigma = 0.30
-    if getattr(ns, "sigma_x1", None) is None:
-        ns.sigma_x1 = default_sigma
-    if getattr(ns, "sigma_x2", None) is None:
-        ns.sigma_x2 = float(ns.sigma_x1)
+    apply_family_recipe_to_namespace(ns)
 
 
 @dataclass(frozen=True)
@@ -48,7 +38,7 @@ class SharedDatasetBundle:
 
 def meta_dict_from_args(ns: Any) -> dict[str, Any]:
     """Build JSON-serializable metadata from an argparse-like namespace (dataset fields)."""
-    apply_sigma_defaults_for_dataset_family(ns)
+    apply_family_recipe_to_namespace(ns)
     out: dict[str, Any] = {
         "version": SHARED_DATASET_NPZ_VERSION,
         "dataset_family": str(ns.dataset_family),
@@ -112,49 +102,11 @@ def _shared_dataset_meta_keys() -> frozenset[str]:
     CLI fields (e.g. ``theta_field_method``).
     """
     dummy = SimpleNamespace(
-        dataset_family="gaussian",
-        tuning_curve_family="cosine",
-        vm_mu_amp=1.0,
-        vm_kappa=1.0,
-        vm_omega=1.0,
-        gauss_mu_amp=1.0,
-        gauss_kappa=0.2,
-        gauss_omega=1.0,
-        randamp_mu_low=0.5,
-        randamp_mu_high=1.5,
-        randamp_kappa=0.2,
-        randamp_omega=1.0,
+        dataset_family="cosine_gaussian",
         seed=0,
         theta_low=-6.0,
         theta_high=6.0,
         x_dim=2,
-        sigma_x1=0.3,
-        sigma_x2=0.3,
-        rho=0.0,
-        rho_clip=0.85,
-        cov_theta_amp1=0.0,
-        cov_theta_amp2=0.0,
-        cov_theta_amp_rho=0.0,
-        cov_theta_freq1=0.0,
-        cov_theta_freq2=0.0,
-        cov_theta_freq_rho=0.0,
-        cov_theta_phase1=0.0,
-        cov_theta_phase2=0.0,
-        cov_theta_phase_rho=0.0,
-        gmm_sep_scale=1.0,
-        gmm_sep_freq=0.0,
-        gmm_sep_phase=0.0,
-        gmm_mix_logit_scale=1.0,
-        gmm_mix_bias=0.0,
-        gmm_mix_freq=0.0,
-        gmm_mix_phase=0.0,
-        sigma_piecewise_low=0.1,
-        sigma_piecewise_high=0.1,
-        linear_k=1.0,
-        linear_sigma_schedule="linear",
-        linear_sigma_sigmoid_center=0.0,
-        linear_sigma_sigmoid_steepness=2.0,
-        theta_zero_to_low=True,
         n_total=100,
         train_frac=1.0,
     )

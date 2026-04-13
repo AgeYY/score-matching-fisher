@@ -130,7 +130,7 @@ Command used:
 
 ```bash
 mamba run -n geo_diffusion python bin/fisher_make_dataset.py \
-  --dataset-family gmm_non_gauss
+  --dataset-family cosine_gmm
 
 mamba run -n geo_diffusion python bin/fisher_estimate_from_dataset.py \
   --dataset-npz data/shared_fisher_dataset.npz \

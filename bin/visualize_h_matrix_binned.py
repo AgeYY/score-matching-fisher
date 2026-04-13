@@ -521,7 +521,7 @@ def run_h_estimation_if_needed(ctx: RunContext) -> None:
 
 def load_h_matrix(ctx: RunContext) -> LoadedHMatrix:
     args = ctx.args
-    suffix = "_non_gauss" if ctx.full_args.dataset_family == "gmm_non_gauss" else "_theta_cov"
+    suffix = "_non_gauss" if ctx.full_args.dataset_family == "cosine_gmm" else "_theta_cov"
     if args.h_matrix_npz:
         h_path = os.path.abspath(args.h_matrix_npz)
     else:

@@ -67,4 +67,4 @@ mamba run -n geo_diffusion python bin/fisher_estimate_from_dataset.py \
   - `tuning_curve.png` — mean \(\mu(\theta)\) vs. \(\theta\),
   - `conditional_slices.png` — conditional \(x\) slices at several \(\theta\) values.
 
-**Notable flags:** `--dataset-family` (`gaussian` / `gmm_non_gauss`), `--x-dim`, covariance and GMM hyperparameters, `--n-joint`, `--output-dir`.
+**Notable flags:** `--dataset-family` (`cosine_gaussian` / `cosine_gmm`), `--x-dim`, covariance and GMM hyperparameters, `--n-joint`, `--output-dir`.

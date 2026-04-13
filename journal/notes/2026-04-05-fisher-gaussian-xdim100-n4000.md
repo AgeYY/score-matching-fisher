@@ -16,7 +16,7 @@ Uniform $\theta \in [\theta_{\text{low}},\theta_{\text{high}}]$, conditional Gau
 
 ```bash
 mamba run -n geo_diffusion python bin/fisher_make_dataset.py \
-  --dataset-family gaussian \
+  --dataset-family cosine_gaussian \
   --x-dim 100 \
   --n-total 4000 \
   --output-npz data/fisher_gaussian_xdim100_n4000.npz
