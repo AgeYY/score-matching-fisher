@@ -939,6 +939,14 @@ def validate_estimation_args(args: Any) -> None:
         raise ValueError("--flow-early-ema-alpha must be in (0, 1].")
     if not (0.0 <= float(getattr(args, "flow_eval_t", 0.8)) <= 1.0):
         raise ValueError("--flow-eval-t must be in [0, 1].")
+    if int(getattr(args, "flow_cond_embed_dim", 16)) < 1:
+        raise ValueError("--flow-cond-embed-dim must be >= 1.")
+    if int(getattr(args, "flow_cond_embed_depth", 1)) < 1:
+        raise ValueError("--flow-cond-embed-depth must be >= 1.")
+    if int(getattr(args, "flow_prior_cond_embed_dim", 16)) < 1:
+        raise ValueError("--flow-prior-cond-embed-dim must be >= 1.")
+    if int(getattr(args, "flow_prior_cond_embed_depth", 1)) < 1:
+        raise ValueError("--flow-prior-cond-embed-depth must be >= 1.")
     if bool(getattr(args, "compute_h_matrix", False)) and not bool(getattr(args, "prior_enable", True)):
         raise ValueError("--compute-h-matrix requires prior score; do not use --no-prior-score.")
     if bool(getattr(args, "skip_shared_fisher_gt_compare", False)):
@@ -1117,14 +1125,28 @@ def run_shared_fisher_estimation(
         if not (0.0 <= flow_eval_t <= 1.0):
             raise ValueError("--flow-eval-t must be in [0, 1].")
         theta_std = float(np.std(theta_score_fit))
-        flow_score_arch = str(getattr(args, "flow_score_arch", "film")).strip().lower()
-        flow_prior_arch = str(getattr(args, "flow_prior_arch", "film")).strip().lower()
+        flow_score_arch = str(getattr(args, "flow_score_arch", "mlp")).strip().lower()
+        flow_prior_arch = str(getattr(args, "flow_prior_arch", "mlp")).strip().lower()
         print(
             "[theta_flow] "
             f"fit={theta_score_fit.shape[0]} val={theta_score_val.shape[0]} "
             f"scheduler={getattr(args, 'flow_scheduler', 'cosine')} t_eval={flow_eval_t:.6f} "
             f"theta_std={theta_std:.6f}"
         )
+        _emb_post = ""
+        if flow_score_arch == "film":
+            _emb_post = (
+                f"cond_embed_post=d{int(getattr(args, 'flow_cond_embed_dim', 16))}"
+                f"xL{int(getattr(args, 'flow_cond_embed_depth', 1))}"
+                f"_{str(getattr(args, 'flow_cond_embed_act', 'silu'))} "
+            )
+        _emb_prior = ""
+        if flow_prior_arch == "film":
+            _emb_prior = (
+                f"cond_embed_prior=d{int(getattr(args, 'flow_prior_cond_embed_dim', 16))}"
+                f"xL{int(getattr(args, 'flow_prior_cond_embed_depth', 1))}"
+                f"_{str(getattr(args, 'flow_prior_cond_embed_act', 'silu'))}"
+            )
         print(
             "[theta_flow] arch "
             f"posterior={flow_score_arch} prior={flow_prior_arch} "
@@ -1133,7 +1155,8 @@ def run_shared_fisher_estimation(
             f"ln_post={bool(getattr(args, 'flow_use_layer_norm', False))} "
             f"ln_prior={bool(getattr(args, 'flow_prior_use_layer_norm', False))} "
             f"zero_out_post={bool(getattr(args, 'flow_zero_out_init', False))} "
-            f"zero_out_prior={bool(getattr(args, 'flow_prior_zero_out_init', False))}"
+            f"zero_out_prior={bool(getattr(args, 'flow_prior_zero_out_init', False))} "
+            f"{_emb_post}{_emb_prior}"
         )
 
         if flow_score_arch == "film":
@@ -1145,6 +1168,9 @@ def run_shared_fisher_estimation(
                 use_layer_norm=bool(getattr(args, "flow_use_layer_norm", False)),
                 gated_film=bool(getattr(args, "flow_gated_film", False)),
                 zero_out_init=bool(getattr(args, "flow_zero_out_init", False)),
+                cond_embed_dim=int(getattr(args, "flow_cond_embed_dim", 16)),
+                cond_embed_depth=int(getattr(args, "flow_cond_embed_depth", 1)),
+                cond_embed_act=str(getattr(args, "flow_cond_embed_act", "silu")),
             ).to(device)
         elif flow_score_arch == "mlp":
             post_model = ConditionalThetaFlowVelocity(
@@ -1222,6 +1248,9 @@ def run_shared_fisher_estimation(
                 use_layer_norm=bool(getattr(args, "flow_prior_use_layer_norm", False)),
                 gated_film=bool(getattr(args, "flow_prior_gated_film", False)),
                 zero_out_init=bool(getattr(args, "flow_prior_zero_out_init", False)),
+                cond_embed_dim=int(getattr(args, "flow_prior_cond_embed_dim", 16)),
+                cond_embed_depth=int(getattr(args, "flow_prior_cond_embed_depth", 1)),
+                cond_embed_act=str(getattr(args, "flow_prior_cond_embed_act", "silu")),
             ).to(device)
         elif flow_prior_arch == "mlp":
             prior_model_flow = PriorThetaFlowVelocity(

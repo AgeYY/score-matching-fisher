@@ -45,6 +45,29 @@ wait "${pid}"
 # or: while kill -0 "${pid}" 2>/dev/null; do sleep 30; done
 ```
 
+## Monitoring long runs (agents)
+
+When the user asks to **monitor until a job finishes**, use a **completion signal** that cannot match your own shell, not `pgrep -f` loops (see **Background jobs** above).
+
+**Good ways to detect completion:**
+
+1. **Sentinel line in a log** the job appends to (e.g. wrap the command with `echo "=== phase done $(date -Is) ==="` after each stage).
+2. **Final artifact file** exists and is non-empty, e.g. `h_decoding_convergence_results.npz` under the run’s `--output-dir`, or `[convergence] Saved:` in `run.log`.
+3. **Poll a known PID**: if you started the job with `pid=$!`, use `while kill -0 "$pid" 2>/dev/null; do sleep 30; done` (refresh the PID if you did not capture it at start).
+
+**Polling pattern (safe):**
+
+```bash
+MASTER=/path/to/pipeline.log   # or check a results file
+while ! grep -q '100D done' "$MASTER" 2>/dev/null; do sleep 45; done
+```
+
+Prefer `grep` on a **unique marker** you or the script wrote, not on a substring that appears in the monitor’s argv.
+
+**Logging:** For long `mamba run` jobs, set `PYTHONUNBUFFERED=1` and/or redirect to a file so progress is visible; otherwise logs may buffer until exit.
+
+**When reporting to the user:** state that the pipeline finished, cite the **absolute path** to the master log and each output directory, and mention key artifacts (e.g. `h_decoding_convergence_combined.svg`, `h_decoding_convergence_results.npz`).
+
 ## Output paths (agent replies)
 
 - When reporting where a script wrote files (datasets, figures, logs, run directories, NPZ/CSV/PNG, etc.), **always state the full absolute path** to the artifact or directory (e.g. `/grad/zeyuan/score-matching-fisher/data/...` or the resolved `DATAROOT` path from `global_setting.py`). Do not rely on repo-relative paths alone (`data/foo`) as the only location the user sees.

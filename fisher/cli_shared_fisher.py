@@ -546,23 +546,23 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--flow-score-arch",
         type=str,
-        default="film",
+        default="mlp",
         choices=["mlp", "film"],
         help=(
             "Theta-flow only (--theta-field-method flow): posterior velocity network. "
-            "mlp concatenates [theta_t, x, t_feat]; film uses an x-trunk with FiLM from (theta_t, logit t). "
-            "Default: film."
+            "mlp concatenates [theta_t, x, t_feat]; film uses an x-trunk with FiLM from separate "
+            "theta/time embeddings (see --flow-cond-embed-*). Default: mlp."
         ),
     )
     p.add_argument(
         "--flow-prior-arch",
         type=str,
-        default="film",
+        default="mlp",
         choices=["mlp", "film"],
         help=(
             "Theta-flow only: prior velocity v(theta_t, t). "
-            "mlp concatenates [theta_t, t_feat]; film uses a theta-trunk with FiLM from (theta_t, logit t). "
-            "Default: film."
+            "mlp concatenates [theta_t, t_feat]; film uses a theta-trunk with FiLM from separate "
+            "theta/time embeddings (see --flow-prior-cond-embed-*). Default: mlp."
         ),
     )
     p.add_argument(
@@ -600,6 +600,50 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         action="store_true",
         default=False,
         help="Theta-flow FiLM prior: zero-initialize final linear head.",
+    )
+    p.add_argument(
+        "--flow-cond-embed-dim",
+        type=int,
+        default=16,
+        help=(
+            "Theta-flow FiLM posterior only: per-channel embedding width for theta_t and for logit(t); "
+            "FiLM cond is concat(theta_embed, time_embed) with total dim 2×this. Default: 16."
+        ),
+    )
+    p.add_argument(
+        "--flow-cond-embed-depth",
+        type=int,
+        default=1,
+        help="Theta-flow FiLM posterior: number of linear layers in each scalar embedding MLP (theta and t). Default: 1.",
+    )
+    p.add_argument(
+        "--flow-cond-embed-act",
+        type=str,
+        default="silu",
+        choices=["silu", "relu", "tanh"],
+        help="Theta-flow FiLM posterior: activation between layers in each scalar embedding MLP (not after last layer).",
+    )
+    p.add_argument(
+        "--flow-prior-cond-embed-dim",
+        type=int,
+        default=16,
+        help=(
+            "Theta-flow FiLM prior only: per-channel embedding width for theta_t and for logit(t); "
+            "FiLM cond is concat(theta_embed, time_embed) with total dim 2×this. Default: 16."
+        ),
+    )
+    p.add_argument(
+        "--flow-prior-cond-embed-depth",
+        type=int,
+        default=1,
+        help="Theta-flow FiLM prior: number of linear layers in each scalar embedding MLP (theta and t). Default: 1.",
+    )
+    p.add_argument(
+        "--flow-prior-cond-embed-act",
+        type=str,
+        default="silu",
+        choices=["silu", "relu", "tanh"],
+        help="Theta-flow FiLM prior: activation between layers in each scalar embedding MLP (not after last layer).",
     )
 
     p.add_argument(

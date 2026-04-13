@@ -1306,8 +1306,8 @@ def main(argv: list[str] | None = None) -> None:
     if tfm == "flow":
         print(
             f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
-            f"(flow_score_arch={getattr(args, 'flow_score_arch', 'film')}, "
-            f"flow_prior_arch={getattr(args, 'flow_prior_arch', 'film')}; "
+            f"(flow_score_arch={getattr(args, 'flow_score_arch', 'mlp')}, "
+            f"flow_prior_arch={getattr(args, 'flow_prior_arch', 'mlp')}; "
             f"DSM --score-arch/--prior-score-arch do not select theta-flow velocity nets)",
             flush=True,
         )

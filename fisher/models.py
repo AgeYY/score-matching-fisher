@@ -4,6 +4,34 @@ import torch
 from torch import nn
 
 
+def _activation_from_str(name: str) -> type[nn.Module]:
+    n = str(name).strip().lower()
+    if n == "silu":
+        return nn.SiLU
+    if n == "relu":
+        return nn.ReLU
+    if n == "tanh":
+        return nn.Tanh
+    raise ValueError(f"Unknown activation '{name}'. Supported: silu, relu, tanh.")
+
+
+def _scalar_embedding_mlp(out_dim: int, depth: int, act: str = "silu") -> nn.Sequential:
+    """Map scalar (B, 1) to (B, out_dim) with ``depth`` linear layers and SiLU between (except last)."""
+    if out_dim < 1:
+        raise ValueError("out_dim must be >= 1.")
+    if depth < 1:
+        raise ValueError("depth must be >= 1.")
+    act_cls = _activation_from_str(act)
+    layers: list[nn.Module] = []
+    in_dim = 1
+    for i in range(depth):
+        layers.append(nn.Linear(in_dim, out_dim))
+        in_dim = out_dim
+        if i < depth - 1:
+            layers.append(act_cls())
+    return nn.Sequential(*layers)
+
+
 class ConditionalScore1D(nn.Module):
     """Score model for s(theta_tilde, x, sigma), with scalar theta."""
 
@@ -211,7 +239,7 @@ class PriorThetaFlowVelocity(nn.Module):
 
 
 class ConditionalThetaFlowVelocityFiLMPerLayer(nn.Module):
-    """Theta-flow velocity v(theta_t, x, t): x-trunk + residual FiLM from (theta_t, logit t)."""
+    """Theta-flow velocity v(theta_t, x, t): x-trunk + residual FiLM from embedded (theta_t, logit t)."""
 
     def __init__(
         self,
@@ -222,6 +250,9 @@ class ConditionalThetaFlowVelocityFiLMPerLayer(nn.Module):
         use_layer_norm: bool = False,
         gated_film: bool = False,
         zero_out_init: bool = False,
+        cond_embed_dim: int = 16,
+        cond_embed_depth: int = 1,
+        cond_embed_act: str = "silu",
     ) -> None:
         super().__init__()
         if x_dim < 2:
@@ -231,7 +262,12 @@ class ConditionalThetaFlowVelocityFiLMPerLayer(nn.Module):
         self.depth = int(depth)
         self.use_logit_time = bool(use_logit_time)
         self.gated_film = bool(gated_film)
-        cond_dim = 2  # theta_t, t_feat
+        self.cond_embed_dim = int(cond_embed_dim)
+        self.cond_embed_depth = int(cond_embed_depth)
+        self.cond_embed_act = str(cond_embed_act)
+        self.theta_embed = _scalar_embedding_mlp(self.cond_embed_dim, self.cond_embed_depth, self.cond_embed_act)
+        self.time_embed = _scalar_embedding_mlp(self.cond_embed_dim, self.cond_embed_depth, self.cond_embed_act)
+        cond_dim = 2 * self.cond_embed_dim
         self.in_proj = nn.Linear(int(x_dim), int(hidden_dim))
         self.in_norm = nn.LayerNorm(int(hidden_dim)) if use_layer_norm else nn.Identity()
         self.cond_residual = nn.Linear(cond_dim, int(hidden_dim))
@@ -266,7 +302,9 @@ class ConditionalThetaFlowVelocityFiLMPerLayer(nn.Module):
         if theta_t.ndim == 1:
             theta_t = theta_t.unsqueeze(-1)
         t_feat = self._t_feat(t)
-        cond = torch.cat([theta_t, t_feat], dim=-1)
+        theta_e = self.theta_embed(theta_t)
+        time_e = self.time_embed(t_feat)
+        cond = torch.cat([theta_e, time_e], dim=-1)
         h = self.in_norm(self.in_proj(x))
         h = torch.nn.functional.silu(h) + self.cond_residual(cond)
         for blk in self.blocks:
@@ -289,7 +327,7 @@ class ConditionalThetaFlowVelocityFiLMPerLayer(nn.Module):
 
 
 class PriorThetaFlowVelocityFiLMPerLayer(nn.Module):
-    """Prior theta-flow velocity v(theta_t, t): theta-trunk + residual FiLM from (theta_t, logit t)."""
+    """Prior theta-flow velocity v(theta_t, t): theta-trunk + residual FiLM from embedded (theta_t, logit t)."""
 
     def __init__(
         self,
@@ -299,13 +337,21 @@ class PriorThetaFlowVelocityFiLMPerLayer(nn.Module):
         use_layer_norm: bool = False,
         gated_film: bool = False,
         zero_out_init: bool = False,
+        cond_embed_dim: int = 16,
+        cond_embed_depth: int = 1,
+        cond_embed_act: str = "silu",
     ) -> None:
         super().__init__()
         self.hidden_dim = int(hidden_dim)
         self.depth = int(depth)
         self.use_logit_time = bool(use_logit_time)
         self.gated_film = bool(gated_film)
-        cond_dim = 2  # theta_t, t_feat
+        self.cond_embed_dim = int(cond_embed_dim)
+        self.cond_embed_depth = int(cond_embed_depth)
+        self.cond_embed_act = str(cond_embed_act)
+        self.theta_embed = _scalar_embedding_mlp(self.cond_embed_dim, self.cond_embed_depth, self.cond_embed_act)
+        self.time_embed = _scalar_embedding_mlp(self.cond_embed_dim, self.cond_embed_depth, self.cond_embed_act)
+        cond_dim = 2 * self.cond_embed_dim
         self.in_proj = nn.Linear(1, int(hidden_dim))
         self.in_norm = nn.LayerNorm(int(hidden_dim)) if use_layer_norm else nn.Identity()
         self.blocks = nn.ModuleList()
@@ -337,7 +383,9 @@ class PriorThetaFlowVelocityFiLMPerLayer(nn.Module):
         if theta_t.ndim == 1:
             theta_t = theta_t.unsqueeze(-1)
         t_feat = self._t_feat(t)
-        cond = torch.cat([theta_t, t_feat], dim=-1)
+        theta_e = self.theta_embed(theta_t)
+        time_e = self.time_embed(t_feat)
+        cond = torch.cat([theta_e, time_e], dim=-1)
         h = self.in_norm(self.in_proj(theta_t))
         h = torch.nn.functional.silu(h)
         for blk in self.blocks:
