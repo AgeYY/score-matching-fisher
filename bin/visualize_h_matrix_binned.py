@@ -21,6 +21,7 @@ import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 import numpy as np
 from scipy.ndimage import gaussian_filter
+from scipy.stats import spearmanr
 import torch
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
@@ -426,6 +427,7 @@ def pairwise_bin_logistic_accuracy_matrix(
 
 
 def matrix_corr_offdiag(a: np.ndarray, b: np.ndarray) -> float:
+    """Spearman rank correlation between vectorized off-diagonal entries (finite pairs only)."""
     aa = np.asarray(a, dtype=np.float64)
     bb = np.asarray(b, dtype=np.float64)
     if aa.shape != bb.shape or aa.ndim != 2 or aa.shape[0] != aa.shape[1]:
@@ -439,7 +441,11 @@ def matrix_corr_offdiag(a: np.ndarray, b: np.ndarray) -> float:
     bv = bb[mask]
     if float(np.std(av)) <= 0.0 or float(np.std(bv)) <= 0.0:
         return float("nan")
-    return float(np.corrcoef(av, bv)[0, 1])
+    res = spearmanr(av, bv)
+    stat = getattr(res, "statistic", None)
+    if stat is None:
+        stat = res[0]
+    return float(stat)
 
 
 def _validate_args(args: argparse.Namespace, n_bins: int) -> None:

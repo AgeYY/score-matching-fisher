@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Convergence of binned H and pairwise decoding vs references.
 
-**Binned H:** off-diagonal correlation vs a **generative ground-truth** Hellinger matrix
+**Binned H:** off-diagonal Spearman correlation vs a **generative ground-truth** Hellinger matrix
 estimated by Monte Carlo from the known toy likelihood (see ``fisher/hellinger_gt.py`` and
 ``report/notes/hellinger_idea.tex``). The MC routine returns squared Hellinger **H^2**; this
 script compares and visualizes **elementwise square roots** ``sqrt(H^2)`` (GT) and
@@ -10,7 +10,7 @@ square root. With ``n_bins`` = ``--num-theta-bins``, the MC count per
 bin row is ``n_mc = n_ref // n_bins`` (integer floor); ``n_bins * n_mc`` may be less than ``n_ref``.
 Nested subset training for each ``n`` in ``--n-list`` uses up to ``n`` samples; the ``n_ref`` column does not train a model.
 
-**Pairwise decoding:** off-diagonal correlation vs the decoding matrix from the ``--n-ref``
+**Pairwise decoding:** off-diagonal Spearman correlation vs the decoding matrix from the ``--n-ref``
 subset (same bin edges as GT), unchanged.
 
 **Dataset:** the loaded NPZ must match ``--dataset-family`` (default ``gaussian_randamp_sqrtd``:
@@ -793,7 +793,7 @@ def _populate_convergence_curve_ax(
     axis_labelsize: float = 12.0,
     legend_fontsize: float = 9.0,
 ) -> None:
-    """Correlation vs n on a single axis (shared with standalone curve figure + combined figure).
+    """Spearman correlation vs n on a single axis (shared with standalone curve figure + combined figure).
 
     Tick sizes default to ``global_setting``-style values (11 pt ticks, 12 pt axis labels).
     The combined figure passes larger values so the right panel stays readable at reduced width.
@@ -828,7 +828,7 @@ def _populate_convergence_curve_ax(
         clip_on=False,
     )
     ax.set_xlabel("dataset size n", fontsize=axis_labelsize)
-    ax.set_ylabel("Correlation(off-diagonal estimated, off-diagonal approx GT)", fontsize=axis_labelsize)
+    ax.set_ylabel("Spearman ρ (off-diagonal estimated vs off-diagonal approx GT)", fontsize=axis_labelsize)
     ax.set_xticks(ns_list)
     ax.tick_params(axis="both", labelsize=tick_labelsize)
     ax.legend(loc="best", fontsize=legend_fontsize)
@@ -1126,7 +1126,7 @@ def _render_convergence_figures_and_summary(
         paths_out["errors"] = "; ".join(err_msg[:20])
     _write_summary(summary_path, args, meta, perm_seed, n_pool, ref_dir, paths_out, per_n_loss_rows)
     with open(summary_path, "a", encoding="utf-8") as sf:
-        sf.write("\n# Correlation targets\n")
+        sf.write("\n# Correlation targets (Spearman off-diagonal; matrix_corr_offdiag)\n")
         sf.write(
             "# corr_h_binned_vs_gt_mc: binned sqrt(H_sym) vs sqrt(generative GT H^2) (MC one-sided Hellinger).\n"
         )

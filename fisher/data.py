@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import ClassVar
 
 import numpy as np
 from scipy.special import expit, logsumexp
@@ -47,6 +48,10 @@ class ToyConditionalGaussianDataset:
     cov_theta_phase_rho: float = 0.40
     rho_clip: float = 0.85
     seed: int = 42
+    # If False, ``log_p_x_given_theta`` uses full ``covariance(theta)`` via
+    # ``fisher.evaluation.log_p_gaussian_mvnormal_from_cov`` (O(d³) per batch row).
+    # Set to False on subclasses that implement non-diagonal ``covariance``.
+    diagonal_gaussian_observation_noise: ClassVar[bool] = True
 
     def __post_init__(self) -> None:
         if not (self.theta_low < self.theta_high):
@@ -190,6 +195,30 @@ class ToyConditionalGaussianDataset:
         theta = self.sample_theta(n)
         x = self.sample_x(theta)
         return theta, x
+
+    def log_p_x_given_theta(self, x: np.ndarray, theta: np.ndarray) -> np.ndarray:
+        """Gaussian log-density: diagonal fast path, or full covariance if configured.
+
+        When :attr:`diagonal_gaussian_observation_noise` is True (default), uses per-dimension
+        variances from :meth:`_variance_diag_from_mu` (matches diagonal :meth:`covariance`).
+
+        For a future subclass with a full ``covariance(theta)``, set
+        ``diagonal_gaussian_observation_noise = False`` on the class (or override this method).
+        """
+        x = np.asarray(x, dtype=np.float64).reshape(-1, self.x_dim)
+        theta = _theta_col(theta)
+        mu = self.tuning_curve(theta)
+        if not bool(type(self).diagonal_gaussian_observation_noise):
+            from fisher.evaluation import log_p_gaussian_mvnormal_from_cov
+
+            cov = self.covariance(theta)
+            return log_p_gaussian_mvnormal_from_cov(x, mu, cov)
+        v = self._variance_diag_from_mu(mu)
+        delta = x - mu
+        quad = np.sum((delta**2) / v, axis=1)
+        logdet = np.sum(np.log(v), axis=1)
+        d = float(self.x_dim)
+        return -0.5 * (d * np.log(2.0 * np.pi) + logdet + quad)
 
 
 @dataclass

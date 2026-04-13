@@ -5,6 +5,28 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
+def log_p_gaussian_mvnormal_from_cov(
+    x: np.ndarray,
+    mu: np.ndarray,
+    cov: np.ndarray,
+) -> np.ndarray:
+    """Multivariate Gaussian log-density for batched ``x`` with per-row mean and covariance.
+
+    Shapes: ``x`` and ``mu`` are ``(n, d)``; ``cov`` is ``(n, d, d)``.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    if x.ndim == 1:
+        x = x.reshape(1, -1)
+    mu = np.asarray(mu, dtype=np.float64).reshape(x.shape[0], x.shape[1])
+    cov = np.asarray(cov, dtype=np.float64)
+    delta = x - mu
+    inv_cov = np.linalg.inv(cov)
+    quad = np.einsum("ni,nij,nj->n", delta, inv_cov, delta)
+    _, logdet = np.linalg.slogdet(cov)
+    d = float(x.shape[1])
+    return -0.5 * (d * np.log(2.0 * np.pi) + logdet + quad)
+
+
 from fisher.data import (
     ToyConditionalGMMNonGaussianDataset,
     ToyConditionalGaussianDataset,
@@ -45,13 +67,8 @@ def log_p_x_given_theta(
     if hasattr(dataset, "log_p_x_given_theta"):
         return dataset.log_p_x_given_theta(x, theta)
     mu = dataset.tuning_curve(theta)
-    delta = x - mu
     cov = dataset.covariance(theta)
-    inv_cov = np.linalg.inv(cov)
-    quad = np.einsum("ni,nij,nj->n", delta, inv_cov, delta)
-    _, logdet = np.linalg.slogdet(cov)
-    d = x.shape[1]
-    return -0.5 * (d * np.log(2.0 * np.pi) + logdet + quad)
+    return log_p_gaussian_mvnormal_from_cov(x, mu, cov)
 
 
 def finite_difference_score(
