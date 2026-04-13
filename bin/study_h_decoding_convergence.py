@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Convergence of binned H and pairwise decoding vs references.
 
-**Binned H:** off-diagonal Spearman correlation vs a **generative ground-truth** Hellinger matrix
+**Binned H:** off-diagonal Pearson r vs a **generative ground-truth** Hellinger matrix
 estimated by Monte Carlo from the known toy likelihood (see ``fisher/hellinger_gt.py`` and
 ``report/notes/hellinger_idea.tex``). The MC routine returns squared Hellinger **H^2**; this
 script compares and visualizes **elementwise square roots** ``sqrt(H^2)`` (GT) and
@@ -10,7 +10,7 @@ square root. With ``n_bins`` = ``--num-theta-bins``, the MC count per
 bin row is ``n_mc = n_ref // n_bins`` (integer floor); ``n_bins * n_mc`` may be less than ``n_ref``.
 Nested subset training for each ``n`` in ``--n-list`` uses up to ``n`` samples; the ``n_ref`` column does not train a model.
 
-**Pairwise decoding:** off-diagonal Spearman correlation vs the decoding matrix from the ``--n-ref``
+**Pairwise decoding:** off-diagonal Pearson r vs the decoding matrix from the ``--n-ref``
 subset (same bin edges as GT), unchanged.
 
 **Dataset:** the loaded NPZ must match ``--dataset-family`` (default ``randamp_gaussian_sqrtd``:
@@ -21,9 +21,11 @@ For each ``n`` in ``--n-list``, the H matrix is computed from trained **posterio
 models (``--theta-field-method dsm``, ``flow``, or ``flow_likelihood``). In ``flow`` mode, H uses
 the **flow-derived score** (velocity-to-epsilon conversion and ``s = -eps/sigma_t``), not raw
 velocity; ``flow_likelihood`` uses direct ODE likelihood ratios.
-This script defaults to **multi-layer FiLM**
-for the posterior (``--score-arch film``, ``--score-depth 3``) and a **3-layer MLP** prior
-(``--prior-score-arch mlp``). The **reference column** (``n_ref``) does **not** run learned H
+For **DSM** (``--theta-field-method dsm``), this script defaults to **multi-layer FiLM** for the
+posterior score (``--score-arch film``, ``--score-depth 3``) and a **3-layer MLP** prior score
+(``--prior-score-arch mlp``). For **flow** / **flow_likelihood**, theta velocity nets default to
+**MLP** (``--flow-score-arch mlp``, ``--flow-prior-arch mlp``); pass ``film`` to either flag for FiLM.
+The **reference column** (``n_ref``) does **not** run learned H
 training: the
 matrix-panel top row shows **MC generative** ``sqrt(H^2)`` (same as the H correlation
 target), while the bottom row still shows pairwise decoding on the ``n_ref`` data subset.
@@ -219,10 +221,13 @@ def build_parser() -> argparse.ArgumentParser:
     add_estimation_arguments(p)
     p.set_defaults(
         output_dir=str(Path(DATA_DIR) / "h_decoding_convergence"),
-        # Posterior: multi-layer FiLM with x trunk and (theta, sigma) additive residual; prior: MLP.
+        # DSM: FiLM posterior score + MLP prior score (see --score-arch / --prior-score-arch).
         score_arch="film",
         score_depth=3,
         prior_depth=3,
+        # Flow / flow_likelihood: MLP velocity nets unless user passes --flow-score-arch film, etc.
+        flow_score_arch="mlp",
+        flow_prior_arch="mlp",
         score_early_ema_alpha=0.05,
         prior_early_ema_alpha=0.05,
         score_early_ema_warmup_epochs=0,
@@ -800,7 +805,7 @@ def _populate_convergence_curve_ax(
     axis_labelsize: float = 12.0,
     legend_fontsize: float = 9.0,
 ) -> None:
-    """Spearman correlation vs n on a single axis (shared with standalone curve figure + combined figure).
+    """Pearson r vs n on a single axis (shared with standalone curve figure + combined figure).
 
     Tick sizes default to ``global_setting``-style values (11 pt ticks, 12 pt axis labels).
     The combined figure passes larger values so the right panel stays readable at reduced width.
@@ -835,7 +840,7 @@ def _populate_convergence_curve_ax(
         clip_on=False,
     )
     ax.set_xlabel("dataset size n", fontsize=axis_labelsize)
-    ax.set_ylabel("Spearman ρ (off-diagonal estimated vs off-diagonal approx GT)", fontsize=axis_labelsize)
+    ax.set_ylabel("Pearson r (off-diagonal estimated vs off-diagonal approx GT)", fontsize=axis_labelsize)
     ax.set_xticks(ns_list)
     ax.tick_params(axis="both", labelsize=tick_labelsize)
     ax.legend(loc="best", fontsize=legend_fontsize)
@@ -1133,12 +1138,12 @@ def _render_convergence_figures_and_summary(
         paths_out["errors"] = "; ".join(err_msg[:20])
     _write_summary(summary_path, args, meta, perm_seed, n_pool, ref_dir, paths_out, per_n_loss_rows)
     with open(summary_path, "a", encoding="utf-8") as sf:
-        sf.write("\n# Correlation targets (Spearman off-diagonal; matrix_corr_offdiag)\n")
+        sf.write("\n# Correlation targets (Pearson r off-diagonal; matrix_corr_offdiag_pearson)\n")
         sf.write(
-            "# corr_h_binned_vs_gt_mc: binned sqrt(H_sym) vs sqrt(generative GT H^2) (MC one-sided Hellinger).\n"
+            "# corr_h_binned_vs_gt_mc: Pearson r, off-diagonal binned sqrt(H_sym) vs sqrt(generative GT H^2) (MC one-sided Hellinger).\n"
         )
         sf.write(
-            "# corr_clf_vs_ref: pairwise decoding vs n_ref subset decoding matrix (same bin edges).\n"
+            "# corr_clf_vs_ref: Pearson r, off-diagonal pairwise decoding vs n_ref subset decoding matrix (same bin edges).\n"
         )
         sf.write(
             "# h_binned_columns last column: MC GT sqrt(H^2) (not DSM/flow); hellinger_gt_sq_mc key stores sqrt(H^2).\n"
@@ -1435,8 +1440,8 @@ def main(argv: list[str] | None = None) -> None:
                 clf_rs,
             )
             h_n_sqrt = _sqrt_h_like(h_n)
-            corr_h[k] = vhb.matrix_corr_offdiag(h_n_sqrt, h_gt_sqrt)
-            corr_clf[k] = vhb.matrix_corr_offdiag(clf_n, clf_ref)
+            corr_h[k] = vhb.matrix_corr_offdiag_pearson(h_n_sqrt, h_gt_sqrt)
+            corr_clf[k] = vhb.matrix_corr_offdiag_pearson(clf_n, clf_ref)
             wall_s[k] = time.time() - t1
             h_sweep.append(np.asarray(h_n_sqrt, dtype=np.float64))
             clf_sweep.append(np.asarray(clf_n, dtype=np.float64))

@@ -126,10 +126,10 @@ def family_recipe_dict(family: str) -> dict[str, Any]:
     raise_if_legacy_dataset_family(fam)
     base = _base_gaussian_like()
     if fam == "cosine_gaussian":
-        out = {**base, "sigma_x1": 0.30, "sigma_x2": 0.30}
+        out = {**base, "sigma_x1": 0.50, "sigma_x2": 0.50}
         return out
     if fam == "cosine_gaussian_sqrtd":
-        return {**base, "sigma_x1": 0.10, "sigma_x2": 0.10}
+        return {**base, "sigma_x1": 0.50, "sigma_x2": 0.50}
     if fam == "randamp_gaussian":
         return {**base, "sigma_x1": 0.30, "sigma_x2": 0.30}
     if fam == "randamp_gaussian_sqrtd":

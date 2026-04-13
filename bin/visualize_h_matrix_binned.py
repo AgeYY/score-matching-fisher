@@ -21,7 +21,7 @@ import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 import numpy as np
 from scipy.ndimage import gaussian_filter
-from scipy.stats import spearmanr
+from scipy.stats import kendalltau, pearsonr, spearmanr
 import torch
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
@@ -442,6 +442,50 @@ def matrix_corr_offdiag(a: np.ndarray, b: np.ndarray) -> float:
     if float(np.std(av)) <= 0.0 or float(np.std(bv)) <= 0.0:
         return float("nan")
     res = spearmanr(av, bv)
+    stat = getattr(res, "statistic", None)
+    if stat is None:
+        stat = res[0]
+    return float(stat)
+
+
+def matrix_corr_offdiag_kendall(a: np.ndarray, b: np.ndarray) -> float:
+    """Kendall tau between vectorized off-diagonal entries (finite pairs only)."""
+    aa = np.asarray(a, dtype=np.float64)
+    bb = np.asarray(b, dtype=np.float64)
+    if aa.shape != bb.shape or aa.ndim != 2 or aa.shape[0] != aa.shape[1]:
+        raise ValueError("matrix_corr_offdiag_kendall requires equal-shape square matrices.")
+    n = aa.shape[0]
+    off = ~np.eye(n, dtype=bool)
+    mask = off & np.isfinite(aa) & np.isfinite(bb)
+    if int(np.sum(mask)) < 3:
+        return float("nan")
+    av = aa[mask]
+    bv = bb[mask]
+    if float(np.std(av)) <= 0.0 or float(np.std(bv)) <= 0.0:
+        return float("nan")
+    res = kendalltau(av, bv)
+    stat = getattr(res, "statistic", None)
+    if stat is None:
+        stat = res[0]
+    return float(stat)
+
+
+def matrix_corr_offdiag_pearson(a: np.ndarray, b: np.ndarray) -> float:
+    """Pearson r between vectorized off-diagonal entries (finite pairs only)."""
+    aa = np.asarray(a, dtype=np.float64)
+    bb = np.asarray(b, dtype=np.float64)
+    if aa.shape != bb.shape or aa.ndim != 2 or aa.shape[0] != aa.shape[1]:
+        raise ValueError("matrix_corr_offdiag_pearson requires equal-shape square matrices.")
+    n = aa.shape[0]
+    off = ~np.eye(n, dtype=bool)
+    mask = off & np.isfinite(aa) & np.isfinite(bb)
+    if int(np.sum(mask)) < 3:
+        return float("nan")
+    av = aa[mask]
+    bv = bb[mask]
+    if float(np.std(av)) <= 0.0 or float(np.std(bv)) <= 0.0:
+        return float("nan")
+    res = pearsonr(av, bv)
     stat = getattr(res, "statistic", None)
     if stat is None:
         stat = res[0]

@@ -14,9 +14,9 @@ Run ``python bin/make_dataset.py --help`` for argparse defaults and exact wordin
 
     Choices (``--dataset-family`` token — summary):
 
-    - ``cosine_gaussian`` — Cosine means; theta-modulated diagonal Gaussian noise (baseline sigmas 0.30).
+    - ``cosine_gaussian`` — Cosine means; theta-modulated diagonal Gaussian noise (baseline sigmas 0.50).
     - ``cosine_gaussian_sqrtd`` — Same cosine means; noise variance scaled by ``x_dim`` (baseline
-      sigmas 0.10) so std ~ sqrt(d).
+      sigmas 0.50) so std ~ sqrt(d).
     - ``randamp_gaussian`` — Random-amplitude Gaussian bump means (per-dim amplitudes drawn once);
       Gaussian observation noise (baseline 0.30). Realized amplitudes in NPZ meta as
       ``randamp_mu_amp_per_dim``.

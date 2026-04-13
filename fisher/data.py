@@ -230,12 +230,12 @@ class ToyConditionalGaussianSqrtdDataset(ToyConditionalGaussianDataset):
     by ``x_dim`` so that noise std scales like ``sqrt(d)`` relative to the base family.
     This avoids pathological high-SNR / near-diagonal distance structure when ``d`` is large.
 
-    Defaults for `sigma_x1` / `sigma_x2` are ``0.1`` (tighter than the base ``0.3``); CLI
-    ``make_dataset.py`` applies the same family default when ``--sigma-x1``/``--sigma-x2`` are omitted.
+    Defaults for `sigma_x1` / `sigma_x2` are ``0.5`` (aligned with the ``cosine_gaussian`` recipe
+    scale); CLI ``make_dataset.py`` applies the fixed family recipe when sampling.
     """
 
-    sigma_x1: float = 0.1
-    sigma_x2: float = 0.1
+    sigma_x1: float = 0.5
+    sigma_x2: float = 0.5
 
     def __post_init__(self) -> None:
         super().__post_init__()

@@ -24,6 +24,13 @@ mamba run -n geo_diffusion python run_fisher.py decoder ... --device cuda
 
 - Default datasets and run outputs use `DATA_DIR = DATAROOT` from `global_setting.py` (override `DATAROOT` via `SCORE_MATCHING_FISHER_DATAROOT`). The repo `data/` path is a symlink to `DATAROOT` when present.
 
+## Markdown math (`journal/notes/`, AGENTS-facing docs)
+
+- Use **dollar delimiters** so math renders consistently in Markdown viewers (e.g. GitHub, many IDEs):
+  - **Inline:** `$...$` (e.g. `$\mu(\theta)$`, `$\sqrt{d}$`).
+  - **Display (own line):** `$$` on a line, equation, then `$$` on a line.
+- Avoid `\(...\)` and `\[...\]` in project Markdown unless a specific pipeline requires them.
+
 ## Notes
 
 - If CUDA is unavailable on the current machine, stop and report that constraint instead of silently switching to CPU.
