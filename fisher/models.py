@@ -210,6 +210,155 @@ class PriorThetaFlowVelocity(nn.Module):
         return self.forward(theta, t)
 
 
+class ConditionalThetaFlowVelocityFiLMPerLayer(nn.Module):
+    """Theta-flow velocity v(theta_t, x, t): x-trunk + residual FiLM from (theta_t, logit t)."""
+
+    def __init__(
+        self,
+        x_dim: int = 2,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        use_logit_time: bool = True,
+        use_layer_norm: bool = False,
+        gated_film: bool = False,
+        zero_out_init: bool = False,
+    ) -> None:
+        super().__init__()
+        if x_dim < 2:
+            raise ValueError("x_dim must be >= 2.")
+        self.x_dim = int(x_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.depth = int(depth)
+        self.use_logit_time = bool(use_logit_time)
+        self.gated_film = bool(gated_film)
+        cond_dim = 2  # theta_t, t_feat
+        self.in_proj = nn.Linear(int(x_dim), int(hidden_dim))
+        self.in_norm = nn.LayerNorm(int(hidden_dim)) if use_layer_norm else nn.Identity()
+        self.cond_residual = nn.Linear(cond_dim, int(hidden_dim))
+        nn.init.zeros_(self.cond_residual.weight)
+        nn.init.zeros_(self.cond_residual.bias)
+        self.blocks = nn.ModuleList()
+        for _ in range(int(depth)):
+            self.blocks.append(
+                nn.ModuleDict(
+                    {
+                        "lin": nn.Linear(int(hidden_dim), int(hidden_dim)),
+                        "gamma": nn.Linear(cond_dim, int(hidden_dim)),
+                        "beta": nn.Linear(cond_dim, int(hidden_dim)),
+                        "norm": (nn.LayerNorm(int(hidden_dim)) if use_layer_norm else nn.Identity()),
+                    }
+                )
+            )
+        self.out = nn.Linear(int(hidden_dim), 1)
+        if zero_out_init:
+            nn.init.zeros_(self.out.weight)
+            nn.init.zeros_(self.out.bias)
+
+    def _t_feat(self, t: torch.Tensor) -> torch.Tensor:
+        if t.ndim == 1:
+            t = t.unsqueeze(-1)
+        if self.use_logit_time:
+            t_clip = torch.clamp(t, min=1e-4, max=1.0 - 1e-4)
+            return torch.log(t_clip) - torch.log1p(-t_clip)
+        return t
+
+    def forward(self, theta_t: torch.Tensor, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        if theta_t.ndim == 1:
+            theta_t = theta_t.unsqueeze(-1)
+        t_feat = self._t_feat(t)
+        cond = torch.cat([theta_t, t_feat], dim=-1)
+        h = self.in_norm(self.in_proj(x))
+        h = torch.nn.functional.silu(h) + self.cond_residual(cond)
+        for blk in self.blocks:
+            y = blk["lin"](h)
+            gamma = blk["gamma"](cond)
+            beta = blk["beta"](cond)
+            if self.gated_film:
+                y = (1.0 + 0.5 * torch.tanh(gamma)) * y + beta
+            else:
+                y = gamma * y + beta
+            y = blk["norm"](y)
+            h = h + torch.nn.functional.silu(y)
+        return self.out(h)
+
+    @torch.no_grad()
+    def predict_velocity(self, theta: torch.Tensor, x: torch.Tensor, t_eval: float) -> torch.Tensor:
+        self.eval()
+        t = torch.full((theta.shape[0], 1), float(t_eval), device=theta.device)
+        return self.forward(theta, x, t)
+
+
+class PriorThetaFlowVelocityFiLMPerLayer(nn.Module):
+    """Prior theta-flow velocity v(theta_t, t): theta-trunk + residual FiLM from (theta_t, logit t)."""
+
+    def __init__(
+        self,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        use_logit_time: bool = True,
+        use_layer_norm: bool = False,
+        gated_film: bool = False,
+        zero_out_init: bool = False,
+    ) -> None:
+        super().__init__()
+        self.hidden_dim = int(hidden_dim)
+        self.depth = int(depth)
+        self.use_logit_time = bool(use_logit_time)
+        self.gated_film = bool(gated_film)
+        cond_dim = 2  # theta_t, t_feat
+        self.in_proj = nn.Linear(1, int(hidden_dim))
+        self.in_norm = nn.LayerNorm(int(hidden_dim)) if use_layer_norm else nn.Identity()
+        self.blocks = nn.ModuleList()
+        for _ in range(int(depth)):
+            self.blocks.append(
+                nn.ModuleDict(
+                    {
+                        "lin": nn.Linear(int(hidden_dim), int(hidden_dim)),
+                        "gamma": nn.Linear(cond_dim, int(hidden_dim)),
+                        "beta": nn.Linear(cond_dim, int(hidden_dim)),
+                        "norm": (nn.LayerNorm(int(hidden_dim)) if use_layer_norm else nn.Identity()),
+                    }
+                )
+            )
+        self.out = nn.Linear(int(hidden_dim), 1)
+        if zero_out_init:
+            nn.init.zeros_(self.out.weight)
+            nn.init.zeros_(self.out.bias)
+
+    def _t_feat(self, t: torch.Tensor) -> torch.Tensor:
+        if t.ndim == 1:
+            t = t.unsqueeze(-1)
+        if self.use_logit_time:
+            t_clip = torch.clamp(t, min=1e-4, max=1.0 - 1e-4)
+            return torch.log(t_clip) - torch.log1p(-t_clip)
+        return t
+
+    def forward(self, theta_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        if theta_t.ndim == 1:
+            theta_t = theta_t.unsqueeze(-1)
+        t_feat = self._t_feat(t)
+        cond = torch.cat([theta_t, t_feat], dim=-1)
+        h = self.in_norm(self.in_proj(theta_t))
+        h = torch.nn.functional.silu(h)
+        for blk in self.blocks:
+            y = blk["lin"](h)
+            gamma = blk["gamma"](cond)
+            beta = blk["beta"](cond)
+            if self.gated_film:
+                y = (1.0 + 0.5 * torch.tanh(gamma)) * y + beta
+            else:
+                y = gamma * y + beta
+            y = blk["norm"](y)
+            h = h + torch.nn.functional.silu(y)
+        return self.out(h)
+
+    @torch.no_grad()
+    def predict_velocity(self, theta: torch.Tensor, t_eval: float) -> torch.Tensor:
+        self.eval()
+        t = torch.full((theta.shape[0], 1), float(t_eval), device=theta.device)
+        return self.forward(theta, t)
+
+
 class ConditionalXScore(nn.Module):
     """Conditional x-score model for s(x_tilde, theta, sigma) with vector output in R^{x_dim}."""
 

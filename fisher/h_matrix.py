@@ -12,9 +12,11 @@ from fisher.models import (
     ConditionalScore1D,
     ConditionalScore1DFiLMPerLayer,
     ConditionalThetaFlowVelocity,
+    ConditionalThetaFlowVelocityFiLMPerLayer,
     PriorScore1D,
     PriorScore1DFiLMPerLayer,
     PriorThetaFlowVelocity,
+    PriorThetaFlowVelocityFiLMPerLayer,
 )
 
 
@@ -67,8 +69,14 @@ class HMatrixEstimator:
     def __init__(
         self,
         *,
-        model_post: ConditionalScore1D | ConditionalScore1DFiLMPerLayer | ConditionalThetaFlowVelocity,
-        model_prior: PriorScore1D | PriorScore1DFiLMPerLayer | PriorThetaFlowVelocity,
+        model_post: ConditionalScore1D
+        | ConditionalScore1DFiLMPerLayer
+        | ConditionalThetaFlowVelocity
+        | ConditionalThetaFlowVelocityFiLMPerLayer,
+        model_prior: PriorScore1D
+        | PriorScore1DFiLMPerLayer
+        | PriorThetaFlowVelocity
+        | PriorThetaFlowVelocityFiLMPerLayer,
         sigma_eval: float,
         device: torch.device,
         pair_batch_size: int = 65536,

@@ -530,7 +530,7 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--flow-eval-t",
         type=float,
-        default=0.9,
+        default=0.8,
         help="Fixed time t used to evaluate theta-flow velocity field for H-matrix (flow mode).",
     )
     p.add_argument("--flow-early-patience", type=int, default=1000)
@@ -543,6 +543,64 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument("--flow-restore-best", action="store_true", default=True)
     p.add_argument("--no-flow-restore-best", action="store_false", dest="flow_restore_best")
+    p.add_argument(
+        "--flow-score-arch",
+        type=str,
+        default="film",
+        choices=["mlp", "film"],
+        help=(
+            "Theta-flow only (--theta-field-method flow): posterior velocity network. "
+            "mlp concatenates [theta_t, x, t_feat]; film uses an x-trunk with FiLM from (theta_t, logit t). "
+            "Default: film."
+        ),
+    )
+    p.add_argument(
+        "--flow-prior-arch",
+        type=str,
+        default="film",
+        choices=["mlp", "film"],
+        help=(
+            "Theta-flow only: prior velocity v(theta_t, t). "
+            "mlp concatenates [theta_t, t_feat]; film uses a theta-trunk with FiLM from (theta_t, logit t). "
+            "Default: film."
+        ),
+    )
+    p.add_argument(
+        "--flow-gated-film",
+        action="store_true",
+        default=False,
+        help="Theta-flow FiLM posterior: use bounded multiplicative FiLM (tanh-gated gamma).",
+    )
+    p.add_argument(
+        "--flow-prior-gated-film",
+        action="store_true",
+        default=False,
+        help="Theta-flow FiLM prior: use bounded multiplicative FiLM (tanh-gated gamma).",
+    )
+    p.add_argument(
+        "--flow-use-layer-norm",
+        action="store_true",
+        default=False,
+        help="Theta-flow FiLM posterior: LayerNorm on trunk and FiLM block outputs.",
+    )
+    p.add_argument(
+        "--flow-prior-use-layer-norm",
+        action="store_true",
+        default=False,
+        help="Theta-flow FiLM prior: LayerNorm on trunk and FiLM block outputs.",
+    )
+    p.add_argument(
+        "--flow-zero-out-init",
+        action="store_true",
+        default=False,
+        help="Theta-flow FiLM posterior: zero-initialize final linear head.",
+    )
+    p.add_argument(
+        "--flow-prior-zero-out-init",
+        action="store_true",
+        default=False,
+        help="Theta-flow FiLM prior: zero-initialize final linear head.",
+    )
 
     p.add_argument(
         "--no-prior-score",

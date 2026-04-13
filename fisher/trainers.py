@@ -9,11 +9,13 @@ from fisher.models import (
     ConditionalScore1D,
     ConditionalScore1DFiLMPerLayer,
     ConditionalThetaFlowVelocity,
+    ConditionalThetaFlowVelocityFiLMPerLayer,
     ConditionalXFlowVelocity,
     ConditionalXFlowVelocityFiLMPerLayer,
     ConditionalXScore,
     LocalDecoderLogit,
     PriorThetaFlowVelocity,
+    PriorThetaFlowVelocityFiLMPerLayer,
     PriorScore1D,
     PriorScore1DFiLMPerLayer,
     UnconditionalXFlowVelocity,
@@ -1026,7 +1028,7 @@ def train_conditional_x_flow_model(
 
 
 def train_conditional_theta_flow_model(
-    model: ConditionalThetaFlowVelocity,
+    model: ConditionalThetaFlowVelocity | ConditionalThetaFlowVelocityFiLMPerLayer,
     theta_train: np.ndarray,
     x_train: np.ndarray,
     epochs: int,
@@ -1147,7 +1149,7 @@ def train_conditional_theta_flow_model(
 
 
 def train_prior_theta_flow_model(
-    model: PriorThetaFlowVelocity,
+    model: PriorThetaFlowVelocity | PriorThetaFlowVelocityFiLMPerLayer,
     theta_train: np.ndarray,
     epochs: int,
     batch_size: int,

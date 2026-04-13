@@ -1303,16 +1303,24 @@ def main(argv: list[str] | None = None) -> None:
     ref_dir = os.path.join(args.output_dir, "reference")
     os.makedirs(ref_dir, exist_ok=True)
     tfm = str(getattr(args, "theta_field_method", "dsm")).strip().lower()
-    print(
-        f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
-        f"(score_arch={getattr(args, 'score_arch', 'mlp')}, "
-        f"prior_arch={getattr(args, 'prior_score_arch', 'mlp')})",
-        flush=True,
-    )
     if tfm == "flow":
+        print(
+            f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
+            f"(flow_score_arch={getattr(args, 'flow_score_arch', 'film')}, "
+            f"flow_prior_arch={getattr(args, 'flow_prior_arch', 'film')}; "
+            f"DSM --score-arch/--prior-score-arch do not select theta-flow velocity nets)",
+            flush=True,
+        )
         print(
             "[convergence] flow mode uses score-from-velocity conversion "
             "(path.velocity_to_epsilon then s=-eps/sigma_t).",
+            flush=True,
+        )
+    else:
+        print(
+            f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
+            f"(score_arch={getattr(args, 'score_arch', 'mlp')}, "
+            f"prior_arch={getattr(args, 'prior_score_arch', 'mlp')})",
             flush=True,
         )
     print(
