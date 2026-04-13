@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any
 
 import numpy as np
@@ -63,6 +64,17 @@ def _make_flow_matching_path(scheduler_name: str) -> Any:
     return AffineProbPath(scheduler=scheduler_lookup[name]())
 
 
+def _make_flow_ode_solver(velocity_model: Any) -> Any:
+    try:
+        from flow_matching.solver.ode_solver import ODESolver
+    except ImportError as e:
+        raise ImportError(
+            "Flow likelihood estimation requires the `flow_matching` package. "
+            "Install it in your environment before using --theta-field-method flow_likelihood."
+        ) from e
+    return ODESolver(velocity_model=velocity_model)
+
+
 class HMatrixEstimator:
     """Estimate directed and symmetric H-matrices from score models."""
 
@@ -82,6 +94,7 @@ class HMatrixEstimator:
         pair_batch_size: int = 65536,
         field_method: str = "dsm",
         flow_scheduler: str = "cosine",
+        flow_ode_steps: int = 64,
     ) -> None:
         if pair_batch_size < 1:
             raise ValueError("pair_batch_size must be >= 1.")
@@ -91,16 +104,29 @@ class HMatrixEstimator:
         self.device = device
         self.pair_batch_size = int(pair_batch_size)
         method = str(field_method).strip().lower()
-        if method not in ("dsm", "flow"):
-            raise ValueError("field_method must be one of {'dsm', 'flow'}.")
+        if method not in ("dsm", "flow", "flow_likelihood"):
+            raise ValueError("field_method must be one of {'dsm', 'flow', 'flow_likelihood'}.")
         if method == "dsm" and sigma_eval <= 0.0:
             raise ValueError("sigma_eval must be positive for DSM mode.")
-        if method == "flow" and not (0.0 <= sigma_eval <= 1.0):
-            raise ValueError("For flow mode, t_eval (passed via sigma_eval) must be in [0, 1].")
+        if method in ("flow", "flow_likelihood") and not (0.0 <= sigma_eval <= 1.0):
+            raise ValueError("For flow-based methods, t_eval (passed via sigma_eval) must be in [0, 1].")
+        if int(flow_ode_steps) < 2:
+            raise ValueError("flow_ode_steps must be >= 2.")
         self.field_method = method
         self.flow_scheduler = str(flow_scheduler).strip().lower()
-        self.flow_score_mode = "velocity_to_epsilon"
-        self._flow_path = _make_flow_matching_path(self.flow_scheduler) if self.field_method == "flow" else None
+        self.flow_score_mode = "velocity_to_epsilon" if self.field_method == "flow" else None
+        self.flow_ode_steps = int(flow_ode_steps)
+        self.flow_likelihood_method = "midpoint"
+        self._flow_path = (
+            _make_flow_matching_path(self.flow_scheduler)
+            if self.field_method in ("flow", "flow_likelihood")
+            else None
+        )
+        self._flow_likelihood_solver_post = None
+        self._flow_likelihood_solver_prior = None
+        if self.field_method == "flow_likelihood":
+            self._flow_likelihood_solver_post = _make_flow_ode_solver(self._post_velocity_for_likelihood)
+            self._flow_likelihood_solver_prior = _make_flow_ode_solver(self._prior_velocity_for_likelihood)
 
     def _velocity_to_score(self, velocity: torch.Tensor, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         if self._flow_path is None:
@@ -116,6 +142,42 @@ class HMatrixEstimator:
         while sigma_t.ndim < x_t.ndim:
             sigma_t = sigma_t.unsqueeze(-1)
         return -eps / torch.clamp(sigma_t, min=1e-8)
+
+    @staticmethod
+    def _standard_normal_log_prob(theta: torch.Tensor) -> torch.Tensor:
+        theta_flat = theta.reshape(theta.shape[0], -1)
+        return -0.5 * (theta_flat.pow(2).sum(dim=1) + theta_flat.shape[1] * math.log(2.0 * math.pi))
+
+    @staticmethod
+    def _time_to_batch_column(t: torch.Tensor | float, ref: torch.Tensor) -> torch.Tensor:
+        t_tensor = t if torch.is_tensor(t) else torch.tensor(float(t), device=ref.device, dtype=ref.dtype)
+        t_tensor = t_tensor.to(device=ref.device, dtype=ref.dtype)
+        batch = int(ref.shape[0])
+        if t_tensor.ndim == 0:
+            return t_tensor.expand(batch).unsqueeze(-1)
+        if t_tensor.ndim == 1:
+            if t_tensor.shape[0] == 1:
+                return t_tensor.expand(batch).unsqueeze(-1)
+            if t_tensor.shape[0] != batch:
+                raise ValueError("ODE solver provided 1D time tensor with mismatched batch size.")
+            return t_tensor.unsqueeze(-1)
+        if t_tensor.ndim == 2:
+            if t_tensor.shape[0] == 1:
+                return t_tensor.expand(batch, t_tensor.shape[1])
+            if t_tensor.shape[0] != batch:
+                raise ValueError("ODE solver provided 2D time tensor with mismatched batch size.")
+            return t_tensor
+        raise ValueError("Unsupported time tensor rank from ODE solver.")
+
+    def _post_velocity_for_likelihood(self, x: torch.Tensor, t: torch.Tensor, **model_extras: Any) -> torch.Tensor:
+        x_cond = model_extras.get("x_cond", None)
+        if x_cond is None:
+            raise ValueError("flow_likelihood posterior ODE call requires model_extras['x_cond'].")
+        return self.model_post(x, x_cond, self._time_to_batch_column(t, x))
+
+    def _prior_velocity_for_likelihood(self, x: torch.Tensor, t: torch.Tensor, **model_extras: Any) -> torch.Tensor:
+        _ = model_extras
+        return self.model_prior(x, self._time_to_batch_column(t, x))
 
     @staticmethod
     def sort_by_theta(theta: np.ndarray, x: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -177,6 +239,52 @@ class HMatrixEstimator:
                 g[i0:i1, :] = (f_post - f_prior).astype(np.float64)
         return g
 
+    def compute_log_ratio_matrix(self, theta_sorted: np.ndarray, x_sorted: np.ndarray) -> np.ndarray:
+        """Directly estimate per-pair log-likelihood ratio matrix via flow ODE likelihoods.
+
+        r[i,j] = log p(theta_j | x_i) - log p(theta_j).
+        """
+        n = int(theta_sorted.shape[0])
+        if n < 1:
+            raise ValueError("Need at least one sample to compute H-matrix.")
+        row_block = max(1, int(self.pair_batch_size // n))
+        theta_grid_col = np.asarray(theta_sorted, dtype=np.float32).reshape(n, 1)
+        r = np.zeros((n, n), dtype=np.float64)
+        self.model_post.eval()
+        self.model_prior.eval()
+        if self._flow_likelihood_solver_post is None or self._flow_likelihood_solver_prior is None:
+            raise RuntimeError("flow_likelihood ODE solvers are not initialized.")
+        for i0 in range(0, n, row_block):
+            i1 = min(n, i0 + row_block)
+            xb = np.asarray(x_sorted[i0:i1], dtype=np.float32)
+            b = int(i1 - i0)
+            theta_tile = np.tile(theta_grid_col, (b, 1))
+            x_rep = np.repeat(xb, repeats=n, axis=0)
+            theta_t = torch.from_numpy(theta_tile).to(self.device)
+            x_t = torch.from_numpy(x_rep).to(self.device)
+            time_grid = torch.linspace(1.0, 0.0, self.flow_ode_steps + 1, device=theta_t.device, dtype=theta_t.dtype)
+            _, log_post = self._flow_likelihood_solver_post.compute_likelihood(
+                x_1=theta_t,
+                log_p0=self._standard_normal_log_prob,
+                step_size=None,
+                method=self.flow_likelihood_method,
+                time_grid=time_grid,
+                exact_divergence=True,
+                enable_grad=False,
+                x_cond=x_t,
+            )
+            _, log_prior = self._flow_likelihood_solver_prior.compute_likelihood(
+                x_1=theta_t,
+                log_p0=self._standard_normal_log_prob,
+                step_size=None,
+                method=self.flow_likelihood_method,
+                time_grid=time_grid,
+                exact_divergence=True,
+                enable_grad=False,
+            )
+            r[i0:i1, :] = (log_post.reshape(b, n) - log_prior.reshape(b, n)).detach().cpu().numpy().astype(np.float64)
+        return r
+
     @staticmethod
     def compute_c_matrix(theta_sorted: np.ndarray, g_matrix: np.ndarray) -> np.ndarray:
         theta_flat = np.asarray(theta_sorted, dtype=np.float64).reshape(-1)
@@ -218,9 +326,14 @@ class HMatrixEstimator:
         if np.any(np.diff(theta_sorted.reshape(-1)) < 0.0):
             raise ValueError("sort_by_theta produced a non-monotone theta sequence.")
 
-        g_sorted = self.compute_g_matrix(theta_sorted, x_sorted)
-        c_sorted = self.compute_c_matrix(theta_sorted, g_sorted)
-        delta_sorted = self.compute_delta_l(c_sorted)
+        if self.field_method == "flow_likelihood":
+            c_sorted = self.compute_log_ratio_matrix(theta_sorted, x_sorted)
+            delta_sorted = self.compute_delta_l(c_sorted)
+            g_sorted = np.zeros_like(c_sorted, dtype=np.float64)
+        else:
+            g_sorted = self.compute_g_matrix(theta_sorted, x_sorted)
+            c_sorted = self.compute_c_matrix(theta_sorted, g_sorted)
+            delta_sorted = self.compute_delta_l(c_sorted)
         h_dir_sorted = self.compute_h_directed(delta_sorted)
         h_sym_sorted = self.symmetrize(h_dir_sorted)
 
@@ -256,10 +369,10 @@ class HMatrixEstimator:
             h_sym=h_sym_used,
             sigma_eval=self.sigma_eval,
             field_method=self.field_method,
-            eval_scalar_name=("t_eval" if self.field_method == "flow" else "sigma_eval"),
+            eval_scalar_name=("t_eval" if self.field_method == "flow" else ("flow_ode_t_span" if self.field_method == "flow_likelihood" else "sigma_eval")),
             order_mode=order_mode,
             delta_diag_max_abs=delta_diag_max_abs,
             h_sym_max_asym_abs=h_sym_max_asym_abs,
-            flow_scheduler=(self.flow_scheduler if self.field_method == "flow" else None),
-            flow_score_mode=(self.flow_score_mode if self.field_method == "flow" else None),
+            flow_scheduler=(self.flow_scheduler if self.field_method in ("flow", "flow_likelihood") else None),
+            flow_score_mode=(self.flow_score_mode if self.flow_score_mode is not None else ("direct_ode_likelihood" if self.field_method == "flow_likelihood" else None)),
         )

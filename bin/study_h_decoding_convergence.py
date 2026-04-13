@@ -18,11 +18,13 @@ random-amplitude Gaussian bumps plus ``sqrt(x_dim)`` observation-noise scaling; 
 Regenerate the NPZ if the family does not match.
 
 For each ``n`` in ``--n-list``, the H matrix is computed from trained **posterior** and **prior**
-models (``--theta-field-method dsm`` or ``flow``). In ``flow`` mode, H uses the
-**flow-derived score** (velocity-to-epsilon conversion and ``s = -eps/sigma_t``), not raw velocity.
+models (``--theta-field-method dsm``, ``flow``, or ``flow_likelihood``). In ``flow`` mode, H uses
+the **flow-derived score** (velocity-to-epsilon conversion and ``s = -eps/sigma_t``), not raw
+velocity; ``flow_likelihood`` uses direct ODE likelihood ratios.
 This script defaults to **multi-layer FiLM**
 for the posterior (``--score-arch film``, ``--score-depth 3``) and a **3-layer MLP** prior
-(``--prior-score-arch mlp``). The **reference column** (``n_ref``) does **not** run DSM/flow: the
+(``--prior-score-arch mlp``). The **reference column** (``n_ref``) does **not** run learned H
+training: the
 matrix-panel top row shows **MC generative** ``sqrt(H^2)`` (same as the H correlation
 target), while the bottom row still shows pairwise decoding on the ``n_ref`` data subset.
 
@@ -563,7 +565,12 @@ def _render_training_losses_panel(
             continue
 
         tfm = str(bundle.get("theta_field_method", "dsm")).strip().lower()
-        post_lab = "theta-flow" if tfm == "flow" else "score (DSM)"
+        if tfm == "flow":
+            post_lab = "theta-flow score"
+        elif tfm == "flow_likelihood":
+            post_lab = "theta-flow direct likelihood"
+        else:
+            post_lab = "score (DSM)"
         _plot_loss_triplet(
             axes[0, j],
             bundle["score_train_losses"],
@@ -1316,6 +1323,18 @@ def main(argv: list[str] | None = None) -> None:
             "(path.velocity_to_epsilon then s=-eps/sigma_t).",
             flush=True,
         )
+    elif tfm == "flow_likelihood":
+        print(
+            f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
+            f"(flow_score_arch={getattr(args, 'flow_score_arch', 'mlp')}, "
+            f"flow_prior_arch={getattr(args, 'flow_prior_arch', 'mlp')})",
+            flush=True,
+        )
+        print(
+            "[convergence] flow_likelihood mode uses direct ODE likelihood ratios "
+            "(no velocity-to-score theta integration).",
+            flush=True,
+        )
     else:
         print(
             f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
@@ -1324,7 +1343,7 @@ def main(argv: list[str] | None = None) -> None:
             flush=True,
         )
     print(
-        "[convergence] n_ref reference: no DSM/flow training; matrix-panel top row = MC GT sqrt(H^2); "
+        "[convergence] n_ref reference: no learned H training at n_ref; matrix-panel top row = MC GT sqrt(H^2); "
         "pairwise decoding from n_ref subset only.",
         flush=True,
     )

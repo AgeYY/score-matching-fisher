@@ -809,8 +809,8 @@ def validate_dataset_sample_args(args: Any) -> None:
 
 def validate_estimation_args(args: Any) -> None:
     _apply_dsm_stability_preset(args)
-    if str(getattr(args, "theta_field_method", "dsm")) not in ("dsm", "flow"):
-        raise ValueError("--theta-field-method must be one of {'dsm', 'flow'}.")
+    if str(getattr(args, "theta_field_method", "dsm")) not in ("dsm", "flow", "flow_likelihood"):
+        raise ValueError("--theta-field-method must be one of {'dsm', 'flow', 'flow_likelihood'}.")
     if args.score_eval_sigmas < 1:
         raise ValueError("--score-eval-sigmas must be >= 1.")
     if args.score_early_patience < 1:
@@ -1092,9 +1092,9 @@ def run_shared_fisher_estimation(
         )
 
     theta_field_method = str(getattr(args, "theta_field_method", "dsm")).strip().lower()
-    if theta_field_method == "flow":
+    if theta_field_method in ("flow", "flow_likelihood"):
         if not bool(getattr(args, "prior_enable", True)):
-            raise ValueError("theta_field_method=flow currently requires prior model enabled.")
+            raise ValueError("flow-based theta_field_method currently requires prior model enabled.")
         flow_eval_t = float(getattr(args, "flow_eval_t", 0.8))
         if not (0.0 <= flow_eval_t <= 1.0):
             raise ValueError("--flow-eval-t must be in [0, 1].")
@@ -1104,7 +1104,8 @@ def run_shared_fisher_estimation(
         print(
             "[theta_flow] "
             f"fit={theta_score_fit.shape[0]} val={theta_score_val.shape[0]} "
-            f"scheduler={getattr(args, 'flow_scheduler', 'cosine')} t_eval={flow_eval_t:.6f} "
+            f"scheduler={getattr(args, 'flow_scheduler', 'cosine')} method={theta_field_method} "
+            f"t_eval={flow_eval_t:.6f} "
             f"theta_std={theta_std:.6f}"
         )
         _emb_post = ""
@@ -1303,10 +1304,11 @@ def run_shared_fisher_estimation(
 
         h_result: HMatrixResult | None = None
         if bool(getattr(args, "compute_h_matrix", False)):
-            h_eval = flow_eval_t
+            h_eval = flow_eval_t if theta_field_method == "flow" else 1.0
             print(
                 "[h_matrix] "
-                f"enabled=True field=flow t_eval={h_eval:.6f} "
+                f"enabled=True field={theta_field_method} "
+                f"{'t_eval' if theta_field_method == 'flow' else 'flow_ode_t_span'}={h_eval:.6f} "
                 f"restore_original_order={bool(getattr(args, 'h_restore_original_order', False))} "
                 f"pair_batch_size={int(getattr(args, 'h_batch_size', 65536))}"
             )
@@ -1316,7 +1318,7 @@ def run_shared_fisher_estimation(
                 sigma_eval=h_eval,
                 device=device,
                 pair_batch_size=int(getattr(args, "h_batch_size", 65536)),
-                field_method="flow",
+                field_method=theta_field_method,
                 flow_scheduler=str(getattr(args, "flow_scheduler", "cosine")),
             )
             h_result = h_estimator.run(
@@ -1331,8 +1333,12 @@ def run_shared_fisher_estimation(
                 args, h_result, suffix
             )
             print(
-                "[summary] flow mode completed (H-matrix only path; "
-                "velocity converted to score via path.velocity_to_epsilon and s=-eps/sigma_t)."
+                "[summary] flow-based mode completed (H-matrix only path; "
+                + (
+                    "velocity converted to score via path.velocity_to_epsilon and s=-eps/sigma_t)."
+                    if theta_field_method == "flow"
+                    else "flow_matching ODESolver.compute_likelihood used for per-pair log-likelihood ratios)."
+                )
             )
             print("Saved artifacts:")
             print(f"  - {post_loss_fig}")
@@ -1377,12 +1383,12 @@ def run_shared_fisher_estimation(
                 prior_n_clipped_steps=int(prior_train_out.get("n_clipped_steps", 0)),
                 prior_n_total_steps=int(prior_train_out.get("n_total_steps", 0)),
                 prior_lr_last=float(prior_train_out.get("lr_last", float("nan"))),
-                theta_field_method="flow",
+                theta_field_method=theta_field_method,
             )
             print(f"[training_losses] saved {tnpz}")
             return
 
-        raise RuntimeError("theta_field_method=flow requires --compute-h-matrix to produce output artifacts.")
+        raise RuntimeError("flow-based theta_field_method requires --compute-h-matrix to produce output artifacts.")
 
     theta_std = float(np.std(theta_score_fit))
     sigma_post = float("nan")

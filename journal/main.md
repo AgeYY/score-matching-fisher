@@ -16,6 +16,7 @@ Collected markdown notes in `journal/notes/`: long-form chapters (moved from the
 
 ## 2026-04
 
+- [2026-04-13 `flow_likelihood`: direct flow ODE log-density for $\theta$ H-matrix (math + algorithm)](notes/2026-04-13-flow-ode-direct-likelihood-theta-h-matrix.md)
 - [2026-04-13 H-decoding: weak binned-\(H\) vs GT on periodic cosine means (2D vs 3D `cosine_gaussian`)](notes/2026-04-13-h-decoding-periodic-cosine-weak.md)
 - [2026-04-11 EDM vs NCSM: synthetic score fit and 50D H-decoding (EDM underperforms)](notes/2026-04-11-edm-underperforms-ncsm-hdecoding-synthetic.md)
 - [2026-04-11 EDM vs NCSM benchmark: synthetic conditional theta-score (Layer A sanity check)](notes/2026-04-11-edm-vs-ncsm-synthetic-theta-score.md)

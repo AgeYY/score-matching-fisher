@@ -88,8 +88,11 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         "--theta-field-method",
         type=str,
         default="dsm",
-        choices=["dsm", "flow"],
-        help="Scalar field for theta-derivative pipeline: denoising score model (dsm) or flow velocity model (flow).",
+        choices=["dsm", "flow", "flow_likelihood"],
+        help=(
+            "Theta likelihood-ratio field method: denoising score model (dsm), flow velocity converted to "
+            "score then theta path integration (flow), or direct flow ODE likelihood ratio (flow_likelihood)."
+        ),
     )
 
     p.add_argument("--score-epochs", type=int, default=10000)
