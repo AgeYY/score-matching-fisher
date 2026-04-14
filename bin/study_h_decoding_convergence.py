@@ -225,16 +225,6 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="If set, symmetrize GT H^2 matrix as (H^2 + H^2.T) / 2 after one-sided MC estimation.",
     )
-    p.add_argument(
-        "--enforce-70-30-split",
-        action="store_true",
-        help=(
-            "Fail fast unless the NPZ meta train_frac is ~0.7 and estimation flags implement a strict "
-            "70/30 policy: --score-data-mode split, --score-val-source eval_set, "
-            "--score-fisher-eval-data score_eval. Also requires each n in --n-list to have non-empty "
-            "train and eval slices after subsetting."
-        ),
-    )
     add_estimation_arguments(p)
     p.set_defaults(
         output_dir=str(Path(DATA_DIR) / "h_decoding_convergence"),
@@ -320,57 +310,6 @@ def _subset_bundle(
         theta_eval=theta_eval,
         x_eval=x_eval,
     )
-
-
-def _subset_train_eval_counts(n: int, train_frac: float) -> tuple[int, int]:
-    """Match :func:`_subset_bundle` train/eval sizes for a nested subset of length ``n``."""
-    n = int(n)
-    tf = float(train_frac)
-    if tf >= 1.0:
-        n_train = n
-    else:
-        n_train = int(tf * n)
-        n_train = min(max(n_train, 1), n - 1)
-    n_eval = n - n_train
-    return int(n_train), int(n_eval)
-
-
-_ENFORCE_70_30_TARGET_FRAC = 0.7
-_ENFORCE_70_30_ATOL = 1e-5
-
-
-def _validate_enforce_70_30_split(args: argparse.Namespace, meta: dict, ns: list[int]) -> None:
-    """Raise ``ValueError`` if ``--enforce-70-30-split`` requirements are not met."""
-    tf_meta = float(meta.get("train_frac", 1.0))
-    if abs(tf_meta - _ENFORCE_70_30_TARGET_FRAC) > _ENFORCE_70_30_ATOL:
-        raise ValueError(
-            f"--enforce-70-30-split requires NPZ meta train_frac ≈ {_ENFORCE_70_30_TARGET_FRAC} "
-            f"(atol={_ENFORCE_70_30_ATOL}); got train_frac={tf_meta!r}. Regenerate with "
-            "make_dataset.py --train-frac 0.7."
-        )
-    if str(getattr(args, "score_data_mode", "")).strip().lower() != "split":
-        raise ValueError(
-            "--enforce-70-30-split requires --score-data-mode split "
-            f"(got {getattr(args, 'score_data_mode', None)!r})."
-        )
-    if str(getattr(args, "score_val_source", "")).strip().lower() != "eval_set":
-        raise ValueError(
-            "--enforce-70-30-split requires --score-val-source eval_set "
-            f"(got {getattr(args, 'score_val_source', None)!r})."
-        )
-    if str(getattr(args, "score_fisher_eval_data", "")).strip().lower() != "score_eval":
-        raise ValueError(
-            "--enforce-70-30-split requires --score-fisher-eval-data score_eval "
-            f"(got {getattr(args, 'score_fisher_eval_data', None)!r})."
-        )
-    for n in ns:
-        n_fit, n_val = _subset_train_eval_counts(n, tf_meta)
-        if n_fit < 1 or n_val < 1:
-            raise ValueError(
-                "--enforce-70-30-split requires non-empty fit and eval for each n in --n-list; "
-                f"for n={n} got n_fit={n_fit} n_eval={n_val} (train_frac={tf_meta}). "
-                "Increase n or use a smaller train_frac."
-            )
 
 
 def _make_full_args(args: argparse.Namespace, meta: dict) -> SimpleNamespace:
@@ -964,13 +903,6 @@ def _write_summary(
         f.write(f"dataset pool size: {n_pool}\n")
         f.write(f"reference run dir: {ref_dir}\n")
         f.write(f"meta seed: {meta.get('seed')}\n")
-        f.write(f"meta train_frac: {meta.get('train_frac')}\n")
-        f.write(
-            f"score_data_mode: {getattr(args, 'score_data_mode', '')}  "
-            f"score_val_source: {getattr(args, 'score_val_source', '')}  "
-            f"score_fisher_eval_data: {getattr(args, 'score_fisher_eval_data', '')}\n"
-        )
-        f.write(f"enforce_70_30_split: {bool(getattr(args, 'enforce_70_30_split', False))}\n")
         for k, v in paths_out.items():
             f.write(f"{k}: {v}\n")
         f.write("\n# Per-n training-loss artifacts\n")
@@ -1293,9 +1225,6 @@ def main(argv: list[str] | None = None) -> None:
             f"Require max(n-list) <= n-ref for nested subsets; got max(n_list)={max(ns)} n_ref={args.n_ref}."
         )
 
-    if bool(getattr(args, "enforce_70_30_split", False)):
-        _validate_enforce_70_30_split(args, meta, ns)
-
     if bool(getattr(args, "visualization_only", False)):
         cached = _load_cached_convergence_results(args.output_dir)
         _validate_cached_matches_cli(args, cached, ns)
@@ -1514,18 +1443,6 @@ def main(argv: list[str] | None = None) -> None:
         try:
             t1 = time.time()
             bundle_n = _subset_bundle(bundle, perm, int(n), meta)
-            n_fit, n_val = _subset_train_eval_counts(int(n), float(meta.get("train_frac", 1.0)))
-            if bool(getattr(args, "enforce_70_30_split", False)) or (
-                str(getattr(args, "score_fisher_eval_data", "")).strip().lower() == "score_eval"
-                and str(getattr(args, "score_data_mode", "")).strip().lower() == "split"
-            ):
-                print(
-                    "[convergence] split_summary "
-                    f"n={n} n_fit={n_fit} n_val={n_val} H_eval_rows={n_val} "
-                    f"(score_fisher_eval_data={getattr(args, 'score_fisher_eval_data', '')!r}; "
-                    f"meta train_frac={float(meta.get('train_frac', 1.0))!r})",
-                    flush=True,
-                )
             loaded_n, x_n, _ = _estimate_one(
                 args=args,
                 meta=meta,
