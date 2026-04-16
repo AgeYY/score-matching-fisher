@@ -88,11 +88,13 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         "--theta-field-method",
         type=str,
         default="dsm",
-        choices=["dsm", "flow", "flow_likelihood", "flow_x_likelihood"],
+        choices=["dsm", "flow", "flow_likelihood", "flow_x_likelihood", "ctsm_v"],
         help=(
             "Theta likelihood-ratio field method: denoising score model (dsm), flow velocity converted to "
             "score then theta path integration (flow), direct theta-space ODE likelihood ratio (flow_likelihood), "
-            "or conditional x-space ODE log-density log p(x|theta) (flow_x_likelihood; no prior model)."
+            "or conditional x-space ODE log-density log p(x|theta) (flow_x_likelihood; no prior model), "
+            "or pair-conditioned CTSM-v direct log-ratio integration over bridge time "
+            "(ctsm_v; no prior model)."
         ),
     )
 
@@ -503,6 +505,66 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         action="store_true",
         default=False,
         help="flow_x_likelihood + theta_fourier_mlp: drop constant 1 from the theta feature vector.",
+    )
+    p.add_argument(
+        "--ctsm-epochs",
+        type=int,
+        default=8000,
+        help="ctsm_v: training epochs for pair-conditioned CTSM-v model.",
+    )
+    p.add_argument(
+        "--ctsm-batch-size",
+        type=int,
+        default=512,
+        help="ctsm_v: batch size of ordered sample pairs (x0,a),(x1,b).",
+    )
+    p.add_argument(
+        "--ctsm-lr",
+        type=float,
+        default=2e-3,
+        help="ctsm_v: learning rate.",
+    )
+    p.add_argument(
+        "--ctsm-hidden-dim",
+        type=int,
+        default=256,
+        help="ctsm_v: hidden width of pair-conditioned time-score MLP.",
+    )
+    p.add_argument(
+        "--ctsm-two-sb-var",
+        type=float,
+        default=2.0,
+        help="ctsm_v: TwoSB bridge variance parameter (var = sigma^2).",
+    )
+    p.add_argument(
+        "--ctsm-factor",
+        type=float,
+        default=1.0,
+        help="ctsm_v: CTSM-v weighting factor in the closed-form target.",
+    )
+    p.add_argument(
+        "--ctsm-t-eps",
+        type=float,
+        default=1e-5,
+        help="ctsm_v: time sampling clamp t in [t_eps, 1-t_eps] for stability.",
+    )
+    p.add_argument(
+        "--ctsm-int-n-time",
+        type=int,
+        default=300,
+        help="ctsm_v: number of trapezoid time points for DeltaL integration.",
+    )
+    p.add_argument(
+        "--ctsm-m-scale",
+        type=float,
+        default=1.0,
+        help="ctsm_v: multiplicative scale for midpoint conditioning m.",
+    )
+    p.add_argument(
+        "--ctsm-delta-scale",
+        type=float,
+        default=0.5,
+        help="ctsm_v: multiplicative scale for offset conditioning Delta.",
     )
 
     p.add_argument(

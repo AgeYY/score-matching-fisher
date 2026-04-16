@@ -334,6 +334,14 @@ def hellinger_figure_labels(h_field_method: str) -> tuple[str, str, str]:
             r"Hellinger LB ($H^2$)",
             f"Flow ODE likelihood field ({tag}): binned symmetric H treated as H^2; ",
         )
+    if m == "ctsm_v":
+        return (
+            r"Binned $H_{ij}^2$ → Hellinger LB on $A^*_{ij}$"
+            + "\n"
+            + r"(pair-conditioned CTSM-v direct $\Delta L_{ij}$)",
+            r"Hellinger LB ($H^2$)",
+            "Pair-conditioned CTSM-v direct log-ratio field: binned symmetric H treated as H^2; ",
+        )
     return (
         r"Binned $H_{ij}^2$ → Hellinger LB on $A^*_{ij}$"
         + "\n"

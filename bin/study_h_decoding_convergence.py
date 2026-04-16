@@ -18,8 +18,10 @@ random-amplitude Gaussian bumps plus ``sqrt(x_dim)`` observation-noise scaling; 
 Regenerate the NPZ if the family does not match.
 
 For each ``n`` in ``--n-list``, the H matrix is computed from trained models
-(``--theta-field-method dsm``, ``flow``, ``flow_likelihood``, or ``flow_x_likelihood``); DSM / flow /
+(``--theta-field-method dsm``, ``flow``, ``flow_likelihood``, ``flow_x_likelihood``, or ``ctsm_v``); DSM / flow /
 flow_likelihood use posterior and prior, while ``flow_x_likelihood`` trains a conditional x-flow only.
+``ctsm_v`` trains a pair-conditioned bridge-time score model and directly integrates
+``DeltaL_ij = int_0^1 s_hat(x_i,t,m_ij,Delta_ij) dt``.
 In ``flow`` mode, H uses
 the **flow-derived score** (velocity-to-epsilon conversion and ``s = -eps/sigma_t``), not raw
 velocity; ``flow_likelihood`` uses theta-space ODE likelihood ratios; ``flow_x_likelihood`` uses
@@ -1358,6 +1360,19 @@ def main(argv: list[str] | None = None) -> None:
         print(
             "[convergence] flow_x_likelihood mode uses ODE likelihood on x-space flow log p(x|theta) "
             "(no prior model).",
+            flush=True,
+        )
+    elif tfm == "ctsm_v":
+        print(
+            f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
+            f"(ctsm_hidden_dim={int(getattr(args, 'ctsm_hidden_dim', 256))}, "
+            f"ctsm_two_sb_var={float(getattr(args, 'ctsm_two_sb_var', 2.0))}, "
+            f"ctsm_int_n_time={int(getattr(args, 'ctsm_int_n_time', 300))})",
+            flush=True,
+        )
+        print(
+            "[convergence] ctsm_v mode uses pair-conditioned bridge-time score integration "
+            "for per-pair directed log-likelihood ratios.",
             flush=True,
         )
     else:

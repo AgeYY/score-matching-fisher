@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 import math
 import os
 from types import SimpleNamespace
@@ -41,6 +42,9 @@ from fisher.models import (
     PriorThetaFlowVelocityThetaFourierMLP,
 )
 from fisher.dataset_family_recipes import raise_if_legacy_dataset_family
+from fisher.ctsm_models import ToyPairConditionedTimeScoreNet
+from fisher.ctsm_objectives import ctsm_v_pair_conditioned_loss
+from fisher.ctsm_paths import TwoSB
 from fisher.shared_dataset_io import (
     SHARED_DATASET_META_KEYS,
     apply_sigma_defaults_for_dataset_family,
@@ -865,9 +869,10 @@ def validate_estimation_args(args: Any) -> None:
         "flow",
         "flow_likelihood",
         "flow_x_likelihood",
+        "ctsm_v",
     ):
         raise ValueError(
-            "--theta-field-method must be one of {'dsm', 'flow', 'flow_likelihood', 'flow_x_likelihood'}."
+            "--theta-field-method must be one of {'dsm', 'flow', 'flow_likelihood', 'flow_x_likelihood', 'ctsm_v'}."
         )
     if args.score_eval_sigmas < 1:
         raise ValueError("--score-eval-sigmas must be >= 1.")
@@ -1096,14 +1101,32 @@ def validate_estimation_args(args: Any) -> None:
     if (
         bool(getattr(args, "compute_h_matrix", False))
         and not bool(getattr(args, "prior_enable", True))
-        and _tfm_val != "flow_x_likelihood"
+        and _tfm_val not in ("flow_x_likelihood", "ctsm_v")
     ):
         raise ValueError("--compute-h-matrix requires prior score; do not use --no-prior-score.")
     if bool(getattr(args, "skip_shared_fisher_gt_compare", False)):
         if not bool(getattr(args, "compute_h_matrix", False)):
             raise ValueError("--skip-shared-fisher-gt-compare requires --compute-h-matrix.")
-        if not bool(getattr(args, "prior_enable", True)) and _tfm_val != "flow_x_likelihood":
+        if not bool(getattr(args, "prior_enable", True)) and _tfm_val not in ("flow_x_likelihood", "ctsm_v"):
             raise ValueError("--skip-shared-fisher-gt-compare requires prior score; do not use --no-prior-score.")
+    if int(getattr(args, "ctsm_epochs", 1)) < 1:
+        raise ValueError("--ctsm-epochs must be >= 1.")
+    if int(getattr(args, "ctsm_batch_size", 1)) < 1:
+        raise ValueError("--ctsm-batch-size must be >= 1.")
+    if float(getattr(args, "ctsm_lr", 0.0)) <= 0.0:
+        raise ValueError("--ctsm-lr must be positive.")
+    if int(getattr(args, "ctsm_hidden_dim", 1)) < 1:
+        raise ValueError("--ctsm-hidden-dim must be >= 1.")
+    if float(getattr(args, "ctsm_two_sb_var", 0.0)) <= 0.0:
+        raise ValueError("--ctsm-two-sb-var must be positive.")
+    if float(getattr(args, "ctsm_t_eps", -1.0)) < 0.0 or float(getattr(args, "ctsm_t_eps", -1.0)) >= 0.5:
+        raise ValueError("--ctsm-t-eps must be in [0, 0.5).")
+    if int(getattr(args, "ctsm_int_n_time", 1)) < 2:
+        raise ValueError("--ctsm-int-n-time must be >= 2.")
+    if float(getattr(args, "ctsm_m_scale", 0.0)) <= 0.0:
+        raise ValueError("--ctsm-m-scale must be positive.")
+    if float(getattr(args, "ctsm_delta_scale", 0.0)) <= 0.0:
+        raise ValueError("--ctsm-delta-scale must be positive.")
 
 
 def _save_dsm_score_prior_training_losses_npz(
@@ -1203,6 +1226,206 @@ def merge_meta_into_args(meta: dict[str, Any], est_ns: Any) -> Any:
     return SimpleNamespace(**out)
 
 
+def train_pair_conditioned_ctsm_v_model(
+    *,
+    model: ToyPairConditionedTimeScoreNet,
+    theta_train: np.ndarray,
+    x_train: np.ndarray,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    device: torch.device,
+    log_every: int,
+    two_sb_var: float,
+    factor: float,
+    t_eps: float,
+    theta_val: np.ndarray | None = None,
+    x_val: np.ndarray | None = None,
+    early_stopping_patience: int = 1000,
+    early_stopping_min_delta: float = 1e-4,
+    early_stopping_ema_alpha: float = 0.05,
+    restore_best: bool = True,
+    val_batches_per_epoch: int = 8,
+) -> dict[str, Any]:
+    theta_fit_np = np.asarray(theta_train, dtype=np.float32).reshape(-1, 1)
+    x_fit_np = np.asarray(x_train, dtype=np.float32)
+    if x_fit_np.ndim != 2 or x_fit_np.shape[0] != theta_fit_np.shape[0]:
+        raise ValueError("CTSM-v training expects x_train shape (N,d) and theta_train length N.")
+    if theta_fit_np.shape[0] < 2:
+        raise ValueError("CTSM-v training requires at least 2 samples.")
+
+    theta_val_np = None
+    x_val_np = None
+    if theta_val is not None and x_val is not None:
+        theta_val_np = np.asarray(theta_val, dtype=np.float32).reshape(-1, 1)
+        x_val_np = np.asarray(x_val, dtype=np.float32)
+        if x_val_np.ndim != 2 or x_val_np.shape[0] != theta_val_np.shape[0]:
+            raise ValueError("CTSM-v validation expects x_val shape (N,d) and theta_val length N.")
+        if theta_val_np.shape[0] < 2:
+            theta_val_np = None
+            x_val_np = None
+
+    prob_path = TwoSB(dim=int(x_fit_np.shape[1]), var=float(two_sb_var))
+    opt = torch.optim.Adam(model.parameters(), lr=float(lr))
+
+    theta_fit_t = torch.from_numpy(theta_fit_np).to(device)
+    x_fit_t = torch.from_numpy(x_fit_np).to(device)
+    theta_val_t = torch.from_numpy(theta_val_np).to(device) if theta_val_np is not None else None
+    x_val_t = torch.from_numpy(x_val_np).to(device) if x_val_np is not None else None
+
+    train_losses: list[float] = []
+    val_losses: list[float] = []
+    val_monitor_losses: list[float] = []
+    best_epoch = 0
+    best_val_loss = float("inf")
+    best_state: dict[str, torch.Tensor] | None = None
+    ema_monitor: float | None = None
+    patience_bad = 0
+    stopped_early = False
+    has_nonfinite = False
+
+    grad_norm_sum = 0.0
+    grad_norm_max = 0.0
+    n_total_steps = 0
+
+    n_fit = int(theta_fit_t.shape[0])
+    n_val = int(theta_val_t.shape[0]) if theta_val_t is not None else 0
+
+    for epoch in range(1, int(epochs) + 1):
+        model.train()
+        ia = torch.randint(0, n_fit, (int(batch_size),), device=device)
+        ib = torch.randint(0, n_fit, (int(batch_size),), device=device)
+        x0 = x_fit_t[ia]
+        x1 = x_fit_t[ib]
+        a = theta_fit_t[ia]
+        b = theta_fit_t[ib]
+        loss = ctsm_v_pair_conditioned_loss(
+            model=model,
+            prob_path=prob_path,
+            x0=x0,
+            x1=x1,
+            a=a,
+            b=b,
+            factor=float(factor),
+            t_eps=float(t_eps),
+        )
+        if not torch.isfinite(loss):
+            has_nonfinite = True
+            raise RuntimeError(f"Non-finite CTSM-v train loss at epoch {epoch}: {float(loss.detach().cpu())!r}")
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+
+        grad_sq = 0.0
+        for p in model.parameters():
+            if p.grad is None:
+                continue
+            gn = float(p.grad.detach().norm(2).item())
+            grad_sq += gn * gn
+        grad_norm = float(math.sqrt(grad_sq))
+        grad_norm_sum += grad_norm
+        grad_norm_max = max(grad_norm_max, grad_norm)
+        n_total_steps += 1
+
+        opt.step()
+        train_loss = float(loss.detach().cpu().item())
+        train_losses.append(train_loss)
+
+        if theta_val_t is None or x_val_t is None:
+            val_loss = train_loss
+        else:
+            model.eval()
+            vb = max(1, int(val_batches_per_epoch))
+            v_losses: list[float] = []
+            with torch.no_grad():
+                for _ in range(vb):
+                    ia_v = torch.randint(0, n_val, (int(batch_size),), device=device)
+                    ib_v = torch.randint(0, n_val, (int(batch_size),), device=device)
+                    x0_v = x_val_t[ia_v]
+                    x1_v = x_val_t[ib_v]
+                    a_v = theta_val_t[ia_v]
+                    b_v = theta_val_t[ib_v]
+                    lv = ctsm_v_pair_conditioned_loss(
+                        model=model,
+                        prob_path=prob_path,
+                        x0=x0_v,
+                        x1=x1_v,
+                        a=a_v,
+                        b=b_v,
+                        factor=float(factor),
+                        t_eps=float(t_eps),
+                    )
+                    if not torch.isfinite(lv):
+                        has_nonfinite = True
+                        raise RuntimeError(
+                            f"Non-finite CTSM-v validation loss at epoch {epoch}: {float(lv.detach().cpu())!r}"
+                        )
+                    v_losses.append(float(lv.detach().cpu().item()))
+            val_loss = float(np.mean(v_losses))
+
+        val_losses.append(val_loss)
+        if ema_monitor is None:
+            ema_monitor = val_loss
+        else:
+            alpha = float(early_stopping_ema_alpha)
+            ema_monitor = alpha * val_loss + (1.0 - alpha) * ema_monitor
+        val_monitor_losses.append(float(ema_monitor))
+
+        improved = float(ema_monitor) < (best_val_loss - float(early_stopping_min_delta))
+        if improved:
+            best_val_loss = float(ema_monitor)
+            best_epoch = int(epoch)
+            patience_bad = 0
+            if restore_best:
+                best_state = deepcopy(model.state_dict())
+        else:
+            patience_bad += 1
+
+        if epoch % max(1, int(log_every)) == 0:
+            print(
+                "[ctsm_v] "
+                f"epoch={epoch} train={train_loss:.6f} val={val_loss:.6f} "
+                f"val_ema={float(ema_monitor):.6f} best_epoch={best_epoch}"
+            )
+        if patience_bad >= int(early_stopping_patience):
+            stopped_early = True
+            break
+
+    stopped_epoch = int(len(train_losses))
+    if restore_best and best_state is not None:
+        model.load_state_dict(best_state)
+
+    param_sq = 0.0
+    with torch.no_grad():
+        for p in model.parameters():
+            pn = float(p.detach().norm(2).item())
+            param_sq += pn * pn
+    param_norm_final = float(math.sqrt(param_sq))
+
+    if best_epoch <= 0:
+        best_epoch = stopped_epoch
+        if np.isfinite(np.asarray(val_monitor_losses, dtype=np.float64)).any():
+            best_val_loss = float(np.nanmin(np.asarray(val_monitor_losses, dtype=np.float64)))
+        else:
+            best_val_loss = float("nan")
+
+    return {
+        "train_losses": np.asarray(train_losses, dtype=np.float64),
+        "val_losses": np.asarray(val_losses, dtype=np.float64),
+        "val_monitor_losses": np.asarray(val_monitor_losses, dtype=np.float64),
+        "best_epoch": int(best_epoch),
+        "stopped_epoch": int(stopped_epoch),
+        "stopped_early": bool(stopped_early),
+        "best_val_loss": float(best_val_loss),
+        "has_nonfinite": bool(has_nonfinite),
+        "grad_norm_mean": float(grad_norm_sum / max(1, n_total_steps)),
+        "grad_norm_max": float(grad_norm_max),
+        "param_norm_final": float(param_norm_final),
+        "n_clipped_steps": int(0),
+        "n_total_steps": int(n_total_steps),
+        "lr_last": float(opt.param_groups[0]["lr"]),
+    }
+
+
 def run_shared_fisher_estimation(
     args: Any,
     dataset: ToyConditionalGaussianDataset
@@ -1268,6 +1491,174 @@ def run_shared_fisher_estimation(
         )
 
     theta_field_method = str(getattr(args, "theta_field_method", "dsm")).strip().lower()
+    if theta_field_method == "ctsm_v":
+        if not bool(getattr(args, "compute_h_matrix", False)):
+            raise RuntimeError("ctsm_v requires --compute-h-matrix to produce output artifacts.")
+        theta_std = float(np.std(theta_score_fit))
+        print(
+            "[ctsm_v] "
+            f"fit={theta_score_fit.shape[0]} val={theta_score_val.shape[0]} "
+            f"x_dim={int(args.x_dim)} theta_std={theta_std:.6f} "
+            f"two_sb_var={float(getattr(args, 'ctsm_two_sb_var', 2.0)):.6f} "
+            f"factor={float(getattr(args, 'ctsm_factor', 1.0)):.6f} "
+            f"t_eps={float(getattr(args, 'ctsm_t_eps', 1e-5)):.2e} "
+            f"int_n_time={int(getattr(args, 'ctsm_int_n_time', 300))}"
+        )
+        ctsm_model = ToyPairConditionedTimeScoreNet(
+            dim=int(args.x_dim),
+            hidden_dim=int(getattr(args, "ctsm_hidden_dim", 256)),
+            m_scale=float(getattr(args, "ctsm_m_scale", 1.0)),
+            delta_scale=float(getattr(args, "ctsm_delta_scale", 0.5)),
+        ).to(device)
+        ctsm_out = train_pair_conditioned_ctsm_v_model(
+            model=ctsm_model,
+            theta_train=theta_score_fit,
+            x_train=x_score_fit,
+            epochs=int(getattr(args, "ctsm_epochs", 8000)),
+            batch_size=int(getattr(args, "ctsm_batch_size", 512)),
+            lr=float(getattr(args, "ctsm_lr", 2e-3)),
+            device=device,
+            log_every=max(1, int(args.log_every)),
+            two_sb_var=float(getattr(args, "ctsm_two_sb_var", 2.0)),
+            factor=float(getattr(args, "ctsm_factor", 1.0)),
+            t_eps=float(getattr(args, "ctsm_t_eps", 1e-5)),
+            theta_val=theta_score_val,
+            x_val=x_score_val,
+            early_stopping_patience=int(getattr(args, "flow_early_patience", 1000)),
+            early_stopping_min_delta=float(getattr(args, "flow_early_min_delta", 1e-4)),
+            early_stopping_ema_alpha=float(getattr(args, "flow_early_ema_alpha", 0.05)),
+            restore_best=bool(getattr(args, "flow_restore_best", True)),
+        )
+        post_train_losses = np.asarray(ctsm_out["train_losses"], dtype=np.float64)
+        post_val_losses = np.asarray(ctsm_out["val_losses"], dtype=np.float64)
+        post_val_monitor_losses = np.asarray(ctsm_out.get("val_monitor_losses", []), dtype=np.float64)
+        post_best_epoch = int(ctsm_out["best_epoch"])
+        post_stopped_epoch = int(ctsm_out["stopped_epoch"])
+        post_stopped_early = bool(ctsm_out["stopped_early"])
+        post_best_val_loss = float(ctsm_out["best_val_loss"])
+
+        post_loss_fig = os.path.join(args.output_dir, "score_loss_vs_epoch.png")
+        epochs_arr = np.arange(1, post_train_losses.size + 1)
+        plt.figure(figsize=(8.8, 5.0))
+        plt.plot(epochs_arr, post_train_losses, color="#1f77b4", linewidth=2.0, label="CTSM-v train loss")
+        if post_val_losses.size == post_train_losses.size and np.any(np.isfinite(post_val_losses)):
+            plt.plot(epochs_arr, post_val_losses, color="#d62728", linewidth=2.0, label="CTSM-v val loss")
+        if post_val_monitor_losses.size == post_train_losses.size and np.any(np.isfinite(post_val_monitor_losses)):
+            plt.plot(
+                epochs_arr,
+                post_val_monitor_losses,
+                color="#ff7f0e",
+                linewidth=2.0,
+                linestyle="--",
+                label=f"CTSM-v val EMA (α={getattr(args, 'flow_early_ema_alpha', 0.05):g})",
+            )
+        if 1 <= post_best_epoch <= post_train_losses.size:
+            plt.axvline(post_best_epoch, color="#2ca02c", linestyle="--", linewidth=1.5, label=f"Best epoch {post_best_epoch}")
+        if 1 <= post_stopped_epoch <= post_train_losses.size:
+            plt.axvline(
+                post_stopped_epoch,
+                color="#9467bd",
+                linestyle=":",
+                linewidth=1.6,
+                label=f"Stop epoch {post_stopped_epoch}",
+            )
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.title("Pair-conditioned CTSM-v training")
+        plt.grid(alpha=0.25, linestyle="--", linewidth=0.8)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(post_loss_fig, dpi=180)
+        plt.close()
+
+        if args.score_fisher_eval_data == "full":
+            theta_score_fisher_eval, x_score_fisher_eval = theta_all, x_all
+        else:
+            theta_score_fisher_eval, x_score_fisher_eval = theta_score_eval, x_score_eval
+        if theta_score_fisher_eval.shape[0] == 0:
+            raise ValueError(
+                "--score-fisher-eval-data score_eval requires non-empty theta_eval/x_eval; "
+                "use --train-frac < 1 or --score-fisher-eval-data full."
+            )
+
+        h_eval = float(getattr(args, "ctsm_t_eps", 1e-5))
+        print(
+            "[h_matrix] "
+            "enabled=True field=ctsm_v "
+            f"ctsm_t_eps={h_eval:.6g} ctsm_int_n_time={int(getattr(args, 'ctsm_int_n_time', 300))} "
+            f"restore_original_order={bool(getattr(args, 'h_restore_original_order', False))} "
+            f"pair_batch_size={int(getattr(args, 'h_batch_size', 65536))}"
+        )
+        h_estimator = HMatrixEstimator(
+            model_post=ctsm_model,
+            model_prior=None,
+            sigma_eval=h_eval,
+            device=device,
+            pair_batch_size=int(getattr(args, "h_batch_size", 65536)),
+            field_method="ctsm_v",
+            flow_scheduler=str(getattr(args, "flow_scheduler", "vp")),
+            ctsm_int_n_time=int(getattr(args, "ctsm_int_n_time", 300)),
+            ctsm_t_eps=float(getattr(args, "ctsm_t_eps", 1e-5)),
+        )
+        h_result = h_estimator.run(
+            theta=theta_score_fisher_eval,
+            x=x_score_fisher_eval,
+            restore_original_order=bool(getattr(args, "h_restore_original_order", False)),
+        )
+
+        suffix = "_non_gauss" if args.dataset_family == "cosine_gmm" else "_theta_cov"
+        h_npz_path, h_summary_path, h_fig_path, h_delta_fig_path = _save_h_matrix_dsm_artifacts(args, h_result, suffix)
+        print(
+            "[summary] ctsm_v mode completed (pair-conditioned CTSM-v bridge score integrated over t for per-pair DeltaL)."
+        )
+        print("Saved artifacts:")
+        print(f"  - {post_loss_fig}")
+        print(f"  - {h_npz_path}")
+        print(f"  - {h_summary_path}")
+        print(f"  - {h_fig_path}")
+        if h_delta_fig_path:
+            print(f"  - {h_delta_fig_path}")
+        prior_empty = np.asarray([], dtype=np.float64)
+        tnpz = _save_dsm_score_prior_training_losses_npz(
+            args.output_dir,
+            theta_all=theta_all,
+            theta_score_fit=theta_score_fit,
+            theta_score_val=theta_score_val,
+            score_data_mode=str(args.score_data_mode),
+            score_train_losses=post_train_losses,
+            score_val_losses=post_val_losses,
+            score_val_monitor_losses=post_val_monitor_losses,
+            score_best_epoch=post_best_epoch,
+            score_stopped_epoch=post_stopped_epoch,
+            score_stopped_early=post_stopped_early,
+            score_best_val_loss=post_best_val_loss,
+            prior_enable=False,
+            prior_train_losses=prior_empty,
+            prior_val_losses=prior_empty,
+            prior_val_monitor_losses=prior_empty,
+            prior_best_epoch=0,
+            prior_stopped_epoch=0,
+            prior_stopped_early=False,
+            prior_best_val_loss=float("nan"),
+            score_has_nonfinite=bool(ctsm_out.get("has_nonfinite", False)),
+            score_grad_norm_mean=float(ctsm_out.get("grad_norm_mean", float("nan"))),
+            score_grad_norm_max=float(ctsm_out.get("grad_norm_max", float("nan"))),
+            score_param_norm_final=float(ctsm_out.get("param_norm_final", float("nan"))),
+            score_n_clipped_steps=int(ctsm_out.get("n_clipped_steps", 0)),
+            score_n_total_steps=int(ctsm_out.get("n_total_steps", 0)),
+            score_lr_last=float(ctsm_out.get("lr_last", float("nan"))),
+            prior_has_nonfinite=False,
+            prior_grad_norm_mean=float("nan"),
+            prior_grad_norm_max=float("nan"),
+            prior_param_norm_final=float("nan"),
+            prior_n_clipped_steps=0,
+            prior_n_total_steps=0,
+            prior_lr_last=float("nan"),
+            theta_field_method="ctsm_v",
+        )
+        print(f"[training_losses] saved {tnpz}")
+        return
+
     if theta_field_method == "flow_x_likelihood":
         if not bool(getattr(args, "compute_h_matrix", False)):
             raise RuntimeError("flow_x_likelihood requires --compute-h-matrix to produce output artifacts.")
