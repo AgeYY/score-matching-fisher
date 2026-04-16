@@ -33,6 +33,7 @@ from fisher.models import (
     ConditionalThetaFlowVelocityThetaFourierMLP,
     ConditionalXFlowVelocity,
     ConditionalXFlowVelocityFiLMPerLayer,
+    ConditionalXFlowVelocityIndependentMLP,
     ConditionalXFlowVelocityThetaFourierFiLMPerLayer,
     ConditionalXFlowVelocityThetaFourierMLP,
     LocalDecoderLogit,
@@ -1006,10 +1007,10 @@ def validate_estimation_args(args: Any) -> None:
             "--flow-score-arch theta_fourier_film is only valid with --theta-field-method flow_x_likelihood."
         )
     if _tfm_val == "flow_x_likelihood":
-        if _fsa not in ("mlp", "film", "theta_fourier_mlp", "theta_fourier_film"):
+        if _fsa not in ("mlp", "film", "theta_fourier_mlp", "theta_fourier_film", "indep_mlp"):
             raise ValueError(
-                "--flow-score-arch must be one of {'mlp', 'film', 'theta_fourier_mlp', 'theta_fourier_film'} when "
-                "--theta-field-method is flow_x_likelihood."
+                "--flow-score-arch must be one of {'mlp', 'film', 'theta_fourier_mlp', 'theta_fourier_film', "
+                "'indep_mlp'} when --theta-field-method is flow_x_likelihood."
             )
     elif _tfm_val in ("flow", "flow_likelihood"):
         if _fsa not in ("mlp", "film", "theta_fourier_mlp"):
@@ -1775,9 +1776,17 @@ def run_shared_fisher_estimation(
                 theta_fourier_include_linear=not bool(getattr(args, "flow_x_theta_fourier_no_linear", False)),
                 theta_fourier_include_bias=not bool(getattr(args, "flow_x_theta_fourier_no_bias", False)),
             ).to(device)
+        elif flow_score_arch == "indep_mlp":
+            x_flow_model = ConditionalXFlowVelocityIndependentMLP(
+                x_dim=int(args.x_dim),
+                hidden_dim=int(getattr(args, "flow_hidden_dim", 128)),
+                depth=int(getattr(args, "flow_depth", 3)),
+                use_logit_time=True,
+            ).to(device)
         else:
             raise ValueError(
-                "--flow-score-arch must be one of {'mlp', 'film', 'theta_fourier_mlp', 'theta_fourier_film'}."
+                "--flow-score-arch must be one of {'mlp', 'film', 'theta_fourier_mlp', 'theta_fourier_film', "
+                "'indep_mlp'}."
             )
         post_train_out = train_conditional_x_flow_model(
             model=x_flow_model,

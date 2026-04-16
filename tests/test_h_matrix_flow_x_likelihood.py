@@ -12,6 +12,7 @@ from fisher.cli_shared_fisher import add_estimation_arguments
 from fisher.h_matrix import HMatrixEstimator
 from fisher.models import (
     ConditionalXFlowVelocity,
+    ConditionalXFlowVelocityIndependentMLP,
     ConditionalXFlowVelocityThetaFourierFiLMPerLayer,
     ConditionalXFlowVelocityThetaFourierMLP,
 )
@@ -125,6 +126,21 @@ class TestHMatrixFlowXLikelihood(unittest.TestCase):
         args.theta_field_method = "flow_x_likelihood"
         validate_estimation_args(args)
 
+    def test_validate_accepts_indep_mlp_for_flow_x_only(self) -> None:
+        parser = argparse.ArgumentParser()
+        add_estimation_arguments(parser)
+        args = parser.parse_args(["--flow-score-arch", "indep_mlp"])
+        args.theta_field_method = "flow_x_likelihood"
+        validate_estimation_args(args)
+
+    def test_validate_rejects_indep_mlp_for_dsm(self) -> None:
+        parser = argparse.ArgumentParser()
+        add_estimation_arguments(parser)
+        args = parser.parse_args(["--flow-score-arch", "indep_mlp"])
+        args.theta_field_method = "dsm"
+        with self.assertRaises(ValueError):
+            validate_estimation_args(args)
+
     def test_effective_theta_fourier_omega_theta_range(self) -> None:
         ns = SimpleNamespace(
             flow_x_theta_fourier_omega_mode="theta_range",
@@ -166,6 +182,47 @@ class TestHMatrixFlowXLikelihood(unittest.TestCase):
         out = m(x_t, theta, t)
         self.assertEqual(tuple(out.shape), (b, 4))
         self.assertTrue(torch.isfinite(out).all())
+
+    def test_indep_mlp_forward_shape(self) -> None:
+        m = ConditionalXFlowVelocityIndependentMLP(x_dim=4, hidden_dim=16, depth=2, use_logit_time=True)
+        b = 5
+        x_t = torch.randn(b, 4)
+        theta = torch.randn(b, 1)
+        t = torch.rand(b, 1)
+        out = m(x_t, theta, t)
+        self.assertEqual(tuple(out.shape), (b, 4))
+        self.assertTrue(torch.isfinite(out).all())
+
+    def test_indep_mlp_perturb_one_x_only_affects_matching_output_dim(self) -> None:
+        torch.manual_seed(0)
+        m = ConditionalXFlowVelocityIndependentMLP(x_dim=3, hidden_dim=12, depth=2, use_logit_time=True)
+        x1 = torch.randn(6, 3)
+        theta = torch.randn(6, 1)
+        t = torch.rand(6, 1)
+        x2 = x1.clone()
+        x2[:, 0] = x2[:, 0] + 50.0
+        o1 = m(x1, theta, t)
+        o2 = m(x2, theta, t)
+        self.assertTrue(torch.allclose(o1[:, 1:], o2[:, 1:]))
+        self.assertFalse(torch.allclose(o1[:, 0], o2[:, 0]))
+
+    def test_flow_x_likelihood_accepts_indep_mlp_estimator(self) -> None:
+        post = ConditionalXFlowVelocityIndependentMLP(x_dim=2, hidden_dim=8, depth=1, use_logit_time=True)
+        est = HMatrixEstimator(
+            model_post=post,
+            model_prior=None,
+            sigma_eval=1.0,
+            device=torch.device("cpu"),
+            pair_batch_size=32,
+            field_method="flow_x_likelihood",
+            flow_scheduler="cosine",
+            flow_ode_steps=8,
+        )
+        theta = np.linspace(-0.5, 0.5, 4, dtype=np.float64).reshape(-1, 1)
+        x = np.random.default_rng(0).standard_normal((4, 2)).astype(np.float64)
+        out = est.run(theta=theta, x=x, restore_original_order=False)
+        self.assertEqual(out.field_method, "flow_x_likelihood")
+        self.assertTrue(np.isfinite(out.h_sym).all())
 
     def test_flow_x_fourier_theta_invariant_velocity_yields_small_offdiag_delta(self) -> None:
         post = _ThetaInvariantFourierXFlow()

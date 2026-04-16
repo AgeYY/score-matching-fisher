@@ -13,6 +13,7 @@ from fisher.models import (
     ConditionalThetaFlowVelocityThetaFourierMLP,
     ConditionalXFlowVelocity,
     ConditionalXFlowVelocityFiLMPerLayer,
+    ConditionalXFlowVelocityIndependentMLP,
     ConditionalXFlowVelocityThetaFourierFiLMPerLayer,
     ConditionalXFlowVelocityThetaFourierMLP,
     ConditionalXScore,
@@ -913,6 +914,7 @@ def _make_flow_matching_path(scheduler_name: str):
 def train_conditional_x_flow_model(
     model: ConditionalXFlowVelocity
     | ConditionalXFlowVelocityFiLMPerLayer
+    | ConditionalXFlowVelocityIndependentMLP
     | ConditionalXFlowVelocityThetaFourierFiLMPerLayer
     | ConditionalXFlowVelocityThetaFourierMLP,
     theta_train: np.ndarray,
@@ -1039,6 +1041,7 @@ def _train_conditional_x_flow_phase(
     *,
     model: ConditionalXFlowVelocity
     | ConditionalXFlowVelocityFiLMPerLayer
+    | ConditionalXFlowVelocityIndependentMLP
     | ConditionalXFlowVelocityThetaFourierFiLMPerLayer
     | ConditionalXFlowVelocityThetaFourierMLP,
     theta_train: np.ndarray,

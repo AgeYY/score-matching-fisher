@@ -697,6 +697,66 @@ class ConditionalXFlowVelocity(nn.Module):
         return self.forward(x_t, theta, t)
 
 
+class ConditionalXFlowVelocityIndependentMLP(nn.Module):
+    """Conditional velocity v(x_t, theta, t) with no cross-dimension coupling.
+
+    Each output dimension k is produced by a separate MLP that only sees
+    ``(x_t[..., k], theta, t)``. There is no mixing of different x coordinates
+    inside the network (factorized / independent-dimension inductive bias).
+    """
+
+    def __init__(
+        self,
+        x_dim: int = 2,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        use_logit_time: bool = True,
+    ) -> None:
+        super().__init__()
+        if x_dim < 1:
+            raise ValueError("x_dim must be >= 1.")
+        self.x_dim = int(x_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.depth = int(depth)
+        self.use_logit_time = bool(use_logit_time)
+        in_dim = 1 + 1 + 1  # x_k, theta, t_feat
+        self.nets = nn.ModuleList()
+        for _ in range(self.x_dim):
+            layers: list[nn.Module] = []
+            d_in = in_dim
+            for _ in range(depth):
+                layers.append(nn.Linear(d_in, hidden_dim))
+                layers.append(nn.SiLU())
+                d_in = hidden_dim
+            layers.append(nn.Linear(hidden_dim, 1))
+            self.nets.append(nn.Sequential(*layers))
+
+    def _t_feat(self, t: torch.Tensor) -> torch.Tensor:
+        if t.ndim == 1:
+            t = t.unsqueeze(-1)
+        if self.use_logit_time:
+            t_clip = torch.clamp(t, min=1e-4, max=1.0 - 1e-4)
+            return torch.log(t_clip) - torch.log1p(-t_clip)
+        return t
+
+    def forward(self, x_t: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        if x_t.shape[-1] != self.x_dim:
+            raise ValueError(f"x_t last dim {x_t.shape[-1]} != x_dim={self.x_dim}")
+        t_feat = self._t_feat(t)
+        parts: list[torch.Tensor] = []
+        for k in range(self.x_dim):
+            xk = x_t[:, k : k + 1]
+            feats = torch.cat([xk, theta, t_feat], dim=-1)
+            parts.append(self.nets[k](feats))
+        return torch.cat(parts, dim=-1)
+
+    @torch.no_grad()
+    def predict_velocity(self, x_t: torch.Tensor, theta: torch.Tensor, t_eval: float) -> torch.Tensor:
+        self.eval()
+        t = torch.full((x_t.shape[0], 1), float(t_eval), device=x_t.device)
+        return self.forward(x_t, theta, t)
+
+
 class ConditionalXFlowVelocityThetaFourierMLP(nn.Module):
     """Conditional velocity v(x_t, theta, t) with theta features [1, theta] plus sin/cos harmonics.
 
