@@ -968,6 +968,15 @@ def validate_estimation_args(args: Any) -> None:
         raise ValueError("--h-sigma-eval must be positive, or <= 0 to auto-select sigma_min.")
     if int(getattr(args, "flow_epochs", 1)) < 1:
         raise ValueError("--flow-epochs must be >= 1.")
+    if bool(getattr(args, "flow_x_two_stage_mean_theta_pretrain", False)):
+        if str(getattr(args, "theta_field_method", "dsm")).strip().lower() != "flow_x_likelihood":
+            raise ValueError(
+                "--flow-x-two-stage-mean-theta-pretrain is only valid with --theta-field-method flow_x_likelihood."
+            )
+        if int(getattr(args, "flow_epochs", 1)) < 2:
+            raise ValueError(
+                "--flow-x-two-stage-mean-theta-pretrain requires --flow-epochs >= 2 (split floor(E/2) + remainder)."
+            )
     if int(getattr(args, "flow_batch_size", 1)) < 1:
         raise ValueError("--flow-batch-size must be >= 1.")
     if float(getattr(args, "flow_lr", 0.0)) <= 0.0:
@@ -1704,12 +1713,22 @@ def run_shared_fisher_estimation(
                 f" theta_fourier_linear={not bool(getattr(args, 'flow_x_theta_fourier_no_linear', False))}"
                 f" theta_fourier_bias={not bool(getattr(args, 'flow_x_theta_fourier_no_bias', False))}"
             )
+        _xf_twostage = bool(getattr(args, "flow_x_two_stage_mean_theta_pretrain", False))
+        _e_tot = int(getattr(args, "flow_epochs", 10000))
+        _e1 = _e_tot // 2
+        _e2 = _e_tot - _e1
         print(
             "[x_flow] "
             f"fit={theta_score_fit.shape[0]} val={theta_score_val.shape[0]} "
             f"scheduler={getattr(args, 'flow_scheduler', 'vp')} method=flow_x_likelihood "
             f"x_dim={int(args.x_dim)} theta_std={theta_std:.6f}"
-            f"{_xf_extra}"
+            f" two_stage_mean_theta_pretrain={_xf_twostage}"
+            + (
+                f" (stage1_epochs={_e1} stage2_epochs={_e2})"
+                if _xf_twostage
+                else ""
+            )
+            + f"{_xf_extra}"
         )
         if flow_score_arch == "film":
             x_flow_model = ConditionalXFlowVelocityFiLMPerLayer(
@@ -1755,7 +1774,16 @@ def run_shared_fisher_estimation(
             early_stopping_ema_alpha=float(getattr(args, "flow_early_ema_alpha", 0.05)),
             restore_best=bool(getattr(args, "flow_restore_best", True)),
             scheduler_name=str(getattr(args, "flow_scheduler", "vp")),
+            two_stage_mean_theta_pretrain=_xf_twostage,
         )
+        if post_train_out.get("flow_x_two_stage"):
+            print(
+                "[x_flow] two-stage training finished: "
+                f"theta_mean_pretrain={float(post_train_out['theta_mean_pretrain']):.6f} "
+                f"stage_boundary_epoch={int(post_train_out['stage_boundary_epoch'])} "
+                f"best_epoch={int(post_train_out['best_epoch'])} "
+                f"best_val_smooth={float(post_train_out['best_val_loss']):.6f}"
+            )
         post_train_losses = np.asarray(post_train_out["train_losses"], dtype=np.float64)
         post_val_losses = np.asarray(post_train_out["val_losses"], dtype=np.float64)
         post_val_monitor_losses = np.asarray(post_train_out.get("val_monitor_losses", []), dtype=np.float64)
@@ -1779,6 +1807,17 @@ def run_shared_fisher_estimation(
                 linestyle="--",
                 label=f"X-flow val EMA (α={getattr(args, 'flow_early_ema_alpha', 0.05):g})",
             )
+        if post_train_out.get("flow_x_two_stage"):
+            sb = int(post_train_out["stage_boundary_epoch"])
+            if 1 <= sb < post_train_losses.size:
+                plt.axvline(
+                    sb,
+                    color="#7f7f7f",
+                    linestyle="-",
+                    linewidth=1.4,
+                    alpha=0.9,
+                    label=f"Two-stage boundary (end stage 1, epoch {sb})",
+                )
         if 1 <= post_best_epoch <= post_train_losses.size:
             plt.axvline(post_best_epoch, color="#2ca02c", linestyle="--", linewidth=1.5, label=f"Best epoch {post_best_epoch}")
         if 1 <= post_stopped_epoch <= post_train_losses.size:

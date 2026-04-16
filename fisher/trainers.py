@@ -925,7 +925,134 @@ def train_conditional_x_flow_model(
     early_stopping_ema_alpha: float = 0.05,
     restore_best: bool = True,
     scheduler_name: str = "cosine",
-) -> dict[str, float | int | bool | list[float]]:
+    *,
+    two_stage_mean_theta_pretrain: bool = False,
+) -> dict[str, float | int | bool | list[float] | list[int]]:
+    """Train conditional x-flow velocity. Optional two-stage: mean-theta pretrain then conditional finetune.
+
+    When ``two_stage_mean_theta_pretrain`` is True, ``epochs`` is split ``floor(E/2)`` + ``E - floor(E)``
+    (50/50 when E even; extra epoch goes to stage 2). Stage 1 fixes theta to mean(theta_train);
+    stage 2 uses real theta. Requires ``epochs >= 2``.
+    """
+    if two_stage_mean_theta_pretrain:
+        if int(epochs) < 2:
+            raise ValueError("two_stage_mean_theta_pretrain requires flow_epochs >= 2.")
+        e1 = int(epochs) // 2
+        e2 = int(epochs) - e1
+        mean_theta = float(np.mean(np.asarray(theta_train, dtype=np.float64).reshape(-1)))
+        print(
+            f"[x_flow] two_stage_mean_theta_pretrain=True stage1_epochs={e1} stage2_epochs={e2} "
+            f"theta_mean={mean_theta:.6f}"
+        )
+        out1 = _train_conditional_x_flow_phase(
+            model=model,
+            theta_train=theta_train,
+            x_train=x_train,
+            epochs=e1,
+            batch_size=batch_size,
+            lr=lr,
+            device=device,
+            log_every=log_every,
+            theta_val=theta_val,
+            x_val=x_val,
+            early_stopping_patience=early_stopping_patience,
+            early_stopping_min_delta=early_stopping_min_delta,
+            early_stopping_ema_alpha=early_stopping_ema_alpha,
+            restore_best=restore_best,
+            scheduler_name=scheduler_name,
+            fixed_theta=float(mean_theta),
+            phase_label="stage1_mean_theta",
+            epoch_base=0,
+            total_epochs_label=int(epochs),
+        )
+        actual_e1 = len(out1["train_losses"])
+        out2 = _train_conditional_x_flow_phase(
+            model=model,
+            theta_train=theta_train,
+            x_train=x_train,
+            epochs=e2,
+            batch_size=batch_size,
+            lr=lr,
+            device=device,
+            log_every=log_every,
+            theta_val=theta_val,
+            x_val=x_val,
+            early_stopping_patience=early_stopping_patience,
+            early_stopping_min_delta=early_stopping_min_delta,
+            early_stopping_ema_alpha=early_stopping_ema_alpha,
+            restore_best=restore_best,
+            scheduler_name=scheduler_name,
+            fixed_theta=None,
+            phase_label="stage2_conditional",
+            epoch_base=actual_e1,
+            total_epochs_label=int(epochs),
+        )
+        tr = list(out1["train_losses"]) + list(out2["train_losses"])
+        va = list(out1["val_losses"]) + list(out2["val_losses"])
+        vm = list(out1["val_monitor_losses"]) + list(out2["val_monitor_losses"])
+        # Final model uses stage-2 best checkpoint (already restored inside phase 2).
+        return {
+            "train_losses": tr,
+            "val_losses": va,
+            "val_monitor_losses": vm,
+            "best_val_loss": float(out2["best_val_loss"]),
+            "best_epoch": int(actual_e1 + int(out2["best_epoch"])),
+            "stopped_epoch": int(actual_e1 + int(out2["stopped_epoch"])),
+            "stopped_early": bool(out1.get("stopped_early") or out2.get("stopped_early")),
+            "flow_x_two_stage": True,
+            "stage1_epochs": int(e1),
+            "stage2_epochs": int(e2),
+            "theta_mean_pretrain": float(mean_theta),
+            "stage1_best_epoch_local": int(out1["best_epoch"]),
+            "stage2_best_epoch_local": int(out2["best_epoch"]),
+            "stage_boundary_epoch": int(actual_e1),
+        }
+
+    return _train_conditional_x_flow_phase(
+        model=model,
+        theta_train=theta_train,
+        x_train=x_train,
+        epochs=int(epochs),
+        batch_size=batch_size,
+        lr=lr,
+        device=device,
+        log_every=log_every,
+        theta_val=theta_val,
+        x_val=x_val,
+        early_stopping_patience=early_stopping_patience,
+        early_stopping_min_delta=early_stopping_min_delta,
+        early_stopping_ema_alpha=early_stopping_ema_alpha,
+        restore_best=restore_best,
+        scheduler_name=scheduler_name,
+        fixed_theta=None,
+        phase_label="",
+        epoch_base=0,
+        total_epochs_label=int(epochs),
+    )
+
+
+def _train_conditional_x_flow_phase(
+    *,
+    model: ConditionalXFlowVelocity | ConditionalXFlowVelocityFiLMPerLayer | ConditionalXFlowVelocityThetaFourierMLP,
+    theta_train: np.ndarray,
+    x_train: np.ndarray,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    device: torch.device,
+    log_every: int,
+    theta_val: np.ndarray | None,
+    x_val: np.ndarray | None,
+    early_stopping_patience: int,
+    early_stopping_min_delta: float,
+    early_stopping_ema_alpha: float,
+    restore_best: bool,
+    scheduler_name: str,
+    fixed_theta: float | None,
+    phase_label: str,
+    epoch_base: int,
+    total_epochs_label: int,
+) -> dict[str, float | int | bool | list[float] | list[int]]:
     path = _make_flow_matching_path(scheduler_name=scheduler_name)
     loader = to_score_loader(theta_train, x_train, batch_size=batch_size, shuffle=True)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -943,18 +1070,22 @@ def train_conditional_x_flow_model(
     best_state: dict[str, torch.Tensor] | None = None
     patience_counter = 0
     stopped_early = False
-    stopped_epoch = epochs
+    stopped_epoch = int(epochs)
     val_ema: float | None = None
     alpha = float(early_stopping_ema_alpha)
     if not (0.0 < alpha <= 1.0):
         raise ValueError("early_stopping_ema_alpha must be in (0, 1].")
 
-    for epoch in range(1, epochs + 1):
+    tag = f" {phase_label}" if phase_label else ""
+
+    for epoch in range(1, int(epochs) + 1):
         epoch_losses: list[float] = []
         model.train()
         for tb, xb in loader:
             tb = tb.to(device, non_blocking=True)
             xb = xb.to(device, non_blocking=True)
+            if fixed_theta is not None:
+                tb = torch.full_like(tb, float(fixed_theta))
             x0 = torch.randn_like(xb)
             t = torch.rand(xb.shape[0], device=xb.device)
             path_sample = path.sample(t=t, x_0=x0, x_1=xb)
@@ -975,6 +1106,8 @@ def train_conditional_x_flow_model(
                 for tb, xb in val_loader:
                     tb = tb.to(device, non_blocking=True)
                     xb = xb.to(device, non_blocking=True)
+                    if fixed_theta is not None:
+                        tb = torch.full_like(tb, float(fixed_theta))
                     x0 = torch.randn_like(xb)
                     t = torch.rand(xb.shape[0], device=xb.device)
                     path_sample = path.sample(t=t, x_0=x0, x_1=xb)
@@ -996,28 +1129,29 @@ def train_conditional_x_flow_model(
             val_monitor_losses.append(float("nan"))
         val_losses.append(mean_val_loss)
 
-        if epoch == 1 or epoch % log_every == 0 or epoch == epochs:
+        global_ep = int(epoch_base) + epoch
+        if epoch == 1 or epoch % log_every == 0 or epoch == int(epochs):
             if has_val:
                 print(
-                    f"[epoch {epoch:4d}/{epochs}] flow_train={mean_train_loss:.6f} "
+                    f"[epoch {global_ep:4d}/{total_epochs_label}]{tag} flow_train={mean_train_loss:.6f} "
                     f"val_loss={mean_val_loss:.6f} val_smooth={val_monitor_losses[-1]:.6f} "
                     f"best_smooth={best_val_loss:.6f} best_epoch={best_epoch}"
                 )
             else:
-                print(f"[epoch {epoch:4d}/{epochs}] flow_loss={mean_train_loss:.6f}")
+                print(f"[epoch {global_ep:4d}/{total_epochs_label}]{tag} flow_loss={mean_train_loss:.6f}")
 
         if has_val and patience_counter >= early_stopping_patience:
             stopped_early = True
             stopped_epoch = epoch
             print(
-                f"[early-stop] epoch={epoch} best_epoch={best_epoch} "
+                f"[early-stop]{tag} epoch={epoch} (global={global_ep}) best_epoch={best_epoch} "
                 f"best_smooth={best_val_loss:.6f} patience={early_stopping_patience}"
             )
             break
 
     if has_val and restore_best and best_state is not None:
         model.load_state_dict(best_state)
-        print(f"[restore-best] restored epoch={best_epoch} val_smooth={best_val_loss:.6f}")
+        print(f"[restore-best]{tag} restored epoch={best_epoch} val_smooth={best_val_loss:.6f}")
 
     return {
         "train_losses": train_losses,

@@ -272,6 +272,16 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--flow-restore-best", action="store_true", default=True)
     p.add_argument("--no-flow-restore-best", action="store_false", dest="flow_restore_best")
     p.add_argument(
+        "--flow-x-two-stage-mean-theta-pretrain",
+        action="store_true",
+        default=False,
+        help=(
+            "flow_x_likelihood only: split --flow-epochs 50/50 — stage 1 trains with theta fixed at "
+            "mean(theta on score-fit split) (unconditional-like); stage 2 finetunes with true per-sample theta. "
+            "Odd E: stage1=floor(E/2), stage2=E-stage1 (extra epoch to stage 2). Requires --flow-epochs >= 2."
+        ),
+    )
+    p.add_argument(
         "--flow-score-arch",
         type=str,
         default="mlp",
