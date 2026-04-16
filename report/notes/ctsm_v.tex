@@ -225,6 +225,7 @@ and identifying
 This produces a pair-conditioned bridge sample directly from observed data.
 
 \subsection{Inference}
+\label{subsec:ctsm-inference}
 
 Once the network has been trained, the estimated scalar time score is
 \begin{equation}
@@ -292,3 +293,149 @@ This yields a direct CTSM-v-style estimator for the desired pairwise quantities
 \begin{equation*}
     \log \frac{p(x_i\mid \theta_i)}{p(x_i\mid \theta_j)}.
 \end{equation*}
+
+\subsection{Hellinger distance and the log-likelihood ratio}
+
+Denoting the continuous-valued stimulus variable as $\theta$, the neural population response is modeled as a conditional distribution $p(x\mid \theta)$ which is unknown. A dataset is sampled from the joint distribution
+\begin{equation}
+    p(x,\theta)=p(\theta)p(x\mid \theta),
+\end{equation}
+where $p(\theta)$ is the prior over stimulus conditions.
+
+Representation dissimilarity analysis measures the ``distance'' between two stimulus conditions through the distance between the corresponding conditional distributions. A common choice is Kullback--Leibler divergence; however, KL divergence is not a metric. We therefore use the squared Hellinger distance $H^2(p_i,p_j)$,
+\begin{equation}
+    H^2(p_i,p_j)
+    =
+    1-\int \sqrt{p(x\mid \theta_i)\,p(x\mid \theta_j)}\,dx,
+    \qquad
+    p_i:=p(x\mid \theta_i),\;\; p_j:=p(x\mid \theta_j).
+\end{equation}
+Besides being a true distance, the Hellinger distance is attractive here for two additional reasons: locally (for infinitesimally close conditions) $H^2$ matches the Fisher-information metric to leading order, and it controls the Bayes error of the optimal binary classifier between $p_i$ and $p_j$.
+
+Define the log-likelihood ratio
+\begin{equation}
+    \Delta \ell_{ij}(x)
+    :=
+    \log p(x\mid \theta_j)-\log p(x\mid \theta_i).
+\end{equation}
+Then the Bhattacharyya integrand can be written as
+\begin{equation}
+    \sqrt{p(x\mid \theta_i)\,p(x\mid \theta_j)}
+    =
+    p(x\mid \theta_i)\exp\!\left(\frac{\Delta \ell_{ij}(x)}{2}\right),
+\end{equation}
+which yields the exact one-sided identity
+\begin{equation}
+    H^2(p_i,p_j)
+    =
+    1-
+    \mathbb{E}_{x\sim p_i}
+    \left[
+    \exp\!\left(\frac{\Delta \ell_{ij}(x)}{2}\right)
+    \right].
+\end{equation}
+Although exact, this form is asymmetric at the sample level because the expectation is taken only under $p_i$. To obtain a symmetric sample-wise quantity, we use
+\begin{equation}
+    H^2(p_i,p_j)
+    =
+    \frac12\,
+    \mathbb{E}_{x_i\sim p_i,\;x_j\sim p_j}
+    \left[
+    h_{ij}(x_i)+h_{ij}(x_j)
+    \right],
+\end{equation}
+where
+\begin{equation}
+    h_{ij}(x)
+    :=
+    1-\operatorname{sech}\!\left(\frac{\Delta \ell_{ij}(x)}{2}\right).
+\end{equation}
+This expresses $H^2$ as an average of two contributions, one evaluated on $x_i\sim p_i$ and one on $x_j\sim p_j$.
+
+The remaining task is to estimate $\Delta \ell_{ij}(x)$ without discretizing $\theta$. In an earlier score-based pipeline, $\Delta \ell_{ij}$ was obtained by integrating an estimated Fisher score along $\theta$. Here we estimate the log-likelihood ratio \emph{directly} from the pair-conditioned bridge time score: by \eqref{eq:ratio_from_time_score},
+\begin{equation}
+    \Delta \ell_{ij}(x)
+    =
+    \int_0^1 s_t^{\theta_i,\theta_j}(x)\,dt,
+\end{equation}
+and subsection~\ref{subsec:ctsm-inference} replaces $s_t$ by the learned $\hat s_\phi$ from \eqref{eq:scalar_from_vector}.
+
+\subsection{From CTSM-v estimates to the Hellinger matrix}
+
+For each ordered pair $(i,j)$ in the dataset, set
+\begin{equation}
+    m_{ij}:=\frac{\theta_i+\theta_j}{2},
+    \qquad
+    \Delta_{ij}:=\theta_j-\theta_i.
+\end{equation}
+Following \eqref{eq:estimated_ratio}, define the \emph{directed} log-ratio estimate evaluated on observation $x_i$ by
+\begin{equation}
+    \Delta L_{ij}
+    :=
+    \int_0^1 \hat s_\phi\!\left(x_i,t,m_{ij},\Delta_{ij}\right) dt
+    \;\approx\;
+    \log \frac{p(x_i\mid \theta_j)}{p(x_i\mid \theta_i)}.
+    \label{eq:DeltaLij}
+\end{equation}
+Thus $\Delta L_{ii}=0$, and $\Delta L_{ij}$ is exactly the quantity needed inside $h_{ij}$ after training the pair-conditioned CTSM-v model \eqref{eq:ctsmv_loss}.
+
+The directed sample-wise contribution is
+\begin{equation}
+    H^{\rightarrow}_{ij}
+    :=
+    1-\operatorname{sech}\!\left(\frac{\Delta L_{ij}}{2}\right),
+\end{equation}
+and its symmetrization is
+\begin{equation}
+    H^{\mathrm{sym}}_{ij}
+    :=
+    \frac12\left(H^{\rightarrow}_{ij}+H^{\rightarrow}_{ji}\right).
+\end{equation}
+Finally, the squared Hellinger distance matrix is obtained by taking expectations over independent draws from the two conditions,
+\begin{equation}
+    \mathbf{H}^2
+    :=
+    \bigl[\mathbb{E}_{x_i\sim p_i,\;x_j\sim p_j}[H^{\mathrm{sym}}_{ij}]\bigr],
+    \label{eq:H2_matrix}
+\end{equation}
+which in practice may be estimated by binning $\theta$ or by regression. The role of pair-conditioned CTSM-v is confined to the log-ratio step \eqref{eq:DeltaLij}; the Hellinger construction above is unchanged.
+
+\paragraph{Relation to \eqref{eq:final_query}.}
+The estimator \eqref{eq:final_query} targets $\log p(x_i\mid \theta_i)-\log p(x_i\mid \theta_j)$, i.e.\ the negative of $\Delta \ell_{ij}(x_i)$. Consistency requires $\Delta L_{ij}=-\,\hat r_\phi(x_i;\theta_j,\theta_i)$ with $\hat r_\phi$ as in \eqref{eq:estimated_ratio}.
+
+\subsection{Algorithmic summary: from \texorpdfstring{$\mathcal{D}$}{D} to \texorpdfstring{$\mathbf{H}^2$}{H squared}}
+
+Given
+\begin{equation}
+    \mathcal{D}=\{(\theta_i,x_i)\}_{i=1}^N,
+\end{equation}
+the pipeline is:
+\begin{enumerate}[leftmargin=2em]
+    \item Train $f_\phi(x,t,m,\Delta)$ with the pair-conditioned CTSM-v objective \eqref{eq:ctsmv_loss} on ordered sample pairs (as in the sampling scheme stated there).
+    \item For every ordered pair $(i,j)$, compute $m_{ij}$, $\Delta_{ij}$, and
+    \begin{equation*}
+        \Delta L_{ij}=\int_0^1 \hat s_\phi(x_i,t,m_{ij},\Delta_{ij})\,dt,
+        \qquad
+        \hat s_\phi=\mathbf{1}^\top f_\phi.
+    \end{equation*}
+    \item Form $H^{\rightarrow}_{ij}=1-\operatorname{sech}(\Delta L_{ij}/2)$ and $H^{\mathrm{sym}}_{ij}=\tfrac12(H^{\rightarrow}_{ij}+H^{\rightarrow}_{ji})$.
+    \item Estimate $\mathbf{H}^2$ via \eqref{eq:H2_matrix} (e.g.\ binning or regression).
+\end{enumerate}
+Thus
+\begin{equation*}
+    \{(\theta_i,x_i)\}_{i=1}^N
+    \longrightarrow
+    f_\phi
+    \longrightarrow
+    \Delta \mathbf{L}
+    \longrightarrow
+    \mathbf{H}^{\rightarrow}
+    \longrightarrow
+    \mathbf{H}^{\mathrm{sym}}
+    \longrightarrow
+    \mathbf{H}^2.
+\end{equation*}
+
+\subsection{Evaluation protocol (preliminary)}
+
+For toy analyses, one may retain a fixed generative model (e.g.\ a low-dimensional linear tuning curve with heteroscedastic Gaussian noise), draw a large reference sample to approximate ground-truth $H^2$ and pairwise decoding matrices, then subsample the dataset repeatedly, re-estimate $\mathbf{H}^2$ and decoding via the pipeline above, and compare off-diagonal entries to the reference. Under this revised method, only the estimator for $\Delta \ell_{ij}(x)$ changes relative to a Fisher-score integration baseline; the downstream comparison protocol is unchanged.
