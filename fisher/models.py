@@ -666,8 +666,8 @@ class ConditionalXFlowVelocity(nn.Module):
         use_logit_time: bool = True,
     ) -> None:
         super().__init__()
-        if x_dim < 2:
-            raise ValueError("x_dim must be >= 2.")
+        if x_dim < 1:
+            raise ValueError("x_dim must be >= 1.")
         self.x_dim = int(x_dim)
         self.use_logit_time = bool(use_logit_time)
         in_dim = x_dim + 1 + 1  # x_t, theta, t
@@ -718,8 +718,8 @@ class ConditionalXFlowVelocityThetaFourierMLP(nn.Module):
         theta_fourier_include_bias: bool = True,
     ) -> None:
         super().__init__()
-        if x_dim < 2:
-            raise ValueError("x_dim must be >= 2.")
+        if x_dim < 1:
+            raise ValueError("x_dim must be >= 1.")
         self.x_dim = int(x_dim)
         self.hidden_dim = int(hidden_dim)
         self.depth = int(depth)
@@ -800,8 +800,8 @@ class ConditionalXFlowVelocityFiLMPerLayer(nn.Module):
         use_logit_time: bool = True,
     ) -> None:
         super().__init__()
-        if x_dim < 2:
-            raise ValueError("x_dim must be >= 2.")
+        if x_dim < 1:
+            raise ValueError("x_dim must be >= 1.")
         self.x_dim = int(x_dim)
         self.hidden_dim = int(hidden_dim)
         self.depth = int(depth)
@@ -871,8 +871,8 @@ class ConditionalXFlowVelocityThetaFourierFiLMPerLayer(nn.Module):
         theta_fourier_include_bias: bool = True,
     ) -> None:
         super().__init__()
-        if x_dim < 2:
-            raise ValueError("x_dim must be >= 2.")
+        if x_dim < 1:
+            raise ValueError("x_dim must be >= 1.")
         self.x_dim = int(x_dim)
         self.hidden_dim = int(hidden_dim)
         self.depth = int(depth)

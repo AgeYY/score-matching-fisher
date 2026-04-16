@@ -854,8 +854,8 @@ def build_dataset_from_args(
 def validate_dataset_sample_args(args: Any) -> None:
     """Validate generic dataset args; per-family tuning/noise is fixed via ``apply_family_recipe_to_namespace``."""
     apply_sigma_defaults_for_dataset_family(args)
-    if args.x_dim < 2:
-        raise ValueError("--x-dim must be >= 2.")
+    if args.x_dim < 1:
+        raise ValueError("--x-dim must be >= 1.")
     if str(getattr(args, "dataset_family", "")) in (
         "cos_sin_piecewise",
         "linear_piecewise",
@@ -1640,7 +1640,7 @@ def run_shared_fisher_estimation(
             device=device,
             pair_batch_size=int(getattr(args, "h_batch_size", 65536)),
             field_method="ctsm_v",
-            flow_scheduler=str(getattr(args, "flow_scheduler", "vp")),
+            flow_scheduler=str(getattr(args, "flow_scheduler", "cosine")),
             ctsm_int_n_time=int(getattr(args, "ctsm_int_n_time", 300)),
             ctsm_t_eps=float(getattr(args, "ctsm_t_eps", 1e-5)),
         )
@@ -1727,7 +1727,7 @@ def run_shared_fisher_estimation(
         print(
             "[x_flow] "
             f"fit={theta_score_fit.shape[0]} val={theta_score_val.shape[0]} "
-            f"scheduler={getattr(args, 'flow_scheduler', 'vp')} method=flow_x_likelihood "
+            f"scheduler={getattr(args, 'flow_scheduler', 'cosine')} method=flow_x_likelihood "
             f"x_dim={int(args.x_dim)} theta_std={theta_std:.6f}"
             f" two_stage_mean_theta_pretrain={_xf_twostage}"
             + (
@@ -1794,7 +1794,7 @@ def run_shared_fisher_estimation(
             early_stopping_min_delta=float(getattr(args, "flow_early_min_delta", 1e-4)),
             early_stopping_ema_alpha=float(getattr(args, "flow_early_ema_alpha", 0.05)),
             restore_best=bool(getattr(args, "flow_restore_best", True)),
-            scheduler_name=str(getattr(args, "flow_scheduler", "vp")),
+            scheduler_name=str(getattr(args, "flow_scheduler", "cosine")),
             two_stage_mean_theta_pretrain=_xf_twostage,
         )
         if post_train_out.get("flow_x_two_stage"):
@@ -1883,7 +1883,7 @@ def run_shared_fisher_estimation(
             device=device,
             pair_batch_size=int(getattr(args, "h_batch_size", 65536)),
             field_method="flow_x_likelihood",
-            flow_scheduler=str(getattr(args, "flow_scheduler", "vp")),
+            flow_scheduler=str(getattr(args, "flow_scheduler", "cosine")),
         )
         h_result = h_estimator.run(
             theta=theta_score_fisher_eval,
@@ -1959,7 +1959,7 @@ def run_shared_fisher_estimation(
         print(
             "[theta_flow] "
             f"fit={theta_score_fit.shape[0]} val={theta_score_val.shape[0]} "
-            f"scheduler={getattr(args, 'flow_scheduler', 'vp')} method={theta_field_method} "
+            f"scheduler={getattr(args, 'flow_scheduler', 'cosine')} method={theta_field_method} "
             f"t_eval={flow_eval_t:.6f} "
             f"theta_std={theta_std:.6f}"
         )
@@ -2059,7 +2059,7 @@ def run_shared_fisher_estimation(
             early_stopping_min_delta=float(getattr(args, "flow_early_min_delta", 1e-4)),
             early_stopping_ema_alpha=float(getattr(args, "flow_early_ema_alpha", 0.05)),
             restore_best=bool(getattr(args, "flow_restore_best", True)),
-            scheduler_name=str(getattr(args, "flow_scheduler", "vp")),
+            scheduler_name=str(getattr(args, "flow_scheduler", "cosine")),
         )
         post_train_losses = np.asarray(post_train_out["train_losses"], dtype=np.float64)
         post_val_losses = np.asarray(post_train_out["val_losses"], dtype=np.float64)
@@ -2147,7 +2147,7 @@ def run_shared_fisher_estimation(
             early_stopping_min_delta=float(getattr(args, "prior_early_min_delta", 1e-4)),
             early_stopping_ema_alpha=float(getattr(args, "prior_early_ema_alpha", 0.05)),
             restore_best=bool(getattr(args, "prior_restore_best", True)),
-            scheduler_name=str(getattr(args, "flow_scheduler", "vp")),
+            scheduler_name=str(getattr(args, "flow_scheduler", "cosine")),
         )
         prior_train_losses = np.asarray(prior_train_out["train_losses"], dtype=np.float64)
         prior_val_losses = np.asarray(prior_train_out["val_losses"], dtype=np.float64)
@@ -2218,7 +2218,7 @@ def run_shared_fisher_estimation(
                 device=device,
                 pair_batch_size=int(getattr(args, "h_batch_size", 65536)),
                 field_method=theta_field_method,
-                flow_scheduler=str(getattr(args, "flow_scheduler", "vp")),
+                flow_scheduler=str(getattr(args, "flow_scheduler", "cosine")),
             )
             h_result = h_estimator.run(
                 theta=theta_score_fisher_eval,

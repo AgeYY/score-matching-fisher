@@ -16,6 +16,7 @@ Collected markdown notes in `journal/notes/`: long-form chapters (moved from the
 
 ## 2026-04
 
+- [2026-04-16 Marginal leading-$K$ dims for `flow_x_likelihood` H-decoding (10D `cosine_gaussian_sqrtd`): GT marginal, MLP x-flow, cosine scheduler, no two-stage / no Fourier (defaults in cited runs)](notes/2026-04-16-marginal-leading-dims-flow-x-h-decoding.md)
 - [2026-04-16 Pair-conditioned CTSM-v (`tests/ctsm_pair_conditioned.py`): discrete $\theta$ grid, conditional GMM variance, $\log p(x|b)-\log p(x|a)$ + reproducibility](notes/2026-04-16-pair-conditioned-ctsm-v-discrete-theta-gmm.md)
 - [2026-04-16 CTSM-v toy (`tests/ctsm.py`): `TwoSB` two-sample bridge, bimodal GMM $p$/$q$, $\log q/p$ by trapezoid $t$-integration + figures](notes/2026-04-16-ctsm-v-toy-gaussian-log-ratio.md)
 - [2026-04-13 `theta_fourier_mlp`: Fourier + linear $\theta$ features for conditional x-flow (`flow_x_likelihood`) + cosine $\sqrt{d}$ benchmarks; addendum: theta-space **theta_fourier_mlp** for **`flow`** (`velocity`→score) vs **`flow_likelihood`** (ODE log-density)](notes/2026-04-13-flow-x-likelihood-h-matrix-randamp-sqrtd-50d.md)

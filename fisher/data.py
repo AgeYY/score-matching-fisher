@@ -56,8 +56,8 @@ class ToyConditionalGaussianDataset:
     def __post_init__(self) -> None:
         if not (self.theta_low < self.theta_high):
             raise ValueError("theta_low must be smaller than theta_high.")
-        if self.x_dim < 2:
-            raise ValueError("x_dim must be >= 2.")
+        if self.x_dim < 1:
+            raise ValueError("x_dim must be >= 1.")
         if not (-0.99 < self.rho < 0.99):
             raise ValueError("rho must be in (-0.99, 0.99).")
         if not (0.0 <= self.cov_theta_amp1 < 0.95 and 0.0 <= self.cov_theta_amp2 < 0.95):
