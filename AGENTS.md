@@ -24,6 +24,12 @@ mamba run -n geo_diffusion python run_fisher.py decoder ... --device cuda
 
 - Default datasets and run outputs use `DATA_DIR = DATAROOT` from `global_setting.py` (override `DATAROOT` via `SCORE_MATCHING_FISHER_DATAROOT`). The repo `data/` path is a symlink to `DATAROOT` when present.
 
+### Reporting paths to humans (prefer `data/`)
+
+- When a file or directory lives under `DATAROOT`, **report it via the repo symlink** so paths match the tree users browse in the clone: **`./data/...`** (from repo root) or **`<repo-root>/data/...`** as a full absolute path.
+- **Do not** spell the same location using the bare resolved `DATAROOT` path (e.g. `/data/zeyuan/score-matching-fisher/...`) when `./data/` is available—those are the same inode, but `data/` is stable in docs and matches IDE file trees.
+- Scripts may still read/write using `DATAROOT` internally; this rule is for **agent replies and documentation**, not for changing code.
+
 ## Markdown math (`journal/notes/`, AGENTS-facing docs)
 
 - Use **dollar delimiters** so math renders consistently in Markdown viewers (e.g. GitHub, many IDEs):
@@ -73,8 +79,8 @@ Prefer `grep` on a **unique marker** you or the script wrote, not on a substring
 
 **Logging:** For long `mamba run` jobs, set `PYTHONUNBUFFERED=1` and/or redirect to a file so progress is visible; otherwise logs may buffer until exit.
 
-**When reporting to the user:** state that the pipeline finished, cite the **absolute path** to the master log and each output directory, and mention key artifacts (e.g. `h_decoding_convergence_combined.svg`, `h_decoding_convergence_results.npz`).
+**When reporting to the user:** state that the pipeline finished, cite the **absolute path** to the master log and each output directory (prefer **`<repo-root>/data/...`** when outputs are under `DATAROOT`), and mention key artifacts (e.g. `h_decoding_convergence_combined.svg`, `h_decoding_convergence_results.npz`).
 
 ## Output paths (agent replies)
 
-- When reporting where a script wrote files (datasets, figures, logs, run directories, NPZ/CSV/PNG, etc.), **always state the full absolute path** to the artifact or directory (e.g. `/grad/zeyuan/score-matching-fisher/data/...` or the resolved `DATAROOT` path from `global_setting.py`). Do not rely on repo-relative paths alone (`data/foo`) as the only location the user sees.
+- When reporting where a script wrote files (datasets, figures, logs, run directories, NPZ/CSV/PNG, etc.), **always state a full path** the user can open. Prefer **`<repo-root>/data/...`** for anything under `DATAROOT` (see **Data layout → Reporting paths**). Avoid giving only repo-relative `data/foo` with no root, and **avoid** spelling the same file using the resolved `DATAROOT` path alone (e.g. `/data/zeyuan/score-matching-fisher/...`) when `./data/` is present.
