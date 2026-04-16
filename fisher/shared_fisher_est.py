@@ -42,7 +42,11 @@ from fisher.models import (
     PriorThetaFlowVelocityThetaFourierMLP,
 )
 from fisher.dataset_family_recipes import raise_if_legacy_dataset_family
-from fisher.ctsm_models import ToyPairConditionedTimeScoreNet
+from fisher.ctsm_models import (
+    PairConditionedTimeScoreNetBase,
+    ToyPairConditionedTimeScoreNet,
+    ToyPairConditionedTimeScoreNetFiLM,
+)
 from fisher.ctsm_objectives import ctsm_v_pair_conditioned_loss
 from fisher.ctsm_paths import TwoSB
 from fisher.shared_dataset_io import (
@@ -1127,6 +1131,13 @@ def validate_estimation_args(args: Any) -> None:
         raise ValueError("--ctsm-m-scale must be positive.")
     if float(getattr(args, "ctsm_delta_scale", 0.0)) <= 0.0:
         raise ValueError("--ctsm-delta-scale must be positive.")
+    _ca = str(getattr(args, "ctsm_arch", "film")).strip().lower()
+    if _ca not in ("mlp", "film"):
+        raise ValueError("--ctsm-arch must be one of {'mlp','film'}.")
+    if int(getattr(args, "ctsm_film_depth", 1)) < 1:
+        raise ValueError("--ctsm-film-depth must be >= 1.")
+    if float(getattr(args, "ctsm_weight_decay", 0.0)) < 0.0:
+        raise ValueError("--ctsm-weight-decay must be >= 0.")
 
 
 def _save_dsm_score_prior_training_losses_npz(
@@ -1228,12 +1239,13 @@ def merge_meta_into_args(meta: dict[str, Any], est_ns: Any) -> Any:
 
 def train_pair_conditioned_ctsm_v_model(
     *,
-    model: ToyPairConditionedTimeScoreNet,
+    model: PairConditionedTimeScoreNetBase,
     theta_train: np.ndarray,
     x_train: np.ndarray,
     epochs: int,
     batch_size: int,
     lr: float,
+    weight_decay: float = 0.0,
     device: torch.device,
     log_every: int,
     two_sb_var: float,
@@ -1266,7 +1278,7 @@ def train_pair_conditioned_ctsm_v_model(
             x_val_np = None
 
     prob_path = TwoSB(dim=int(x_fit_np.shape[1]), var=float(two_sb_var))
-    opt = torch.optim.Adam(model.parameters(), lr=float(lr))
+    opt = torch.optim.AdamW(model.parameters(), lr=float(lr), weight_decay=float(weight_decay))
 
     theta_fit_t = torch.from_numpy(theta_fit_np).to(device)
     x_fit_t = torch.from_numpy(x_fit_np).to(device)
@@ -1497,19 +1509,35 @@ def run_shared_fisher_estimation(
         theta_std = float(np.std(theta_score_fit))
         print(
             "[ctsm_v] "
+            f"arch={str(getattr(args, 'ctsm_arch', 'film')).strip().lower()} "
             f"fit={theta_score_fit.shape[0]} val={theta_score_val.shape[0]} "
             f"x_dim={int(args.x_dim)} theta_std={theta_std:.6f} "
             f"two_sb_var={float(getattr(args, 'ctsm_two_sb_var', 2.0)):.6f} "
             f"factor={float(getattr(args, 'ctsm_factor', 1.0)):.6f} "
             f"t_eps={float(getattr(args, 'ctsm_t_eps', 1e-5)):.2e} "
-            f"int_n_time={int(getattr(args, 'ctsm_int_n_time', 300))}"
+            f"int_n_time={int(getattr(args, 'ctsm_int_n_time', 300))} "
+            f"adamw_wd={float(getattr(args, 'ctsm_weight_decay', 0.0)):.3e}"
         )
-        ctsm_model = ToyPairConditionedTimeScoreNet(
-            dim=int(args.x_dim),
-            hidden_dim=int(getattr(args, "ctsm_hidden_dim", 256)),
-            m_scale=float(getattr(args, "ctsm_m_scale", 1.0)),
-            delta_scale=float(getattr(args, "ctsm_delta_scale", 0.5)),
-        ).to(device)
+        _ctsm_arch = str(getattr(args, "ctsm_arch", "film")).strip().lower()
+        if _ctsm_arch == "film":
+            ctsm_model = ToyPairConditionedTimeScoreNetFiLM(
+                dim=int(args.x_dim),
+                hidden_dim=int(getattr(args, "ctsm_hidden_dim", 256)),
+                depth=int(getattr(args, "ctsm_film_depth", 3)),
+                m_scale=float(getattr(args, "ctsm_m_scale", 1.0)),
+                delta_scale=float(getattr(args, "ctsm_delta_scale", 0.5)),
+                use_logit_time=not bool(getattr(args, "ctsm_raw_time", False)),
+                gated_film=bool(getattr(args, "ctsm_gated_film", False)),
+            ).to(device)
+        elif _ctsm_arch == "mlp":
+            ctsm_model = ToyPairConditionedTimeScoreNet(
+                dim=int(args.x_dim),
+                hidden_dim=int(getattr(args, "ctsm_hidden_dim", 256)),
+                m_scale=float(getattr(args, "ctsm_m_scale", 1.0)),
+                delta_scale=float(getattr(args, "ctsm_delta_scale", 0.5)),
+            ).to(device)
+        else:
+            raise ValueError("--ctsm-arch must be one of {'mlp','film'}.")
         ctsm_out = train_pair_conditioned_ctsm_v_model(
             model=ctsm_model,
             theta_train=theta_score_fit,
@@ -1517,6 +1545,7 @@ def run_shared_fisher_estimation(
             epochs=int(getattr(args, "ctsm_epochs", 8000)),
             batch_size=int(getattr(args, "ctsm_batch_size", 512)),
             lr=float(getattr(args, "ctsm_lr", 2e-3)),
+            weight_decay=float(getattr(args, "ctsm_weight_decay", 0.0)),
             device=device,
             log_every=max(1, int(args.log_every)),
             two_sb_var=float(getattr(args, "ctsm_two_sb_var", 2.0)),
@@ -1585,6 +1614,7 @@ def run_shared_fisher_estimation(
         print(
             "[h_matrix] "
             "enabled=True field=ctsm_v "
+            f"ctsm_arch={str(getattr(args, 'ctsm_arch', 'film')).strip().lower()} "
             f"ctsm_t_eps={h_eval:.6g} ctsm_int_n_time={int(getattr(args, 'ctsm_int_n_time', 300))} "
             f"restore_original_order={bool(getattr(args, 'h_restore_original_order', False))} "
             f"pair_batch_size={int(getattr(args, 'h_batch_size', 65536))}"

@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from fisher.ctsm_models import ToyPairConditionedTimeScoreNet
+from fisher.ctsm_models import PairConditionedTimeScoreNetBase
 from fisher.ctsm_objectives import estimate_log_ratio_trapz_pair
 from fisher.models import (
     ConditionalScore1D,
@@ -97,7 +97,7 @@ class HMatrixEstimator:
         | ConditionalXFlowVelocity
         | ConditionalXFlowVelocityFiLMPerLayer
         | ConditionalXFlowVelocityThetaFourierMLP
-        | ToyPairConditionedTimeScoreNet,
+        | PairConditionedTimeScoreNetBase,
         model_prior: PriorScore1D
         | PriorScore1DFiLMPerLayer
         | PriorThetaFlowVelocity
@@ -149,8 +149,8 @@ class HMatrixEstimator:
         elif method == "ctsm_v":
             if model_prior is not None:
                 raise ValueError("ctsm_v expects model_prior=None.")
-            if not isinstance(model_post, ToyPairConditionedTimeScoreNet):
-                raise TypeError("ctsm_v requires model_post to be ToyPairConditionedTimeScoreNet.")
+            if not isinstance(model_post, PairConditionedTimeScoreNetBase):
+                raise TypeError("ctsm_v requires model_post to be a PairConditionedTimeScoreNetBase subclass.")
         elif model_prior is None:
             raise ValueError(f"field_method={method!r} requires a non-None model_prior.")
         self.field_method = method

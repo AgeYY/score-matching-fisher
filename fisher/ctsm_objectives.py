@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from scipy import integrate
 
-from fisher.ctsm_models import ToyFullTimeScoreNet, ToyPairConditionedTimeScoreNet
+from fisher.ctsm_models import PairConditionedTimeScoreNetBase, ToyFullTimeScoreNet
 from fisher.ctsm_paths import TwoSB
 
 
@@ -44,7 +44,7 @@ def ctsm_v_two_sample_loss(
 
 
 def ctsm_v_pair_conditioned_loss(
-    model: ToyPairConditionedTimeScoreNet,
+    model: PairConditionedTimeScoreNetBase,
     prob_path: TwoSB,
     x0: torch.Tensor,
     x1: torch.Tensor,
@@ -108,7 +108,7 @@ def estimate_log_ratio_trapz(
 
 @torch.no_grad()
 def estimate_log_ratio_trapz_pair(
-    model: ToyPairConditionedTimeScoreNet,
+    model: PairConditionedTimeScoreNetBase,
     x: torch.Tensor,
     a: torch.Tensor,
     b: torch.Tensor,

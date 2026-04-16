@@ -1365,7 +1365,8 @@ def main(argv: list[str] | None = None) -> None:
     elif tfm == "ctsm_v":
         print(
             f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
-            f"(ctsm_hidden_dim={int(getattr(args, 'ctsm_hidden_dim', 256))}, "
+            f"(ctsm_arch={str(getattr(args, 'ctsm_arch', 'film')).strip().lower()}, "
+            f"ctsm_hidden_dim={int(getattr(args, 'ctsm_hidden_dim', 256))}, "
             f"ctsm_two_sb_var={float(getattr(args, 'ctsm_two_sb_var', 2.0))}, "
             f"ctsm_int_n_time={int(getattr(args, 'ctsm_int_n_time', 300))})",
             flush=True,

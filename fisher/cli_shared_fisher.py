@@ -566,6 +566,41 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         default=0.5,
         help="ctsm_v: multiplicative scale for offset conditioning Delta.",
     )
+    p.add_argument(
+        "--ctsm-arch",
+        type=str,
+        default="film",
+        choices=["mlp", "film"],
+        help=(
+            "ctsm_v: network style. 'mlp' concatenates [x,t,m,Delta] into a 4-layer MLP. "
+            "'film' uses an x-trunk with per-layer FiLM from (logit(t), m, Delta), "
+            "matching the flow FiLM style in models.py."
+        ),
+    )
+    p.add_argument(
+        "--ctsm-film-depth",
+        type=int,
+        default=3,
+        help="ctsm_v + FiLM: number of residual FiLM blocks after silu(in_proj(x)). Ignored for --ctsm-arch mlp.",
+    )
+    p.add_argument(
+        "--ctsm-gated-film",
+        action="store_true",
+        default=False,
+        help="ctsm_v + FiLM: use tanh-gated multiplicative FiLM (gamma) for stability.",
+    )
+    p.add_argument(
+        "--ctsm-raw-time",
+        action="store_true",
+        default=False,
+        help="ctsm_v + FiLM: use raw t in FiLM cond instead of logit(t).",
+    )
+    p.add_argument(
+        "--ctsm-weight-decay",
+        type=float,
+        default=0.0,
+        help="ctsm_v: AdamW weight decay (L2 penalty on weights). Default 0 preserves prior behavior.",
+    )
 
     p.add_argument(
         "--no-prior-score",
