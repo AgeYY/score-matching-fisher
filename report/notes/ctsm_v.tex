@@ -1,0 +1,294 @@
+\section{A pair-conditioned bridge extension of CTSM-v for continuous parameterized densities}
+
+\subsection{Problem setup}
+
+We consider a continuous family of conditional densities
+\begin{equation}
+    p(x\mid \theta), \qquad \theta \in \Theta \subseteq \mathbb{R},
+\end{equation}
+and a dataset of paired observations
+\begin{equation}
+    \mathcal{D} = \{(\theta_n, x_n)\}_{n=1}^N.
+\end{equation}
+Our goal is to estimate, for any pair $(i,j)$,
+\begin{equation}
+    r_{ij}(x_i)
+    :=
+    \log \frac{p(x_i\mid \theta_i)}{p(x_i\mid \theta_j)}.
+\end{equation}
+More generally, for any $x$ and any pair of endpoint parameters $(a,b)$, we would like to estimate
+\begin{equation}
+    r(x; a,b)
+    :=
+    \log \frac{p(x\mid b)}{p(x\mid a)}.
+\end{equation}
+
+The guiding idea is to extend the two-sample CTSM-v framework from the case of two unknown endpoint densities to the case of a continuously indexed family $p(x\mid \theta)$. The extension is based on learning a \emph{pair-conditioned bridge model} between the endpoint conditionals $p(x\mid a)$ and $p(x\mid b)$.
+
+\subsection{Bridge representation of the conditional log-ratio}
+
+For any ordered pair $(a,b)$, define a probability path
+\begin{equation}
+    q_t^{a,b}(x), \qquad t \in [0,1],
+\end{equation}
+with endpoint constraints
+\begin{equation}
+    q_0^{a,b}(x) = p(x\mid a),
+    \qquad
+    q_1^{a,b}(x) = p(x\mid b).
+\end{equation}
+Let
+\begin{equation}
+    s_t^{a,b}(x)
+    :=
+    \partial_t \log q_t^{a,b}(x)
+\end{equation}
+be the corresponding time score. Then, by the fundamental theorem of calculus,
+\begin{equation}
+    \log \frac{p(x\mid b)}{p(x\mid a)}
+    =
+    \log q_1^{a,b}(x) - \log q_0^{a,b}(x)
+    =
+    \int_0^1 s_t^{a,b}(x) \, dt.
+    \label{eq:ratio_from_time_score}
+\end{equation}
+Therefore, if we can learn the time score $s_t^{a,b}(x)$ for each endpoint pair $(a,b)$, then the desired conditional log-ratio is obtained by integrating over $t$.
+
+\subsection{Pair-conditioned Gaussian bridge}
+
+A natural extension of the two-sided CTSM-v bridge is the following conditional Gaussian bridge. Given endpoint samples
+\begin{equation}
+    x_0 \sim p(\cdot \mid a),
+    \qquad
+    x_1 \sim p(\cdot \mid b),
+    \qquad
+    \varepsilon \sim \mathcal{N}(0, I),
+\end{equation}
+we define
+\begin{equation}
+    x_t
+    =
+    (1-t)x_0 + t x_1 + \sqrt{\sigma^2 t(1-t)}\, \varepsilon,
+    \qquad t \in [0,1].
+    \label{eq:twosb_bridge}
+\end{equation}
+Conditioned on $(x_0, x_1)$, the bridge distribution is Gaussian:
+\begin{equation}
+    q_t(x \mid x_0, x_1, a,b)
+    =
+    \mathcal{N}\!
+    \left(
+        x;
+        (1-t)x_0 + t x_1,
+        \sigma^2 t(1-t) I
+    \right).
+\end{equation}
+Marginalizing over the endpoint samples yields the unconditional bridge marginal
+\begin{equation}
+    q_t^{a,b}(x)
+    =
+    \iint
+    q_t(x \mid x_0, x_1, a,b)
+    \, p(x_0\mid a)
+    \, p(x_1\mid b)
+    \, dx_0 \, dx_1.
+    \label{eq:unconditional_bridge_marginal}
+\end{equation}
+By construction,
+\begin{equation}
+    q_0^{a,b}(x)=p(x\mid a),
+    \qquad
+    q_1^{a,b}(x)=p(x\mid b),
+\end{equation}
+so \eqref{eq:ratio_from_time_score} holds for the desired pairwise ratio.
+
+\subsection{Neural parameterization}
+
+We learn a vector-valued model
+\begin{equation}
+    f_\phi(x,t,m,\Delta) \in \mathbb{R}^d,
+\end{equation}
+where $d=\dim(x)$ and where the pair of endpoint parameters $(a,b)$ is reparameterized as
+\begin{equation}
+    m = \frac{a+b}{2},
+    \qquad
+    \Delta = b-a.
+\end{equation}
+Thus, the model input is
+\begin{equation}
+    (x,t,m,\Delta),
+\end{equation}
+rather than $(x,t,a,b)$. This parameterization separates the pair into a midpoint location $m$ and a relative displacement $\Delta$, which is often a more natural coordinate system for learning pair-conditioned transformations.
+
+The scalar time score estimate is obtained by summing the vector output,
+\begin{equation}
+    \hat s_\phi(x,t,m,\Delta)
+    :=
+    \mathbf{1}^\top f_\phi(x,t,m,\Delta),
+    \label{eq:scalar_from_vector}
+\end{equation}
+which matches the CTSM-v style in which a vector-valued regression target is learned and then reduced to the scalar time score.
+
+\subsection{CTSM-v training objective}
+
+The key advantage of the bridge \eqref{eq:twosb_bridge} is that conditioned on $(x_0,x_1)$, the path is Gaussian, so the CTSM-v target remains available in closed form.
+
+Let the bridge variance be denoted by
+\begin{equation}
+    \operatorname{Var}(x_t \mid x_0,x_1)
+    =
+    \sigma^2 t(1-t) I.
+\end{equation}
+Introduce the shorthand
+\begin{equation}
+    \mu_t = (1-t)x_0 + t x_1,
+    \qquad
+    x_t = \mu_t + \sqrt{\sigma^2 t(1-t)}\,\varepsilon.
+\end{equation}
+For the two-sided bridge, the vector CTSM-v target takes the form
+\begin{equation}
+    g(x_t,\varepsilon,x_0,x_1,t)
+    =
+    -\frac{\tau_t}{\sqrt{2}}
+    +
+    \frac{\tau_t}{\sqrt{2}}\,\varepsilon^{\odot 2}
+    +
+    \frac{\sqrt{2}\,\sqrt{t(1-t)}}{\kappa_t \sigma}
+    \, \varepsilon \odot (x_1-x_0),
+    \label{eq:vector_target}
+\end{equation}
+where
+\begin{equation}
+    \kappa_t
+    =
+    \sqrt{1 - 4t + 4t^2 + 2\alpha t - 2\alpha t^2},
+    \qquad
+    \tau_t = \frac{1-2t}{\kappa_t},
+    \label{eq:kappa_tau}
+\end{equation}
+and $\alpha$ is the time-weighting factor used in CTSM-v. The corresponding scalar prefactor is
+\begin{equation}
+    \lambda_t
+    =
+    \frac{\sqrt{2}\, t(1-t)}{\kappa_t}.
+    \label{eq:lambda_t}
+\end{equation}
+Here $\varepsilon^{\odot 2}$ denotes elementwise squaring and $\odot$ denotes elementwise multiplication.
+
+The CTSM-v loss is then
+\begin{equation}
+    \mathcal{L}(\phi)
+    =
+    \mathbb{E}
+    \left[
+        \left\|
+            g(x_t,\varepsilon,x_0,x_1,t)
+            -
+            \lambda_t f_\phi(x_t,t,m,\Delta)
+        \right\|_2^2
+    \right],
+    \label{eq:ctsmv_loss}
+\end{equation}
+where the expectation is over the training sampling procedure:
+\begin{equation}
+    a,b \sim \pi(a,b),
+    \qquad
+    x_0 \sim p(\cdot\mid a),
+    \qquad
+    x_1 \sim p(\cdot\mid b),
+    \qquad
+    t \sim \mathrm{Uniform}(\varepsilon_0,1-\varepsilon_0),
+    \qquad
+    \varepsilon \sim \mathcal{N}(0,I).
+\end{equation}
+The pair-conditioning variables are then set to
+\begin{equation}
+    m = \frac{a+b}{2},
+    \qquad
+    \Delta = b-a.
+\end{equation}
+
+In a dataset-based implementation, one may form training tuples by selecting two observed pairs
+\begin{equation}
+    (\theta_i,x_i), \qquad (\theta_j,x_j),
+\end{equation}
+and identifying
+\begin{equation}
+    a = \theta_i,
+    \qquad
+    b = \theta_j,
+    \qquad
+    x_0 = x_i,
+    \qquad
+    x_1 = x_j.
+\end{equation}
+This produces a pair-conditioned bridge sample directly from observed data.
+
+\subsection{Inference}
+
+Once the network has been trained, the estimated scalar time score is
+\begin{equation}
+    \hat s_\phi(x,t,m,\Delta)
+    =
+    \mathbf{1}^\top f_\phi(x,t,m,\Delta).
+\end{equation}
+For a query point $x$ and endpoint parameters $(a,b)$, define
+\begin{equation}
+    \hat r_\phi(x;a,b)
+    :=
+    \int_0^1 \hat s_\phi\!\left(x,t,\frac{a+b}{2},b-a\right) dt.
+    \label{eq:estimated_ratio}
+\end{equation}
+Then the desired pairwise estimator is
+\begin{equation}
+    \widehat{\log \frac{p(x_i\mid \theta_i)}{p(x_i\mid \theta_j)}}
+    =
+    \hat r_\phi(x_i;\theta_j,\theta_i).
+    \label{eq:final_query}
+\end{equation}
+The order of the endpoints matters: the denominator parameter is the start point and the numerator parameter is the end point.
+
+\subsection{Statistical assumption and interpretation}
+
+This construction is meaningful only under a regularity assumption on the family $p(x\mid \theta)$. In particular, the method relies on the idea that the conditional density varies sufficiently smoothly with $\theta$ so that information can be shared across different endpoint pairs through the parameterized model $f_\phi(x,t,m,\Delta)$.
+
+If the data contain very sparse observations at each $\theta$, then the quality of the learned ratio field depends critically on the extent to which the conditional family is learnable from shared structure across nearby and distant parameter values. Under this interpretation, the pair-conditioned bridge model is best viewed as a nonparametric or semiparametric estimator of the full conditional ratio field
+\begin{equation}
+    (x,a,b) 
+    \mapsto
+    \log \frac{p(x\mid b)}{p(x\mid a)},
+\end{equation}
+represented through the integral of a learned time score.
+
+\subsection{Summary}
+
+The proposed extension replaces the original two-distribution CTSM-v setting with a family of pair-conditioned bridges indexed by endpoint parameters $(a,b)$, or equivalently by midpoint--displacement coordinates $(m,\Delta)$. The main ingredients are:
+\begin{enumerate}[leftmargin=2em]
+    \item For each endpoint pair $(a,b)$, define the two-sided Gaussian bridge
+    \begin{equation*}
+        x_t = (1-t)x_0 + t x_1 + \sqrt{\sigma^2 t(1-t)}\,\varepsilon,
+        \qquad
+        x_0 \sim p(\cdot\mid a),
+        \quad
+        x_1 \sim p(\cdot\mid b).
+    \end{equation*}
+    \item Learn a vector-valued CTSM-v network
+    \begin{equation*}
+        f_\phi(x,t,m,\Delta),
+        \qquad
+        m=\frac{a+b}{2},
+        \quad
+        \Delta=b-a,
+    \end{equation*}
+    using the closed-form conditional Gaussian target.
+    \item Recover the conditional log-ratio by integration:
+    \begin{equation*}
+        \log \frac{p(x\mid b)}{p(x\mid a)}
+        \approx
+        \int_0^1 \mathbf{1}^\top f_\phi\!\left(x,t,\frac{a+b}{2},b-a\right) dt.
+    \end{equation*}
+\end{enumerate}
+This yields a direct CTSM-v-style estimator for the desired pairwise quantities
+\begin{equation*}
+    \log \frac{p(x_i\mid \theta_i)}{p(x_i\mid \theta_j)}.
+\end{equation*}

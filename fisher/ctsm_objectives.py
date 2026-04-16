@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from scipy import integrate
 
-from fisher.ctsm_models import ToyFullTimeScoreNet
+from fisher.ctsm_models import ToyFullTimeScoreNet, ToyPairConditionedTimeScoreNet
 from fisher.ctsm_paths import TwoSB
 
 
@@ -43,6 +43,49 @@ def ctsm_v_two_sample_loss(
     return loss_per_sample.mean()
 
 
+def ctsm_v_pair_conditioned_loss(
+    model: ToyPairConditionedTimeScoreNet,
+    prob_path: TwoSB,
+    x0: torch.Tensor,
+    x1: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    factor: float = 1.0,
+    t_eps: float = 1e-5,
+) -> torch.Tensor:
+    """
+    CTSM-v loss with pair conditioning (m, Delta) = ((a+b)/2, b-a).
+
+    Same TwoSB bridge and vector target as two-sample CTSM-v; only the network input changes.
+    """
+    batch_size = x0.shape[0]
+    t = torch.rand(batch_size, 1, device=x0.device) * (1.0 - 2.0 * t_eps) + t_eps
+
+    if a.dim() == 1:
+        a = a.unsqueeze(-1)
+    if b.dim() == 1:
+        b = b.unsqueeze(-1)
+
+    m = 0.5 * (a + b)
+    delta = b - a
+
+    mean, std, _ = prob_path.marginal_prob(x0, x1, t)
+    epsilon = torch.randn_like(x0)
+    x_t = mean + std * epsilon
+
+    lambda_t, targets = prob_path.full_epsilon_target(
+        epsilon=epsilon,
+        x0=x0,
+        x1=x1,
+        t=t,
+        factor=factor,
+    )
+
+    pred = lambda_t * model.forward_full(x_t, t, m, delta)
+    loss_per_sample = torch.mean((targets - pred) ** 2, dim=-1)
+    return loss_per_sample.mean()
+
+
 @torch.no_grad()
 def estimate_log_ratio_trapz(
     model: ToyFullTimeScoreNet,
@@ -59,6 +102,36 @@ def estimate_log_ratio_trapz(
     for t in ts:
         t_batch = torch.full((x.shape[0], 1), float(t), device=x.device)
         values.append(model(x, t_batch).squeeze(-1))
+    values = torch.stack(values, dim=0)
+    return torch.trapz(values, ts, dim=0)
+
+
+@torch.no_grad()
+def estimate_log_ratio_trapz_pair(
+    model: ToyPairConditionedTimeScoreNet,
+    x: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    eps1: float = 1e-5,
+    eps2: float = 1e-5,
+    n_time: int = 300,
+) -> torch.Tensor:
+    """
+    Trapezoidal integration of scalar s_hat(x,t,m,Delta) over t, with
+    m = (a+b)/2, Delta = b-a, estimating log p(x|b) - log p(x|a).
+    """
+    if a.dim() == 1:
+        a = a.unsqueeze(-1)
+    if b.dim() == 1:
+        b = b.unsqueeze(-1)
+    m = 0.5 * (a + b)
+    delta = b - a
+
+    ts = torch.linspace(eps1, 1.0 - eps2, n_time, device=x.device)
+    values = []
+    for t in ts:
+        t_batch = torch.full((x.shape[0], 1), float(t), device=x.device)
+        values.append(model(x, t_batch, m, delta).squeeze(-1))
     values = torch.stack(values, dim=0)
     return torch.trapz(values, ts, dim=0)
 
