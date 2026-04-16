@@ -252,7 +252,7 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--flow-lr", type=float, default=1e-3)
     p.add_argument("--flow-hidden-dim", type=int, default=128)
     p.add_argument("--flow-depth", type=int, default=3)
-    p.add_argument("--flow-scheduler", type=str, default="cosine", choices=["cosine", "vp", "linear_vp"])
+    p.add_argument("--flow-scheduler", type=str, default="vp", choices=["cosine", "vp", "linear_vp"])
     p.add_argument(
         "--flow-eval-t",
         type=float,

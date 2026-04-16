@@ -105,7 +105,7 @@ class HMatrixEstimator:
         device: torch.device,
         pair_batch_size: int = 65536,
         field_method: str = "dsm",
-        flow_scheduler: str = "cosine",
+        flow_scheduler: str = "vp",
         flow_ode_steps: int = 64,
     ) -> None:
         if pair_batch_size < 1:
