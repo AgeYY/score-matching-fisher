@@ -10,7 +10,11 @@ import torch
 
 from fisher.cli_shared_fisher import add_estimation_arguments
 from fisher.h_matrix import HMatrixEstimator
-from fisher.models import ConditionalXFlowVelocity, ConditionalXFlowVelocityThetaFourierMLP
+from fisher.models import (
+    ConditionalXFlowVelocity,
+    ConditionalXFlowVelocityThetaFourierFiLMPerLayer,
+    ConditionalXFlowVelocityThetaFourierMLP,
+)
 from fisher.shared_fisher_est import effective_flow_x_theta_fourier_omega, validate_estimation_args
 from fisher.trainers import train_conditional_x_flow_model
 
@@ -131,6 +135,22 @@ class TestHMatrixFlowXLikelihood(unittest.TestCase):
         om, _log = effective_flow_x_theta_fourier_omega(ns)
         self.assertAlmostEqual(float(om), 2.0 * math.pi / 12.0, places=10)
 
+    def test_theta_fourier_film_forward_shape(self) -> None:
+        m = ConditionalXFlowVelocityThetaFourierFiLMPerLayer(
+            x_dim=4,
+            hidden_dim=16,
+            depth=2,
+            theta_fourier_k=3,
+            theta_fourier_omega=0.7,
+        )
+        b = 5
+        x_t = torch.randn(b, 4)
+        theta = torch.randn(b, 1)
+        t = torch.rand(b, 1)
+        out = m(x_t, theta, t)
+        self.assertEqual(tuple(out.shape), (b, 4))
+        self.assertTrue(torch.isfinite(out).all())
+
     def test_theta_fourier_mlp_forward_shape(self) -> None:
         m = ConditionalXFlowVelocityThetaFourierMLP(
             x_dim=4,
@@ -175,6 +195,15 @@ class TestHMatrixFlowXLikelihood(unittest.TestCase):
         args = parser.parse_args([])
         args.theta_field_method = "dsm"
         args.flow_score_arch = "theta_fourier_mlp"
+        with self.assertRaises(ValueError):
+            validate_estimation_args(args)
+
+    def test_validate_rejects_theta_fourier_film_for_dsm(self) -> None:
+        parser = argparse.ArgumentParser()
+        add_estimation_arguments(parser)
+        args = parser.parse_args([])
+        args.theta_field_method = "dsm"
+        args.flow_score_arch = "theta_fourier_film"
         with self.assertRaises(ValueError):
             validate_estimation_args(args)
 

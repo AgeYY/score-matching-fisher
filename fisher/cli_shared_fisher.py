@@ -285,14 +285,15 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         "--flow-score-arch",
         type=str,
         default="mlp",
-        choices=["mlp", "film", "theta_fourier_mlp"],
+        choices=["mlp", "film", "theta_fourier_mlp", "theta_fourier_film"],
         help=(
             "Flow posterior velocity architecture. For --theta-field-method flow / flow_likelihood: "
             "mlp concatenates [theta_t, x, t_feat]; film uses an x-trunk with FiLM from separate "
             "theta/time embeddings (see --flow-cond-embed-*); "
             "theta_fourier_mlp uses [theta Fourier features, x, t_feat] (see --flow-theta-fourier-*). "
             "For --theta-field-method flow_x_likelihood only: theta_fourier_mlp is an MLP on "
-            "[x, theta Fourier features, t_feat] (see --flow-x-theta-fourier-*). Default: mlp."
+            "[x, theta Fourier features, t_feat]; theta_fourier_film is an x-trunk FiLM net with "
+            "(Fourier(theta), logit t) conditioning (see --flow-x-theta-fourier-*). Default: mlp."
         ),
     )
     p.add_argument(

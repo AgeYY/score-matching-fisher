@@ -13,6 +13,7 @@ from fisher.models import (
     ConditionalThetaFlowVelocityThetaFourierMLP,
     ConditionalXFlowVelocity,
     ConditionalXFlowVelocityFiLMPerLayer,
+    ConditionalXFlowVelocityThetaFourierFiLMPerLayer,
     ConditionalXFlowVelocityThetaFourierMLP,
     ConditionalXScore,
     LocalDecoderLogit,
@@ -910,7 +911,10 @@ def _make_flow_matching_path(scheduler_name: str):
 
 
 def train_conditional_x_flow_model(
-    model: ConditionalXFlowVelocity | ConditionalXFlowVelocityFiLMPerLayer | ConditionalXFlowVelocityThetaFourierMLP,
+    model: ConditionalXFlowVelocity
+    | ConditionalXFlowVelocityFiLMPerLayer
+    | ConditionalXFlowVelocityThetaFourierFiLMPerLayer
+    | ConditionalXFlowVelocityThetaFourierMLP,
     theta_train: np.ndarray,
     x_train: np.ndarray,
     epochs: int,
@@ -1033,7 +1037,10 @@ def train_conditional_x_flow_model(
 
 def _train_conditional_x_flow_phase(
     *,
-    model: ConditionalXFlowVelocity | ConditionalXFlowVelocityFiLMPerLayer | ConditionalXFlowVelocityThetaFourierMLP,
+    model: ConditionalXFlowVelocity
+    | ConditionalXFlowVelocityFiLMPerLayer
+    | ConditionalXFlowVelocityThetaFourierFiLMPerLayer
+    | ConditionalXFlowVelocityThetaFourierMLP,
     theta_train: np.ndarray,
     x_train: np.ndarray,
     epochs: int,
