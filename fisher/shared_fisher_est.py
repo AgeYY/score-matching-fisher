@@ -34,6 +34,7 @@ from fisher.models import (
     ConditionalXFlowVelocity,
     ConditionalXFlowVelocityFiLMPerLayer,
     ConditionalXFlowVelocityIndependentMLP,
+    ConditionalXFlowVelocityIndependentThetaFourierMLP,
     ConditionalXFlowVelocityThetaFourierFiLMPerLayer,
     ConditionalXFlowVelocityThetaFourierMLP,
     LocalDecoderLogit,
@@ -1007,10 +1008,17 @@ def validate_estimation_args(args: Any) -> None:
             "--flow-score-arch theta_fourier_film is only valid with --theta-field-method flow_x_likelihood."
         )
     if _tfm_val == "flow_x_likelihood":
-        if _fsa not in ("mlp", "film", "theta_fourier_mlp", "theta_fourier_film", "indep_mlp"):
+        if _fsa not in (
+            "mlp",
+            "film",
+            "theta_fourier_mlp",
+            "theta_fourier_film",
+            "indep_mlp",
+            "indep_theta_fourier_mlp",
+        ):
             raise ValueError(
                 "--flow-score-arch must be one of {'mlp', 'film', 'theta_fourier_mlp', 'theta_fourier_film', "
-                "'indep_mlp'} when --theta-field-method is flow_x_likelihood."
+                "'indep_mlp', 'indep_theta_fourier_mlp'} when --theta-field-method is flow_x_likelihood."
             )
     elif _tfm_val in ("flow", "flow_likelihood"):
         if _fsa not in ("mlp", "film", "theta_fourier_mlp"):
@@ -1036,7 +1044,7 @@ def validate_estimation_args(args: Any) -> None:
         raise ValueError("--flow-x-theta-fourier-k must be >= 0.")
     if _fx_omega_mode not in ("fixed", "theta_range"):
         raise ValueError("--flow-x-theta-fourier-omega-mode must be one of {'fixed', 'theta_range'}.")
-    if _tfm_val == "flow_x_likelihood" and _fsa in ("theta_fourier_mlp", "theta_fourier_film"):
+    if _tfm_val == "flow_x_likelihood" and _fsa in ("theta_fourier_mlp", "theta_fourier_film", "indep_theta_fourier_mlp"):
         if _fx_omega_mode == "theta_range":
             lo = float(getattr(args, "theta_low", -6.0))
             hi = float(getattr(args, "theta_high", 6.0))
@@ -1054,7 +1062,7 @@ def validate_estimation_args(args: Any) -> None:
         theta_feat_dim = (1 if _fx_inc_bias else 0) + (1 if _fx_inc_lin else 0) + 2 * _fx_k
         if theta_feat_dim < 1:
             raise ValueError(
-                "flow_x theta_fourier_mlp / theta_fourier_film: theta feature dim is 0. Use "
+                "flow_x theta_fourier_mlp / theta_fourier_film / indep_theta_fourier_mlp: theta feature dim is 0. Use "
                 "--flow-x-theta-fourier-k >= 1 or keep linear/bias features enabled."
             )
     _ft_post_k = int(getattr(args, "flow_theta_fourier_k", 4))
@@ -1710,7 +1718,7 @@ def run_shared_fisher_estimation(
         theta_std = float(np.std(theta_score_fit))
         flow_score_arch = str(getattr(args, "flow_score_arch", "mlp")).strip().lower()
         _xf_extra = ""
-        if flow_score_arch in ("theta_fourier_mlp", "theta_fourier_film"):
+        if flow_score_arch in ("theta_fourier_mlp", "theta_fourier_film", "indep_theta_fourier_mlp"):
             _om_eff, _om_log = effective_flow_x_theta_fourier_omega(args)
             _xf_extra = (
                 f" theta_fourier_k={int(getattr(args, 'flow_x_theta_fourier_k', 4))}"
@@ -1721,6 +1729,8 @@ def run_shared_fisher_estimation(
             )
             if flow_score_arch == "theta_fourier_film":
                 _xf_extra = " film_x_trunk" + _xf_extra
+            if flow_score_arch == "indep_theta_fourier_mlp":
+                _xf_extra = " indep_per_dim" + _xf_extra
         _xf_twostage = bool(getattr(args, "flow_x_two_stage_mean_theta_pretrain", False))
         _e_tot = int(getattr(args, "flow_epochs", 10000))
         _e1 = _e_tot // 2
@@ -1783,10 +1793,22 @@ def run_shared_fisher_estimation(
                 depth=int(getattr(args, "flow_depth", 3)),
                 use_logit_time=True,
             ).to(device)
+        elif flow_score_arch == "indep_theta_fourier_mlp":
+            _om_eff, _ = effective_flow_x_theta_fourier_omega(args)
+            x_flow_model = ConditionalXFlowVelocityIndependentThetaFourierMLP(
+                x_dim=int(args.x_dim),
+                hidden_dim=int(getattr(args, "flow_hidden_dim", 128)),
+                depth=int(getattr(args, "flow_depth", 3)),
+                use_logit_time=True,
+                theta_fourier_k=int(getattr(args, "flow_x_theta_fourier_k", 4)),
+                theta_fourier_omega=float(_om_eff),
+                theta_fourier_include_linear=not bool(getattr(args, "flow_x_theta_fourier_no_linear", False)),
+                theta_fourier_include_bias=not bool(getattr(args, "flow_x_theta_fourier_no_bias", False)),
+            ).to(device)
         else:
             raise ValueError(
                 "--flow-score-arch must be one of {'mlp', 'film', 'theta_fourier_mlp', 'theta_fourier_film', "
-                "'indep_mlp'}."
+                "'indep_mlp', 'indep_theta_fourier_mlp'}."
             )
         post_train_out = train_conditional_x_flow_model(
             model=x_flow_model,

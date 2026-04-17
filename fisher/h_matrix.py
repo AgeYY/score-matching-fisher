@@ -20,6 +20,7 @@ from fisher.models import (
     ConditionalXFlowVelocity,
     ConditionalXFlowVelocityFiLMPerLayer,
     ConditionalXFlowVelocityIndependentMLP,
+    ConditionalXFlowVelocityIndependentThetaFourierMLP,
     ConditionalXFlowVelocityThetaFourierFiLMPerLayer,
     ConditionalXFlowVelocityThetaFourierMLP,
     PriorScore1D,
@@ -99,6 +100,7 @@ class HMatrixEstimator:
         | ConditionalXFlowVelocity
         | ConditionalXFlowVelocityFiLMPerLayer
         | ConditionalXFlowVelocityIndependentMLP
+        | ConditionalXFlowVelocityIndependentThetaFourierMLP
         | ConditionalXFlowVelocityThetaFourierFiLMPerLayer
         | ConditionalXFlowVelocityThetaFourierMLP
         | PairConditionedTimeScoreNetBase,
@@ -144,6 +146,7 @@ class HMatrixEstimator:
                     ConditionalXFlowVelocity,
                     ConditionalXFlowVelocityFiLMPerLayer,
                     ConditionalXFlowVelocityIndependentMLP,
+                    ConditionalXFlowVelocityIndependentThetaFourierMLP,
                     ConditionalXFlowVelocityThetaFourierFiLMPerLayer,
                     ConditionalXFlowVelocityThetaFourierMLP,
                 ),
@@ -151,6 +154,7 @@ class HMatrixEstimator:
                 raise TypeError(
                     "flow_x_likelihood requires model_post to be ConditionalXFlowVelocity, "
                     "ConditionalXFlowVelocityFiLMPerLayer, ConditionalXFlowVelocityIndependentMLP, "
+                    "ConditionalXFlowVelocityIndependentThetaFourierMLP, "
                     "ConditionalXFlowVelocityThetaFourierFiLMPerLayer, or ConditionalXFlowVelocityThetaFourierMLP."
                 )
         elif method == "ctsm_v":

@@ -14,6 +14,7 @@ from fisher.models import (
     ConditionalXFlowVelocity,
     ConditionalXFlowVelocityFiLMPerLayer,
     ConditionalXFlowVelocityIndependentMLP,
+    ConditionalXFlowVelocityIndependentThetaFourierMLP,
     ConditionalXFlowVelocityThetaFourierFiLMPerLayer,
     ConditionalXFlowVelocityThetaFourierMLP,
     ConditionalXScore,
@@ -915,6 +916,7 @@ def train_conditional_x_flow_model(
     model: ConditionalXFlowVelocity
     | ConditionalXFlowVelocityFiLMPerLayer
     | ConditionalXFlowVelocityIndependentMLP
+    | ConditionalXFlowVelocityIndependentThetaFourierMLP
     | ConditionalXFlowVelocityThetaFourierFiLMPerLayer
     | ConditionalXFlowVelocityThetaFourierMLP,
     theta_train: np.ndarray,
@@ -1042,6 +1044,7 @@ def _train_conditional_x_flow_phase(
     model: ConditionalXFlowVelocity
     | ConditionalXFlowVelocityFiLMPerLayer
     | ConditionalXFlowVelocityIndependentMLP
+    | ConditionalXFlowVelocityIndependentThetaFourierMLP
     | ConditionalXFlowVelocityThetaFourierFiLMPerLayer
     | ConditionalXFlowVelocityThetaFourierMLP,
     theta_train: np.ndarray,
