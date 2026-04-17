@@ -341,7 +341,7 @@ class HMatrixEstimator:
                 step_size=None,
                 method=self.flow_likelihood_method,
                 time_grid=time_grid,
-                exact_divergence=False,
+                exact_divergence=True,
                 enable_grad=False,
                 x_cond=x_t,
             )
@@ -351,7 +351,7 @@ class HMatrixEstimator:
                 step_size=None,
                 method=self.flow_likelihood_method,
                 time_grid=time_grid,
-                exact_divergence=False,
+                exact_divergence=True,
                 enable_grad=False,
             )
             r[i0:i1, :] = (log_post.reshape(b, n) - log_prior.reshape(b, n)).detach().cpu().numpy().astype(np.float64)
@@ -383,7 +383,7 @@ class HMatrixEstimator:
                 step_size=None,
                 method=self.flow_likelihood_method,
                 time_grid=time_grid,
-                exact_divergence=False,
+                exact_divergence=True,
                 enable_grad=False,
                 theta_cond=theta_t,
             )
