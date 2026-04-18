@@ -10,7 +10,12 @@ import torch
 
 from fisher.cli_shared_fisher import add_estimation_arguments
 from fisher.h_matrix import HMatrixEstimator
-from fisher.models import ConditionalThetaFlowVelocityThetaFourierMLP, PriorThetaFlowVelocityThetaFourierMLP
+from fisher.models import (
+    ConditionalThetaFlowVelocityThetaFourierFiLMPerLayer,
+    ConditionalThetaFlowVelocityThetaFourierMLP,
+    PriorThetaFlowVelocityThetaFourierFiLMPerLayer,
+    PriorThetaFlowVelocityThetaFourierMLP,
+)
 from fisher.shared_fisher_est import (
     effective_flow_theta_fourier_omega_post,
     effective_flow_theta_fourier_omega_prior,
@@ -67,17 +72,15 @@ class TestThetaFlowThetaFourier(unittest.TestCase):
         om2, _ = effective_flow_theta_fourier_omega_prior(ns2)
         self.assertAlmostEqual(float(om2), 2.0 * (2.0 * math.pi / 10.0), places=10)
 
-    def test_validate_accepts_flow_likelihood_theta_fourier(self) -> None:
+    def test_validate_accepts_theta_flow_film_fourier(self) -> None:
         parser = argparse.ArgumentParser()
         add_estimation_arguments(parser)
         args = parser.parse_args(
             [
                 "--theta-field-method",
-                "flow_likelihood",
-                "--flow-score-arch",
-                "theta_fourier_mlp",
-                "--flow-prior-arch",
-                "theta_fourier_mlp",
+                "theta_flow",
+                "--flow-arch",
+                "film_fourier",
             ]
         )
         validate_estimation_args(args)
@@ -88,9 +91,9 @@ class TestThetaFlowThetaFourier(unittest.TestCase):
         args = parser.parse_args(
             [
                 "--theta-field-method",
-                "flow",
-                "--flow-score-arch",
-                "theta_fourier_mlp",
+                "theta_flow",
+                "--flow-arch",
+                "film_fourier",
                 "--flow-theta-fourier-k",
                 "0",
                 "--flow-theta-fourier-no-linear",
@@ -100,14 +103,42 @@ class TestThetaFlowThetaFourier(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_estimation_args(args)
 
-    def test_validate_rejects_theta_fourier_mlp_for_dsm(self) -> None:
+    def test_validate_rejects_legacy_flow_likelihood_method(self) -> None:
         parser = argparse.ArgumentParser()
         add_estimation_arguments(parser)
-        args = parser.parse_args([])
-        args.theta_field_method = "dsm"
-        args.flow_score_arch = "theta_fourier_mlp"
+        args = parser.parse_args(["--theta-field-method", "flow_likelihood"])
         with self.assertRaises(ValueError):
             validate_estimation_args(args)
+
+    def test_conditional_theta_film_fourier_forward_shape(self) -> None:
+        m = ConditionalThetaFlowVelocityThetaFourierFiLMPerLayer(
+            x_dim=4,
+            hidden_dim=16,
+            depth=2,
+            theta_fourier_k=3,
+            theta_fourier_omega=0.7,
+        )
+        b = 5
+        theta_t = torch.randn(b, 1)
+        x = torch.randn(b, 4)
+        t = torch.rand(b, 1)
+        out = m(theta_t, x, t)
+        self.assertEqual(tuple(out.shape), (b, 1))
+        self.assertTrue(torch.isfinite(out).all())
+
+    def test_prior_theta_film_fourier_forward_shape(self) -> None:
+        m = PriorThetaFlowVelocityThetaFourierFiLMPerLayer(
+            hidden_dim=16,
+            depth=2,
+            theta_fourier_k=3,
+            theta_fourier_omega=0.7,
+        )
+        b = 5
+        theta_t = torch.randn(b, 1)
+        t = torch.rand(b, 1)
+        out = m(theta_t, t)
+        self.assertEqual(tuple(out.shape), (b, 1))
+        self.assertTrue(torch.isfinite(out).all())
 
     def test_flow_likelihood_h_matrix_smoke_fourier_models(self) -> None:
         torch.manual_seed(0)

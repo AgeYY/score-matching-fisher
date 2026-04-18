@@ -73,11 +73,10 @@ class TestHMatrixFlowLikelihood(unittest.TestCase):
         self.assertTrue(np.isfinite(out.h_sym).all())
         self.assertEqual(out.flow_score_mode, "direct_ode_likelihood")
 
-    def test_validate_estimation_args_accepts_flow_likelihood(self) -> None:
+    def test_validate_estimation_args_accepts_theta_flow(self) -> None:
         parser = argparse.ArgumentParser()
         add_estimation_arguments(parser)
-        args = parser.parse_args([])
-        args.theta_field_method = "flow_likelihood"
+        args = parser.parse_args(["--theta-field-method", "theta_flow", "--flow-arch", "mlp"])
         validate_estimation_args(args)
 
 

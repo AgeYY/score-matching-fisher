@@ -410,6 +410,238 @@ class PriorThetaFlowVelocityThetaFourierMLP(nn.Module):
         return self.forward(theta, t)
 
 
+class ConditionalThetaFlowVelocityThetaFourierFiLMPerLayer(nn.Module):
+    """Theta-flow velocity v(theta_t, x, t): x-trunk + residual FiLM from (Fourier(theta_t), logit t)."""
+
+    def __init__(
+        self,
+        x_dim: int = 2,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        use_logit_time: bool = True,
+        use_layer_norm: bool = False,
+        gated_film: bool = False,
+        zero_out_init: bool = False,
+        *,
+        theta_fourier_k: int = 4,
+        theta_fourier_omega: float = 1.0,
+        theta_fourier_include_linear: bool = True,
+        theta_fourier_include_bias: bool = True,
+    ) -> None:
+        super().__init__()
+        if x_dim < 2:
+            raise ValueError("x_dim must be >= 2.")
+        self.x_dim = int(x_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.depth = int(depth)
+        self.use_logit_time = bool(use_logit_time)
+        self.gated_film = bool(gated_film)
+        self.theta_fourier_k = int(theta_fourier_k)
+        self.theta_fourier_omega = float(theta_fourier_omega)
+        self.theta_fourier_include_linear = bool(theta_fourier_include_linear)
+        self.theta_fourier_include_bias = bool(theta_fourier_include_bias)
+        if self.theta_fourier_k < 0:
+            raise ValueError("theta_fourier_k must be >= 0.")
+        if self.theta_fourier_k > 0 and abs(self.theta_fourier_omega) < 1e-12:
+            raise ValueError("theta_fourier_omega must be non-zero when theta_fourier_k > 0.")
+        theta_feat_dim = 0
+        if self.theta_fourier_include_bias:
+            theta_feat_dim += 1
+        if self.theta_fourier_include_linear:
+            theta_feat_dim += 1
+        theta_feat_dim += 2 * self.theta_fourier_k
+        if theta_feat_dim < 1:
+            raise ValueError(
+                "Theta feature dim is 0: enable bias and/or linear term, or set theta_fourier_k >= 1."
+            )
+        self._theta_feat_dim = int(theta_feat_dim)
+        cond_dim = self._theta_feat_dim + 1
+        self.in_proj = nn.Linear(int(x_dim), int(hidden_dim))
+        self.in_norm = nn.LayerNorm(int(hidden_dim)) if use_layer_norm else nn.Identity()
+        self.cond_residual = nn.Linear(cond_dim, int(hidden_dim))
+        nn.init.zeros_(self.cond_residual.weight)
+        nn.init.zeros_(self.cond_residual.bias)
+        self.blocks = nn.ModuleList()
+        for _ in range(int(depth)):
+            self.blocks.append(
+                nn.ModuleDict(
+                    {
+                        "lin": nn.Linear(int(hidden_dim), int(hidden_dim)),
+                        "gamma": nn.Linear(cond_dim, int(hidden_dim)),
+                        "beta": nn.Linear(cond_dim, int(hidden_dim)),
+                        "norm": (nn.LayerNorm(int(hidden_dim)) if use_layer_norm else nn.Identity()),
+                    }
+                )
+            )
+        self.out = nn.Linear(int(hidden_dim), 1)
+        if zero_out_init:
+            nn.init.zeros_(self.out.weight)
+            nn.init.zeros_(self.out.bias)
+
+    def _theta_features(self, theta: torch.Tensor) -> torch.Tensor:
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        parts: list[torch.Tensor] = []
+        if self.theta_fourier_include_bias:
+            parts.append(torch.ones_like(theta))
+        if self.theta_fourier_include_linear:
+            parts.append(theta)
+        w = float(self.theta_fourier_omega)
+        for k in range(1, self.theta_fourier_k + 1):
+            ang = float(k) * w * theta
+            parts.append(torch.sin(ang))
+            parts.append(torch.cos(ang))
+        return torch.cat(parts, dim=-1)
+
+    def _t_feat(self, t: torch.Tensor) -> torch.Tensor:
+        if t.ndim == 1:
+            t = t.unsqueeze(-1)
+        if self.use_logit_time:
+            t_clip = torch.clamp(t, min=1e-4, max=1.0 - 1e-4)
+            return torch.log(t_clip) - torch.log1p(-t_clip)
+        return t
+
+    def _cond(self, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        return torch.cat([self._theta_features(theta), self._t_feat(t)], dim=-1)
+
+    def forward(self, theta_t: torch.Tensor, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        cond = self._cond(theta_t, t)
+        h = self.in_norm(self.in_proj(x))
+        h = torch.nn.functional.silu(h) + self.cond_residual(cond)
+        for blk in self.blocks:
+            y = blk["lin"](h)
+            gamma = blk["gamma"](cond)
+            beta = blk["beta"](cond)
+            if self.gated_film:
+                y = (1.0 + 0.5 * torch.tanh(gamma)) * y + beta
+            else:
+                y = gamma * y + beta
+            y = blk["norm"](y)
+            h = h + torch.nn.functional.silu(y)
+        return self.out(h)
+
+    @torch.no_grad()
+    def predict_velocity(self, theta: torch.Tensor, x: torch.Tensor, t_eval: float) -> torch.Tensor:
+        self.eval()
+        t = torch.full((theta.shape[0], 1), float(t_eval), device=theta.device)
+        return self.forward(theta, x, t)
+
+
+class PriorThetaFlowVelocityThetaFourierFiLMPerLayer(nn.Module):
+    """Prior theta-flow velocity v(theta_t, t): theta trunk + residual FiLM from (Fourier(theta_t), logit t)."""
+
+    def __init__(
+        self,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        use_logit_time: bool = True,
+        use_layer_norm: bool = False,
+        gated_film: bool = False,
+        zero_out_init: bool = False,
+        *,
+        theta_fourier_k: int = 4,
+        theta_fourier_omega: float = 1.0,
+        theta_fourier_include_linear: bool = True,
+        theta_fourier_include_bias: bool = True,
+    ) -> None:
+        super().__init__()
+        self.hidden_dim = int(hidden_dim)
+        self.depth = int(depth)
+        self.use_logit_time = bool(use_logit_time)
+        self.gated_film = bool(gated_film)
+        self.theta_fourier_k = int(theta_fourier_k)
+        self.theta_fourier_omega = float(theta_fourier_omega)
+        self.theta_fourier_include_linear = bool(theta_fourier_include_linear)
+        self.theta_fourier_include_bias = bool(theta_fourier_include_bias)
+        if self.theta_fourier_k < 0:
+            raise ValueError("theta_fourier_k must be >= 0.")
+        if self.theta_fourier_k > 0 and abs(self.theta_fourier_omega) < 1e-12:
+            raise ValueError("theta_fourier_omega must be non-zero when theta_fourier_k > 0.")
+        theta_feat_dim = 0
+        if self.theta_fourier_include_bias:
+            theta_feat_dim += 1
+        if self.theta_fourier_include_linear:
+            theta_feat_dim += 1
+        theta_feat_dim += 2 * self.theta_fourier_k
+        if theta_feat_dim < 1:
+            raise ValueError(
+                "Theta feature dim is 0: enable bias and/or linear term, or set theta_fourier_k >= 1."
+            )
+        self._theta_feat_dim = int(theta_feat_dim)
+        cond_dim = self._theta_feat_dim + 1
+        self.in_proj = nn.Linear(1, int(hidden_dim))
+        self.in_norm = nn.LayerNorm(int(hidden_dim)) if use_layer_norm else nn.Identity()
+        self.cond_residual = nn.Linear(cond_dim, int(hidden_dim))
+        nn.init.zeros_(self.cond_residual.weight)
+        nn.init.zeros_(self.cond_residual.bias)
+        self.blocks = nn.ModuleList()
+        for _ in range(int(depth)):
+            self.blocks.append(
+                nn.ModuleDict(
+                    {
+                        "lin": nn.Linear(int(hidden_dim), int(hidden_dim)),
+                        "gamma": nn.Linear(cond_dim, int(hidden_dim)),
+                        "beta": nn.Linear(cond_dim, int(hidden_dim)),
+                        "norm": (nn.LayerNorm(int(hidden_dim)) if use_layer_norm else nn.Identity()),
+                    }
+                )
+            )
+        self.out = nn.Linear(int(hidden_dim), 1)
+        if zero_out_init:
+            nn.init.zeros_(self.out.weight)
+            nn.init.zeros_(self.out.bias)
+
+    def _theta_features(self, theta: torch.Tensor) -> torch.Tensor:
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        parts: list[torch.Tensor] = []
+        if self.theta_fourier_include_bias:
+            parts.append(torch.ones_like(theta))
+        if self.theta_fourier_include_linear:
+            parts.append(theta)
+        w = float(self.theta_fourier_omega)
+        for k in range(1, self.theta_fourier_k + 1):
+            ang = float(k) * w * theta
+            parts.append(torch.sin(ang))
+            parts.append(torch.cos(ang))
+        return torch.cat(parts, dim=-1)
+
+    def _t_feat(self, t: torch.Tensor) -> torch.Tensor:
+        if t.ndim == 1:
+            t = t.unsqueeze(-1)
+        if self.use_logit_time:
+            t_clip = torch.clamp(t, min=1e-4, max=1.0 - 1e-4)
+            return torch.log(t_clip) - torch.log1p(-t_clip)
+        return t
+
+    def _cond(self, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        return torch.cat([self._theta_features(theta), self._t_feat(t)], dim=-1)
+
+    def forward(self, theta_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        if theta_t.ndim == 1:
+            theta_t = theta_t.unsqueeze(-1)
+        cond = self._cond(theta_t, t)
+        h = self.in_norm(self.in_proj(theta_t))
+        h = torch.nn.functional.silu(h) + self.cond_residual(cond)
+        for blk in self.blocks:
+            y = blk["lin"](h)
+            gamma = blk["gamma"](cond)
+            beta = blk["beta"](cond)
+            if self.gated_film:
+                y = (1.0 + 0.5 * torch.tanh(gamma)) * y + beta
+            else:
+                y = gamma * y + beta
+            y = blk["norm"](y)
+            h = h + torch.nn.functional.silu(y)
+        return self.out(h)
+
+    @torch.no_grad()
+    def predict_velocity(self, theta: torch.Tensor, t_eval: float) -> torch.Tensor:
+        self.eval()
+        t = torch.full((theta.shape[0], 1), float(t_eval), device=theta.device)
+        return self.forward(theta, t)
+
+
 class ConditionalThetaFlowVelocityFiLMPerLayer(nn.Module):
     """Theta-flow velocity v(theta_t, x, t): x-trunk + residual FiLM from embedded (theta_t, logit t)."""
 

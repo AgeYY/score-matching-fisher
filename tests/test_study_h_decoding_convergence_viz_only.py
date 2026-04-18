@@ -103,7 +103,7 @@ class TestStudyHDecodingConvergenceVizOnly(unittest.TestCase):
                 p = loss_dir / f"n_{int(n):06d}.npz"
                 np.savez_compressed(
                     p,
-                    theta_field_method=np.array("dsm"),
+                    theta_field_method=np.array("theta_flow"),
                     prior_enable=np.array(True),
                     score_train_losses=np.array([0.1], dtype=np.float64),
                     score_val_losses=np.array([0.2], dtype=np.float64),

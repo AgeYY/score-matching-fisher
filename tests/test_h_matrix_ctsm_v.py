@@ -39,16 +39,14 @@ class TestHMatrixCtsmV(unittest.TestCase):
         self.assertLess(float(np.max(np.abs(np.diag(out.delta_l_matrix)))), 1e-8)
         self.assertLess(float(np.max(np.abs(np.diag(out.h_sym)))), 1e-8)
 
-    def test_validate_estimation_args_accepts_ctsm_v(self) -> None:
+    def test_validate_estimation_args_rejects_ctsm_v(self) -> None:
         parser = argparse.ArgumentParser()
         add_estimation_arguments(parser)
-        args = parser.parse_args([])
-        args.theta_field_method = "ctsm_v"
-        args.compute_h_matrix = True
-        args.prior_enable = False
-        validate_estimation_args(args)
+        args = parser.parse_args(["--theta-field-method", "ctsm_v"])
+        with self.assertRaises(ValueError):
+            validate_estimation_args(args)
 
-    def test_shared_estimation_ctsm_v_smoke(self) -> None:
+    def test_shared_estimation_ctsm_v_rejected(self) -> None:
         parser = argparse.ArgumentParser()
         add_estimation_arguments(parser)
         args = parser.parse_args([])
@@ -85,25 +83,18 @@ class TestHMatrixCtsmV(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             args.output_dir = str(Path(td))
-            run_shared_fisher_estimation(
-                args,
-                dataset=object(),  # ctsm_v branch returns before dataset-dependent Fisher/decoder logic
-                theta_all=theta_all,
-                x_all=x_all,
-                theta_train=theta_train,
-                x_train=x_train,
-                theta_eval=theta_eval,
-                x_eval=x_eval,
-                rng=np.random.default_rng(0),
-            )
-            h_npz = Path(td) / "h_matrix_results_theta_cov.npz"
-            losses_npz = Path(td) / "score_prior_training_losses.npz"
-            self.assertTrue(h_npz.is_file())
-            self.assertTrue(losses_npz.is_file())
-            with np.load(h_npz, allow_pickle=True) as z:
-                self.assertEqual(str(z["h_field_method"][0]), "ctsm_v")
-                h = np.asarray(z["h_sym"], dtype=np.float64)
-                self.assertTrue(np.isfinite(h).all())
+            with self.assertRaises(ValueError):
+                run_shared_fisher_estimation(
+                    args,
+                    dataset=object(),
+                    theta_all=theta_all,
+                    x_all=x_all,
+                    theta_train=theta_train,
+                    x_train=x_train,
+                    theta_eval=theta_eval,
+                    x_eval=x_eval,
+                    rng=np.random.default_rng(0),
+                )
 
 
 if __name__ == "__main__":

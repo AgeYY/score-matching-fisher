@@ -120,28 +120,27 @@ class TestHMatrixFlowXLikelihood(unittest.TestCase):
                 flow_ode_steps=8,
             )
 
-    def test_validate_estimation_args_accepts_flow_x_likelihood(self) -> None:
+    def test_validate_estimation_args_accepts_x_flow(self) -> None:
         parser = argparse.ArgumentParser()
         add_estimation_arguments(parser)
-        args = parser.parse_args([])
-        args.theta_field_method = "flow_x_likelihood"
+        args = parser.parse_args(["--theta-field-method", "x_flow", "--flow-arch", "mlp"])
         validate_estimation_args(args)
 
-    def test_validate_accepts_indep_mlp_for_flow_x_only(self) -> None:
+    def test_validate_rejects_legacy_flow_score_arch_indep_mlp(self) -> None:
         parser = argparse.ArgumentParser()
         add_estimation_arguments(parser)
         args = parser.parse_args(["--flow-score-arch", "indep_mlp"])
-        args.theta_field_method = "flow_x_likelihood"
-        validate_estimation_args(args)
+        with self.assertRaises(ValueError):
+            validate_estimation_args(args)
 
-    def test_validate_accepts_indep_theta_fourier_mlp_for_flow_x(self) -> None:
+    def test_validate_rejects_legacy_flow_score_arch_indep_theta_fourier(self) -> None:
         parser = argparse.ArgumentParser()
         add_estimation_arguments(parser)
         args = parser.parse_args(
             ["--flow-score-arch", "indep_theta_fourier_mlp", "--flow-x-theta-fourier-k", "4"]
         )
-        args.theta_field_method = "flow_x_likelihood"
-        validate_estimation_args(args)
+        with self.assertRaises(ValueError):
+            validate_estimation_args(args)
 
     def test_indep_theta_fourier_mlp_forward_shape(self) -> None:
         m = ConditionalXFlowVelocityIndependentThetaFourierMLP(
@@ -160,11 +159,10 @@ class TestHMatrixFlowXLikelihood(unittest.TestCase):
         self.assertEqual(tuple(out.shape), (b, 4))
         self.assertTrue(torch.isfinite(out).all())
 
-    def test_validate_rejects_indep_mlp_for_dsm(self) -> None:
+    def test_validate_rejects_legacy_dsm_method(self) -> None:
         parser = argparse.ArgumentParser()
         add_estimation_arguments(parser)
-        args = parser.parse_args(["--flow-score-arch", "indep_mlp"])
-        args.theta_field_method = "dsm"
+        args = parser.parse_args(["--theta-field-method", "dsm"])
         with self.assertRaises(ValueError):
             validate_estimation_args(args)
 
@@ -273,21 +271,17 @@ class TestHMatrixFlowXLikelihood(unittest.TestCase):
         off = d[~np.eye(n, dtype=bool)]
         self.assertLess(float(np.max(np.abs(off))), 1e-5)
 
-    def test_validate_rejects_theta_fourier_arch_for_dsm(self) -> None:
+    def test_validate_rejects_legacy_flow_likelihood_method(self) -> None:
         parser = argparse.ArgumentParser()
         add_estimation_arguments(parser)
-        args = parser.parse_args([])
-        args.theta_field_method = "dsm"
-        args.flow_score_arch = "theta_fourier_mlp"
+        args = parser.parse_args(["--theta-field-method", "flow_likelihood"])
         with self.assertRaises(ValueError):
             validate_estimation_args(args)
 
-    def test_validate_rejects_theta_fourier_film_for_dsm(self) -> None:
+    def test_validate_rejects_legacy_flow_score_arch_theta_fourier_film(self) -> None:
         parser = argparse.ArgumentParser()
         add_estimation_arguments(parser)
-        args = parser.parse_args([])
-        args.theta_field_method = "dsm"
-        args.flow_score_arch = "theta_fourier_film"
+        args = parser.parse_args(["--flow-score-arch", "theta_fourier_film"])
         with self.assertRaises(ValueError):
             validate_estimation_args(args)
 
@@ -295,7 +289,7 @@ class TestHMatrixFlowXLikelihood(unittest.TestCase):
         parser = argparse.ArgumentParser()
         add_estimation_arguments(parser)
         args = parser.parse_args([])
-        args.theta_field_method = "dsm"
+        args.theta_field_method = "theta_flow"
         args.flow_x_two_stage_mean_theta_pretrain = True
         args.flow_epochs = 10
         with self.assertRaises(ValueError):
@@ -305,7 +299,7 @@ class TestHMatrixFlowXLikelihood(unittest.TestCase):
         parser = argparse.ArgumentParser()
         add_estimation_arguments(parser)
         args = parser.parse_args([])
-        args.theta_field_method = "flow_x_likelihood"
+        args.theta_field_method = "x_flow"
         args.flow_x_two_stage_mean_theta_pretrain = True
         args.flow_epochs = 1
         with self.assertRaises(ValueError):
@@ -372,9 +366,9 @@ class TestHMatrixFlowXLikelihood(unittest.TestCase):
         args = parser.parse_args(
             [
                 "--theta-field-method",
-                "flow_x_likelihood",
-                "--flow-score-arch",
-                "theta_fourier_mlp",
+                "x_flow",
+                "--flow-arch",
+                "film_fourier",
                 "--flow-x-theta-fourier-k",
                 "0",
                 "--flow-x-theta-fourier-no-linear",

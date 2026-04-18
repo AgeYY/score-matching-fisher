@@ -17,23 +17,12 @@ subset (same bin edges as GT), unchanged.
 random-amplitude Gaussian bumps plus ``sqrt(x_dim)`` observation-noise scaling; see ``make_dataset.py``).
 Regenerate the NPZ if the family does not match.
 
-For each ``n`` in ``--n-list``, the H matrix is computed from trained models
-(``--theta-field-method dsm``, ``flow``, ``flow_likelihood``, ``flow_x_likelihood``, or ``ctsm_v``); DSM / flow /
-flow_likelihood use posterior and prior, while ``flow_x_likelihood`` trains a conditional x-flow only.
-``ctsm_v`` trains a pair-conditioned bridge-time score model and directly integrates
-``DeltaL_ij = int_0^1 s_hat(x_i,t,m_ij,Delta_ij) dt``.
-In ``flow`` mode, H uses
-the **flow-derived score** (velocity-to-epsilon conversion and ``s = -eps/sigma_t``), not raw
-velocity; ``flow_likelihood`` uses theta-space ODE likelihood ratios; ``flow_x_likelihood`` uses
-conditional x-space ODE log-densities ``log p(x|theta)`` (no prior model).
-For **DSM** (``--theta-field-method dsm``), this script defaults to **multi-layer FiLM** for the
-posterior score (``--score-arch film``, ``--score-depth 3``) and a **3-layer MLP** prior score
-(``--prior-score-arch mlp``). For **flow** / **flow_likelihood**, theta velocity nets default to
-**MLP** (``--flow-score-arch mlp``, ``--flow-prior-arch mlp``); you can also use **theta-space Fourier
-features** via ``theta_fourier_mlp`` (posterior: ``--flow-theta-fourier-*``; prior:
-``--flow-prior-theta-fourier-*``). For **flow_x_likelihood**, use ``--flow-score-arch`` to pick the
-conditional **x**-flow: ``mlp``, ``film``, or ``theta_fourier_mlp`` (Fourier theta features; see
-``--flow-x-theta-fourier-*``). Pass ``film`` for FiLM where supported.
+For each ``n`` in ``--n-list``, the H matrix is computed from trained flow-matching models.
+Only two methods are supported: ``--theta-field-method theta_flow`` (theta-space FM with prior)
+and ``--theta-field-method x_flow`` (conditional x-space FM likelihood; no prior model).
+Each method has two architecture choices via ``--flow-arch``: ``mlp`` or ``film_fourier``.
+``film_fourier`` uses FiLM conditioning with Fourier theta features
+(``--flow-theta-fourier-*`` for ``theta_flow`` and ``--flow-x-theta-fourier-*`` for ``x_flow``).
 The **reference column** (``n_ref``) does **not** run learned H
 training: the
 matrix-panel top row shows **MC generative** ``sqrt(H^2)`` (same as the H correlation
@@ -230,13 +219,8 @@ def build_parser() -> argparse.ArgumentParser:
     add_estimation_arguments(p)
     p.set_defaults(
         output_dir=str(Path(DATA_DIR) / "h_decoding_convergence"),
-        # DSM: FiLM posterior score + MLP prior score (see --score-arch / --prior-score-arch).
-        score_arch="film",
-        score_depth=3,
-        prior_depth=3,
-        # Flow / flow_likelihood / flow_x_likelihood: MLP nets unless user passes --flow-score-arch film, etc.
-        flow_score_arch="mlp",
-        flow_prior_arch="mlp",
+        theta_field_method="theta_flow",
+        flow_arch="mlp",
         score_early_ema_alpha=0.05,
         prior_early_ema_alpha=0.05,
         score_early_ema_warmup_epochs=0,
@@ -465,7 +449,7 @@ def _load_per_n_training_loss_npz(path: str) -> dict[str, Any]:
         pv = z["prior_enable"]
         prior_enable = bool(np.asarray(pv).reshape(-1)[0])
 
-    tfm = "dsm"
+    tfm = "theta_flow"
     if "theta_field_method" in z.files:
         raw = z["theta_field_method"]
         if raw.dtype == object or raw.dtype.kind in ("U", "S"):
@@ -578,15 +562,13 @@ def _render_training_losses_panel(
                 axes[r, j].set_axis_off()
             continue
 
-        tfm = str(bundle.get("theta_field_method", "dsm")).strip().lower()
-        if tfm == "flow":
+        tfm = str(bundle.get("theta_field_method", "theta_flow")).strip().lower()
+        if tfm == "theta_flow":
             post_lab = "theta-flow score"
-        elif tfm == "flow_likelihood":
-            post_lab = "theta-flow direct likelihood"
-        elif tfm == "flow_x_likelihood":
+        elif tfm == "x_flow":
             post_lab = "x-flow direct likelihood"
         else:
-            post_lab = "score (DSM)"
+            post_lab = tfm
         _plot_loss_triplet(
             axes[0, j],
             bundle["score_train_losses"],
@@ -1325,64 +1307,31 @@ def main(argv: list[str] | None = None) -> None:
 
     ref_dir = os.path.join(args.output_dir, "reference")
     os.makedirs(ref_dir, exist_ok=True)
-    tfm = str(getattr(args, "theta_field_method", "dsm")).strip().lower()
-    if tfm == "flow":
+    tfm = str(getattr(args, "theta_field_method", "theta_flow")).strip().lower()
+    if tfm == "theta_flow":
         print(
             f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
-            f"(flow_score_arch={getattr(args, 'flow_score_arch', 'mlp')}, "
-            f"flow_prior_arch={getattr(args, 'flow_prior_arch', 'mlp')}; "
-            f"DSM --score-arch/--prior-score-arch do not select theta-flow velocity nets)",
+            f"(flow_arch={getattr(args, 'flow_arch', 'mlp')})",
             flush=True,
         )
         print(
-            "[convergence] flow mode uses score-from-velocity conversion "
+            "[convergence] theta_flow mode uses score-from-velocity conversion "
             "(path.velocity_to_epsilon then s=-eps/sigma_t).",
             flush=True,
         )
-    elif tfm == "flow_likelihood":
+    elif tfm == "x_flow":
         print(
             f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
-            f"(flow_score_arch={getattr(args, 'flow_score_arch', 'mlp')}, "
-            f"flow_prior_arch={getattr(args, 'flow_prior_arch', 'mlp')})",
+            f"(flow_arch={getattr(args, 'flow_arch', 'mlp')}; conditional x-flow only)",
             flush=True,
         )
         print(
-            "[convergence] flow_likelihood mode uses direct ODE likelihood ratios "
-            "(no velocity-to-score theta integration).",
-            flush=True,
-        )
-    elif tfm == "flow_x_likelihood":
-        print(
-            f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
-            f"(flow_score_arch={getattr(args, 'flow_score_arch', 'mlp')}; conditional x-flow only)",
-            flush=True,
-        )
-        print(
-            "[convergence] flow_x_likelihood mode uses ODE likelihood on x-space flow log p(x|theta) "
+            "[convergence] x_flow mode uses ODE likelihood on x-space flow log p(x|theta) "
             "(no prior model).",
             flush=True,
         )
-    elif tfm == "ctsm_v":
-        print(
-            f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
-            f"(ctsm_arch={str(getattr(args, 'ctsm_arch', 'film')).strip().lower()}, "
-            f"ctsm_hidden_dim={int(getattr(args, 'ctsm_hidden_dim', 256))}, "
-            f"ctsm_two_sb_var={float(getattr(args, 'ctsm_two_sb_var', 2.0))}, "
-            f"ctsm_int_n_time={int(getattr(args, 'ctsm_int_n_time', 300))})",
-            flush=True,
-        )
-        print(
-            "[convergence] ctsm_v mode uses pair-conditioned bridge-time score integration "
-            "for per-pair directed log-likelihood ratios.",
-            flush=True,
-        )
     else:
-        print(
-            f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
-            f"(score_arch={getattr(args, 'score_arch', 'mlp')}, "
-            f"prior_arch={getattr(args, 'prior_score_arch', 'mlp')})",
-            flush=True,
-        )
+        raise ValueError(f"Unsupported --theta-field-method={tfm!r}; use theta_flow or x_flow.")
     print(
         "[convergence] n_ref reference: no learned H training at n_ref; matrix-panel top row = MC GT sqrt(H^2); "
         "pairwise decoding from n_ref subset only.",

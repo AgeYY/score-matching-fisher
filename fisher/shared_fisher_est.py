@@ -30,6 +30,7 @@ from fisher.models import (
     ConditionalScore1DFiLMPerLayer,
     ConditionalThetaFlowVelocity,
     ConditionalThetaFlowVelocityFiLMPerLayer,
+    ConditionalThetaFlowVelocityThetaFourierFiLMPerLayer,
     ConditionalThetaFlowVelocityThetaFourierMLP,
     ConditionalXFlowVelocity,
     ConditionalXFlowVelocityFiLMPerLayer,
@@ -42,6 +43,7 @@ from fisher.models import (
     PriorScore1DFiLMPerLayer,
     PriorThetaFlowVelocity,
     PriorThetaFlowVelocityFiLMPerLayer,
+    PriorThetaFlowVelocityThetaFourierFiLMPerLayer,
     PriorThetaFlowVelocityThetaFourierMLP,
 )
 from fisher.dataset_family_recipes import raise_if_legacy_dataset_family
@@ -118,6 +120,33 @@ def require_device(name: str) -> torch.device:
     if name == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but unavailable. Per repo policy, do not fallback silently.")
     return torch.device(name)
+
+
+def normalize_theta_field_method(method: str) -> str:
+    m = str(method).strip().lower()
+    if m in ("theta_flow", "x_flow"):
+        return m
+    legacy_map = {
+        "flow": "theta_flow",
+        "flow_likelihood": "theta_flow",
+        "flow_x_likelihood": "x_flow",
+    }
+    if m in legacy_map:
+        raise ValueError(
+            f"Legacy --theta-field-method={m!r} is removed. Use --theta-field-method {legacy_map[m]!r}."
+        )
+    if m in ("dsm", "ctsm_v"):
+        raise ValueError(
+            f"Legacy --theta-field-method={m!r} is removed. Use --theta-field-method 'theta_flow' or 'x_flow'."
+        )
+    raise ValueError("--theta-field-method must be one of {'theta_flow','x_flow'}.")
+
+
+def normalize_flow_arch(args: Any) -> str:
+    arch = str(getattr(args, "flow_arch", "mlp")).strip().lower()
+    if arch in ("mlp", "film_fourier"):
+        return arch
+    raise ValueError("--flow-arch must be one of {'mlp','film_fourier'}.")
 
 
 def build_posterior_score_model(
@@ -871,15 +900,19 @@ def validate_dataset_sample_args(args: Any) -> None:
 
 def validate_estimation_args(args: Any) -> None:
     _apply_dsm_stability_preset(args)
-    if str(getattr(args, "theta_field_method", "dsm")) not in (
-        "dsm",
-        "flow",
-        "flow_likelihood",
-        "flow_x_likelihood",
-        "ctsm_v",
-    ):
+    _tfm_val = normalize_theta_field_method(str(getattr(args, "theta_field_method", "theta_flow")))
+    _arch = normalize_flow_arch(args)
+    setattr(args, "theta_field_method", _tfm_val)
+    setattr(args, "flow_arch", _arch)
+    legacy_flow_score_arch = getattr(args, "flow_score_arch", None)
+    legacy_flow_prior_arch = getattr(args, "flow_prior_arch", None)
+    if legacy_flow_score_arch is not None:
         raise ValueError(
-            "--theta-field-method must be one of {'dsm', 'flow', 'flow_likelihood', 'flow_x_likelihood', 'ctsm_v'}."
+            "Legacy --flow-score-arch is removed. Use --flow-arch {mlp,film_fourier}."
+        )
+    if legacy_flow_prior_arch is not None:
+        raise ValueError(
+            "Legacy --flow-prior-arch is removed. Use --flow-arch {mlp,film_fourier}."
         )
     if args.score_eval_sigmas < 1:
         raise ValueError("--score-eval-sigmas must be >= 1.")
@@ -972,9 +1005,9 @@ def validate_estimation_args(args: Any) -> None:
     if int(getattr(args, "flow_epochs", 1)) < 1:
         raise ValueError("--flow-epochs must be >= 1.")
     if bool(getattr(args, "flow_x_two_stage_mean_theta_pretrain", False)):
-        if str(getattr(args, "theta_field_method", "dsm")).strip().lower() != "flow_x_likelihood":
+        if _tfm_val != "x_flow":
             raise ValueError(
-                "--flow-x-two-stage-mean-theta-pretrain is only valid with --theta-field-method flow_x_likelihood."
+                "--flow-x-two-stage-mean-theta-pretrain is only valid with --theta-field-method x_flow."
             )
         if int(getattr(args, "flow_epochs", 1)) < 2:
             raise ValueError(
@@ -1000,42 +1033,8 @@ def validate_estimation_args(args: Any) -> None:
         raise ValueError("--flow-prior-cond-embed-dim must be >= 1.")
     if int(getattr(args, "flow_prior_cond_embed_depth", 1)) < 1:
         raise ValueError("--flow-prior-cond-embed-depth must be >= 1.")
-    _tfm_val = str(getattr(args, "theta_field_method", "dsm")).strip().lower()
-    _fsa = str(getattr(args, "flow_score_arch", "mlp")).strip().lower()
-    _fpa = str(getattr(args, "flow_prior_arch", "mlp")).strip().lower()
-    if _fsa == "theta_fourier_film" and _tfm_val != "flow_x_likelihood":
-        raise ValueError(
-            "--flow-score-arch theta_fourier_film is only valid with --theta-field-method flow_x_likelihood."
-        )
-    if _tfm_val == "flow_x_likelihood":
-        if _fsa not in (
-            "mlp",
-            "film",
-            "theta_fourier_mlp",
-            "theta_fourier_film",
-            "indep_mlp",
-            "indep_theta_fourier_mlp",
-        ):
-            raise ValueError(
-                "--flow-score-arch must be one of {'mlp', 'film', 'theta_fourier_mlp', 'theta_fourier_film', "
-                "'indep_mlp', 'indep_theta_fourier_mlp'} when --theta-field-method is flow_x_likelihood."
-            )
-    elif _tfm_val in ("flow", "flow_likelihood"):
-        if _fsa not in ("mlp", "film", "theta_fourier_mlp"):
-            raise ValueError(
-                "--flow-score-arch must be one of {'mlp', 'film', 'theta_fourier_mlp'} when "
-                f"--theta-field-method is flow or flow_likelihood (got {_fsa!r})."
-            )
-        if _fpa not in ("mlp", "film", "theta_fourier_mlp"):
-            raise ValueError(
-                "--flow-prior-arch must be one of {'mlp', 'film', 'theta_fourier_mlp'} when "
-                f"--theta-field-method is flow or flow_likelihood (got {_fpa!r})."
-            )
-    elif _fsa not in ("mlp", "film"):
-        raise ValueError(
-            "--flow-score-arch must be one of {'mlp', 'film'} for --theta-field-method "
-            f"outside flow / flow_likelihood / flow_x_likelihood (got {_fsa!r})."
-        )
+    if _arch not in ("mlp", "film_fourier"):
+        raise ValueError("--flow-arch must be one of {'mlp','film_fourier'}.")
     _fx_k = int(getattr(args, "flow_x_theta_fourier_k", 4))
     _fx_omega_mode = str(getattr(args, "flow_x_theta_fourier_omega_mode", "theta_range")).strip().lower()
     _fx_inc_lin = not bool(getattr(args, "flow_x_theta_fourier_no_linear", False))
@@ -1044,7 +1043,7 @@ def validate_estimation_args(args: Any) -> None:
         raise ValueError("--flow-x-theta-fourier-k must be >= 0.")
     if _fx_omega_mode not in ("fixed", "theta_range"):
         raise ValueError("--flow-x-theta-fourier-omega-mode must be one of {'fixed', 'theta_range'}.")
-    if _tfm_val == "flow_x_likelihood" and _fsa in ("theta_fourier_mlp", "theta_fourier_film", "indep_theta_fourier_mlp"):
+    if _tfm_val == "x_flow" and _arch == "film_fourier":
         if _fx_omega_mode == "theta_range":
             lo = float(getattr(args, "theta_low", -6.0))
             hi = float(getattr(args, "theta_high", 6.0))
@@ -1062,7 +1061,7 @@ def validate_estimation_args(args: Any) -> None:
         theta_feat_dim = (1 if _fx_inc_bias else 0) + (1 if _fx_inc_lin else 0) + 2 * _fx_k
         if theta_feat_dim < 1:
             raise ValueError(
-                "flow_x theta_fourier_mlp / theta_fourier_film / indep_theta_fourier_mlp: theta feature dim is 0. Use "
+                "x_flow film_fourier: theta feature dim is 0. Use "
                 "--flow-x-theta-fourier-k >= 1 or keep linear/bias features enabled."
             )
     _ft_post_k = int(getattr(args, "flow_theta_fourier_k", 4))
@@ -1073,7 +1072,7 @@ def validate_estimation_args(args: Any) -> None:
     _ft_prior_omega_mode = str(getattr(args, "flow_prior_theta_fourier_omega_mode", "theta_range")).strip().lower()
     _ft_prior_inc_lin = not bool(getattr(args, "flow_prior_theta_fourier_no_linear", False))
     _ft_prior_inc_bias = not bool(getattr(args, "flow_prior_theta_fourier_no_bias", False))
-    if _tfm_val in ("flow", "flow_likelihood") and _fsa == "theta_fourier_mlp":
+    if _tfm_val == "theta_flow" and _arch == "film_fourier":
         if _ft_post_k < 0:
             raise ValueError("--flow-theta-fourier-k must be >= 0.")
         if _ft_post_omega_mode not in ("fixed", "theta_range"):
@@ -1096,10 +1095,10 @@ def validate_estimation_args(args: Any) -> None:
         _tf_dim_post = (1 if _ft_post_inc_bias else 0) + (1 if _ft_post_inc_lin else 0) + 2 * _ft_post_k
         if _tf_dim_post < 1:
             raise ValueError(
-                "theta_fourier_mlp (posterior): theta feature dim is 0. Use --flow-theta-fourier-k >= 1 or keep "
+                "theta_flow film_fourier (posterior): theta feature dim is 0. Use --flow-theta-fourier-k >= 1 or keep "
                 "linear/bias features enabled."
             )
-    if _tfm_val in ("flow", "flow_likelihood") and _fpa == "theta_fourier_mlp":
+    if _tfm_val == "theta_flow" and _arch == "film_fourier":
         if _ft_prior_k < 0:
             raise ValueError("--flow-prior-theta-fourier-k must be >= 0.")
         if _ft_prior_omega_mode not in ("fixed", "theta_range"):
@@ -1122,19 +1121,19 @@ def validate_estimation_args(args: Any) -> None:
         _tf_dim_prior = (1 if _ft_prior_inc_bias else 0) + (1 if _ft_prior_inc_lin else 0) + 2 * _ft_prior_k
         if _tf_dim_prior < 1:
             raise ValueError(
-                "theta_fourier_mlp (prior): theta feature dim is 0. Use --flow-prior-theta-fourier-k >= 1 or keep "
+                "theta_flow film_fourier (prior): theta feature dim is 0. Use --flow-prior-theta-fourier-k >= 1 or keep "
                 "linear/bias features enabled."
             )
     if (
         bool(getattr(args, "compute_h_matrix", False))
         and not bool(getattr(args, "prior_enable", True))
-        and _tfm_val not in ("flow_x_likelihood", "ctsm_v")
+        and _tfm_val != "x_flow"
     ):
         raise ValueError("--compute-h-matrix requires prior score; do not use --no-prior-score.")
     if bool(getattr(args, "skip_shared_fisher_gt_compare", False)):
         if not bool(getattr(args, "compute_h_matrix", False)):
             raise ValueError("--skip-shared-fisher-gt-compare requires --compute-h-matrix.")
-        if not bool(getattr(args, "prior_enable", True)) and _tfm_val not in ("flow_x_likelihood", "ctsm_v"):
+        if not bool(getattr(args, "prior_enable", True)) and _tfm_val != "x_flow":
             raise ValueError("--skip-shared-fisher-gt-compare requires prior score; do not use --no-prior-score.")
     if int(getattr(args, "ctsm_epochs", 1)) < 1:
         raise ValueError("--ctsm-epochs must be >= 1.")
@@ -1199,7 +1198,7 @@ def _save_dsm_score_prior_training_losses_npz(
     prior_n_clipped_steps: int = 0,
     prior_n_total_steps: int = 0,
     prior_lr_last: float = float("nan"),
-    theta_field_method: str = "dsm",
+    theta_field_method: str = "theta_flow",
 ) -> str:
     """Write per-run training curves for posterior and optional prior (DSM score or theta-flow)."""
     path = os.path.join(output_dir, "score_prior_training_losses.npz")
@@ -1525,7 +1524,8 @@ def run_shared_fisher_estimation(
             f"val_frac_eff={theta_score_val.shape[0]/n_score_total:.4f}"
         )
 
-    theta_field_method = str(getattr(args, "theta_field_method", "dsm")).strip().lower()
+    theta_field_method = normalize_theta_field_method(str(getattr(args, "theta_field_method", "theta_flow")))
+    flow_arch = normalize_flow_arch(args)
     if theta_field_method == "ctsm_v":
         if not bool(getattr(args, "compute_h_matrix", False)):
             raise RuntimeError("ctsm_v requires --compute-h-matrix to produce output artifacts.")
@@ -1712,13 +1712,13 @@ def run_shared_fisher_estimation(
         print(f"[training_losses] saved {tnpz}")
         return
 
-    if theta_field_method == "flow_x_likelihood":
+    if theta_field_method == "x_flow":
         if not bool(getattr(args, "compute_h_matrix", False)):
-            raise RuntimeError("flow_x_likelihood requires --compute-h-matrix to produce output artifacts.")
+            raise RuntimeError("x_flow requires --compute-h-matrix to produce output artifacts.")
         theta_std = float(np.std(theta_score_fit))
-        flow_score_arch = str(getattr(args, "flow_score_arch", "mlp")).strip().lower()
+        flow_score_arch = str(flow_arch).strip().lower()
         _xf_extra = ""
-        if flow_score_arch in ("theta_fourier_mlp", "theta_fourier_film", "indep_theta_fourier_mlp"):
+        if flow_score_arch == "film_fourier":
             _om_eff, _om_log = effective_flow_x_theta_fourier_omega(args)
             _xf_extra = (
                 f" theta_fourier_k={int(getattr(args, 'flow_x_theta_fourier_k', 4))}"
@@ -1727,10 +1727,7 @@ def run_shared_fisher_estimation(
                 f" theta_fourier_linear={not bool(getattr(args, 'flow_x_theta_fourier_no_linear', False))}"
                 f" theta_fourier_bias={not bool(getattr(args, 'flow_x_theta_fourier_no_bias', False))}"
             )
-            if flow_score_arch == "theta_fourier_film":
-                _xf_extra = " film_x_trunk" + _xf_extra
-            if flow_score_arch == "indep_theta_fourier_mlp":
-                _xf_extra = " indep_per_dim" + _xf_extra
+            _xf_extra = " film_x_trunk" + _xf_extra
         _xf_twostage = bool(getattr(args, "flow_x_two_stage_mean_theta_pretrain", False))
         _e_tot = int(getattr(args, "flow_epochs", 10000))
         _e1 = _e_tot // 2
@@ -1738,7 +1735,7 @@ def run_shared_fisher_estimation(
         print(
             "[x_flow] "
             f"fit={theta_score_fit.shape[0]} val={theta_score_val.shape[0]} "
-            f"scheduler={getattr(args, 'flow_scheduler', 'cosine')} method=flow_x_likelihood "
+            f"scheduler={getattr(args, 'flow_scheduler', 'cosine')} method=x_flow "
             f"x_dim={int(args.x_dim)} theta_std={theta_std:.6f}"
             f" two_stage_mean_theta_pretrain={_xf_twostage}"
             + (
@@ -1748,33 +1745,14 @@ def run_shared_fisher_estimation(
             )
             + f"{_xf_extra}"
         )
-        if flow_score_arch == "film":
-            x_flow_model = ConditionalXFlowVelocityFiLMPerLayer(
-                x_dim=int(args.x_dim),
-                hidden_dim=int(getattr(args, "flow_hidden_dim", 128)),
-                depth=int(getattr(args, "flow_depth", 3)),
-                use_logit_time=True,
-            ).to(device)
-        elif flow_score_arch == "mlp":
+        if flow_score_arch == "mlp":
             x_flow_model = ConditionalXFlowVelocity(
                 x_dim=int(args.x_dim),
                 hidden_dim=int(getattr(args, "flow_hidden_dim", 128)),
                 depth=int(getattr(args, "flow_depth", 3)),
                 use_logit_time=True,
             ).to(device)
-        elif flow_score_arch == "theta_fourier_mlp":
-            _om_eff, _ = effective_flow_x_theta_fourier_omega(args)
-            x_flow_model = ConditionalXFlowVelocityThetaFourierMLP(
-                x_dim=int(args.x_dim),
-                hidden_dim=int(getattr(args, "flow_hidden_dim", 128)),
-                depth=int(getattr(args, "flow_depth", 3)),
-                use_logit_time=True,
-                theta_fourier_k=int(getattr(args, "flow_x_theta_fourier_k", 4)),
-                theta_fourier_omega=float(_om_eff),
-                theta_fourier_include_linear=not bool(getattr(args, "flow_x_theta_fourier_no_linear", False)),
-                theta_fourier_include_bias=not bool(getattr(args, "flow_x_theta_fourier_no_bias", False)),
-            ).to(device)
-        elif flow_score_arch == "theta_fourier_film":
+        elif flow_score_arch == "film_fourier":
             _om_eff, _ = effective_flow_x_theta_fourier_omega(args)
             x_flow_model = ConditionalXFlowVelocityThetaFourierFiLMPerLayer(
                 x_dim=int(args.x_dim),
@@ -1786,30 +1764,8 @@ def run_shared_fisher_estimation(
                 theta_fourier_include_linear=not bool(getattr(args, "flow_x_theta_fourier_no_linear", False)),
                 theta_fourier_include_bias=not bool(getattr(args, "flow_x_theta_fourier_no_bias", False)),
             ).to(device)
-        elif flow_score_arch == "indep_mlp":
-            x_flow_model = ConditionalXFlowVelocityIndependentMLP(
-                x_dim=int(args.x_dim),
-                hidden_dim=int(getattr(args, "flow_hidden_dim", 128)),
-                depth=int(getattr(args, "flow_depth", 3)),
-                use_logit_time=True,
-            ).to(device)
-        elif flow_score_arch == "indep_theta_fourier_mlp":
-            _om_eff, _ = effective_flow_x_theta_fourier_omega(args)
-            x_flow_model = ConditionalXFlowVelocityIndependentThetaFourierMLP(
-                x_dim=int(args.x_dim),
-                hidden_dim=int(getattr(args, "flow_hidden_dim", 128)),
-                depth=int(getattr(args, "flow_depth", 3)),
-                use_logit_time=True,
-                theta_fourier_k=int(getattr(args, "flow_x_theta_fourier_k", 4)),
-                theta_fourier_omega=float(_om_eff),
-                theta_fourier_include_linear=not bool(getattr(args, "flow_x_theta_fourier_no_linear", False)),
-                theta_fourier_include_bias=not bool(getattr(args, "flow_x_theta_fourier_no_bias", False)),
-            ).to(device)
         else:
-            raise ValueError(
-                "--flow-score-arch must be one of {'mlp', 'film', 'theta_fourier_mlp', 'theta_fourier_film', "
-                "'indep_mlp', 'indep_theta_fourier_mlp'}."
-            )
+            raise ValueError("--flow-arch must be one of {'mlp','film_fourier'}.")
         post_train_out = train_conditional_x_flow_model(
             model=x_flow_model,
             theta_train=theta_score_fit,
@@ -1882,7 +1838,7 @@ def run_shared_fisher_estimation(
             )
         plt.xlabel("Epoch")
         plt.ylabel("Loss")
-        plt.title("Conditional x-flow training (flow_x_likelihood)")
+        plt.title("Conditional x-flow training (x_flow)")
         plt.grid(alpha=0.25, linestyle="--", linewidth=0.8)
         plt.legend()
         plt.tight_layout()
@@ -1902,7 +1858,7 @@ def run_shared_fisher_estimation(
         h_eval = 1.0
         print(
             "[h_matrix] "
-            "enabled=True field=flow_x_likelihood "
+            "enabled=True field=x_flow "
             f"flow_ode_t_span={h_eval:.6f} "
             f"restore_original_order={bool(getattr(args, 'h_restore_original_order', False))} "
             f"pair_batch_size={int(getattr(args, 'h_batch_size', 65536))}"
@@ -1927,7 +1883,7 @@ def run_shared_fisher_estimation(
             args, h_result, suffix
         )
         print(
-            "[summary] flow_x_likelihood mode completed (H-matrix only path; "
+            "[summary] x_flow mode completed (H-matrix only path; "
             "ODESolver.compute_likelihood on conditional x-flow for log p(x|theta))."
         )
         print("Saved artifacts:")
@@ -1973,43 +1929,29 @@ def run_shared_fisher_estimation(
             prior_n_clipped_steps=0,
             prior_n_total_steps=0,
             prior_lr_last=float("nan"),
-            theta_field_method="flow_x_likelihood",
+            theta_field_method="x_flow",
         )
         print(f"[training_losses] saved {tnpz}")
         return
 
-    if theta_field_method in ("flow", "flow_likelihood"):
+    if theta_field_method == "theta_flow":
         if not bool(getattr(args, "prior_enable", True)):
-            raise ValueError("flow-based theta_field_method currently requires prior model enabled.")
+            raise ValueError("theta_flow currently requires prior model enabled.")
         flow_eval_t = float(getattr(args, "flow_eval_t", 0.8))
         if not (0.0 <= flow_eval_t <= 1.0):
             raise ValueError("--flow-eval-t must be in [0, 1].")
         theta_std = float(np.std(theta_score_fit))
-        flow_score_arch = str(getattr(args, "flow_score_arch", "mlp")).strip().lower()
-        flow_prior_arch = str(getattr(args, "flow_prior_arch", "mlp")).strip().lower()
+        flow_score_arch = str(flow_arch).strip().lower()
+        flow_prior_arch = str(flow_arch).strip().lower()
         print(
             "[theta_flow] "
             f"fit={theta_score_fit.shape[0]} val={theta_score_val.shape[0]} "
-            f"scheduler={getattr(args, 'flow_scheduler', 'cosine')} method={theta_field_method} "
+            f"scheduler={getattr(args, 'flow_scheduler', 'cosine')} method=theta_flow "
             f"t_eval={flow_eval_t:.6f} "
             f"theta_std={theta_std:.6f}"
         )
-        _emb_post = ""
-        if flow_score_arch == "film":
-            _emb_post = (
-                f"cond_embed_post=d{int(getattr(args, 'flow_cond_embed_dim', 16))}"
-                f"xL{int(getattr(args, 'flow_cond_embed_depth', 1))}"
-                f"_{str(getattr(args, 'flow_cond_embed_act', 'silu'))} "
-            )
-        _emb_prior = ""
-        if flow_prior_arch == "film":
-            _emb_prior = (
-                f"cond_embed_prior=d{int(getattr(args, 'flow_prior_cond_embed_dim', 16))}"
-                f"xL{int(getattr(args, 'flow_prior_cond_embed_depth', 1))}"
-                f"_{str(getattr(args, 'flow_prior_cond_embed_act', 'silu'))}"
-            )
         _xf_post = ""
-        if flow_score_arch == "theta_fourier_mlp":
+        if flow_score_arch == "film_fourier":
             _om_eff, _om_log = effective_flow_theta_fourier_omega_post(args)
             _xf_post = (
                 f" theta_fourier_post_k={int(getattr(args, 'flow_theta_fourier_k', 4))}"
@@ -2019,7 +1961,7 @@ def run_shared_fisher_estimation(
                 f" theta_fourier_post_bias={not bool(getattr(args, 'flow_theta_fourier_no_bias', False))}"
             )
         _xf_prior = ""
-        if flow_prior_arch == "theta_fourier_mlp":
+        if flow_prior_arch == "film_fourier":
             _om_eff_p, _om_log_p = effective_flow_theta_fourier_omega_prior(args)
             _xf_prior = (
                 f" theta_fourier_prior_k={int(getattr(args, 'flow_prior_theta_fourier_k', 4))}"
@@ -2037,12 +1979,19 @@ def run_shared_fisher_estimation(
             f"ln_prior={bool(getattr(args, 'flow_prior_use_layer_norm', False))} "
             f"zero_out_post={bool(getattr(args, 'flow_zero_out_init', False))} "
             f"zero_out_prior={bool(getattr(args, 'flow_prior_zero_out_init', False))} "
-            f"{_emb_post}{_emb_prior}"
             f"{_xf_post}{_xf_prior}"
         )
 
-        if flow_score_arch == "film":
-            post_model = ConditionalThetaFlowVelocityFiLMPerLayer(
+        if flow_score_arch == "mlp":
+            post_model = ConditionalThetaFlowVelocity(
+                x_dim=args.x_dim,
+                hidden_dim=int(getattr(args, "flow_hidden_dim", 128)),
+                depth=int(getattr(args, "flow_depth", 3)),
+                use_logit_time=True,
+            ).to(device)
+        elif flow_score_arch == "film_fourier":
+            _om_eff, _ = effective_flow_theta_fourier_omega_post(args)
+            post_model = ConditionalThetaFlowVelocityThetaFourierFiLMPerLayer(
                 x_dim=int(args.x_dim),
                 hidden_dim=int(getattr(args, "flow_hidden_dim", 128)),
                 depth=int(getattr(args, "flow_depth", 3)),
@@ -2050,31 +1999,13 @@ def run_shared_fisher_estimation(
                 use_layer_norm=bool(getattr(args, "flow_use_layer_norm", False)),
                 gated_film=bool(getattr(args, "flow_gated_film", False)),
                 zero_out_init=bool(getattr(args, "flow_zero_out_init", False)),
-                cond_embed_dim=int(getattr(args, "flow_cond_embed_dim", 16)),
-                cond_embed_depth=int(getattr(args, "flow_cond_embed_depth", 1)),
-                cond_embed_act=str(getattr(args, "flow_cond_embed_act", "silu")),
-            ).to(device)
-        elif flow_score_arch == "mlp":
-            post_model = ConditionalThetaFlowVelocity(
-                x_dim=args.x_dim,
-                hidden_dim=int(getattr(args, "flow_hidden_dim", 128)),
-                depth=int(getattr(args, "flow_depth", 3)),
-                use_logit_time=True,
-            ).to(device)
-        elif flow_score_arch == "theta_fourier_mlp":
-            _om_eff, _ = effective_flow_theta_fourier_omega_post(args)
-            post_model = ConditionalThetaFlowVelocityThetaFourierMLP(
-                x_dim=int(args.x_dim),
-                hidden_dim=int(getattr(args, "flow_hidden_dim", 128)),
-                depth=int(getattr(args, "flow_depth", 3)),
-                use_logit_time=True,
                 theta_fourier_k=int(getattr(args, "flow_theta_fourier_k", 4)),
                 theta_fourier_omega=float(_om_eff),
                 theta_fourier_include_linear=not bool(getattr(args, "flow_theta_fourier_no_linear", False)),
                 theta_fourier_include_bias=not bool(getattr(args, "flow_theta_fourier_no_bias", False)),
             ).to(device)
         else:
-            raise ValueError("--flow-score-arch must be one of {'mlp', 'film', 'theta_fourier_mlp'}.")
+            raise ValueError("--flow-arch must be one of {'mlp','film_fourier'}.")
         post_train_out = train_conditional_theta_flow_model(
             model=post_model,
             theta_train=theta_score_fit,
@@ -2134,37 +2065,28 @@ def run_shared_fisher_estimation(
         plt.savefig(post_loss_fig, dpi=180)
         plt.close()
 
-        if flow_prior_arch == "film":
-            prior_model_flow = PriorThetaFlowVelocityFiLMPerLayer(
+        if flow_prior_arch == "mlp":
+            prior_model_flow = PriorThetaFlowVelocity(
+                hidden_dim=int(getattr(args, "prior_hidden_dim", 128)),
+                depth=int(getattr(args, "prior_depth", 3)),
+                use_logit_time=True,
+            ).to(device)
+        elif flow_prior_arch == "film_fourier":
+            _om_eff_p, _ = effective_flow_theta_fourier_omega_prior(args)
+            prior_model_flow = PriorThetaFlowVelocityThetaFourierFiLMPerLayer(
                 hidden_dim=int(getattr(args, "prior_hidden_dim", 128)),
                 depth=int(getattr(args, "prior_depth", 3)),
                 use_logit_time=True,
                 use_layer_norm=bool(getattr(args, "flow_prior_use_layer_norm", False)),
                 gated_film=bool(getattr(args, "flow_prior_gated_film", False)),
                 zero_out_init=bool(getattr(args, "flow_prior_zero_out_init", False)),
-                cond_embed_dim=int(getattr(args, "flow_prior_cond_embed_dim", 16)),
-                cond_embed_depth=int(getattr(args, "flow_prior_cond_embed_depth", 1)),
-                cond_embed_act=str(getattr(args, "flow_prior_cond_embed_act", "silu")),
-            ).to(device)
-        elif flow_prior_arch == "mlp":
-            prior_model_flow = PriorThetaFlowVelocity(
-                hidden_dim=int(getattr(args, "prior_hidden_dim", 128)),
-                depth=int(getattr(args, "prior_depth", 3)),
-                use_logit_time=True,
-            ).to(device)
-        elif flow_prior_arch == "theta_fourier_mlp":
-            _om_eff_p, _ = effective_flow_theta_fourier_omega_prior(args)
-            prior_model_flow = PriorThetaFlowVelocityThetaFourierMLP(
-                hidden_dim=int(getattr(args, "prior_hidden_dim", 128)),
-                depth=int(getattr(args, "prior_depth", 3)),
-                use_logit_time=True,
                 theta_fourier_k=int(getattr(args, "flow_prior_theta_fourier_k", 4)),
                 theta_fourier_omega=float(_om_eff_p),
                 theta_fourier_include_linear=not bool(getattr(args, "flow_prior_theta_fourier_no_linear", False)),
                 theta_fourier_include_bias=not bool(getattr(args, "flow_prior_theta_fourier_no_bias", False)),
             ).to(device)
         else:
-            raise ValueError("--flow-prior-arch must be one of {'mlp', 'film', 'theta_fourier_mlp'}.")
+            raise ValueError("--flow-arch must be one of {'mlp','film_fourier'}.")
         prior_train_out = train_prior_theta_flow_model(
             model=prior_model_flow,
             theta_train=theta_score_fit,
@@ -2234,11 +2156,11 @@ def run_shared_fisher_estimation(
 
         h_result: HMatrixResult | None = None
         if bool(getattr(args, "compute_h_matrix", False)):
-            h_eval = flow_eval_t if theta_field_method == "flow" else 1.0
+            h_eval = flow_eval_t
             print(
                 "[h_matrix] "
-                f"enabled=True field={theta_field_method} "
-                f"{'t_eval' if theta_field_method == 'flow' else 'flow_ode_t_span'}={h_eval:.6f} "
+                "enabled=True field=theta_flow "
+                f"t_eval={h_eval:.6f} "
                 f"restore_original_order={bool(getattr(args, 'h_restore_original_order', False))} "
                 f"pair_batch_size={int(getattr(args, 'h_batch_size', 65536))}"
             )
@@ -2248,7 +2170,7 @@ def run_shared_fisher_estimation(
                 sigma_eval=h_eval,
                 device=device,
                 pair_batch_size=int(getattr(args, "h_batch_size", 65536)),
-                field_method=theta_field_method,
+                field_method="flow",
                 flow_scheduler=str(getattr(args, "flow_scheduler", "cosine")),
             )
             h_result = h_estimator.run(
@@ -2263,12 +2185,8 @@ def run_shared_fisher_estimation(
                 args, h_result, suffix
             )
             print(
-                "[summary] flow-based mode completed (H-matrix only path; "
-                + (
-                    "velocity converted to score via path.velocity_to_epsilon and s=-eps/sigma_t)."
-                    if theta_field_method == "flow"
-                    else "flow_matching ODESolver.compute_likelihood used for per-pair log-likelihood ratios)."
-                )
+                "[summary] theta_flow mode completed (H-matrix only path; "
+                "velocity converted to score via path.velocity_to_epsilon and s=-eps/sigma_t)."
             )
             print("Saved artifacts:")
             print(f"  - {post_loss_fig}")
@@ -2313,12 +2231,12 @@ def run_shared_fisher_estimation(
                 prior_n_clipped_steps=int(prior_train_out.get("n_clipped_steps", 0)),
                 prior_n_total_steps=int(prior_train_out.get("n_total_steps", 0)),
                 prior_lr_last=float(prior_train_out.get("lr_last", float("nan"))),
-                theta_field_method=theta_field_method,
+                theta_field_method="theta_flow",
             )
             print(f"[training_losses] saved {tnpz}")
             return
 
-        raise RuntimeError("flow-based theta_field_method requires --compute-h-matrix to produce output artifacts.")
+        raise RuntimeError("theta_flow requires --compute-h-matrix to produce output artifacts.")
 
     theta_std = float(np.std(theta_score_fit))
     sigma_post = float("nan")

@@ -87,14 +87,10 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--theta-field-method",
         type=str,
-        default="dsm",
-        choices=["dsm", "flow", "flow_likelihood", "flow_x_likelihood", "ctsm_v"],
+        default="theta_flow",
         help=(
-            "Theta likelihood-ratio field method: denoising score model (dsm), flow velocity converted to "
-            "score then theta path integration (flow), direct theta-space ODE likelihood ratio (flow_likelihood), "
-            "or conditional x-space ODE log-density log p(x|theta) (flow_x_likelihood; no prior model), "
-            "or pair-conditioned CTSM-v direct log-ratio integration over bridge time "
-            "(ctsm_v; no prior model)."
+            "Likelihood-ratio field method: theta_flow (flow matching in theta space) or "
+            "x_flow (flow matching in x space via conditional likelihood)."
         ),
     )
 
@@ -276,41 +272,32 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         action="store_true",
         default=False,
         help=(
-            "flow_x_likelihood only: split --flow-epochs 50/50 — stage 1 trains with theta fixed at "
+            "x_flow only: split --flow-epochs 50/50 — stage 1 trains with theta fixed at "
             "mean(theta on score-fit split) (unconditional-like); stage 2 finetunes with true per-sample theta. "
             "Odd E: stage1=floor(E/2), stage2=E-stage1 (extra epoch to stage 2). Requires --flow-epochs >= 2."
         ),
     )
     p.add_argument(
-        "--flow-score-arch",
+        "--flow-arch",
         type=str,
         default="mlp",
-        choices=["mlp", "film", "theta_fourier_mlp", "theta_fourier_film", "indep_mlp", "indep_theta_fourier_mlp"],
+        choices=["mlp", "film_fourier"],
         help=(
-            "Flow posterior velocity architecture. For --theta-field-method flow / flow_likelihood: "
-            "mlp concatenates [theta_t, x, t_feat]; film uses an x-trunk with FiLM from separate "
-            "theta/time embeddings (see --flow-cond-embed-*); "
-            "theta_fourier_mlp uses [theta Fourier features, x, t_feat] (see --flow-theta-fourier-*). "
-            "For --theta-field-method flow_x_likelihood only: theta_fourier_mlp is an MLP on "
-            "[x, theta Fourier features, t_feat]; theta_fourier_film is an x-trunk FiLM net with "
-            "(Fourier(theta), logit t) conditioning (see --flow-x-theta-fourier-*); "
-            "indep_mlp uses d separate 1D MLPs (one per x dimension, no cross-dimension coupling); "
-            "indep_theta_fourier_mlp is the same independence structure with Fourier(theta) features "
-            "(see --flow-x-theta-fourier-*). Default: mlp."
+            "Flow architecture shared by both theta_flow and x_flow: "
+            "mlp, or film_fourier (FiLM blocks with Fourier theta features)."
         ),
+    )
+    p.add_argument(
+        "--flow-score-arch",
+        type=str,
+        default=None,
+        help=argparse.SUPPRESS,
     )
     p.add_argument(
         "--flow-prior-arch",
         type=str,
-        default="mlp",
-        choices=["mlp", "film", "theta_fourier_mlp"],
-        help=(
-            "Theta-flow only: prior velocity v(theta_t, t). "
-            "mlp concatenates [theta_t, t_feat]; film uses a theta-trunk with FiLM from separate "
-            "theta/time embeddings (see --flow-prior-cond-embed-*); "
-            "theta_fourier_mlp uses [theta Fourier features, t_feat] (see --flow-prior-theta-fourier-*). "
-            "Default: mlp."
-        ),
+        default=None,
+        help=argparse.SUPPRESS,
     )
     p.add_argument(
         "--flow-gated-film",
@@ -398,7 +385,7 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         type=int,
         default=4,
         help=(
-            "flow / flow_likelihood + --flow-score-arch theta_fourier_mlp: number of harmonic pairs "
+            "theta_flow + --flow-arch film_fourier: number of harmonic pairs "
             "(sin, cos) for theta encoding in the posterior theta-flow. Ignored for other arch/methods."
         ),
     )
@@ -408,7 +395,7 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         default="theta_range",
         choices=["theta_range", "fixed"],
         help=(
-            "Posterior theta-flow theta_fourier_mlp: how to set omega in sin(k*omega*theta). "
+            "Posterior theta_flow film_fourier: how to set omega in sin(k*omega*theta). "
             "theta_range (default): omega_eff = (2*pi / (theta_high-theta_low)) * mult, where mult is "
             "--flow-theta-fourier-omega. "
             "fixed: use --flow-theta-fourier-omega as omega directly (e.g. 1 gives period 2*pi for k=1)."
@@ -419,7 +406,7 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         type=float,
         default=1.0,
         help=(
-            "Posterior theta-flow theta_fourier_mlp: with --flow-theta-fourier-omega-mode fixed, this is omega. "
+            "Posterior theta_flow film_fourier: with --flow-theta-fourier-omega-mode fixed, this is omega. "
             "With theta_range, this is a positive multiplier mult on (2*pi/span) (default 1 => fundamental period "
             "equals theta_high-theta_low)."
         ),
@@ -428,13 +415,13 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         "--flow-theta-fourier-no-linear",
         action="store_true",
         default=False,
-        help="Posterior theta-flow theta_fourier_mlp: drop raw theta from the theta feature vector.",
+        help="Posterior theta_flow film_fourier: drop raw theta from the theta feature vector.",
     )
     p.add_argument(
         "--flow-theta-fourier-no-bias",
         action="store_true",
         default=False,
-        help="Posterior theta-flow theta_fourier_mlp: drop constant 1 from the theta feature vector.",
+        help="Posterior theta_flow film_fourier: drop constant 1 from the theta feature vector.",
     )
     p.add_argument(
         "--flow-prior-theta-fourier-k",
@@ -451,7 +438,7 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         default="theta_range",
         choices=["theta_range", "fixed"],
         help=(
-            "Prior theta-flow theta_fourier_mlp: how to set omega in sin(k*omega*theta). "
+            "Prior theta_flow film_fourier: how to set omega in sin(k*omega*theta). "
             "Same semantics as --flow-theta-fourier-omega-mode, but for the prior network."
         ),
     )
@@ -460,7 +447,7 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         type=float,
         default=1.0,
         help=(
-            "Prior theta-flow theta_fourier_mlp: omega or theta_range multiplier (see "
+            "Prior theta_flow film_fourier: omega or theta_range multiplier (see "
             "--flow-prior-theta-fourier-omega-mode)."
         ),
     )
@@ -468,13 +455,13 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         "--flow-prior-theta-fourier-no-linear",
         action="store_true",
         default=False,
-        help="Prior theta-flow theta_fourier_mlp: drop raw theta from the theta feature vector.",
+        help="Prior theta_flow film_fourier: drop raw theta from the theta feature vector.",
     )
     p.add_argument(
         "--flow-prior-theta-fourier-no-bias",
         action="store_true",
         default=False,
-        help="Prior theta-flow theta_fourier_mlp: drop constant 1 from the theta feature vector.",
+        help="Prior theta_flow film_fourier: drop constant 1 from the theta feature vector.",
     )
 
     p.add_argument(
@@ -482,7 +469,7 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         type=int,
         default=4,
         help=(
-            "flow_x_likelihood + --flow-score-arch theta_fourier_mlp: number of harmonic pairs "
+            "x_flow + --flow-arch film_fourier: number of harmonic pairs "
             "(sin, cos) for theta encoding. Ignored for other methods."
         ),
     )
@@ -492,7 +479,7 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         default="theta_range",
         choices=["theta_range", "fixed"],
         help=(
-            "flow_x_likelihood + theta_fourier_mlp: how to set omega in sin(k*omega*theta). "
+            "x_flow + film_fourier: how to set omega in sin(k*omega*theta). "
             "theta_range (default): omega_eff = (2*pi / (theta_high-theta_low)) * mult, where mult is "
             "--flow-x-theta-fourier-omega, so the k=1 harmonic has period (theta_high-theta_low)/mult. "
             "fixed: use --flow-x-theta-fourier-omega as omega directly (e.g. 1 gives period 2*pi)."
@@ -503,7 +490,7 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         type=float,
         default=1.0,
         help=(
-            "flow_x_likelihood + theta_fourier_mlp: with --flow-x-theta-fourier-omega-mode fixed, this is omega. "
+            "x_flow + film_fourier: with --flow-x-theta-fourier-omega-mode fixed, this is omega. "
             "With theta_range, this is a positive multiplier mult on (2*pi/span) (default 1 => fundamental period "
             "equals theta_high-theta_low)."
         ),
@@ -512,13 +499,13 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         "--flow-x-theta-fourier-no-linear",
         action="store_true",
         default=False,
-        help="flow_x_likelihood + theta_fourier_mlp: drop raw theta from the theta feature vector.",
+        help="x_flow + film_fourier: drop raw theta from the theta feature vector.",
     )
     p.add_argument(
         "--flow-x-theta-fourier-no-bias",
         action="store_true",
         default=False,
-        help="flow_x_likelihood + theta_fourier_mlp: drop constant 1 from the theta feature vector.",
+        help="x_flow + film_fourier: drop constant 1 from the theta feature vector.",
     )
     p.add_argument(
         "--ctsm-epochs",

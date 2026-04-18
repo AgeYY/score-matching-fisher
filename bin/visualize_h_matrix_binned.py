@@ -319,14 +319,14 @@ def hellinger_acc_ub_from_binned_h_squared(h_squared_binned: np.ndarray) -> np.n
 
 def hellinger_figure_labels(h_field_method: str) -> tuple[str, str, str]:
     m = str(h_field_method).strip().lower()
-    if m == "flow":
+    if m in ("flow", "theta_flow"):
         return (
             r"Binned $H_{ij}^2$ (flow-derived score) → Hellinger LB on $A^*_{ij}$",
             r"Hellinger LB ($H^2$)",
             "Flow-derived score field (from velocity): binned symmetric H treated as H^2; ",
         )
-    if m in ("flow_likelihood", "flow_x_likelihood"):
-        tag = "theta-space ODE likelihood" if m == "flow_likelihood" else "x-space ODE log p(x|θ)"
+    if m in ("flow_x_likelihood", "x_flow"):
+        tag = "x-space ODE log p(x|θ)"
         return (
             r"Binned $H_{ij}^2$ → Hellinger LB on $A^*_{ij}$"
             + "\n"
