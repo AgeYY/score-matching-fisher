@@ -89,8 +89,10 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         type=str,
         default="theta_flow",
         help=(
-            "Likelihood-ratio field method: theta_flow (flow matching in theta space) or "
-            "x_flow (flow matching in x space via conditional likelihood)."
+            "Likelihood-ratio field method: theta_flow (theta-space flow ODE log-likelihood Bayes ratios "
+            "log p(theta|x)-log p(theta)), theta_path_integral (velocity-to-score plus trapezoid integral "
+            "along sorted theta), x_flow (conditional x-space flow ODE log p(x|theta)), or "
+            "ctsm_v (pair-conditioned CTSM-v time-score integration)."
         ),
     )
 
@@ -283,7 +285,7 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         default="mlp",
         choices=["mlp", "film_fourier"],
         help=(
-            "Flow architecture shared by both theta_flow and x_flow: "
+            "Flow architecture shared by theta_flow, theta_path_integral, and x_flow: "
             "mlp, or film_fourier (FiLM blocks with Fourier theta features)."
         ),
     )
@@ -385,7 +387,7 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         type=int,
         default=4,
         help=(
-            "theta_flow + --flow-arch film_fourier: number of harmonic pairs "
+            "theta_flow / theta_path_integral + --flow-arch film_fourier: number of harmonic pairs "
             "(sin, cos) for theta encoding in the posterior theta-flow. Ignored for other arch/methods."
         ),
     )
@@ -428,7 +430,7 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         type=int,
         default=4,
         help=(
-            "flow / flow_likelihood + --flow-prior-arch theta_fourier_mlp: number of harmonic pairs "
+            "theta_flow / theta_path_integral + --flow-prior-arch theta_fourier_mlp: number of harmonic pairs "
             "(sin, cos) for theta encoding in the prior theta-flow."
         ),
     )
@@ -536,6 +538,19 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         type=float,
         default=2.0,
         help="ctsm_v: TwoSB bridge variance parameter (var = sigma^2).",
+    )
+    p.add_argument(
+        "--ctsm-path-schedule",
+        type=str,
+        default="linear",
+        choices=["linear", "cosine"],
+        help="ctsm_v: schedule for the two-endpoint bridge clock u=s(t).",
+    )
+    p.add_argument(
+        "--ctsm-path-eps",
+        type=float,
+        default=1e-12,
+        help="ctsm_v: numerical epsilon for path denominators.",
     )
     p.add_argument(
         "--ctsm-factor",

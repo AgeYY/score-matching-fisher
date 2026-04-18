@@ -107,8 +107,17 @@ class TestThetaFlowThetaFourier(unittest.TestCase):
         parser = argparse.ArgumentParser()
         add_estimation_arguments(parser)
         args = parser.parse_args(["--theta-field-method", "flow_likelihood"])
-        with self.assertRaises(ValueError):
+        with self.assertRaises(ValueError) as ctx:
             validate_estimation_args(args)
+        self.assertIn("theta_path_integral", str(ctx.exception))
+
+    def test_validate_rejects_legacy_flow_method(self) -> None:
+        parser = argparse.ArgumentParser()
+        add_estimation_arguments(parser)
+        args = parser.parse_args(["--theta-field-method", "flow"])
+        with self.assertRaises(ValueError) as ctx:
+            validate_estimation_args(args)
+        self.assertIn("theta_flow", str(ctx.exception))
 
     def test_conditional_theta_film_fourier_forward_shape(self) -> None:
         m = ConditionalThetaFlowVelocityThetaFourierFiLMPerLayer(
@@ -161,7 +170,7 @@ class TestThetaFlowThetaFourier(unittest.TestCase):
             sigma_eval=1.0,
             device=torch.device("cpu"),
             pair_batch_size=32,
-            field_method="flow_likelihood",
+            field_method="theta_flow",
             flow_scheduler="cosine",
             flow_ode_steps=16,
         )

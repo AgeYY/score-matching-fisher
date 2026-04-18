@@ -40,14 +40,14 @@ class TestHMatrixFlowLikelihood(unittest.TestCase):
             sigma_eval=1.0,
             device=torch.device("cpu"),
             pair_batch_size=64,
-            field_method="flow_likelihood",
+            field_method="theta_flow",
             flow_scheduler="cosine",
             flow_ode_steps=32,
         )
         theta = np.linspace(-1.0, 1.0, 6, dtype=np.float64).reshape(-1, 1)
         x = np.stack([np.sin(theta.reshape(-1)), np.cos(theta.reshape(-1))], axis=1).astype(np.float64)
         out = est.run(theta=theta, x=x, restore_original_order=False)
-        self.assertEqual(out.field_method, "flow_likelihood")
+        self.assertEqual(out.field_method, "theta_flow")
         self.assertEqual(out.eval_scalar_name, "flow_ode_t_span")
         self.assertLess(float(np.max(np.abs(out.delta_l_matrix))), 1e-9)
         self.assertLess(float(np.max(np.abs(out.h_sym))), 1e-9)
@@ -61,7 +61,7 @@ class TestHMatrixFlowLikelihood(unittest.TestCase):
             sigma_eval=1.0,
             device=torch.device("cpu"),
             pair_batch_size=64,
-            field_method="flow_likelihood",
+            field_method="theta_flow",
             flow_scheduler="cosine",
             flow_ode_steps=16,
         )
@@ -77,6 +77,12 @@ class TestHMatrixFlowLikelihood(unittest.TestCase):
         parser = argparse.ArgumentParser()
         add_estimation_arguments(parser)
         args = parser.parse_args(["--theta-field-method", "theta_flow", "--flow-arch", "mlp"])
+        validate_estimation_args(args)
+
+    def test_validate_estimation_args_accepts_theta_path_integral(self) -> None:
+        parser = argparse.ArgumentParser()
+        add_estimation_arguments(parser)
+        args = parser.parse_args(["--theta-field-method", "theta_path_integral", "--flow-arch", "mlp"])
         validate_estimation_args(args)
 
 

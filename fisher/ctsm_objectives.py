@@ -8,12 +8,12 @@ import torch
 from torchdiffeq import odeint
 
 from fisher.ctsm_models import PairConditionedTimeScoreNetBase, ToyFullTimeScoreNet
-from fisher.ctsm_paths import TwoSB
+from fisher.ctsm_paths import TwoEndpointBridge
 
 
 def ctsm_v_two_sample_loss(
     model: ToyFullTimeScoreNet,
-    prob_path: TwoSB,
+    prob_path: TwoEndpointBridge,
     x0: torch.Tensor,
     x1: torch.Tensor,
     factor: float = 1.0,
@@ -44,7 +44,7 @@ def ctsm_v_two_sample_loss(
 
 def ctsm_v_pair_conditioned_loss(
     model: PairConditionedTimeScoreNetBase,
-    prob_path: TwoSB,
+    prob_path: TwoEndpointBridge,
     x0: torch.Tensor,
     x1: torch.Tensor,
     a: torch.Tensor,

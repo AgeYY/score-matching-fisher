@@ -60,7 +60,7 @@ def _make_flow_matching_path(scheduler_name: str) -> Any:
     except ImportError as e:
         raise ImportError(
             "Flow score conversion requires the `flow_matching` package. "
-            "Install it in your environment before using --theta-field-method flow."
+            "Install it in your environment before using --theta-field-method theta_path_integral."
         ) from e
 
     scheduler_lookup = {
@@ -81,7 +81,7 @@ def _make_flow_ode_solver(velocity_model: Any) -> Any:
         raise ImportError(
             "Flow likelihood estimation requires the `flow_matching` package. "
             "Install it in your environment before using flow ODE likelihood methods "
-            "(flow_likelihood / flow_x_likelihood)."
+            "(theta_flow / flow_x_likelihood)."
         ) from e
     return ODESolver(velocity_model=velocity_model)
 
@@ -127,13 +127,14 @@ class HMatrixEstimator:
         self.device = device
         self.pair_batch_size = int(pair_batch_size)
         method = str(field_method).strip().lower()
-        if method not in ("dsm", "flow", "flow_likelihood", "flow_x_likelihood", "ctsm_v"):
+        if method not in ("dsm", "theta_path_integral", "theta_flow", "flow_x_likelihood", "ctsm_v"):
             raise ValueError(
-                "field_method must be one of {'dsm', 'flow', 'flow_likelihood', 'flow_x_likelihood', 'ctsm_v'}."
+                "field_method must be one of "
+                "{'dsm', 'theta_path_integral', 'theta_flow', 'flow_x_likelihood', 'ctsm_v'}."
             )
         if method == "dsm" and sigma_eval <= 0.0:
             raise ValueError("sigma_eval must be positive for DSM mode.")
-        if method in ("flow", "flow_likelihood", "flow_x_likelihood") and not (0.0 <= sigma_eval <= 1.0):
+        if method in ("theta_path_integral", "theta_flow", "flow_x_likelihood") and not (0.0 <= sigma_eval <= 1.0):
             raise ValueError("For flow-based methods, t_eval (passed via sigma_eval) must be in [0, 1].")
         if int(flow_ode_steps) < 2:
             raise ValueError("flow_ode_steps must be >= 2.")
@@ -166,7 +167,7 @@ class HMatrixEstimator:
             raise ValueError(f"field_method={method!r} requires a non-None model_prior.")
         self.field_method = method
         self.flow_scheduler = str(flow_scheduler).strip().lower()
-        self.flow_score_mode = "velocity_to_epsilon" if self.field_method == "flow" else None
+        self.flow_score_mode = "velocity_to_epsilon" if self.field_method == "theta_path_integral" else None
         self.flow_ode_steps = int(flow_ode_steps)
         if int(ctsm_int_n_time) < 2:
             raise ValueError("ctsm_int_n_time must be >= 2.")
@@ -177,13 +178,13 @@ class HMatrixEstimator:
         self.flow_likelihood_method = "midpoint"
         self._flow_path = (
             _make_flow_matching_path(self.flow_scheduler)
-            if self.field_method in ("flow", "flow_likelihood")
+            if self.field_method in ("theta_path_integral", "theta_flow")
             else None
         )
         self._flow_likelihood_solver_post = None
         self._flow_likelihood_solver_prior = None
         self._flow_x_likelihood_solver = None
-        if self.field_method == "flow_likelihood":
+        if self.field_method == "theta_flow":
             self._flow_likelihood_solver_post = _make_flow_ode_solver(self._post_velocity_for_likelihood)
             self._flow_likelihood_solver_prior = _make_flow_ode_solver(self._prior_velocity_for_likelihood)
         if self.field_method == "flow_x_likelihood":
@@ -233,7 +234,7 @@ class HMatrixEstimator:
     def _post_velocity_for_likelihood(self, x: torch.Tensor, t: torch.Tensor, **model_extras: Any) -> torch.Tensor:
         x_cond = model_extras.get("x_cond", None)
         if x_cond is None:
-            raise ValueError("flow_likelihood posterior ODE call requires model_extras['x_cond'].")
+            raise ValueError("theta_flow posterior ODE call requires model_extras['x_cond'].")
         return self.model_post(x, x_cond, self._time_to_batch_column(t, x))
 
     def _prior_velocity_for_likelihood(self, x: torch.Tensor, t: torch.Tensor, **model_extras: Any) -> torch.Tensor:
@@ -283,7 +284,7 @@ class HMatrixEstimator:
                 x_rep = np.repeat(xb, repeats=n, axis=0)
                 theta_t = torch.from_numpy(theta_tile).to(self.device)
                 x_t = torch.from_numpy(x_rep).to(self.device)
-                if self.field_method == "flow":
+                if self.field_method == "theta_path_integral":
                     t_eval = torch.full(
                         (theta_t.shape[0], 1),
                         fill_value=float(self.sigma_eval),
@@ -329,7 +330,7 @@ class HMatrixEstimator:
         if self.model_prior is not None:
             self.model_prior.eval()
         if self._flow_likelihood_solver_post is None or self._flow_likelihood_solver_prior is None:
-            raise RuntimeError("flow_likelihood ODE solvers are not initialized.")
+            raise RuntimeError("theta_flow ODE solvers are not initialized.")
         for i0 in range(0, n, row_block):
             i1 = min(n, i0 + row_block)
             xb = np.asarray(x_sorted[i0:i1], dtype=np.float32)
@@ -469,7 +470,7 @@ class HMatrixEstimator:
         if np.any(np.diff(theta_sorted.reshape(-1)) < 0.0):
             raise ValueError("sort_by_theta produced a non-monotone theta sequence.")
 
-        if self.field_method == "flow_likelihood":
+        if self.field_method == "theta_flow":
             c_sorted = self.compute_log_ratio_matrix(theta_sorted, x_sorted)
             delta_sorted = self.compute_delta_l(c_sorted)
             g_sorted = np.zeros_like(c_sorted, dtype=np.float64)
@@ -522,10 +523,10 @@ class HMatrixEstimator:
             field_method=self.field_method,
             eval_scalar_name=(
                 "t_eval"
-                if self.field_method == "flow"
+                if self.field_method == "theta_path_integral"
                 else (
                     "flow_ode_t_span"
-                    if self.field_method in ("flow_likelihood", "flow_x_likelihood")
+                    if self.field_method in ("theta_flow", "flow_x_likelihood")
                     else ("ctsm_t_eps" if self.field_method == "ctsm_v" else "sigma_eval")
                 )
             ),
@@ -534,7 +535,7 @@ class HMatrixEstimator:
             h_sym_max_asym_abs=h_sym_max_asym_abs,
             flow_scheduler=(
                 self.flow_scheduler
-                if self.field_method in ("flow", "flow_likelihood", "flow_x_likelihood")
+                if self.field_method in ("theta_path_integral", "theta_flow", "flow_x_likelihood")
                 else None
             ),
             flow_score_mode=(
@@ -542,7 +543,7 @@ class HMatrixEstimator:
                 if self.flow_score_mode is not None
                 else (
                     "direct_ode_likelihood"
-                    if self.field_method == "flow_likelihood"
+                    if self.field_method == "theta_flow"
                     else (
                         "direct_ode_x_cond_likelihood"
                         if self.field_method == "flow_x_likelihood"

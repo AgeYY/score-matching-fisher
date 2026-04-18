@@ -124,22 +124,24 @@ def require_device(name: str) -> torch.device:
 
 def normalize_theta_field_method(method: str) -> str:
     m = str(method).strip().lower()
-    if m in ("theta_flow", "x_flow"):
+    if m in ("theta_flow", "theta_path_integral", "x_flow", "ctsm_v"):
         return m
-    legacy_map = {
-        "flow": "theta_flow",
-        "flow_likelihood": "theta_flow",
-        "flow_x_likelihood": "x_flow",
-    }
-    if m in legacy_map:
+    legacy_names = (
+        "flow",
+        "flow_likelihood",
+        "flow_x_likelihood",
+        "dsm",
+    )
+    if m in legacy_names:
         raise ValueError(
-            f"Legacy --theta-field-method={m!r} is removed. Use --theta-field-method {legacy_map[m]!r}."
+            "Legacy --theta-field-method is removed. Use one of "
+            "{'theta_flow', 'theta_path_integral', 'x_flow', 'ctsm_v'}. "
+            "theta_flow = theta-space flow ODE log-likelihood Bayes ratios; "
+            "theta_path_integral = velocity-to-score plus trapezoid integral along sorted theta."
         )
-    if m in ("dsm", "ctsm_v"):
-        raise ValueError(
-            f"Legacy --theta-field-method={m!r} is removed. Use --theta-field-method 'theta_flow' or 'x_flow'."
-        )
-    raise ValueError("--theta-field-method must be one of {'theta_flow','x_flow'}.")
+    raise ValueError(
+        "--theta-field-method must be one of {'theta_flow','theta_path_integral','x_flow','ctsm_v'}."
+    )
 
 
 def normalize_flow_arch(args: Any) -> str:
@@ -1072,7 +1074,7 @@ def validate_estimation_args(args: Any) -> None:
     _ft_prior_omega_mode = str(getattr(args, "flow_prior_theta_fourier_omega_mode", "theta_range")).strip().lower()
     _ft_prior_inc_lin = not bool(getattr(args, "flow_prior_theta_fourier_no_linear", False))
     _ft_prior_inc_bias = not bool(getattr(args, "flow_prior_theta_fourier_no_bias", False))
-    if _tfm_val == "theta_flow" and _arch == "film_fourier":
+    if _tfm_val in ("theta_flow", "theta_path_integral") and _arch == "film_fourier":
         if _ft_post_k < 0:
             raise ValueError("--flow-theta-fourier-k must be >= 0.")
         if _ft_post_omega_mode not in ("fixed", "theta_range"):
@@ -1095,10 +1097,10 @@ def validate_estimation_args(args: Any) -> None:
         _tf_dim_post = (1 if _ft_post_inc_bias else 0) + (1 if _ft_post_inc_lin else 0) + 2 * _ft_post_k
         if _tf_dim_post < 1:
             raise ValueError(
-                "theta_flow film_fourier (posterior): theta feature dim is 0. Use --flow-theta-fourier-k >= 1 or keep "
-                "linear/bias features enabled."
+                "theta_flow / theta_path_integral film_fourier (posterior): theta feature dim is 0. Use "
+                "--flow-theta-fourier-k >= 1 or keep linear/bias features enabled."
             )
-    if _tfm_val == "theta_flow" and _arch == "film_fourier":
+    if _tfm_val in ("theta_flow", "theta_path_integral") and _arch == "film_fourier":
         if _ft_prior_k < 0:
             raise ValueError("--flow-prior-theta-fourier-k must be >= 0.")
         if _ft_prior_omega_mode not in ("fixed", "theta_range"):
@@ -1121,8 +1123,8 @@ def validate_estimation_args(args: Any) -> None:
         _tf_dim_prior = (1 if _ft_prior_inc_bias else 0) + (1 if _ft_prior_inc_lin else 0) + 2 * _ft_prior_k
         if _tf_dim_prior < 1:
             raise ValueError(
-                "theta_flow film_fourier (prior): theta feature dim is 0. Use --flow-prior-theta-fourier-k >= 1 or keep "
-                "linear/bias features enabled."
+                "theta_flow / theta_path_integral film_fourier (prior): theta feature dim is 0. Use "
+                "--flow-prior-theta-fourier-k >= 1 or keep linear/bias features enabled."
             )
     if (
         bool(getattr(args, "compute_h_matrix", False))
@@ -1145,6 +1147,10 @@ def validate_estimation_args(args: Any) -> None:
         raise ValueError("--ctsm-hidden-dim must be >= 1.")
     if float(getattr(args, "ctsm_two_sb_var", 0.0)) <= 0.0:
         raise ValueError("--ctsm-two-sb-var must be positive.")
+    if str(getattr(args, "ctsm_path_schedule", "linear")).strip().lower() not in ("linear", "cosine"):
+        raise ValueError("--ctsm-path-schedule must be one of {'linear','cosine'}.")
+    if float(getattr(args, "ctsm_path_eps", 0.0)) <= 0.0:
+        raise ValueError("--ctsm-path-eps must be positive.")
     if float(getattr(args, "ctsm_t_eps", -1.0)) < 0.0 or float(getattr(args, "ctsm_t_eps", -1.0)) >= 0.5:
         raise ValueError("--ctsm-t-eps must be in [0, 0.5).")
     if int(getattr(args, "ctsm_int_n_time", 1)) < 2:
@@ -1271,6 +1277,8 @@ def train_pair_conditioned_ctsm_v_model(
     device: torch.device,
     log_every: int,
     two_sb_var: float,
+    path_schedule: str = "linear",
+    path_eps: float = 1e-12,
     factor: float,
     t_eps: float,
     theta_val: np.ndarray | None = None,
@@ -1299,7 +1307,12 @@ def train_pair_conditioned_ctsm_v_model(
             theta_val_np = None
             x_val_np = None
 
-    prob_path = TwoSB(dim=int(x_fit_np.shape[1]), var=float(two_sb_var))
+    prob_path = TwoSB(
+        dim=int(x_fit_np.shape[1]),
+        var=float(two_sb_var),
+        scheduler=str(path_schedule),
+        eps=float(path_eps),
+    )
     opt = torch.optim.AdamW(model.parameters(), lr=float(lr), weight_decay=float(weight_decay))
 
     theta_fit_t = torch.from_numpy(theta_fit_np).to(device)
@@ -1536,6 +1549,8 @@ def run_shared_fisher_estimation(
             f"fit={theta_score_fit.shape[0]} val={theta_score_val.shape[0]} "
             f"x_dim={int(args.x_dim)} theta_std={theta_std:.6f} "
             f"two_sb_var={float(getattr(args, 'ctsm_two_sb_var', 2.0)):.6f} "
+            f"path_schedule={str(getattr(args, 'ctsm_path_schedule', 'linear')).strip().lower()} "
+            f"path_eps={float(getattr(args, 'ctsm_path_eps', 1e-12)):.1e} "
             f"factor={float(getattr(args, 'ctsm_factor', 1.0)):.6f} "
             f"t_eps={float(getattr(args, 'ctsm_t_eps', 1e-5)):.2e} "
             f"int_n_time={int(getattr(args, 'ctsm_int_n_time', 300))} "
@@ -1572,6 +1587,8 @@ def run_shared_fisher_estimation(
             device=device,
             log_every=max(1, int(args.log_every)),
             two_sb_var=float(getattr(args, "ctsm_two_sb_var", 2.0)),
+            path_schedule=str(getattr(args, "ctsm_path_schedule", "linear")),
+            path_eps=float(getattr(args, "ctsm_path_eps", 1e-12)),
             factor=float(getattr(args, "ctsm_factor", 1.0)),
             t_eps=float(getattr(args, "ctsm_t_eps", 1e-5)),
             theta_val=theta_score_val,
@@ -1638,6 +1655,7 @@ def run_shared_fisher_estimation(
             "[h_matrix] "
             "enabled=True field=ctsm_v "
             f"ctsm_arch={str(getattr(args, 'ctsm_arch', 'film')).strip().lower()} "
+            f"ctsm_path_schedule={str(getattr(args, 'ctsm_path_schedule', 'linear')).strip().lower()} "
             f"ctsm_t_eps={h_eval:.6g} ctsm_int_n_time={int(getattr(args, 'ctsm_int_n_time', 300))} "
             f"restore_original_order={bool(getattr(args, 'h_restore_original_order', False))} "
             f"pair_batch_size={int(getattr(args, 'h_batch_size', 65536))}"
@@ -1934,9 +1952,9 @@ def run_shared_fisher_estimation(
         print(f"[training_losses] saved {tnpz}")
         return
 
-    if theta_field_method == "theta_flow":
+    if theta_field_method in ("theta_flow", "theta_path_integral"):
         if not bool(getattr(args, "prior_enable", True)):
-            raise ValueError("theta_flow currently requires prior model enabled.")
+            raise ValueError("theta_flow and theta_path_integral currently require prior model enabled.")
         flow_eval_t = float(getattr(args, "flow_eval_t", 0.8))
         if not (0.0 <= flow_eval_t <= 1.0):
             raise ValueError("--flow-eval-t must be in [0, 1].")
@@ -1944,9 +1962,9 @@ def run_shared_fisher_estimation(
         flow_score_arch = str(flow_arch).strip().lower()
         flow_prior_arch = str(flow_arch).strip().lower()
         print(
-            "[theta_flow] "
+            f"[{theta_field_method}] "
             f"fit={theta_score_fit.shape[0]} val={theta_score_val.shape[0]} "
-            f"scheduler={getattr(args, 'flow_scheduler', 'cosine')} method=theta_flow "
+            f"scheduler={getattr(args, 'flow_scheduler', 'cosine')} method={theta_field_method} "
             f"t_eval={flow_eval_t:.6f} "
             f"theta_std={theta_std:.6f}"
         )
@@ -1971,7 +1989,7 @@ def run_shared_fisher_estimation(
                 f" theta_fourier_prior_bias={not bool(getattr(args, 'flow_prior_theta_fourier_no_bias', False))}"
             )
         print(
-            "[theta_flow] arch "
+            f"[{theta_field_method}] arch "
             f"posterior={flow_score_arch} prior={flow_prior_arch} "
             f"gated_post={bool(getattr(args, 'flow_gated_film', False))} "
             f"gated_prior={bool(getattr(args, 'flow_prior_gated_film', False))} "
@@ -2157,9 +2175,10 @@ def run_shared_fisher_estimation(
         h_result: HMatrixResult | None = None
         if bool(getattr(args, "compute_h_matrix", False)):
             h_eval = flow_eval_t
+            _h_field = "theta_flow" if theta_field_method == "theta_flow" else "theta_path_integral"
             print(
                 "[h_matrix] "
-                "enabled=True field=theta_flow "
+                f"enabled=True field={_h_field} "
                 f"t_eval={h_eval:.6f} "
                 f"restore_original_order={bool(getattr(args, 'h_restore_original_order', False))} "
                 f"pair_batch_size={int(getattr(args, 'h_batch_size', 65536))}"
@@ -2170,7 +2189,7 @@ def run_shared_fisher_estimation(
                 sigma_eval=h_eval,
                 device=device,
                 pair_batch_size=int(getattr(args, "h_batch_size", 65536)),
-                field_method="flow",
+                field_method=_h_field,
                 flow_scheduler=str(getattr(args, "flow_scheduler", "cosine")),
             )
             h_result = h_estimator.run(
@@ -2184,10 +2203,18 @@ def run_shared_fisher_estimation(
             h_npz_path, h_summary_path, h_fig_path, h_delta_fig_path = _save_h_matrix_dsm_artifacts(
                 args, h_result, suffix
             )
-            print(
-                "[summary] theta_flow mode completed (H-matrix only path; "
-                "velocity converted to score via path.velocity_to_epsilon and s=-eps/sigma_t)."
-            )
+            if theta_field_method == "theta_flow":
+                print(
+                    "[summary] theta_flow mode completed (H-matrix only path; "
+                    "ODESolver.compute_likelihood on conditional theta-flow for log p(theta|x) minus prior; "
+                    "Bayes-ratio matrix)."
+                )
+            else:
+                print(
+                    "[summary] theta_path_integral mode completed (H-matrix only path; "
+                    "velocity converted to score via path.velocity_to_epsilon and s=-eps/sigma_t; "
+                    "trapezoid integral along sorted theta)."
+                )
             print("Saved artifacts:")
             print(f"  - {post_loss_fig}")
             print(f"  - {prior_loss_fig}")
@@ -2231,12 +2258,14 @@ def run_shared_fisher_estimation(
                 prior_n_clipped_steps=int(prior_train_out.get("n_clipped_steps", 0)),
                 prior_n_total_steps=int(prior_train_out.get("n_total_steps", 0)),
                 prior_lr_last=float(prior_train_out.get("lr_last", float("nan"))),
-                theta_field_method="theta_flow",
+                theta_field_method=theta_field_method,
             )
             print(f"[training_losses] saved {tnpz}")
             return
 
-        raise RuntimeError("theta_flow requires --compute-h-matrix to produce output artifacts.")
+        raise RuntimeError(
+            "theta_flow and theta_path_integral require --compute-h-matrix to produce output artifacts."
+        )
 
     theta_std = float(np.std(theta_score_fit))
     sigma_post = float("nan")

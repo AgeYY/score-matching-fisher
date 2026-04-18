@@ -1,12 +1,14 @@
 # `flow_x_likelihood`: x-space flow ODE log-density for the H-matrix (direct $\log p(x\mid\theta)$)
 
+> **CLI (2026-04-18):** use `--theta-field-method x_flow` (internal `field_method="flow_x_likelihood"`). The θ-space ODE Bayes-ratio method is `--theta-field-method theta_flow`; path integration is `theta_path_integral`. See [rename note](2026-04-18-theta-flow-rename-and-bayes-ratio.md).
+
 ## Question / context
 
-The existing **`flow_likelihood`** path ([note](2026-04-13-flow-ode-direct-likelihood-theta-h-matrix.md)) trains **$\theta$-space** conditional and prior flows and evaluates **$\log p(\theta\mid x)$** (up to training fidelity) via an ODE change-of-variables on $\theta$, then uses **posterior minus prior** log-densities to build pairwise ratios. That is naturally read as a **Bayes-rule** construction on the latent.
+The existing **`theta_flow`** θ-space path ([note](2026-04-13-flow-ode-direct-likelihood-theta-h-matrix.md)) trains **$\theta$-space** conditional and prior flows and evaluates **$\log p(\theta\mid x)$** (up to training fidelity) via an ODE change-of-variables on $\theta$, then uses **posterior minus prior** log-densities to build pairwise ratios. That is naturally read as a **Bayes-rule** construction on the latent.
 
 This note documents **`flow_x_likelihood`**, which instead trains a **conditional flow in observation space** and estimates **$\log p(x\mid\theta)$** directly with the **same** ODE likelihood machinery, but with **state $x \in \mathbb{R}^{d_x}$** and **no unconditional $p(x)$** subtraction (conditional-only formulation). The downstream H-decoding pipeline still applies **$\Delta L$ centering** and the usual Hellinger map from `HMatrixEstimator`.
 
-**Implementation:** [`fisher/h_matrix.py`](../../fisher/h_matrix.py) (`field_method="flow_x_likelihood"`, `compute_x_conditional_loglik_matrix`), training in [`fisher/shared_fisher_est.py`](../../fisher/shared_fisher_est.py) via `train_conditional_x_flow_model` and models `ConditionalXFlowVelocity` / `ConditionalXFlowVelocityFiLMPerLayer` / `ConditionalXFlowVelocityThetaFourierMLP` (`--flow-score-arch theta_fourier_mlp`) in [`fisher/models.py`](../../fisher/models.py). CLI: `--theta-field-method flow_x_likelihood` in [`fisher/cli_shared_fisher.py`](../../fisher/cli_shared_fisher.py).
+**Implementation:** [`fisher/h_matrix.py`](../../fisher/h_matrix.py) (`field_method="flow_x_likelihood"`, `compute_x_conditional_loglik_matrix`), training in [`fisher/shared_fisher_est.py`](../../fisher/shared_fisher_est.py) via `train_conditional_x_flow_model` and models `ConditionalXFlowVelocity` / `ConditionalXFlowVelocityFiLMPerLayer` / `ConditionalXFlowVelocityThetaFourierMLP` (`--flow-score-arch theta_fourier_mlp`) in [`fisher/models.py`](../../fisher/models.py). CLI: `--theta-field-method x_flow` in [`fisher/cli_shared_fisher.py`](../../fisher/cli_shared_fisher.py).
 
 ## Method
 

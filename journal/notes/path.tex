@@ -1,0 +1,188 @@
+\section{From affine two-endpoint bridge to target score}
+
+We consider a general two-endpoint affine bridge of the form
+\begin{equation}
+x_t = a_t x_0 + b_t x_1 + c_t \varepsilon,
+\qquad
+\varepsilon \sim \mathcal N(0, I),
+\qquad
+t \in [0,1],
+\end{equation}
+with endpoint constraints
+\begin{equation}
+a_0 = 1,\quad b_0 = 0,\quad c_0 = 0,
+\qquad
+a_1 = 0,\quad b_1 = 1,\quad c_1 = 0.
+\end{equation}
+Conditioning on the endpoints $z=(x_0,x_1)$, this defines a conditional Gaussian path
+\begin{equation}
+p_t(x \mid z) = \mathcal N\!\bigl(x;\mu_t(z), k_t I\bigr),
+\end{equation}
+where
+\begin{equation}
+\mu_t(z) = a_t x_0 + b_t x_1,
+\qquad
+k_t = c_t^2.
+\end{equation}
+Thus the bridge is simply a Gaussian path with time-dependent mean and isotropic variance.
+
+The quantity of interest is the \emph{time score}
+\begin{equation}
+s_t(x \mid z) := \partial_t \log p_t(x \mid z).
+\end{equation}
+Since
+\begin{equation}
+\log p_t(x \mid z)
+=
+-\frac{D}{2}\log(2\pi k_t)
+-\frac{1}{2k_t}\norm{x-\mu_t(z)}^2,
+\end{equation}
+we define the standardized residual
+\begin{equation}
+\epsilon_t(x,z)
+:=
+\frac{x-\mu_t(z)}{\sqrt{k_t}}.
+\end{equation}
+A direct differentiation gives
+\begin{equation}
+\boxed{
+\partial_t \log p_t(x \mid z)
+=
+-\frac{D \dot k_t}{2k_t}
++
+\frac{1}{\sqrt{k_t}}\,\dot\mu_t(z)^\top \epsilon_t(x,z)
++
+\frac{\dot k_t}{2k_t}\norm{\epsilon_t(x,z)}^2
+}
+\label{eq:scalar_time_score}
+\end{equation}
+with
+\begin{equation}
+\dot \mu_t(z) = \dot a_t x_0 + \dot b_t x_1,
+\qquad
+\dot k_t = 2 c_t \dot c_t.
+\end{equation}
+This is the scalar target score used in conditional time-score estimation.
+
+For the vectorized target, note that because the covariance is diagonal, the coordinates are conditionally independent given $z$:
+\begin{equation}
+p_t(x \mid z)=\prod_{i=1}^D p_t(x_i \mid z).
+\end{equation}
+Hence
+\begin{equation}
+\partial_t \log p_t(x \mid z)
+=
+\sum_{i=1}^D \partial_t \log p_t(x_i \mid z).
+\end{equation}
+Define the vectorized target score by stacking the coordinatewise terms:
+\begin{equation}
+\mathrm{vec}\!\bigl(\partial_t \log p_t(x \mid z)\bigr)
+:=
+\begin{bmatrix}
+\partial_t \log p_t(x_1 \mid z) \\
+\vdots \\
+\partial_t \log p_t(x_D \mid z)
+\end{bmatrix}.
+\end{equation}
+Then the same differentiation as above yields the compact vector formula
+\begin{equation}
+\boxed{
+\mathrm{vec}\!\bigl(\partial_t \log p_t(x \mid z)\bigr)
+=
+-\frac{\dot k_t}{2k_t}\mathbf 1
++
+\frac{1}{\sqrt{k_t}}\,\dot\mu_t(z)\odot \epsilon_t(x,z)
++
+\frac{\dot k_t}{2k_t}\,\epsilon_t(x,z)^{\odot 2}
+}
+\label{eq:vector_time_score}
+\end{equation}
+where $\odot$ denotes elementwise product and $(\cdot)^{\odot 2}$ denotes elementwise square. Summing all entries of \eqref{eq:vector_time_score} recovers the scalar score in \eqref{eq:scalar_time_score}.
+
+The formulas above immediately cover several useful bridges.
+
+\paragraph{Linear Schr\"odinger-bridge-style path.}
+Choose
+\begin{equation}
+a_t = 1-t,
+\qquad
+b_t = t,
+\qquad
+c_t = \sigma \sqrt{t(1-t)}.
+\end{equation}
+Then
+\begin{equation}
+\mu_t(z) = (1-t)x_0 + t x_1,
+\qquad
+k_t = \sigma^2 t(1-t),
+\end{equation}
+and therefore
+\begin{equation}
+\dot \mu_t(z) = x_1-x_0,
+\qquad
+\dot k_t = \sigma^2(1-2t).
+\end{equation}
+Plugging into \eqref{eq:vector_time_score} gives
+\begin{equation}
+\mathrm{vec}\!\bigl(\partial_t \log p_t(x \mid z)\bigr)
+=
+-\frac{1-2t}{2t(1-t)}\mathbf 1
++
+\frac{1}{\sigma\sqrt{t(1-t)}}(x_1-x_0)\odot \epsilon_t
++
+\frac{1-2t}{2t(1-t)}\epsilon_t^{\odot 2},
+\end{equation}
+with
+\begin{equation}
+\epsilon_t
+=
+\frac{x-[(1-t)x_0+t x_1]}{\sigma\sqrt{t(1-t)}}.
+\end{equation}
+
+\paragraph{Cosine-schedule two-endpoint bridge.}
+Let
+\begin{equation}
+s(t)=\frac{1-\cos(\pi t)}{2},
+\end{equation}
+and define
+\begin{equation}
+a_t = 1-s(t)=\cos^2\!\left(\frac{\pi t}{2}\right),
+\qquad
+b_t = s(t)=\sin^2\!\left(\frac{\pi t}{2}\right),
+\qquad
+c_t = \sigma \sqrt{s(t)(1-s(t))}=\frac{\sigma}{2}\sin(\pi t).
+\end{equation}
+Then
+\begin{equation}
+\mu_t(z)=\cos^2\!\left(\frac{\pi t}{2}\right)x_0+\sin^2\!\left(\frac{\pi t}{2}\right)x_1,
+\qquad
+k_t=\frac{\sigma^2}{4}\sin^2(\pi t),
+\end{equation}
+and
+\begin{equation}
+\dot \mu_t(z)=\frac{\pi}{2}\sin(\pi t)(x_1-x_0),
+\qquad
+\dot k_t=\frac{\pi \sigma^2}{4}\sin(2\pi t).
+\end{equation}
+Substituting into \eqref{eq:vector_time_score} gives
+\begin{equation}
+\mathrm{vec}\!\bigl(\partial_t \log p_t(x \mid z)\bigr)
+=
+-\pi \cot(\pi t)\mathbf 1
++
+\frac{\pi}{\sigma}(x_1-x_0)\odot \epsilon_t
++
+\pi \cot(\pi t)\,\epsilon_t^{\odot 2},
+\end{equation}
+where now
+\begin{equation}
+\epsilon_t
+=
+\frac{x-\cos^2(\pi t/2)x_0-\sin^2(\pi t/2)x_1}{(\sigma/2)\sin(\pi t)}.
+\end{equation}
+
+The general message is simple: once a two-endpoint bridge can be written as a Gaussian affine interpolation
+\begin{equation}
+x_t = a_t x_0 + b_t x_1 + c_t \varepsilon,
+\end{equation}
+its scalar and vectorized target scores follow immediately from \eqref{eq:scalar_time_score} and \eqref{eq:vector_time_score}. Different schedules only change $\mu_t$, $k_t$, and their derivatives.

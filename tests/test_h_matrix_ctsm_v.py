@@ -39,14 +39,14 @@ class TestHMatrixCtsmV(unittest.TestCase):
         self.assertLess(float(np.max(np.abs(np.diag(out.delta_l_matrix)))), 1e-8)
         self.assertLess(float(np.max(np.abs(np.diag(out.h_sym)))), 1e-8)
 
-    def test_validate_estimation_args_rejects_ctsm_v(self) -> None:
+    def test_validate_estimation_args_accepts_ctsm_v(self) -> None:
         parser = argparse.ArgumentParser()
         add_estimation_arguments(parser)
         args = parser.parse_args(["--theta-field-method", "ctsm_v"])
-        with self.assertRaises(ValueError):
-            validate_estimation_args(args)
+        validate_estimation_args(args)
+        self.assertEqual(str(args.theta_field_method), "ctsm_v")
 
-    def test_shared_estimation_ctsm_v_rejected(self) -> None:
+    def test_shared_estimation_ctsm_v_runs_and_writes_h_artifacts(self) -> None:
         parser = argparse.ArgumentParser()
         add_estimation_arguments(parser)
         args = parser.parse_args([])
@@ -83,18 +83,21 @@ class TestHMatrixCtsmV(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             args.output_dir = str(Path(td))
-            with self.assertRaises(ValueError):
-                run_shared_fisher_estimation(
-                    args,
-                    dataset=object(),
-                    theta_all=theta_all,
-                    x_all=x_all,
-                    theta_train=theta_train,
-                    x_train=x_train,
-                    theta_eval=theta_eval,
-                    x_eval=x_eval,
-                    rng=np.random.default_rng(0),
-                )
+            run_shared_fisher_estimation(
+                args,
+                dataset=object(),
+                theta_all=theta_all,
+                x_all=x_all,
+                theta_train=theta_train,
+                x_train=x_train,
+                theta_eval=theta_eval,
+                x_eval=x_eval,
+                rng=np.random.default_rng(0),
+            )
+            out_dir = Path(td)
+            self.assertTrue((out_dir / "h_matrix_results_theta_cov.npz").is_file())
+            self.assertTrue((out_dir / "h_matrix_summary_theta_cov.txt").is_file())
+            self.assertTrue((out_dir / "score_prior_training_losses.npz").is_file())
 
 
 if __name__ == "__main__":

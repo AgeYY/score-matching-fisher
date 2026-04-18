@@ -319,11 +319,18 @@ def hellinger_acc_ub_from_binned_h_squared(h_squared_binned: np.ndarray) -> np.n
 
 def hellinger_figure_labels(h_field_method: str) -> tuple[str, str, str]:
     m = str(h_field_method).strip().lower()
-    if m in ("flow", "theta_flow"):
+    if m == "theta_path_integral":
         return (
             r"Binned $H_{ij}^2$ (flow-derived score) → Hellinger LB on $A^*_{ij}$",
             r"Hellinger LB ($H^2$)",
             "Flow-derived score field (from velocity): binned symmetric H treated as H^2; ",
+        )
+    if m == "theta_flow":
+        tag = r"$\theta$-space ODE log-likelihood ($\log p(\theta|x)-\log p(\theta)$)"
+        return (
+            r"Binned $H_{ij}^2$ → Hellinger LB on $A^*_{ij}$" + "\n" + f"({tag})",
+            r"Hellinger LB ($H^2$)",
+            "Theta-flow ODE likelihood field (Bayes log-ratio matrix): binned symmetric H treated as H^2; ",
         )
     if m in ("flow_x_likelihood", "x_flow"):
         tag = "x-space ODE log p(x|θ)"
@@ -1210,22 +1217,33 @@ def write_summary(
             "A^lb_ij = 0.5*(1+H_ij^2) <= A*_ij <= A^ub_ij = 0.5*(1+sqrt(2*H_ij^2-H_ij^4)); "
             "diagonal NaN; off-diagonal in [0.5,1] when H_ij^2 in [0,1].\n"
         )
-        if str(loaded.h_field_method).strip().lower() != "flow":
-            f.write(
-                "  DSM note: the trained fields are denoising scores; "
-                "∇_θ log p(θ|x) is the standard score target, and "
-                "∇_θ p(θ|x) = p(θ|x) ∇_θ log p(θ|x) on the support of p.\n"
-            )
-        else:
+        _hfm = str(loaded.h_field_method).strip().lower()
+        if _hfm == "theta_path_integral":
             f.write(
                 "  Flow note: H uses score recovered from velocity via the affine path conversion "
                 "(path.velocity_to_epsilon followed by s = -eps / sigma_t), "
-                "not raw velocity-as-score.\n"
+                "not raw velocity-as-score; trapezoid integral along sorted θ.\n"
             )
             if loaded.flow_scheduler is not None:
                 f.write(f"  flow_scheduler: {loaded.flow_scheduler}\n")
             if loaded.flow_score_mode is not None:
                 f.write(f"  flow_score_mode: {loaded.flow_score_mode}\n")
+        elif _hfm == "theta_flow":
+            f.write(
+                "  Theta-flow ODE note: H uses per-pair log-density from ODESolver.compute_likelihood "
+                "on the learned θ-space flow (posterior conditional on x minus prior), not score integration "
+                "along θ.\n"
+            )
+            if loaded.flow_scheduler is not None:
+                f.write(f"  flow_scheduler: {loaded.flow_scheduler}\n")
+            if loaded.flow_score_mode is not None:
+                f.write(f"  flow_score_mode: {loaded.flow_score_mode}\n")
+        else:
+            f.write(
+                "  DSM note: the trained fields are denoising scores; "
+                "∇_θ log p(θ|x) is the standard score target, and "
+                "∇_θ p(θ|x) = p(θ|x) ∇_θ log p(θ|x) on the support of p.\n"
+            )
         f.write(f"correlation_hellinger_acc_lb_vs_gt_approx: {metrics.corr_hellinger_lb_vs_gt}\n")
         f.write(f"correlation_hellinger_acc_ub_vs_gt_approx: {metrics.corr_hellinger_ub_vs_gt}\n")
 

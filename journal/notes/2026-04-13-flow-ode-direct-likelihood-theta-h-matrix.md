@@ -1,12 +1,14 @@
 # Flow ODE direct likelihood for $\theta$ H-matrix (`flow_likelihood`)
 
+> **Naming (2026-04-18):** CLI `--theta-field-method theta_flow` and `HMatrixEstimator` `field_method="theta_flow"` now denote this **ODE log-likelihood / Bayes-ratio** path (formerly documented as `flow_likelihood`). The **velocity → score → trapezoid integral along sorted θ** path is **`theta_path_integral`** (formerly `flow` / default `theta_flow`). See [theta-flow rename note](2026-04-18-theta-flow-rename-and-bayes-ratio.md).
+
 ## Context
 
 The repository’s older **`flow`** path for the theta field trains conditional and prior **flow-matching velocity** models, then converts velocity to a **score** (`velocity_to_epsilon` and $s = -\epsilon/\sigma_t$) and **path-integrates** score differences along $\theta$ to build a $\Delta \log$-type matrix for H-decoding.
 
 The **`flow_likelihood`** option keeps the **same trained networks** but skips score conversion and score integration. Instead it uses the **continuity equation / change-of-variables** along the learned ODE to estimate **$\log p(\theta)$** at the endpoint and forms **pairwise log-likelihood ratios** directly. Those ratios feed the same downstream H-building steps (symmetric Hellinger matrix) as the score-based pipeline.
 
-**Implementation:** `fisher/h_matrix.py` (`HMatrixEstimator`, `field_method="flow_likelihood"`), invoked from `fisher/shared_fisher_est.py` when `--theta-field-method flow_likelihood`.
+**Implementation:** `fisher/h_matrix.py` (`HMatrixEstimator`, `field_method="theta_flow"`), invoked from `fisher/shared_fisher_est.py` when `--theta-field-method theta_flow`.
 
 ## Method (continuous time)
 

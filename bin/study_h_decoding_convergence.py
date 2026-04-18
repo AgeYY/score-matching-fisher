@@ -17,12 +17,15 @@ subset (same bin edges as GT), unchanged.
 random-amplitude Gaussian bumps plus ``sqrt(x_dim)`` observation-noise scaling; see ``make_dataset.py``).
 Regenerate the NPZ if the family does not match.
 
-For each ``n`` in ``--n-list``, the H matrix is computed from trained flow-matching models.
-Only two methods are supported: ``--theta-field-method theta_flow`` (theta-space FM with prior)
-and ``--theta-field-method x_flow`` (conditional x-space FM likelihood; no prior model).
-Each method has two architecture choices via ``--flow-arch``: ``mlp`` or ``film_fourier``.
+For each ``n`` in ``--n-list``, the H matrix is computed from trained models for the selected
+field method. Supported methods are ``--theta-field-method theta_flow`` (theta-space flow ODE
+log-likelihood Bayes ratios; prior + posterior theta-flows), ``--theta-field-method theta_path_integral``
+(same training as theta_flow but H from velocity-to-score plus trapezoid integral along sorted ``theta``),
+``--theta-field-method x_flow`` (conditional x-space FM likelihood; no prior model), and
+``--theta-field-method ctsm_v`` (pair-conditioned CTSM-v time-score integration; no prior model).
+Flow methods have two architecture choices via ``--flow-arch``: ``mlp`` or ``film_fourier``.
 ``film_fourier`` uses FiLM conditioning with Fourier theta features
-(``--flow-theta-fourier-*`` for ``theta_flow`` and ``--flow-x-theta-fourier-*`` for ``x_flow``).
+(``--flow-theta-fourier-*`` for ``theta_flow`` / ``theta_path_integral`` and ``--flow-x-theta-fourier-*`` for ``x_flow``).
 The **reference column** (``n_ref``) does **not** run learned H
 training: the
 matrix-panel top row shows **MC generative** ``sqrt(H^2)`` (same as the H correlation
@@ -564,9 +567,13 @@ def _render_training_losses_panel(
 
         tfm = str(bundle.get("theta_field_method", "theta_flow")).strip().lower()
         if tfm == "theta_flow":
-            post_lab = "theta-flow score"
+            post_lab = "theta-flow ODE Bayes-ratio"
+        elif tfm == "theta_path_integral":
+            post_lab = "theta-path-integral score"
         elif tfm == "x_flow":
             post_lab = "x-flow direct likelihood"
+        elif tfm == "ctsm_v":
+            post_lab = "pair-conditioned CTSM-v"
         else:
             post_lab = tfm
         _plot_loss_triplet(
@@ -1315,8 +1322,19 @@ def main(argv: list[str] | None = None) -> None:
             flush=True,
         )
         print(
-            "[convergence] theta_flow mode uses score-from-velocity conversion "
-            "(path.velocity_to_epsilon then s=-eps/sigma_t).",
+            "[convergence] theta_flow mode uses ODE log-likelihood on theta-space flows "
+            "(log p(theta|x) - log p(theta) via compute_likelihood; no theta-axis score integral).",
+            flush=True,
+        )
+    elif tfm == "theta_path_integral":
+        print(
+            f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
+            f"(flow_arch={getattr(args, 'flow_arch', 'mlp')})",
+            flush=True,
+        )
+        print(
+            "[convergence] theta_path_integral mode uses score-from-velocity conversion "
+            "(path.velocity_to_epsilon then s=-eps/sigma_t) and trapezoid integral along sorted theta.",
             flush=True,
         )
     elif tfm == "x_flow":
@@ -1330,8 +1348,22 @@ def main(argv: list[str] | None = None) -> None:
             "(no prior model).",
             flush=True,
         )
+    elif tfm == "ctsm_v":
+        print(
+            f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
+            f"(ctsm_arch={getattr(args, 'ctsm_arch', 'film')}; pair-conditioned bridge model)",
+            flush=True,
+        )
+        print(
+            "[convergence] ctsm_v mode uses pair-conditioned CTSM-v to integrate per-pair "
+            "log-ratio fields over t (no prior model).",
+            flush=True,
+        )
     else:
-        raise ValueError(f"Unsupported --theta-field-method={tfm!r}; use theta_flow or x_flow.")
+        raise ValueError(
+            f"Unsupported --theta-field-method={tfm!r}; use "
+            "theta_flow, theta_path_integral, x_flow, or ctsm_v."
+        )
     print(
         "[convergence] n_ref reference: no learned H training at n_ref; matrix-panel top row = MC GT sqrt(H^2); "
         "pairwise decoding from n_ref subset only.",
