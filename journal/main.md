@@ -16,6 +16,8 @@ Collected markdown notes in `journal/notes/`: long-form chapters (moved from the
 
 ## 2026-04
 
+- [2026-04-18 CTSM-v log-likelihood ratio on continuous parametric Gaussian family $p_t(x)=\mathcal{N}(2t-1,1)$: $(x,t)$ dataset, random held-out $(t_i,t_j)$ pairs, and reproducibility with `--ctsm-max-epochs 10000 --ctsm-early-patience 1000`](notes/2026-04-18-ctsm-v-parametric-gaussian-t-log-ratio.md)
+- [2026-04-18 CTSM-v log-likelihood ratio between two 1D Gaussians: pair-conditioned FiLM (`a=-1`, `b=+1`), estimated vs GT scatter, and reproducibility command](notes/2026-04-18-ctsm-v-gaussian-two-dist-log-ratio.md)
 - [2026-04-16 Marginal leading-$K$ dims for `flow_x_likelihood` H-decoding (10D `cosine_gaussian_sqrtd`): GT marginal, MLP x-flow, cosine scheduler, no two-stage / no Fourier (defaults in cited runs)](notes/2026-04-16-marginal-leading-dims-flow-x-h-decoding.md)
 - [2026-04-16 Pair-conditioned CTSM-v (`tests/ctsm_pair_conditioned.py`): discrete $\theta$ grid, conditional GMM variance, $\log p(x|b)-\log p(x|a)$ + reproducibility](notes/2026-04-16-pair-conditioned-ctsm-v-discrete-theta-gmm.md)
 - [2026-04-16 CTSM-v toy (`tests/ctsm.py`): `TwoSB` two-sample bridge, bimodal GMM $p$/$q$, $\log q/p$ by trapezoid $t$-integration + figures](notes/2026-04-16-ctsm-v-toy-gaussian-log-ratio.md)

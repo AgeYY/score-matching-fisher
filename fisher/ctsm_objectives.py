@@ -4,9 +4,8 @@ CTSM-v loss (two-sample, full vector target) and log q/p estimation by integrati
 
 from __future__ import annotations
 
-import numpy as np
 import torch
-from scipy import integrate
+from torchdiffeq import odeint
 
 from fisher.ctsm_models import PairConditionedTimeScoreNetBase, ToyFullTimeScoreNet
 from fisher.ctsm_paths import TwoSB
@@ -137,37 +136,49 @@ def estimate_log_ratio_trapz_pair(
 
 
 @torch.no_grad()
-def estimate_log_ratio_scipy(
+def estimate_log_ratio_torch(
     model: ToyFullTimeScoreNet,
     x: torch.Tensor,
     eps1: float = 1e-5,
     eps2: float = 1e-5,
-    method: str = "RK45",
-    rtol: float = 1e-5,
-    atol: float = 1e-5,
+    n_steps: int = 256,
     device: torch.device | None = None,
 ) -> torch.Tensor:
     """
-    scipy.integrate.solve_ivp analogue of density_ratios.get_toy_density_ratio_fn.
+    Fixed-step torchdiffeq RK4 integration of scalar model(x, t) over t.
 
     If `device` is None, uses the device of model parameters.
     """
+    if int(n_steps) < 1:
+        raise ValueError("n_steps must be >= 1.")
+    if eps1 < 0.0 or eps2 < 0.0:
+        raise ValueError("eps1 and eps2 must be >= 0.")
+    t0 = float(eps1)
+    t1 = float(1.0 - eps2)
+    if not t0 < t1:
+        raise ValueError("Require eps1 < 1 - eps2 for a valid integration interval.")
+
     if device is None:
-        device = next(model.parameters()).device
+        try:
+            device = next(model.parameters()).device
+        except StopIteration:
+            device = x.device
 
-    x_cpu = x.detach().cpu()
+    x_dev = x.detach().to(device)
+    step_size = (t1 - t0) / float(n_steps)
+    t_span = torch.tensor([t0, t1], device=device, dtype=x_dev.dtype)
+    y0 = torch.zeros((x_dev.shape[0],), device=device, dtype=x_dev.dtype)
 
-    def ode_func(t, y):
-        t_batch = torch.full((x_cpu.shape[0], 1), float(t), dtype=x_cpu.dtype)
-        out = model(x_cpu.to(device), t_batch.to(device)).squeeze(-1)
-        return out.detach().cpu().numpy()
+    def ode_func(t: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        _ = y
+        t_batch = torch.full((x_dev.shape[0], 1), float(t), device=device, dtype=x_dev.dtype)
+        return model(x_dev, t_batch).squeeze(-1)
 
-    solution = integrate.solve_ivp(
+    y_path = odeint(
         ode_func,
-        (eps1, 1.0 - eps2),
-        np.zeros((x_cpu.shape[0],), dtype=np.float64),
-        method=method,
-        rtol=rtol,
-        atol=atol,
+        y0,
+        t_span,
+        method="rk4",
+        options={"step_size": step_size},
     )
-    return torch.tensor(solution.y[:, -1], dtype=x.dtype, device=x.device)
+    return y_path[-1].to(device=x.device, dtype=x.dtype)
