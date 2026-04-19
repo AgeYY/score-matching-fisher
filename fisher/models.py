@@ -238,6 +238,198 @@ class PriorThetaFlowVelocity(nn.Module):
         return self.forward(theta, t)
 
 
+class ConditionalThetaFlowVelocityIIDSoft(nn.Module):
+    """Conditional theta-flow velocity: mean over observation coordinates + interaction (velocity in R^M).
+
+    Shared small MLP ``phi`` maps ``(theta~, x_i, t)`` to a vector in ``R^M`` (``M = theta_dim``).
+    A second MLP ``psi`` maps the full ``(theta~, x, t)`` to ``R^M``. Output is::
+
+        v(theta~, x, t) = (1/D_x) * sum_i phi(theta~, x_i, t) + alpha * psi(theta~, x, t)
+
+    where ``D_x = x_dim`` is the observation dimension and ``theta~`` is the full ``theta_t`` vector.
+    """
+
+    def __init__(
+        self,
+        x_dim: int = 2,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        use_logit_time: bool = True,
+        *,
+        theta_dim: int = 1,
+        interaction_hidden_dim: int | None = None,
+        interaction_depth: int | None = None,
+        alpha_init: float = 0.001,
+        alpha_learnable: bool = True,
+    ) -> None:
+        super().__init__()
+        if int(x_dim) < 1:
+            raise ValueError("x_dim must be >= 1.")
+        if int(theta_dim) < 1:
+            raise ValueError("theta_dim must be >= 1.")
+        self.x_dim = int(x_dim)
+        self.theta_dim = int(theta_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.depth = int(depth)
+        self.use_logit_time = bool(use_logit_time)
+        self.alpha_learnable = bool(alpha_learnable)
+        int_h = int(interaction_hidden_dim) if interaction_hidden_dim is not None else self.hidden_dim
+        int_d = int(interaction_depth) if interaction_depth is not None else self.depth
+        if int_h < 1:
+            raise ValueError("interaction_hidden_dim must be >= 1.")
+        if int_d < 1:
+            raise ValueError("interaction_depth must be >= 1.")
+
+        # phi(theta~, x_i, t_feat) -> R^{theta_dim}
+        in_phi = int(self.theta_dim) + 1 + 1
+        d_in = in_phi
+        phi_layers: list[nn.Module] = []
+        for _ in range(self.depth):
+            phi_layers.append(nn.Linear(d_in, self.hidden_dim))
+            phi_layers.append(nn.SiLU())
+            d_in = self.hidden_dim
+        phi_layers.append(nn.Linear(d_in, int(self.theta_dim)))
+        self.phi_net = nn.Sequential(*phi_layers)
+
+        # psi(theta~, x, t_feat) -> R^{theta_dim}
+        in_psi = int(self.theta_dim) + int(x_dim) + 1
+        d_psi = in_psi
+        psi_layers: list[nn.Module] = []
+        for _ in range(int_d):
+            psi_layers.append(nn.Linear(d_psi, int_h))
+            psi_layers.append(nn.SiLU())
+            d_psi = int_h
+        psi_layers.append(nn.Linear(d_psi, int(self.theta_dim)))
+        self.psi_net = nn.Sequential(*psi_layers)
+
+        a0 = float(alpha_init)
+        if self.alpha_learnable:
+            self.register_parameter("alpha", nn.Parameter(torch.tensor([a0], dtype=torch.float32)))
+        else:
+            self.register_buffer("alpha", torch.tensor([a0], dtype=torch.float32))
+
+    def _t_feat(self, t: torch.Tensor) -> torch.Tensor:
+        if t.ndim == 1:
+            t = t.unsqueeze(-1)
+        if self.use_logit_time:
+            t_clip = torch.clamp(t, min=1e-4, max=1.0 - 1e-4)
+            return torch.log(t_clip) - torch.log1p(-t_clip)
+        return t
+
+    def forward(self, theta_t: torch.Tensor, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        if theta_t.shape[-1] != self.theta_dim:
+            raise ValueError(f"theta_t last dim {theta_t.shape[-1]} != theta_dim={self.theta_dim}")
+        if x.shape[-1] != self.x_dim:
+            raise ValueError(f"x last dim {x.shape[-1]} != x_dim={self.x_dim}")
+        t_feat = self._t_feat(t)
+        parts: list[torch.Tensor] = []
+        for i in range(self.x_dim):
+            xi = x[:, i : i + 1]
+            feats = torch.cat([theta_t, xi, t_feat], dim=-1)
+            parts.append(self.phi_net(feats))
+        # (B, D_x, M) then mean over x coordinates -> (B, M)
+        phi_stack = torch.stack(parts, dim=1)
+        v_add = phi_stack.mean(dim=1)
+        feats_psi = torch.cat([theta_t, x, t_feat], dim=-1)
+        v_int = self.psi_net(feats_psi)
+        alpha = self.alpha.view(1, 1).to(dtype=v_add.dtype, device=v_add.device)
+        return v_add + alpha * v_int
+
+    @torch.no_grad()
+    def predict_velocity(self, theta: torch.Tensor, x: torch.Tensor, t_eval: float) -> torch.Tensor:
+        self.eval()
+        t = torch.full((theta.shape[0], 1), float(t_eval), device=theta.device)
+        return self.forward(theta, x, t)
+
+
+class PriorThetaFlowVelocityIIDSoft(nn.Module):
+    """Prior theta-flow velocity: same pooling structure as the conditional model, without ``x``.
+
+    ``v(theta, t) = (1/D) * sum_k phi(theta_k, t) * 1_D + alpha * psi(theta, t)`` with ``D = theta_dim``.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        use_logit_time: bool = True,
+        *,
+        theta_dim: int = 1,
+        interaction_hidden_dim: int | None = None,
+        interaction_depth: int | None = None,
+        alpha_init: float = 0.001,
+        alpha_learnable: bool = True,
+    ) -> None:
+        super().__init__()
+        if int(theta_dim) < 1:
+            raise ValueError("theta_dim must be >= 1.")
+        self.theta_dim = int(theta_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.depth = int(depth)
+        self.use_logit_time = bool(use_logit_time)
+        self.alpha_learnable = bool(alpha_learnable)
+        int_h = int(interaction_hidden_dim) if interaction_hidden_dim is not None else self.hidden_dim
+        int_d = int(interaction_depth) if interaction_depth is not None else self.depth
+        if int_h < 1:
+            raise ValueError("interaction_hidden_dim must be >= 1.")
+        if int_d < 1:
+            raise ValueError("interaction_depth must be >= 1.")
+
+        d_phi = 1 + 1  # theta_k, t_feat
+        phi_layers: list[nn.Module] = []
+        for _ in range(self.depth):
+            phi_layers.append(nn.Linear(d_phi, self.hidden_dim))
+            phi_layers.append(nn.SiLU())
+            d_phi = self.hidden_dim
+        phi_layers.append(nn.Linear(d_phi, 1))
+        self.phi_net = nn.Sequential(*phi_layers)
+
+        d_psi = int(self.theta_dim) + 1
+        psi_layers: list[nn.Module] = []
+        for _ in range(int_d):
+            psi_layers.append(nn.Linear(d_psi, int_h))
+            psi_layers.append(nn.SiLU())
+            d_psi = int_h
+        psi_layers.append(nn.Linear(d_psi, int(self.theta_dim)))
+        self.psi_net = nn.Sequential(*psi_layers)
+
+        a0 = float(alpha_init)
+        if self.alpha_learnable:
+            self.register_parameter("alpha", nn.Parameter(torch.tensor([a0], dtype=torch.float32)))
+        else:
+            self.register_buffer("alpha", torch.tensor([a0], dtype=torch.float32))
+
+    def _t_feat(self, t: torch.Tensor) -> torch.Tensor:
+        if t.ndim == 1:
+            t = t.unsqueeze(-1)
+        if self.use_logit_time:
+            t_clip = torch.clamp(t, min=1e-4, max=1.0 - 1e-4)
+            return torch.log(t_clip) - torch.log1p(-t_clip)
+        return t
+
+    def forward(self, theta_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        if theta_t.shape[-1] != self.theta_dim:
+            raise ValueError(f"theta_t last dim {theta_t.shape[-1]} != theta_dim={self.theta_dim}")
+        t_feat = self._t_feat(t)
+        parts: list[torch.Tensor] = []
+        for k in range(self.theta_dim):
+            tk = theta_t[:, k : k + 1]
+            feats = torch.cat([tk, t_feat], dim=-1)
+            parts.append(self.phi_net(feats))
+        phi_stack = torch.cat(parts, dim=-1)
+        v_add = phi_stack.mean(dim=-1, keepdim=True).expand_as(theta_t)
+        feats_psi = torch.cat([theta_t, t_feat], dim=-1)
+        v_int = self.psi_net(feats_psi)
+        alpha = self.alpha.view(1, 1).to(dtype=v_add.dtype, device=v_add.device)
+        return v_add + alpha * v_int
+
+    @torch.no_grad()
+    def predict_velocity(self, theta: torch.Tensor, t_eval: float) -> torch.Tensor:
+        self.eval()
+        t = torch.full((theta.shape[0], 1), float(t_eval), device=theta.device)
+        return self.forward(theta, t)
+
+
 class ConditionalThetaFlowVelocityThetaFourierMLP(nn.Module):
     """Conditional theta-flow velocity v(theta_t, x, t) with theta features [1, theta] plus sin/cos harmonics.
 
@@ -1080,6 +1272,107 @@ class ConditionalXFlowVelocityIndependentThetaFourierMLP(nn.Module):
             feats = torch.cat([xk, theta_feat, t_feat], dim=-1)
             parts.append(self.nets[k](feats))
         return torch.cat(parts, dim=-1)
+
+    @torch.no_grad()
+    def predict_velocity(self, x_t: torch.Tensor, theta: torch.Tensor, t_eval: float) -> torch.Tensor:
+        self.eval()
+        t = torch.full((x_t.shape[0], 1), float(t_eval), device=x_t.device)
+        return self.forward(x_t, theta, t)
+
+
+class ConditionalXFlowVelocityIIDSoft(nn.Module):
+    """Conditional x-flow with soft iid-x bias: mean-field additive branch + interaction residual.
+
+    A shared small MLP ``phi`` maps each coordinate to a scalar, then the additive velocity is the
+    coordinate-wise mean (pooled evidence) broadcast to every output dimension. A second small MLP
+    ``psi`` maps the full state. Output is::
+
+        v(x, theta, t) = (1/D) * sum_i phi(x_i, theta, t) * 1_D + alpha * psi(x, theta, t)
+
+    where ``1_D`` is the all-ones vector in ``R^D``, ``alpha`` is learnable or fixed, and
+    ``phi``, ``psi`` are the usual coordinate / full-vector branches from the ``iid-x`` idea.
+    """
+
+    def __init__(
+        self,
+        x_dim: int = 2,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        use_logit_time: bool = True,
+        *,
+        interaction_hidden_dim: int | None = None,
+        interaction_depth: int | None = None,
+        alpha_init: float = 0.001,
+        alpha_learnable: bool = True,
+    ) -> None:
+        super().__init__()
+        if x_dim < 1:
+            raise ValueError("x_dim must be >= 1.")
+        self.x_dim = int(x_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.depth = int(depth)
+        self.use_logit_time = bool(use_logit_time)
+        self.alpha_learnable = bool(alpha_learnable)
+        int_h = int(interaction_hidden_dim) if interaction_hidden_dim is not None else self.hidden_dim
+        int_d = int(interaction_depth) if interaction_depth is not None else self.depth
+        if int_h < 1:
+            raise ValueError("interaction_hidden_dim must be >= 1.")
+        if int_d < 1:
+            raise ValueError("interaction_depth must be >= 1.")
+
+        # Shared phi: scalar on each coordinate (inputs: x_k, theta, t_feat); pooled by mean over k.
+        in_phi = 1 + 1 + 1
+        d_in = in_phi
+        phi_layers: list[nn.Module] = []
+        for _ in range(self.depth):
+            phi_layers.append(nn.Linear(d_in, self.hidden_dim))
+            phi_layers.append(nn.SiLU())
+            d_in = self.hidden_dim
+        phi_layers.append(nn.Linear(d_in, 1))
+        self.phi_net = nn.Sequential(*phi_layers)
+
+        # Full interaction psi: R^{x_dim} -> R^{x_dim}.
+        in_psi = int(x_dim) + 1 + 1
+        d_psi = in_psi
+        psi_layers: list[nn.Module] = []
+        for _ in range(int_d):
+            psi_layers.append(nn.Linear(d_psi, int_h))
+            psi_layers.append(nn.SiLU())
+            d_psi = int_h
+        psi_layers.append(nn.Linear(d_psi, int(x_dim)))
+        self.psi_net = nn.Sequential(*psi_layers)
+
+        a0 = float(alpha_init)
+        if self.alpha_learnable:
+            self.register_parameter("alpha", nn.Parameter(torch.tensor([a0], dtype=torch.float32)))
+        else:
+            self.register_buffer("alpha", torch.tensor([a0], dtype=torch.float32))
+
+    def _t_feat(self, t: torch.Tensor) -> torch.Tensor:
+        if t.ndim == 1:
+            t = t.unsqueeze(-1)
+        if self.use_logit_time:
+            t_clip = torch.clamp(t, min=1e-4, max=1.0 - 1e-4)
+            return torch.log(t_clip) - torch.log1p(-t_clip)
+        return t
+
+    def forward(self, x_t: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        if x_t.shape[-1] != self.x_dim:
+            raise ValueError(f"x_t last dim {x_t.shape[-1]} != x_dim={self.x_dim}")
+        t_feat = self._t_feat(t)
+        parts: list[torch.Tensor] = []
+        for k in range(self.x_dim):
+            xk = x_t[:, k : k + 1]
+            feats = torch.cat([xk, theta, t_feat], dim=-1)
+            parts.append(self.phi_net(feats))
+        # (1/D) * sum_i phi(x_i, theta, t), broadcast to R^D (same scalar in every coordinate).
+        phi_stack = torch.cat(parts, dim=-1)
+        v_add_mean = phi_stack.mean(dim=-1, keepdim=True)
+        v_add = v_add_mean.expand_as(x_t)
+        feats_psi = torch.cat([x_t, theta, t_feat], dim=-1)
+        v_int = self.psi_net(feats_psi)
+        alpha = self.alpha.view(1, 1).to(dtype=v_add.dtype, device=v_add.device)
+        return v_add + alpha * v_int
 
     @torch.no_grad()
     def predict_velocity(self, x_t: torch.Tensor, theta: torch.Tensor, t_eval: float) -> torch.Tensor:

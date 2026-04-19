@@ -16,9 +16,11 @@ from fisher.models import (
     ConditionalScore1DFiLMPerLayer,
     ConditionalThetaFlowVelocity,
     ConditionalThetaFlowVelocityFiLMPerLayer,
+    ConditionalThetaFlowVelocityIIDSoft,
     ConditionalThetaFlowVelocityThetaFourierMLP,
     ConditionalXFlowVelocity,
     ConditionalXFlowVelocityFiLMPerLayer,
+    ConditionalXFlowVelocityIIDSoft,
     ConditionalXFlowVelocityIndependentMLP,
     ConditionalXFlowVelocityIndependentThetaFourierMLP,
     ConditionalXFlowVelocityThetaFourierFiLMPerLayer,
@@ -27,6 +29,7 @@ from fisher.models import (
     PriorScore1DFiLMPerLayer,
     PriorThetaFlowVelocity,
     PriorThetaFlowVelocityFiLMPerLayer,
+    PriorThetaFlowVelocityIIDSoft,
     PriorThetaFlowVelocityThetaFourierMLP,
 )
 
@@ -96,9 +99,11 @@ class HMatrixEstimator:
         | ConditionalScore1DFiLMPerLayer
         | ConditionalThetaFlowVelocity
         | ConditionalThetaFlowVelocityFiLMPerLayer
+        | ConditionalThetaFlowVelocityIIDSoft
         | ConditionalThetaFlowVelocityThetaFourierMLP
         | ConditionalXFlowVelocity
         | ConditionalXFlowVelocityFiLMPerLayer
+        | ConditionalXFlowVelocityIIDSoft
         | ConditionalXFlowVelocityIndependentMLP
         | ConditionalXFlowVelocityIndependentThetaFourierMLP
         | ConditionalXFlowVelocityThetaFourierFiLMPerLayer
@@ -108,6 +113,7 @@ class HMatrixEstimator:
         | PriorScore1DFiLMPerLayer
         | PriorThetaFlowVelocity
         | PriorThetaFlowVelocityFiLMPerLayer
+        | PriorThetaFlowVelocityIIDSoft
         | PriorThetaFlowVelocityThetaFourierMLP
         | None = None,
         sigma_eval: float,
@@ -146,6 +152,7 @@ class HMatrixEstimator:
                 (
                     ConditionalXFlowVelocity,
                     ConditionalXFlowVelocityFiLMPerLayer,
+                    ConditionalXFlowVelocityIIDSoft,
                     ConditionalXFlowVelocityIndependentMLP,
                     ConditionalXFlowVelocityIndependentThetaFourierMLP,
                     ConditionalXFlowVelocityThetaFourierFiLMPerLayer,
@@ -154,7 +161,8 @@ class HMatrixEstimator:
             ):
                 raise TypeError(
                     "flow_x_likelihood requires model_post to be ConditionalXFlowVelocity, "
-                    "ConditionalXFlowVelocityFiLMPerLayer, ConditionalXFlowVelocityIndependentMLP, "
+                    "ConditionalXFlowVelocityFiLMPerLayer, ConditionalXFlowVelocityIIDSoft, "
+                    "ConditionalXFlowVelocityIndependentMLP, "
                     "ConditionalXFlowVelocityIndependentThetaFourierMLP, "
                     "ConditionalXFlowVelocityThetaFourierFiLMPerLayer, or ConditionalXFlowVelocityThetaFourierMLP."
                 )

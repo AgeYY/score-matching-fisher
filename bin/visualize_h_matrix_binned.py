@@ -210,12 +210,6 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
-        "--clf-test-frac",
-        type=float,
-        default=0.3,
-        help="Held-out fraction for pairwise bin-vs-bin logistic regression (default 0.3).",
-    )
-    p.add_argument(
         "--clf-min-class-count",
         type=int,
         default=5,
@@ -225,7 +219,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--clf-random-state",
         type=int,
         default=-1,
-        help="Random seed for train/test split; -1 uses dataset seed from NPZ meta.",
+        help="Random seed for LogisticRegression; -1 uses dataset seed from NPZ meta.",
+    )
+    p.add_argument(
+        "--gt-approx-clf-validation-frac",
+        type=float,
+        default=0.3,
+        help=(
+            "Held-out fraction of the synthetic GT sample for GT-approximation pairwise decoding only "
+            "(default 0.3). Does not affect the primary classifier, which trains on NPZ train and scores on NPZ validation."
+        ),
     )
     p.add_argument(
         "--gt-approx-n-total",
@@ -358,22 +361,94 @@ def hellinger_figure_labels(h_field_method: str) -> tuple[str, str, str]:
     )
 
 
-def theta_for_h_matrix_alignment(bundle: SharedDatasetBundle, full_args: SimpleNamespace) -> np.ndarray:
-    mode = str(getattr(full_args, "score_fisher_eval_data", "full"))
-    if mode == "full":
+def theta_for_h_matrix_alignment(bundle: SharedDatasetBundle, *, h_field_method: str) -> np.ndarray:
+    """Rows that match ``theta_used`` in ``h_matrix_results*.npz`` for alignment checks."""
+    m = str(h_field_method).strip().lower()
+    if m in ("dsm", "theta_flow", "theta_path_integral", "flow_x_likelihood", "ctsm_v"):
         return np.asarray(bundle.theta_all, dtype=np.float64).reshape(-1)
-    if mode == "score_eval":
-        return np.asarray(bundle.theta_eval, dtype=np.float64).reshape(-1)
-    raise ValueError(f"Unknown score_fisher_eval_data: {mode}")
+    return np.asarray(bundle.theta_validation, dtype=np.float64).reshape(-1)
 
 
-def x_for_h_matrix_alignment(bundle: SharedDatasetBundle, full_args: SimpleNamespace) -> np.ndarray:
-    mode = str(getattr(full_args, "score_fisher_eval_data", "full"))
-    if mode == "full":
+def x_for_h_matrix_alignment(bundle: SharedDatasetBundle, *, h_field_method: str) -> np.ndarray:
+    m = str(h_field_method).strip().lower()
+    if m in ("dsm", "theta_flow", "theta_path_integral", "flow_x_likelihood", "ctsm_v"):
         return np.asarray(bundle.x_all, dtype=np.float64)
-    if mode == "score_eval":
-        return np.asarray(bundle.x_eval, dtype=np.float64)
-    raise ValueError(f"Unknown score_fisher_eval_data: {mode}")
+    return np.asarray(bundle.x_validation, dtype=np.float64)
+
+
+def pairwise_bin_logistic_accuracy_train_val(
+    x_train: np.ndarray,
+    bin_train: np.ndarray,
+    x_val: np.ndarray,
+    bin_val: np.ndarray,
+    n_bins: int,
+    *,
+    min_class_count: int,
+    random_state: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, int]]:
+    """Fit pairwise logistic models on training bins; report accuracy on validation bins."""
+    x_tr = np.asarray(x_train, dtype=np.float64)
+    x_va = np.asarray(x_val, dtype=np.float64)
+    if x_tr.ndim != 2 or x_va.ndim != 2 or x_tr.shape[1] != x_va.shape[1]:
+        raise ValueError("x_train and x_val must be 2D with matching feature dim.")
+    bi_tr = np.asarray(bin_train, dtype=np.int64).reshape(-1)
+    bi_va = np.asarray(bin_val, dtype=np.int64).reshape(-1)
+    if x_tr.shape[0] != bi_tr.shape[0] or x_va.shape[0] != bi_va.shape[0]:
+        raise ValueError("x_* and bin_* must have the same number of rows per split.")
+    if min_class_count < 1:
+        raise ValueError("--clf-min-class-count must be >= 1.")
+
+    acc = np.full((n_bins, n_bins), np.nan, dtype=np.float64)
+    valid = np.zeros((n_bins, n_bins), dtype=bool)
+    support = np.zeros((n_bins, n_bins), dtype=np.int64)
+    stats = {"insufficient_counts": 0, "val_empty_class": 0, "fit_fail": 0, "ok_pairs": 0}
+
+    rs = int(random_state)
+    for i in range(n_bins):
+        for j in range(i + 1, n_bins):
+            ia_tr = np.flatnonzero(bi_tr == i)
+            jb_tr = np.flatnonzero(bi_tr == j)
+            ia_va = np.flatnonzero(bi_va == i)
+            jb_va = np.flatnonzero(bi_va == j)
+            ni_tr, nj_tr = int(ia_tr.size), int(jb_tr.size)
+            ni_va, nj_va = int(ia_va.size), int(jb_va.size)
+            support[i, j] = ni_tr + nj_tr + ni_va + nj_va
+            support[j, i] = support[i, j]
+
+            if (
+                ni_tr < min_class_count
+                or nj_tr < min_class_count
+                or ni_va < min_class_count
+                or nj_va < min_class_count
+            ):
+                stats["insufficient_counts"] += 1
+                continue
+
+            X_tr = np.vstack([x_tr[ia_tr], x_tr[jb_tr]])
+            y_tr = np.concatenate([np.zeros(ni_tr, dtype=np.int64), np.ones(nj_tr, dtype=np.int64)])
+            X_va = np.vstack([x_va[ia_va], x_va[jb_va]])
+            y_va = np.concatenate([np.zeros(ni_va, dtype=np.int64), np.ones(nj_va, dtype=np.int64)])
+
+            if len(np.unique(y_tr)) < 2 or len(np.unique(y_va)) < 2:
+                stats["val_empty_class"] += 1
+                continue
+
+            try:
+                clf = LogisticRegression(solver="lbfgs", random_state=rs)
+                clf.fit(X_tr, y_tr)
+                score = float(clf.score(X_va, y_va))
+            except Exception:
+                stats["fit_fail"] += 1
+                continue
+
+            acc[i, j] = score
+            acc[j, i] = score
+            valid[i, j] = True
+            valid[j, i] = True
+            stats["ok_pairs"] += 1
+
+    np.fill_diagonal(acc, np.nan)
+    return acc, valid, support, stats
 
 
 def pairwise_bin_logistic_accuracy_matrix(
@@ -381,18 +456,19 @@ def pairwise_bin_logistic_accuracy_matrix(
     bin_idx: np.ndarray,
     n_bins: int,
     *,
-    test_frac: float,
+    validation_frac: float,
     min_class_count: int,
     random_state: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, int]]:
+    """Single pooled sample: stratified train/validation split per pair (e.g. synthetic GT baseline)."""
     x2 = np.asarray(x, dtype=np.float64)
     if x2.ndim != 2:
         raise ValueError("x must be 2D.")
     bi = np.asarray(bin_idx, dtype=np.int64).reshape(-1)
     if x2.shape[0] != bi.shape[0]:
         raise ValueError("x and bin_idx must have the same number of rows.")
-    if not (0.0 < float(test_frac) < 1.0):
-        raise ValueError("--clf-test-frac must be in (0, 1).")
+    if not (0.0 < float(validation_frac) < 1.0):
+        raise ValueError("validation_frac must be in (0, 1).")
     if min_class_count < 1:
         raise ValueError("--clf-min-class-count must be >= 1.")
 
@@ -418,24 +494,24 @@ def pairwise_bin_logistic_accuracy_matrix(
             y = np.concatenate([np.zeros(ni, dtype=np.int64), np.ones(nj, dtype=np.int64)])
 
             try:
-                X_tr, X_te, y_tr, y_te = train_test_split(
-                    X, y, test_size=float(test_frac), stratify=y, random_state=rs
+                X_tr, X_va, y_tr, y_va = train_test_split(
+                    X, y, test_size=float(validation_frac), stratify=y, random_state=rs
                 )
             except ValueError:
                 try:
-                    X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=float(test_frac), random_state=rs)
+                    X_tr, X_va, y_tr, y_va = train_test_split(X, y, test_size=float(validation_frac), random_state=rs)
                 except ValueError:
                     stats["split_fail"] += 1
                     continue
 
-            if len(np.unique(y_tr)) < 2 or len(np.unique(y_te)) < 2:
+            if len(np.unique(y_tr)) < 2 or len(np.unique(y_va)) < 2:
                 stats["split_fail"] += 1
                 continue
 
             try:
                 clf = LogisticRegression(solver="lbfgs", random_state=rs)
                 clf.fit(X_tr, y_tr)
-                score = float(clf.score(X_te, y_te))
+                score = float(clf.score(X_va, y_va))
             except Exception:
                 stats["fit_fail"] += 1
                 continue
@@ -520,8 +596,8 @@ def _validate_args(args: argparse.Namespace, n_bins: int) -> None:
     validate_estimation_args(args)
     if n_bins < 1:
         raise ValueError("--num-theta-bins must be >= 1.")
-    if not (0.0 < float(args.clf_test_frac) < 1.0):
-        raise ValueError("--clf-test-frac must be in (0, 1).")
+    if not (0.0 < float(args.gt_approx_clf_validation_frac) < 1.0):
+        raise ValueError("--gt-approx-clf-validation-frac must be in (0, 1).")
     if int(args.clf_min_class_count) < 1:
         raise ValueError("--clf-min-class-count must be >= 1.")
     if int(args.gt_approx_n_total) < 2:
@@ -581,8 +657,8 @@ def run_h_estimation_if_needed(ctx: RunContext) -> None:
         x_all=ctx.bundle.x_all,
         theta_train=ctx.bundle.theta_train,
         x_train=ctx.bundle.x_train,
-        theta_eval=ctx.bundle.theta_eval,
-        x_eval=ctx.bundle.x_eval,
+        theta_validation=ctx.bundle.theta_validation,
+        x_validation=ctx.bundle.x_validation,
         rng=ctx.rng,
     )
 
@@ -628,16 +704,16 @@ def load_h_matrix(ctx: RunContext) -> LoadedHMatrix:
 
 
 def _validate_alignment(ctx: RunContext, loaded: LoadedHMatrix) -> np.ndarray:
-    theta_chk = theta_for_h_matrix_alignment(ctx.bundle, ctx.full_args)
+    theta_chk = theta_for_h_matrix_alignment(ctx.bundle, h_field_method=loaded.h_field_method)
     if theta_chk.shape[0] != loaded.theta_used.shape[0]:
         raise ValueError(
             f"theta/H row mismatch: theta_chk={theta_chk.shape[0]} theta_used={loaded.theta_used.shape[0]}"
         )
     if not np.allclose(theta_chk, loaded.theta_used, rtol=0.0, atol=1e-5):
         raise ValueError(
-            "theta_used from H-matrix npz does not match dataset theta for score_fisher_eval_data split."
+            "theta_used from H-matrix npz does not match expected dataset rows for this h_field_method."
         )
-    x_chk = x_for_h_matrix_alignment(ctx.bundle, ctx.full_args)
+    x_chk = x_for_h_matrix_alignment(ctx.bundle, h_field_method=loaded.h_field_method)
     if x_chk.shape[0] != loaded.theta_used.shape[0]:
         raise ValueError(f"x/H row mismatch: x_aligned={x_chk.shape[0]} theta_used={loaded.theta_used.shape[0]}")
     return x_chk
@@ -648,8 +724,13 @@ def compute_binned_metrics(ctx: RunContext, loaded: LoadedHMatrix) -> BinnedMetr
     args = ctx.args
     x_chk = _validate_alignment(ctx, loaded)
 
-    edges, edge_lo, edge_hi = theta_bin_edges(loaded.theta_used, n_bins)
-    bin_idx = theta_to_bin_index(loaded.theta_used, edges, n_bins)
+    th_tr = np.asarray(ctx.bundle.theta_train, dtype=np.float64).reshape(-1)
+    th_va = np.asarray(ctx.bundle.theta_validation, dtype=np.float64).reshape(-1)
+    theta_pooled = np.concatenate([th_tr, th_va], axis=0)
+    edges, edge_lo, edge_hi = theta_bin_edges(theta_pooled, n_bins)
+    bin_idx = theta_to_bin_index(np.asarray(loaded.theta_used, dtype=np.float64).reshape(-1), edges, n_bins)
+    bin_train = theta_to_bin_index(th_tr, edges, n_bins)
+    bin_val = theta_to_bin_index(th_va, edges, n_bins)
     centers = 0.5 * (edges[:-1] + edges[1:])
 
     h_binned, count_matrix = average_matrix_by_bins(loaded.h_sym, bin_idx, n_bins)
@@ -658,11 +739,12 @@ def compute_binned_metrics(ctx: RunContext, loaded: LoadedHMatrix) -> BinnedMetr
     hellinger_acc_ub_binned = hellinger_acc_ub_from_binned_h_squared(h_binned)
 
     clf_rs = int(ctx.meta["seed"]) if int(args.clf_random_state) < 0 else int(args.clf_random_state)
-    clf_acc, clf_valid, clf_support, clf_stats = pairwise_bin_logistic_accuracy_matrix(
-        x_chk,
-        bin_idx,
+    clf_acc, clf_valid, clf_support, clf_stats = pairwise_bin_logistic_accuracy_train_val(
+        ctx.bundle.x_train,
+        bin_train,
+        ctx.bundle.x_validation,
+        bin_val,
         n_bins,
-        test_frac=float(args.clf_test_frac),
         min_class_count=int(args.clf_min_class_count),
         random_state=clf_rs,
     )
@@ -676,7 +758,7 @@ def compute_binned_metrics(ctx: RunContext, loaded: LoadedHMatrix) -> BinnedMetr
         x_gt,
         gt_bin_idx,
         n_bins,
-        test_frac=float(args.clf_test_frac),
+        validation_frac=float(args.gt_approx_clf_validation_frac),
         min_class_count=int(args.clf_min_class_count),
         random_state=gt_seed,
     )
@@ -887,7 +969,7 @@ def write_results_npz(ctx: RunContext, loaded: LoadedHMatrix, metrics: BinnedMet
         corr_hellinger_acc_ub_vs_gt_approx=np.asarray([metrics.corr_hellinger_ub_vs_gt], dtype=np.float64),
         clf_valid_mask=metrics.clf_valid,
         clf_pair_support=metrics.clf_support,
-        clf_test_frac=np.asarray([float(ctx.args.clf_test_frac)], dtype=np.float64),
+        gt_approx_clf_validation_frac=np.asarray([float(ctx.args.gt_approx_clf_validation_frac)], dtype=np.float64),
         clf_min_class_count=np.asarray([int(ctx.args.clf_min_class_count)], dtype=np.int64),
         clf_max_iter=np.asarray([_SKLEARN_LR_MAX_ITER_DEFAULT], dtype=np.int64),
         clf_random_state=np.asarray([metrics.clf_rs], dtype=np.int64),
@@ -1165,11 +1247,17 @@ def write_summary(
         f.write(f"dataset_npz: {ctx.config.dataset_npz}\n")
         f.write(f"output_dir: {ctx.full_args.output_dir}\n")
         f.write(f"n_samples: {loaded.h_sym.shape[0]}\n")
-        f.write(f"score_fisher_eval_data: {getattr(ctx.full_args, 'score_fisher_eval_data', '')}\n")
+        f.write(
+            "h_eval_rows: full pool (train+validation) for DSM, theta_flow, theta_path_integral, "
+            "flow_x_likelihood, ctsm_v; otherwise validation (see theta_for_h_matrix_alignment)\n"
+        )
         f.write(f"h_field_method: {loaded.h_field_method}\n")
         f.write(f"{loaded.h_eval_scalar_name}: {loaded.h_eval_scalar_value}\n")
         f.write(f"num_theta_bins: {n_bins}\n")
-        f.write(f"theta_bin_edges: [{metrics.edge_lo}, {metrics.edge_hi}] (min/max of theta_used from H-matrix)\n")
+        f.write(
+            f"theta_bin_edges: [{metrics.edge_lo}, {metrics.edge_hi}] "
+            f"(min/max of pooled train+validation theta for this run)\n"
+        )
         f.write(f"h_binned finite cells: {n_finite} nan cells: {n_nan}\n")
         if n_finite > 0:
             f.write(
@@ -1179,16 +1267,21 @@ def write_summary(
                 f"h_binned_sqrt min (finite): {float(np.nanmin(metrics.h_binned_sqrt))} max: {float(np.nanmax(metrics.h_binned_sqrt))}\n"
             )
 
-        f.write("classifier: sklearn LogisticRegression(lbfgs), pairwise bin i vs j, held-out accuracy\n")
         f.write(
-            f"  clf_test_frac={float(ctx.args.clf_test_frac)} clf_min_class_count={int(ctx.args.clf_min_class_count)} "
+            "classifier: sklearn LogisticRegression(lbfgs), pairwise bin i vs j; "
+            "fit on training NPZ rows, accuracy on validation NPZ rows\n"
+        )
+        f.write(
+            f"  clf_min_class_count={int(ctx.args.clf_min_class_count)} "
+            f"gt_approx_clf_validation_frac={float(ctx.args.gt_approx_clf_validation_frac)} (synthetic GT baseline only) "
             f"clf_max_iter={_SKLEARN_LR_MAX_ITER_DEFAULT} (sklearn LogisticRegression default) "
             f"clf_random_state={metrics.clf_rs}\n"
         )
+        _split_fail = int(metrics.clf_stats.get("split_fail", metrics.clf_stats.get("val_empty_class", 0)))
         f.write(
             f"  off-diagonal finite: {clf_finite} nan: {clf_nan_off} "
             f"ok_pairs={metrics.clf_stats['ok_pairs']} insufficient_counts={metrics.clf_stats['insufficient_counts']} "
-            f"split_fail={metrics.clf_stats['split_fail']} fit_fail={metrics.clf_stats['fit_fail']}\n"
+            f"split_or_val_fail={_split_fail} fit_fail={metrics.clf_stats['fit_fail']}\n"
         )
 
         off_mask = ~np.eye(n_bins, dtype=bool)

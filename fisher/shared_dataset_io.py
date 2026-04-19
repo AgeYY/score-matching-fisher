@@ -12,7 +12,7 @@ import numpy as np
 
 from fisher.dataset_family_recipes import apply_family_recipe_to_namespace
 
-SHARED_DATASET_NPZ_VERSION = 1
+SHARED_DATASET_NPZ_VERSION = 2
 
 
 def apply_sigma_defaults_for_dataset_family(ns: Any) -> None:
@@ -29,11 +29,11 @@ class SharedDatasetBundle:
     theta_all: np.ndarray
     x_all: np.ndarray
     train_idx: np.ndarray
-    eval_idx: np.ndarray
+    validation_idx: np.ndarray
     theta_train: np.ndarray
     x_train: np.ndarray
-    theta_eval: np.ndarray
-    x_eval: np.ndarray
+    theta_validation: np.ndarray
+    x_validation: np.ndarray
 
 
 def meta_dict_from_args(ns: Any) -> dict[str, Any]:
@@ -125,14 +125,16 @@ def save_shared_dataset_npz(
     theta_all: np.ndarray,
     x_all: np.ndarray,
     train_idx: np.ndarray,
-    eval_idx: np.ndarray,
+    validation_idx: np.ndarray,
     theta_train: np.ndarray,
     x_train: np.ndarray,
-    theta_eval: np.ndarray,
-    x_eval: np.ndarray,
+    theta_validation: np.ndarray,
+    x_validation: np.ndarray,
 ) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    meta = dict(meta)
+    meta["version"] = int(SHARED_DATASET_NPZ_VERSION)
     meta_json = json.dumps(meta, sort_keys=True)
     meta_utf8 = meta_json.encode("utf-8")
     np.savez_compressed(
@@ -141,11 +143,11 @@ def save_shared_dataset_npz(
         theta_all=theta_all.astype(np.float64, copy=False),
         x_all=x_all.astype(np.float64, copy=False),
         train_idx=train_idx.astype(np.int64, copy=False),
-        eval_idx=eval_idx.astype(np.int64, copy=False),
+        validation_idx=validation_idx.astype(np.int64, copy=False),
         theta_train=theta_train.astype(np.float64, copy=False),
         x_train=x_train.astype(np.float64, copy=False),
-        theta_eval=theta_eval.astype(np.float64, copy=False),
-        x_eval=x_eval.astype(np.float64, copy=False),
+        theta_validation=theta_validation.astype(np.float64, copy=False),
+        x_validation=x_validation.astype(np.float64, copy=False),
     )
 
 
@@ -156,19 +158,30 @@ def load_shared_dataset_npz(path: str | Path) -> SharedDatasetBundle:
         meta_json = meta_utf8.tobytes().decode("utf-8")
         meta = json.loads(meta_json)
         ver = int(meta.get("version", 0))
-        if ver != SHARED_DATASET_NPZ_VERSION:
+
+        if ver == 2:
+            vidx = np.asarray(data["validation_idx"], dtype=np.int64)
+            th_val = np.asarray(data["theta_validation"], dtype=np.float64)
+            x_val = np.asarray(data["x_validation"], dtype=np.float64)
+        elif ver == 1:
+            vidx = np.asarray(data["eval_idx"], dtype=np.int64)
+            th_val = np.asarray(data["theta_eval"], dtype=np.float64)
+            x_val = np.asarray(data["x_eval"], dtype=np.float64)
+        else:
             raise ValueError(
-                f"Unsupported shared dataset npz version: {ver} (expected {SHARED_DATASET_NPZ_VERSION})"
+                f"Unsupported shared dataset npz version: {ver} "
+                f"(expected 1 for legacy or {SHARED_DATASET_NPZ_VERSION} current)."
             )
+
         bundle = SharedDatasetBundle(
             meta=meta,
             theta_all=np.asarray(data["theta_all"], dtype=np.float64),
             x_all=np.asarray(data["x_all"], dtype=np.float64),
             train_idx=np.asarray(data["train_idx"], dtype=np.int64),
-            eval_idx=np.asarray(data["eval_idx"], dtype=np.int64),
+            validation_idx=vidx,
             theta_train=np.asarray(data["theta_train"], dtype=np.float64),
             x_train=np.asarray(data["x_train"], dtype=np.float64),
-            theta_eval=np.asarray(data["theta_eval"], dtype=np.float64),
-            x_eval=np.asarray(data["x_eval"], dtype=np.float64),
+            theta_validation=th_val,
+            x_validation=x_val,
         )
     return bundle

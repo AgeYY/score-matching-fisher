@@ -30,10 +30,12 @@ from fisher.models import (
     ConditionalScore1DFiLMPerLayer,
     ConditionalThetaFlowVelocity,
     ConditionalThetaFlowVelocityFiLMPerLayer,
+    ConditionalThetaFlowVelocityIIDSoft,
     ConditionalThetaFlowVelocityThetaFourierFiLMPerLayer,
     ConditionalThetaFlowVelocityThetaFourierMLP,
     ConditionalXFlowVelocity,
     ConditionalXFlowVelocityFiLMPerLayer,
+    ConditionalXFlowVelocityIIDSoft,
     ConditionalXFlowVelocityIndependentMLP,
     ConditionalXFlowVelocityIndependentThetaFourierMLP,
     ConditionalXFlowVelocityThetaFourierFiLMPerLayer,
@@ -43,6 +45,7 @@ from fisher.models import (
     PriorScore1DFiLMPerLayer,
     PriorThetaFlowVelocity,
     PriorThetaFlowVelocityFiLMPerLayer,
+    PriorThetaFlowVelocityIIDSoft,
     PriorThetaFlowVelocityThetaFourierFiLMPerLayer,
     PriorThetaFlowVelocityThetaFourierMLP,
 )
@@ -146,9 +149,9 @@ def normalize_theta_field_method(method: str) -> str:
 
 def normalize_flow_arch(args: Any) -> str:
     arch = str(getattr(args, "flow_arch", "mlp")).strip().lower()
-    if arch in ("mlp", "film_fourier"):
+    if arch in ("mlp", "film_fourier", "iid_soft"):
         return arch
-    raise ValueError("--flow-arch must be one of {'mlp','film_fourier'}.")
+    raise ValueError("--flow-arch must be one of {'mlp','film_fourier','iid_soft'}.")
 
 
 def build_posterior_score_model(
@@ -895,7 +898,7 @@ def validate_dataset_sample_args(args: Any) -> None:
     ) and int(args.x_dim) != 2:
         raise ValueError("--dataset-family cos_sin_piecewise / linear_piecewise requires --x-dim 2.")
     if int(args.n_total) < 2:
-        raise ValueError("--n-total must be >= 2 for train/eval split.")
+        raise ValueError("--n-total must be >= 2 for train/validation split.")
     if not (0.0 < float(args.train_frac) <= 1.0):
         raise ValueError("--train-frac must be in (0, 1].")
 
@@ -910,11 +913,13 @@ def validate_estimation_args(args: Any) -> None:
     legacy_flow_prior_arch = getattr(args, "flow_prior_arch", None)
     if legacy_flow_score_arch is not None:
         raise ValueError(
-            "Legacy --flow-score-arch is removed. Use --flow-arch {mlp,film_fourier}."
+            "Legacy --flow-score-arch is removed. Use --flow-arch {mlp,film_fourier,iid_soft} "
+            "(iid_soft is x_flow only)."
         )
     if legacy_flow_prior_arch is not None:
         raise ValueError(
-            "Legacy --flow-prior-arch is removed. Use --flow-arch {mlp,film_fourier}."
+            "Legacy --flow-prior-arch is removed. Use --flow-arch {mlp,film_fourier,iid_soft} "
+            "(iid_soft is x_flow only)."
         )
     if args.score_eval_sigmas < 1:
         raise ValueError("--score-eval-sigmas must be >= 1.")
@@ -1035,8 +1040,15 @@ def validate_estimation_args(args: Any) -> None:
         raise ValueError("--flow-prior-cond-embed-dim must be >= 1.")
     if int(getattr(args, "flow_prior_cond_embed_depth", 1)) < 1:
         raise ValueError("--flow-prior-cond-embed-depth must be >= 1.")
-    if _arch not in ("mlp", "film_fourier"):
-        raise ValueError("--flow-arch must be one of {'mlp','film_fourier'}.")
+    if _arch not in ("mlp", "film_fourier", "iid_soft"):
+        raise ValueError("--flow-arch must be one of {'mlp','film_fourier','iid_soft'}.")
+    if _arch == "iid_soft" and _tfm_val not in ("x_flow", "theta_flow", "theta_path_integral"):
+        raise ValueError(
+            "--flow-arch iid_soft is only valid with --theta-field-method "
+            "x_flow, theta_flow, or theta_path_integral."
+        )
+    if _arch == "iid_soft" and _tfm_val == "ctsm_v":
+        raise ValueError("--flow-arch iid_soft is not supported for --theta-field-method ctsm_v.")
     _fx_k = int(getattr(args, "flow_x_theta_fourier_k", 4))
     _fx_omega_mode = str(getattr(args, "flow_x_theta_fourier_omega_mode", "theta_range")).strip().lower()
     _fx_inc_lin = not bool(getattr(args, "flow_x_theta_fourier_no_linear", False))
@@ -1066,6 +1078,26 @@ def validate_estimation_args(args: Any) -> None:
                 "x_flow film_fourier: theta feature dim is 0. Use "
                 "--flow-x-theta-fourier-k >= 1 or keep linear/bias features enabled."
             )
+    if _tfm_val == "x_flow" and _arch == "iid_soft":
+        _iid_hm = float(getattr(args, "flow_x_iid_interaction_hidden_mult", 1.0))
+        if not (math.isfinite(_iid_hm) and _iid_hm > 0.0):
+            raise ValueError("--flow-x-iid-interaction-hidden-mult must be a finite positive number.")
+        _iid_id = getattr(args, "flow_x_iid_interaction_depth", None)
+        if _iid_id is not None and int(_iid_id) < 1:
+            raise ValueError("--flow-x-iid-interaction-depth must be >= 1 when set.")
+    if _tfm_val in ("theta_flow", "theta_path_integral") and _arch == "iid_soft":
+        _thm = float(getattr(args, "flow_theta_iid_interaction_hidden_mult", 1.0))
+        if not (math.isfinite(_thm) and _thm > 0.0):
+            raise ValueError("--flow-theta-iid-interaction-hidden-mult must be a finite positive number.")
+        _thd = getattr(args, "flow_theta_iid_interaction_depth", None)
+        if _thd is not None and int(_thd) < 1:
+            raise ValueError("--flow-theta-iid-interaction-depth must be >= 1 when set.")
+        _prm = float(getattr(args, "flow_prior_iid_interaction_hidden_mult", 1.0))
+        if not (math.isfinite(_prm) and _prm > 0.0):
+            raise ValueError("--flow-prior-iid-interaction-hidden-mult must be a finite positive number.")
+        _prd = getattr(args, "flow_prior_iid_interaction_depth", None)
+        if _prd is not None and int(_prd) < 1:
+            raise ValueError("--flow-prior-iid-interaction-depth must be >= 1 when set.")
     _ft_post_k = int(getattr(args, "flow_theta_fourier_k", 4))
     _ft_post_omega_mode = str(getattr(args, "flow_theta_fourier_omega_mode", "theta_range")).strip().lower()
     _ft_post_inc_lin = not bool(getattr(args, "flow_theta_fourier_no_linear", False))
@@ -1174,7 +1206,7 @@ def _save_dsm_score_prior_training_losses_npz(
     theta_all: np.ndarray,
     theta_score_fit: np.ndarray,
     theta_score_val: np.ndarray,
-    score_data_mode: str,
+    score_split: str,
     score_train_losses: np.ndarray,
     score_val_losses: np.ndarray,
     score_val_monitor_losses: np.ndarray,
@@ -1215,7 +1247,7 @@ def _save_dsm_score_prior_training_losses_npz(
         n_theta_all=np.int64(np.asarray(theta_all).shape[0]),
         n_score_fit=np.int64(theta_score_fit.shape[0]),
         n_score_val=np.int64(theta_score_val.shape[0]),
-        score_data_mode=np.asarray([str(score_data_mode)], dtype=object),
+        score_split=np.asarray([str(score_split)], dtype=object),
         score_train_losses=np.asarray(score_train_losses, dtype=np.float64),
         score_val_losses=np.asarray(score_val_losses, dtype=np.float64),
         score_val_monitor_losses=np.asarray(score_val_monitor_losses, dtype=np.float64),
@@ -1484,8 +1516,8 @@ def run_shared_fisher_estimation(
     x_all: np.ndarray,
     theta_train: np.ndarray,
     x_train: np.ndarray,
-    theta_eval: np.ndarray,
-    x_eval: np.ndarray,
+    theta_validation: np.ndarray,
+    x_validation: np.ndarray,
     rng: np.random.Generator,
 ) -> None:
     _apply_dsm_stability_preset(args)
@@ -1495,47 +1527,24 @@ def run_shared_fisher_estimation(
     device = require_device(args.device)
     os.makedirs(args.output_dir, exist_ok=True)
 
-    if args.score_data_mode == "full":
-        theta_score_train, x_score_train = theta_all, x_all
-        theta_score_eval, x_score_eval = theta_all, x_all
-    else:
-        theta_score_train, x_score_train = theta_train, x_train
-        theta_score_eval, x_score_eval = theta_eval, x_eval
+    theta_score_fit = np.asarray(theta_train, dtype=np.float64)
+    x_score_fit = np.asarray(x_train, dtype=np.float64)
+    theta_score_val = np.asarray(theta_validation, dtype=np.float64)
+    x_score_val = np.asarray(x_validation, dtype=np.float64)
+    if theta_score_fit.shape[0] < 1 or theta_score_val.shape[0] < 1:
+        raise ValueError(
+            "Shared Fisher estimation requires non-empty train and validation splits. "
+            "Regenerate the dataset with 0 < --train-frac < 1 (see make_dataset.py)."
+        )
     print(
         "[score_data] "
-        f"mode={args.score_data_mode} "
-        f"train={theta_score_train.shape[0]} eval={theta_score_eval.shape[0]}"
+        f"train={theta_score_fit.shape[0]} validation={theta_score_val.shape[0]}"
     )
-    if args.score_val_source == "eval_set":
-        theta_score_fit = theta_score_train
-        x_score_fit = x_score_train
-        theta_score_val = theta_score_eval
-        x_score_val = x_score_eval
-        if theta_score_fit.shape[0] < 1 or theta_score_val.shape[0] < 1:
-            raise ValueError("score train/eval split must have non-empty train and eval sets.")
-        print(
-            "[score_train] "
-            f"val_source=eval_set fit={theta_score_fit.shape[0]} val={theta_score_val.shape[0]}"
-        )
-    else:
-        n_score_total = theta_score_train.shape[0]
-        if n_score_total < 2:
-            raise ValueError("score training requires at least 2 samples for train/validation split.")
-        n_score_val = int(round(SCORE_VAL_FRACTION * n_score_total))
-        n_score_val = max(1, min(n_score_val, n_score_total - 1))
-        score_perm = rng.permutation(n_score_total)
-        score_val_idx = score_perm[:n_score_val]
-        score_fit_idx = score_perm[n_score_val:]
-        theta_score_fit = theta_score_train[score_fit_idx]
-        x_score_fit = x_score_train[score_fit_idx]
-        theta_score_val = theta_score_train[score_val_idx]
-        x_score_val = x_score_train[score_val_idx]
-        print(
-            "[score_train] "
-            f"val_source=train_split fit={theta_score_fit.shape[0]} val={theta_score_val.shape[0]} "
-            f"val_target_frac={SCORE_VAL_FRACTION} "
-            f"val_frac_eff={theta_score_val.shape[0]/n_score_total:.4f}"
-        )
+    print(
+        "[score_train] "
+        f"fit={theta_score_fit.shape[0]} val={theta_score_val.shape[0]} "
+        "(dataset train_idx / validation_idx)"
+    )
 
     theta_field_method = normalize_theta_field_method(str(getattr(args, "theta_field_method", "theta_flow")))
     flow_arch = normalize_flow_arch(args)
@@ -1640,23 +1649,16 @@ def run_shared_fisher_estimation(
         plt.savefig(post_loss_fig, dpi=180)
         plt.close()
 
-        if args.score_fisher_eval_data == "full":
-            theta_score_fisher_eval, x_score_fisher_eval = theta_all, x_all
-        else:
-            theta_score_fisher_eval, x_score_fisher_eval = theta_score_eval, x_score_eval
-        if theta_score_fisher_eval.shape[0] == 0:
-            raise ValueError(
-                "--score-fisher-eval-data score_eval requires non-empty theta_eval/x_eval; "
-                "use --train-frac < 1 or --score-fisher-eval-data full."
-            )
-
         h_eval = float(getattr(args, "ctsm_t_eps", 1e-5))
+        theta_h_matrix = np.asarray(theta_all, dtype=np.float64)
+        x_h_matrix = np.asarray(x_all, dtype=np.float64)
         print(
             "[h_matrix] "
             "enabled=True field=ctsm_v "
             f"ctsm_arch={str(getattr(args, 'ctsm_arch', 'film')).strip().lower()} "
             f"ctsm_path_schedule={str(getattr(args, 'ctsm_path_schedule', 'linear')).strip().lower()} "
             f"ctsm_t_eps={h_eval:.6g} ctsm_int_n_time={int(getattr(args, 'ctsm_int_n_time', 300))} "
+            f"n_theta_x={int(theta_h_matrix.shape[0])} (train+validation full pool) "
             f"restore_original_order={bool(getattr(args, 'h_restore_original_order', False))} "
             f"pair_batch_size={int(getattr(args, 'h_batch_size', 65536))}"
         )
@@ -1672,8 +1674,8 @@ def run_shared_fisher_estimation(
             ctsm_t_eps=float(getattr(args, "ctsm_t_eps", 1e-5)),
         )
         h_result = h_estimator.run(
-            theta=theta_score_fisher_eval,
-            x=x_score_fisher_eval,
+            theta=theta_h_matrix,
+            x=x_h_matrix,
             restore_original_order=bool(getattr(args, "h_restore_original_order", False)),
         )
 
@@ -1695,7 +1697,7 @@ def run_shared_fisher_estimation(
             theta_all=theta_all,
             theta_score_fit=theta_score_fit,
             theta_score_val=theta_score_val,
-            score_data_mode=str(args.score_data_mode),
+            score_split="dataset_train_validation",
             score_train_losses=post_train_losses,
             score_val_losses=post_val_losses,
             score_val_monitor_losses=post_val_monitor_losses,
@@ -1746,6 +1748,19 @@ def run_shared_fisher_estimation(
                 f" theta_fourier_bias={not bool(getattr(args, 'flow_x_theta_fourier_no_bias', False))}"
             )
             _xf_extra = " film_x_trunk" + _xf_extra
+        elif flow_score_arch == "iid_soft":
+            _hid_l = int(getattr(args, "flow_hidden_dim", 128))
+            _mult_l = float(getattr(args, "flow_x_iid_interaction_hidden_mult", 1.0))
+            _int_h_l = max(1, int(round(_hid_l * _mult_l)))
+            _dep_l = int(getattr(args, "flow_depth", 3))
+            _int_d_raw_l = getattr(args, "flow_x_iid_interaction_depth", None)
+            _int_d_l = int(_int_d_raw_l) if _int_d_raw_l is not None else _dep_l
+            _ai = float(getattr(args, "flow_x_iid_alpha_init", 0.001))
+            _al = not bool(getattr(args, "flow_x_iid_alpha_fixed", False))
+            _xf_extra = (
+                f" iid_soft alpha_init={_ai:.6g} alpha_learnable={_al}"
+                f" psi_hidden={_int_h_l} psi_depth={_int_d_l}"
+            )
         _xf_twostage = bool(getattr(args, "flow_x_two_stage_mean_theta_pretrain", False))
         _e_tot = int(getattr(args, "flow_epochs", 10000))
         _e1 = _e_tot // 2
@@ -1782,8 +1797,27 @@ def run_shared_fisher_estimation(
                 theta_fourier_include_linear=not bool(getattr(args, "flow_x_theta_fourier_no_linear", False)),
                 theta_fourier_include_bias=not bool(getattr(args, "flow_x_theta_fourier_no_bias", False)),
             ).to(device)
+        elif flow_score_arch == "iid_soft":
+            _hid = int(getattr(args, "flow_hidden_dim", 128))
+            _dep = int(getattr(args, "flow_depth", 3))
+            _mult = float(getattr(args, "flow_x_iid_interaction_hidden_mult", 1.0))
+            _int_h = max(1, int(round(_hid * _mult)))
+            _int_d_raw = getattr(args, "flow_x_iid_interaction_depth", None)
+            _int_d = int(_int_d_raw) if _int_d_raw is not None else _dep
+            _alpha_init = float(getattr(args, "flow_x_iid_alpha_init", 0.001))
+            _alpha_learn = not bool(getattr(args, "flow_x_iid_alpha_fixed", False))
+            x_flow_model = ConditionalXFlowVelocityIIDSoft(
+                x_dim=int(args.x_dim),
+                hidden_dim=_hid,
+                depth=_dep,
+                use_logit_time=True,
+                interaction_hidden_dim=_int_h,
+                interaction_depth=_int_d,
+                alpha_init=_alpha_init,
+                alpha_learnable=_alpha_learn,
+            ).to(device)
         else:
-            raise ValueError("--flow-arch must be one of {'mlp','film_fourier'}.")
+            raise ValueError("--flow-arch must be one of {'mlp','film_fourier','iid_soft'}.")
         post_train_out = train_conditional_x_flow_model(
             model=x_flow_model,
             theta_train=theta_score_fit,
@@ -1863,21 +1897,14 @@ def run_shared_fisher_estimation(
         plt.savefig(post_loss_fig, dpi=180)
         plt.close()
 
-        if args.score_fisher_eval_data == "full":
-            theta_score_fisher_eval, x_score_fisher_eval = theta_all, x_all
-        else:
-            theta_score_fisher_eval, x_score_fisher_eval = theta_score_eval, x_score_eval
-        if theta_score_fisher_eval.shape[0] == 0:
-            raise ValueError(
-                "--score-fisher-eval-data score_eval requires non-empty theta_eval/x_eval; "
-                "use --train-frac < 1 or --score-fisher-eval-data full."
-            )
-
+        theta_h_matrix = np.asarray(theta_all, dtype=np.float64)
+        x_h_matrix = np.asarray(x_all, dtype=np.float64)
         h_eval = 1.0
         print(
             "[h_matrix] "
             "enabled=True field=x_flow "
             f"flow_ode_t_span={h_eval:.6f} "
+            f"n_theta_x={int(theta_h_matrix.shape[0])} (train+validation full pool) "
             f"restore_original_order={bool(getattr(args, 'h_restore_original_order', False))} "
             f"pair_batch_size={int(getattr(args, 'h_batch_size', 65536))}"
         )
@@ -1891,8 +1918,8 @@ def run_shared_fisher_estimation(
             flow_scheduler=str(getattr(args, "flow_scheduler", "cosine")),
         )
         h_result = h_estimator.run(
-            theta=theta_score_fisher_eval,
-            x=x_score_fisher_eval,
+            theta=theta_h_matrix,
+            x=x_h_matrix,
             restore_original_order=bool(getattr(args, "h_restore_original_order", False)),
         )
 
@@ -1917,7 +1944,7 @@ def run_shared_fisher_estimation(
             theta_all=theta_all,
             theta_score_fit=theta_score_fit,
             theta_score_val=theta_score_val,
-            score_data_mode=str(args.score_data_mode),
+            score_split="dataset_train_validation",
             score_train_losses=post_train_losses,
             score_val_losses=post_val_losses,
             score_val_monitor_losses=post_val_monitor_losses,
@@ -1959,6 +1986,7 @@ def run_shared_fisher_estimation(
         if not (0.0 <= flow_eval_t <= 1.0):
             raise ValueError("--flow-eval-t must be in [0, 1].")
         theta_std = float(np.std(theta_score_fit))
+        theta_dim_flow = int(theta_score_fit.shape[1]) if theta_score_fit.ndim >= 2 else 1
         flow_score_arch = str(flow_arch).strip().lower()
         flow_prior_arch = str(flow_arch).strip().lower()
         print(
@@ -1966,7 +1994,7 @@ def run_shared_fisher_estimation(
             f"fit={theta_score_fit.shape[0]} val={theta_score_val.shape[0]} "
             f"scheduler={getattr(args, 'flow_scheduler', 'cosine')} method={theta_field_method} "
             f"t_eval={flow_eval_t:.6f} "
-            f"theta_std={theta_std:.6f}"
+            f"theta_std={theta_std:.6f} theta_dim={theta_dim_flow}"
         )
         _xf_post = ""
         if flow_score_arch == "film_fourier":
@@ -1978,6 +2006,20 @@ def run_shared_fisher_estimation(
                 f" theta_fourier_post_linear={not bool(getattr(args, 'flow_theta_fourier_no_linear', False))}"
                 f" theta_fourier_post_bias={not bool(getattr(args, 'flow_theta_fourier_no_bias', False))}"
             )
+        elif flow_score_arch == "iid_soft":
+            _hid_pi = int(getattr(args, "flow_hidden_dim", 128))
+            _mult_pi = float(getattr(args, "flow_theta_iid_interaction_hidden_mult", 1.0))
+            _int_h_pi = max(1, int(round(_hid_pi * _mult_pi)))
+            _dep_pi = int(getattr(args, "flow_depth", 3))
+            _int_d_raw_pi = getattr(args, "flow_theta_iid_interaction_depth", None)
+            _int_d_pi = int(_int_d_raw_pi) if _int_d_raw_pi is not None else _dep_pi
+            _ai_pi = float(getattr(args, "flow_theta_iid_alpha_init", 0.001))
+            _al_pi = not bool(getattr(args, "flow_theta_iid_alpha_fixed", False))
+            _xf_post = (
+                f" post_iid_soft theta_dim={theta_dim_flow} x_dim={int(args.x_dim)} "
+                f"phi(theta~,x_i)->R^{{theta_dim}} mean_over_x alpha_init={_ai_pi:.6g} alpha_learnable={_al_pi}"
+                f" psi_hidden={_int_h_pi} psi_depth={_int_d_pi}"
+            )
         _xf_prior = ""
         if flow_prior_arch == "film_fourier":
             _om_eff_p, _om_log_p = effective_flow_theta_fourier_omega_prior(args)
@@ -1987,6 +2029,19 @@ def run_shared_fisher_estimation(
                 f" theta_fourier_prior_omega_in_net={float(_om_eff_p):.6g}"
                 f" theta_fourier_prior_linear={not bool(getattr(args, 'flow_prior_theta_fourier_no_linear', False))}"
                 f" theta_fourier_prior_bias={not bool(getattr(args, 'flow_prior_theta_fourier_no_bias', False))}"
+            )
+        elif flow_prior_arch == "iid_soft":
+            _hid_pr = int(getattr(args, "prior_hidden_dim", 128))
+            _mult_pr = float(getattr(args, "flow_prior_iid_interaction_hidden_mult", 1.0))
+            _int_h_pr = max(1, int(round(_hid_pr * _mult_pr)))
+            _dep_pr = int(getattr(args, "prior_depth", 3))
+            _int_d_raw_pr = getattr(args, "flow_prior_iid_interaction_depth", None)
+            _int_d_pr = int(_int_d_raw_pr) if _int_d_raw_pr is not None else _dep_pr
+            _ai_pr = float(getattr(args, "flow_prior_iid_alpha_init", 0.001))
+            _al_pr = not bool(getattr(args, "flow_prior_iid_alpha_fixed", False))
+            _xf_prior = (
+                f" prior_iid_soft theta_dim={theta_dim_flow} alpha_init={_ai_pr:.6g} alpha_learnable={_al_pr}"
+                f" psi_hidden={_int_h_pr} psi_depth={_int_d_pr}"
             )
         print(
             f"[{theta_field_method}] arch "
@@ -2022,8 +2077,28 @@ def run_shared_fisher_estimation(
                 theta_fourier_include_linear=not bool(getattr(args, "flow_theta_fourier_no_linear", False)),
                 theta_fourier_include_bias=not bool(getattr(args, "flow_theta_fourier_no_bias", False)),
             ).to(device)
+        elif flow_score_arch == "iid_soft":
+            _ph = int(getattr(args, "flow_hidden_dim", 128))
+            _pd = int(getattr(args, "flow_depth", 3))
+            _pm = float(getattr(args, "flow_theta_iid_interaction_hidden_mult", 1.0))
+            _pih = max(1, int(round(_ph * _pm)))
+            _pdr = getattr(args, "flow_theta_iid_interaction_depth", None)
+            _pid = int(_pdr) if _pdr is not None else _pd
+            _pai = float(getattr(args, "flow_theta_iid_alpha_init", 0.001))
+            _pal = not bool(getattr(args, "flow_theta_iid_alpha_fixed", False))
+            post_model = ConditionalThetaFlowVelocityIIDSoft(
+                x_dim=int(args.x_dim),
+                hidden_dim=_ph,
+                depth=_pd,
+                use_logit_time=True,
+                theta_dim=theta_dim_flow,
+                interaction_hidden_dim=_pih,
+                interaction_depth=_pid,
+                alpha_init=_pai,
+                alpha_learnable=_pal,
+            ).to(device)
         else:
-            raise ValueError("--flow-arch must be one of {'mlp','film_fourier'}.")
+            raise ValueError("--flow-arch must be one of {'mlp','film_fourier','iid_soft'}.")
         post_train_out = train_conditional_theta_flow_model(
             model=post_model,
             theta_train=theta_score_fit,
@@ -2103,8 +2178,27 @@ def run_shared_fisher_estimation(
                 theta_fourier_include_linear=not bool(getattr(args, "flow_prior_theta_fourier_no_linear", False)),
                 theta_fourier_include_bias=not bool(getattr(args, "flow_prior_theta_fourier_no_bias", False)),
             ).to(device)
+        elif flow_prior_arch == "iid_soft":
+            _prh = int(getattr(args, "prior_hidden_dim", 128))
+            _prd0 = int(getattr(args, "prior_depth", 3))
+            _prm = float(getattr(args, "flow_prior_iid_interaction_hidden_mult", 1.0))
+            _prih = max(1, int(round(_prh * _prm)))
+            _prdr = getattr(args, "flow_prior_iid_interaction_depth", None)
+            _prid = int(_prdr) if _prdr is not None else _prd0
+            _prai = float(getattr(args, "flow_prior_iid_alpha_init", 0.001))
+            _pral = not bool(getattr(args, "flow_prior_iid_alpha_fixed", False))
+            prior_model_flow = PriorThetaFlowVelocityIIDSoft(
+                hidden_dim=_prh,
+                depth=_prd0,
+                use_logit_time=True,
+                theta_dim=theta_dim_flow,
+                interaction_hidden_dim=_prih,
+                interaction_depth=_prid,
+                alpha_init=_prai,
+                alpha_learnable=_pral,
+            ).to(device)
         else:
-            raise ValueError("--flow-arch must be one of {'mlp','film_fourier'}.")
+            raise ValueError("--flow-arch must be one of {'mlp','film_fourier','iid_soft'}.")
         prior_train_out = train_prior_theta_flow_model(
             model=prior_model_flow,
             theta_train=theta_score_fit,
@@ -2162,15 +2256,9 @@ def run_shared_fisher_estimation(
         plt.savefig(prior_loss_fig, dpi=180)
         plt.close()
 
-        if args.score_fisher_eval_data == "full":
-            theta_score_fisher_eval, x_score_fisher_eval = theta_all, x_all
-        else:
-            theta_score_fisher_eval, x_score_fisher_eval = theta_score_eval, x_score_eval
-        if theta_score_fisher_eval.shape[0] == 0:
-            raise ValueError(
-                "--score-fisher-eval-data score_eval requires non-empty theta_eval/x_eval; "
-                "use --train-frac < 1 or --score-fisher-eval-data full."
-            )
+        # H matrix: full per-run pool (train ∪ validation); fitting stays on train split with val early stop.
+        theta_h_matrix = np.asarray(theta_all, dtype=np.float64)
+        x_h_matrix = np.asarray(x_all, dtype=np.float64)
 
         h_result: HMatrixResult | None = None
         if bool(getattr(args, "compute_h_matrix", False)):
@@ -2180,6 +2268,7 @@ def run_shared_fisher_estimation(
                 "[h_matrix] "
                 f"enabled=True field={_h_field} "
                 f"t_eval={h_eval:.6f} "
+                f"n_theta_x={int(theta_h_matrix.shape[0])} (train+validation full pool) "
                 f"restore_original_order={bool(getattr(args, 'h_restore_original_order', False))} "
                 f"pair_batch_size={int(getattr(args, 'h_batch_size', 65536))}"
             )
@@ -2193,8 +2282,8 @@ def run_shared_fisher_estimation(
                 flow_scheduler=str(getattr(args, "flow_scheduler", "cosine")),
             )
             h_result = h_estimator.run(
-                theta=theta_score_fisher_eval,
-                x=x_score_fisher_eval,
+                theta=theta_h_matrix,
+                x=x_h_matrix,
                 restore_original_order=bool(getattr(args, "h_restore_original_order", False)),
             )
 
@@ -2228,7 +2317,7 @@ def run_shared_fisher_estimation(
                 theta_all=theta_all,
                 theta_score_fit=theta_score_fit,
                 theta_score_val=theta_score_val,
-                score_data_mode=str(args.score_data_mode),
+                score_split="dataset_train_validation",
                 score_train_losses=post_train_losses,
                 score_val_losses=post_val_losses,
                 score_val_monitor_losses=post_val_monitor_losses,
@@ -2440,7 +2529,7 @@ def run_shared_fisher_estimation(
             theta_all=theta_all,
             theta_score_fit=theta_score_fit,
             theta_score_val=theta_score_val,
-            score_data_mode=str(args.score_data_mode),
+            score_split="dataset_train_validation",
             score_train_losses=score_train_losses,
             score_val_losses=score_val_losses,
             score_val_monitor_losses=score_val_monitor_losses,
@@ -2467,18 +2556,10 @@ def run_shared_fisher_estimation(
         print(f"[training_losses] saved {tnpz}")
     eval_low = args.theta_low + args.eval_margin
     eval_high = args.theta_high - args.eval_margin
-    if args.score_fisher_eval_data == "full":
-        theta_score_fisher_eval, x_score_fisher_eval = theta_all, x_all
-    else:
-        theta_score_fisher_eval, x_score_fisher_eval = theta_score_eval, x_score_eval
-    if theta_score_fisher_eval.shape[0] == 0:
-        raise ValueError(
-            "--score-fisher-eval-data score_eval requires non-empty theta_eval/x_eval; "
-            "use --train-frac < 1 or --score-fisher-eval-data full."
-        )
+    theta_score_fisher_eval, x_score_fisher_eval = theta_score_val, x_score_val
     print(
         "[score_fisher_eval] "
-        f"data={args.score_fisher_eval_data} n={theta_score_fisher_eval.shape[0]}"
+        f"validation n={theta_score_fisher_eval.shape[0]}"
     )
 
     fisher_mode = str(getattr(args, "fisher_score_mode", "posterior_minus_prior"))
@@ -2624,7 +2705,7 @@ def run_shared_fisher_estimation(
             theta_all=theta_all,
             theta_score_fit=theta_score_fit,
             theta_score_val=theta_score_val,
-            score_data_mode=str(args.score_data_mode),
+            score_split="dataset_train_validation",
             score_train_losses=score_train_losses,
             score_val_losses=score_val_losses,
             score_val_monitor_losses=score_val_monitor_losses,
@@ -2666,6 +2747,7 @@ def run_shared_fisher_estimation(
             print(
                 "[h_matrix] "
                 f"enabled=True sigma_eval={h_sigma_eval:.6f} "
+                f"n_theta_x={int(np.asarray(theta_all).shape[0])} (train+validation full pool) "
                 f"restore_original_order={bool(getattr(args, 'h_restore_original_order', False))} "
                 f"pair_batch_size={int(getattr(args, 'h_batch_size', 65536))}"
             )
@@ -2677,8 +2759,8 @@ def run_shared_fisher_estimation(
                 pair_batch_size=int(getattr(args, "h_batch_size", 65536)),
             )
             h_result_skip = h_estimator.run(
-                theta=theta_score_fisher_eval,
-                x=x_score_fisher_eval,
+                theta=np.asarray(theta_all, dtype=np.float64),
+                x=np.asarray(x_all, dtype=np.float64),
                 restore_original_order=bool(getattr(args, "h_restore_original_order", False)),
             )
             print(
@@ -2748,6 +2830,7 @@ def run_shared_fisher_estimation(
         print(
             "[h_matrix] "
             f"enabled=True sigma_eval={h_sigma_eval:.6f} "
+            f"n_theta_x={int(np.asarray(theta_all).shape[0])} (train+validation full pool) "
             f"restore_original_order={bool(getattr(args, 'h_restore_original_order', False))} "
             f"pair_batch_size={int(getattr(args, 'h_batch_size', 65536))}"
         )
@@ -2759,8 +2842,8 @@ def run_shared_fisher_estimation(
             pair_batch_size=int(getattr(args, "h_batch_size", 65536)),
         )
         h_result = h_estimator.run(
-            theta=theta_score_fisher_eval,
-            x=x_score_fisher_eval,
+            theta=np.asarray(theta_all, dtype=np.float64),
+            x=np.asarray(x_all, dtype=np.float64),
             restore_original_order=bool(getattr(args, "h_restore_original_order", False)),
         )
         print(
@@ -2770,22 +2853,15 @@ def run_shared_fisher_estimation(
             f"h_sym_max_asym_abs={h_result.h_sym_max_asym_abs:.3e}"
         )
 
-    dec_theta_eval = theta_eval
-    dec_x_eval = x_eval
-    if dec_theta_eval.shape[0] == 0:
-        dec_theta_eval = theta_train
-        dec_x_eval = x_train
-        print(
-            "[decoder] theta_eval empty; using theta_train/x_train for decoder eval windows "
-            "(train_frac=1 has no held-out split)."
-        )
+    dec_theta_validation = theta_validation
+    dec_x_validation = x_validation
 
     decoder_fisher, decoder_se, decoder_valid, decoder_diag = fit_decoder_from_shared_data(
         centers=centers,
         theta_train=theta_train,
         x_train=x_train,
-        theta_eval=dec_theta_eval,
-        x_eval=dec_x_eval,
+        theta_eval=dec_theta_validation,
+        x_eval=dec_x_validation,
         epsilon=args.decoder_epsilon,
         bandwidth=args.decoder_bandwidth,
         min_class_count=args.decoder_min_class_count,
@@ -3074,24 +3150,16 @@ def run_shared_fisher_estimation(
         f.write(f"x_dim: {args.x_dim}\n")
         f.write(f"n_total: {args.n_total}\n")
         f.write(f"train_frac: {args.train_frac}\n")
-        f.write(f"score_data_mode: {args.score_data_mode}\n")
-        f.write(f"score_fisher_eval_data: {args.score_fisher_eval_data}\n")
+        f.write("score_split: dataset_train_idx / validation_idx (NPZ splits)\n")
         f.write(
             "score_data_counts: "
-            f"train={theta_score_train.shape[0]}, eval={theta_score_eval.shape[0]}\n"
+            f"train={int(np.asarray(theta_train).shape[0])}, "
+            f"validation={int(np.asarray(theta_validation).shape[0])}\n"
         )
         f.write(
             "score_fit_val_counts: "
-            f"fit={theta_score_fit.shape[0]}, val={theta_score_val.shape[0]}, "
-            f"val_source={args.score_val_source}"
+            f"fit={theta_score_fit.shape[0]}, val={theta_score_val.shape[0]}\n"
         )
-        if args.score_val_source == "train_split":
-            f.write(
-                f", val_target_frac={SCORE_VAL_FRACTION}, "
-                f"val_frac_eff={theta_score_val.shape[0] / max(theta_score_train.shape[0], 1):.6f}\n"
-            )
-        else:
-            f.write("\n")
         f.write(f"gt_mc_samples_per_bin: {args.gt_mc_samples_per_bin}\n")
         f.write(
             "score_early_stopping: "

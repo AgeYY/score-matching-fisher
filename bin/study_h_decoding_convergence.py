@@ -23,7 +23,9 @@ log-likelihood Bayes ratios; prior + posterior theta-flows), ``--theta-field-met
 (same training as theta_flow but H from velocity-to-score plus trapezoid integral along sorted ``theta``),
 ``--theta-field-method x_flow`` (conditional x-space FM likelihood; no prior model), and
 ``--theta-field-method ctsm_v`` (pair-conditioned CTSM-v time-score integration; no prior model).
-Flow methods have two architecture choices via ``--flow-arch``: ``mlp`` or ``film_fourier``.
+Flow methods use ``--flow-arch``: ``mlp`` or ``film_fourier`` for ``theta_flow`` / ``theta_path_integral``;
+you may also use ``iid_soft`` for any of ``theta_flow``, ``theta_path_integral``, or ``x_flow``
+(see ``--flow-theta-iid-*``, ``--flow-prior-iid-*``, and ``--flow-x-iid-*``).
 ``film_fourier`` uses FiLM conditioning with Fourier theta features
 (``--flow-theta-fourier-*`` for ``theta_flow`` / ``theta_path_integral`` and ``--flow-x-theta-fourier-*`` for ``x_flow``).
 The **reference column** (``n_ref``) does **not** run learned H
@@ -176,12 +178,6 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
-        "--clf-test-frac",
-        type=float,
-        default=0.3,
-        help="Held-out fraction for pairwise bin-vs-bin logistic regression (default 0.3).",
-    )
-    p.add_argument(
         "--clf-min-class-count",
         type=int,
         default=5,
@@ -191,7 +187,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--clf-random-state",
         type=int,
         default=-1,
-        help="Random seed for train/test split; -1 uses dataset seed from NPZ meta.",
+        help="Random seed for LogisticRegression; -1 uses dataset seed from NPZ meta.",
     )
     p.add_argument(
         "--keep-intermediate",
@@ -243,8 +239,6 @@ def _validate_cli(args: argparse.Namespace) -> None:
     validate_estimation_args(args)
     if int(args.num_theta_bins) < 1:
         raise ValueError("--num-theta-bins must be >= 1.")
-    if not (0.0 < float(args.clf_test_frac) < 1.0):
-        raise ValueError("--clf-test-frac must be in (0, 1).")
     if int(args.clf_min_class_count) < 1:
         raise ValueError("--clf-min-class-count must be >= 1.")
     n_ref = int(args.n_ref)
@@ -265,7 +259,7 @@ def _subset_bundle(
     n: int,
     meta: dict,
 ) -> SharedDatasetBundle:
-    """First n indices in perm order (nested subsets). Train/eval split matches make_dataset."""
+    """First n indices in perm order (nested subsets). Train/validation split matches make_dataset."""
     n = int(n)
     sub_perm = perm[:n]
     # Keep theta shape (N,1) like make_dataset / SharedDatasetBundle — 1D theta + (B,1)
@@ -284,20 +278,20 @@ def _subset_bundle(
         n_train = min(max(n_train, 1), n - 1)
     theta_train = theta_all[:n_train]
     x_train = x_all[:n_train]
-    theta_eval = theta_all[n_train:]
-    x_eval = x_all[n_train:]
+    theta_validation = theta_all[n_train:]
+    x_validation = x_all[n_train:]
     train_idx = np.arange(n_train, dtype=np.int64)
-    eval_idx = np.arange(n_train, n, dtype=np.int64)
+    validation_idx = np.arange(n_train, n, dtype=np.int64)
     return SharedDatasetBundle(
         meta=bundle.meta,
         theta_all=theta_all,
         x_all=x_all,
         train_idx=train_idx,
-        eval_idx=eval_idx,
+        validation_idx=validation_idx,
         theta_train=theta_train,
         x_train=x_train,
-        theta_eval=theta_eval,
-        x_eval=x_eval,
+        theta_validation=theta_validation,
+        x_validation=x_validation,
     )
 
 
@@ -341,20 +335,24 @@ def _run_ctx_for_bundle(
 
 def _metrics_fixed_edges(
     loaded: vhb.LoadedHMatrix,
-    x_aligned: np.ndarray,
+    bundle: SharedDatasetBundle,
     edges: np.ndarray,
     n_bins: int,
-    clf_test_frac: float,
     clf_min_class_count: int,
     clf_random_state: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    bin_idx = vhb.theta_to_bin_index(loaded.theta_used, edges, n_bins)
+    th_tr = np.asarray(bundle.theta_train, dtype=np.float64).reshape(-1)
+    th_va = np.asarray(bundle.theta_validation, dtype=np.float64).reshape(-1)
+    bin_idx = vhb.theta_to_bin_index(np.asarray(loaded.theta_used, dtype=np.float64).reshape(-1), edges, n_bins)
+    bin_train = vhb.theta_to_bin_index(th_tr, edges, n_bins)
+    bin_val = vhb.theta_to_bin_index(th_va, edges, n_bins)
     h_binned, _ = vhb.average_matrix_by_bins(loaded.h_sym, bin_idx, n_bins)
-    clf_acc, _, _, _ = vhb.pairwise_bin_logistic_accuracy_matrix(
-        x_aligned,
-        bin_idx,
+    clf_acc, _, _, _ = vhb.pairwise_bin_logistic_accuracy_train_val(
+        bundle.x_train,
+        bin_train,
+        bundle.x_validation,
+        bin_val,
         n_bins,
-        test_frac=float(clf_test_frac),
         min_class_count=int(clf_min_class_count),
         random_state=int(clf_random_state),
     )
@@ -369,25 +367,26 @@ def _pairwise_clf_from_bundle(
     output_dir: str,
     edges: np.ndarray,
     n_bins: int,
-    clf_test_frac: float,
     clf_min_class_count: int,
     clf_random_state: int,
 ) -> np.ndarray:
-    """Pairwise bin decoding matrix without training or loading an H-matrix (same split as H path)."""
+    """Pairwise bin decoding: train on NPZ train rows, accuracy on NPZ validation rows."""
     d = vars(args).copy()
     d.setdefault("h_matrix_npz", None)
     d.setdefault("h_only", False)
     args2 = argparse.Namespace(**d)
     args2.output_dir = output_dir
     full_args = _make_full_args(args2, meta)
-    theta = vhb.theta_for_h_matrix_alignment(bundle, full_args)
-    x = vhb.x_for_h_matrix_alignment(bundle, full_args)
-    bin_idx = vhb.theta_to_bin_index(theta, edges, n_bins)
-    clf_acc, _, _, _ = vhb.pairwise_bin_logistic_accuracy_matrix(
-        x,
-        bin_idx,
+    th_tr = np.asarray(bundle.theta_train, dtype=np.float64).reshape(-1)
+    th_va = np.asarray(bundle.theta_validation, dtype=np.float64).reshape(-1)
+    bin_train = vhb.theta_to_bin_index(th_tr, edges, n_bins)
+    bin_val = vhb.theta_to_bin_index(th_va, edges, n_bins)
+    clf_acc, _, _, _ = vhb.pairwise_bin_logistic_accuracy_train_val(
+        bundle.x_train,
+        bin_train,
+        bundle.x_validation,
+        bin_val,
         n_bins,
-        test_frac=float(clf_test_frac),
         min_class_count=int(clf_min_class_count),
         random_state=int(clf_random_state),
     )
@@ -412,16 +411,16 @@ def _estimate_one(
     ctx = _run_ctx_for_bundle(args2, meta, bundle, full_args, n_bins)
     vhb.run_h_estimation_if_needed(ctx)
     loaded = vhb.load_h_matrix(ctx)
-    theta_chk = vhb.theta_for_h_matrix_alignment(ctx.bundle, ctx.full_args)
+    theta_chk = vhb.theta_for_h_matrix_alignment(ctx.bundle, h_field_method=loaded.h_field_method)
     if theta_chk.shape[0] != loaded.theta_used.shape[0]:
         raise ValueError(
             f"theta/H row mismatch: theta_chk={theta_chk.shape[0]} theta_used={loaded.theta_used.shape[0]}"
         )
     if not np.allclose(theta_chk, loaded.theta_used, rtol=0.0, atol=1e-5):
         raise ValueError(
-            "theta_used from H-matrix npz does not match dataset theta for score_fisher_eval_data split."
+            "theta_used from H-matrix npz does not match expected dataset rows for this h_field_method."
         )
-    x_aligned = vhb.x_for_h_matrix_alignment(ctx.bundle, ctx.full_args)
+    x_aligned = vhb.x_for_h_matrix_alignment(ctx.bundle, h_field_method=loaded.h_field_method)
     if x_aligned.shape[0] != loaded.theta_used.shape[0]:
         raise ValueError(
             f"x/H row mismatch: x_aligned={x_aligned.shape[0]} theta_used={loaded.theta_used.shape[0]}"
@@ -1381,7 +1380,6 @@ def main(argv: list[str] | None = None) -> None:
         output_dir=ref_dir,
         edges=edges,
         n_bins=n_bins,
-        clf_test_frac=float(args.clf_test_frac),
         clf_min_class_count=int(args.clf_min_class_count),
         clf_random_state=clf_rs,
     )
@@ -1440,7 +1438,7 @@ def main(argv: list[str] | None = None) -> None:
         try:
             t1 = time.time()
             bundle_n = _subset_bundle(bundle, perm, int(n), meta)
-            loaded_n, x_n, _ = _estimate_one(
+            loaded_n, _, _ = _estimate_one(
                 args=args,
                 meta=meta,
                 bundle=bundle_n,
@@ -1449,10 +1447,9 @@ def main(argv: list[str] | None = None) -> None:
             )
             h_n, clf_n = _metrics_fixed_edges(
                 loaded_n,
-                x_n,
+                bundle_n,
                 edges,
                 n_bins,
-                float(args.clf_test_frac),
                 int(args.clf_min_class_count),
                 clf_rs,
             )

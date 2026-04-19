@@ -4,6 +4,7 @@ import argparse
 import importlib.util
 import unittest
 from pathlib import Path
+import sys
 
 import numpy as np
 import torch
@@ -16,6 +17,7 @@ _MODULE_PATH = _REPO_ROOT / "bin" / "visualize_h_matrix_binned.py"
 _SPEC = importlib.util.spec_from_file_location("visualize_h_matrix_binned", _MODULE_PATH)
 assert _SPEC is not None and _SPEC.loader is not None
 _MODULE = importlib.util.module_from_spec(_SPEC)
+sys.modules[str(_SPEC.name)] = _MODULE
 _SPEC.loader.exec_module(_MODULE)
 
 average_matrix_by_bins = _MODULE.average_matrix_by_bins
@@ -23,6 +25,7 @@ config_from_args = _MODULE.config_from_args
 hellinger_acc_lb_from_binned_h_squared = _MODULE.hellinger_acc_lb_from_binned_h_squared
 hellinger_acc_ub_from_binned_h_squared = _MODULE.hellinger_acc_ub_from_binned_h_squared
 matrix_corr_offdiag = _MODULE.matrix_corr_offdiag
+pairwise_bin_logistic_accuracy_train_val = _MODULE.pairwise_bin_logistic_accuracy_train_val
 parse_args = _MODULE.parse_args
 run_binned_visualization = _MODULE.run_binned_visualization
 theta_bin_edges = _MODULE.theta_bin_edges
@@ -50,7 +53,7 @@ def _write_fixture_dataset_and_h(tmp_path: Path) -> tuple[Path, Path]:
     theta_all = np.linspace(-1.0, 1.0, num=12, dtype=np.float64).reshape(-1, 1)
     x_all = np.concatenate([theta_all, theta_all**2], axis=1)
     train_idx = np.arange(0, 6, dtype=np.int64)
-    eval_idx = np.arange(6, 12, dtype=np.int64)
+    validation_idx = np.arange(6, 12, dtype=np.int64)
 
     dataset_npz = tmp_path / "shared_dataset.npz"
     save_shared_dataset_npz(
@@ -59,11 +62,11 @@ def _write_fixture_dataset_and_h(tmp_path: Path) -> tuple[Path, Path]:
         theta_all=theta_all,
         x_all=x_all,
         train_idx=train_idx,
-        eval_idx=eval_idx,
+        validation_idx=validation_idx,
         theta_train=theta_all[train_idx],
         x_train=x_all[train_idx],
-        theta_eval=theta_all[eval_idx],
-        x_eval=x_all[eval_idx],
+        theta_validation=theta_all[validation_idx],
+        x_validation=x_all[validation_idx],
     )
 
     th = theta_all.reshape(-1)
@@ -75,7 +78,7 @@ def _write_fixture_dataset_and_h(tmp_path: Path) -> tuple[Path, Path]:
         h_npz,
         h_sym=h_sym,
         theta_used=th,
-        h_field_method=np.asarray(["dsm"], dtype=object),
+        h_field_method=np.asarray(["theta_flow"], dtype=object),
         h_eval_scalar_name=np.asarray(["sigma_eval"], dtype=object),
         sigma_eval=np.asarray([0.1], dtype=np.float64),
     )
@@ -91,6 +94,30 @@ def test_theta_bin_helpers() -> None:
     assert hi == 1.0
     assert edges.shape == (3,)
     assert idx.tolist() == [0, 0, 1, 1]
+
+
+def test_pairwise_clf_uses_train_then_scores_validation() -> None:
+    """Quick check that accuracy is computed on the validation rows only (shape / finite entries)."""
+    rng = np.random.default_rng(0)
+    n_tr, n_va = 40, 20
+    x_tr = rng.standard_normal((n_tr, 2))
+    x_va = rng.standard_normal((n_va, 2))
+    th_tr = rng.uniform(-1, 1, size=n_tr)
+    th_va = rng.uniform(-1, 1, size=n_va)
+    edges, _, _ = theta_bin_edges(np.concatenate([th_tr, th_va]), n_bins=3)
+    bi_tr = theta_to_bin_index(th_tr, edges, 3)
+    bi_va = theta_to_bin_index(th_va, edges, 3)
+    acc, valid, _, stats = pairwise_bin_logistic_accuracy_train_val(
+        x_tr,
+        bi_tr,
+        x_va,
+        bi_va,
+        3,
+        min_class_count=2,
+        random_state=7,
+    )
+    assert acc.shape == (3, 3)
+    assert stats["ok_pairs"] >= 0
 
 
 def test_average_matrix_by_bins() -> None:
@@ -143,8 +170,6 @@ def test_integration_gpu_smoke_or_explicit_cuda_error(tmp_path: Path) -> None:
             "4",
             "--clf-min-class-count",
             "1",
-            "--clf-test-frac",
-            "0.5",
             "--gt-approx-n-total",
             "64",
             "--output-dir",

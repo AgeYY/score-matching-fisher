@@ -224,11 +224,11 @@ class TestGaussianTuningCurve(unittest.TestCase):
                 theta_all=theta_all,
                 x_all=x_all,
                 train_idx=tr,
-                eval_idx=ev,
+                validation_idx=ev,
                 theta_train=theta_all,
                 x_train=x_all,
-                theta_eval=np.empty((0, 1), dtype=np.float64),
-                x_eval=np.empty((0, 4), dtype=np.float64),
+                theta_validation=np.empty((0, 1), dtype=np.float64),
+                x_validation=np.empty((0, 4), dtype=np.float64),
             )
             bundle = load_shared_dataset_npz(path)
         self.assertEqual(bundle.meta["dataset_family"], "cosine_gaussian_sqrtd")
@@ -259,11 +259,11 @@ class TestGaussianTuningCurve(unittest.TestCase):
                 theta_all=theta_all,
                 x_all=x_all,
                 train_idx=tr,
-                eval_idx=ev,
+                validation_idx=ev,
                 theta_train=theta_all,
                 x_train=x_all,
-                theta_eval=np.empty((0, 1), dtype=np.float64),
-                x_eval=np.empty((0, 4), dtype=np.float64),
+                theta_validation=np.empty((0, 1), dtype=np.float64),
+                x_validation=np.empty((0, 4), dtype=np.float64),
             )
             bundle = load_shared_dataset_npz(path)
         self.assertEqual(bundle.meta["dataset_family"], "randamp_gaussian")

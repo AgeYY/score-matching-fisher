@@ -8,7 +8,12 @@ import numpy as np
 import torch
 
 from fisher.h_matrix import HMatrixEstimator
-from fisher.models import ConditionalThetaFlowVelocity, PriorThetaFlowVelocity
+from fisher.models import (
+    ConditionalThetaFlowVelocity,
+    ConditionalThetaFlowVelocityIIDSoft,
+    PriorThetaFlowVelocity,
+    PriorThetaFlowVelocityIIDSoft,
+)
 
 
 class TestHMatrixThetaPathIntegral(unittest.TestCase):
@@ -35,6 +40,26 @@ class TestHMatrixThetaPathIntegral(unittest.TestCase):
         self.assertTrue(np.isfinite(out.g_matrix).all())
         self.assertTrue(np.isfinite(out.c_matrix).all())
         self.assertTrue(np.isfinite(out.delta_l_matrix).all())
+        self.assertTrue(np.isfinite(out.h_sym).all())
+
+    def test_theta_path_integral_iid_soft_runs_and_finite(self) -> None:
+        torch.manual_seed(1)
+        post = ConditionalThetaFlowVelocityIIDSoft(x_dim=2, hidden_dim=14, depth=2)
+        prior = PriorThetaFlowVelocityIIDSoft(hidden_dim=14, depth=2)
+        est = HMatrixEstimator(
+            model_post=post,
+            model_prior=prior,
+            sigma_eval=0.8,
+            device=torch.device("cpu"),
+            pair_batch_size=64,
+            field_method="theta_path_integral",
+            flow_scheduler="cosine",
+            flow_ode_steps=16,
+        )
+        theta = np.linspace(-0.5, 0.5, 5, dtype=np.float64).reshape(-1, 1)
+        x = np.stack([np.sin(theta.reshape(-1)), np.cos(theta.reshape(-1))], axis=1).astype(np.float64)
+        out = est.run(theta=theta, x=x, restore_original_order=False)
+        self.assertEqual(out.field_method, "theta_path_integral")
         self.assertTrue(np.isfinite(out.h_sym).all())
 
 

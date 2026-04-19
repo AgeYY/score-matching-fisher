@@ -56,9 +56,6 @@ class TestHMatrixCtsmV(unittest.TestCase):
         args.device = "cpu"
         args.x_dim = 2
         args.dataset_family = "cosine_gaussian"
-        args.score_data_mode = "full"
-        args.score_val_source = "train_split"
-        args.score_fisher_eval_data = "full"
         args.h_restore_original_order = True
         args.h_batch_size = 128
         args.h_save_intermediates = True
@@ -78,8 +75,8 @@ class TestHMatrixCtsmV(unittest.TestCase):
         split = n // 2
         theta_train = theta_all[:split]
         x_train = x_all[:split]
-        theta_eval = theta_all[split:]
-        x_eval = x_all[split:]
+        theta_validation = theta_all[split:]
+        x_validation = x_all[split:]
 
         with tempfile.TemporaryDirectory() as td:
             args.output_dir = str(Path(td))
@@ -90,8 +87,8 @@ class TestHMatrixCtsmV(unittest.TestCase):
                 x_all=x_all,
                 theta_train=theta_train,
                 x_train=x_train,
-                theta_eval=theta_eval,
-                x_eval=x_eval,
+                theta_validation=theta_validation,
+                x_validation=x_validation,
                 rng=np.random.default_rng(0),
             )
             out_dir = Path(td)

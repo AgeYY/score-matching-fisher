@@ -125,7 +125,7 @@ def main() -> None:
     tr_idx = perm[:n_train]
     ev_idx = perm[n_train:]
     theta_train, x_train = theta_all[tr_idx], x_all[tr_idx]
-    theta_eval, x_eval = theta_all[ev_idx], x_all[ev_idx]
+    theta_validation, x_validation = theta_all[ev_idx], x_all[ev_idx]
 
     meta = meta_dict_from_args(args)
     if str(args.dataset_family) in ("randamp_gaussian", "randamp_gaussian_sqrtd"):
@@ -136,14 +136,16 @@ def main() -> None:
         theta_all=theta_all,
         x_all=x_all,
         train_idx=tr_idx.astype(np.int64),
-        eval_idx=ev_idx.astype(np.int64),
+        validation_idx=ev_idx.astype(np.int64),
         theta_train=theta_train,
         x_train=x_train,
-        theta_eval=theta_eval,
-        x_eval=x_eval,
+        theta_validation=theta_validation,
+        x_validation=x_validation,
     )
 
-    print(f"[data] total={n_total} train={theta_train.shape[0]} eval={theta_eval.shape[0]}")
+    print(
+        f"[data] total={n_total} train={theta_train.shape[0]} validation={theta_validation.shape[0]}"
+    )
     print(f"Saved shared dataset: {args.output_npz}")
 
     out_dir = Path(args.output_npz).resolve().parent

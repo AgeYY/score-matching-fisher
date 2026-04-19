@@ -40,14 +40,16 @@ class TestStudyHDecodingConvergenceVizOnly(unittest.TestCase):
             dataset_family="cosine_gaussian_sqrtd",
             x_dim=4,
             n_total=n_total,
-            train_frac=1.0,
+            train_frac=0.5,
             seed=seed,
         )
         ds = build_dataset_from_args(ns_ds)
         theta_all, x_all = ds.sample_joint(n_total)
         meta = meta_dict_from_args(ns_ds)
-        tr = np.arange(n_total, dtype=np.int64)
-        ev = np.array([], dtype=np.int64)
+        n_train = int(0.5 * n_total)
+        n_train = min(max(n_train, 1), n_total - 1)
+        tr = np.arange(0, n_train, dtype=np.int64)
+        va = np.arange(n_train, n_total, dtype=np.int64)
 
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -58,11 +60,11 @@ class TestStudyHDecodingConvergenceVizOnly(unittest.TestCase):
                 theta_all=theta_all,
                 x_all=x_all,
                 train_idx=tr,
-                eval_idx=ev,
-                theta_train=theta_all,
-                x_train=x_all,
-                theta_eval=np.empty((0, 1), dtype=np.float64),
-                x_eval=np.empty((0, 4), dtype=np.float64),
+                validation_idx=va,
+                theta_train=theta_all[tr],
+                x_train=x_all[tr],
+                theta_validation=theta_all[va],
+                x_validation=x_all[va],
             )
             out_dir = tmp_path / "run_out"
             out_dir.mkdir()

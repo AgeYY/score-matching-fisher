@@ -29,7 +29,7 @@ Run ``python bin/make_dataset.py --help`` for argparse defaults and exact wordin
     - ``linear_piecewise`` — Linear mean construction in 2D; observation std vs ``θ`` (piecewise /
       scheduled). **Requires** ``--x-dim 2``.
 
-- ``--seed`` (default 7) — NumPy RNG seed for joint sampling and for the train/eval permutation.
+- ``--seed`` (default 7) — NumPy RNG seed for joint sampling and for the train/validation permutation.
 
 - ``--theta-low``, ``--theta-high`` (defaults -6.0, 6.0) — θ is uniform on ``[theta-low, theta-high]``.
 
@@ -38,8 +38,9 @@ Run ``python bin/make_dataset.py --help`` for argparse defaults and exact wordin
 
 - ``--n-total`` / ``--num-samples`` (default 3000) — Number of joint ``(θ, x)`` draws before splitting.
 
-- ``--train-frac`` (default 1.0) — Fraction of indices assigned to ``train_idx``. If ``< 1``,
-  the remainder is ``eval_idx`` (held-out). Must be in ``(0, 1]``.
+- ``--train-frac`` (default 0.7) — Fraction of indices assigned to ``train_idx``. The remainder is
+  ``validation_idx`` (held-out). Must be in ``(0, 1]``. Values ``< 1`` are required for shared Fisher /
+  H-matrix / pairwise-CLF pipelines that need a non-empty validation slice.
 
 - ``--output-npz`` — Path to the written archive (default under ``global_setting.DATA_DIR`` /
   ``SCORE_MATCHING_FISHER_DATAROOT``). Contains ``theta_all``, ``x_all``, indices, splits, and
@@ -140,7 +141,7 @@ def main() -> None:
     tr_idx = perm[:n_train]
     ev_idx = perm[n_train:]
     theta_train, x_train = theta_all[tr_idx], x_all[tr_idx]
-    theta_eval, x_eval = theta_all[ev_idx], x_all[ev_idx]
+    theta_validation, x_validation = theta_all[ev_idx], x_all[ev_idx]
 
     meta = meta_dict_from_args(args)
     if str(args.dataset_family) in ("randamp_gaussian", "randamp_gaussian_sqrtd"):
@@ -151,14 +152,17 @@ def main() -> None:
         theta_all=theta_all,
         x_all=x_all,
         train_idx=tr_idx.astype(np.int64),
-        eval_idx=ev_idx.astype(np.int64),
+        validation_idx=ev_idx.astype(np.int64),
         theta_train=theta_train,
         x_train=x_train,
-        theta_eval=theta_eval,
-        x_eval=x_eval,
+        theta_validation=theta_validation,
+        x_validation=x_validation,
     )
 
-    print(f"[data] total={n_total} train={theta_train.shape[0]} eval={theta_eval.shape[0]}")
+    print(
+        f"[data] total={n_total} train={theta_train.shape[0]} "
+        f"validation={theta_validation.shape[0]}"
+    )
     print(f"Saved shared dataset: {args.output_npz}")
 
     out_dir = Path(args.output_npz).resolve().parent

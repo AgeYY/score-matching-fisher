@@ -12,6 +12,7 @@ from fisher.cli_shared_fisher import add_estimation_arguments
 from fisher.h_matrix import HMatrixEstimator
 from fisher.models import (
     ConditionalXFlowVelocity,
+    ConditionalXFlowVelocityIIDSoft,
     ConditionalXFlowVelocityIndependentMLP,
     ConditionalXFlowVelocityIndependentThetaFourierMLP,
     ConditionalXFlowVelocityThetaFourierFiLMPerLayer,
@@ -377,6 +378,83 @@ class TestHMatrixFlowXLikelihood(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             validate_estimation_args(args)
+
+    def test_validate_iid_soft_rejects_ctsm_v(self) -> None:
+        parser = argparse.ArgumentParser()
+        add_estimation_arguments(parser)
+        args = parser.parse_args(["--theta-field-method", "ctsm_v", "--flow-arch", "iid_soft"])
+        with self.assertRaises(ValueError) as ctx:
+            validate_estimation_args(args)
+        self.assertIn("iid_soft", str(ctx.exception).lower())
+
+    def test_validate_accepts_x_flow_iid_soft(self) -> None:
+        parser = argparse.ArgumentParser()
+        add_estimation_arguments(parser)
+        args = parser.parse_args(["--theta-field-method", "x_flow", "--flow-arch", "iid_soft"])
+        validate_estimation_args(args)
+        self.assertEqual(str(args.flow_arch).strip().lower(), "iid_soft")
+
+    def test_iid_soft_forward_shape(self) -> None:
+        m = ConditionalXFlowVelocityIIDSoft(
+            x_dim=4,
+            hidden_dim=16,
+            depth=2,
+            use_logit_time=True,
+            interaction_hidden_dim=12,
+            interaction_depth=2,
+            alpha_init=0.05,
+            alpha_learnable=True,
+        )
+        b = 5
+        x_t = torch.randn(b, 4)
+        theta = torch.randn(b, 1)
+        t = torch.rand(b, 1)
+        out = m(x_t, theta, t)
+        self.assertEqual(tuple(out.shape), (b, 4))
+        self.assertTrue(torch.isfinite(out).all())
+
+    def test_iid_soft_alpha_zero_additive_broadcast_and_joint_shift(self) -> None:
+        """With alpha=0, v equals the mean(phi(x_i)) broadcast: all dims match; perturbing x_0 shifts all dims."""
+        torch.manual_seed(0)
+        m = ConditionalXFlowVelocityIIDSoft(
+            x_dim=3,
+            hidden_dim=12,
+            depth=2,
+            use_logit_time=True,
+            alpha_init=0.0,
+            alpha_learnable=False,
+        )
+        x1 = torch.randn(6, 3)
+        theta = torch.randn(6, 1)
+        t = torch.rand(6, 1)
+        o1 = m(x1, theta, t)
+        self.assertTrue(torch.allclose(o1[:, 0], o1[:, 1]))
+        self.assertTrue(torch.allclose(o1[:, 1], o1[:, 2]))
+        x2 = x1.clone()
+        x2[:, 0] = x2[:, 0] + 50.0
+        o2 = m(x2, theta, t)
+        delta = o2 - o1
+        self.assertTrue(torch.allclose(delta[:, 0], delta[:, 1]))
+        self.assertTrue(torch.allclose(delta[:, 1], delta[:, 2]))
+        self.assertFalse(torch.allclose(delta, torch.zeros_like(delta)))
+
+    def test_flow_x_likelihood_accepts_iid_soft_estimator(self) -> None:
+        post = ConditionalXFlowVelocityIIDSoft(x_dim=2, hidden_dim=8, depth=1, use_logit_time=True)
+        est = HMatrixEstimator(
+            model_post=post,
+            model_prior=None,
+            sigma_eval=1.0,
+            device=torch.device("cpu"),
+            pair_batch_size=32,
+            field_method="flow_x_likelihood",
+            flow_scheduler="cosine",
+            flow_ode_steps=8,
+        )
+        theta = np.linspace(-0.5, 0.5, 4, dtype=np.float64).reshape(-1, 1)
+        x = np.random.default_rng(0).standard_normal((4, 2)).astype(np.float64)
+        out = est.run(theta=theta, x=x, restore_original_order=False)
+        self.assertEqual(out.field_method, "flow_x_likelihood")
+        self.assertTrue(np.isfinite(out.h_sym).all())
 
 
 if __name__ == "__main__":

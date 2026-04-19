@@ -23,7 +23,7 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
         "--seed",
         type=int,
         default=7,
-        help="Integer seed for NumPy RNG (joint sampling and train/eval split permutation).",
+        help="Integer seed for NumPy RNG (joint sampling and train/validation split permutation).",
     )
     p.add_argument(
         "--dataset-family",
@@ -69,15 +69,19 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
         default=3000,
         metavar="N",
         help=(
-            "Total number of data points: joint (theta, x) samples drawn before the train/eval split. "
+            "Total number of data points: joint (theta, x) samples drawn before the train/validation split. "
             "Same as --num-samples."
         ),
     )
     p.add_argument(
         "--train-frac",
         type=float,
-        default=1.0,
-        help="Fraction of n_total in train_idx; 1.0 means no held-out theta_eval/x_eval split.",
+        default=0.7,
+        help=(
+            "Fraction of n_total in train_idx; remainder is validation_idx. "
+            "Use a value in (0, 1) so score training, H-matrix evaluation, and pairwise CLF "
+            "(train-fit / val-eval) share the same split. 1.0 leaves validation empty (not supported for shared Fisher)."
+        ),
     )
 
 
@@ -150,21 +154,6 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
             "Default: mlp."
         ),
     )
-    p.add_argument(
-        "--score-data-mode",
-        type=str,
-        default="full",
-        choices=["split", "full"],
-        help="split: train score on theta_train only; full: train score on all (theta_all, x_all).",
-    )
-    p.add_argument(
-        "--score-fisher-eval-data",
-        type=str,
-        default="full",
-        choices=["score_eval", "full"],
-        help="Data split used for score-based Fisher evaluation after training.",
-    )
-    p.add_argument("--score-val-source", type=str, default="train_split", choices=["train_split", "eval_set"])
     p.add_argument("--score-early-patience", type=int, default=1500)
     p.add_argument("--score-early-min-delta", type=float, default=1e-4)
     p.add_argument(
@@ -283,11 +272,95 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         "--flow-arch",
         type=str,
         default="mlp",
-        choices=["mlp", "film_fourier"],
+        choices=["mlp", "film_fourier", "iid_soft"],
         help=(
             "Flow architecture shared by theta_flow, theta_path_integral, and x_flow: "
-            "mlp, or film_fourier (FiLM blocks with Fourier theta features)."
+            "mlp, film_fourier (FiLM blocks with Fourier theta features), or iid_soft "
+            "(x_flow: mean pooled phi(x_k)+psi(x); theta_flow/theta_path_integral: "
+            "mean pooled phi(theta~,x_i)+psi(theta~,x) in R^{theta_dim}; prior iid_soft unchanged; "
+            "see --flow-x-iid-* and --flow-theta-iid-* / --flow-prior-iid-*)."
         ),
+    )
+    p.add_argument(
+        "--flow-x-iid-alpha-init",
+        type=float,
+        default=0.001,
+        help="x_flow + iid_soft: initial alpha in v_add + alpha * v_int (default 0.001).",
+    )
+    p.add_argument(
+        "--flow-x-iid-alpha-fixed",
+        action="store_true",
+        default=False,
+        help="x_flow + iid_soft: keep alpha fixed at --flow-x-iid-alpha-init (not learnable).",
+    )
+    p.add_argument(
+        "--flow-x-iid-interaction-hidden-mult",
+        type=float,
+        default=1.0,
+        help=(
+            "x_flow + iid_soft: multiply --flow-hidden-dim to set psi (interaction) MLP width "
+            "(default 1.0; rounded to int, minimum 1)."
+        ),
+    )
+    p.add_argument(
+        "--flow-x-iid-interaction-depth",
+        type=int,
+        default=None,
+        help="x_flow + iid_soft: depth of psi MLP; default same as --flow-depth.",
+    )
+    p.add_argument(
+        "--flow-theta-iid-alpha-init",
+        type=float,
+        default=0.001,
+        help="theta_flow / theta_path_integral + iid_soft: posterior alpha init (default 0.001).",
+    )
+    p.add_argument(
+        "--flow-theta-iid-alpha-fixed",
+        action="store_true",
+        default=False,
+        help="theta_flow / theta_path_integral + iid_soft: posterior alpha fixed (not learnable).",
+    )
+    p.add_argument(
+        "--flow-theta-iid-interaction-hidden-mult",
+        type=float,
+        default=1.0,
+        help=(
+            "theta_flow / theta_path_integral + iid_soft: multiply --flow-hidden-dim for posterior psi width "
+            "(default 1.0; rounded, min 1)."
+        ),
+    )
+    p.add_argument(
+        "--flow-theta-iid-interaction-depth",
+        type=int,
+        default=None,
+        help="theta_flow / theta_path_integral + iid_soft: posterior psi depth; default --flow-depth.",
+    )
+    p.add_argument(
+        "--flow-prior-iid-alpha-init",
+        type=float,
+        default=0.001,
+        help="theta_flow / theta_path_integral + iid_soft: prior alpha init (default 0.001).",
+    )
+    p.add_argument(
+        "--flow-prior-iid-alpha-fixed",
+        action="store_true",
+        default=False,
+        help="theta_flow / theta_path_integral + iid_soft: prior alpha fixed (not learnable).",
+    )
+    p.add_argument(
+        "--flow-prior-iid-interaction-hidden-mult",
+        type=float,
+        default=1.0,
+        help=(
+            "theta_flow / theta_path_integral + iid_soft: multiply --prior-hidden-dim for prior psi width "
+            "(default 1.0; rounded, min 1)."
+        ),
+    )
+    p.add_argument(
+        "--flow-prior-iid-interaction-depth",
+        type=int,
+        default=None,
+        help="theta_flow / theta_path_integral + iid_soft: prior psi depth; default --prior-depth.",
     )
     p.add_argument(
         "--flow-score-arch",
