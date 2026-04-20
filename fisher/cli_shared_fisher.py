@@ -37,6 +37,7 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
             "randamp_gaussian",
             "randamp_gaussian_sqrtd",
             "randamp_gaussian_sqrtd_realnvp",
+            "randamp_gaussian_sqrtd_pr_autoencoder",
             "cosine_gmm",
             "cos_sin_piecewise",
             "linear_piecewise",
@@ -52,6 +53,8 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
             "'randamp_gaussian_sqrtd' (same as randamp_gaussian with sqrt(x_dim) noise scaling); "
             "'randamp_gaussian_sqrtd_realnvp' (sample base randamp_gaussian_sqrtd in z_dim=2 then map "
             "to x_dim with a fixed untrained RealNVP embedding); "
+            "'randamp_gaussian_sqrtd_pr_autoencoder' (sample base randamp_gaussian_sqrtd in latent z_dim, "
+            "default 2, set via --pr-autoencoder-z-dim; map to x_dim with a trained PR-autoencoder); "
             "'cosine_gmm' (theta-dependent 2-component mixture); "
             "'cos_sin_piecewise' (cos/sin means + piecewise obs. std vs theta sign); "
             "'linear_piecewise' (linear means + piecewise obs. std vs theta)."
@@ -70,6 +73,17 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
         help="Upper bound of theta (see --theta-low).",
     )
     p.add_argument("--x-dim", type=int, default=2, help="Observation dimension (length of x).")
+    p.add_argument(
+        "--pr-autoencoder-z-dim",
+        type=int,
+        default=2,
+        metavar="Z",
+        help=(
+            "For randamp_gaussian_sqrtd_pr_autoencoder only: latent dimension of the base "
+            "randamp_gaussian_sqrtd draw before PR-autoencoder embedding (encoder input z_dim; "
+            "requires --x-dim >= this value)."
+        ),
+    )
     p.add_argument(
         "--n-total",
         "--num-samples",

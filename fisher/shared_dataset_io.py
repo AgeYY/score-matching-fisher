@@ -108,6 +108,18 @@ def meta_dict_from_args(ns: Any) -> dict[str, Any]:
     out["realnvp_batch_norm_between_transforms"] = bool(
         getattr(ns, "realnvp_batch_norm_between_transforms", True)
     )
+    out["pr_autoencoder_enabled"] = bool(getattr(ns, "pr_autoencoder_enabled", False))
+    out["pr_autoencoder_z_dim"] = int(getattr(ns, "pr_autoencoder_z_dim", 2))
+    out["pr_autoencoder_hidden1"] = int(getattr(ns, "pr_autoencoder_hidden1", 100))
+    out["pr_autoencoder_hidden2"] = int(getattr(ns, "pr_autoencoder_hidden2", 200))
+    out["pr_autoencoder_train_samples"] = int(getattr(ns, "pr_autoencoder_train_samples", 12000))
+    out["pr_autoencoder_train_epochs"] = int(getattr(ns, "pr_autoencoder_train_epochs", 200))
+    out["pr_autoencoder_train_batch_size"] = int(getattr(ns, "pr_autoencoder_train_batch_size", 512))
+    out["pr_autoencoder_train_lr"] = float(getattr(ns, "pr_autoencoder_train_lr", 1e-3))
+    out["pr_autoencoder_lambda_pr"] = float(getattr(ns, "pr_autoencoder_lambda_pr", 1e-2))
+    out["pr_autoencoder_pr_eps"] = float(getattr(ns, "pr_autoencoder_pr_eps", 1e-8))
+    out["pr_autoencoder_seed"] = int(getattr(ns, "pr_autoencoder_seed", int(ns.seed)))
+    out["pr_autoencoder_cache_key"] = str(getattr(ns, "pr_autoencoder_cache_key", ""))
     return out
 
 

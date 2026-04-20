@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Executable RealNVP low->high synthetic generator checks (no training).
+"""Executable low->high synthetic generator checks.
 
-This script is intentionally not a unittest/pytest module. It runs a small set of
-self-checks and exits nonzero if any check fails.
+Default method is a PR-regularized autoencoder (trained + cached), with an optional
+legacy RealNVP baseline for side-by-side debugging.
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Callable, List, Tuple
+from typing import Callable
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -19,32 +19,56 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-matplotlib.use("Agg")
+_repo_root = Path(__file__).resolve().parent.parent
+if str(_repo_root) not in sys.path:
+    sys.path.insert(0, str(_repo_root))
 
-try:
-    from glasflow import RealNVP
-except Exception as exc:  # pragma: no cover - import-time environment check
-    raise RuntimeError(
-        "glasflow is required for this script. Install it in geo_diffusion, e.g.:\n"
-        "  mamba run -n geo_diffusion pip install glasflow"
-    ) from exc
+from fisher.autoencoder_embedding import (
+    InputAutoencoder,
+    PRAutoencoderConfig,
+    embed_latents,
+    participation_ratio,
+    set_torch_seed,
+    train_or_load_pr_autoencoder,
+)
+
+matplotlib.use("Agg")
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
-            "Run executable checks for low->high dimensional synthetic generation "
-            "via zero-padding + RealNVP (Option B only, no training)."
+            "Run executable checks for low->high dimensional synthetic generation. "
+            "Default method: PR-regularized autoencoder (implemented in fisher/autoencoder_embedding.py); "
+            "optional mode: zero-pad + RealNVP."
         )
     )
+    p.add_argument("--embedding-method", type=str, default="pr_autoencoder", choices=["pr_autoencoder", "realnvp"])
     p.add_argument("--z-dim", type=int, default=2)
     p.add_argument("--h-dim", type=int, default=32)
-    p.add_argument("--n-transforms", type=int, default=6)
-    p.add_argument("--hidden-width", type=int, default=128)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cuda")
+
+    # PR-autoencoder settings (used when --embedding-method pr_autoencoder)
+    p.add_argument("--enc-hidden1", type=int, default=100)
+    p.add_argument("--enc-hidden2", type=int, default=200)
+    p.add_argument("--train-samples", type=int, default=12000)
+    p.add_argument("--train-epochs", type=int, default=200)
+    p.add_argument("--train-batch-size", type=int, default=512)
+    p.add_argument("--train-lr", type=float, default=1e-3)
+    p.add_argument("--lambda-pr", type=float, default=1e-2)
+    p.add_argument("--pr-eps", type=float, default=1e-8)
+    p.add_argument("--recon-threshold", type=float, default=0.5)
+    p.add_argument("--pr-threshold", type=float, default=2.0)
+    p.add_argument("--cache-dir", type=str, default="data/pr_autoencoder_cache")
+    p.add_argument("--force-retrain", action="store_true")
+
+    # RealNVP settings (used when --embedding-method realnvp)
+    p.add_argument("--n-transforms", type=int, default=6)
+    p.add_argument("--hidden-width", type=int, default=128)
     p.add_argument("--positive-output", action="store_true")
+
     p.add_argument("--save-viz", action="store_true", help="Save synthetic data visualizations.")
     p.add_argument("--viz-samples", type=int, default=2000, help="Number of synthetic samples for visualization.")
     p.add_argument(
@@ -56,16 +80,22 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def set_seed(seed: int) -> None:
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
 def ensure_device(device: str) -> torch.device:
     if device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested (`--device cuda`) but CUDA is unavailable on this machine.")
     return torch.device(device)
+
+
+def _assert(cond: bool, msg: str) -> None:
+    if not cond:
+        raise AssertionError(msg)
+
+
+def _pca_project_2d(x: np.ndarray) -> np.ndarray:
+    x0 = x - x.mean(axis=0, keepdims=True)
+    _, _, vh = np.linalg.svd(x0, full_matrices=False)
+    basis = vh[:2].T
+    return x0 @ basis
 
 
 class LowToHighRealNVPGenerator(nn.Module):
@@ -83,8 +113,19 @@ class LowToHighRealNVPGenerator(nn.Module):
         self.z_dim = z_dim
         self.h_dim = h_dim
         self.positive_output = positive_output
-        self.flow = RealNVP(
-            n_inputs=h_dim,
+        self.flow = self._build_flow(n_inputs=h_dim, n_transforms=n_transforms, hidden_width=hidden_width)
+
+    @staticmethod
+    def _build_flow(n_inputs: int, n_transforms: int, hidden_width: int) -> nn.Module:
+        try:
+            from glasflow import RealNVP
+        except Exception as exc:
+            raise RuntimeError(
+                "glasflow is required for --embedding-method realnvp. Install it in geo_diffusion, e.g.:\n"
+                "  mamba run -n geo_diffusion pip install glasflow"
+            ) from exc
+        return RealNVP(
+            n_inputs=n_inputs,
             n_transforms=n_transforms,
             n_neurons=hidden_width,
             batch_norm_between_transforms=True,
@@ -97,7 +138,7 @@ class LowToHighRealNVPGenerator(nn.Module):
         pad = torch.zeros(batch, self.h_dim - self.z_dim, device=z.device, dtype=z.dtype)
         return torch.cat([z, pad], dim=-1)
 
-    def flow_forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def flow_forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         out = self.flow.forward(x)
         if isinstance(out, tuple) and len(out) == 2:
             h, logdet = out
@@ -111,7 +152,7 @@ class LowToHighRealNVPGenerator(nn.Module):
             "Expected tensor or (tensor, logdet) tuple."
         )
 
-    def forward(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         x0 = self.pad_latent(z)
         h, logdet = self.flow_forward(x0)
         if self.positive_output:
@@ -119,12 +160,131 @@ class LowToHighRealNVPGenerator(nn.Module):
         return h, logdet
 
 
-def _assert(cond: bool, msg: str) -> None:
-    if not cond:
-        raise AssertionError(msg)
+def _pr_config_from_args(args: argparse.Namespace) -> PRAutoencoderConfig:
+    return PRAutoencoderConfig(
+        z_dim=int(args.z_dim),
+        h_dim=int(args.h_dim),
+        hidden1=int(args.enc_hidden1),
+        hidden2=int(args.enc_hidden2),
+        train_samples=int(args.train_samples),
+        train_epochs=int(args.train_epochs),
+        train_batch_size=int(args.train_batch_size),
+        train_lr=float(args.train_lr),
+        lambda_pr=float(args.lambda_pr),
+        pr_eps=float(args.pr_eps),
+    )
 
 
-def check_dimensionality_increase(model: LowToHighRealNVPGenerator, args: argparse.Namespace, device: torch.device) -> None:
+def check_dimensionality_increase_pr(model: InputAutoencoder, args: argparse.Namespace, device: torch.device) -> None:
+    _assert(args.h_dim > args.z_dim, "Expected dimensionality increase: h_dim must be > z_dim.")
+    z = torch.randn(args.batch_size, args.z_dim, device=device)
+    h, z_hat = model(z)
+    _assert(tuple(z.shape) == (args.batch_size, args.z_dim), f"Unexpected z shape: {tuple(z.shape)}")
+    _assert(tuple(h.shape) == (args.batch_size, args.h_dim), f"Unexpected h shape: {tuple(h.shape)}")
+    _assert(tuple(z_hat.shape) == (args.batch_size, args.z_dim), f"Unexpected z_hat shape: {tuple(z_hat.shape)}")
+
+
+def check_finite_outputs_pr(model: InputAutoencoder, args: argparse.Namespace, device: torch.device) -> None:
+    z = torch.randn(args.batch_size, args.z_dim, device=device)
+    h, z_hat = model(z)
+    _assert(bool(torch.isfinite(h).all()), "Non-finite values found in h output.")
+    _assert(bool(torch.isfinite(z_hat).all()), "Non-finite values found in z_hat output.")
+
+
+def check_quality_pr(model: InputAutoencoder, args: argparse.Namespace, device: torch.device) -> None:
+    z = torch.randn(max(args.batch_size * 4, 256), args.z_dim, device=device)
+    with torch.no_grad():
+        h, z_hat = model(z)
+        recon = F.mse_loss(z_hat, z).item()
+        pr = float(participation_ratio(h, eps=float(args.pr_eps)).item())
+    _assert(recon <= float(args.recon_threshold), f"Reconstruction MSE too high: {recon:.6f} > {args.recon_threshold}")
+    _assert(pr >= float(args.pr_threshold), f"Participation ratio too low: {pr:.6f} < {args.pr_threshold}")
+
+
+def check_reproducibility_pr(args: argparse.Namespace, device: torch.device) -> None:
+    cfg = _pr_config_from_args(args)
+    out1 = train_or_load_pr_autoencoder(
+        config=cfg,
+        seed=int(args.seed),
+        device=device,
+        cache_dir=args.cache_dir,
+        force_retrain=False,
+    )
+    out2 = train_or_load_pr_autoencoder(
+        config=cfg,
+        seed=int(args.seed),
+        device=device,
+        cache_dir=args.cache_dir,
+        force_retrain=False,
+    )
+
+    set_torch_seed(args.seed)
+    z1 = torch.randn(args.batch_size, args.z_dim, device=device)
+    set_torch_seed(args.seed)
+    z2 = torch.randn(args.batch_size, args.z_dim, device=device)
+    _assert(torch.allclose(z1, z2), "Latent sampling is not reproducible for same seed.")
+
+    with torch.no_grad():
+        h1, zhat1 = out1.model(z1)
+        h2, zhat2 = out2.model(z2)
+    _assert(torch.allclose(h1, h2), "PR-autoencoder outputs are not reproducible for same cache/config.")
+    _assert(torch.allclose(zhat1, zhat2), "PR-autoencoder recon outputs are not reproducible for same cache/config.")
+
+
+def check_invalid_hdim_raises_pr(args: argparse.Namespace) -> None:
+    try:
+        _ = InputAutoencoder(
+            z_dim=max(2, args.z_dim),
+            h_dim=max(1, args.z_dim - 1),
+            hidden1=args.enc_hidden1,
+            hidden2=args.enc_hidden2,
+        )
+    except ValueError:
+        return
+    raise AssertionError("Expected ValueError when h_dim < z_dim, but no error was raised.")
+
+
+def run_checks_pr(args: argparse.Namespace, device: torch.device) -> tuple[int, InputAutoencoder | None, dict[str, np.ndarray] | None, Path | None]:
+    cfg = _pr_config_from_args(args)
+    build = train_or_load_pr_autoencoder(
+        config=cfg,
+        seed=int(args.seed),
+        device=device,
+        cache_dir=args.cache_dir,
+        force_retrain=bool(args.force_retrain),
+    )
+    model = build.model
+    metrics = build.metrics
+    cache_run_dir = build.cache_run_dir
+
+    checks: list[tuple[str, Callable[[], None]]] = [
+        ("dimensionality increase and output shapes", lambda: check_dimensionality_increase_pr(model, args, device)),
+        ("outputs are finite", lambda: check_finite_outputs_pr(model, args, device)),
+        ("quality checks (recon + PR)", lambda: check_quality_pr(model, args, device)),
+        ("seed/cache reproducibility", lambda: check_reproducibility_pr(args, device)),
+        ("invalid h_dim < z_dim raises", lambda: check_invalid_hdim_raises_pr(args)),
+    ]
+
+    failed: list[str] = []
+    for name, fn in checks:
+        try:
+            fn()
+            print(f"[pass] {name}")
+        except Exception as exc:
+            failed.append(f"{name}: {exc}")
+            print(f"[fail] {name}: {exc}")
+
+    if failed:
+        print("\nSummary: FAIL")
+        for item in failed:
+            print(f" - {item}")
+        return 1, model, metrics, cache_run_dir
+
+    print("\nSummary: PASS")
+    return 0, model, metrics, cache_run_dir
+
+
+def check_dimensionality_increase_realnvp(model: LowToHighRealNVPGenerator, args: argparse.Namespace, device: torch.device) -> None:
     _assert(args.h_dim > args.z_dim, "Expected dimensionality increase: h_dim must be > z_dim.")
     z = torch.randn(args.batch_size, args.z_dim, device=device)
     h, logdet = model(z)
@@ -133,7 +293,7 @@ def check_dimensionality_increase(model: LowToHighRealNVPGenerator, args: argpar
     _assert(tuple(logdet.shape) == (args.batch_size,), f"Unexpected logdet shape: {tuple(logdet.shape)}")
 
 
-def check_padding_preserves_latent(model: LowToHighRealNVPGenerator, args: argparse.Namespace, device: torch.device) -> None:
+def check_padding_preserves_latent_realnvp(model: LowToHighRealNVPGenerator, args: argparse.Namespace, device: torch.device) -> None:
     z = torch.randn(args.batch_size, args.z_dim, device=device)
     padded = model.pad_latent(z)
     _assert(tuple(padded.shape) == (args.batch_size, args.h_dim), f"Unexpected padded shape: {tuple(padded.shape)}")
@@ -142,14 +302,14 @@ def check_padding_preserves_latent(model: LowToHighRealNVPGenerator, args: argpa
     _assert(torch.allclose(tail, torch.zeros_like(tail)), "Padding tail is not all zeros.")
 
 
-def check_finite_outputs(model: LowToHighRealNVPGenerator, args: argparse.Namespace, device: torch.device) -> None:
+def check_finite_outputs_realnvp(model: LowToHighRealNVPGenerator, args: argparse.Namespace, device: torch.device) -> None:
     z = torch.randn(args.batch_size, args.z_dim, device=device)
     h, logdet = model(z)
     _assert(bool(torch.isfinite(h).all()), "Non-finite values found in h output.")
     _assert(bool(torch.isfinite(logdet).all()), "Non-finite values found in logdet output.")
 
 
-def check_positive_output_branch(args: argparse.Namespace, device: torch.device) -> None:
+def check_positive_output_branch_realnvp(args: argparse.Namespace, device: torch.device) -> None:
     model = LowToHighRealNVPGenerator(
         z_dim=args.z_dim,
         h_dim=args.h_dim,
@@ -162,8 +322,8 @@ def check_positive_output_branch(args: argparse.Namespace, device: torch.device)
     _assert(bool((h >= 0).all()), "positive_output=True but negative values were produced.")
 
 
-def check_reproducibility(args: argparse.Namespace, device: torch.device) -> None:
-    set_seed(args.seed)
+def check_reproducibility_realnvp(args: argparse.Namespace, device: torch.device) -> None:
+    set_torch_seed(args.seed)
     m1 = LowToHighRealNVPGenerator(
         z_dim=args.z_dim,
         h_dim=args.h_dim,
@@ -174,7 +334,7 @@ def check_reproducibility(args: argparse.Namespace, device: torch.device) -> Non
     z1 = torch.randn(args.batch_size, args.z_dim, device=device)
     h1, l1 = m1(z1)
 
-    set_seed(args.seed)
+    set_torch_seed(args.seed)
     m2 = LowToHighRealNVPGenerator(
         z_dim=args.z_dim,
         h_dim=args.h_dim,
@@ -190,7 +350,7 @@ def check_reproducibility(args: argparse.Namespace, device: torch.device) -> Non
     _assert(torch.allclose(l1, l2), "logdet output is not reproducible for same seed.")
 
 
-def check_invalid_hdim_raises(args: argparse.Namespace) -> None:
+def check_invalid_hdim_raises_realnvp(args: argparse.Namespace) -> None:
     try:
         _ = LowToHighRealNVPGenerator(
             z_dim=max(2, args.z_dim),
@@ -204,8 +364,8 @@ def check_invalid_hdim_raises(args: argparse.Namespace) -> None:
     raise AssertionError("Expected ValueError when h_dim < z_dim, but no error was raised.")
 
 
-def run_checks(args: argparse.Namespace, device: torch.device) -> int:
-    set_seed(args.seed)
+def run_checks_realnvp(args: argparse.Namespace, device: torch.device) -> tuple[int, LowToHighRealNVPGenerator | None, None, None]:
+    set_torch_seed(args.seed)
     model = LowToHighRealNVPGenerator(
         z_dim=args.z_dim,
         h_dim=args.h_dim,
@@ -214,16 +374,16 @@ def run_checks(args: argparse.Namespace, device: torch.device) -> int:
         positive_output=args.positive_output,
     ).to(device)
 
-    checks: List[Tuple[str, Callable[[], None]]] = [
-        ("dimensionality increase and output shapes", lambda: check_dimensionality_increase(model, args, device)),
-        ("zero-padding preserves latent prefix", lambda: check_padding_preserves_latent(model, args, device)),
-        ("outputs are finite", lambda: check_finite_outputs(model, args, device)),
-        ("positive_output branch", lambda: check_positive_output_branch(args, device)),
-        ("seed reproducibility", lambda: check_reproducibility(args, device)),
-        ("invalid h_dim < z_dim raises", lambda: check_invalid_hdim_raises(args)),
+    checks: list[tuple[str, Callable[[], None]]] = [
+        ("dimensionality increase and output shapes", lambda: check_dimensionality_increase_realnvp(model, args, device)),
+        ("zero-padding preserves latent prefix", lambda: check_padding_preserves_latent_realnvp(model, args, device)),
+        ("outputs are finite", lambda: check_finite_outputs_realnvp(model, args, device)),
+        ("positive_output branch", lambda: check_positive_output_branch_realnvp(args, device)),
+        ("seed reproducibility", lambda: check_reproducibility_realnvp(args, device)),
+        ("invalid h_dim < z_dim raises", lambda: check_invalid_hdim_raises_realnvp(args)),
     ]
 
-    failed: List[str] = []
+    failed: list[str] = []
     for name, fn in checks:
         try:
             fn()
@@ -236,36 +396,38 @@ def run_checks(args: argparse.Namespace, device: torch.device) -> int:
         print("\nSummary: FAIL")
         for item in failed:
             print(f" - {item}")
-        return 1
+        return 1, model, None, None
 
     print("\nSummary: PASS")
-    return 0
+    return 0, model, None, None
 
 
-def _pca_project_2d(x: np.ndarray) -> np.ndarray:
-    x0 = x - x.mean(axis=0, keepdims=True)
-    _, _, vh = np.linalg.svd(x0, full_matrices=False)
-    basis = vh[:2].T
-    return x0 @ basis
-
-
-def save_visualizations(args: argparse.Namespace, device: torch.device) -> None:
-    set_seed(args.seed)
-    model = LowToHighRealNVPGenerator(
-        z_dim=args.z_dim,
-        h_dim=args.h_dim,
-        n_transforms=args.n_transforms,
-        hidden_width=args.hidden_width,
-        positive_output=args.positive_output,
-    ).to(device)
+def save_visualizations(
+    args: argparse.Namespace,
+    device: torch.device,
+    model: nn.Module,
+    metrics: dict[str, np.ndarray] | None,
+    cache_run_dir: Path | None,
+) -> None:
+    set_torch_seed(args.seed)
+    model = model.to(device)
     model.eval()
+
     n = int(max(16, args.viz_samples))
     with torch.no_grad():
         z = torch.randn(n, args.z_dim, device=device)
-        h, logdet = model(z)
+        if args.embedding_method == "pr_autoencoder":
+            h, z_hat = embed_latents(model=model, z=z)
+            aux = z_hat
+            aux_name = "z_hat"
+        else:
+            h, logdet = model(z)
+            aux = logdet
+            aux_name = "logdet"
+
     z_np = z.detach().cpu().numpy()
     h_np = h.detach().cpu().numpy()
-    logdet_np = logdet.detach().cpu().numpy()
+    aux_np = aux.detach().cpu().numpy()
 
     out_dir = Path(args.viz_output_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -304,40 +466,81 @@ def save_visualizations(args: argparse.Namespace, device: torch.device) -> None:
     ax10.set_ylabel("PC2")
     ax10.set_title("PCA of h")
 
-    ax11.hist(logdet_np, bins=60, color="#54a24b", alpha=0.85)
-    ax11.set_xlabel("logdet")
-    ax11.set_ylabel("count")
-    ax11.set_title("Flow logdet distribution")
+    if args.embedding_method == "pr_autoencoder":
+        recon_err = np.mean((aux_np - z_np) ** 2, axis=1)
+        ax11.hist(recon_err, bins=60, color="#54a24b", alpha=0.85)
+        ax11.set_xlabel("per-sample recon MSE")
+        ax11.set_ylabel("count")
+        ax11.set_title("Reconstruction error distribution")
+    else:
+        ax11.hist(aux_np, bins=60, color="#54a24b", alpha=0.85)
+        ax11.set_xlabel("logdet")
+        ax11.set_ylabel("count")
+        ax11.set_title("Flow logdet distribution")
 
     fig.tight_layout()
-    panel_png = out_dir / "realnvp_synth_overview.png"
-    panel_svg = out_dir / "realnvp_synth_overview.svg"
+    prefix = "pr_autoencoder" if args.embedding_method == "pr_autoencoder" else "realnvp_synth"
+    panel_png = out_dir / f"{prefix}_overview.png"
+    panel_svg = out_dir / f"{prefix}_overview.svg"
     fig.savefig(panel_png, dpi=180, bbox_inches="tight")
     fig.savefig(panel_svg, bbox_inches="tight")
     plt.close(fig)
 
-    sample_npz = out_dir / "realnvp_synth_samples.npz"
-    np.savez_compressed(
-        sample_npz,
-        z=z_np.astype(np.float64, copy=False),
-        h=h_np.astype(np.float64, copy=False),
-        logdet=logdet_np.astype(np.float64, copy=False),
-        seed=np.asarray([args.seed], dtype=np.int64),
-        z_dim=np.asarray([args.z_dim], dtype=np.int64),
-        h_dim=np.asarray([args.h_dim], dtype=np.int64),
-        n_samples=np.asarray([n], dtype=np.int64),
-    )
+    if args.embedding_method == "pr_autoencoder" and metrics is not None:
+        fig2, axes = plt.subplots(1, 3, figsize=(15, 4.2))
+        epochs = np.arange(1, metrics["loss"].shape[0] + 1)
+        axes[0].plot(epochs, metrics["loss"], color="#4c78a8")
+        axes[0].set_title("Total loss")
+        axes[0].set_xlabel("epoch")
+        axes[1].plot(epochs, metrics["recon"], color="#f58518")
+        axes[1].set_title("Reconstruction MSE")
+        axes[1].set_xlabel("epoch")
+        axes[2].plot(epochs, metrics["pr"], color="#54a24b")
+        axes[2].set_title("Participation ratio")
+        axes[2].set_xlabel("epoch")
+        fig2.tight_layout()
+        curves_png = out_dir / "pr_autoencoder_training_curves.png"
+        curves_svg = out_dir / "pr_autoencoder_training_curves.svg"
+        fig2.savefig(curves_png, dpi=180, bbox_inches="tight")
+        fig2.savefig(curves_svg, bbox_inches="tight")
+        plt.close(fig2)
+        print(f"[viz] Saved: {curves_png}")
+        print(f"[viz] Saved: {curves_svg}")
+
+    sample_npz = out_dir / f"{prefix}_samples.npz"
+    save_kwargs = {
+        "z": z_np.astype(np.float64, copy=False),
+        "h": h_np.astype(np.float64, copy=False),
+        aux_name: aux_np.astype(np.float64, copy=False),
+        "seed": np.asarray([args.seed], dtype=np.int64),
+        "z_dim": np.asarray([args.z_dim], dtype=np.int64),
+        "h_dim": np.asarray([args.h_dim], dtype=np.int64),
+        "n_samples": np.asarray([n], dtype=np.int64),
+    }
+    if metrics is not None:
+        save_kwargs["train_loss"] = metrics["loss"]
+        save_kwargs["train_recon"] = metrics["recon"]
+        save_kwargs["train_pr"] = metrics["pr"]
+    np.savez_compressed(sample_npz, **save_kwargs)
+
     print(f"[viz] Saved: {panel_png}")
     print(f"[viz] Saved: {panel_svg}")
     print(f"[viz] Saved: {sample_npz}")
+    if cache_run_dir is not None:
+        print(f"[cache] artifacts: {cache_run_dir}")
 
 
 def main() -> None:
     args = parse_args()
     device = ensure_device(args.device)
-    code = run_checks(args, device)
-    if code == 0 and bool(args.save_viz):
-        save_visualizations(args, device)
+
+    if args.embedding_method == "pr_autoencoder":
+        code, model, metrics, cache_run_dir = run_checks_pr(args, device)
+    else:
+        code, model, metrics, cache_run_dir = run_checks_realnvp(args, device)
+
+    if code == 0 and bool(args.save_viz) and model is not None:
+        save_visualizations(args, device, model=model, metrics=metrics, cache_run_dir=cache_run_dir)
     sys.exit(code)
 
 

@@ -19,6 +19,7 @@ from fisher.data import (
     _tuning_centers_uniform_theta,
 )
 from fisher.dataset_family_recipes import assert_no_legacy_dataset_cli_flags
+from fisher.pr_autoencoder_embedding import build_randamp_gaussian_sqrtd_pr_autoencoder_dataset
 from fisher.realnvp_embedding import build_randamp_gaussian_sqrtd_realnvp_dataset
 from fisher.shared_dataset_io import load_shared_dataset_npz, meta_dict_from_args, save_shared_dataset_npz
 from fisher.shared_fisher_est import build_dataset_from_args, build_dataset_from_meta, validate_dataset_sample_args
@@ -192,6 +193,42 @@ class TestGaussianTuningCurve(unittest.TestCase):
         self.assertIsInstance(ds, ToyConditionalGaussianRandampSqrtdDataset)
         self.assertEqual(int(ds.x_dim), 2)
 
+    def test_build_gaussian_randamp_sqrtd_pr_autoencoder_meta_dataset_is_base_sqrtd(self) -> None:
+        ns = _ns(
+            dataset_family="randamp_gaussian_sqrtd_pr_autoencoder",
+            x_dim=10,
+            n_total=32,
+            train_frac=1.0,
+            seed=1,
+        )
+        validate_dataset_sample_args(ns)
+        ds = build_dataset_from_args(ns)
+        self.assertIsInstance(ds, ToyConditionalGaussianRandampSqrtdDataset)
+        self.assertEqual(int(ds.x_dim), 2)
+
+    def test_pr_autoencoder_embedding_shape_and_seed_reproducibility(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ns = _ns(
+                dataset_family="randamp_gaussian_sqrtd_pr_autoencoder",
+                x_dim=12,
+                n_total=48,
+                train_frac=1.0,
+                seed=9,
+            )
+            ns.device = "cpu"
+            ns.pr_autoencoder_train_samples = 512
+            ns.pr_autoencoder_train_epochs = 6
+            ns.pr_autoencoder_train_batch_size = 128
+            ns.pr_autoencoder_cache_dir = tmp
+            validate_dataset_sample_args(ns)
+            out1 = build_randamp_gaussian_sqrtd_pr_autoencoder_dataset(ns)
+            out2 = build_randamp_gaussian_sqrtd_pr_autoencoder_dataset(ns)
+            self.assertEqual(out1.theta_all.shape, (48, 1))
+            self.assertEqual(out1.x_embed_all.shape, (48, 12))
+            self.assertTrue(np.isfinite(out1.x_embed_all).all())
+            np.testing.assert_allclose(out1.theta_all, out2.theta_all, rtol=0, atol=0)
+            np.testing.assert_allclose(out1.x_embed_all, out2.x_embed_all, rtol=0, atol=0)
+
     @unittest.skipUnless(_HAS_GLASFLOW, "glasflow is required for RealNVP embedding test.")
     def test_realnvp_embedding_shape_and_seed_reproducibility(self) -> None:
         ns = _ns(
@@ -227,6 +264,34 @@ class TestGaussianTuningCurve(unittest.TestCase):
         meta["realnvp_hidden_width"] = 128
         meta["realnvp_seed"] = int(ns.seed)
         meta["realnvp_batch_norm_between_transforms"] = True
+        meta["randamp_mu_amp_per_dim"] = ds0._randamp_amp.tolist()
+        ds = build_dataset_from_meta(meta)
+        self.assertIsInstance(ds, ToyConditionalGaussianRandampSqrtdDataset)
+        self.assertEqual(int(ds.x_dim), 2)
+
+    def test_meta_roundtrip_gaussian_randamp_sqrtd_pr_autoencoder_uses_zdim(self) -> None:
+        ns = _ns(
+            dataset_family="randamp_gaussian_sqrtd_pr_autoencoder",
+            x_dim=16,
+            n_total=10,
+            train_frac=1.0,
+            seed=11,
+        )
+        validate_dataset_sample_args(ns)
+        ds0 = build_dataset_from_args(ns)
+        meta = meta_dict_from_args(ns)
+        meta["pr_autoencoder_enabled"] = True
+        meta["pr_autoencoder_z_dim"] = 2
+        meta["pr_autoencoder_hidden1"] = 100
+        meta["pr_autoencoder_hidden2"] = 200
+        meta["pr_autoencoder_train_samples"] = 12000
+        meta["pr_autoencoder_train_epochs"] = 200
+        meta["pr_autoencoder_train_batch_size"] = 512
+        meta["pr_autoencoder_train_lr"] = 1e-3
+        meta["pr_autoencoder_lambda_pr"] = 1e-2
+        meta["pr_autoencoder_pr_eps"] = 1e-8
+        meta["pr_autoencoder_seed"] = int(ns.seed)
+        meta["pr_autoencoder_cache_key"] = "pr_ae_dummy"
         meta["randamp_mu_amp_per_dim"] = ds0._randamp_amp.tolist()
         ds = build_dataset_from_meta(meta)
         self.assertIsInstance(ds, ToyConditionalGaussianRandampSqrtdDataset)
