@@ -1,4 +1,6 @@
-\section{PR-regularized autoencoder for low-to-high embedding}
+\section{Flow matching is able to discover latent Hellinger RDM}
+
+\subsection{Embedding low-dimensional latent to high-dimensional embedding}
 
 Many experiments require observations $x \in \mathbb{R}^{d}$ while a simple generative model lives in a low-dimensional latent space $\mathbb{R}^{m}$ with $m \ll d$. To generate such kind of dataset, we use \emph{participation-ratio} (PR) regularized autoencoder to project low-dimensional dataset into high-dimensional dataset.
 
@@ -28,30 +30,16 @@ The training loss combines reconstruction and encouraging high participation,
 \end{equation}
 with $\lambda \ge 0$ trading fidelity to $z$ against spreading mass in the embedding space.
 
-\subsection{Path-integral $\theta$-flow $H$-matrix agreement after PR embedding}
+\subsection{Flow matching is able to discover latent Hellinger RDM}
 
-After lifting low-dimensional observations into $\mathbb{R}^{d}$ with the PR-regularized autoencoder, we still wish to compare a \emph{learned} pairwise information matrix to a \emph{generative} reference.
-We summarize two regimes: embeddings from $m=2$ to $d=50$, and from $m=10$ to $d=100$.
-In each case the conditional law of $x$ given $\theta$ follows the same random-amplitude Gaussian tuning family with observation noise scaled like $\sqrt{d}$ in the embedded space, so difficulty grows with~$d$.
-
-For nested training subsets of size $n$ drawn from a larger reference pool, we train posterior and prior $\theta$-space flow models and build the symmetric matrix $H^{\mathrm{sym}}$ using the \emph{path-integral} construction (velocity-to-score along $\theta$ with trapezoidal integration), then bin to match the generative Monte Carlo estimate of (squared) Hellinger affinity between bin-conditional laws.
-We report the Pearson correlation between off-diagonal entries of the binned matrix and the corresponding square-root generative panel (top row of the convergence plots; panels annotate $\sqrt{H^{2}}$ vs.\ the learned summary).
-Separately, we fit pairwise linear classifiers between bins in observation space and compare their accuracy matrix to the one obtained at the reference sample size (bottom row).
-
-Figure~\ref{fig:pr-embed-theta-path-integral-h-decoding} collects the latent and embedded geometry (PCA views and tuning curves) together with these convergence panels.
-In both the $2\!\to\!50$ and $10\!\to\!100$ settings, the $H$-matrix track stays close to the generative ground truth even at $n=80$: the blue correlation curve is already large and quickly plateaus near one.
-The pairwise-decoding track (red) is noisier at small~$n$, as expected when separating high-dimensional clouds with limited data; it improves markedly by $n=400$--$600$ and aligns with the $H$-matrix curve in the larger-$n$ regime.
-The transient dip in decoding correlation at $n=200$ in the $10\!\to\!100$ experiment is consistent with finite-sample variability of nested subsets and does not contradict strong agreement of the path-integral $H$ summary with the generative reference.
-Overall, path-integral $\theta$-flow estimation of the binned $H$ structure remains a stable, sample-efficient summary after PR embedding, while raw decoding metrics require more data to match the same reference.
+We constructed two datasets. The latent datasets were constructed same as the previous notes, using gaussian tuning with random amplitude, and acitivty-modulated noise. We constructed 2D and 10D datasets, and embedded into higher dimensional space using PR-regularized autoencoder. We then used flow matching to estimate the Hellinger RDM, and found it is able to discover the latent Hellinger RDM.
 
 \FloatBarrier
 \begin{figure}[!htbp]
   \centering
   \includegraphics[width=\linewidth]{notes/figures/2026-04-20-pr-regularized-autoencoder/pr_embedding_theta_flow_h_decoding.png}
   \caption{%
-    PR embedding of low-dimensional generative data into higher $d$, followed by path-integral $\theta$-flow $H$-matrix and pairwise-decoding convergence versus sample size~$n$.
-    \emph{Top:} $m=2$ latent coordinates, tuning curves, PCA of embedded $x\in\mathbb{R}^{50}$, and binned $\sqrt{H^{2}}$ / decoding matrices for $n\in\{80,200,400,600\}$ with a large-$n_{\mathrm{ref}}$ approximate ground-truth column; right: off-diagonal Pearson $r$ vs~$n$ for the $H$ track (blue) and decoding track (red).
-    \emph{Bottom:} the same layout for $m=10$ and embedded $x\in\mathbb{R}^{100}$.
-    The path-integral $H$ correlation stays high even at small~$n$; decoding correlation catches up as $n$ grows.}
+  (A) 2D latent dataset. (B) Embedding to 50D using PR-regularized autoencoder, then visualized using PCA. (C) Flow matching is able to discover the latent Hellinger RDM. Where the GT was estiamted based on the latent dataset only. (D, E, F) Same as A, B, C, but from 10D latent to 100D embedded space.
+    }
   \label{fig:pr-embed-theta-path-integral-h-decoding}
 \end{figure}
