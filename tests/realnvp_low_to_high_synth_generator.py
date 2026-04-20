@@ -9,11 +9,17 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 from typing import Callable, List, Tuple
 
+import matplotlib
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+matplotlib.use("Agg")
 
 try:
     from glasflow import RealNVP
@@ -39,6 +45,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cuda")
     p.add_argument("--positive-output", action="store_true")
+    p.add_argument("--save-viz", action="store_true", help="Save synthetic data visualizations.")
+    p.add_argument("--viz-samples", type=int, default=2000, help="Number of synthetic samples for visualization.")
+    p.add_argument(
+        "--viz-output-dir",
+        type=str,
+        default="data/realnvp_low_to_high_synth_viz",
+        help="Directory for visualization artifacts when --save-viz is set.",
+    )
     return p.parse_args()
 
 
@@ -228,10 +242,102 @@ def run_checks(args: argparse.Namespace, device: torch.device) -> int:
     return 0
 
 
+def _pca_project_2d(x: np.ndarray) -> np.ndarray:
+    x0 = x - x.mean(axis=0, keepdims=True)
+    _, _, vh = np.linalg.svd(x0, full_matrices=False)
+    basis = vh[:2].T
+    return x0 @ basis
+
+
+def save_visualizations(args: argparse.Namespace, device: torch.device) -> None:
+    set_seed(args.seed)
+    model = LowToHighRealNVPGenerator(
+        z_dim=args.z_dim,
+        h_dim=args.h_dim,
+        n_transforms=args.n_transforms,
+        hidden_width=args.hidden_width,
+        positive_output=args.positive_output,
+    ).to(device)
+    model.eval()
+    n = int(max(16, args.viz_samples))
+    with torch.no_grad():
+        z = torch.randn(n, args.z_dim, device=device)
+        h, logdet = model(z)
+    z_np = z.detach().cpu().numpy()
+    h_np = h.detach().cpu().numpy()
+    logdet_np = logdet.detach().cpu().numpy()
+
+    out_dir = Path(args.viz_output_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    fig, axs = plt.subplots(2, 2, figsize=(12, 9))
+    ax00, ax01, ax10, ax11 = axs.ravel()
+
+    if args.z_dim >= 2:
+        sc = ax00.scatter(z_np[:, 0], z_np[:, 1], c=np.linalg.norm(z_np, axis=1), s=8, alpha=0.55, cmap="viridis")
+        fig.colorbar(sc, ax=ax00, label="||z||")
+        ax00.set_xlabel("z1")
+        ax00.set_ylabel("z2")
+        ax00.set_title("Latent z (first 2 dims)")
+    else:
+        ax00.hist(z_np[:, 0], bins=60, color="#4c78a8", alpha=0.85)
+        ax00.set_xlabel("z1")
+        ax00.set_ylabel("count")
+        ax00.set_title("Latent z histogram")
+
+    if args.h_dim >= 2:
+        sc_h = ax01.scatter(h_np[:, 0], h_np[:, 1], c=z_np[:, 0], s=8, alpha=0.55, cmap="plasma")
+        fig.colorbar(sc_h, ax=ax01, label="z1")
+        ax01.set_xlabel("h1")
+        ax01.set_ylabel("h2")
+        ax01.set_title("Embedded h (first 2 dims)")
+    else:
+        ax01.hist(h_np[:, 0], bins=60, color="#f58518", alpha=0.85)
+        ax01.set_xlabel("h1")
+        ax01.set_ylabel("count")
+        ax01.set_title("Embedded h histogram")
+
+    pca = _pca_project_2d(h_np) if args.h_dim >= 2 else np.concatenate([h_np, np.zeros_like(h_np)], axis=1)
+    sc_pca = ax10.scatter(pca[:, 0], pca[:, 1], c=np.linalg.norm(h_np, axis=1), s=8, alpha=0.55, cmap="viridis")
+    fig.colorbar(sc_pca, ax=ax10, label="||h||")
+    ax10.set_xlabel("PC1")
+    ax10.set_ylabel("PC2")
+    ax10.set_title("PCA of h")
+
+    ax11.hist(logdet_np, bins=60, color="#54a24b", alpha=0.85)
+    ax11.set_xlabel("logdet")
+    ax11.set_ylabel("count")
+    ax11.set_title("Flow logdet distribution")
+
+    fig.tight_layout()
+    panel_png = out_dir / "realnvp_synth_overview.png"
+    panel_svg = out_dir / "realnvp_synth_overview.svg"
+    fig.savefig(panel_png, dpi=180, bbox_inches="tight")
+    fig.savefig(panel_svg, bbox_inches="tight")
+    plt.close(fig)
+
+    sample_npz = out_dir / "realnvp_synth_samples.npz"
+    np.savez_compressed(
+        sample_npz,
+        z=z_np.astype(np.float64, copy=False),
+        h=h_np.astype(np.float64, copy=False),
+        logdet=logdet_np.astype(np.float64, copy=False),
+        seed=np.asarray([args.seed], dtype=np.int64),
+        z_dim=np.asarray([args.z_dim], dtype=np.int64),
+        h_dim=np.asarray([args.h_dim], dtype=np.int64),
+        n_samples=np.asarray([n], dtype=np.int64),
+    )
+    print(f"[viz] Saved: {panel_png}")
+    print(f"[viz] Saved: {panel_svg}")
+    print(f"[viz] Saved: {sample_npz}")
+
+
 def main() -> None:
     args = parse_args()
     device = ensure_device(args.device)
     code = run_checks(args, device)
+    if code == 0 and bool(args.save_viz):
+        save_visualizations(args, device)
     sys.exit(code)
 
 

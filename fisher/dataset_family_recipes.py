@@ -152,6 +152,8 @@ def family_recipe_dict(family: str) -> dict[str, Any]:
         return {**base, "sigma_x1": 0.30, "sigma_x2": 0.30}
     if fam == "randamp_gaussian_sqrtd":
         return {**base, "sigma_x1": 0.20, "sigma_x2": 0.20}
+    if fam == "randamp_gaussian_sqrtd_realnvp":
+        return {**base, "sigma_x1": 0.20, "sigma_x2": 0.20}
     if fam == "cosine_gmm":
         return {**base, "sigma_x1": 0.30, "sigma_x2": 0.30}
     if fam == "cos_sin_piecewise":
@@ -209,10 +211,14 @@ def format_resolved_family_summary(ns: Any) -> str:
         f"  tuning_curve_family={r['tuning_curve_family']!r}",
         f"  observation noise: sigma_x1={sx1}, sigma_x2={sx2}, rho={r['rho']}  (obs_noise_scale={scale})",
     ]
-    if fam in ("randamp_gaussian", "randamp_gaussian_sqrtd"):
+    if fam in ("randamp_gaussian", "randamp_gaussian_sqrtd", "randamp_gaussian_sqrtd_realnvp"):
         lines.append(
             f"  randamp bumps: low={r['randamp_mu_low']}, high={r['randamp_mu_high']}, "
             f"kappa={r['randamp_kappa']}, omega={r['randamp_omega']}"
+        )
+    if fam == "randamp_gaussian_sqrtd_realnvp":
+        lines.append(
+            "  realnvp embedding: fixed untrained map with z_dim=2, n_transforms=6, hidden_width=128"
         )
     if fam == "cosine_gaussian_sqrtd_rand_tune":
         lines.append(

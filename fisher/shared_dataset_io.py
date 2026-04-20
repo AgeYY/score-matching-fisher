@@ -100,6 +100,14 @@ def meta_dict_from_args(ns: Any) -> dict[str, Any]:
         out["cosine_tune_amp_per_dim"] = np.asarray(_cta, dtype=np.float64).reshape(-1).tolist()
     else:
         out["cosine_tune_amp_per_dim"] = None
+    out["realnvp_enabled"] = bool(getattr(ns, "realnvp_enabled", False))
+    out["realnvp_z_dim"] = int(getattr(ns, "realnvp_z_dim", 2))
+    out["realnvp_n_transforms"] = int(getattr(ns, "realnvp_n_transforms", 6))
+    out["realnvp_hidden_width"] = int(getattr(ns, "realnvp_hidden_width", 128))
+    out["realnvp_seed"] = int(getattr(ns, "realnvp_seed", int(ns.seed)))
+    out["realnvp_batch_norm_between_transforms"] = bool(
+        getattr(ns, "realnvp_batch_norm_between_transforms", True)
+    )
     return out
 
 

@@ -36,6 +36,7 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
             "cosine_gaussian_sqrtd_rand_tune",
             "randamp_gaussian",
             "randamp_gaussian_sqrtd",
+            "randamp_gaussian_sqrtd_realnvp",
             "cosine_gmm",
             "cos_sin_piecewise",
             "linear_piecewise",
@@ -49,6 +50,8 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
             "amplitudes drawn once from Uniform(0.5, 1.5)); "
             "'randamp_gaussian' (random-amplitude Gaussian bumps + Gaussian obs. noise); "
             "'randamp_gaussian_sqrtd' (same as randamp_gaussian with sqrt(x_dim) noise scaling); "
+            "'randamp_gaussian_sqrtd_realnvp' (sample base randamp_gaussian_sqrtd in z_dim=2 then map "
+            "to x_dim with a fixed untrained RealNVP embedding); "
             "'cosine_gmm' (theta-dependent 2-component mixture); "
             "'cos_sin_piecewise' (cos/sin means + piecewise obs. std vs theta sign); "
             "'linear_piecewise' (linear means + piecewise obs. std vs theta)."

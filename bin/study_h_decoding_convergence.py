@@ -124,6 +124,7 @@ def build_parser() -> argparse.ArgumentParser:
             "cosine_gaussian_sqrtd_rand_tune",
             "randamp_gaussian",
             "randamp_gaussian_sqrtd",
+            "randamp_gaussian_sqrtd_realnvp",
             "cosine_gmm",
             "cos_sin_piecewise",
             "linear_piecewise",

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import tempfile
 import unittest
+import importlib.util
 from pathlib import Path
 
 import numpy as np
@@ -18,8 +19,11 @@ from fisher.data import (
     _tuning_centers_uniform_theta,
 )
 from fisher.dataset_family_recipes import assert_no_legacy_dataset_cli_flags
+from fisher.realnvp_embedding import build_randamp_gaussian_sqrtd_realnvp_dataset
 from fisher.shared_dataset_io import load_shared_dataset_npz, meta_dict_from_args, save_shared_dataset_npz
 from fisher.shared_fisher_est import build_dataset_from_args, build_dataset_from_meta, validate_dataset_sample_args
+
+_HAS_GLASFLOW = importlib.util.find_spec("glasflow") is not None
 
 
 def _ns(**overrides: object) -> argparse.Namespace:
@@ -174,6 +178,59 @@ class TestGaussianTuningCurve(unittest.TestCase):
         theta, x = ds.sample_joint(16)
         self.assertEqual(x.shape, (16, 4))
         self.assertTrue(np.isfinite(x).all())
+
+    def test_build_gaussian_randamp_sqrtd_realnvp_meta_dataset_is_base_sqrtd(self) -> None:
+        ns = _ns(
+            dataset_family="randamp_gaussian_sqrtd_realnvp",
+            x_dim=10,
+            n_total=32,
+            train_frac=1.0,
+            seed=1,
+        )
+        validate_dataset_sample_args(ns)
+        ds = build_dataset_from_args(ns)
+        self.assertIsInstance(ds, ToyConditionalGaussianRandampSqrtdDataset)
+        self.assertEqual(int(ds.x_dim), 2)
+
+    @unittest.skipUnless(_HAS_GLASFLOW, "glasflow is required for RealNVP embedding test.")
+    def test_realnvp_embedding_shape_and_seed_reproducibility(self) -> None:
+        ns = _ns(
+            dataset_family="randamp_gaussian_sqrtd_realnvp",
+            x_dim=12,
+            n_total=48,
+            train_frac=1.0,
+            seed=9,
+        )
+        validate_dataset_sample_args(ns)
+        out1 = build_randamp_gaussian_sqrtd_realnvp_dataset(ns)
+        out2 = build_randamp_gaussian_sqrtd_realnvp_dataset(ns)
+        self.assertEqual(out1.theta_all.shape, (48, 1))
+        self.assertEqual(out1.x_embed_all.shape, (48, 12))
+        self.assertTrue(np.isfinite(out1.x_embed_all).all())
+        np.testing.assert_allclose(out1.theta_all, out2.theta_all, rtol=0, atol=0)
+        np.testing.assert_allclose(out1.x_embed_all, out2.x_embed_all, rtol=0, atol=0)
+
+    def test_meta_roundtrip_gaussian_randamp_sqrtd_realnvp_uses_realnvp_zdim(self) -> None:
+        ns = _ns(
+            dataset_family="randamp_gaussian_sqrtd_realnvp",
+            x_dim=16,
+            n_total=10,
+            train_frac=1.0,
+            seed=11,
+        )
+        validate_dataset_sample_args(ns)
+        ds0 = build_dataset_from_args(ns)
+        meta = meta_dict_from_args(ns)
+        meta["realnvp_enabled"] = True
+        meta["realnvp_z_dim"] = 2
+        meta["realnvp_n_transforms"] = 6
+        meta["realnvp_hidden_width"] = 128
+        meta["realnvp_seed"] = int(ns.seed)
+        meta["realnvp_batch_norm_between_transforms"] = True
+        meta["randamp_mu_amp_per_dim"] = ds0._randamp_amp.tolist()
+        ds = build_dataset_from_meta(meta)
+        self.assertIsInstance(ds, ToyConditionalGaussianRandampSqrtdDataset)
+        self.assertEqual(int(ds.x_dim), 2)
 
     def test_meta_roundtrip_gaussian_randamp(self) -> None:
         ns = _ns(

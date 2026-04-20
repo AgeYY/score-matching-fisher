@@ -29,6 +29,7 @@ from fisher.dataset_family_recipes import (
     format_resolved_family_summary,
 )
 from fisher.dataset_visualization import plot_joint_and_tuning, summarize_dataset
+from fisher.realnvp_embedding import build_randamp_gaussian_sqrtd_realnvp_dataset
 from fisher.shared_dataset_io import meta_dict_from_args, save_shared_dataset_npz
 from fisher.shared_fisher_est import build_dataset_from_args, validate_dataset_sample_args
 
@@ -111,9 +112,15 @@ def main() -> None:
     rng = np.random.default_rng(args.seed)
     rng_dim1 = np.random.default_rng(int(args.seed) + 913_409)
 
-    dataset = build_dataset_from_args(args)
     n_total = int(args.n_total)
-    theta_all, x_all = dataset.sample_joint(n_total)
+    if str(args.dataset_family) == "randamp_gaussian_sqrtd_realnvp":
+        built = build_randamp_gaussian_sqrtd_realnvp_dataset(args)
+        dataset = built.base_dataset
+        theta_all = built.theta_all
+        x_all = built.x_embed_all
+    else:
+        dataset = build_dataset_from_args(args)
+        theta_all, x_all = dataset.sample_joint(n_total)
     perm = rng.permutation(n_total)
     tf = float(args.train_frac)
     if tf >= 1.0:
@@ -128,8 +135,21 @@ def main() -> None:
     theta_validation, x_validation = theta_all[ev_idx], x_all[ev_idx]
 
     meta = meta_dict_from_args(args)
-    if str(args.dataset_family) in ("randamp_gaussian", "randamp_gaussian_sqrtd"):
+    if str(args.dataset_family) in (
+        "randamp_gaussian",
+        "randamp_gaussian_sqrtd",
+        "randamp_gaussian_sqrtd_realnvp",
+    ):
         meta["randamp_mu_amp_per_dim"] = dataset._randamp_amp.tolist()
+    if str(args.dataset_family) == "randamp_gaussian_sqrtd_realnvp":
+        meta["realnvp_enabled"] = True
+        meta["realnvp_z_dim"] = int(built.embedder_config.z_dim)
+        meta["realnvp_n_transforms"] = int(built.embedder_config.n_transforms)
+        meta["realnvp_hidden_width"] = int(built.embedder_config.hidden_width)
+        meta["realnvp_seed"] = int(args.seed)
+        meta["realnvp_batch_norm_between_transforms"] = bool(
+            built.embedder_config.batch_norm_between_transforms
+        )
     save_shared_dataset_npz(
         args.output_npz,
         meta=meta,
@@ -150,7 +170,13 @@ def main() -> None:
 
     out_dir = Path(args.output_npz).resolve().parent
     joint_tuning_path = out_dir / "joint_scatter_and_tuning_curve.png"
-    summarize_dataset(theta_all, x_all, dataset)
+    if str(args.dataset_family) == "randamp_gaussian_sqrtd_realnvp":
+        print(
+            "[data] Skipping summarize_dataset for randamp_gaussian_sqrtd_realnvp: "
+            "embedded x_dim differs from base tuning dimension."
+        )
+    else:
+        summarize_dataset(theta_all, x_all, dataset)
     plot_joint_and_tuning(theta_all, x_all, dataset, str(joint_tuning_path))
     print(f"Saved visualization: {joint_tuning_path}")
     print(f"Saved visualization: {joint_tuning_path.with_suffix('.svg')}")
