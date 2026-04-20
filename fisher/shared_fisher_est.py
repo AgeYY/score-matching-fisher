@@ -17,6 +17,7 @@ from global_setting import SCORE_VAL_FRACTION
 from fisher.data import (
     ToyConditionalGMMNonGaussianDataset,
     ToyConditionalGaussianDataset,
+    ToyConditionalGaussianCosineRandampSqrtdDataset,
     ToyConditionalGaussianRandampDataset,
     ToyConditionalGaussianRandampSqrtdDataset,
     ToyConditionalGaussianSqrtdDataset,
@@ -683,6 +684,7 @@ def build_dataset_from_meta(
 ) -> (
     ToyConditionalGaussianDataset
     | ToyConditionalGaussianSqrtdDataset
+    | ToyConditionalGaussianCosineRandampSqrtdDataset
     | ToyConditionalGaussianRandampDataset
     | ToyConditionalGaussianRandampSqrtdDataset
     | ToyCosSinPiecewiseNoiseDataset
@@ -744,6 +746,42 @@ def build_dataset_from_meta(
             cov_theta_phase2=float(meta["cov_theta_phase2"]),
             cov_theta_phase_rho=float(meta["cov_theta_phase_rho"]),
             rho_clip=float(meta["rho_clip"]),
+            seed=seed,
+        )
+    if family == "cosine_gaussian_sqrtd_rand_tune":
+        cta_raw = meta.get("cosine_tune_amp_per_dim")
+        cta: np.ndarray | None
+        if cta_raw is not None:
+            cta = np.asarray(cta_raw, dtype=np.float64).reshape(-1)
+        else:
+            cta = None
+        return ToyConditionalGaussianCosineRandampSqrtdDataset(
+            theta_low=float(meta["theta_low"]),
+            theta_high=float(meta["theta_high"]),
+            x_dim=int(meta["x_dim"]),
+            tuning_curve_family=str(meta.get("tuning_curve_family", "cosine")),
+            vm_mu_amp=float(meta.get("vm_mu_amp", 1.0)),
+            vm_kappa=float(meta.get("vm_kappa", 1.0)),
+            vm_omega=float(meta.get("vm_omega", 1.0)),
+            gauss_mu_amp=float(meta.get("gauss_mu_amp", 1.0)),
+            gauss_kappa=float(meta.get("gauss_kappa", 0.2)),
+            gauss_omega=float(meta.get("gauss_omega", 1.0)),
+            sigma_x1=float(meta["sigma_x1"]),
+            sigma_x2=float(meta["sigma_x2"]),
+            rho=float(meta["rho"]),
+            cov_theta_amp1=float(meta["cov_theta_amp1"]),
+            cov_theta_amp2=float(meta["cov_theta_amp2"]),
+            cov_theta_amp_rho=float(meta["cov_theta_amp_rho"]),
+            cov_theta_freq1=float(meta["cov_theta_freq1"]),
+            cov_theta_freq2=float(meta["cov_theta_freq2"]),
+            cov_theta_freq_rho=float(meta["cov_theta_freq_rho"]),
+            cov_theta_phase1=float(meta["cov_theta_phase1"]),
+            cov_theta_phase2=float(meta["cov_theta_phase2"]),
+            cov_theta_phase_rho=float(meta["cov_theta_phase_rho"]),
+            rho_clip=float(meta["rho_clip"]),
+            cosine_tune_amp_low=float(meta.get("cosine_tune_amp_low", 0.5)),
+            cosine_tune_amp_high=float(meta.get("cosine_tune_amp_high", 1.5)),
+            cosine_tune_amp_per_dim=cta,
             seed=seed,
         )
     if family == "randamp_gaussian":
@@ -878,6 +916,7 @@ def build_dataset_from_args(
 ) -> (
     ToyConditionalGaussianDataset
     | ToyConditionalGaussianSqrtdDataset
+    | ToyConditionalGaussianCosineRandampSqrtdDataset
     | ToyConditionalGaussianRandampDataset
     | ToyConditionalGaussianRandampSqrtdDataset
     | ToyCosSinPiecewiseNoiseDataset
@@ -890,6 +929,9 @@ def build_dataset_from_args(
 def validate_dataset_sample_args(args: Any) -> None:
     """Validate generic dataset args; per-family tuning/noise is fixed via ``apply_family_recipe_to_namespace``."""
     apply_sigma_defaults_for_dataset_family(args)
+    _ons = float(getattr(args, "obs_noise_scale", 1.0))
+    if not math.isfinite(_ons) or _ons <= 0.0:
+        raise ValueError("--obs-noise-scale must be a finite positive number.")
     if args.x_dim < 1:
         raise ValueError("--x-dim must be >= 1.")
     if str(getattr(args, "dataset_family", "")) in (
@@ -1989,12 +2031,27 @@ def run_shared_fisher_estimation(
         theta_dim_flow = int(theta_score_fit.shape[1]) if theta_score_fit.ndim >= 2 else 1
         flow_score_arch = str(flow_arch).strip().lower()
         flow_prior_arch = str(flow_arch).strip().lower()
+        theta_onehot_state = bool(getattr(args, "theta_flow_onehot_state", False))
+        if theta_onehot_state:
+            if theta_field_method != "theta_flow":
+                raise ValueError("--theta-flow-onehot-state requires theta_field_method=theta_flow.")
+            if flow_score_arch != "mlp" or flow_prior_arch != "mlp":
+                raise ValueError(
+                    "--theta-flow-onehot-state currently supports flow_arch=mlp only "
+                    f"(got posterior={flow_score_arch!r}, prior={flow_prior_arch!r})."
+                )
+            if theta_dim_flow < 2:
+                raise ValueError(
+                    "--theta-flow-onehot-state expects theta dimension >= 2 after preprocessing; "
+                    f"got theta_dim={theta_dim_flow}."
+                )
+        theta_repr = f"one_hot[{theta_dim_flow}]" if theta_onehot_state else ("scalar" if theta_dim_flow == 1 else f"vector[{theta_dim_flow}]")
         print(
             f"[{theta_field_method}] "
             f"fit={theta_score_fit.shape[0]} val={theta_score_val.shape[0]} "
             f"scheduler={getattr(args, 'flow_scheduler', 'cosine')} method={theta_field_method} "
             f"t_eval={flow_eval_t:.6f} "
-            f"theta_std={theta_std:.6f} theta_dim={theta_dim_flow}"
+            f"theta_std={theta_std:.6f} theta_dim={theta_dim_flow} theta_repr={theta_repr}"
         )
         _xf_post = ""
         if flow_score_arch == "film_fourier":
@@ -2061,6 +2118,7 @@ def run_shared_fisher_estimation(
                 hidden_dim=int(getattr(args, "flow_hidden_dim", 128)),
                 depth=int(getattr(args, "flow_depth", 3)),
                 use_logit_time=True,
+                theta_dim=theta_dim_flow,
             ).to(device)
         elif flow_score_arch == "film_fourier":
             _om_eff, _ = effective_flow_theta_fourier_omega_post(args)
@@ -2163,6 +2221,7 @@ def run_shared_fisher_estimation(
                 hidden_dim=int(getattr(args, "prior_hidden_dim", 128)),
                 depth=int(getattr(args, "prior_depth", 3)),
                 use_logit_time=True,
+                theta_dim=theta_dim_flow,
             ).to(device)
         elif flow_prior_arch == "film_fourier":
             _om_eff_p, _ = effective_flow_theta_fourier_omega_prior(args)
@@ -2887,6 +2946,7 @@ def run_shared_fisher_estimation(
     if args.dataset_family in (
         "cosine_gaussian",
         "cosine_gaussian_sqrtd",
+        "cosine_gaussian_sqrtd_rand_tune",
         "randamp_gaussian",
         "randamp_gaussian_sqrtd",
         "cos_sin_piecewise",
@@ -3278,6 +3338,7 @@ def run_shared_fisher_estimation(
         if args.dataset_family in (
             "cosine_gaussian",
             "cosine_gaussian_sqrtd",
+            "cosine_gaussian_sqrtd_rand_tune",
             "randamp_gaussian",
             "randamp_gaussian_sqrtd",
         ):

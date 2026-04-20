@@ -32,6 +32,7 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
         choices=[
             "cosine_gaussian",
             "cosine_gaussian_sqrtd",
+            "cosine_gaussian_sqrtd_rand_tune",
             "randamp_gaussian",
             "randamp_gaussian_sqrtd",
             "cosine_gmm",
@@ -42,6 +43,8 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
             "Generative family (selects fixed tuning + noise internally). Options: "
             "'cosine_gaussian' (theta-modulated Gaussian obs. noise, cosine means); "
             "'cosine_gaussian_sqrtd' (same means; obs. noise std scales by sqrt(x_dim)); "
+            "'cosine_gaussian_sqrtd_rand_tune' (like cosine_gaussian_sqrtd but per-dim cosine "
+            "amplitudes drawn once from Uniform(0.5, 1.5)); "
             "'randamp_gaussian' (random-amplitude Gaussian bumps + Gaussian obs. noise); "
             "'randamp_gaussian_sqrtd' (same as randamp_gaussian with sqrt(x_dim) noise scaling); "
             "'cosine_gmm' (theta-dependent 2-component mixture); "
@@ -81,6 +84,15 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
             "Fraction of n_total in train_idx; remainder is validation_idx. "
             "Use a value in (0, 1) so score training, H-matrix evaluation, and pairwise CLF "
             "(train-fit / val-eval) share the same split. 1.0 leaves validation empty (not supported for shared Fisher)."
+        ),
+    )
+    p.add_argument(
+        "--obs-noise-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Multiplies the family-fixed baseline observation-noise scales sigma_x1 and sigma_x2 "
+            "after applying --dataset-family (default 1.0). Example: 0.5 halves Gaussian observation noise."
         ),
     )
 

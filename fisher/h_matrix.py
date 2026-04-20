@@ -259,14 +259,41 @@ class HMatrixEstimator:
         return self.model_post(x, theta_cond, self._time_to_batch_column(t, x))
 
     @staticmethod
+    def _theta_as_matrix(theta: np.ndarray) -> np.ndarray:
+        th = np.asarray(theta, dtype=np.float64)
+        if th.ndim == 1:
+            return th.reshape(-1, 1)
+        if th.ndim != 2:
+            raise ValueError("theta must be 1D or 2D.")
+        return th
+
+    @staticmethod
+    def _theta_is_one_hot(theta_mat: np.ndarray, *, atol: float = 1e-6) -> bool:
+        th = np.asarray(theta_mat, dtype=np.float64)
+        if th.ndim != 2 or th.shape[1] < 2:
+            return False
+        row_sum_ok = np.allclose(np.sum(th, axis=1), 1.0, atol=atol, rtol=0.0)
+        in_range = bool(np.all(th >= -atol) and np.all(th <= 1.0 + atol))
+        near_binary = bool(np.all((np.abs(th) <= atol) | (np.abs(th - 1.0) <= atol)))
+        return bool(row_sum_ok and in_range and near_binary)
+
+    @staticmethod
     def sort_by_theta(theta: np.ndarray, x: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        theta_col = np.asarray(theta, dtype=np.float64).reshape(-1, 1)
+        theta_col = HMatrixEstimator._theta_as_matrix(theta)
         x2 = np.asarray(x, dtype=np.float64)
         if x2.ndim != 2:
             raise ValueError("x must be a 2D array.")
         if theta_col.shape[0] != x2.shape[0]:
             raise ValueError("theta and x must have the same number of rows.")
-        perm = np.argsort(theta_col.reshape(-1), kind="mergesort")
+        if theta_col.shape[1] == 1:
+            perm = np.argsort(theta_col[:, 0], kind="mergesort")
+        elif HMatrixEstimator._theta_is_one_hot(theta_col):
+            # One-hot states: deterministic order by active bin index.
+            perm = np.argsort(np.argmax(theta_col, axis=1), kind="mergesort")
+        else:
+            # General multidim theta: lexicographic column order.
+            keys = [theta_col[:, j] for j in range(theta_col.shape[1] - 1, -1, -1)]
+            perm = np.lexsort(keys)
         inv_perm = np.empty_like(perm)
         inv_perm[perm] = np.arange(perm.size, dtype=perm.dtype)
         theta_sorted = theta_col[perm]
@@ -274,11 +301,14 @@ class HMatrixEstimator:
         return theta_sorted, x_sorted, perm, inv_perm
 
     def compute_g_matrix(self, theta_sorted: np.ndarray, x_sorted: np.ndarray) -> np.ndarray:
-        n = int(theta_sorted.shape[0])
+        theta_grid_col = self._theta_as_matrix(theta_sorted)
+        if theta_grid_col.shape[1] != 1:
+            raise ValueError("compute_g_matrix requires scalar theta (shape (N,1)).")
+        n = int(theta_grid_col.shape[0])
         if n < 1:
             raise ValueError("Need at least one sample to compute H-matrix.")
         row_block = max(1, int(self.pair_batch_size // n))
-        theta_grid_col = np.asarray(theta_sorted, dtype=np.float32).reshape(n, 1)
+        theta_grid_col = np.asarray(theta_grid_col, dtype=np.float32)
         g = np.zeros((n, n), dtype=np.float64)
         self.model_post.eval()
         if self.model_prior is not None:
@@ -328,11 +358,12 @@ class HMatrixEstimator:
 
         r[i,j] = log p(theta_j | x_i) - log p(theta_j).
         """
-        n = int(theta_sorted.shape[0])
+        theta_grid_col = self._theta_as_matrix(theta_sorted)
+        n = int(theta_grid_col.shape[0])
         if n < 1:
             raise ValueError("Need at least one sample to compute H-matrix.")
         row_block = max(1, int(self.pair_batch_size // n))
-        theta_grid_col = np.asarray(theta_sorted, dtype=np.float32).reshape(n, 1)
+        theta_grid_col = np.asarray(theta_grid_col, dtype=np.float32)
         r = np.zeros((n, n), dtype=np.float64)
         self.model_post.eval()
         if self.model_prior is not None:
@@ -372,11 +403,14 @@ class HMatrixEstimator:
 
     def compute_x_conditional_loglik_matrix(self, theta_sorted: np.ndarray, x_sorted: np.ndarray) -> np.ndarray:
         """Estimate C_ij = log p(x_i | theta_j) via conditional x-flow ODE likelihood (one solver call per block)."""
-        n = int(theta_sorted.shape[0])
+        theta_grid_col = self._theta_as_matrix(theta_sorted)
+        if theta_grid_col.shape[1] != 1:
+            raise ValueError("compute_x_conditional_loglik_matrix requires scalar theta (shape (N,1)).")
+        n = int(theta_grid_col.shape[0])
         if n < 1:
             raise ValueError("Need at least one sample to compute H-matrix.")
         row_block = max(1, int(self.pair_batch_size // n))
-        theta_grid_col = np.asarray(theta_sorted, dtype=np.float32).reshape(n, 1)
+        theta_grid_col = np.asarray(theta_grid_col, dtype=np.float32)
         c = np.zeros((n, n), dtype=np.float64)
         self.model_post.eval()
         if self._flow_x_likelihood_solver is None:
@@ -405,11 +439,14 @@ class HMatrixEstimator:
 
     def compute_ctsm_delta_l_matrix(self, theta_sorted: np.ndarray, x_sorted: np.ndarray) -> np.ndarray:
         """Estimate direct DeltaL_ij = log p(x_i|theta_j) - log p(x_i|theta_i) via pair-conditioned CTSM-v."""
-        n = int(theta_sorted.shape[0])
+        theta_grid_col = self._theta_as_matrix(theta_sorted)
+        if theta_grid_col.shape[1] != 1:
+            raise ValueError("compute_ctsm_delta_l_matrix requires scalar theta (shape (N,1)).")
+        n = int(theta_grid_col.shape[0])
         if n < 1:
             raise ValueError("Need at least one sample to compute H-matrix.")
         row_block = max(1, int(self.pair_batch_size // n))
-        theta_grid_col = np.asarray(theta_sorted, dtype=np.float32).reshape(n, 1)
+        theta_grid_col = np.asarray(theta_grid_col, dtype=np.float32)
         delta_l = np.zeros((n, n), dtype=np.float64)
         self.model_post.eval()
         with torch.no_grad():
@@ -439,7 +476,10 @@ class HMatrixEstimator:
 
     @staticmethod
     def compute_c_matrix(theta_sorted: np.ndarray, g_matrix: np.ndarray) -> np.ndarray:
-        theta_flat = np.asarray(theta_sorted, dtype=np.float64).reshape(-1)
+        theta_arr = np.asarray(theta_sorted, dtype=np.float64)
+        if theta_arr.ndim == 2 and theta_arr.shape[1] != 1:
+            raise ValueError("compute_c_matrix requires scalar theta (shape (N,1)).")
+        theta_flat = theta_arr.reshape(-1)
         if g_matrix.ndim != 2 or g_matrix.shape[0] != theta_flat.size or g_matrix.shape[1] != theta_flat.size:
             raise ValueError("g_matrix must have shape (N, N) matching theta_sorted.")
         dtheta = np.diff(theta_flat).reshape(1, -1)
@@ -473,9 +513,9 @@ class HMatrixEstimator:
         return mat_sorted[np.ix_(inv_perm, inv_perm)]
 
     def run(self, theta: np.ndarray, x: np.ndarray, *, restore_original_order: bool = False) -> HMatrixResult:
-        theta_col = np.asarray(theta, dtype=np.float64).reshape(-1, 1)
+        theta_col = self._theta_as_matrix(theta)
         theta_sorted, x_sorted, perm, inv_perm = self.sort_by_theta(theta_col, x)
-        if np.any(np.diff(theta_sorted.reshape(-1)) < 0.0):
+        if theta_sorted.shape[1] == 1 and np.any(np.diff(theta_sorted[:, 0]) < 0.0):
             raise ValueError("sort_by_theta produced a non-monotone theta sequence.")
 
         if self.field_method == "theta_flow":
@@ -501,7 +541,7 @@ class HMatrixEstimator:
         h_sym_max_asym_abs = float(np.max(np.abs(h_sym_sorted - h_sym_sorted.T)))
 
         if restore_original_order:
-            theta_used = theta_col.reshape(-1)
+            theta_used = theta_col.reshape(-1) if theta_col.shape[1] == 1 else theta_col.copy()
             g_used = self._permute_back(g_sorted, inv_perm)
             c_used = self._permute_back(c_sorted, inv_perm)
             delta_used = self._permute_back(delta_sorted, inv_perm)
@@ -509,7 +549,7 @@ class HMatrixEstimator:
             h_sym_used = self._permute_back(h_sym_sorted, inv_perm)
             order_mode = "original"
         else:
-            theta_used = theta_sorted.reshape(-1)
+            theta_used = theta_sorted.reshape(-1) if theta_sorted.shape[1] == 1 else theta_sorted.copy()
             g_used = g_sorted
             c_used = c_sorted
             delta_used = delta_sorted
@@ -519,7 +559,7 @@ class HMatrixEstimator:
 
         return HMatrixResult(
             theta_used=theta_used,
-            theta_sorted=theta_sorted.reshape(-1),
+            theta_sorted=(theta_sorted.reshape(-1) if theta_sorted.shape[1] == 1 else theta_sorted.copy()),
             perm=perm,
             inv_perm=inv_perm,
             g_matrix=g_used,

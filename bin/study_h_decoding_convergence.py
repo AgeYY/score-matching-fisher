@@ -53,7 +53,7 @@ import tempfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, TypedDict
+from typing import Any, NamedTuple, TypedDict
 
 _repo_root = Path(__file__).resolve().parent.parent
 _bin_dir = Path(__file__).resolve().parent
@@ -118,6 +118,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=[
             "cosine_gaussian",
             "cosine_gaussian_sqrtd",
+            "cosine_gaussian_sqrtd_rand_tune",
             "randamp_gaussian",
             "randamp_gaussian_sqrtd",
             "cosine_gmm",
@@ -176,6 +177,47 @@ def build_parser() -> argparse.ArgumentParser:
             "Number of equal-width theta bins (default 10). GT Hellinger MC uses "
             "n_mc = n_ref // num_theta_bins (floor) samples per bin row."
         ),
+    )
+    p.add_argument(
+        "--theta-flow-onehot-state",
+        action="store_true",
+        help=(
+            "theta_flow only: replace scalar theta state with one-hot bin vectors built from "
+            "--num-theta-bins fixed edges on the n_ref permutation prefix. "
+            "Flow ODE state becomes R^num_theta_bins."
+        ),
+    )
+    p.add_argument(
+        "--theta-flow-fourier-state",
+        action="store_true",
+        help=(
+            "theta_flow only: replace scalar theta state with Fourier features built from "
+            "theta range on the n_ref permutation prefix. Base period is "
+            "theta_flow_fourier_period_mult * (theta_max - theta_min), then harmonics k=1..K."
+        ),
+    )
+    p.add_argument(
+        "--theta-flow-fourier-k",
+        type=int,
+        default=4,
+        help=(
+            "Number of Fourier harmonics K for --theta-flow-fourier-state. "
+            "State dim = 2*K (+1 when --theta-flow-fourier-include-linear)."
+        ),
+    )
+    p.add_argument(
+        "--theta-flow-fourier-period-mult",
+        type=float,
+        default=2.0,
+        help=(
+            "Base-period multiplier for Fourier theta state: "
+            "period = multiplier * (theta_max - theta_min) from n_ref subset."
+        ),
+    )
+    p.add_argument(
+        "--theta-flow-fourier-include-linear",
+        action="store_true",
+        help="Include centered linear theta term in Fourier theta state.",
     )
     p.add_argument(
         "--clf-min-class-count",
@@ -250,7 +292,81 @@ def _validate_cli(args: argparse.Namespace) -> None:
             "GT Hellinger requires n_mc = n_ref // num_theta_bins >= 1 "
             f"(got n_ref={n_ref} num_theta_bins={n_bins_cli})."
         )
+    use_onehot = bool(getattr(args, "theta_flow_onehot_state", False))
+    use_fourier = bool(getattr(args, "theta_flow_fourier_state", False))
+    if use_onehot and use_fourier:
+        raise ValueError("Use only one theta-flow state override: one-hot or Fourier, not both.")
+    if use_onehot:
+        tfm = str(getattr(args, "theta_field_method", "theta_flow")).strip().lower()
+        arch = str(getattr(args, "flow_arch", "mlp")).strip().lower()
+        if tfm != "theta_flow":
+            raise ValueError(
+                "--theta-flow-onehot-state requires --theta-field-method theta_flow "
+                f"(got {getattr(args, 'theta_field_method', None)!r})."
+            )
+        if arch != "mlp":
+            raise ValueError(
+                "--theta-flow-onehot-state currently supports --flow-arch mlp only "
+                f"(got {getattr(args, 'flow_arch', None)!r})."
+            )
+    if use_fourier:
+        tfm = str(getattr(args, "theta_field_method", "theta_flow")).strip().lower()
+        arch = str(getattr(args, "flow_arch", "mlp")).strip().lower()
+        if tfm != "theta_flow":
+            raise ValueError(
+                "--theta-flow-fourier-state requires --theta-field-method theta_flow "
+                f"(got {getattr(args, 'theta_field_method', None)!r})."
+            )
+        if arch != "mlp":
+            raise ValueError(
+                "--theta-flow-fourier-state currently supports --flow-arch mlp only "
+                f"(got {getattr(args, 'flow_arch', None)!r})."
+            )
+        if int(getattr(args, "theta_flow_fourier_k", 0)) < 1:
+            raise ValueError("--theta-flow-fourier-k must be >= 1.")
+        period_mult = float(getattr(args, "theta_flow_fourier_period_mult", 0.0))
+        if not np.isfinite(period_mult) or period_mult <= 0.0:
+            raise ValueError("--theta-flow-fourier-period-mult must be a finite positive number.")
     _parse_n_list(args.n_list)  # syntax check only; pool size checked in main
+
+
+def _build_theta_fourier_state(
+    theta_scalar: np.ndarray,
+    *,
+    theta_ref: np.ndarray,
+    k: int,
+    period_mult: float,
+    include_linear: bool,
+) -> tuple[np.ndarray, float, float, float]:
+    """Build deterministic Fourier theta-state vectors from scalar theta."""
+    theta_all = np.asarray(theta_scalar, dtype=np.float64).reshape(-1)
+    theta_ref_vec = np.asarray(theta_ref, dtype=np.float64).reshape(-1)
+    if theta_all.size < 1 or theta_ref_vec.size < 1:
+        raise ValueError("Fourier theta state requires non-empty theta arrays.")
+    ref_min = float(np.min(theta_ref_vec))
+    ref_max = float(np.max(theta_ref_vec))
+    ref_range = float(ref_max - ref_min)
+    range_safe = max(ref_range, 1e-12)
+    period = float(period_mult) * range_safe
+    w0 = 2.0 * np.pi / period
+    theta_center = 0.5 * (ref_min + ref_max)
+    theta_shift = theta_all - theta_center
+    cols: list[np.ndarray] = []
+    if include_linear:
+        cols.append((theta_shift / range_safe).reshape(-1, 1))
+    for kk in range(1, int(k) + 1):
+        phase = (float(kk) * w0) * theta_shift
+        cols.append(np.sin(phase).reshape(-1, 1))
+        cols.append(np.cos(phase).reshape(-1, 1))
+    out = np.concatenate(cols, axis=1).astype(np.float64, copy=False)
+    return out, ref_range, period, theta_center
+
+
+class SweepSubset(NamedTuple):
+    bundle: SharedDatasetBundle
+    bin_all: np.ndarray
+    bin_train: np.ndarray
+    bin_validation: np.ndarray
 
 
 def _subset_bundle(
@@ -258,18 +374,23 @@ def _subset_bundle(
     perm: np.ndarray,
     n: int,
     meta: dict,
-) -> SharedDatasetBundle:
+    *,
+    bin_idx_all: np.ndarray,
+    theta_state_all: np.ndarray | None = None,
+) -> SweepSubset:
     """First n indices in perm order (nested subsets). Train/validation split matches make_dataset."""
     n = int(n)
     sub_perm = perm[:n]
-    # Keep theta shape (N,1) like make_dataset / SharedDatasetBundle — 1D theta + (B,1)
-    # sigma in training would broadcast to (B,B) and break FiLM/MLP.
-    theta_all = np.asarray(bundle.theta_all[sub_perm], dtype=np.float64)
+    theta_src_all = bundle.theta_all if theta_state_all is None else theta_state_all
+    theta_all = np.asarray(theta_src_all[sub_perm], dtype=np.float64)
     if theta_all.ndim == 1:
         theta_all = theta_all.reshape(-1, 1)
-    elif theta_all.ndim != 2 or theta_all.shape[1] != 1:
-        theta_all = theta_all.reshape(-1, 1)
+    elif theta_all.ndim != 2:
+        raise ValueError("theta_state_all must be 1D or 2D.")
     x_all = np.asarray(bundle.x_all[sub_perm], dtype=np.float64)
+    bin_all = np.asarray(bin_idx_all[sub_perm], dtype=np.int64).reshape(-1)
+    if bin_all.shape[0] != n:
+        raise ValueError("bin_idx_all subset length mismatch.")
     tf = float(meta["train_frac"])
     if tf >= 1.0:
         n_train = n
@@ -280,18 +401,25 @@ def _subset_bundle(
     x_train = x_all[:n_train]
     theta_validation = theta_all[n_train:]
     x_validation = x_all[n_train:]
+    bin_train = bin_all[:n_train]
+    bin_validation = bin_all[n_train:]
     train_idx = np.arange(n_train, dtype=np.int64)
     validation_idx = np.arange(n_train, n, dtype=np.int64)
-    return SharedDatasetBundle(
-        meta=bundle.meta,
-        theta_all=theta_all,
-        x_all=x_all,
-        train_idx=train_idx,
-        validation_idx=validation_idx,
-        theta_train=theta_train,
-        x_train=x_train,
-        theta_validation=theta_validation,
-        x_validation=x_validation,
+    return SweepSubset(
+        bundle=SharedDatasetBundle(
+            meta=bundle.meta,
+            theta_all=theta_all,
+            x_all=x_all,
+            train_idx=train_idx,
+            validation_idx=validation_idx,
+            theta_train=theta_train,
+            x_train=x_train,
+            theta_validation=theta_validation,
+            x_validation=x_validation,
+        ),
+        bin_all=bin_all,
+        bin_train=bin_train,
+        bin_validation=bin_validation,
     )
 
 
@@ -335,23 +463,21 @@ def _run_ctx_for_bundle(
 
 def _metrics_fixed_edges(
     loaded: vhb.LoadedHMatrix,
-    bundle: SharedDatasetBundle,
-    edges: np.ndarray,
+    subset: SweepSubset,
     n_bins: int,
     clf_min_class_count: int,
     clf_random_state: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    th_tr = np.asarray(bundle.theta_train, dtype=np.float64).reshape(-1)
-    th_va = np.asarray(bundle.theta_validation, dtype=np.float64).reshape(-1)
-    bin_idx = vhb.theta_to_bin_index(np.asarray(loaded.theta_used, dtype=np.float64).reshape(-1), edges, n_bins)
-    bin_train = vhb.theta_to_bin_index(th_tr, edges, n_bins)
-    bin_val = vhb.theta_to_bin_index(th_va, edges, n_bins)
-    h_binned, _ = vhb.average_matrix_by_bins(loaded.h_sym, bin_idx, n_bins)
+    if loaded.h_sym.shape[0] != subset.bin_all.shape[0]:
+        raise ValueError(
+            f"h_sym rows {loaded.h_sym.shape[0]} do not match subset bins length {subset.bin_all.shape[0]}."
+        )
+    h_binned, _ = vhb.average_matrix_by_bins(loaded.h_sym, subset.bin_all, n_bins)
     clf_acc, _, _, _ = vhb.pairwise_bin_logistic_accuracy_train_val(
-        bundle.x_train,
-        bin_train,
-        bundle.x_validation,
-        bin_val,
+        subset.bundle.x_train,
+        subset.bin_train,
+        subset.bundle.x_validation,
+        subset.bin_validation,
         n_bins,
         min_class_count=int(clf_min_class_count),
         random_state=int(clf_random_state),
@@ -363,9 +489,8 @@ def _pairwise_clf_from_bundle(
     *,
     args: argparse.Namespace,
     meta: dict,
-    bundle: SharedDatasetBundle,
+    subset: SweepSubset,
     output_dir: str,
-    edges: np.ndarray,
     n_bins: int,
     clf_min_class_count: int,
     clf_random_state: int,
@@ -377,15 +502,11 @@ def _pairwise_clf_from_bundle(
     args2 = argparse.Namespace(**d)
     args2.output_dir = output_dir
     full_args = _make_full_args(args2, meta)
-    th_tr = np.asarray(bundle.theta_train, dtype=np.float64).reshape(-1)
-    th_va = np.asarray(bundle.theta_validation, dtype=np.float64).reshape(-1)
-    bin_train = vhb.theta_to_bin_index(th_tr, edges, n_bins)
-    bin_val = vhb.theta_to_bin_index(th_va, edges, n_bins)
     clf_acc, _, _, _ = vhb.pairwise_bin_logistic_accuracy_train_val(
-        bundle.x_train,
-        bin_train,
-        bundle.x_validation,
-        bin_val,
+        subset.bundle.x_train,
+        subset.bin_train,
+        subset.bundle.x_validation,
+        subset.bin_validation,
         n_bins,
         min_class_count=int(clf_min_class_count),
         random_state=int(clf_random_state),
@@ -888,6 +1009,18 @@ def _write_summary(
         f.write(f"output_dir: {args.output_dir}\n")
         f.write(f"n_ref: {args.n_ref}  n_list: {args.n_list}\n")
         f.write(f"num_theta_bins: {args.num_theta_bins}\n")
+        f.write(f"theta_flow_onehot_state: {bool(getattr(args, 'theta_flow_onehot_state', False))}\n")
+        f.write(f"theta_flow_fourier_state: {bool(getattr(args, 'theta_flow_fourier_state', False))}\n")
+        if bool(getattr(args, "theta_flow_fourier_state", False)):
+            f.write(f"theta_flow_fourier_k: {int(getattr(args, 'theta_flow_fourier_k', 0))}\n")
+            f.write(
+                "theta_flow_fourier_period_mult: "
+                f"{float(getattr(args, 'theta_flow_fourier_period_mult', 0.0))}\n"
+            )
+            f.write(
+                "theta_flow_fourier_include_linear: "
+                f"{bool(getattr(args, 'theta_flow_fourier_include_linear', False))}\n"
+            )
         f.write(f"subset_seed_offset: {args.subset_seed_offset}\n")
         f.write(f"permutation rng seed: {perm_seed}\n")
         f.write(f"dataset pool size: {n_pool}\n")
@@ -1285,8 +1418,39 @@ def main(argv: list[str] | None = None) -> None:
             flush=True,
         )
 
-    theta_ref = np.asarray(bundle.theta_all[perm[: int(args.n_ref)]], dtype=np.float64).reshape(-1)
+    theta_raw_all = np.asarray(bundle.theta_all, dtype=np.float64)
+    if theta_raw_all.ndim == 2 and int(theta_raw_all.shape[1]) != 1:
+        raise ValueError(
+            "Convergence binning requires scalar theta in dataset bundle; "
+            f"got theta_all shape={theta_raw_all.shape}."
+        )
+    theta_scalar_all = theta_raw_all.reshape(-1)
+    theta_ref = np.asarray(theta_scalar_all[perm[: int(args.n_ref)]], dtype=np.float64).reshape(-1)
     edges, edge_lo, edge_hi = vhb.theta_bin_edges(theta_ref, n_bins)
+    bin_idx_all = vhb.theta_to_bin_index(theta_scalar_all, edges, n_bins)
+    theta_state_all: np.ndarray | None = None
+    if bool(getattr(args, "theta_flow_onehot_state", False)):
+        theta_state_all = np.eye(n_bins, dtype=np.float64)[bin_idx_all]
+        print(
+            f"[convergence] theta_flow one-hot state enabled: theta -> one_hot(bin(theta), K={n_bins})",
+            flush=True,
+        )
+    elif bool(getattr(args, "theta_flow_fourier_state", False)):
+        theta_state_all, theta_fourier_ref_range, theta_fourier_period, theta_fourier_center = _build_theta_fourier_state(
+            theta_scalar_all,
+            theta_ref=theta_ref,
+            k=int(args.theta_flow_fourier_k),
+            period_mult=float(args.theta_flow_fourier_period_mult),
+            include_linear=bool(args.theta_flow_fourier_include_linear),
+        )
+        print(
+            "[convergence] theta_flow Fourier state enabled: "
+            f"dim={theta_state_all.shape[1]} K={int(args.theta_flow_fourier_k)} "
+            f"period={theta_fourier_period:.6g} "
+            f"(mult={float(args.theta_flow_fourier_period_mult):.3g}, ref_range={theta_fourier_ref_range:.6g}, "
+            f"center={theta_fourier_center:.6g}, include_linear={bool(args.theta_flow_fourier_include_linear)})",
+            flush=True,
+        )
 
     clf_rs = base_seed if int(args.clf_random_state) < 0 else int(args.clf_random_state)
 
@@ -1371,14 +1535,20 @@ def main(argv: list[str] | None = None) -> None:
     print(f"[convergence] reference dir (decoding-only artifacts) n={args.n_ref} -> {ref_dir}", flush=True)
     print(f"[convergence] n_list={ns}", flush=True)
     t0 = time.time()
-    bundle_ref = _subset_bundle(bundle, perm, int(args.n_ref), meta)
+    subset_ref = _subset_bundle(
+        bundle,
+        perm,
+        int(args.n_ref),
+        meta,
+        bin_idx_all=bin_idx_all,
+        theta_state_all=theta_state_all,
+    )
     h_ref = np.asarray(h_gt_sqrt, dtype=np.float64)
     clf_ref = _pairwise_clf_from_bundle(
         args=args,
         meta=meta,
-        bundle=bundle_ref,
+        subset=subset_ref,
         output_dir=ref_dir,
-        edges=edges,
         n_bins=n_bins,
         clf_min_class_count=int(args.clf_min_class_count),
         clf_random_state=clf_rs,
@@ -1437,18 +1607,24 @@ def main(argv: list[str] | None = None) -> None:
 
         try:
             t1 = time.time()
-            bundle_n = _subset_bundle(bundle, perm, int(n), meta)
+            subset_n = _subset_bundle(
+                bundle,
+                perm,
+                int(n),
+                meta,
+                bin_idx_all=bin_idx_all,
+                theta_state_all=theta_state_all,
+            )
             loaded_n, _, _ = _estimate_one(
                 args=args,
                 meta=meta,
-                bundle=bundle_n,
+                bundle=subset_n.bundle,
                 output_dir=run_dir,
                 n_bins=n_bins,
             )
             h_n, clf_n = _metrics_fixed_edges(
                 loaded_n,
-                bundle_n,
-                edges,
+                subset_n,
                 n_bins,
                 int(args.clf_min_class_count),
                 clf_rs,

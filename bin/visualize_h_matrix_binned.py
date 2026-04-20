@@ -364,9 +364,15 @@ def hellinger_figure_labels(h_field_method: str) -> tuple[str, str, str]:
 def theta_for_h_matrix_alignment(bundle: SharedDatasetBundle, *, h_field_method: str) -> np.ndarray:
     """Rows that match ``theta_used`` in ``h_matrix_results*.npz`` for alignment checks."""
     m = str(h_field_method).strip().lower()
-    if m in ("dsm", "theta_flow", "theta_path_integral", "flow_x_likelihood", "ctsm_v"):
-        return np.asarray(bundle.theta_all, dtype=np.float64).reshape(-1)
-    return np.asarray(bundle.theta_validation, dtype=np.float64).reshape(-1)
+    th = np.asarray(
+        bundle.theta_all if m in ("dsm", "theta_flow", "theta_path_integral", "flow_x_likelihood", "ctsm_v") else bundle.theta_validation,
+        dtype=np.float64,
+    )
+    if th.ndim == 2 and th.shape[1] == 1:
+        return th.reshape(-1)
+    if th.ndim not in (1, 2):
+        raise ValueError("theta_for_h_matrix_alignment expects theta arrays with rank 1 or 2.")
+    return th
 
 
 def x_for_h_matrix_alignment(bundle: SharedDatasetBundle, *, h_field_method: str) -> np.ndarray:
@@ -675,7 +681,7 @@ def load_h_matrix(ctx: RunContext) -> LoadedHMatrix:
 
     h_npz = np.load(h_path, allow_pickle=True)
     h_sym = np.asarray(h_npz["h_sym"], dtype=np.float64)
-    theta_used = np.asarray(h_npz["theta_used"], dtype=np.float64).reshape(-1)
+    theta_used = np.asarray(h_npz["theta_used"], dtype=np.float64)
     h_field_method = str(h_npz["h_field_method"][0]) if "h_field_method" in h_npz.files else "dsm"
     h_eval_scalar_name = (
         str(h_npz["h_eval_scalar_name"][0]) if "h_eval_scalar_name" in h_npz.files else "sigma_eval"

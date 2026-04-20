@@ -249,6 +249,51 @@ class ToyConditionalGaussianSqrtdDataset(ToyConditionalGaussianDataset):
 
 
 @dataclass
+class ToyConditionalGaussianCosineRandampSqrtdDataset(ToyConditionalGaussianSqrtdDataset):
+    """``cosine_gaussian_sqrtd``-style observation noise with per-dimension random cosine amplitudes.
+
+    Mean: ``mu_j(theta) = a_j * cos(omega * theta + phi_j)`` where each ``a_j`` is drawn once at
+    init, ``a_j ~ Uniform(cosine_tune_amp_low, cosine_tune_amp_high)``, unless
+    ``cosine_tune_amp_per_dim`` is supplied (e.g. from saved NPZ meta).
+
+    Observation variance uses the same sqrt-``x_dim`` scaling as :class:`ToyConditionalGaussianSqrtdDataset`.
+    """
+
+    cosine_tune_amp_low: float = 0.5
+    cosine_tune_amp_high: float = 1.5
+    cosine_tune_amp_per_dim: np.ndarray | None = field(default=None)
+
+    def __post_init__(self) -> None:
+        if not (self.cosine_tune_amp_low < self.cosine_tune_amp_high):
+            raise ValueError("cosine_tune_amp_low must be < cosine_tune_amp_high.")
+        super().__post_init__()
+        if self.cosine_tune_amp_per_dim is not None:
+            self._cosine_tune_amp = np.asarray(self.cosine_tune_amp_per_dim, dtype=np.float64).reshape(-1)
+            if self._cosine_tune_amp.shape[0] != self.x_dim:
+                raise ValueError(
+                    f"cosine_tune_amp_per_dim length {self._cosine_tune_amp.shape[0]} != x_dim {self.x_dim}."
+                )
+        else:
+            self._cosine_tune_amp = self.rng.uniform(
+                self.cosine_tune_amp_low, self.cosine_tune_amp_high, size=(self.x_dim,)
+            ).astype(np.float64)
+
+    def tuning_curve(self, theta: np.ndarray) -> np.ndarray:
+        if self.tuning_curve_family != "cosine":
+            return super().tuning_curve(theta)
+        t = _theta_col(theta)
+        ph = self._mu_phases.reshape(1, -1)
+        return self._cosine_tune_amp.reshape(1, -1) * np.cos(self._mu_omega * t + ph)
+
+    def tuning_curve_derivative(self, theta: np.ndarray) -> np.ndarray:
+        if self.tuning_curve_family != "cosine":
+            return super().tuning_curve_derivative(theta)
+        t = _theta_col(theta)
+        ph = self._mu_phases.reshape(1, -1)
+        return self._cosine_tune_amp.reshape(1, -1) * (-self._mu_omega * np.sin(self._mu_omega * t + ph))
+
+
+@dataclass
 class ToyConditionalGaussianRandampDataset(ToyConditionalGaussianDataset):
     """Gaussian bump tuning with per-dimension random amplitudes (fixed across samples).
 
@@ -797,6 +842,7 @@ def make_theta_grid(theta_low: float, theta_high: float, eval_margin: float, n_b
 def make_local_decoder_data(
     dataset: ToyConditionalGaussianDataset
     | ToyConditionalGaussianSqrtdDataset
+    | ToyConditionalGaussianCosineRandampSqrtdDataset
     | ToyConditionalGaussianRandampDataset
     | ToyConditionalGaussianRandampSqrtdDataset
     | ToyCosSinPiecewiseNoiseDataset

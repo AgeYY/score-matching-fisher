@@ -42,6 +42,7 @@ def meta_dict_from_args(ns: Any) -> dict[str, Any]:
     out: dict[str, Any] = {
         "version": SHARED_DATASET_NPZ_VERSION,
         "dataset_family": str(ns.dataset_family),
+        "obs_noise_scale": float(getattr(ns, "obs_noise_scale", 1.0)),
         "tuning_curve_family": str(ns.tuning_curve_family),
         "vm_mu_amp": float(ns.vm_mu_amp),
         "vm_kappa": float(ns.vm_kappa),
@@ -92,6 +93,13 @@ def meta_dict_from_args(ns: Any) -> dict[str, Any]:
         out["randamp_mu_amp_per_dim"] = np.asarray(_ra, dtype=np.float64).reshape(-1).tolist()
     else:
         out["randamp_mu_amp_per_dim"] = None
+    out["cosine_tune_amp_low"] = float(getattr(ns, "cosine_tune_amp_low", 0.5))
+    out["cosine_tune_amp_high"] = float(getattr(ns, "cosine_tune_amp_high", 1.5))
+    _cta = getattr(ns, "cosine_tune_amp_per_dim", None)
+    if _cta is not None:
+        out["cosine_tune_amp_per_dim"] = np.asarray(_cta, dtype=np.float64).reshape(-1).tolist()
+    else:
+        out["cosine_tune_amp_per_dim"] = None
     return out
 
 
@@ -103,6 +111,7 @@ def _shared_dataset_meta_keys() -> frozenset[str]:
     """
     dummy = SimpleNamespace(
         dataset_family="cosine_gaussian",
+        obs_noise_scale=1.0,
         seed=0,
         theta_low=-6.0,
         theta_high=6.0,

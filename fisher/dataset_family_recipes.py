@@ -6,6 +6,7 @@ behavior selector for dataset generation.
 
 from __future__ import annotations
 
+import math
 from typing import Any, Final
 
 # Breaking rename (2026): old meta/CLI strings -> new canonical token (for migration errors only).
@@ -130,6 +131,14 @@ def family_recipe_dict(family: str) -> dict[str, Any]:
         return out
     if fam == "cosine_gaussian_sqrtd":
         return {**base, "sigma_x1": 0.50, "sigma_x2": 0.50}
+    if fam == "cosine_gaussian_sqrtd_rand_tune":
+        return {
+            **base,
+            "sigma_x1": 0.50,
+            "sigma_x2": 0.50,
+            "cosine_tune_amp_low": 0.5,
+            "cosine_tune_amp_high": 1.5,
+        }
     if fam == "randamp_gaussian":
         return {**base, "sigma_x1": 0.30, "sigma_x2": 0.30}
     if fam == "randamp_gaussian_sqrtd":
@@ -149,6 +158,12 @@ def apply_family_recipe_to_namespace(ns: Any) -> None:
     recipe = family_recipe_dict(fam)
     for k, v in recipe.items():
         setattr(ns, k, v)
+    scale = float(getattr(ns, "obs_noise_scale", 1.0))
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError("--obs-noise-scale must be a finite positive number.")
+    if scale != 1.0:
+        setattr(ns, "sigma_x1", float(getattr(ns, "sigma_x1")) * scale)
+        setattr(ns, "sigma_x2", float(getattr(ns, "sigma_x2")) * scale)
 
 
 def assert_no_legacy_dataset_cli_flags(argv: list[str]) -> None:
@@ -175,15 +190,25 @@ def format_resolved_family_summary(ns: Any) -> str:
     """Human-readable summary of the fixed recipe (for logging)."""
     fam = str(getattr(ns, "dataset_family", "cosine_gaussian"))
     r = family_recipe_dict(fam)
+    scale = float(getattr(ns, "obs_noise_scale", 1.0))
+    if not math.isfinite(scale) or scale <= 0.0:
+        scale = 1.0
+    sx1 = float(r["sigma_x1"]) * scale
+    sx2 = float(r["sigma_x2"]) * scale
     lines = [
         f"dataset_family={fam} (fixed internal recipe; not configurable via CLI)",
         f"  tuning_curve_family={r['tuning_curve_family']!r}",
-        f"  observation noise: sigma_x1={r['sigma_x1']}, sigma_x2={r['sigma_x2']}, rho={r['rho']}",
+        f"  observation noise: sigma_x1={sx1}, sigma_x2={sx2}, rho={r['rho']}  (obs_noise_scale={scale})",
     ]
     if fam in ("randamp_gaussian", "randamp_gaussian_sqrtd"):
         lines.append(
             f"  randamp bumps: low={r['randamp_mu_low']}, high={r['randamp_mu_high']}, "
             f"kappa={r['randamp_kappa']}, omega={r['randamp_omega']}"
+        )
+    if fam == "cosine_gaussian_sqrtd_rand_tune":
+        lines.append(
+            f"  cosine per-dim amp: Uniform({r['cosine_tune_amp_low']}, {r['cosine_tune_amp_high']}) "
+            "(fixed across samples; stored in NPZ meta)"
         )
     if fam == "cosine_gmm":
         lines.append(

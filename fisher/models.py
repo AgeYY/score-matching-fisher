@@ -160,7 +160,7 @@ class ConditionalScore1DFiLMPerLayer(nn.Module):
 
 
 class ConditionalThetaFlowVelocity(nn.Module):
-    """Conditional theta-velocity model v(theta_t, x, t) with scalar output."""
+    """Conditional theta-velocity model v(theta_t, x, t) with output in R^{theta_dim}."""
 
     def __init__(
         self,
@@ -168,21 +168,33 @@ class ConditionalThetaFlowVelocity(nn.Module):
         hidden_dim: int = 128,
         depth: int = 3,
         use_logit_time: bool = True,
+        *,
+        theta_dim: int = 1,
     ) -> None:
         super().__init__()
         if x_dim < 2:
             raise ValueError("x_dim must be >= 2.")
+        if int(theta_dim) < 1:
+            raise ValueError("theta_dim must be >= 1.")
+        self.x_dim = int(x_dim)
+        self.theta_dim = int(theta_dim)
         self.use_logit_time = bool(use_logit_time)
-        in_dim = 1 + x_dim + 1  # theta_t, x, t
+        in_dim = self.theta_dim + self.x_dim + 1  # theta_t, x, t
         layers: list[nn.Module] = []
         for _ in range(depth):
             layers.append(nn.Linear(in_dim, hidden_dim))
             layers.append(nn.SiLU())
             in_dim = hidden_dim
-        layers.append(nn.Linear(hidden_dim, 1))
+        layers.append(nn.Linear(hidden_dim, self.theta_dim))
         self.net = nn.Sequential(*layers)
 
     def forward(self, theta_t: torch.Tensor, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        if theta_t.ndim == 1:
+            theta_t = theta_t.unsqueeze(-1)
+        if theta_t.shape[-1] != self.theta_dim:
+            raise ValueError(f"theta_t last dim {theta_t.shape[-1]} != theta_dim={self.theta_dim}")
+        if x.shape[-1] != self.x_dim:
+            raise ValueError(f"x last dim {x.shape[-1]} != x_dim={self.x_dim}")
         if t.ndim == 1:
             t = t.unsqueeze(-1)
         if self.use_logit_time:
@@ -201,26 +213,35 @@ class ConditionalThetaFlowVelocity(nn.Module):
 
 
 class PriorThetaFlowVelocity(nn.Module):
-    """Unconditional theta-velocity model v(theta_t, t) with scalar output."""
+    """Unconditional theta-velocity model v(theta_t, t) with output in R^{theta_dim}."""
 
     def __init__(
         self,
         hidden_dim: int = 128,
         depth: int = 3,
         use_logit_time: bool = True,
+        *,
+        theta_dim: int = 1,
     ) -> None:
         super().__init__()
+        if int(theta_dim) < 1:
+            raise ValueError("theta_dim must be >= 1.")
+        self.theta_dim = int(theta_dim)
         self.use_logit_time = bool(use_logit_time)
-        in_dim = 1 + 1  # theta_t, t
+        in_dim = self.theta_dim + 1  # theta_t, t
         layers: list[nn.Module] = []
         for _ in range(depth):
             layers.append(nn.Linear(in_dim, hidden_dim))
             layers.append(nn.SiLU())
             in_dim = hidden_dim
-        layers.append(nn.Linear(hidden_dim, 1))
+        layers.append(nn.Linear(hidden_dim, self.theta_dim))
         self.net = nn.Sequential(*layers)
 
     def forward(self, theta_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        if theta_t.ndim == 1:
+            theta_t = theta_t.unsqueeze(-1)
+        if theta_t.shape[-1] != self.theta_dim:
+            raise ValueError(f"theta_t last dim {theta_t.shape[-1]} != theta_dim={self.theta_dim}")
         if t.ndim == 1:
             t = t.unsqueeze(-1)
         if self.use_logit_time:

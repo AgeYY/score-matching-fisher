@@ -8,7 +8,12 @@ import torch
 
 from fisher.cli_shared_fisher import add_estimation_arguments
 from fisher.h_matrix import HMatrixEstimator
-from fisher.models import ConditionalThetaFlowVelocityIIDSoft, PriorThetaFlowVelocityIIDSoft
+from fisher.models import (
+    ConditionalThetaFlowVelocity,
+    ConditionalThetaFlowVelocityIIDSoft,
+    PriorThetaFlowVelocity,
+    PriorThetaFlowVelocityIIDSoft,
+)
 from fisher.shared_fisher_est import validate_estimation_args
 
 
@@ -192,6 +197,64 @@ class TestHMatrixFlowLikelihood(unittest.TestCase):
         theta = np.linspace(-0.4, 0.4, 4, dtype=np.float64).reshape(-1, 1)
         x = np.stack([np.sin(theta.reshape(-1)), np.cos(theta.reshape(-1))], axis=1).astype(np.float64)
         out = est.run(theta=theta, x=x, restore_original_order=False)
+        self.assertTrue(np.isfinite(out.h_sym).all())
+
+    def test_theta_flow_mlp_accepts_vector_theta_state(self) -> None:
+        torch.manual_seed(2)
+        theta_dim = 4
+        post = ConditionalThetaFlowVelocity(x_dim=2, hidden_dim=12, depth=1, theta_dim=theta_dim)
+        prior = PriorThetaFlowVelocity(hidden_dim=12, depth=1, theta_dim=theta_dim)
+        est = HMatrixEstimator(
+            model_post=post,
+            model_prior=prior,
+            sigma_eval=0.8,
+            device=torch.device("cpu"),
+            pair_batch_size=32,
+            field_method="theta_flow",
+            flow_scheduler="cosine",
+            flow_ode_steps=8,
+        )
+        # One-hot theta states; run() should preserve 2D theta rows and sort by active bin.
+        theta_idx = np.asarray([2, 0, 3, 1, 0], dtype=np.int64)
+        theta = np.eye(theta_dim, dtype=np.float64)[theta_idx]
+        x = np.random.default_rng(2).standard_normal((theta.shape[0], 2))
+        out = est.run(theta=theta, x=x, restore_original_order=False)
+        self.assertEqual(out.theta_used.shape, (theta.shape[0], theta_dim))
+        self.assertEqual(out.theta_sorted.shape, (theta.shape[0], theta_dim))
+        self.assertTrue(np.isfinite(out.h_sym).all())
+        sorted_bins = np.argmax(out.theta_sorted, axis=1)
+        self.assertTrue(np.all(np.diff(sorted_bins) >= 0))
+
+    def test_theta_flow_mlp_accepts_fourier_vector_theta_state(self) -> None:
+        torch.manual_seed(3)
+        theta_scalar = np.linspace(-1.0, 1.0, 7, dtype=np.float64)
+        k = 3
+        period = 2.0 * (float(theta_scalar.max()) - float(theta_scalar.min()))
+        w0 = 2.0 * np.pi / max(period, 1e-12)
+        theta_cols = []
+        for kk in range(1, k + 1):
+            theta_cols.append(np.sin(kk * w0 * theta_scalar).reshape(-1, 1))
+            theta_cols.append(np.cos(kk * w0 * theta_scalar).reshape(-1, 1))
+        theta = np.concatenate(theta_cols, axis=1)
+
+        theta_dim = int(theta.shape[1])
+        post = ConditionalThetaFlowVelocity(x_dim=2, hidden_dim=16, depth=2, theta_dim=theta_dim)
+        prior = PriorThetaFlowVelocity(hidden_dim=16, depth=2, theta_dim=theta_dim)
+        est = HMatrixEstimator(
+            model_post=post,
+            model_prior=prior,
+            sigma_eval=0.9,
+            device=torch.device("cpu"),
+            pair_batch_size=32,
+            field_method="theta_flow",
+            flow_scheduler="cosine",
+            flow_ode_steps=8,
+        )
+        x = np.stack([np.sin(theta_scalar), np.cos(theta_scalar)], axis=1).astype(np.float64)
+        out = est.run(theta=theta, x=x, restore_original_order=False)
+        self.assertEqual(out.theta_used.shape, (theta.shape[0], theta_dim))
+        self.assertEqual(out.theta_sorted.shape, (theta.shape[0], theta_dim))
+        self.assertTrue(np.isfinite(out.delta_l_matrix).all())
         self.assertTrue(np.isfinite(out.h_sym).all())
 
 

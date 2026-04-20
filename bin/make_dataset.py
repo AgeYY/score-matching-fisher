@@ -17,6 +17,9 @@ Run ``python bin/make_dataset.py --help`` for argparse defaults and exact wordin
     - ``cosine_gaussian`` — Cosine means; theta-modulated diagonal Gaussian noise (baseline sigmas 0.50).
     - ``cosine_gaussian_sqrtd`` — Same cosine means; noise variance scaled by ``x_dim`` (baseline
       sigmas 0.50) so std ~ sqrt(d).
+    - ``cosine_gaussian_sqrtd_rand_tune`` — Like ``cosine_gaussian_sqrtd``, but each coordinate's
+      cosine mean amplitude is multiplied by an independent factor drawn once from ``Uniform(0.5, 1.5)``
+      (stored in NPZ meta as ``cosine_tune_amp_per_dim``).
     - ``randamp_gaussian`` — Random-amplitude Gaussian bump means (per-dim amplitudes drawn once);
       Gaussian observation noise (baseline 0.30). Realized amplitudes in NPZ meta as
       ``randamp_mu_amp_per_dim``.
@@ -41,6 +44,9 @@ Run ``python bin/make_dataset.py --help`` for argparse defaults and exact wordin
 - ``--train-frac`` (default 0.7) — Fraction of indices assigned to ``train_idx``. The remainder is
   ``validation_idx`` (held-out). Must be in ``(0, 1]``. Values ``< 1`` are required for shared Fisher /
   H-matrix / pairwise-CLF pipelines that need a non-empty validation slice.
+
+- ``--obs-noise-scale`` (default 1.0) — Multiplies the family-fixed baseline ``sigma_x1`` / ``sigma_x2``
+  (e.g. ``0.5`` halves observation noise relative to the default recipe).
 
 - ``--output-npz`` — Path to the written archive (default under ``global_setting.DATA_DIR`` /
   ``SCORE_MATCHING_FISHER_DATAROOT``). Contains ``theta_all``, ``x_all``, indices, splits, and
@@ -146,6 +152,8 @@ def main() -> None:
     meta = meta_dict_from_args(args)
     if str(args.dataset_family) in ("randamp_gaussian", "randamp_gaussian_sqrtd"):
         meta["randamp_mu_amp_per_dim"] = dataset._randamp_amp.tolist()
+    if str(args.dataset_family) == "cosine_gaussian_sqrtd_rand_tune":
+        meta["cosine_tune_amp_per_dim"] = dataset._cosine_tune_amp.tolist()
     save_shared_dataset_npz(
         args.output_npz,
         meta=meta,
