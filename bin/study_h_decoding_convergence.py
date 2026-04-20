@@ -122,7 +122,6 @@ def build_parser() -> argparse.ArgumentParser:
             "cosine_gaussian_sqrtd_rand_tune",
             "randamp_gaussian",
             "randamp_gaussian_sqrtd",
-            "randamp_gaussian_sqrtd_pr_autoencoder",
             "cosine_gmm",
             "cos_sin_piecewise",
             "linear_piecewise",
@@ -562,7 +561,7 @@ def _estimate_one(
     ctx = _run_ctx_for_bundle(args2, meta, bundle, full_args, n_bins)
     vhb.run_h_estimation_if_needed(ctx)
     loaded = vhb.load_h_matrix(ctx)
-    theta_chk = vhb.theta_for_h_matrix_alignment(ctx.bundle, h_field_method=loaded.h_field_method)
+    theta_chk = vhb.theta_for_h_matrix_alignment(ctx.bundle, ctx.full_args)
     if theta_chk.shape[0] != loaded.theta_used.shape[0]:
         raise ValueError(
             f"theta/H row mismatch: theta_chk={theta_chk.shape[0]} theta_used={loaded.theta_used.shape[0]}"
@@ -571,7 +570,7 @@ def _estimate_one(
         raise ValueError(
             "theta_used from H-matrix npz does not match expected dataset rows for this h_field_method."
         )
-    x_aligned = vhb.x_for_h_matrix_alignment(ctx.bundle, h_field_method=loaded.h_field_method)
+    x_aligned = vhb.x_for_h_matrix_alignment(ctx.bundle, ctx.full_args)
     if x_aligned.shape[0] != loaded.theta_used.shape[0]:
         raise ValueError(
             f"x/H row mismatch: x_aligned={x_aligned.shape[0]} theta_used={loaded.theta_used.shape[0]}"

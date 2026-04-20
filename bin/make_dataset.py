@@ -26,9 +26,8 @@ Run ``python bin/make_dataset.py --help`` for argparse defaults and exact wordin
       Gaussian observation noise (baseline 0.30). Realized amplitudes in NPZ meta as
       ``randamp_mu_amp_per_dim``.
     - ``randamp_gaussian_sqrtd`` — Same bump tuning as ``randamp_gaussian`` with sqrt-d noise scaling
-      (baseline 0.20).
-    - ``randamp_gaussian_sqrtd_pr_autoencoder`` — Generate base ``randamp_gaussian_sqrtd`` in latent
-      dimension ``--pr-autoencoder-z-dim`` (default 2) and map to ``--x-dim`` via a trained PR-autoencoder.
+      (baseline 0.20). For high-dimensional observation space via a PR-autoencoder, generate this
+      family at low ``--x-dim``, then run ``bin/project_dataset_pr_autoencoder.py``.
     - ``cosine_gmm`` — Cosine-like mean branch inside a theta-dependent two-component mixture (see
       ``ToyConditionalGMMNonGaussianDataset``).
     - ``cos_sin_piecewise`` — Means ``(cos θ, sin θ)``; scalar observation std piecewise in ``θ``
@@ -96,7 +95,6 @@ from fisher.dataset_family_recipes import (
     format_resolved_family_summary,
 )
 from fisher.dataset_visualization import plot_joint_and_tuning, summarize_dataset
-from fisher.pr_autoencoder_embedding import build_randamp_gaussian_sqrtd_pr_autoencoder_dataset
 from fisher.shared_dataset_io import meta_dict_from_args, save_shared_dataset_npz
 from fisher.shared_fisher_est import build_dataset_from_args, validate_dataset_sample_args
 
@@ -122,12 +120,6 @@ def parse_make_dataset_args(argv: list[str] | None = None) -> argparse.Namespace
             "Prefer a path under your DATAROOT data directory."
         ),
     )
-    p.add_argument(
-        "--device",
-        type=str,
-        default="cuda",
-        help="Device used by embedding-based families (e.g., PR-autoencoder).",
-    )
     return p.parse_args(argv)
 
 
@@ -145,14 +137,8 @@ def main() -> None:
     rng = np.random.default_rng(args.seed)
 
     n_total = int(args.n_total)
-    if str(args.dataset_family) == "randamp_gaussian_sqrtd_pr_autoencoder":
-        built = build_randamp_gaussian_sqrtd_pr_autoencoder_dataset(args)
-        dataset = built.base_dataset
-        theta_all = built.theta_all
-        x_all = built.x_embed_all
-    else:
-        dataset = build_dataset_from_args(args)
-        theta_all, x_all = dataset.sample_joint(n_total)
+    dataset = build_dataset_from_args(args)
+    theta_all, x_all = dataset.sample_joint(n_total)
     perm = rng.permutation(n_total)
     tf = float(args.train_frac)
     if tf >= 1.0:
@@ -170,24 +156,10 @@ def main() -> None:
     if str(args.dataset_family) in (
         "randamp_gaussian",
         "randamp_gaussian_sqrtd",
-        "randamp_gaussian_sqrtd_pr_autoencoder",
     ):
         meta["randamp_mu_amp_per_dim"] = dataset._randamp_amp.tolist()
     if str(args.dataset_family) == "cosine_gaussian_sqrtd_rand_tune":
         meta["cosine_tune_amp_per_dim"] = dataset._cosine_tune_amp.tolist()
-    if str(args.dataset_family) == "randamp_gaussian_sqrtd_pr_autoencoder":
-        meta["pr_autoencoder_enabled"] = True
-        meta["pr_autoencoder_z_dim"] = int(built.embedder_config.z_dim)
-        meta["pr_autoencoder_hidden1"] = int(built.embedder_config.hidden1)
-        meta["pr_autoencoder_hidden2"] = int(built.embedder_config.hidden2)
-        meta["pr_autoencoder_train_samples"] = int(built.embedder_config.train_samples)
-        meta["pr_autoencoder_train_epochs"] = int(built.embedder_config.train_epochs)
-        meta["pr_autoencoder_train_batch_size"] = int(built.embedder_config.train_batch_size)
-        meta["pr_autoencoder_train_lr"] = float(built.embedder_config.train_lr)
-        meta["pr_autoencoder_lambda_pr"] = float(built.embedder_config.lambda_pr)
-        meta["pr_autoencoder_pr_eps"] = float(built.embedder_config.pr_eps)
-        meta["pr_autoencoder_seed"] = int(args.seed)
-        meta["pr_autoencoder_cache_key"] = str(built.cache_run_dir.name)
     save_shared_dataset_npz(
         args.output_npz,
         meta=meta,
@@ -209,13 +181,7 @@ def main() -> None:
 
     out_dir = Path(args.output_npz).resolve().parent
     joint_tuning_path = out_dir / "joint_scatter_and_tuning_curve.png"
-    if str(args.dataset_family) == "randamp_gaussian_sqrtd_pr_autoencoder":
-        print(
-            "[data] Skipping summarize_dataset for embedded randamp family: "
-            "embedded x_dim differs from base tuning dimension."
-        )
-    else:
-        summarize_dataset(theta_all, x_all, dataset)
+    summarize_dataset(theta_all, x_all, dataset)
     plot_joint_and_tuning(theta_all, x_all, dataset, str(joint_tuning_path))
     print(f"Saved visualization: {joint_tuning_path}")
     print(f"Saved visualization: {joint_tuning_path.with_suffix('.svg')}")

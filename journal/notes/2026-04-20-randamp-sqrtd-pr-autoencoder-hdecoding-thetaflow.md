@@ -1,5 +1,7 @@
 # 2026-04-20 PR-autoencoder embedding for `randamp_gaussian_sqrtd`: theta-flow H-decoding convergence (2D latent -> 10D/50D)
 
+**Update (later 2026):** The `randamp_gaussian_sqrtd_pr_autoencoder` `dataset_family` token was removed. Use `bin/make_dataset.py --dataset-family randamp_gaussian_sqrtd` at low `--x-dim`, then `bin/project_dataset_pr_autoencoder.py` to embed; see `docs/dataset_pr_autoencoder_workflow.md`. Commands below are historical.
+
 ## Question / Context
 Can we replace the RealNVP embedding path with the new PR-autoencoder embedding for
 `randamp_gaussian_sqrtd`, then run the standard `theta_flow` H-decoding convergence pipeline?

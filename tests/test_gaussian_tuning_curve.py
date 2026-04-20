@@ -176,10 +176,10 @@ class TestGaussianTuningCurve(unittest.TestCase):
         self.assertEqual(x.shape, (16, 4))
         self.assertTrue(np.isfinite(x).all())
 
-    def test_build_gaussian_randamp_sqrtd_pr_autoencoder_meta_dataset_is_base_sqrtd(self) -> None:
+    def test_build_gaussian_randamp_sqrtd_low_x_dim(self) -> None:
         ns = _ns(
-            dataset_family="randamp_gaussian_sqrtd_pr_autoencoder",
-            x_dim=10,
+            dataset_family="randamp_gaussian_sqrtd",
+            x_dim=2,
             n_total=32,
             train_frac=1.0,
             seed=1,
@@ -192,12 +192,13 @@ class TestGaussianTuningCurve(unittest.TestCase):
     def test_pr_autoencoder_embedding_shape_and_seed_reproducibility(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             ns = _ns(
-                dataset_family="randamp_gaussian_sqrtd_pr_autoencoder",
+                dataset_family="randamp_gaussian_sqrtd",
                 x_dim=12,
                 n_total=48,
                 train_frac=1.0,
                 seed=9,
             )
+            ns.pr_autoencoder_z_dim = 2
             ns.device = "cpu"
             ns.pr_autoencoder_train_samples = 512
             ns.pr_autoencoder_train_epochs = 6
@@ -212,18 +213,27 @@ class TestGaussianTuningCurve(unittest.TestCase):
             np.testing.assert_allclose(out1.theta_all, out2.theta_all, rtol=0, atol=0)
             np.testing.assert_allclose(out1.x_embed_all, out2.x_embed_all, rtol=0, atol=0)
 
-    def test_meta_roundtrip_gaussian_randamp_sqrtd_pr_autoencoder_uses_zdim(self) -> None:
-        ns = _ns(
-            dataset_family="randamp_gaussian_sqrtd_pr_autoencoder",
+    def test_meta_roundtrip_gaussian_randamp_sqrtd_pr_embedded_uses_zdim(self) -> None:
+        ns_low = _ns(
+            dataset_family="randamp_gaussian_sqrtd",
+            x_dim=2,
+            n_total=10,
+            train_frac=1.0,
+            seed=11,
+        )
+        validate_dataset_sample_args(ns_low)
+        ds0 = build_dataset_from_args(ns_low)
+        ns_meta = _ns(
+            dataset_family="randamp_gaussian_sqrtd",
             x_dim=16,
             n_total=10,
             train_frac=1.0,
             seed=11,
         )
-        validate_dataset_sample_args(ns)
-        ds0 = build_dataset_from_args(ns)
-        meta = meta_dict_from_args(ns)
+        validate_dataset_sample_args(ns_meta)
+        meta = meta_dict_from_args(ns_meta)
         meta["pr_autoencoder_enabled"] = True
+        meta["pr_autoencoder_embedded"] = True
         meta["pr_autoencoder_z_dim"] = 2
         meta["pr_autoencoder_hidden1"] = 100
         meta["pr_autoencoder_hidden2"] = 200
@@ -233,12 +243,20 @@ class TestGaussianTuningCurve(unittest.TestCase):
         meta["pr_autoencoder_train_lr"] = 1e-3
         meta["pr_autoencoder_lambda_pr"] = 1e-2
         meta["pr_autoencoder_pr_eps"] = 1e-8
-        meta["pr_autoencoder_seed"] = int(ns.seed)
+        meta["pr_autoencoder_seed"] = int(ns_meta.seed)
         meta["pr_autoencoder_cache_key"] = "pr_ae_dummy"
         meta["randamp_mu_amp_per_dim"] = ds0._randamp_amp.tolist()
         ds = build_dataset_from_meta(meta)
         self.assertIsInstance(ds, ToyConditionalGaussianRandampSqrtdDataset)
         self.assertEqual(int(ds.x_dim), 2)
+
+    def test_removed_pr_autoencoder_dataset_family_meta_raises(self) -> None:
+        ns = _ns(dataset_family="randamp_gaussian_sqrtd", x_dim=2, n_total=10, train_frac=1.0, seed=0)
+        meta = meta_dict_from_args(ns)
+        meta["dataset_family"] = "randamp_gaussian_sqrtd_pr_autoencoder"
+        with self.assertRaises(ValueError) as ctx:
+            build_dataset_from_meta(meta)
+        self.assertIn("no longer supported", str(ctx.exception))
 
     def test_meta_roundtrip_gaussian_randamp(self) -> None:
         ns = _ns(

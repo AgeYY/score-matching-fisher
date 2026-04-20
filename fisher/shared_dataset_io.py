@@ -35,6 +35,16 @@ class SharedDatasetBundle:
     theta_validation: np.ndarray
     x_validation: np.ndarray
 
+    @property
+    def theta_eval(self) -> np.ndarray:
+        """Alias for v1 ``theta_eval``; v2 NPZs store the same split as ``theta_validation``."""
+        return self.theta_validation
+
+    @property
+    def x_eval(self) -> np.ndarray:
+        """Alias for v1 ``x_eval``; v2 NPZs store the same split as ``x_validation``."""
+        return self.x_validation
+
 
 def meta_dict_from_args(ns: Any) -> dict[str, Any]:
     """Build JSON-serializable metadata from an argparse-like namespace (dataset fields)."""
@@ -101,6 +111,7 @@ def meta_dict_from_args(ns: Any) -> dict[str, Any]:
     else:
         out["cosine_tune_amp_per_dim"] = None
     out["pr_autoencoder_enabled"] = bool(getattr(ns, "pr_autoencoder_enabled", False))
+    out["pr_autoencoder_embedded"] = bool(getattr(ns, "pr_autoencoder_embedded", False))
     out["pr_autoencoder_z_dim"] = int(getattr(ns, "pr_autoencoder_z_dim", 2))
     out["pr_autoencoder_hidden1"] = int(getattr(ns, "pr_autoencoder_hidden1", 100))
     out["pr_autoencoder_hidden2"] = int(getattr(ns, "pr_autoencoder_hidden2", 200))

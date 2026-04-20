@@ -31,11 +31,11 @@ def _copy_namespace(ns: Any) -> Namespace:
     return out
 
 
-def _config_from_namespace(ns: Any, *, x_dim_target: int) -> PRAutoencoderConfig:
-    """Build config with fixed defaults (override-able only via non-public namespace attrs)."""
+def pr_autoencoder_config_from_namespace(ns: Any, *, h_dim: int) -> PRAutoencoderConfig:
+    """Build :class:`PRAutoencoderConfig` from an argparse-like namespace (PR-* fields optional)."""
     return PRAutoencoderConfig(
-        z_dim=int(getattr(ns, "pr_autoencoder_z_dim", 2)),
-        h_dim=int(x_dim_target),
+        z_dim=int(getattr(ns, "pr_autoencoder_z_dim", getattr(ns, "z_dim", 2))),
+        h_dim=int(h_dim),
         hidden1=int(getattr(ns, "pr_autoencoder_hidden1", 100)),
         hidden2=int(getattr(ns, "pr_autoencoder_hidden2", 200)),
         train_samples=int(getattr(ns, "pr_autoencoder_train_samples", 12000)),
@@ -47,14 +47,50 @@ def _config_from_namespace(ns: Any, *, x_dim_target: int) -> PRAutoencoderConfig
     )
 
 
-def build_randamp_gaussian_sqrtd_pr_autoencoder_dataset(ns: Any) -> PRAutoencoderDatasetBuildResult:
-    """Generate dataset by sampling base randamp_sqrtd in z_dim then embedding with PR-autoencoder."""
-    x_dim_target = int(getattr(ns, "x_dim"))
-    cfg = _config_from_namespace(ns, x_dim_target=x_dim_target)
-    if x_dim_target < cfg.z_dim:
+def project_x_through_pr_autoencoder(
+    x_low: np.ndarray,
+    *,
+    config: PRAutoencoderConfig,
+    seed: int,
+    device: torch.device,
+    cache_dir: str,
+    force_retrain: bool,
+) -> tuple[np.ndarray, Path, bool, dict[str, np.ndarray]]:
+    """Map low-dimensional rows ``x_low`` (N, z_dim) to embedded ``x_embed`` (N, h_dim) via PR-AE encoder.
+
+    Returns ``(x_embed, cache_run_dir, loaded_from_cache, train_metrics)`` where ``train_metrics`` has
+    keys ``loss``, ``recon``, ``pr`` (per-epoch arrays from PR-autoencoder training or cache).
+    """
+    x_arr = np.asarray(x_low, dtype=np.float64)
+    if x_arr.ndim != 2 or int(x_arr.shape[1]) != int(config.z_dim):
         raise ValueError(
-            f"--x-dim must be >= {cfg.z_dim} for randamp_gaussian_sqrtd_pr_autoencoder; got {x_dim_target}."
+            f"x_low must have shape (N, z_dim) with z_dim={config.z_dim}; got {x_arr.shape}."
         )
+    built = train_or_load_pr_autoencoder(
+        config=config,
+        seed=int(seed),
+        device=device,
+        cache_dir=cache_dir,
+        force_retrain=force_retrain,
+    )
+    z_t = torch.from_numpy(x_arr).to(device=device, dtype=torch.float32)
+    with torch.no_grad():
+        h_t, _ = built.model(z_t)
+    x_embed = h_t.detach().cpu().numpy().astype(np.float64, copy=False)
+    metrics = {k: np.asarray(v, dtype=np.float64) for k, v in built.metrics.items()}
+    return x_embed, built.cache_run_dir, bool(built.loaded_from_cache), metrics
+
+
+def build_randamp_gaussian_sqrtd_pr_autoencoder_dataset(ns: Any) -> PRAutoencoderDatasetBuildResult:
+    """Sample base ``randamp_gaussian_sqrtd`` in z_dim, then embed x with a PR-autoencoder to h_dim.
+
+    Used by tests and reproducibility checks; production datasets should use ``make_dataset`` +
+    ``bin/project_dataset_pr_autoencoder.py`` instead of the removed ``dataset_family`` token.
+    """
+    h_dim = int(getattr(ns, "x_dim"))
+    cfg = pr_autoencoder_config_from_namespace(ns, h_dim=h_dim)
+    if h_dim < cfg.z_dim:
+        raise ValueError(f"Target x_dim (h_dim) must be >= z_dim={cfg.z_dim}; got {h_dim}.")
 
     device_name = str(getattr(ns, "device", "cuda"))
     if device_name == "cuda" and not torch.cuda.is_available():
@@ -71,7 +107,8 @@ def build_randamp_gaussian_sqrtd_pr_autoencoder_dataset(ns: Any) -> PRAutoencode
 
     cache_dir = str(getattr(ns, "pr_autoencoder_cache_dir", "data/pr_autoencoder_cache"))
     force_retrain = bool(getattr(ns, "pr_autoencoder_force_retrain", False))
-    built = train_or_load_pr_autoencoder(
+    x_embed_all, cache_run_dir, loaded_from_cache, _metrics = project_x_through_pr_autoencoder(
+        x_base_all,
         config=cfg,
         seed=int(getattr(ns, "seed")),
         device=device,
@@ -79,16 +116,11 @@ def build_randamp_gaussian_sqrtd_pr_autoencoder_dataset(ns: Any) -> PRAutoencode
         force_retrain=force_retrain,
     )
 
-    z_t = torch.from_numpy(np.asarray(x_base_all, dtype=np.float64)).to(device=device, dtype=torch.float32)
-    with torch.no_grad():
-        h_t, _ = built.model(z_t)
-    x_embed_all = h_t.detach().cpu().numpy().astype(np.float64, copy=False)
-
     return PRAutoencoderDatasetBuildResult(
         theta_all=theta_all,
         x_embed_all=x_embed_all,
         base_dataset=base_dataset,
         embedder_config=cfg,
-        cache_run_dir=built.cache_run_dir,
-        loaded_from_cache=bool(built.loaded_from_cache),
+        cache_run_dir=cache_run_dir,
+        loaded_from_cache=loaded_from_cache,
     )

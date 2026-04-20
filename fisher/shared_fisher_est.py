@@ -47,7 +47,7 @@ from fisher.models import (
     PriorThetaFlowVelocityThetaFourierFiLMPerLayer,
     PriorThetaFlowVelocityThetaFourierMLP,
 )
-from fisher.dataset_family_recipes import raise_if_legacy_dataset_family
+from fisher.dataset_family_recipes import raise_if_legacy_dataset_family, raise_if_removed_dataset_family
 from fisher.ctsm_models import (
     PairConditionedTimeScoreNetBase,
     ToyPairConditionedTimeScoreNet,
@@ -689,6 +689,7 @@ def build_dataset_from_meta(
     | ToyConditionalGMMNonGaussianDataset
 ):
     family = str(meta["dataset_family"])
+    raise_if_removed_dataset_family(family)
     raise_if_legacy_dataset_family(family)
     seed = int(meta["seed"])
     if family in ("cosine_gaussian", "cosine_gaussian_const_noise"):
@@ -826,10 +827,13 @@ def build_dataset_from_meta(
             amps_sqrt = np.asarray(amps_raw, dtype=np.float64).reshape(-1)
         else:
             amps_sqrt = None
+        gen_x_dim = int(meta["x_dim"])
+        if bool(meta.get("pr_autoencoder_embedded", False)):
+            gen_x_dim = int(meta.get("pr_autoencoder_z_dim", gen_x_dim))
         return ToyConditionalGaussianRandampSqrtdDataset(
             theta_low=float(meta["theta_low"]),
             theta_high=float(meta["theta_high"]),
-            x_dim=int(meta["x_dim"]),
+            x_dim=gen_x_dim,
             tuning_curve_family=str(meta.get("tuning_curve_family", "cosine")),
             vm_mu_amp=float(meta.get("vm_mu_amp", 1.0)),
             vm_kappa=float(meta.get("vm_kappa", 1.0)),
@@ -855,45 +859,6 @@ def build_dataset_from_meta(
             randamp_kappa=float(meta.get("randamp_kappa", 0.2)),
             randamp_omega=float(meta.get("randamp_omega", 1.0)),
             randamp_mu_amp_per_dim=amps_sqrt,
-            seed=seed,
-        )
-    if family == "randamp_gaussian_sqrtd_pr_autoencoder":
-        amps_raw = meta.get("randamp_mu_amp_per_dim")
-        amps_sqrt_ae: np.ndarray | None
-        if amps_raw is not None:
-            amps_sqrt_ae = np.asarray(amps_raw, dtype=np.float64).reshape(-1)
-        else:
-            amps_sqrt_ae = None
-        z_dim = int(meta.get("pr_autoencoder_z_dim", 2))
-        return ToyConditionalGaussianRandampSqrtdDataset(
-            theta_low=float(meta["theta_low"]),
-            theta_high=float(meta["theta_high"]),
-            x_dim=z_dim,
-            tuning_curve_family=str(meta.get("tuning_curve_family", "cosine")),
-            vm_mu_amp=float(meta.get("vm_mu_amp", 1.0)),
-            vm_kappa=float(meta.get("vm_kappa", 1.0)),
-            vm_omega=float(meta.get("vm_omega", 1.0)),
-            gauss_mu_amp=float(meta.get("gauss_mu_amp", 1.0)),
-            gauss_kappa=float(meta.get("gauss_kappa", 0.2)),
-            gauss_omega=float(meta.get("gauss_omega", 1.0)),
-            sigma_x1=float(meta["sigma_x1"]),
-            sigma_x2=float(meta["sigma_x2"]),
-            rho=float(meta["rho"]),
-            cov_theta_amp1=float(meta["cov_theta_amp1"]),
-            cov_theta_amp2=float(meta["cov_theta_amp2"]),
-            cov_theta_amp_rho=float(meta["cov_theta_amp_rho"]),
-            cov_theta_freq1=float(meta["cov_theta_freq1"]),
-            cov_theta_freq2=float(meta["cov_theta_freq2"]),
-            cov_theta_freq_rho=float(meta["cov_theta_freq_rho"]),
-            cov_theta_phase1=float(meta["cov_theta_phase1"]),
-            cov_theta_phase2=float(meta["cov_theta_phase2"]),
-            cov_theta_phase_rho=float(meta["cov_theta_phase_rho"]),
-            rho_clip=float(meta["rho_clip"]),
-            randamp_mu_low=float(meta.get("randamp_mu_low", 0.5)),
-            randamp_mu_high=float(meta.get("randamp_mu_high", 1.5)),
-            randamp_kappa=float(meta.get("randamp_kappa", 0.2)),
-            randamp_omega=float(meta.get("randamp_omega", 1.0)),
-            randamp_mu_amp_per_dim=amps_sqrt_ae,
             seed=seed,
         )
     if family == "cosine_gmm":
@@ -3041,7 +3006,6 @@ def run_shared_fisher_estimation(
         "cosine_gaussian_sqrtd_rand_tune",
         "randamp_gaussian",
         "randamp_gaussian_sqrtd",
-        "randamp_gaussian_sqrtd_pr_autoencoder",
         "cos_sin_piecewise",
         "linear_piecewise",
     ):
@@ -3435,7 +3399,6 @@ def run_shared_fisher_estimation(
             "cosine_gaussian_sqrtd_rand_tune",
             "randamp_gaussian",
             "randamp_gaussian_sqrtd",
-            "randamp_gaussian_sqrtd_pr_autoencoder",
         ):
             _a = 0.5 * (float(args.cov_theta_amp1) + float(args.cov_theta_amp2))
             f.write(

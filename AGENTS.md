@@ -24,6 +24,10 @@ mamba run -n geo_diffusion python run_fisher.py decoder ... --device cuda
 
 - Default datasets and run outputs use `DATA_DIR = DATAROOT` from `global_setting.py` (override `DATAROOT` via `SCORE_MATCHING_FISHER_DATAROOT`). The repo `data/` path is a symlink to `DATAROOT` when present.
 
+### PR-autoencoder high-`x_dim` datasets
+
+- Generate low-dimensional `randamp_gaussian_sqrtd` with `bin/make_dataset.py`, then embed with `bin/project_dataset_pr_autoencoder.py` (see `docs/dataset_pr_autoencoder_workflow.md`). The `randamp_gaussian_sqrtd_pr_autoencoder` dataset-family token is removed.
+
 ### Reporting paths to humans (prefer `data/`)
 
 - When a file or directory lives under `DATAROOT`, **report it via the repo symlink** so paths match the tree users browse in the clone: **`./data/...`** (from repo root) or **`<repo-root>/data/...`** as a full absolute path.

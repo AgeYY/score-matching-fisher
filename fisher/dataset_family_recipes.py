@@ -20,6 +20,21 @@ LEGACY_DATASET_FAMILY_TO_CANONICAL: Final[dict[str, str]] = {
     "linear_piecewise_noise": "linear_piecewise",
 }
 
+# Dataset tokens removed from the CLI; archives using them must be regenerated.
+REMOVED_DATASET_FAMILIES: Final[dict[str, str]] = {
+    "randamp_gaussian_sqrtd_pr_autoencoder": (
+        "Use a two-step workflow: (1) `python bin/make_dataset.py --dataset-family randamp_gaussian_sqrtd ...` "
+        "for low-dimensional x, then (2) `python bin/project_dataset_pr_autoencoder.py --input-npz ... "
+        "--output-npz ... --h-dim ...` to embed into high-dimensional observation space."
+    ),
+}
+
+
+def raise_if_removed_dataset_family(family: str) -> None:
+    fam = str(family)
+    if fam in REMOVED_DATASET_FAMILIES:
+        raise ValueError(f"dataset_family={fam!r} is no longer supported. {REMOVED_DATASET_FAMILIES[fam]}")
+
 
 def raise_if_legacy_dataset_family(family: str) -> None:
     """Raise ``ValueError`` if ``family`` is a pre-rename token (NPZ meta or manual namespace)."""
@@ -124,6 +139,7 @@ def _base_gaussian_like() -> dict[str, Any]:
 def family_recipe_dict(family: str) -> dict[str, Any]:
     """Return fixed hyperparameters for `family` (excluding seed/theta bounds/x_dim/n_total/train_frac)."""
     fam = str(family)
+    raise_if_removed_dataset_family(fam)
     raise_if_legacy_dataset_family(fam)
     base = _base_gaussian_like()
     if fam == "cosine_gaussian":
@@ -151,8 +167,6 @@ def family_recipe_dict(family: str) -> dict[str, Any]:
     if fam == "randamp_gaussian":
         return {**base, "sigma_x1": 0.30, "sigma_x2": 0.30}
     if fam == "randamp_gaussian_sqrtd":
-        return {**base, "sigma_x1": 0.20, "sigma_x2": 0.20}
-    if fam == "randamp_gaussian_sqrtd_pr_autoencoder":
         return {**base, "sigma_x1": 0.20, "sigma_x2": 0.20}
     if fam == "cosine_gmm":
         return {**base, "sigma_x1": 0.30, "sigma_x2": 0.30}
@@ -214,16 +228,10 @@ def format_resolved_family_summary(ns: Any) -> str:
     if fam in (
         "randamp_gaussian",
         "randamp_gaussian_sqrtd",
-        "randamp_gaussian_sqrtd_pr_autoencoder",
     ):
         lines.append(
             f"  randamp bumps: low={r['randamp_mu_low']}, high={r['randamp_mu_high']}, "
             f"kappa={r['randamp_kappa']}, omega={r['randamp_omega']}"
-        )
-    if fam == "randamp_gaussian_sqrtd_pr_autoencoder":
-        z_ae = int(getattr(ns, "pr_autoencoder_z_dim", 2))
-        lines.append(
-            f"  pr_autoencoder embedding: trained map; z_dim={z_ae} (see --pr-autoencoder-z-dim), hidden=(100,200)"
         )
     if fam == "cosine_gaussian_sqrtd_rand_tune":
         lines.append(
