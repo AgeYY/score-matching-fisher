@@ -129,6 +129,15 @@ def family_recipe_dict(family: str) -> dict[str, Any]:
     if fam == "cosine_gaussian":
         out = {**base, "sigma_x1": 0.50, "sigma_x2": 0.50}
         return out
+    if fam == "cosine_gaussian_const_noise":
+        return {
+            **base,
+            "sigma_x1": 0.50,
+            "sigma_x2": 0.50,
+            "cov_theta_amp1": 0.0,
+            "cov_theta_amp2": 0.0,
+            "cov_theta_amp_rho": 0.0,
+        }
     if fam == "cosine_gaussian_sqrtd":
         return {**base, "sigma_x1": 0.50, "sigma_x2": 0.50}
     if fam == "cosine_gaussian_sqrtd_rand_tune":
@@ -210,6 +219,8 @@ def format_resolved_family_summary(ns: Any) -> str:
             f"  cosine per-dim amp: Uniform({r['cosine_tune_amp_low']}, {r['cosine_tune_amp_high']}) "
             "(fixed across samples; stored in NPZ meta)"
         )
+    if fam == "cosine_gaussian_const_noise":
+        lines.append("  constant noise: cov_theta_amp1=cov_theta_amp2=0 (no activity-coupled variance modulation)")
     if fam == "cosine_gmm":
         lines.append(
             f"  gmm: sep_scale={r['gmm_sep_scale']}, mix_logit_scale={r['gmm_mix_logit_scale']}, ..."

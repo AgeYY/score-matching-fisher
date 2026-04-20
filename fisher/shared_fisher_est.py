@@ -150,9 +150,9 @@ def normalize_theta_field_method(method: str) -> str:
 
 def normalize_flow_arch(args: Any) -> str:
     arch = str(getattr(args, "flow_arch", "mlp")).strip().lower()
-    if arch in ("mlp", "film_fourier", "iid_soft"):
+    if arch in ("mlp", "film", "film_fourier", "iid_soft"):
         return arch
-    raise ValueError("--flow-arch must be one of {'mlp','film_fourier','iid_soft'}.")
+    raise ValueError("--flow-arch must be one of {'mlp','film','film_fourier','iid_soft'}.")
 
 
 def build_posterior_score_model(
@@ -694,7 +694,7 @@ def build_dataset_from_meta(
     family = str(meta["dataset_family"])
     raise_if_legacy_dataset_family(family)
     seed = int(meta["seed"])
-    if family == "cosine_gaussian":
+    if family in ("cosine_gaussian", "cosine_gaussian_const_noise"):
         return ToyConditionalGaussianDataset(
             theta_low=float(meta["theta_low"]),
             theta_high=float(meta["theta_high"]),
@@ -955,12 +955,12 @@ def validate_estimation_args(args: Any) -> None:
     legacy_flow_prior_arch = getattr(args, "flow_prior_arch", None)
     if legacy_flow_score_arch is not None:
         raise ValueError(
-            "Legacy --flow-score-arch is removed. Use --flow-arch {mlp,film_fourier,iid_soft} "
+            "Legacy --flow-score-arch is removed. Use --flow-arch {mlp,film,film_fourier,iid_soft} "
             "(iid_soft is x_flow only)."
         )
     if legacy_flow_prior_arch is not None:
         raise ValueError(
-            "Legacy --flow-prior-arch is removed. Use --flow-arch {mlp,film_fourier,iid_soft} "
+            "Legacy --flow-prior-arch is removed. Use --flow-arch {mlp,film,film_fourier,iid_soft} "
             "(iid_soft is x_flow only)."
         )
     if args.score_eval_sigmas < 1:
@@ -1082,8 +1082,8 @@ def validate_estimation_args(args: Any) -> None:
         raise ValueError("--flow-prior-cond-embed-dim must be >= 1.")
     if int(getattr(args, "flow_prior_cond_embed_depth", 1)) < 1:
         raise ValueError("--flow-prior-cond-embed-depth must be >= 1.")
-    if _arch not in ("mlp", "film_fourier", "iid_soft"):
-        raise ValueError("--flow-arch must be one of {'mlp','film_fourier','iid_soft'}.")
+    if _arch not in ("mlp", "film", "film_fourier", "iid_soft"):
+        raise ValueError("--flow-arch must be one of {'mlp','film','film_fourier','iid_soft'}.")
     if _arch == "iid_soft" and _tfm_val not in ("x_flow", "theta_flow", "theta_path_integral"):
         raise ValueError(
             "--flow-arch iid_soft is only valid with --theta-field-method "
@@ -1320,6 +1320,41 @@ def _save_dsm_score_prior_training_losses_npz(
         prior_n_total_steps=np.int64(prior_n_total_steps),
         prior_lr_last=np.float64(prior_lr_last),
     )
+    return path
+
+
+def _save_theta_flow_model_checkpoint(
+    *,
+    output_dir: str,
+    filename: str,
+    model: torch.nn.Module,
+    model_role: str,
+    theta_field_method: str,
+    flow_arch: str,
+    flow_scheduler: str,
+    theta_dim_flow: int,
+    model_hparams: dict[str, Any],
+    args: Any,
+) -> str:
+    """Save a theta-flow model checkpoint with enough metadata to reconstruct the module."""
+    path = os.path.join(output_dir, filename)
+    payload = {
+        "checkpoint_version": 1,
+        "model_role": str(model_role),
+        "theta_field_method": str(theta_field_method),
+        "flow_arch": str(flow_arch),
+        "flow_scheduler": str(flow_scheduler),
+        "theta_dim_flow": int(theta_dim_flow),
+        "x_dim": int(getattr(args, "x_dim", -1)),
+        "theta_flow_onehot_state": bool(getattr(args, "theta_flow_onehot_state", False)),
+        "theta_flow_fourier_state": bool(getattr(args, "theta_flow_fourier_state", False)),
+        "theta_flow_fourier_k": int(getattr(args, "theta_flow_fourier_k", 0)),
+        "theta_flow_fourier_period_mult": float(getattr(args, "theta_flow_fourier_period_mult", 0.0)),
+        "theta_flow_fourier_include_linear": bool(getattr(args, "theta_flow_fourier_include_linear", False)),
+        "model_hparams": dict(model_hparams),
+        "state_dict": model.state_dict(),
+    }
+    torch.save(payload, path)
     return path
 
 
@@ -1780,7 +1815,14 @@ def run_shared_fisher_estimation(
         theta_std = float(np.std(theta_score_fit))
         flow_score_arch = str(flow_arch).strip().lower()
         _xf_extra = ""
-        if flow_score_arch == "film_fourier":
+        if flow_score_arch == "film":
+            _xf_extra = (
+                " film"
+                f" theta_embed_dim={int(getattr(args, 'flow_cond_embed_dim', 16))}"
+                f" theta_embed_depth={int(getattr(args, 'flow_cond_embed_depth', 1))}"
+                f" theta_embed_act={str(getattr(args, 'flow_cond_embed_act', 'silu'))}"
+            )
+        elif flow_score_arch == "film_fourier":
             _om_eff, _om_log = effective_flow_x_theta_fourier_omega(args)
             _xf_extra = (
                 f" theta_fourier_k={int(getattr(args, 'flow_x_theta_fourier_k', 4))}"
@@ -1827,6 +1869,19 @@ def run_shared_fisher_estimation(
                 depth=int(getattr(args, "flow_depth", 3)),
                 use_logit_time=True,
             ).to(device)
+        elif flow_score_arch == "film":
+            x_flow_model = ConditionalXFlowVelocityFiLMPerLayer(
+                x_dim=int(args.x_dim),
+                hidden_dim=int(getattr(args, "flow_hidden_dim", 128)),
+                depth=int(getattr(args, "flow_depth", 3)),
+                use_logit_time=True,
+                use_layer_norm=bool(getattr(args, "flow_use_layer_norm", False)),
+                gated_film=bool(getattr(args, "flow_gated_film", False)),
+                zero_out_init=bool(getattr(args, "flow_zero_out_init", False)),
+                cond_embed_dim=int(getattr(args, "flow_cond_embed_dim", 16)),
+                cond_embed_depth=int(getattr(args, "flow_cond_embed_depth", 1)),
+                cond_embed_act=str(getattr(args, "flow_cond_embed_act", "silu")),
+            ).to(device)
         elif flow_score_arch == "film_fourier":
             _om_eff, _ = effective_flow_x_theta_fourier_omega(args)
             x_flow_model = ConditionalXFlowVelocityThetaFourierFiLMPerLayer(
@@ -1859,7 +1914,7 @@ def run_shared_fisher_estimation(
                 alpha_learnable=_alpha_learn,
             ).to(device)
         else:
-            raise ValueError("--flow-arch must be one of {'mlp','film_fourier','iid_soft'}.")
+            raise ValueError("--flow-arch must be one of {'mlp','film','film_fourier','iid_soft'}.")
         post_train_out = train_conditional_x_flow_model(
             model=x_flow_model,
             theta_train=theta_score_fit,
@@ -2054,7 +2109,13 @@ def run_shared_fisher_estimation(
             f"theta_std={theta_std:.6f} theta_dim={theta_dim_flow} theta_repr={theta_repr}"
         )
         _xf_post = ""
-        if flow_score_arch == "film_fourier":
+        if flow_score_arch == "film":
+            _xf_post = (
+                f" post_film theta_embed_dim={int(getattr(args, 'flow_cond_embed_dim', 16))}"
+                f" theta_embed_depth={int(getattr(args, 'flow_cond_embed_depth', 1))}"
+                f" theta_embed_act={str(getattr(args, 'flow_cond_embed_act', 'silu'))}"
+            )
+        elif flow_score_arch == "film_fourier":
             _om_eff, _om_log = effective_flow_theta_fourier_omega_post(args)
             _xf_post = (
                 f" theta_fourier_post_k={int(getattr(args, 'flow_theta_fourier_k', 4))}"
@@ -2078,7 +2139,13 @@ def run_shared_fisher_estimation(
                 f" psi_hidden={_int_h_pi} psi_depth={_int_d_pi}"
             )
         _xf_prior = ""
-        if flow_prior_arch == "film_fourier":
+        if flow_prior_arch == "film":
+            _xf_prior = (
+                f" prior_film theta_embed_dim={int(getattr(args, 'flow_prior_cond_embed_dim', 16))}"
+                f" theta_embed_depth={int(getattr(args, 'flow_prior_cond_embed_depth', 1))}"
+                f" theta_embed_act={str(getattr(args, 'flow_prior_cond_embed_act', 'silu'))}"
+            )
+        elif flow_prior_arch == "film_fourier":
             _om_eff_p, _om_log_p = effective_flow_theta_fourier_omega_prior(args)
             _xf_prior = (
                 f" theta_fourier_prior_k={int(getattr(args, 'flow_prior_theta_fourier_k', 4))}"
@@ -2113,6 +2180,13 @@ def run_shared_fisher_estimation(
         )
 
         if flow_score_arch == "mlp":
+            post_ckpt_hparams = {
+                "x_dim": int(args.x_dim),
+                "hidden_dim": int(getattr(args, "flow_hidden_dim", 128)),
+                "depth": int(getattr(args, "flow_depth", 3)),
+                "use_logit_time": True,
+                "theta_dim": int(theta_dim_flow),
+            }
             post_model = ConditionalThetaFlowVelocity(
                 x_dim=args.x_dim,
                 hidden_dim=int(getattr(args, "flow_hidden_dim", 128)),
@@ -2120,8 +2194,46 @@ def run_shared_fisher_estimation(
                 use_logit_time=True,
                 theta_dim=theta_dim_flow,
             ).to(device)
+        elif flow_score_arch == "film":
+            post_ckpt_hparams = {
+                "x_dim": int(args.x_dim),
+                "hidden_dim": int(getattr(args, "flow_hidden_dim", 128)),
+                "depth": int(getattr(args, "flow_depth", 3)),
+                "use_logit_time": True,
+                "use_layer_norm": bool(getattr(args, "flow_use_layer_norm", False)),
+                "gated_film": bool(getattr(args, "flow_gated_film", False)),
+                "zero_out_init": bool(getattr(args, "flow_zero_out_init", False)),
+                "cond_embed_dim": int(getattr(args, "flow_cond_embed_dim", 16)),
+                "cond_embed_depth": int(getattr(args, "flow_cond_embed_depth", 1)),
+                "cond_embed_act": str(getattr(args, "flow_cond_embed_act", "silu")),
+            }
+            post_model = ConditionalThetaFlowVelocityFiLMPerLayer(
+                x_dim=int(args.x_dim),
+                hidden_dim=int(getattr(args, "flow_hidden_dim", 128)),
+                depth=int(getattr(args, "flow_depth", 3)),
+                use_logit_time=True,
+                use_layer_norm=bool(getattr(args, "flow_use_layer_norm", False)),
+                gated_film=bool(getattr(args, "flow_gated_film", False)),
+                zero_out_init=bool(getattr(args, "flow_zero_out_init", False)),
+                cond_embed_dim=int(getattr(args, "flow_cond_embed_dim", 16)),
+                cond_embed_depth=int(getattr(args, "flow_cond_embed_depth", 1)),
+                cond_embed_act=str(getattr(args, "flow_cond_embed_act", "silu")),
+            ).to(device)
         elif flow_score_arch == "film_fourier":
             _om_eff, _ = effective_flow_theta_fourier_omega_post(args)
+            post_ckpt_hparams = {
+                "x_dim": int(args.x_dim),
+                "hidden_dim": int(getattr(args, "flow_hidden_dim", 128)),
+                "depth": int(getattr(args, "flow_depth", 3)),
+                "use_logit_time": True,
+                "use_layer_norm": bool(getattr(args, "flow_use_layer_norm", False)),
+                "gated_film": bool(getattr(args, "flow_gated_film", False)),
+                "zero_out_init": bool(getattr(args, "flow_zero_out_init", False)),
+                "theta_fourier_k": int(getattr(args, "flow_theta_fourier_k", 4)),
+                "theta_fourier_omega": float(_om_eff),
+                "theta_fourier_include_linear": not bool(getattr(args, "flow_theta_fourier_no_linear", False)),
+                "theta_fourier_include_bias": not bool(getattr(args, "flow_theta_fourier_no_bias", False)),
+            }
             post_model = ConditionalThetaFlowVelocityThetaFourierFiLMPerLayer(
                 x_dim=int(args.x_dim),
                 hidden_dim=int(getattr(args, "flow_hidden_dim", 128)),
@@ -2144,6 +2256,17 @@ def run_shared_fisher_estimation(
             _pid = int(_pdr) if _pdr is not None else _pd
             _pai = float(getattr(args, "flow_theta_iid_alpha_init", 0.001))
             _pal = not bool(getattr(args, "flow_theta_iid_alpha_fixed", False))
+            post_ckpt_hparams = {
+                "x_dim": int(args.x_dim),
+                "hidden_dim": int(_ph),
+                "depth": int(_pd),
+                "use_logit_time": True,
+                "theta_dim": int(theta_dim_flow),
+                "interaction_hidden_dim": int(_pih),
+                "interaction_depth": int(_pid),
+                "alpha_init": float(_pai),
+                "alpha_learnable": bool(_pal),
+            }
             post_model = ConditionalThetaFlowVelocityIIDSoft(
                 x_dim=int(args.x_dim),
                 hidden_dim=_ph,
@@ -2156,7 +2279,7 @@ def run_shared_fisher_estimation(
                 alpha_learnable=_pal,
             ).to(device)
         else:
-            raise ValueError("--flow-arch must be one of {'mlp','film_fourier','iid_soft'}.")
+            raise ValueError("--flow-arch must be one of {'mlp','film','film_fourier','iid_soft'}.")
         post_train_out = train_conditional_theta_flow_model(
             model=post_model,
             theta_train=theta_score_fit,
@@ -2217,14 +2340,55 @@ def run_shared_fisher_estimation(
         plt.close()
 
         if flow_prior_arch == "mlp":
+            prior_ckpt_hparams = {
+                "hidden_dim": int(getattr(args, "prior_hidden_dim", 128)),
+                "depth": int(getattr(args, "prior_depth", 3)),
+                "use_logit_time": True,
+                "theta_dim": int(theta_dim_flow),
+            }
             prior_model_flow = PriorThetaFlowVelocity(
                 hidden_dim=int(getattr(args, "prior_hidden_dim", 128)),
                 depth=int(getattr(args, "prior_depth", 3)),
                 use_logit_time=True,
                 theta_dim=theta_dim_flow,
             ).to(device)
+        elif flow_prior_arch == "film":
+            prior_ckpt_hparams = {
+                "hidden_dim": int(getattr(args, "prior_hidden_dim", 128)),
+                "depth": int(getattr(args, "prior_depth", 3)),
+                "use_logit_time": True,
+                "use_layer_norm": bool(getattr(args, "flow_prior_use_layer_norm", False)),
+                "gated_film": bool(getattr(args, "flow_prior_gated_film", False)),
+                "zero_out_init": bool(getattr(args, "flow_prior_zero_out_init", False)),
+                "cond_embed_dim": int(getattr(args, "flow_prior_cond_embed_dim", 16)),
+                "cond_embed_depth": int(getattr(args, "flow_prior_cond_embed_depth", 1)),
+                "cond_embed_act": str(getattr(args, "flow_prior_cond_embed_act", "silu")),
+            }
+            prior_model_flow = PriorThetaFlowVelocityFiLMPerLayer(
+                hidden_dim=int(getattr(args, "prior_hidden_dim", 128)),
+                depth=int(getattr(args, "prior_depth", 3)),
+                use_logit_time=True,
+                use_layer_norm=bool(getattr(args, "flow_prior_use_layer_norm", False)),
+                gated_film=bool(getattr(args, "flow_prior_gated_film", False)),
+                zero_out_init=bool(getattr(args, "flow_prior_zero_out_init", False)),
+                cond_embed_dim=int(getattr(args, "flow_prior_cond_embed_dim", 16)),
+                cond_embed_depth=int(getattr(args, "flow_prior_cond_embed_depth", 1)),
+                cond_embed_act=str(getattr(args, "flow_prior_cond_embed_act", "silu")),
+            ).to(device)
         elif flow_prior_arch == "film_fourier":
             _om_eff_p, _ = effective_flow_theta_fourier_omega_prior(args)
+            prior_ckpt_hparams = {
+                "hidden_dim": int(getattr(args, "prior_hidden_dim", 128)),
+                "depth": int(getattr(args, "prior_depth", 3)),
+                "use_logit_time": True,
+                "use_layer_norm": bool(getattr(args, "flow_prior_use_layer_norm", False)),
+                "gated_film": bool(getattr(args, "flow_prior_gated_film", False)),
+                "zero_out_init": bool(getattr(args, "flow_prior_zero_out_init", False)),
+                "theta_fourier_k": int(getattr(args, "flow_prior_theta_fourier_k", 4)),
+                "theta_fourier_omega": float(_om_eff_p),
+                "theta_fourier_include_linear": not bool(getattr(args, "flow_prior_theta_fourier_no_linear", False)),
+                "theta_fourier_include_bias": not bool(getattr(args, "flow_prior_theta_fourier_no_bias", False)),
+            }
             prior_model_flow = PriorThetaFlowVelocityThetaFourierFiLMPerLayer(
                 hidden_dim=int(getattr(args, "prior_hidden_dim", 128)),
                 depth=int(getattr(args, "prior_depth", 3)),
@@ -2246,6 +2410,16 @@ def run_shared_fisher_estimation(
             _prid = int(_prdr) if _prdr is not None else _prd0
             _prai = float(getattr(args, "flow_prior_iid_alpha_init", 0.001))
             _pral = not bool(getattr(args, "flow_prior_iid_alpha_fixed", False))
+            prior_ckpt_hparams = {
+                "hidden_dim": int(_prh),
+                "depth": int(_prd0),
+                "use_logit_time": True,
+                "theta_dim": int(theta_dim_flow),
+                "interaction_hidden_dim": int(_prih),
+                "interaction_depth": int(_prid),
+                "alpha_init": float(_prai),
+                "alpha_learnable": bool(_pral),
+            }
             prior_model_flow = PriorThetaFlowVelocityIIDSoft(
                 hidden_dim=_prh,
                 depth=_prd0,
@@ -2257,7 +2431,7 @@ def run_shared_fisher_estimation(
                 alpha_learnable=_pral,
             ).to(device)
         else:
-            raise ValueError("--flow-arch must be one of {'mlp','film_fourier','iid_soft'}.")
+            raise ValueError("--flow-arch must be one of {'mlp','film','film_fourier','iid_soft'}.")
         prior_train_out = train_prior_theta_flow_model(
             model=prior_model_flow,
             theta_train=theta_score_fit,
@@ -2315,6 +2489,33 @@ def run_shared_fisher_estimation(
         plt.savefig(prior_loss_fig, dpi=180)
         plt.close()
 
+        post_ckpt_path = _save_theta_flow_model_checkpoint(
+            output_dir=args.output_dir,
+            filename="theta_flow_posterior_checkpoint.pt",
+            model=post_model,
+            model_role="posterior",
+            theta_field_method=theta_field_method,
+            flow_arch=flow_score_arch,
+            flow_scheduler=str(getattr(args, "flow_scheduler", "cosine")),
+            theta_dim_flow=theta_dim_flow,
+            model_hparams=post_ckpt_hparams,
+            args=args,
+        )
+        prior_ckpt_path = _save_theta_flow_model_checkpoint(
+            output_dir=args.output_dir,
+            filename="theta_flow_prior_checkpoint.pt",
+            model=prior_model_flow,
+            model_role="prior",
+            theta_field_method=theta_field_method,
+            flow_arch=flow_prior_arch,
+            flow_scheduler=str(getattr(args, "flow_scheduler", "cosine")),
+            theta_dim_flow=theta_dim_flow,
+            model_hparams=prior_ckpt_hparams,
+            args=args,
+        )
+        print(f"[theta_flow_ckpt] saved posterior checkpoint: {post_ckpt_path}")
+        print(f"[theta_flow_ckpt] saved prior checkpoint: {prior_ckpt_path}")
+
         # H matrix: full per-run pool (train ∪ validation); fitting stays on train split with val early stop.
         theta_h_matrix = np.asarray(theta_all, dtype=np.float64)
         x_h_matrix = np.asarray(x_all, dtype=np.float64)
@@ -2366,6 +2567,8 @@ def run_shared_fisher_estimation(
             print("Saved artifacts:")
             print(f"  - {post_loss_fig}")
             print(f"  - {prior_loss_fig}")
+            print(f"  - {post_ckpt_path}")
+            print(f"  - {prior_ckpt_path}")
             print(f"  - {h_npz_path}")
             print(f"  - {h_summary_path}")
             print(f"  - {h_fig_path}")
@@ -2945,6 +3148,7 @@ def run_shared_fisher_estimation(
 
     if args.dataset_family in (
         "cosine_gaussian",
+        "cosine_gaussian_const_noise",
         "cosine_gaussian_sqrtd",
         "cosine_gaussian_sqrtd_rand_tune",
         "randamp_gaussian",
@@ -3337,6 +3541,7 @@ def run_shared_fisher_estimation(
                 f.write(f"delta_l_heatmap: {h_delta_fig_path}\n")
         if args.dataset_family in (
             "cosine_gaussian",
+            "cosine_gaussian_const_noise",
             "cosine_gaussian_sqrtd",
             "cosine_gaussian_sqrtd_rand_tune",
             "randamp_gaussian",

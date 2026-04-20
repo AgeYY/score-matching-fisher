@@ -15,6 +15,8 @@ Run ``python bin/make_dataset.py --help`` for argparse defaults and exact wordin
     Choices (``--dataset-family`` token — summary):
 
     - ``cosine_gaussian`` — Cosine means; theta-modulated diagonal Gaussian noise (baseline sigmas 0.50).
+    - ``cosine_gaussian_const_noise`` — Cosine means; constant diagonal Gaussian noise (no
+      activity-coupled variance modulation; baseline sigmas 0.50).
     - ``cosine_gaussian_sqrtd`` — Same cosine means; noise variance scaled by ``x_dim`` (baseline
       sigmas 0.50) so std ~ sqrt(d).
     - ``cosine_gaussian_sqrtd_rand_tune`` — Like ``cosine_gaussian_sqrtd``, but each coordinate's

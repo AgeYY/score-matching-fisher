@@ -92,6 +92,27 @@ class TestGaussianTuningCurve(unittest.TestCase):
         self.assertEqual(x.shape, (32, 3))
         self.assertTrue(np.isfinite(x).all())
 
+    def test_cli_build_dataset_cosine_const_noise(self) -> None:
+        ns = _ns(dataset_family="cosine_gaussian_const_noise", n_total=64, train_frac=1.0, seed=0, x_dim=3)
+        validate_dataset_sample_args(ns)
+        ds = build_dataset_from_args(ns)
+        self.assertIsInstance(ds, ToyConditionalGaussianDataset)
+        self.assertAlmostEqual(float(ds.cov_theta_amp1), 0.0, places=12)
+        self.assertAlmostEqual(float(ds.cov_theta_amp2), 0.0, places=12)
+        theta, x = ds.sample_joint(32)
+        self.assertEqual(theta.shape, (32, 1))
+        self.assertEqual(x.shape, (32, 3))
+        self.assertTrue(np.isfinite(x).all())
+
+    def test_cosine_const_noise_scales_are_theta_independent(self) -> None:
+        ns = _ns(dataset_family="cosine_gaussian_const_noise", n_total=64, train_frac=1.0, seed=0, x_dim=4)
+        validate_dataset_sample_args(ns)
+        ds = build_dataset_from_args(ns)
+        theta_grid = np.linspace(float(ns.theta_low), float(ns.theta_high), 21, dtype=np.float64).reshape(-1, 1)
+        scales = ds.covariance_scales(theta_grid)
+        ref = scales[0:1, :]
+        np.testing.assert_allclose(scales, np.repeat(ref, scales.shape[0], axis=0), rtol=0, atol=1e-12)
+
     def test_legacy_cli_flag_rejected(self) -> None:
         with self.assertRaises(ValueError) as ctx:
             assert_no_legacy_dataset_cli_flags(["--tuning-curve-family", "gaussian_raw"])

@@ -31,6 +31,7 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
         default="cosine_gaussian",
         choices=[
             "cosine_gaussian",
+            "cosine_gaussian_const_noise",
             "cosine_gaussian_sqrtd",
             "cosine_gaussian_sqrtd_rand_tune",
             "randamp_gaussian",
@@ -42,6 +43,7 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
         help=(
             "Generative family (selects fixed tuning + noise internally). Options: "
             "'cosine_gaussian' (theta-modulated Gaussian obs. noise, cosine means); "
+            "'cosine_gaussian_const_noise' (cosine means + constant Gaussian obs. noise); "
             "'cosine_gaussian_sqrtd' (same means; obs. noise std scales by sqrt(x_dim)); "
             "'cosine_gaussian_sqrtd_rand_tune' (like cosine_gaussian_sqrtd but per-dim cosine "
             "amplitudes drawn once from Uniform(0.5, 1.5)); "
@@ -284,10 +286,11 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         "--flow-arch",
         type=str,
         default="mlp",
-        choices=["mlp", "film_fourier", "iid_soft"],
+        choices=["mlp", "film", "film_fourier", "iid_soft"],
         help=(
             "Flow architecture shared by theta_flow, theta_path_integral, and x_flow: "
-            "mlp, film_fourier (FiLM blocks with Fourier theta features), or iid_soft "
+            "mlp, film (FiLM blocks with embedded raw theta), "
+            "film_fourier (FiLM blocks with Fourier theta features), or iid_soft "
             "(x_flow: mean pooled phi(x_k)+psi(x); theta_flow/theta_path_integral: "
             "mean pooled phi(theta~,x_i)+psi(theta~,x) in R^{theta_dim}; prior iid_soft unchanged; "
             "see --flow-x-iid-* and --flow-theta-iid-* / --flow-prior-iid-*)."
@@ -390,7 +393,7 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         "--flow-gated-film",
         action="store_true",
         default=False,
-        help="Theta-flow FiLM posterior: use bounded multiplicative FiLM (tanh-gated gamma).",
+        help="Posterior FiLM (flow-arch=film): use bounded multiplicative FiLM (tanh-gated gamma).",
     )
     p.add_argument(
         "--flow-prior-gated-film",
@@ -402,7 +405,7 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         "--flow-use-layer-norm",
         action="store_true",
         default=False,
-        help="Theta-flow FiLM posterior: LayerNorm on trunk and FiLM block outputs.",
+        help="Posterior FiLM (flow-arch=film): LayerNorm on trunk and FiLM block outputs.",
     )
     p.add_argument(
         "--flow-prior-use-layer-norm",
@@ -414,7 +417,7 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         "--flow-zero-out-init",
         action="store_true",
         default=False,
-        help="Theta-flow FiLM posterior: zero-initialize final linear head.",
+        help="Posterior FiLM (flow-arch=film): zero-initialize final linear head.",
     )
     p.add_argument(
         "--flow-prior-zero-out-init",
@@ -427,7 +430,7 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         type=int,
         default=16,
         help=(
-            "Theta-flow FiLM posterior only: per-channel embedding width for theta_t and for logit(t); "
+            "Posterior FiLM (flow-arch=film): per-channel embedding width for theta_t and for logit(t); "
             "FiLM cond is concat(theta_embed, time_embed) with total dim 2×this. Default: 16."
         ),
     )
@@ -435,14 +438,14 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         "--flow-cond-embed-depth",
         type=int,
         default=1,
-        help="Theta-flow FiLM posterior: number of linear layers in each scalar embedding MLP (theta and t). Default: 1.",
+        help="Posterior FiLM (flow-arch=film): number of linear layers in each scalar embedding MLP (theta and t). Default: 1.",
     )
     p.add_argument(
         "--flow-cond-embed-act",
         type=str,
         default="silu",
         choices=["silu", "relu", "tanh"],
-        help="Theta-flow FiLM posterior: activation between layers in each scalar embedding MLP (not after last layer).",
+        help="Posterior FiLM (flow-arch=film): activation between layers in each scalar embedding MLP (not after last layer).",
     )
     p.add_argument(
         "--flow-prior-cond-embed-dim",

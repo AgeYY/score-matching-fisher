@@ -96,28 +96,50 @@ def test_theta_bin_helpers() -> None:
     assert idx.tolist() == [0, 0, 1, 1]
 
 
-def test_pairwise_clf_uses_train_then_scores_validation() -> None:
-    """Quick check that accuracy is computed on the validation rows only (shape / finite entries)."""
+def test_pairwise_clf_uses_train_then_scores_full_eval_pool() -> None:
+    """Fit split uses train rows; evaluation can use the full pooled rows."""
     rng = np.random.default_rng(0)
-    n_tr, n_va = 40, 20
+    n_tr = 60
     x_tr = rng.standard_normal((n_tr, 2))
-    x_va = rng.standard_normal((n_va, 2))
-    th_tr = rng.uniform(-1, 1, size=n_tr)
-    th_va = rng.uniform(-1, 1, size=n_va)
-    edges, _, _ = theta_bin_edges(np.concatenate([th_tr, th_va]), n_bins=3)
+    th_tr = np.concatenate(
+        [
+            rng.uniform(-1.0, -0.34, size=20),
+            rng.uniform(-0.33, 0.33, size=20),
+            rng.uniform(0.34, 1.0, size=20),
+        ]
+    )
+    # Eval pool has only one sample in the middle bin. Old validation-only gating would
+    # reject all pairs; new fit-train/eval-pool policy should still return finite pairs.
+    x_ev = np.vstack(
+        [
+            rng.standard_normal((10, 2)),
+            rng.standard_normal((1, 2)),
+            rng.standard_normal((10, 2)),
+        ]
+    )
+    th_ev = np.concatenate(
+        [
+            rng.uniform(-1.0, -0.34, size=10),
+            rng.uniform(-0.33, 0.33, size=1),
+            rng.uniform(0.34, 1.0, size=10),
+        ]
+    )
+    edges, _, _ = theta_bin_edges(np.concatenate([th_tr, th_ev]), n_bins=3)
     bi_tr = theta_to_bin_index(th_tr, edges, 3)
-    bi_va = theta_to_bin_index(th_va, edges, 3)
+    bi_ev = theta_to_bin_index(th_ev, edges, 3)
     acc, valid, _, stats = pairwise_bin_logistic_accuracy_train_val(
         x_tr,
         bi_tr,
-        x_va,
-        bi_va,
+        x_ev,
+        bi_ev,
         3,
-        min_class_count=2,
+        min_class_count=5,
         random_state=7,
     )
     assert acc.shape == (3, 3)
-    assert stats["ok_pairs"] >= 0
+    assert stats["ok_pairs"] > 0
+    assert np.any(np.isfinite(acc[~np.eye(3, dtype=bool)]))
+    assert bool(valid[0, 2])
 
 
 def test_average_matrix_by_bins() -> None:

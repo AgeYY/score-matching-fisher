@@ -23,7 +23,8 @@ log-likelihood Bayes ratios; prior + posterior theta-flows), ``--theta-field-met
 (same training as theta_flow but H from velocity-to-score plus trapezoid integral along sorted ``theta``),
 ``--theta-field-method x_flow`` (conditional x-space FM likelihood; no prior model), and
 ``--theta-field-method ctsm_v`` (pair-conditioned CTSM-v time-score integration; no prior model).
-Flow methods use ``--flow-arch``: ``mlp`` or ``film_fourier`` for ``theta_flow`` / ``theta_path_integral``;
+Flow methods use ``--flow-arch``: ``mlp``, ``film`` (FiLM with raw-theta embeddings), or
+``film_fourier`` for ``theta_flow`` / ``theta_path_integral``;
 you may also use ``iid_soft`` for any of ``theta_flow``, ``theta_path_integral``, or ``x_flow``
 (see ``--flow-theta-iid-*``, ``--flow-prior-iid-*``, and ``--flow-x-iid-*``).
 ``film_fourier`` uses FiLM conditioning with Fourier theta features
@@ -101,8 +102,9 @@ def build_parser() -> argparse.ArgumentParser:
             "Load a shared dataset .npz, train score models for each n in --n-list, then compare "
             "sqrt(binned H_sym) to sqrt(MC generative H^2) and pairwise decoding to the n_ref-subset decoding matrix. "
             "The n_ref matrix-panel column uses MC GT sqrt(H^2) for the top row (no n_ref model training). "
-            "Also writes h_decoding_convergence_combined.{png,svg} (line plot + matrix panel side-by-side) "
-            "and h_decoding_training_losses_panel.{png,svg} (score/prior loss vs epoch, one column per n)."
+            "Also writes h_decoding_convergence_combined.{png,svg} (matrix panel + correlation curves + "
+            "training-loss panel in one figure) and h_decoding_training_losses_panel.{png,svg} "
+            "(standalone training-loss panel, one column per n)."
         )
     )
     p.add_argument(
@@ -117,6 +119,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="randamp_gaussian_sqrtd",
         choices=[
             "cosine_gaussian",
+            "cosine_gaussian_const_noise",
             "cosine_gaussian_sqrtd",
             "cosine_gaussian_sqrtd_rand_tune",
             "randamp_gaussian",
@@ -476,8 +479,8 @@ def _metrics_fixed_edges(
     clf_acc, _, _, _ = vhb.pairwise_bin_logistic_accuracy_train_val(
         subset.bundle.x_train,
         subset.bin_train,
-        subset.bundle.x_validation,
-        subset.bin_validation,
+        subset.bundle.x_all,
+        subset.bin_all,
         n_bins,
         min_class_count=int(clf_min_class_count),
         random_state=int(clf_random_state),
@@ -495,7 +498,7 @@ def _pairwise_clf_from_bundle(
     clf_min_class_count: int,
     clf_random_state: int,
 ) -> np.ndarray:
-    """Pairwise bin decoding: train on NPZ train rows, accuracy on NPZ validation rows."""
+    """Pairwise bin decoding: train on NPZ train rows, accuracy on NPZ full pool."""
     d = vars(args).copy()
     d.setdefault("h_matrix_npz", None)
     d.setdefault("h_only", False)
@@ -505,8 +508,8 @@ def _pairwise_clf_from_bundle(
     clf_acc, _, _, _ = vhb.pairwise_bin_logistic_accuracy_train_val(
         subset.bundle.x_train,
         subset.bin_train,
-        subset.bundle.x_validation,
-        subset.bin_validation,
+        subset.bundle.x_all,
+        subset.bin_all,
         n_bins,
         min_class_count=int(clf_min_class_count),
         random_state=int(clf_random_state),
@@ -751,29 +754,39 @@ def _save_combined_convergence_figure(
     ns: list[int],
     corr_h: np.ndarray,
     corr_clf: np.ndarray,
+    loss_dir: str,
+    diagnostic_png_path: str | None,
     out_png_path: str,
     dpi: int = 160,
 ) -> str:
-    """Side-by-side matrix panel and correlation curves using one matplotlib figure.
+    """Single figure with matrix panel, correlation curves, training-loss panel, and optional diagnostic.
 
     PNG is raster as usual. SVG keeps the right-hand curve as vector paths (not a single
     embedded screenshot); heatmaps still use matplotlib's normal SVG image handling for ``imshow``.
 
-    Figure height matches the matrix panel (``m_h``). The right column width is chosen so its
-    aspect ratio matches ``_H_DECODING_CURVE_FIGSIZE_IN`` (default square 3.5×3.5 like the
-    isolated curve figure).
+    Top row is matrix panel (left) + correlation curves (right). Middle row spans both columns
+    and mirrors the standalone training-loss panel. Bottom row spans both columns and embeds
+    the fixed-x posterior+tuning diagnostic image when available.
     """
     crv_w, crv_h = _H_DECODING_CURVE_FIGSIZE_IN
     if crv_h <= 0:
         raise ValueError("_H_DECODING_CURVE_FIGSIZE_IN height must be > 0.")
     n_cols = len(h_mats)
+    n_loss_cols = len(ns)
     m_w, m_h = 2.8 * n_cols, 5.0
-    H = float(m_h)
-    Wm = m_w * H / m_h
-    Wc = H * (float(crv_w) / float(crv_h))
+    l_w, l_h = max(2.6 * n_loss_cols, 6.0), 5.8
+    top_h = float(m_h)
+    bot_h = float(l_h)
+    fig_w = max(m_w + (top_h * (float(crv_w) / float(crv_h))), l_w)
     # Constrained layout: colorbars make tight_layout warn and mis-place panels.
-    fig = plt.figure(figsize=(Wm + Wc, H), dpi=dpi, layout="constrained")
-    gs0 = fig.add_gridspec(1, 2, width_ratios=[Wm, Wc])
+    diag_h = 5.2
+    fig = plt.figure(figsize=(fig_w, top_h + bot_h + diag_h), dpi=dpi, layout="constrained")
+    gs0 = fig.add_gridspec(
+        3,
+        2,
+        width_ratios=[m_w, top_h * (float(crv_w) / float(crv_h))],
+        height_ratios=[top_h, bot_h, diag_h],
+    )
     gs_left = gs0[0, 0].subgridspec(2, n_cols)
     axes_m = np.empty((2, n_cols), dtype=object)
     for c in range(n_cols):
@@ -797,6 +810,121 @@ def _save_combined_convergence_figure(
         axis_labelsize=13.0,
         legend_fontsize=10.0,
     )
+    gs_loss = gs0[1, :].subgridspec(2, n_loss_cols)
+    axes_loss = np.empty((2, n_loss_cols), dtype=object)
+    row0_ylabel = "score / posterior loss"
+    row1_ylabel = "prior loss"
+    for j, n in enumerate(ns):
+        path = os.path.join(loss_dir, f"n_{int(n):06d}.npz")
+        axes_loss[0, j] = fig.add_subplot(gs_loss[0, j])
+        axes_loss[1, j] = fig.add_subplot(gs_loss[1, j])
+        if not os.path.isfile(path):
+            for r in (0, 1):
+                axes_loss[r, j].text(
+                    0.5,
+                    0.5,
+                    f"missing\n{path}",
+                    ha="center",
+                    va="center",
+                    transform=axes_loss[r, j].transAxes,
+                    fontsize=8,
+                    color="crimson",
+                )
+                axes_loss[r, j].set_axis_off()
+            continue
+        try:
+            bundle = _load_per_n_training_loss_npz(path)
+        except Exception as e:
+            for r in (0, 1):
+                axes_loss[r, j].text(
+                    0.5,
+                    0.5,
+                    f"load error:\n{e!s}"[:200],
+                    ha="center",
+                    va="center",
+                    transform=axes_loss[r, j].transAxes,
+                    fontsize=7,
+                    color="crimson",
+                )
+                axes_loss[r, j].set_axis_off()
+            continue
+        tfm = str(bundle.get("theta_field_method", "theta_flow")).strip().lower()
+        if tfm == "theta_flow":
+            post_lab = "theta-flow ODE Bayes-ratio"
+        elif tfm == "theta_path_integral":
+            post_lab = "theta-path-integral score"
+        elif tfm == "x_flow":
+            post_lab = "x-flow direct likelihood"
+        elif tfm == "ctsm_v":
+            post_lab = "pair-conditioned CTSM-v"
+        else:
+            post_lab = tfm
+        _plot_loss_triplet(
+            axes_loss[0, j],
+            bundle["score_train_losses"],
+            bundle["score_val_losses"],
+            bundle["score_val_monitor_losses"],
+            ylabel=row0_ylabel if j == 0 else "",
+            title=f"n={n} ({post_lab})",
+            show_legend=(j == 0),
+            score_like=True,
+        )
+        if bundle["prior_enable"]:
+            _plot_loss_triplet(
+                axes_loss[1, j],
+                bundle["prior_train_losses"],
+                bundle["prior_val_losses"],
+                bundle["prior_val_monitor_losses"],
+                ylabel=row1_ylabel if j == 0 else "",
+                title=None,
+                show_legend=(j == 0),
+                score_like=False,
+            )
+        else:
+            axes_loss[1, j].text(
+                0.5,
+                0.5,
+                "prior disabled",
+                ha="center",
+                va="center",
+                transform=axes_loss[1, j].transAxes,
+                fontsize=10,
+            )
+            axes_loss[1, j].set_axis_off()
+
+    ax_diag = fig.add_subplot(gs0[2, :])
+    if diagnostic_png_path is None or not os.path.isfile(str(diagnostic_png_path)):
+        ax_diag.text(
+            0.5,
+            0.5,
+            "Fixed-x posterior+tuning diagnostic not found.\n"
+            "Expected: sweep_runs/n_<max(n_list)>/diagnostics/theta_flow_single_x_posterior_hist.png",
+            ha="center",
+            va="center",
+            fontsize=10,
+        )
+        ax_diag.set_axis_off()
+    else:
+        try:
+            img = plt.imread(str(diagnostic_png_path))
+            ax_diag.imshow(img)
+            ax_diag.set_title(
+                f"Fixed-x posterior+tuning diagnostic ({os.path.basename(str(diagnostic_png_path))})",
+                fontsize=10,
+            )
+            ax_diag.axis("off")
+        except Exception as e:
+            ax_diag.text(
+                0.5,
+                0.5,
+                f"Failed to load diagnostic image:\n{e!s}",
+                ha="center",
+                va="center",
+                fontsize=9,
+                color="crimson",
+            )
+            ax_diag.set_axis_off()
+
     path_svg = _save_figure_png_svg(fig, out_png_path, dpi=dpi)
     plt.close(fig)
     return path_svg
@@ -1209,20 +1337,6 @@ def _render_convergence_figures_and_summary(
         theta_centers=theta_centers,
     )
 
-    combined_path = os.path.join(args.output_dir, "h_decoding_convergence_combined.png")
-    combined_svg = _save_combined_convergence_figure(
-        h_mats=list(h_cols),
-        clf_mats=list(clf_cols),
-        col_labels=col_labels,
-        n_bins=n_bins,
-        theta_centers=theta_centers,
-        ns=list(ns),
-        corr_h=corr_h,
-        corr_clf=corr_clf,
-        out_png_path=combined_path,
-        dpi=160,
-    )
-
     loss_dir = os.path.join(args.output_dir, "training_losses")
     os.makedirs(loss_dir, exist_ok=True)
     manifest_path = os.path.join(loss_dir, "manifest.txt")
@@ -1239,6 +1353,30 @@ def _render_convergence_figures_and_summary(
                     note=row["note"],
                 )
             )
+
+    combined_path = os.path.join(args.output_dir, "h_decoding_convergence_combined.png")
+    diagnostic_png = os.path.join(
+        args.output_dir,
+        "sweep_runs",
+        f"n_{int(max(ns)):06d}",
+        "diagnostics",
+        "theta_flow_single_x_posterior_hist.png",
+    )
+    diagnostic_png_use = diagnostic_png if os.path.isfile(diagnostic_png) else None
+    combined_svg = _save_combined_convergence_figure(
+        h_mats=list(h_cols),
+        clf_mats=list(clf_cols),
+        col_labels=col_labels,
+        n_bins=n_bins,
+        theta_centers=theta_centers,
+        ns=list(ns),
+        corr_h=corr_h,
+        corr_clf=corr_clf,
+        loss_dir=loss_dir,
+        diagnostic_png_path=diagnostic_png_use,
+        out_png_path=combined_path,
+        dpi=160,
+    )
 
     loss_panel_png = os.path.join(args.output_dir, "h_decoding_training_losses_panel.png")
     loss_panel_svg = _render_training_losses_panel(
@@ -1258,6 +1396,7 @@ def _render_convergence_figures_and_summary(
         "matrix_panel_svg": str(Path(matrix_panel_path).with_suffix(".svg")),
         "combined_figure": combined_path,
         "combined_figure_svg": combined_svg,
+        "embedded_fixed_x_diagnostic_png": diagnostic_png_use or "",
         "training_losses_panel": loss_panel_png,
         "training_losses_panel_svg": loss_panel_svg,
         "reference_npz": os.path.join(args.output_dir, "h_decoding_convergence_reference.npz"),

@@ -227,7 +227,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.3,
         help=(
             "Held-out fraction of the synthetic GT sample for GT-approximation pairwise decoding only "
-            "(default 0.3). Does not affect the primary classifier, which trains on NPZ train and scores on NPZ validation."
+            "(default 0.3). Does not affect the primary classifier, which trains on NPZ train and scores on NPZ full pool."
         ),
     )
     p.add_argument(
@@ -385,21 +385,21 @@ def x_for_h_matrix_alignment(bundle: SharedDatasetBundle, *, h_field_method: str
 def pairwise_bin_logistic_accuracy_train_val(
     x_train: np.ndarray,
     bin_train: np.ndarray,
-    x_val: np.ndarray,
-    bin_val: np.ndarray,
+    x_eval: np.ndarray,
+    bin_eval: np.ndarray,
     n_bins: int,
     *,
     min_class_count: int,
     random_state: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, int]]:
-    """Fit pairwise logistic models on training bins; report accuracy on validation bins."""
+    """Fit pairwise logistic models on training bins; report accuracy on evaluation bins."""
     x_tr = np.asarray(x_train, dtype=np.float64)
-    x_va = np.asarray(x_val, dtype=np.float64)
-    if x_tr.ndim != 2 or x_va.ndim != 2 or x_tr.shape[1] != x_va.shape[1]:
-        raise ValueError("x_train and x_val must be 2D with matching feature dim.")
+    x_ev = np.asarray(x_eval, dtype=np.float64)
+    if x_tr.ndim != 2 or x_ev.ndim != 2 or x_tr.shape[1] != x_ev.shape[1]:
+        raise ValueError("x_train and x_eval must be 2D with matching feature dim.")
     bi_tr = np.asarray(bin_train, dtype=np.int64).reshape(-1)
-    bi_va = np.asarray(bin_val, dtype=np.int64).reshape(-1)
-    if x_tr.shape[0] != bi_tr.shape[0] or x_va.shape[0] != bi_va.shape[0]:
+    bi_ev = np.asarray(bin_eval, dtype=np.int64).reshape(-1)
+    if x_tr.shape[0] != bi_tr.shape[0] or x_ev.shape[0] != bi_ev.shape[0]:
         raise ValueError("x_* and bin_* must have the same number of rows per split.")
     if min_class_count < 1:
         raise ValueError("--clf-min-class-count must be >= 1.")
@@ -414,35 +414,30 @@ def pairwise_bin_logistic_accuracy_train_val(
         for j in range(i + 1, n_bins):
             ia_tr = np.flatnonzero(bi_tr == i)
             jb_tr = np.flatnonzero(bi_tr == j)
-            ia_va = np.flatnonzero(bi_va == i)
-            jb_va = np.flatnonzero(bi_va == j)
+            ia_ev = np.flatnonzero(bi_ev == i)
+            jb_ev = np.flatnonzero(bi_ev == j)
             ni_tr, nj_tr = int(ia_tr.size), int(jb_tr.size)
-            ni_va, nj_va = int(ia_va.size), int(jb_va.size)
-            support[i, j] = ni_tr + nj_tr + ni_va + nj_va
+            ni_ev, nj_ev = int(ia_ev.size), int(jb_ev.size)
+            support[i, j] = ni_tr + nj_tr + ni_ev + nj_ev
             support[j, i] = support[i, j]
 
-            if (
-                ni_tr < min_class_count
-                or nj_tr < min_class_count
-                or ni_va < min_class_count
-                or nj_va < min_class_count
-            ):
+            if ni_tr < min_class_count or nj_tr < min_class_count:
                 stats["insufficient_counts"] += 1
                 continue
 
             X_tr = np.vstack([x_tr[ia_tr], x_tr[jb_tr]])
             y_tr = np.concatenate([np.zeros(ni_tr, dtype=np.int64), np.ones(nj_tr, dtype=np.int64)])
-            X_va = np.vstack([x_va[ia_va], x_va[jb_va]])
-            y_va = np.concatenate([np.zeros(ni_va, dtype=np.int64), np.ones(nj_va, dtype=np.int64)])
+            X_ev = np.vstack([x_ev[ia_ev], x_ev[jb_ev]])
+            y_ev = np.concatenate([np.zeros(ni_ev, dtype=np.int64), np.ones(nj_ev, dtype=np.int64)])
 
-            if len(np.unique(y_tr)) < 2 or len(np.unique(y_va)) < 2:
+            if len(np.unique(y_tr)) < 2 or len(np.unique(y_ev)) < 2:
                 stats["val_empty_class"] += 1
                 continue
 
             try:
                 clf = LogisticRegression(solver="lbfgs", random_state=rs)
                 clf.fit(X_tr, y_tr)
-                score = float(clf.score(X_va, y_va))
+                score = float(clf.score(X_ev, y_ev))
             except Exception:
                 stats["fit_fail"] += 1
                 continue
@@ -736,7 +731,7 @@ def compute_binned_metrics(ctx: RunContext, loaded: LoadedHMatrix) -> BinnedMetr
     edges, edge_lo, edge_hi = theta_bin_edges(theta_pooled, n_bins)
     bin_idx = theta_to_bin_index(np.asarray(loaded.theta_used, dtype=np.float64).reshape(-1), edges, n_bins)
     bin_train = theta_to_bin_index(th_tr, edges, n_bins)
-    bin_val = theta_to_bin_index(th_va, edges, n_bins)
+    bin_eval = theta_to_bin_index(np.asarray(ctx.bundle.theta_all, dtype=np.float64).reshape(-1), edges, n_bins)
     centers = 0.5 * (edges[:-1] + edges[1:])
 
     h_binned, count_matrix = average_matrix_by_bins(loaded.h_sym, bin_idx, n_bins)
@@ -748,8 +743,8 @@ def compute_binned_metrics(ctx: RunContext, loaded: LoadedHMatrix) -> BinnedMetr
     clf_acc, clf_valid, clf_support, clf_stats = pairwise_bin_logistic_accuracy_train_val(
         ctx.bundle.x_train,
         bin_train,
-        ctx.bundle.x_validation,
-        bin_val,
+        ctx.bundle.x_all,
+        bin_eval,
         n_bins,
         min_class_count=int(args.clf_min_class_count),
         random_state=clf_rs,
@@ -1275,7 +1270,7 @@ def write_summary(
 
         f.write(
             "classifier: sklearn LogisticRegression(lbfgs), pairwise bin i vs j; "
-            "fit on training NPZ rows, accuracy on validation NPZ rows\n"
+            "fit on training NPZ rows, accuracy on full NPZ pool (train+validation)\n"
         )
         f.write(
             f"  clf_min_class_count={int(ctx.args.clf_min_class_count)} "
