@@ -152,8 +152,6 @@ def family_recipe_dict(family: str) -> dict[str, Any]:
         return {**base, "sigma_x1": 0.30, "sigma_x2": 0.30}
     if fam == "randamp_gaussian_sqrtd":
         return {**base, "sigma_x1": 0.20, "sigma_x2": 0.20}
-    if fam == "randamp_gaussian_sqrtd_realnvp":
-        return {**base, "sigma_x1": 0.20, "sigma_x2": 0.20}
     if fam == "randamp_gaussian_sqrtd_pr_autoencoder":
         return {**base, "sigma_x1": 0.20, "sigma_x2": 0.20}
     if fam == "cosine_gmm":
@@ -216,16 +214,11 @@ def format_resolved_family_summary(ns: Any) -> str:
     if fam in (
         "randamp_gaussian",
         "randamp_gaussian_sqrtd",
-        "randamp_gaussian_sqrtd_realnvp",
         "randamp_gaussian_sqrtd_pr_autoencoder",
     ):
         lines.append(
             f"  randamp bumps: low={r['randamp_mu_low']}, high={r['randamp_mu_high']}, "
             f"kappa={r['randamp_kappa']}, omega={r['randamp_omega']}"
-        )
-    if fam == "randamp_gaussian_sqrtd_realnvp":
-        lines.append(
-            "  realnvp embedding: fixed untrained map with z_dim=2, n_transforms=6, hidden_width=128"
         )
     if fam == "randamp_gaussian_sqrtd_pr_autoencoder":
         z_ae = int(getattr(ns, "pr_autoencoder_z_dim", 2))

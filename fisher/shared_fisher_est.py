@@ -31,12 +31,10 @@ from fisher.models import (
     ConditionalScore1DFiLMPerLayer,
     ConditionalThetaFlowVelocity,
     ConditionalThetaFlowVelocityFiLMPerLayer,
-    ConditionalThetaFlowVelocityIIDSoft,
     ConditionalThetaFlowVelocityThetaFourierFiLMPerLayer,
     ConditionalThetaFlowVelocityThetaFourierMLP,
     ConditionalXFlowVelocity,
     ConditionalXFlowVelocityFiLMPerLayer,
-    ConditionalXFlowVelocityIIDSoft,
     ConditionalXFlowVelocityIndependentMLP,
     ConditionalXFlowVelocityIndependentThetaFourierMLP,
     ConditionalXFlowVelocityThetaFourierFiLMPerLayer,
@@ -46,7 +44,6 @@ from fisher.models import (
     PriorScore1DFiLMPerLayer,
     PriorThetaFlowVelocity,
     PriorThetaFlowVelocityFiLMPerLayer,
-    PriorThetaFlowVelocityIIDSoft,
     PriorThetaFlowVelocityThetaFourierFiLMPerLayer,
     PriorThetaFlowVelocityThetaFourierMLP,
 )
@@ -150,9 +147,9 @@ def normalize_theta_field_method(method: str) -> str:
 
 def normalize_flow_arch(args: Any) -> str:
     arch = str(getattr(args, "flow_arch", "mlp")).strip().lower()
-    if arch in ("mlp", "film", "film_fourier", "iid_soft"):
+    if arch in ("mlp", "film", "film_fourier"):
         return arch
-    raise ValueError("--flow-arch must be one of {'mlp','film','film_fourier','iid_soft'}.")
+    raise ValueError("--flow-arch must be one of {'mlp','film','film_fourier'}.")
 
 
 def build_posterior_score_model(
@@ -860,45 +857,6 @@ def build_dataset_from_meta(
             randamp_mu_amp_per_dim=amps_sqrt,
             seed=seed,
         )
-    if family == "randamp_gaussian_sqrtd_realnvp":
-        amps_raw = meta.get("randamp_mu_amp_per_dim")
-        amps_sqrt_realnvp: np.ndarray | None
-        if amps_raw is not None:
-            amps_sqrt_realnvp = np.asarray(amps_raw, dtype=np.float64).reshape(-1)
-        else:
-            amps_sqrt_realnvp = None
-        z_dim = int(meta.get("realnvp_z_dim", 2))
-        return ToyConditionalGaussianRandampSqrtdDataset(
-            theta_low=float(meta["theta_low"]),
-            theta_high=float(meta["theta_high"]),
-            x_dim=z_dim,
-            tuning_curve_family=str(meta.get("tuning_curve_family", "cosine")),
-            vm_mu_amp=float(meta.get("vm_mu_amp", 1.0)),
-            vm_kappa=float(meta.get("vm_kappa", 1.0)),
-            vm_omega=float(meta.get("vm_omega", 1.0)),
-            gauss_mu_amp=float(meta.get("gauss_mu_amp", 1.0)),
-            gauss_kappa=float(meta.get("gauss_kappa", 0.2)),
-            gauss_omega=float(meta.get("gauss_omega", 1.0)),
-            sigma_x1=float(meta["sigma_x1"]),
-            sigma_x2=float(meta["sigma_x2"]),
-            rho=float(meta["rho"]),
-            cov_theta_amp1=float(meta["cov_theta_amp1"]),
-            cov_theta_amp2=float(meta["cov_theta_amp2"]),
-            cov_theta_amp_rho=float(meta["cov_theta_amp_rho"]),
-            cov_theta_freq1=float(meta["cov_theta_freq1"]),
-            cov_theta_freq2=float(meta["cov_theta_freq2"]),
-            cov_theta_freq_rho=float(meta["cov_theta_freq_rho"]),
-            cov_theta_phase1=float(meta["cov_theta_phase1"]),
-            cov_theta_phase2=float(meta["cov_theta_phase2"]),
-            cov_theta_phase_rho=float(meta["cov_theta_phase_rho"]),
-            rho_clip=float(meta["rho_clip"]),
-            randamp_mu_low=float(meta.get("randamp_mu_low", 0.5)),
-            randamp_mu_high=float(meta.get("randamp_mu_high", 1.5)),
-            randamp_kappa=float(meta.get("randamp_kappa", 0.2)),
-            randamp_omega=float(meta.get("randamp_omega", 1.0)),
-            randamp_mu_amp_per_dim=amps_sqrt_realnvp,
-            seed=seed,
-        )
     if family == "randamp_gaussian_sqrtd_pr_autoencoder":
         amps_raw = meta.get("randamp_mu_amp_per_dim")
         amps_sqrt_ae: np.ndarray | None
@@ -1033,13 +991,11 @@ def validate_estimation_args(args: Any) -> None:
     legacy_flow_prior_arch = getattr(args, "flow_prior_arch", None)
     if legacy_flow_score_arch is not None:
         raise ValueError(
-            "Legacy --flow-score-arch is removed. Use --flow-arch {mlp,film,film_fourier,iid_soft} "
-            "(iid_soft is x_flow only)."
+            "Legacy --flow-score-arch is removed. Use --flow-arch {mlp,film,film_fourier}."
         )
     if legacy_flow_prior_arch is not None:
         raise ValueError(
-            "Legacy --flow-prior-arch is removed. Use --flow-arch {mlp,film,film_fourier,iid_soft} "
-            "(iid_soft is x_flow only)."
+            "Legacy --flow-prior-arch is removed. Use --flow-arch {mlp,film,film_fourier}."
         )
     if args.score_eval_sigmas < 1:
         raise ValueError("--score-eval-sigmas must be >= 1.")
@@ -1160,15 +1116,8 @@ def validate_estimation_args(args: Any) -> None:
         raise ValueError("--flow-prior-cond-embed-dim must be >= 1.")
     if int(getattr(args, "flow_prior_cond_embed_depth", 1)) < 1:
         raise ValueError("--flow-prior-cond-embed-depth must be >= 1.")
-    if _arch not in ("mlp", "film", "film_fourier", "iid_soft"):
-        raise ValueError("--flow-arch must be one of {'mlp','film','film_fourier','iid_soft'}.")
-    if _arch == "iid_soft" and _tfm_val not in ("x_flow", "theta_flow", "theta_path_integral"):
-        raise ValueError(
-            "--flow-arch iid_soft is only valid with --theta-field-method "
-            "x_flow, theta_flow, or theta_path_integral."
-        )
-    if _arch == "iid_soft" and _tfm_val == "ctsm_v":
-        raise ValueError("--flow-arch iid_soft is not supported for --theta-field-method ctsm_v.")
+    if _arch not in ("mlp", "film", "film_fourier"):
+        raise ValueError("--flow-arch must be one of {'mlp','film','film_fourier'}.")
     _fx_k = int(getattr(args, "flow_x_theta_fourier_k", 4))
     _fx_omega_mode = str(getattr(args, "flow_x_theta_fourier_omega_mode", "theta_range")).strip().lower()
     _fx_inc_lin = not bool(getattr(args, "flow_x_theta_fourier_no_linear", False))
@@ -1198,26 +1147,6 @@ def validate_estimation_args(args: Any) -> None:
                 "x_flow film_fourier: theta feature dim is 0. Use "
                 "--flow-x-theta-fourier-k >= 1 or keep linear/bias features enabled."
             )
-    if _tfm_val == "x_flow" and _arch == "iid_soft":
-        _iid_hm = float(getattr(args, "flow_x_iid_interaction_hidden_mult", 1.0))
-        if not (math.isfinite(_iid_hm) and _iid_hm > 0.0):
-            raise ValueError("--flow-x-iid-interaction-hidden-mult must be a finite positive number.")
-        _iid_id = getattr(args, "flow_x_iid_interaction_depth", None)
-        if _iid_id is not None and int(_iid_id) < 1:
-            raise ValueError("--flow-x-iid-interaction-depth must be >= 1 when set.")
-    if _tfm_val in ("theta_flow", "theta_path_integral") and _arch == "iid_soft":
-        _thm = float(getattr(args, "flow_theta_iid_interaction_hidden_mult", 1.0))
-        if not (math.isfinite(_thm) and _thm > 0.0):
-            raise ValueError("--flow-theta-iid-interaction-hidden-mult must be a finite positive number.")
-        _thd = getattr(args, "flow_theta_iid_interaction_depth", None)
-        if _thd is not None and int(_thd) < 1:
-            raise ValueError("--flow-theta-iid-interaction-depth must be >= 1 when set.")
-        _prm = float(getattr(args, "flow_prior_iid_interaction_hidden_mult", 1.0))
-        if not (math.isfinite(_prm) and _prm > 0.0):
-            raise ValueError("--flow-prior-iid-interaction-hidden-mult must be a finite positive number.")
-        _prd = getattr(args, "flow_prior_iid_interaction_depth", None)
-        if _prd is not None and int(_prd) < 1:
-            raise ValueError("--flow-prior-iid-interaction-depth must be >= 1 when set.")
     _ft_post_k = int(getattr(args, "flow_theta_fourier_k", 4))
     _ft_post_omega_mode = str(getattr(args, "flow_theta_fourier_omega_mode", "theta_range")).strip().lower()
     _ft_post_inc_lin = not bool(getattr(args, "flow_theta_fourier_no_linear", False))
@@ -1910,19 +1839,6 @@ def run_shared_fisher_estimation(
                 f" theta_fourier_bias={not bool(getattr(args, 'flow_x_theta_fourier_no_bias', False))}"
             )
             _xf_extra = " film_x_trunk" + _xf_extra
-        elif flow_score_arch == "iid_soft":
-            _hid_l = int(getattr(args, "flow_hidden_dim", 128))
-            _mult_l = float(getattr(args, "flow_x_iid_interaction_hidden_mult", 1.0))
-            _int_h_l = max(1, int(round(_hid_l * _mult_l)))
-            _dep_l = int(getattr(args, "flow_depth", 3))
-            _int_d_raw_l = getattr(args, "flow_x_iid_interaction_depth", None)
-            _int_d_l = int(_int_d_raw_l) if _int_d_raw_l is not None else _dep_l
-            _ai = float(getattr(args, "flow_x_iid_alpha_init", 0.001))
-            _al = not bool(getattr(args, "flow_x_iid_alpha_fixed", False))
-            _xf_extra = (
-                f" iid_soft alpha_init={_ai:.6g} alpha_learnable={_al}"
-                f" psi_hidden={_int_h_l} psi_depth={_int_d_l}"
-            )
         _xf_twostage = bool(getattr(args, "flow_x_two_stage_mean_theta_pretrain", False))
         _e_tot = int(getattr(args, "flow_epochs", 10000))
         _e1 = _e_tot // 2
@@ -1972,27 +1888,8 @@ def run_shared_fisher_estimation(
                 theta_fourier_include_linear=not bool(getattr(args, "flow_x_theta_fourier_no_linear", False)),
                 theta_fourier_include_bias=not bool(getattr(args, "flow_x_theta_fourier_no_bias", False)),
             ).to(device)
-        elif flow_score_arch == "iid_soft":
-            _hid = int(getattr(args, "flow_hidden_dim", 128))
-            _dep = int(getattr(args, "flow_depth", 3))
-            _mult = float(getattr(args, "flow_x_iid_interaction_hidden_mult", 1.0))
-            _int_h = max(1, int(round(_hid * _mult)))
-            _int_d_raw = getattr(args, "flow_x_iid_interaction_depth", None)
-            _int_d = int(_int_d_raw) if _int_d_raw is not None else _dep
-            _alpha_init = float(getattr(args, "flow_x_iid_alpha_init", 0.001))
-            _alpha_learn = not bool(getattr(args, "flow_x_iid_alpha_fixed", False))
-            x_flow_model = ConditionalXFlowVelocityIIDSoft(
-                x_dim=int(args.x_dim),
-                hidden_dim=_hid,
-                depth=_dep,
-                use_logit_time=True,
-                interaction_hidden_dim=_int_h,
-                interaction_depth=_int_d,
-                alpha_init=_alpha_init,
-                alpha_learnable=_alpha_learn,
-            ).to(device)
         else:
-            raise ValueError("--flow-arch must be one of {'mlp','film','film_fourier','iid_soft'}.")
+            raise ValueError("--flow-arch must be one of {'mlp','film','film_fourier'}.")
         post_train_out = train_conditional_x_flow_model(
             model=x_flow_model,
             theta_train=theta_score_fit,
@@ -2202,20 +2099,6 @@ def run_shared_fisher_estimation(
                 f" theta_fourier_post_linear={not bool(getattr(args, 'flow_theta_fourier_no_linear', False))}"
                 f" theta_fourier_post_bias={not bool(getattr(args, 'flow_theta_fourier_no_bias', False))}"
             )
-        elif flow_score_arch == "iid_soft":
-            _hid_pi = int(getattr(args, "flow_hidden_dim", 128))
-            _mult_pi = float(getattr(args, "flow_theta_iid_interaction_hidden_mult", 1.0))
-            _int_h_pi = max(1, int(round(_hid_pi * _mult_pi)))
-            _dep_pi = int(getattr(args, "flow_depth", 3))
-            _int_d_raw_pi = getattr(args, "flow_theta_iid_interaction_depth", None)
-            _int_d_pi = int(_int_d_raw_pi) if _int_d_raw_pi is not None else _dep_pi
-            _ai_pi = float(getattr(args, "flow_theta_iid_alpha_init", 0.001))
-            _al_pi = not bool(getattr(args, "flow_theta_iid_alpha_fixed", False))
-            _xf_post = (
-                f" post_iid_soft theta_dim={theta_dim_flow} x_dim={int(args.x_dim)} "
-                f"phi(theta~,x_i)->R^{{theta_dim}} mean_over_x alpha_init={_ai_pi:.6g} alpha_learnable={_al_pi}"
-                f" psi_hidden={_int_h_pi} psi_depth={_int_d_pi}"
-            )
         _xf_prior = ""
         if flow_prior_arch == "film":
             _xf_prior = (
@@ -2231,19 +2114,6 @@ def run_shared_fisher_estimation(
                 f" theta_fourier_prior_omega_in_net={float(_om_eff_p):.6g}"
                 f" theta_fourier_prior_linear={not bool(getattr(args, 'flow_prior_theta_fourier_no_linear', False))}"
                 f" theta_fourier_prior_bias={not bool(getattr(args, 'flow_prior_theta_fourier_no_bias', False))}"
-            )
-        elif flow_prior_arch == "iid_soft":
-            _hid_pr = int(getattr(args, "prior_hidden_dim", 128))
-            _mult_pr = float(getattr(args, "flow_prior_iid_interaction_hidden_mult", 1.0))
-            _int_h_pr = max(1, int(round(_hid_pr * _mult_pr)))
-            _dep_pr = int(getattr(args, "prior_depth", 3))
-            _int_d_raw_pr = getattr(args, "flow_prior_iid_interaction_depth", None)
-            _int_d_pr = int(_int_d_raw_pr) if _int_d_raw_pr is not None else _dep_pr
-            _ai_pr = float(getattr(args, "flow_prior_iid_alpha_init", 0.001))
-            _al_pr = not bool(getattr(args, "flow_prior_iid_alpha_fixed", False))
-            _xf_prior = (
-                f" prior_iid_soft theta_dim={theta_dim_flow} alpha_init={_ai_pr:.6g} alpha_learnable={_al_pr}"
-                f" psi_hidden={_int_h_pr} psi_depth={_int_d_pr}"
             )
         print(
             f"[{theta_field_method}] arch "
@@ -2325,39 +2195,8 @@ def run_shared_fisher_estimation(
                 theta_fourier_include_linear=not bool(getattr(args, "flow_theta_fourier_no_linear", False)),
                 theta_fourier_include_bias=not bool(getattr(args, "flow_theta_fourier_no_bias", False)),
             ).to(device)
-        elif flow_score_arch == "iid_soft":
-            _ph = int(getattr(args, "flow_hidden_dim", 128))
-            _pd = int(getattr(args, "flow_depth", 3))
-            _pm = float(getattr(args, "flow_theta_iid_interaction_hidden_mult", 1.0))
-            _pih = max(1, int(round(_ph * _pm)))
-            _pdr = getattr(args, "flow_theta_iid_interaction_depth", None)
-            _pid = int(_pdr) if _pdr is not None else _pd
-            _pai = float(getattr(args, "flow_theta_iid_alpha_init", 0.001))
-            _pal = not bool(getattr(args, "flow_theta_iid_alpha_fixed", False))
-            post_ckpt_hparams = {
-                "x_dim": int(args.x_dim),
-                "hidden_dim": int(_ph),
-                "depth": int(_pd),
-                "use_logit_time": True,
-                "theta_dim": int(theta_dim_flow),
-                "interaction_hidden_dim": int(_pih),
-                "interaction_depth": int(_pid),
-                "alpha_init": float(_pai),
-                "alpha_learnable": bool(_pal),
-            }
-            post_model = ConditionalThetaFlowVelocityIIDSoft(
-                x_dim=int(args.x_dim),
-                hidden_dim=_ph,
-                depth=_pd,
-                use_logit_time=True,
-                theta_dim=theta_dim_flow,
-                interaction_hidden_dim=_pih,
-                interaction_depth=_pid,
-                alpha_init=_pai,
-                alpha_learnable=_pal,
-            ).to(device)
         else:
-            raise ValueError("--flow-arch must be one of {'mlp','film','film_fourier','iid_soft'}.")
+            raise ValueError("--flow-arch must be one of {'mlp','film','film_fourier'}.")
         post_train_out = train_conditional_theta_flow_model(
             model=post_model,
             theta_train=theta_score_fit,
@@ -2479,37 +2318,8 @@ def run_shared_fisher_estimation(
                 theta_fourier_include_linear=not bool(getattr(args, "flow_prior_theta_fourier_no_linear", False)),
                 theta_fourier_include_bias=not bool(getattr(args, "flow_prior_theta_fourier_no_bias", False)),
             ).to(device)
-        elif flow_prior_arch == "iid_soft":
-            _prh = int(getattr(args, "prior_hidden_dim", 128))
-            _prd0 = int(getattr(args, "prior_depth", 3))
-            _prm = float(getattr(args, "flow_prior_iid_interaction_hidden_mult", 1.0))
-            _prih = max(1, int(round(_prh * _prm)))
-            _prdr = getattr(args, "flow_prior_iid_interaction_depth", None)
-            _prid = int(_prdr) if _prdr is not None else _prd0
-            _prai = float(getattr(args, "flow_prior_iid_alpha_init", 0.001))
-            _pral = not bool(getattr(args, "flow_prior_iid_alpha_fixed", False))
-            prior_ckpt_hparams = {
-                "hidden_dim": int(_prh),
-                "depth": int(_prd0),
-                "use_logit_time": True,
-                "theta_dim": int(theta_dim_flow),
-                "interaction_hidden_dim": int(_prih),
-                "interaction_depth": int(_prid),
-                "alpha_init": float(_prai),
-                "alpha_learnable": bool(_pral),
-            }
-            prior_model_flow = PriorThetaFlowVelocityIIDSoft(
-                hidden_dim=_prh,
-                depth=_prd0,
-                use_logit_time=True,
-                theta_dim=theta_dim_flow,
-                interaction_hidden_dim=_prih,
-                interaction_depth=_prid,
-                alpha_init=_prai,
-                alpha_learnable=_pral,
-            ).to(device)
         else:
-            raise ValueError("--flow-arch must be one of {'mlp','film','film_fourier','iid_soft'}.")
+            raise ValueError("--flow-arch must be one of {'mlp','film','film_fourier'}.")
         prior_train_out = train_prior_theta_flow_model(
             model=prior_model_flow,
             theta_train=theta_score_fit,
@@ -3231,7 +3041,6 @@ def run_shared_fisher_estimation(
         "cosine_gaussian_sqrtd_rand_tune",
         "randamp_gaussian",
         "randamp_gaussian_sqrtd",
-        "randamp_gaussian_sqrtd_realnvp",
         "randamp_gaussian_sqrtd_pr_autoencoder",
         "cos_sin_piecewise",
         "linear_piecewise",
@@ -3626,7 +3435,6 @@ def run_shared_fisher_estimation(
             "cosine_gaussian_sqrtd_rand_tune",
             "randamp_gaussian",
             "randamp_gaussian_sqrtd",
-            "randamp_gaussian_sqrtd_realnvp",
             "randamp_gaussian_sqrtd_pr_autoencoder",
         ):
             _a = 0.5 * (float(args.cov_theta_amp1) + float(args.cov_theta_amp2))

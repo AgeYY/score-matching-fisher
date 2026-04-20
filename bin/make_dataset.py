@@ -27,8 +27,6 @@ Run ``python bin/make_dataset.py --help`` for argparse defaults and exact wordin
       ``randamp_mu_amp_per_dim``.
     - ``randamp_gaussian_sqrtd`` — Same bump tuning as ``randamp_gaussian`` with sqrt-d noise scaling
       (baseline 0.20).
-    - ``randamp_gaussian_sqrtd_realnvp`` — Generate base ``randamp_gaussian_sqrtd`` in 2D and map
-      to ``x_dim`` via a fixed, untrained RealNVP embedding.
     - ``randamp_gaussian_sqrtd_pr_autoencoder`` — Generate base ``randamp_gaussian_sqrtd`` in latent
       dimension ``--pr-autoencoder-z-dim`` (default 2) and map to ``--x-dim`` via a trained PR-autoencoder.
     - ``cosine_gmm`` — Cosine-like mean branch inside a theta-dependent two-component mixture (see
@@ -99,7 +97,6 @@ from fisher.dataset_family_recipes import (
 )
 from fisher.dataset_visualization import plot_joint_and_tuning, summarize_dataset
 from fisher.pr_autoencoder_embedding import build_randamp_gaussian_sqrtd_pr_autoencoder_dataset
-from fisher.realnvp_embedding import build_randamp_gaussian_sqrtd_realnvp_dataset
 from fisher.shared_dataset_io import meta_dict_from_args, save_shared_dataset_npz
 from fisher.shared_fisher_est import build_dataset_from_args, validate_dataset_sample_args
 
@@ -148,12 +145,7 @@ def main() -> None:
     rng = np.random.default_rng(args.seed)
 
     n_total = int(args.n_total)
-    if str(args.dataset_family) == "randamp_gaussian_sqrtd_realnvp":
-        built = build_randamp_gaussian_sqrtd_realnvp_dataset(args)
-        dataset = built.base_dataset
-        theta_all = built.theta_all
-        x_all = built.x_embed_all
-    elif str(args.dataset_family) == "randamp_gaussian_sqrtd_pr_autoencoder":
+    if str(args.dataset_family) == "randamp_gaussian_sqrtd_pr_autoencoder":
         built = build_randamp_gaussian_sqrtd_pr_autoencoder_dataset(args)
         dataset = built.base_dataset
         theta_all = built.theta_all
@@ -178,21 +170,11 @@ def main() -> None:
     if str(args.dataset_family) in (
         "randamp_gaussian",
         "randamp_gaussian_sqrtd",
-        "randamp_gaussian_sqrtd_realnvp",
         "randamp_gaussian_sqrtd_pr_autoencoder",
     ):
         meta["randamp_mu_amp_per_dim"] = dataset._randamp_amp.tolist()
     if str(args.dataset_family) == "cosine_gaussian_sqrtd_rand_tune":
         meta["cosine_tune_amp_per_dim"] = dataset._cosine_tune_amp.tolist()
-    if str(args.dataset_family) == "randamp_gaussian_sqrtd_realnvp":
-        meta["realnvp_enabled"] = True
-        meta["realnvp_z_dim"] = int(built.embedder_config.z_dim)
-        meta["realnvp_n_transforms"] = int(built.embedder_config.n_transforms)
-        meta["realnvp_hidden_width"] = int(built.embedder_config.hidden_width)
-        meta["realnvp_seed"] = int(args.seed)
-        meta["realnvp_batch_norm_between_transforms"] = bool(
-            built.embedder_config.batch_norm_between_transforms
-        )
     if str(args.dataset_family) == "randamp_gaussian_sqrtd_pr_autoencoder":
         meta["pr_autoencoder_enabled"] = True
         meta["pr_autoencoder_z_dim"] = int(built.embedder_config.z_dim)
@@ -227,10 +209,7 @@ def main() -> None:
 
     out_dir = Path(args.output_npz).resolve().parent
     joint_tuning_path = out_dir / "joint_scatter_and_tuning_curve.png"
-    if str(args.dataset_family) in (
-        "randamp_gaussian_sqrtd_realnvp",
-        "randamp_gaussian_sqrtd_pr_autoencoder",
-    ):
+    if str(args.dataset_family) == "randamp_gaussian_sqrtd_pr_autoencoder":
         print(
             "[data] Skipping summarize_dataset for embedded randamp family: "
             "embedded x_dim differs from base tuning dimension."

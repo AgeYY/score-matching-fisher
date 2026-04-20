@@ -36,7 +36,6 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
             "cosine_gaussian_sqrtd_rand_tune",
             "randamp_gaussian",
             "randamp_gaussian_sqrtd",
-            "randamp_gaussian_sqrtd_realnvp",
             "randamp_gaussian_sqrtd_pr_autoencoder",
             "cosine_gmm",
             "cos_sin_piecewise",
@@ -51,8 +50,6 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
             "amplitudes drawn once from Uniform(0.5, 1.5)); "
             "'randamp_gaussian' (random-amplitude Gaussian bumps + Gaussian obs. noise); "
             "'randamp_gaussian_sqrtd' (same as randamp_gaussian with sqrt(x_dim) noise scaling); "
-            "'randamp_gaussian_sqrtd_realnvp' (sample base randamp_gaussian_sqrtd in z_dim=2 then map "
-            "to x_dim with a fixed untrained RealNVP embedding); "
             "'randamp_gaussian_sqrtd_pr_autoencoder' (sample base randamp_gaussian_sqrtd in latent z_dim, "
             "default 2, set via --pr-autoencoder-z-dim; map to x_dim with a trained PR-autoencoder); "
             "'cosine_gmm' (theta-dependent 2-component mixture); "
@@ -303,96 +300,12 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         "--flow-arch",
         type=str,
         default="mlp",
-        choices=["mlp", "film", "film_fourier", "iid_soft"],
+        choices=["mlp", "film", "film_fourier"],
         help=(
             "Flow architecture shared by theta_flow, theta_path_integral, and x_flow: "
-            "mlp, film (FiLM blocks with embedded raw theta), "
-            "film_fourier (FiLM blocks with Fourier theta features), or iid_soft "
-            "(x_flow: mean pooled phi(x_k)+psi(x); theta_flow/theta_path_integral: "
-            "mean pooled phi(theta~,x_i)+psi(theta~,x) in R^{theta_dim}; prior iid_soft unchanged; "
-            "see --flow-x-iid-* and --flow-theta-iid-* / --flow-prior-iid-*)."
+            "mlp, film (FiLM blocks with embedded raw theta), or "
+            "film_fourier (FiLM blocks with Fourier theta features)."
         ),
-    )
-    p.add_argument(
-        "--flow-x-iid-alpha-init",
-        type=float,
-        default=0.001,
-        help="x_flow + iid_soft: initial alpha in v_add + alpha * v_int (default 0.001).",
-    )
-    p.add_argument(
-        "--flow-x-iid-alpha-fixed",
-        action="store_true",
-        default=False,
-        help="x_flow + iid_soft: keep alpha fixed at --flow-x-iid-alpha-init (not learnable).",
-    )
-    p.add_argument(
-        "--flow-x-iid-interaction-hidden-mult",
-        type=float,
-        default=1.0,
-        help=(
-            "x_flow + iid_soft: multiply --flow-hidden-dim to set psi (interaction) MLP width "
-            "(default 1.0; rounded to int, minimum 1)."
-        ),
-    )
-    p.add_argument(
-        "--flow-x-iid-interaction-depth",
-        type=int,
-        default=None,
-        help="x_flow + iid_soft: depth of psi MLP; default same as --flow-depth.",
-    )
-    p.add_argument(
-        "--flow-theta-iid-alpha-init",
-        type=float,
-        default=0.001,
-        help="theta_flow / theta_path_integral + iid_soft: posterior alpha init (default 0.001).",
-    )
-    p.add_argument(
-        "--flow-theta-iid-alpha-fixed",
-        action="store_true",
-        default=False,
-        help="theta_flow / theta_path_integral + iid_soft: posterior alpha fixed (not learnable).",
-    )
-    p.add_argument(
-        "--flow-theta-iid-interaction-hidden-mult",
-        type=float,
-        default=1.0,
-        help=(
-            "theta_flow / theta_path_integral + iid_soft: multiply --flow-hidden-dim for posterior psi width "
-            "(default 1.0; rounded, min 1)."
-        ),
-    )
-    p.add_argument(
-        "--flow-theta-iid-interaction-depth",
-        type=int,
-        default=None,
-        help="theta_flow / theta_path_integral + iid_soft: posterior psi depth; default --flow-depth.",
-    )
-    p.add_argument(
-        "--flow-prior-iid-alpha-init",
-        type=float,
-        default=0.001,
-        help="theta_flow / theta_path_integral + iid_soft: prior alpha init (default 0.001).",
-    )
-    p.add_argument(
-        "--flow-prior-iid-alpha-fixed",
-        action="store_true",
-        default=False,
-        help="theta_flow / theta_path_integral + iid_soft: prior alpha fixed (not learnable).",
-    )
-    p.add_argument(
-        "--flow-prior-iid-interaction-hidden-mult",
-        type=float,
-        default=1.0,
-        help=(
-            "theta_flow / theta_path_integral + iid_soft: multiply --prior-hidden-dim for prior psi width "
-            "(default 1.0; rounded, min 1)."
-        ),
-    )
-    p.add_argument(
-        "--flow-prior-iid-interaction-depth",
-        type=int,
-        default=None,
-        help="theta_flow / theta_path_integral + iid_soft: prior psi depth; default --prior-depth.",
     )
     p.add_argument(
         "--flow-score-arch",

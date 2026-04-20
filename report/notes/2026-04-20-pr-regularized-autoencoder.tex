@@ -1,0 +1,29 @@
+\section{PR-regularized autoencoder for low-to-high embedding}
+
+Many experiments require observations $x \in \mathbb{R}^{d}$ while a simple generative model lives in a low-dimensional latent space $\mathbb{R}^{m}$ with $m \ll d$. To generate such kind of dataset, we use \emph{participation-ratio} (PR) regularized autoencoder to project low-dimensional dataset into high-dimensional dataset.
+
+The PR-regularized autoencoder learns a deterministic map that lifts $z \in \mathbb{R}^{m}$ to embeddings $h \in \mathbb{R}^{d}$ without collapsing $h$ onto a very thin subspace of $\mathbb{R}^{d}$.
+Fix $d \ge m$ and parameters $\psi$ for an encoder $f_{\psi}:\mathbb{R}^{m}\to\mathbb{R}^{d}$ and decoder $g_{\psi}:\mathbb{R}^{d}\to\mathbb{R}^{m}$; write
+\begin{equation}
+  h = f_{\psi}(z) \in \mathbb{R}^{d},
+  \qquad
+  \hat{z} = g_{\psi}(h) \in \mathbb{R}^{m}.
+\end{equation}
+Reconstruction is measured by mean squared error between $\hat{z}$ and $z$ over training samples.
+
+Given a mini-batch of embeddings $h^{(1)},\ldots,h^{(n)}$, center them coordinatewise, let $\tilde{H}\in\mathbb{R}^{n\times d}$ have rows $(h^{(i)} - \bar{h})^{\mathsf{T}}$, and form the unbiased batch covariance $C = \frac{1}{n-1}\tilde{H}^{\mathsf{T}}\tilde{H}$.
+The \emph{participation ratio} is
+\begin{equation}
+  \label{eq:pr-def}
+  \mathrm{PR}(C) = \frac{\bigl(\operatorname{tr} C\bigr)^{2}}{\operatorname{tr}(C^{2}) + \varepsilon},
+\end{equation}
+with $\varepsilon>0$ a small numerical floor; larger $\mathrm{PR}(C)$ indicates that batch variance spreads across more directions in $\mathbb{R}^{d}$.
+The training loss combines reconstruction and encouraging high participation,
+\begin{equation}
+  \label{eq:pr-loss}
+  \mathcal{L}
+  =
+  \frac{1}{n}\sum_{i=1}^{n} \bigl\lVert g_{\psi}(f_{\psi}(z^{(i)})) - z^{(i)} \bigr\rVert_{2}^{2}
+  - \lambda\,\mathrm{PR}(C),
+\end{equation}
+with $\lambda \ge 0$ trading fidelity to $z$ against spreading mass in the embedding space.

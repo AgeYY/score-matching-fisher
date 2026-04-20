@@ -10,11 +10,9 @@ from fisher.models import (
     ConditionalScore1DFiLMPerLayer,
     ConditionalThetaFlowVelocity,
     ConditionalThetaFlowVelocityFiLMPerLayer,
-    ConditionalThetaFlowVelocityIIDSoft,
     ConditionalThetaFlowVelocityThetaFourierMLP,
     ConditionalXFlowVelocity,
     ConditionalXFlowVelocityFiLMPerLayer,
-    ConditionalXFlowVelocityIIDSoft,
     ConditionalXFlowVelocityIndependentMLP,
     ConditionalXFlowVelocityIndependentThetaFourierMLP,
     ConditionalXFlowVelocityThetaFourierFiLMPerLayer,
@@ -23,7 +21,6 @@ from fisher.models import (
     LocalDecoderLogit,
     PriorThetaFlowVelocity,
     PriorThetaFlowVelocityFiLMPerLayer,
-    PriorThetaFlowVelocityIIDSoft,
     PriorThetaFlowVelocityThetaFourierMLP,
     PriorScore1D,
     PriorScore1DFiLMPerLayer,
@@ -918,7 +915,6 @@ def _make_flow_matching_path(scheduler_name: str):
 def train_conditional_x_flow_model(
     model: ConditionalXFlowVelocity
     | ConditionalXFlowVelocityFiLMPerLayer
-    | ConditionalXFlowVelocityIIDSoft
     | ConditionalXFlowVelocityIndependentMLP
     | ConditionalXFlowVelocityIndependentThetaFourierMLP
     | ConditionalXFlowVelocityThetaFourierFiLMPerLayer
@@ -1047,7 +1043,6 @@ def _train_conditional_x_flow_phase(
     *,
     model: ConditionalXFlowVelocity
     | ConditionalXFlowVelocityFiLMPerLayer
-    | ConditionalXFlowVelocityIIDSoft
     | ConditionalXFlowVelocityIndependentMLP
     | ConditionalXFlowVelocityIndependentThetaFourierMLP
     | ConditionalXFlowVelocityThetaFourierFiLMPerLayer
@@ -1185,7 +1180,6 @@ def _train_conditional_x_flow_phase(
 def train_conditional_theta_flow_model(
     model: ConditionalThetaFlowVelocity
     | ConditionalThetaFlowVelocityFiLMPerLayer
-    | ConditionalThetaFlowVelocityIIDSoft
     | ConditionalThetaFlowVelocityThetaFourierMLP,
     theta_train: np.ndarray,
     x_train: np.ndarray,
@@ -1309,7 +1303,6 @@ def train_conditional_theta_flow_model(
 def train_prior_theta_flow_model(
     model: PriorThetaFlowVelocity
     | PriorThetaFlowVelocityFiLMPerLayer
-    | PriorThetaFlowVelocityIIDSoft
     | PriorThetaFlowVelocityThetaFourierMLP,
     theta_train: np.ndarray,
     epochs: int,

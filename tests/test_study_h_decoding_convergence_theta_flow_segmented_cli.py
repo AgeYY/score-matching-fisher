@@ -85,7 +85,7 @@ def test_validate_rejects_onehot_non_mlp_arch() -> None:
             "--theta-field-method",
             "theta_flow",
             "--flow-arch",
-            "iid_soft",
+            "film",
         ]
     )
     with pytest.raises(ValueError, match="flow.arch mlp"):

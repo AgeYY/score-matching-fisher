@@ -131,7 +131,7 @@ class TestStudyHDecodingConvergenceFourierThetaFlowSmoke(unittest.TestCase):
                 "--dataset-family",
                 "cosine_gaussian_sqrtd",
                 "--flow-arch",
-                "iid_soft",
+                "film",
                 "--theta-flow-fourier-state",
                 "--device",
                 "cpu",

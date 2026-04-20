@@ -24,9 +24,7 @@ log-likelihood Bayes ratios; prior + posterior theta-flows), ``--theta-field-met
 ``--theta-field-method x_flow`` (conditional x-space FM likelihood; no prior model), and
 ``--theta-field-method ctsm_v`` (pair-conditioned CTSM-v time-score integration; no prior model).
 Flow methods use ``--flow-arch``: ``mlp``, ``film`` (FiLM with raw-theta embeddings), or
-``film_fourier`` for ``theta_flow`` / ``theta_path_integral``;
-you may also use ``iid_soft`` for any of ``theta_flow``, ``theta_path_integral``, or ``x_flow``
-(see ``--flow-theta-iid-*``, ``--flow-prior-iid-*``, and ``--flow-x-iid-*``).
+``film_fourier`` for ``theta_flow`` / ``theta_path_integral`` / ``x_flow``.
 ``film_fourier`` uses FiLM conditioning with Fourier theta features
 (``--flow-theta-fourier-*`` for ``theta_flow`` / ``theta_path_integral`` and ``--flow-x-theta-fourier-*`` for ``x_flow``).
 The **reference column** (``n_ref``) does **not** run learned H
@@ -124,7 +122,6 @@ def build_parser() -> argparse.ArgumentParser:
             "cosine_gaussian_sqrtd_rand_tune",
             "randamp_gaussian",
             "randamp_gaussian_sqrtd",
-            "randamp_gaussian_sqrtd_realnvp",
             "randamp_gaussian_sqrtd_pr_autoencoder",
             "cosine_gmm",
             "cos_sin_piecewise",
@@ -225,6 +222,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Include centered linear theta term in Fourier theta state.",
     )
     p.add_argument(
+        "--theta-flow-segmented",
+        action="store_true",
+        help=(
+            "theta_flow only: estimate H using equal-width theta segments "
+            "(orchestration in visualize_h_matrix_binned)."
+        ),
+    )
+    p.add_argument(
         "--clf-min-class-count",
         type=int,
         default=5,
@@ -282,6 +287,14 @@ def _parse_n_list(s: str) -> list[int]:
     return [int(x) for x in parts]
 
 
+def theta_segment_ids_equal_width(
+    theta: np.ndarray,
+    n_segments: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Delegate to ``visualize_h_matrix_binned.theta_segment_ids_equal_width``."""
+    return vhb.theta_segment_ids_equal_width(theta, n_segments)
+
+
 def _validate_cli(args: argparse.Namespace) -> None:
     validate_estimation_args(args)
     if int(args.num_theta_bins) < 1:
@@ -299,8 +312,13 @@ def _validate_cli(args: argparse.Namespace) -> None:
         )
     use_onehot = bool(getattr(args, "theta_flow_onehot_state", False))
     use_fourier = bool(getattr(args, "theta_flow_fourier_state", False))
+    use_segmented = bool(getattr(args, "theta_flow_segmented", False))
     if use_onehot and use_fourier:
         raise ValueError("Use only one theta-flow state override: one-hot or Fourier, not both.")
+    if use_segmented and use_onehot:
+        raise ValueError("Use only one theta-flow mode: segmented or one-hot, not both.")
+    if use_segmented and use_fourier:
+        raise ValueError("Use only one theta-flow mode: segmented or Fourier, not both.")
     if use_onehot:
         tfm = str(getattr(args, "theta_field_method", "theta_flow")).strip().lower()
         arch = str(getattr(args, "flow_arch", "mlp")).strip().lower()
@@ -332,6 +350,13 @@ def _validate_cli(args: argparse.Namespace) -> None:
         period_mult = float(getattr(args, "theta_flow_fourier_period_mult", 0.0))
         if not np.isfinite(period_mult) or period_mult <= 0.0:
             raise ValueError("--theta-flow-fourier-period-mult must be a finite positive number.")
+    if use_segmented:
+        tfm = str(getattr(args, "theta_field_method", "theta_flow")).strip().lower()
+        if tfm != "theta_flow":
+            raise ValueError(
+                "--theta-flow-segmented requires --theta-field-method theta_flow "
+                f"(got {getattr(args, 'theta_field_method', None)!r})."
+            )
     _parse_n_list(args.n_list)  # syntax check only; pool size checked in main
 
 
