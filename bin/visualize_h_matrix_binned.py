@@ -270,6 +270,13 @@ def theta_to_bin_index(theta: np.ndarray, edges: np.ndarray, n_bins: int) -> np.
     return np.clip(idx, 0, n_bins - 1).astype(np.int64)
 
 
+def theta_segment_ids_equal_width(theta: np.ndarray, n_segments: int) -> tuple[np.ndarray, np.ndarray]:
+    """Equal-width theta segmentation helper used by segmented theta-flow mode."""
+    edges, _, _ = theta_bin_edges(theta, int(n_segments))
+    seg_ids = theta_to_bin_index(theta, edges, int(n_segments))
+    return seg_ids, edges
+
+
 def average_matrix_by_bins(
     mat: np.ndarray,
     bin_idx: np.ndarray,

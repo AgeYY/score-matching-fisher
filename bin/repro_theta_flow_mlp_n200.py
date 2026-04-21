@@ -1,23 +1,20 @@
 #!/usr/bin/env python3
-"""Minimal reproducer for theta-flow MLP convergence at fixed n=200.
+"""Minimal reproducer for theta-flow/NF convergence at fixed n=200.
 
 This script intentionally exposes only a tiny CLI surface and fixes the rest:
 - dataset_family = randamp_gaussian
 - x_dim = --x-dim (default 2)
 - obs_noise_scale = 0.5 (TEMPORARY: half the family baseline noise; restore to 1.0 for default)
 - n_total = 3000, train_frac = 0.7, seed = 7
-- theta_field_method = theta_flow
-- flow_arch = mlp
+- theta_field_method = theta_flow or nf
+- flow_arch = mlp (theta_flow only)
 - n_ref = 1000
 - n_list = 200
 - num_theta_bins = 10
 
 It creates a shared dataset NPZ, then runs ``bin/study_h_decoding_convergence.py``
-with those fixed settings and prints the resulting metrics.
-Per-n run directories are kept so fitted model checkpoints remain available under
-``<output-dir>/sweep_runs/n_000200/`` for diagnostics, and the script auto-runs
-the fixed-x posterior+tuning diagnostic then re-renders the combined figure so
-the diagnostic panel is embedded in ``h_decoding_convergence_combined``.
+with fixed settings and prints the resulting metrics. Method selection supports
+theta-flow only, NF only, or both (into separate subdirectories).
 """
 
 from __future__ import annotations
@@ -82,6 +79,42 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=["cuda"],
         help="Execution device. Per repo policy this reproducer requires CUDA.",
     )
+    p.add_argument(
+        "--method",
+        type=str,
+        default="both",
+        choices=["theta-flow", "nf", "both"],
+        help="Which method branch to run: theta-flow, nf, or both.",
+    )
+    p.add_argument("--flow-epochs", type=int, default=None, help="Optional theta-flow override: --flow-epochs.")
+    p.add_argument("--prior-epochs", type=int, default=None, help="Optional theta-flow override: --prior-epochs.")
+    p.add_argument(
+        "--flow-batch-size",
+        type=int,
+        default=None,
+        help="Optional theta-flow override: --flow-batch-size.",
+    )
+    p.add_argument(
+        "--prior-batch-size",
+        type=int,
+        default=None,
+        help="Optional theta-flow override: --prior-batch-size.",
+    )
+    p.add_argument("--nf-epochs", type=int, default=2000, help="NF method only: training epochs.")
+    p.add_argument("--nf-batch-size", type=int, default=256, help="NF method only: batch size.")
+    p.add_argument("--nf-lr", type=float, default=1e-3, help="NF method only: learning rate.")
+    p.add_argument("--nf-hidden-dim", type=int, default=128, help="NF method only: hidden size.")
+    p.add_argument("--nf-context-dim", type=int, default=32, help="NF method only: context size.")
+    p.add_argument("--nf-transforms", type=int, default=5, help="NF method only: spline transforms.")
+    p.add_argument(
+        "--nf-pair-batch-size",
+        type=int,
+        default=65536,
+        help="NF method only: pair budget per C-matrix block.",
+    )
+    p.add_argument("--nf-early-patience", type=int, default=300, help="NF method only: early-stop patience.")
+    p.add_argument("--nf-early-min-delta", type=float, default=1e-4, help="NF method only: early min delta.")
+    p.add_argument("--nf-early-ema-alpha", type=float, default=0.05, help="NF method only: EMA alpha.")
     return p
 
 
@@ -145,6 +178,86 @@ def _parse_metrics(results_csv: Path) -> tuple[int, float, float]:
     return n, corr_h, corr_clf
 
 
+def _run_convergence(
+    *,
+    method: str,
+    out_dir: Path,
+    dataset_npz: Path,
+    n: int,
+    n_ref: int,
+    args: argparse.Namespace,
+) -> tuple[Path, int, float, float]:
+    study_py = _repo_root / "bin" / "study_h_decoding_convergence.py"
+    if not study_py.is_file():
+        raise FileNotFoundError(f"Missing study script: {study_py}")
+    os.makedirs(out_dir, exist_ok=True)
+    cmd = [
+        sys.executable,
+        str(study_py),
+        "--dataset-npz",
+        str(dataset_npz),
+        "--dataset-family",
+        "randamp_gaussian",
+        "--output-dir",
+        str(out_dir),
+        "--theta-field-method",
+        str(method),
+        "--n-ref",
+        str(n_ref),
+        "--n-list",
+        str(n),
+        "--num-theta-bins",
+        "10",
+        "--keep-intermediate",
+        "--run-seed",
+        "7",
+        "--device",
+        args.device,
+    ]
+    if str(method) == "theta_flow":
+        cmd += ["--flow-arch", "mlp"]
+        if args.flow_epochs is not None:
+            cmd += ["--flow-epochs", str(int(args.flow_epochs))]
+        if args.prior_epochs is not None:
+            cmd += ["--prior-epochs", str(int(args.prior_epochs))]
+        if args.flow_batch_size is not None:
+            cmd += ["--flow-batch-size", str(int(args.flow_batch_size))]
+        if args.prior_batch_size is not None:
+            cmd += ["--prior-batch-size", str(int(args.prior_batch_size))]
+    else:
+        cmd += [
+            "--nf-epochs",
+            str(int(args.nf_epochs)),
+            "--nf-batch-size",
+            str(int(args.nf_batch_size)),
+            "--nf-lr",
+            str(float(args.nf_lr)),
+            "--nf-hidden-dim",
+            str(int(args.nf_hidden_dim)),
+            "--nf-context-dim",
+            str(int(args.nf_context_dim)),
+            "--nf-transforms",
+            str(int(args.nf_transforms)),
+            "--nf-pair-batch-size",
+            str(int(args.nf_pair_batch_size)),
+            "--nf-early-patience",
+            str(int(args.nf_early_patience)),
+            "--nf-early-min-delta",
+            str(float(args.nf_early_min_delta)),
+            "--nf-early-ema-alpha",
+            str(float(args.nf_early_ema_alpha)),
+        ]
+    print(f"[repro] running convergence ({method})...", flush=True)
+    result = subprocess.run(cmd, cwd=str(_repo_root), check=False)
+    if result.returncode != 0:
+        raise RuntimeError(f"study_h_decoding_convergence ({method}) failed with code {result.returncode}.")
+    results_csv = out_dir / "h_decoding_convergence_results.csv"
+    if not results_csv.is_file():
+        raise FileNotFoundError(f"Missing expected results CSV: {results_csv}")
+    n_row, corr_h, corr_clf = _parse_metrics(results_csv)
+    return results_csv, n_row, corr_h, corr_clf
+
+
 def main() -> None:
     args = _build_parser().parse_args()
     x_dim = int(args.x_dim)
@@ -162,90 +275,50 @@ def main() -> None:
     dataset_npz = out_dir / "shared_dataset.npz"
     _write_dataset(dataset_npz, x_dim=x_dim)
     print(f"[repro] x_dim={x_dim} dataset_npz={dataset_npz}", flush=True)
+    method = str(args.method).strip().lower()
+    run_theta = method in ("theta-flow", "both")
+    run_nf = method in ("nf", "both")
 
-    study_py = _repo_root / "bin" / "study_h_decoding_convergence.py"
-    if not study_py.is_file():
-        raise FileNotFoundError(f"Missing study script: {study_py}")
-
-    cmd = [
-        sys.executable,
-        str(study_py),
-        "--dataset-npz",
-        str(dataset_npz),
-        "--dataset-family",
-        "randamp_gaussian",
-        "--output-dir",
-        str(out_dir),
-        "--theta-field-method",
-        "theta_flow",
-        "--flow-arch",
-        "mlp",
-        "--n-ref",
-        str(n_ref),
-        "--n-list",
-        str(n),
-        "--num-theta-bins",
-        "10",
-        "--keep-intermediate",
-        "--run-seed",
-        "7",
-        "--device",
-        args.device,
-    ]
-    print("[repro] running study_h_decoding_convergence with fixed config...", flush=True)
-    result = subprocess.run(cmd, cwd=str(_repo_root), check=False)
-    if result.returncode != 0:
-        raise RuntimeError(f"study_h_decoding_convergence failed with code {result.returncode}.")
-
-    diag_py = _repo_root / "bin" / "diagnose_theta_flow_single_x_samples.py"
-    if not diag_py.is_file():
-        raise FileNotFoundError(f"Missing diagnostic script: {diag_py}")
-    run_dir = out_dir / "sweep_runs" / f"n_{n:06d}"
-    diag_cmd = [
-        sys.executable,
-        str(diag_py),
-        "--run-dir",
-        str(run_dir),
-        "--dataset-npz",
-        str(dataset_npz),
-        "--x-index",
-        "0",
-        "--n-samples",
-        "20000",
-        "--device",
-        args.device,
-    ]
-    print("[repro] running fixed-x posterior+tuning diagnostic...", flush=True)
-    diag_res = subprocess.run(diag_cmd, cwd=str(_repo_root), check=False)
-    if diag_res.returncode != 0:
-        raise RuntimeError(f"diagnose_theta_flow_single_x_samples failed with code {diag_res.returncode}.")
-
-    # Combined figure is generated during the first study run (before diagnostic exists).
-    # Regenerate figures from cached NPZ so the diagnostic panel is embedded.
-    viz_cmd = cmd + ["--visualization-only"]
-    print("[repro] regenerating combined figures with embedded diagnostic panel...", flush=True)
-    viz_res = subprocess.run(viz_cmd, cwd=str(_repo_root), check=False)
-    if viz_res.returncode != 0:
-        raise RuntimeError(f"study_h_decoding_convergence --visualization-only failed with code {viz_res.returncode}.")
-
-    results_csv = out_dir / "h_decoding_convergence_results.csv"
-    if not results_csv.is_file():
-        raise FileNotFoundError(f"Missing expected results CSV: {results_csv}")
-    n_row, corr_h, corr_clf = _parse_metrics(results_csv)
-    gap = corr_h - corr_clf
+    results: list[tuple[str, Path, int, float, float]] = []
+    if run_theta:
+        theta_dir = out_dir if method != "both" else out_dir / "theta_flow"
+        csv_path, n_row, corr_h, corr_clf = _run_convergence(
+            method="theta_flow",
+            out_dir=theta_dir,
+            dataset_npz=dataset_npz,
+            n=n,
+            n_ref=n_ref,
+            args=args,
+        )
+        results.append(("theta_flow", csv_path, n_row, corr_h, corr_clf))
+    if run_nf:
+        nf_dir = out_dir if method != "both" else out_dir / "nf"
+        csv_path, n_row, corr_h, corr_clf = _run_convergence(
+            method="nf",
+            out_dir=nf_dir,
+            dataset_npz=dataset_npz,
+            n=n,
+            n_ref=n_ref,
+            args=args,
+        )
+        results.append(("nf", csv_path, n_row, corr_h, corr_clf))
 
     print("[repro] completed.", flush=True)
     print(f"[repro] output_dir={out_dir}", flush=True)
-    print(f"[repro] results_csv={results_csv}", flush=True)
-    print(
-        "[repro] n={} corr_h_binned_vs_gt_mc={:.6f} corr_clf_vs_ref={:.6f} gap(h-clf)={:.6f}".format(
-            n_row,
-            corr_h,
-            corr_clf,
-            gap,
-        ),
-        flush=True,
-    )
+    print(f"[repro] method={method}", flush=True)
+    for tag, results_csv, n_row, corr_h, corr_clf in results:
+        gap = corr_h - corr_clf
+        print(f"[repro][{tag}] results_csv={results_csv}", flush=True)
+        print(
+            "[repro][{}] n={} corr_h_binned_vs_gt_mc={:.6f} corr_clf_vs_ref={:.6f} gap(h-clf)={:.6f}".format(
+                tag,
+                n_row,
+                corr_h,
+                corr_clf,
+                gap,
+            ),
+            flush=True,
+        )
 
 
 if __name__ == "__main__":

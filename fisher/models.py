@@ -1210,6 +1210,12 @@ class ConditionalXFlowVelocityFiLMPerLayer(nn.Module):
         hidden_dim: int = 128,
         depth: int = 3,
         use_logit_time: bool = True,
+        use_layer_norm: bool = False,
+        gated_film: bool = False,
+        zero_out_init: bool = False,
+        cond_embed_dim: int = 16,
+        cond_embed_depth: int = 1,
+        cond_embed_act: str = "silu",
     ) -> None:
         super().__init__()
         if x_dim < 1:
@@ -1218,8 +1224,15 @@ class ConditionalXFlowVelocityFiLMPerLayer(nn.Module):
         self.hidden_dim = int(hidden_dim)
         self.depth = int(depth)
         self.use_logit_time = bool(use_logit_time)
-        cond_dim = 2
+        self.gated_film = bool(gated_film)
+        self.cond_embed_dim = int(cond_embed_dim)
+        self.cond_embed_depth = int(cond_embed_depth)
+        self.cond_embed_act = str(cond_embed_act)
+        self.theta_embed = _scalar_embedding_mlp(self.cond_embed_dim, self.cond_embed_depth, self.cond_embed_act)
+        self.time_embed = _scalar_embedding_mlp(self.cond_embed_dim, self.cond_embed_depth, self.cond_embed_act)
+        cond_dim = 2 * self.cond_embed_dim
         self.in_proj = nn.Linear(int(x_dim), int(hidden_dim))
+        self.in_norm = nn.LayerNorm(int(hidden_dim)) if use_layer_norm else nn.Identity()
         self.blocks = nn.ModuleList()
         for _ in range(int(depth)):
             self.blocks.append(
@@ -1228,10 +1241,14 @@ class ConditionalXFlowVelocityFiLMPerLayer(nn.Module):
                         "lin": nn.Linear(int(hidden_dim), int(hidden_dim)),
                         "gamma": nn.Linear(cond_dim, int(hidden_dim)),
                         "beta": nn.Linear(cond_dim, int(hidden_dim)),
+                        "norm": (nn.LayerNorm(int(hidden_dim)) if use_layer_norm else nn.Identity()),
                     }
                 )
             )
         self.out = nn.Linear(int(hidden_dim), int(x_dim))
+        if zero_out_init:
+            nn.init.zeros_(self.out.weight)
+            nn.init.zeros_(self.out.bias)
 
     def _theta_feat(self, theta: torch.Tensor) -> torch.Tensor:
         if theta.ndim == 1:
@@ -1247,17 +1264,26 @@ class ConditionalXFlowVelocityFiLMPerLayer(nn.Module):
         return t
 
     def _cond(self, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        return torch.cat([self._theta_feat(theta), self._t_feat(t)], dim=-1)
+        theta_feat = self._theta_feat(theta)
+        t_feat = self._t_feat(t)
+        theta_e = self.theta_embed(theta_feat)
+        time_e = self.time_embed(t_feat)
+        return torch.cat([theta_e, time_e], dim=-1)
 
     def forward(self, x_t: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         cond = self._cond(theta, t)
-        h = torch.nn.functional.silu(self.in_proj(x_t))
+        h = self.in_norm(self.in_proj(x_t))
+        h = torch.nn.functional.silu(h)
         for blk in self.blocks:
-            h = blk["lin"](h)
+            y = blk["lin"](h)
             gamma = blk["gamma"](cond)
             beta = blk["beta"](cond)
-            h = gamma * h + beta
-            h = torch.nn.functional.silu(h)
+            if self.gated_film:
+                y = (1.0 + 0.5 * torch.tanh(gamma)) * y + beta
+            else:
+                y = gamma * y + beta
+            y = blk["norm"](y)
+            h = torch.nn.functional.silu(y)
         return self.out(h)
 
     @torch.no_grad()

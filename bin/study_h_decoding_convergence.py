@@ -21,8 +21,9 @@ For each ``n`` in ``--n-list``, the H matrix is computed from trained models for
 field method. Supported methods are ``--theta-field-method theta_flow`` (theta-space flow ODE
 log-likelihood Bayes ratios; prior + posterior theta-flows), ``--theta-field-method theta_path_integral``
 (same training as theta_flow but H from velocity-to-score plus trapezoid integral along sorted ``theta``),
-``--theta-field-method x_flow`` (conditional x-space FM likelihood; no prior model), and
-``--theta-field-method ctsm_v`` (pair-conditioned CTSM-v time-score integration; no prior model).
+``--theta-field-method x_flow`` (conditional x-space FM likelihood; no prior model),
+``--theta-field-method ctsm_v`` (pair-conditioned CTSM-v time-score integration; no prior model), and
+``--theta-field-method nf`` (conditional normalizing flow log p(theta|x); no prior model).
 Flow methods use ``--flow-arch``: ``mlp``, ``film`` (FiLM with raw-theta embeddings), or
 ``film_fourier`` for ``theta_flow`` / ``theta_path_integral`` / ``x_flow``.
 ``film_fourier`` uses FiLM conditioning with Fourier theta features
@@ -71,6 +72,15 @@ import torch
 import visualize_h_matrix_binned as vhb
 from fisher.cli_shared_fisher import add_estimation_arguments
 from fisher.hellinger_gt import bin_centers_from_edges, estimate_hellinger_sq_one_sided_mc
+from fisher.nf_hellinger import (
+    ConditionalThetaNF,
+    compute_c_matrix_nf,
+    compute_delta_l as compute_delta_l_nf,
+    compute_h_directed as compute_h_directed_nf,
+    require_zuko_for_nf,
+    symmetrize as symmetrize_nf,
+    train_conditional_nf,
+)
 from fisher.shared_dataset_io import SharedDatasetBundle, load_shared_dataset_npz
 from fisher.shared_fisher_est import (
     build_dataset_from_meta,
@@ -266,6 +276,26 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="If set, symmetrize GT H^2 matrix as (H^2 + H^2.T) / 2 after one-sided MC estimation.",
     )
+    p.add_argument("--nf-epochs", type=int, default=2000, help="NF method only: training epochs.")
+    p.add_argument("--nf-batch-size", type=int, default=256, help="NF method only: training batch size.")
+    p.add_argument("--nf-lr", type=float, default=1e-3, help="NF method only: learning rate.")
+    p.add_argument("--nf-hidden-dim", type=int, default=128, help="NF method only: encoder hidden size.")
+    p.add_argument("--nf-context-dim", type=int, default=32, help="NF method only: context size.")
+    p.add_argument("--nf-transforms", type=int, default=5, help="NF method only: spline transform count.")
+    p.add_argument(
+        "--nf-pair-batch-size",
+        type=int,
+        default=65536,
+        help="NF method only: approximate pair budget per C-matrix block (rows*cols).",
+    )
+    p.add_argument("--nf-early-patience", type=int, default=300, help="NF method only: early-stop patience.")
+    p.add_argument("--nf-early-min-delta", type=float, default=1e-4, help="NF method only: early-stop min delta.")
+    p.add_argument(
+        "--nf-early-ema-alpha",
+        type=float,
+        default=0.05,
+        help="NF method only: EMA alpha for validation monitor.",
+    )
     add_estimation_arguments(p)
     p.set_defaults(
         output_dir=str(Path(DATA_DIR) / "h_decoding_convergence"),
@@ -295,7 +325,31 @@ def theta_segment_ids_equal_width(
 
 
 def _validate_cli(args: argparse.Namespace) -> None:
-    validate_estimation_args(args)
+    tfm = str(getattr(args, "theta_field_method", "theta_flow")).strip().lower()
+    if tfm == "nf":
+        setattr(args, "theta_field_method", "nf")
+        require_zuko_for_nf()
+        if int(getattr(args, "nf_epochs", 0)) < 1:
+            raise ValueError("--nf-epochs must be >= 1.")
+        if int(getattr(args, "nf_batch_size", 0)) < 1:
+            raise ValueError("--nf-batch-size must be >= 1.")
+        if float(getattr(args, "nf_lr", 0.0)) <= 0.0:
+            raise ValueError("--nf-lr must be > 0.")
+        if int(getattr(args, "nf_hidden_dim", 0)) < 1:
+            raise ValueError("--nf-hidden-dim must be >= 1.")
+        if int(getattr(args, "nf_context_dim", 0)) < 1:
+            raise ValueError("--nf-context-dim must be >= 1.")
+        if int(getattr(args, "nf_transforms", 0)) < 1:
+            raise ValueError("--nf-transforms must be >= 1.")
+        if int(getattr(args, "nf_pair_batch_size", 0)) < 1:
+            raise ValueError("--nf-pair-batch-size must be >= 1.")
+        if int(getattr(args, "nf_early_patience", -1)) < 0:
+            raise ValueError("--nf-early-patience must be >= 0.")
+        alpha = float(getattr(args, "nf_early_ema_alpha", 0.0))
+        if not np.isfinite(alpha) or alpha <= 0.0 or alpha > 1.0:
+            raise ValueError("--nf-early-ema-alpha must be in (0, 1].")
+    else:
+        validate_estimation_args(args)
     if int(args.num_theta_bins) < 1:
         raise ValueError("--num-theta-bins must be >= 1.")
     if int(args.clf_min_class_count) < 1:
@@ -525,12 +579,6 @@ def _pairwise_clf_from_bundle(
     clf_random_state: int,
 ) -> np.ndarray:
     """Pairwise bin decoding: train on NPZ train rows, accuracy on NPZ full pool."""
-    d = vars(args).copy()
-    d.setdefault("h_matrix_npz", None)
-    d.setdefault("h_only", False)
-    args2 = argparse.Namespace(**d)
-    args2.output_dir = output_dir
-    full_args = _make_full_args(args2, meta)
     clf_acc, _, _, _ = vhb.pairwise_bin_logistic_accuracy_train_val(
         subset.bundle.x_train,
         subset.bin_train,
@@ -552,6 +600,78 @@ def _estimate_one(
     n_bins: int,
 ) -> tuple[vhb.LoadedHMatrix, np.ndarray, torch.device]:
     """Train (unless h-only), load H, return loaded H, x_aligned, and device."""
+    tfm = str(getattr(args, "theta_field_method", "theta_flow")).strip().lower()
+    if tfm == "nf":
+        dev = require_device(str(getattr(args, "device", "cuda")))
+        os.makedirs(output_dir, exist_ok=True)
+        theta_train = np.asarray(bundle.theta_train, dtype=np.float64).reshape(-1)
+        theta_val = np.asarray(bundle.theta_validation, dtype=np.float64).reshape(-1)
+        theta_all = np.asarray(bundle.theta_all, dtype=np.float64).reshape(-1)
+        x_train = np.asarray(bundle.x_train, dtype=np.float64)
+        x_val = np.asarray(bundle.x_validation, dtype=np.float64)
+        x_all = np.asarray(bundle.x_all, dtype=np.float64)
+        if x_train.ndim != 2 or x_all.ndim != 2:
+            raise ValueError("NF method expects x arrays to be 2D.")
+        if theta_train.size < 1 or theta_val.size < 1:
+            raise ValueError("NF method requires non-empty train and validation splits.")
+
+        model = ConditionalThetaNF(
+            x_dim=int(x_all.shape[1]),
+            context_dim=int(getattr(args, "nf_context_dim", 32)),
+            hidden_dim=int(getattr(args, "nf_hidden_dim", 128)),
+            transforms=int(getattr(args, "nf_transforms", 5)),
+        ).to(dev)
+        train_out = train_conditional_nf(
+            model=model,
+            theta_train=theta_train,
+            x_train=x_train,
+            theta_val=theta_val,
+            x_val=x_val,
+            device=dev,
+            epochs=int(getattr(args, "nf_epochs", 2000)),
+            batch_size=int(getattr(args, "nf_batch_size", 256)),
+            lr=float(getattr(args, "nf_lr", 1e-3)),
+            patience=int(getattr(args, "nf_early_patience", 300)),
+            min_delta=float(getattr(args, "nf_early_min_delta", 1e-4)),
+            ema_alpha=float(getattr(args, "nf_early_ema_alpha", 0.05)),
+        )
+        c_matrix = compute_c_matrix_nf(
+            model=model,
+            theta_all=theta_all,
+            x_all=x_all,
+            device=dev,
+            pair_batch_size=int(getattr(args, "nf_pair_batch_size", 65536)),
+        )
+        delta_l = compute_delta_l_nf(c_matrix)
+        h_sym = symmetrize_nf(compute_h_directed_nf(delta_l))
+
+        np.savez_compressed(
+            os.path.join(output_dir, "h_matrix_results_theta_cov.npz"),
+            theta_used=np.asarray(theta_all, dtype=np.float64),
+            h_sym=np.asarray(h_sym, dtype=np.float64),
+            c_matrix=np.asarray(c_matrix, dtype=np.float64),
+            delta_l_matrix=np.asarray(delta_l, dtype=np.float64),
+            h_field_method=np.asarray(["nf"], dtype=object),
+            h_eval_scalar_name=np.asarray(["nf_log_prob_delta"], dtype=object),
+            sigma_eval=np.asarray([np.nan], dtype=np.float64),
+        )
+        np.savez_compressed(
+            os.path.join(output_dir, "score_prior_training_losses.npz"),
+            theta_field_method=np.asarray(["nf"], dtype=object),
+            prior_enable=np.bool_(False),
+            score_train_losses=np.asarray(train_out["train_losses"], dtype=np.float64),
+            score_val_losses=np.asarray(train_out["val_losses"], dtype=np.float64),
+            score_val_monitor_losses=np.asarray(train_out["val_ema_losses"], dtype=np.float64),
+            prior_train_losses=np.asarray([], dtype=np.float64),
+            prior_val_losses=np.asarray([], dtype=np.float64),
+            prior_val_monitor_losses=np.asarray([], dtype=np.float64),
+        )
+        loaded_nf = SimpleNamespace(
+            h_sym=np.asarray(h_sym, dtype=np.float64),
+            theta_used=np.asarray(theta_all, dtype=np.float64),
+        )
+        return loaded_nf, np.asarray(x_all, dtype=np.float64), dev
+
     d = vars(args).copy()
     d.setdefault("h_matrix_npz", None)
     d.setdefault("h_only", False)
@@ -723,6 +843,8 @@ def _render_training_losses_panel(
             post_lab = "x-flow direct likelihood"
         elif tfm == "ctsm_v":
             post_lab = "pair-conditioned CTSM-v"
+        elif tfm == "nf":
+            post_lab = "normalizing-flow posterior"
         else:
             post_lab = tfm
         _plot_loss_triplet(
@@ -883,6 +1005,8 @@ def _save_combined_convergence_figure(
             post_lab = "x-flow direct likelihood"
         elif tfm == "ctsm_v":
             post_lab = "pair-conditioned CTSM-v"
+        elif tfm == "nf":
+            post_lab = "normalizing-flow posterior"
         else:
             post_lab = tfm
         _plot_loss_triplet(
@@ -1687,10 +1811,21 @@ def main(argv: list[str] | None = None) -> None:
             "log-ratio fields over t (no prior model).",
             flush=True,
         )
+    elif tfm == "nf":
+        print(
+            f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
+            "(conditional normalizing flow p(theta|x), no prior model)",
+            flush=True,
+        )
+        print(
+            "[convergence] nf mode builds C[i,j]=log p(theta_j|x_i), then DeltaL=C-diag(C), "
+            "and H via 1-sech(DeltaL/2).",
+            flush=True,
+        )
     else:
         raise ValueError(
             f"Unsupported --theta-field-method={tfm!r}; use "
-            "theta_flow, theta_path_integral, x_flow, or ctsm_v."
+            "theta_flow, theta_path_integral, x_flow, ctsm_v, or nf."
         )
     print(
         "[convergence] n_ref reference: no learned H training at n_ref; matrix-panel top row = MC GT sqrt(H^2); "
