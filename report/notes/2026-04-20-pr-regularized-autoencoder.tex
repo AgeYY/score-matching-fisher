@@ -1,6 +1,6 @@
-\section{Flow matching is able to discover latent Hellinger RDM}
+\section{Flow matching with path integral is able to discover latent Hellinger RDM}
 
-\subsection{Embedding low-dimensional latent to high-dimensional embedding}
+\subsection{Embedding low-dimensional latent to high dimensional space}
 
 Many experiments require observations $x \in \mathbb{R}^{d}$ while a simple generative model lives in a low-dimensional latent space $\mathbb{R}^{m}$ with $m \ll d$. To generate such kind of dataset, we use \emph{participation-ratio} (PR) regularized autoencoder to project low-dimensional dataset into high-dimensional dataset.
 
@@ -30,7 +30,7 @@ The training loss combines reconstruction and encouraging high participation,
 \end{equation}
 with $\lambda \ge 0$ trading fidelity to $z$ against spreading mass in the embedding space.
 
-\subsection{Flow matching is able to discover latent Hellinger RDM}
+\subsection{Flow matching with path integral is able to discover latent Hellinger RDM}
 
 We constructed two datasets. The latent datasets were constructed same as the previous notes, using gaussian tuning with random amplitude, and acitivty-modulated noise. We constructed 2D and 10D datasets, and embedded into higher dimensional space using PR-regularized autoencoder. We then used flow matching to estimate the Hellinger RDM, and found it is able to discover the latent Hellinger RDM.
 
@@ -39,7 +39,7 @@ We constructed two datasets. The latent datasets were constructed same as the pr
   \centering
   \includegraphics[width=\linewidth]{notes/figures/2026-04-20-pr-regularized-autoencoder/pr_embedding_theta_flow_h_decoding.png}
   \caption{%
-  (A) 2D latent dataset. (B) Embedding to 50D using PR-regularized autoencoder, then visualized using PCA. (C) Flow matching is able to discover the latent Hellinger RDM. Where the GT was estiamted based on the latent dataset only. (D, E, F) Same as A, B, C, but from 10D latent to 100D embedded space.
+  (A) 2D latent dataset. (B) Embedding to 50D using PR-regularized autoencoder, then visualized using PCA. (C) Flow matching is able to discover the latent Hellinger RDM. The GT was estimated based on the latent dataset only. (D, E, F) Same as A, B, C, but from 10D latent to 100D embedded space.
     }
   \label{fig:pr-embed-theta-path-integral-h-decoding}
 \end{figure}

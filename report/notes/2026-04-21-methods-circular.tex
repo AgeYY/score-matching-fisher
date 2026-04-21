@@ -1,0 +1,67 @@
+\section{All attempts failed to estimate Hellinger RDM on circular dataset}
+
+We have shown that flow matchiing with path integral method fails to estimate the Hellinger RDM on circular dataset. This is quite natural in the sense that path integral method on circular dataset makes "detours". Thanks to the AI coding agent nowadays, we can quickly try new ideas. The purpose of this note is to try to use different methods for estimating Hellinger distance and hoping some of them will work for circular dataset. Although the final answer is NO.
+
+\subsection{Method 1: Flow matching exact likelihood computation}
+A fitted flow matching allows exact likelihood computation by path integral on parameter $t$ rather than $\theta$. Therefore when estimating the log likelihood ratio, we don't need to make "detours" along $\theta$.
+
+Let $t\in[0,1]$ interpolate between a tractable base density $p_0$ on $\mathbb{R}^d$ (e.g.\ standard Gaussian) and the model distribution $p_1$ over observations.
+The learned time-dependent and stimulus-dependent velocity field $v_t:\mathbb{R}^d\to\mathbb{R}^d$ defines the probability-flow ODE
+\begin{equation}
+  \frac{\mathrm{d}}{\mathrm{d}t}\, x_t(\theta) = v_t(x_t; \theta),
+\end{equation}
+whose time-$t$ marginal density we denote $p_t$.
+Along a trajectory $\{x_t\}_{t\in[0,1]}$, the instantaneous change-of-variables formula gives
+\begin{equation}
+  \frac{\mathrm{d}}{\mathrm{d}t}\, \log p_t(x_t | \theta)
+  = -\,\mathrm{div}\, v_t(x_t; \theta)
+  = -\,\mathrm{tr}\!\bigl(\nabla_x v_t(x_t; \theta)\bigr),
+\end{equation}
+so, writing $x_1=x$ for a sample from $p_1$ and $x_0$ for its preimage under the flow,
+\begin{equation}
+  \log p_1(x | \theta)
+  = \log p_0(x_0)
+    - \int_0^1 \mathrm{div}\, v_t(x_t; \theta)\,\mathrm{d}t.
+\end{equation}
+To evaluate $\log p_1(x | \theta)$, one integrates the ODE (typically \emph{backward} from $x$ at $t=1$ to $x_0(\theta)$ at $t=0$) and accumulates the divergence along that $t$-parameterized path.
+This replaces path integration along the stimulus $\theta$ with integration along the flow time $t$.
+
+Once we have $\log p_1(x | \theta)$, we can estimate the log likelihood ratio by $\log p_1(x | \theta_i) - \log p_1(x | \theta_j)$, thus estimating the Hellinger distance.
+
+The result is showing in figure, this method works for low-dimensional circular dataset but not high-dimensional.
+
+\subsection{Method 2: Flow matching exact likelihood computation on $\theta$ space}
+In method 1, we fit flow matching on $x$ space conditioning on $\theta$, which might be challenging because $x$ is high-dimensional. To simplify the dimensionality, we use Bayes' rule to convert the problem to a problem on $\theta$ space. 
+
+For any prior $p(\theta)$ over stimuli,
+\begin{equation}
+  p(x \mid \theta) = \frac{p(\theta \mid x)\, p(x)}{p(\theta)},
+\end{equation}
+so
+\begin{equation}
+  \log \frac{p(x \mid \theta_1)}{p(x \mid \theta_2)}
+  = \log \frac{p(\theta_1 \mid x)}{p(\theta_2 \mid x)} + \log \frac{p(\theta_2)}{p(\theta_1)}.
+\end{equation}
+Therefore the problem becomes estimating the log posterior $p(\theta \mid x)$ on low-dimensional $\theta$.
+
+We use the same method as method 1 for estimating $\log p(\theta \mid x)$, except now we use $x$ as conditioning variable and $\theta$ as the state variable. The result showing that this method, again works for low-dimensional circular dataset but not high-dimensional.
+
+\subsection{Method 3: Flow matching exact likelihood computation with Fourier features}
+In method 1 and method 2, we used the raw $\theta$ as the raw into to the network (an MLP). However, I noticed that MLP is not good at capturing the periodic structure of data acoording to perivious paper -- MLP tends to fit the low-frequency components. To reduce the inductive bias of MLP, similar to previous work, we feed the Fourier features of $\theta$ (Method 1) or $\tilde{\theta}$ (noisy state $\theta$ because Method 2 works on the $\theta$ space) to the velocity network. The result showing that this method slightly improve the performance on both method 1 and method 2, but still under performance to the baseline binning and decoding method.
+
+\subsection{Method 4: Vectorized Conditional Time Score Matching (CTSM-v)}
+Why those methods failed? One possible reason is that when estimating $\log p(x \mid \theta)$, we use $\theta$ as a conditioning variable, which feels like we fix $\theta_1$ and estimate $\log p(x \mid \theta_1)$ then fix to another $\theta_2$ and estimate $\log p(x \mid \theta_2)$. The estimation of $\log p(x \mid \theta_1)$ and $\log p(x \mid \theta_2)$ are related only because of the velocity network interpolate with $\theta$ points. This indirect connection between $\theta_1$ and $\theta_2$ may make the log likelihood ratio relies heavily on the $\theta$ distance rather than the overlapping of $x$ points (illustrated in figure).
+
+Can we estimate the log likelihood ratio by path interpolating between two unknown distributions directly rather than relying on $t$ path interpolating the a gaussian distribution? Yes, this is the idea of Vectorized Conditional Time Score Matching (CTSM-v, see detail in methods). This method is based on score matching, constructed probability path between two distributions (see Methods). 
+
+To check if this method works, I constructed two gaussian distributions, then use CTSM-v to fit and estimate the log likelihood ratio. CTSM-v performs better than flow matching with exact likelihood method.
+
+Next, we apply CTSM-v to non-circular dataset (see xxx). Interesting, it does not work well for high-dimensional non-circular dataset. Not sure why.
+
+\subsection{Normalizing flow}
+Some previous papers argue that flow matching is not good at estimating log likelihood compared to normalizing flow, after all, normalizing flow is trained directly on log likelihood. Therefore, we used normalizing flow to estimate $\log p(\theta \mid x)$.
+
+For non-circular dataset ...
+
+For circular dataset, interstingly, the estimation of log likelihood ratio using normalizing flow is better than flow matching method, but the RDM estimation is worse.
+
