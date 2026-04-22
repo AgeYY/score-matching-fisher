@@ -16,6 +16,7 @@ Collected markdown notes in `journal/notes/`: long-form chapters (moved from the
 
 ## 2026-04
 
+- [2026-04-22 Theta-flow **Fourier + Soft-MoE posterior** on 2D `cosine_gaussian_sqrtd`: H-decoding metrics vs MLP / Soft-MoE; repro + figure](notes/2026-04-22-theta-flow-fourier-softmoe-posterior-2d-h-decoding.md)
 - [2026-04-22 Theta-flow **Soft-MoE posterior** vs MLP on 2D `cosine_gaussian_sqrtd` H-decoding (`corr_h` / `corr_llr`); repro commands + figures](notes/2026-04-22-theta-flow-soft-moe-posterior-2d-h-decoding.md)
 - [2026-04-22 OT-CFM vs CFM 2D bimodal benchmark (`tests/ot_cfm_torchcfm.py`): TorchCFM matchers, data split, MMD, Markdown + commands](notes/2026-04-22-ot-cfm-bimodal-2d-benchmark.md)
 - [2026-04-22 Fixed-$x$ posterior panel: model curve (softmax + KDE) vs “GT” (generative $x\mid\theta$ + uniform prior); methods detail + `study_h_decoding_convergence` pointers](notes/2026-04-22-fixed-x-posterior-model-vs-approx-gt.md)
