@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import torch
 from torch import nn
@@ -918,28 +920,71 @@ def _make_flow_matching_path(scheduler_name: str):
     return AffineProbPath(scheduler=scheduler_lookup[name]())
 
 
-def _rollout_theta_flow_endpoint(
+def _standard_normal_log_prob(theta: torch.Tensor) -> torch.Tensor:
+    theta_flat = theta.reshape(theta.shape[0], -1)
+    return -0.5 * (theta_flat.pow(2).sum(dim=1) + theta_flat.shape[1] * math.log(2.0 * math.pi))
+
+
+def _theta_flow_exact_divergence(
+    velocity: torch.Tensor,
+    theta_t: torch.Tensor,
+    *,
+    create_graph: bool,
+) -> torch.Tensor:
+    v_flat = velocity.reshape(velocity.shape[0], -1)
+    div = torch.zeros(v_flat.shape[0], device=theta_t.device, dtype=theta_t.dtype)
+    for i in range(v_flat.shape[1]):
+        grad_i = torch.autograd.grad(
+            v_flat[:, i].sum(),
+            theta_t,
+            create_graph=create_graph,
+            retain_graph=True,
+        )[0]
+        div = div + grad_i.reshape(grad_i.shape[0], -1)[:, i]
+    return div
+
+
+def _theta_flow_conditional_nll_aux_loss(
+    *,
     model: ConditionalThetaFlowVelocity
     | ConditionalThetaFlowVelocityFiLMPerLayer
     | ConditionalThetaFlowVelocityThetaFourierMLP,
-    theta0: torch.Tensor,
+    theta_target: torch.Tensor,
     x_cond: torch.Tensor,
     n_steps: int,
+    enable_grad: bool,
 ) -> torch.Tensor:
-    """Differentiable fixed-step rollout for dtheta/dt = v(theta_t, x, t), t in [0, 1]."""
     steps = int(n_steps)
     if steps < 1:
         raise ValueError("endpoint ODE steps must be >= 1.")
-    theta = theta0
-    dt = 1.0 / float(steps)
-    batch = int(theta.shape[0])
+    step_dt = -1.0 / float(steps)  # integrate from t=1 -> 0
+    theta_t = theta_target
+    log_det = torch.zeros(theta_target.shape[0], device=theta_target.device, dtype=theta_target.dtype)
+    create_graph = bool(enable_grad)
     for k in range(steps):
-        # Midpoint-in-time Euler step; keeps rollout simple and stable.
-        t_mid = (float(k) + 0.5) * dt
-        t_col = torch.full((batch, 1), t_mid, device=theta.device, dtype=theta.dtype)
-        v = model(theta, x_cond, t_col)
-        theta = theta + dt * v
-    return theta
+        t_mid = 1.0 + (float(k) + 0.5) * step_dt
+        t_col = torch.full(
+            (theta_target.shape[0], 1),
+            t_mid,
+            device=theta_target.device,
+            dtype=theta_target.dtype,
+        )
+        with torch.set_grad_enabled(True):
+            theta_req = theta_t.requires_grad_(True)
+            velocity = model(theta_req, x_cond, t_col)
+            div = _theta_flow_exact_divergence(
+                velocity=velocity,
+                theta_t=theta_req,
+                create_graph=create_graph,
+            )
+        theta_t = theta_t + step_dt * velocity
+        log_det = log_det + step_dt * div
+        if not enable_grad:
+            theta_t = theta_t.detach()
+            log_det = log_det.detach()
+    log_post = _standard_normal_log_prob(theta_t) + log_det
+    nll = -torch.mean(log_post)
+    return nll
 
 
 def train_conditional_x_flow_model(
@@ -1276,13 +1321,13 @@ def train_conditional_theta_flow_model(
             pred = model(path_sample.x_t, xb, path_sample.t)
             fm_loss = torch.mean((pred - path_sample.dx_t) ** 2)
             if endpoint_enabled:
-                theta1_hat = _rollout_theta_flow_endpoint(
+                endpoint_loss = _theta_flow_conditional_nll_aux_loss(
                     model=model,
-                    theta0=theta0,
+                    theta_target=tb,
                     x_cond=xb,
                     n_steps=endpoint_steps,
+                    enable_grad=True,
                 )
-                endpoint_loss = torch.mean((theta1_hat - tb) ** 2)
                 loss = fm_loss + endpoint_weight * endpoint_loss
             else:
                 endpoint_loss = torch.zeros((), device=tb.device, dtype=tb.dtype)
@@ -1316,13 +1361,13 @@ def train_conditional_theta_flow_model(
                     pred = model(path_sample.x_t, xb, path_sample.t)
                     val_fm_loss = torch.mean((pred - path_sample.dx_t) ** 2)
                     if endpoint_enabled:
-                        theta1_hat = _rollout_theta_flow_endpoint(
+                        val_endpoint_loss = _theta_flow_conditional_nll_aux_loss(
                             model=model,
-                            theta0=theta0,
+                            theta_target=tb,
                             x_cond=xb,
                             n_steps=endpoint_steps,
+                            enable_grad=False,
                         )
-                        val_endpoint_loss = torch.mean((theta1_hat - tb) ** 2)
                         val_loss = val_fm_loss + endpoint_weight * val_endpoint_loss
                     else:
                         val_endpoint_loss = torch.zeros((), device=tb.device, dtype=tb.dtype)
@@ -1359,7 +1404,7 @@ def train_conditional_theta_flow_model(
                 if endpoint_enabled:
                     msg = (
                         f"{msg} endpoint_lambda={endpoint_weight:.6g} "
-                        f"train_endpoint_mean={mean_train_endpoint_loss:.6f}"
+                        f"train_endpoint_mean={mean_train_endpoint_loss:.6f} (nll)"
                     )
                 print(
                     msg
@@ -1369,7 +1414,7 @@ def train_conditional_theta_flow_model(
                 if endpoint_enabled:
                     msg = (
                         f"{msg} endpoint_lambda={endpoint_weight:.6g} "
-                        f"train_endpoint_mean={mean_train_endpoint_loss:.6f}"
+                        f"train_endpoint_mean={mean_train_endpoint_loss:.6f} (nll)"
                     )
                 print(msg)
 

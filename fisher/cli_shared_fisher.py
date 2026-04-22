@@ -260,8 +260,8 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         type=float,
         default=0.1,
         help=(
-            "theta_flow only: auxiliary endpoint reconstruction weight lambda for "
-            "loss = flow_matching + lambda * ||theta_1_hat - theta||^2. "
+            "theta_flow only: auxiliary conditional likelihood weight lambda for "
+            "loss = flow_matching + lambda * (-mean log p(theta|x)). "
             "Set 0 to disable."
         ),
     )
@@ -270,8 +270,8 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         type=int,
         default=20,
         help=(
-            "theta_flow only: fixed rollout steps in t in [0,1] for endpoint theta_1_hat "
-            "used by --flow-endpoint-loss-weight."
+            "theta_flow only: ODE integration steps for the auxiliary "
+            "-mean log p(theta|x) likelihood term."
         ),
     )
     p.add_argument("--flow-hidden-dim", type=int, default=128)

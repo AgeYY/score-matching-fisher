@@ -4,7 +4,10 @@ import numpy as np
 import torch
 
 from fisher.models import ConditionalThetaFlowVelocity
-from fisher.trainers import _rollout_theta_flow_endpoint, train_conditional_theta_flow_model
+from fisher.trainers import (
+    _theta_flow_conditional_nll_aux_loss,
+    train_conditional_theta_flow_model,
+)
 
 
 def _make_toy_dataset(n: int = 16) -> tuple[np.ndarray, np.ndarray]:
@@ -14,13 +17,18 @@ def _make_toy_dataset(n: int = 16) -> tuple[np.ndarray, np.ndarray]:
     return theta, x
 
 
-def test_theta_flow_endpoint_rollout_is_differentiable() -> None:
+def test_theta_flow_endpoint_nll_is_differentiable() -> None:
     torch.manual_seed(0)
     model = ConditionalThetaFlowVelocity(x_dim=2, hidden_dim=8, depth=1)
-    theta0 = torch.randn(8, 1)
+    theta = torch.randn(8, 1)
     x_cond = torch.randn(8, 2)
-    theta1 = _rollout_theta_flow_endpoint(model=model, theta0=theta0, x_cond=x_cond, n_steps=4)
-    loss = torch.mean(theta1.pow(2))
+    loss = _theta_flow_conditional_nll_aux_loss(
+        model=model,
+        theta_target=theta,
+        x_cond=x_cond,
+        n_steps=4,
+        enable_grad=True,
+    )
     loss.backward()
     grad_norm = 0.0
     for p in model.parameters():
@@ -79,7 +87,7 @@ def test_train_theta_flow_endpoint_loss_enabled_tracks_component_losses() -> Non
     assert len(out["train_fm_losses"]) == 2
     assert len(out["train_endpoint_losses"]) == 2
     assert np.all(np.isfinite(np.asarray(out["train_endpoint_losses"], dtype=np.float64)))
-    assert np.any(np.asarray(out["train_endpoint_losses"], dtype=np.float64) > 0.0)
+    assert np.any(np.abs(np.asarray(out["train_endpoint_losses"], dtype=np.float64)) > 1e-6)
     assert len(out["val_losses"]) == 2
     assert len(out["val_fm_losses"]) == 2
     assert len(out["val_endpoint_losses"]) == 2

@@ -9,7 +9,7 @@ This script intentionally exposes only a tiny CLI surface and fixes the rest:
 - theta in [theta-low, theta-high] (default 0, 3; was [-6,6] in make_dataset)
 - theta_field_method = theta_flow or nf
 - flow_arch = mlp (theta_flow only)
-- theta_flow endpoint auxiliary loss can be controlled via
+- theta_flow auxiliary conditional likelihood loss can be controlled via
   --flow-endpoint-loss-weight and --flow-endpoint-steps (theta_flow only)
 - n_ref = 1000
 - n in --n (default 200) as the sole --n-list value; --n-ref (default 1000) for reference subset
@@ -150,7 +150,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Optional theta-flow override for study_h_decoding_convergence: "
-            "--flow-endpoint-loss-weight (0 disables endpoint term)."
+            "--flow-endpoint-loss-weight (0 disables auxiliary -mean log p(theta|x) term)."
         ),
     )
     p.add_argument(
@@ -159,7 +159,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Optional theta-flow override for study_h_decoding_convergence: "
-            "--flow-endpoint-steps."
+            "--flow-endpoint-steps (ODE steps for auxiliary likelihood term)."
         ),
     )
     p.add_argument("--nf-epochs", type=int, default=2000, help="NF method only: training epochs.")
