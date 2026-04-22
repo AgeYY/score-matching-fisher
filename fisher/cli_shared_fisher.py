@@ -258,11 +258,11 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--flow-endpoint-loss-weight",
         type=float,
-        default=0.1,
+        default=0.0,
         help=(
             "theta_flow only: auxiliary conditional likelihood weight lambda for "
             "loss = flow_matching + lambda * (-mean log p(theta|x)). "
-            "Set 0 to disable."
+            "Default 0 disables; set >0 to enable."
         ),
     )
     p.add_argument(
@@ -307,12 +307,25 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         "--flow-arch",
         type=str,
         default="mlp",
-        choices=["mlp", "film", "film_fourier"],
+        choices=["mlp", "soft_moe", "film", "film_fourier"],
         help=(
             "Flow architecture shared by theta_flow, theta_path_integral, and x_flow: "
-            "mlp, film (FiLM blocks with embedded raw theta), or "
+            "mlp, soft_moe (dense soft gating over MLP experts), "
+            "film (FiLM blocks with embedded raw theta), or "
             "film_fourier (FiLM blocks with Fourier theta features)."
         ),
+    )
+    p.add_argument(
+        "--flow-moe-num-experts",
+        type=int,
+        default=4,
+        help="Posterior soft_moe only: number of experts in dense softmax routing.",
+    )
+    p.add_argument(
+        "--flow-moe-router-temperature",
+        type=float,
+        default=1.0,
+        help="Posterior soft_moe only: router softmax temperature (>0).",
     )
     p.add_argument(
         "--flow-score-arch",

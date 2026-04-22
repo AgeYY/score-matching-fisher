@@ -8,9 +8,10 @@ This script intentionally exposes only a tiny CLI surface and fixes the rest:
 - n_total = 3000, train_frac = 0.7, seed = 7
 - theta in [theta-low, theta-high] (default -6, 6)
 - theta_field_method = theta_flow or nf
-- flow_arch = mlp (theta_flow only)
+- flow_arch = mlp or soft_moe (theta_flow only)
 - theta_flow auxiliary conditional likelihood loss can be controlled via
-  --flow-endpoint-loss-weight and --flow-endpoint-steps (theta_flow only)
+  --flow-endpoint-loss-weight and --flow-endpoint-steps (theta_flow only); study default
+  weight is 0 (flow matching only) unless you pass --flow-endpoint-loss-weight here
 - n_ref = 1000
 - n in --n (default 200) as the sole --n-list value; --n-ref (default 1000) for reference subset
 - num_theta_bins = 10
@@ -159,6 +160,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--flow-epochs", type=int, default=None, help="Optional theta-flow override: --flow-epochs.")
     p.add_argument("--prior-epochs", type=int, default=None, help="Optional theta-flow override: --prior-epochs.")
     p.add_argument(
+        "--flow-arch",
+        type=str,
+        default="mlp",
+        choices=["mlp", "soft_moe"],
+        help="Theta-flow posterior architecture override (default: mlp).",
+    )
+    p.add_argument(
         "--flow-batch-size",
         type=int,
         default=None,
@@ -199,6 +207,18 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Optional theta-flow override: --prior-depth (prior flow MLP depth).",
+    )
+    p.add_argument(
+        "--flow-moe-num-experts",
+        type=int,
+        default=None,
+        help="Theta-flow soft_moe only: optional override for --flow-moe-num-experts.",
+    )
+    p.add_argument(
+        "--flow-moe-router-temperature",
+        type=float,
+        default=None,
+        help="Theta-flow soft_moe only: optional override for --flow-moe-router-temperature.",
     )
     p.add_argument("--nf-epochs", type=int, default=2000, help="NF method only: training epochs.")
     p.add_argument("--nf-batch-size", type=int, default=256, help="NF method only: batch size.")
@@ -435,7 +455,7 @@ def _run_convergence(
         args.device,
     ]
     if str(method) == "theta_flow":
-        cmd += ["--flow-arch", "mlp"]
+        cmd += ["--flow-arch", str(args.flow_arch)]
         if args.flow_epochs is not None:
             cmd += ["--flow-epochs", str(int(args.flow_epochs))]
         if args.prior_epochs is not None:
@@ -452,6 +472,10 @@ def _run_convergence(
             cmd += ["--flow-depth", str(int(args.flow_depth))]
         if args.prior_depth is not None:
             cmd += ["--prior-depth", str(int(args.prior_depth))]
+        if args.flow_moe_num_experts is not None:
+            cmd += ["--flow-moe-num-experts", str(int(args.flow_moe_num_experts))]
+        if args.flow_moe_router_temperature is not None:
+            cmd += ["--flow-moe-router-temperature", str(float(args.flow_moe_router_temperature))]
     else:
         cmd += [
             "--nf-epochs",

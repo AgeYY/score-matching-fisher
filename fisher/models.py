@@ -212,6 +212,80 @@ class ConditionalThetaFlowVelocity(nn.Module):
         return self.forward(theta, x, t)
 
 
+class ConditionalThetaFlowVelocitySoftMoE(nn.Module):
+    """Conditional theta-velocity model with dense soft-MoE experts.
+
+    Both the router and each expert consume the same ``[theta_t, x, t_feat]`` features.
+    The output is the dense softmax-weighted sum of all expert outputs.
+    """
+
+    def __init__(
+        self,
+        x_dim: int = 2,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        use_logit_time: bool = True,
+        *,
+        theta_dim: int = 1,
+        num_experts: int = 4,
+        router_temperature: float = 1.0,
+    ) -> None:
+        super().__init__()
+        if x_dim < 2:
+            raise ValueError("x_dim must be >= 2.")
+        if int(theta_dim) < 1:
+            raise ValueError("theta_dim must be >= 1.")
+        if int(num_experts) < 1:
+            raise ValueError("num_experts must be >= 1.")
+        if float(router_temperature) <= 0.0:
+            raise ValueError("router_temperature must be > 0.")
+        self.x_dim = int(x_dim)
+        self.theta_dim = int(theta_dim)
+        self.use_logit_time = bool(use_logit_time)
+        self.num_experts = int(num_experts)
+        self.router_temperature = float(router_temperature)
+        in_dim = self.theta_dim + self.x_dim + 1  # theta_t, x, t
+
+        def _make_expert() -> nn.Sequential:
+            layers: list[nn.Module] = []
+            hid_in = int(in_dim)
+            for _ in range(int(depth)):
+                layers.append(nn.Linear(hid_in, int(hidden_dim)))
+                layers.append(nn.SiLU())
+                hid_in = int(hidden_dim)
+            layers.append(nn.Linear(int(hidden_dim), self.theta_dim))
+            return nn.Sequential(*layers)
+
+        self.experts = nn.ModuleList([_make_expert() for _ in range(self.num_experts)])
+        self.router = nn.Linear(int(in_dim), self.num_experts)
+
+    def forward(self, theta_t: torch.Tensor, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        if theta_t.ndim == 1:
+            theta_t = theta_t.unsqueeze(-1)
+        if theta_t.shape[-1] != self.theta_dim:
+            raise ValueError(f"theta_t last dim {theta_t.shape[-1]} != theta_dim={self.theta_dim}")
+        if x.shape[-1] != self.x_dim:
+            raise ValueError(f"x last dim {x.shape[-1]} != x_dim={self.x_dim}")
+        if t.ndim == 1:
+            t = t.unsqueeze(-1)
+        if self.use_logit_time:
+            t_clip = torch.clamp(t, min=1e-4, max=1.0 - 1e-4)
+            t_feat = torch.log(t_clip) - torch.log1p(-t_clip)
+        else:
+            t_feat = t
+        feats = torch.cat([theta_t, x, t_feat], dim=-1)
+        gate_logits = self.router(feats) / self.router_temperature
+        gate_probs = torch.softmax(gate_logits, dim=-1)
+        expert_outs = torch.stack([expert(feats) for expert in self.experts], dim=1)
+        return torch.sum(gate_probs.unsqueeze(-1) * expert_outs, dim=1)
+
+    @torch.no_grad()
+    def predict_velocity(self, theta: torch.Tensor, x: torch.Tensor, t_eval: float) -> torch.Tensor:
+        self.eval()
+        t = torch.full((theta.shape[0], 1), float(t_eval), device=theta.device)
+        return self.forward(theta, x, t)
+
+
 class PriorThetaFlowVelocity(nn.Module):
     """Unconditional theta-velocity model v(theta_t, t) with output in R^{theta_dim}."""
 

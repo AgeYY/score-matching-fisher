@@ -22,7 +22,7 @@ from fisher.shared_fisher_est import validate_estimation_args
 def test_validate_accepts_theta_flow_endpoint_defaults() -> None:
     args = parse_full_args([])
     validate_estimation_args(args)
-    assert float(args.flow_endpoint_loss_weight) == pytest.approx(0.1)
+    assert float(args.flow_endpoint_loss_weight) == pytest.approx(0.0)
     assert int(args.flow_endpoint_steps) == 20
 
 

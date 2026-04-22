@@ -31,6 +31,7 @@ from fisher.models import (
     ConditionalScore1DFiLMPerLayer,
     ConditionalThetaFlowVelocity,
     ConditionalThetaFlowVelocityFiLMPerLayer,
+    ConditionalThetaFlowVelocitySoftMoE,
     ConditionalThetaFlowVelocityThetaFourierFiLMPerLayer,
     ConditionalThetaFlowVelocityThetaFourierMLP,
     ConditionalXFlowVelocity,
@@ -147,9 +148,9 @@ def normalize_theta_field_method(method: str) -> str:
 
 def normalize_flow_arch(args: Any) -> str:
     arch = str(getattr(args, "flow_arch", "mlp")).strip().lower()
-    if arch in ("mlp", "film", "film_fourier"):
+    if arch in ("mlp", "soft_moe", "film", "film_fourier"):
         return arch
-    raise ValueError("--flow-arch must be one of {'mlp','film','film_fourier'}.")
+    raise ValueError("--flow-arch must be one of {'mlp','soft_moe','film','film_fourier'}.")
 
 
 def build_posterior_score_model(
@@ -956,11 +957,11 @@ def validate_estimation_args(args: Any) -> None:
     legacy_flow_prior_arch = getattr(args, "flow_prior_arch", None)
     if legacy_flow_score_arch is not None:
         raise ValueError(
-            "Legacy --flow-score-arch is removed. Use --flow-arch {mlp,film,film_fourier}."
+            "Legacy --flow-score-arch is removed. Use --flow-arch {mlp,soft_moe,film,film_fourier}."
         )
     if legacy_flow_prior_arch is not None:
         raise ValueError(
-            "Legacy --flow-prior-arch is removed. Use --flow-arch {mlp,film,film_fourier}."
+            "Legacy --flow-prior-arch is removed. Use --flow-arch {mlp,soft_moe,film,film_fourier}."
         )
     if args.score_eval_sigmas < 1:
         raise ValueError("--score-eval-sigmas must be >= 1.")
@@ -1065,7 +1066,7 @@ def validate_estimation_args(args: Any) -> None:
         raise ValueError("--flow-batch-size must be >= 1.")
     if float(getattr(args, "flow_lr", 0.0)) <= 0.0:
         raise ValueError("--flow-lr must be positive.")
-    if float(getattr(args, "flow_endpoint_loss_weight", 0.1)) < 0.0:
+    if float(getattr(args, "flow_endpoint_loss_weight", 0.0)) < 0.0:
         raise ValueError("--flow-endpoint-loss-weight must be non-negative.")
     if int(getattr(args, "flow_endpoint_steps", 20)) < 1:
         raise ValueError("--flow-endpoint-steps must be >= 1.")
@@ -1085,8 +1086,12 @@ def validate_estimation_args(args: Any) -> None:
         raise ValueError("--flow-prior-cond-embed-dim must be >= 1.")
     if int(getattr(args, "flow_prior_cond_embed_depth", 1)) < 1:
         raise ValueError("--flow-prior-cond-embed-depth must be >= 1.")
-    if _arch not in ("mlp", "film", "film_fourier"):
-        raise ValueError("--flow-arch must be one of {'mlp','film','film_fourier'}.")
+    if _arch not in ("mlp", "soft_moe", "film", "film_fourier"):
+        raise ValueError("--flow-arch must be one of {'mlp','soft_moe','film','film_fourier'}.")
+    if int(getattr(args, "flow_moe_num_experts", 4)) < 1:
+        raise ValueError("--flow-moe-num-experts must be >= 1.")
+    if float(getattr(args, "flow_moe_router_temperature", 1.0)) <= 0.0:
+        raise ValueError("--flow-moe-router-temperature must be > 0.")
     _fx_k = int(getattr(args, "flow_x_theta_fourier_k", 4))
     _fx_omega_mode = str(getattr(args, "flow_x_theta_fourier_omega_mode", "theta_range")).strip().lower()
     _fx_inc_lin = not bool(getattr(args, "flow_x_theta_fourier_no_linear", False))
@@ -1095,6 +1100,8 @@ def validate_estimation_args(args: Any) -> None:
         raise ValueError("--flow-x-theta-fourier-k must be >= 0.")
     if _fx_omega_mode not in ("fixed", "theta_range"):
         raise ValueError("--flow-x-theta-fourier-omega-mode must be one of {'fixed', 'theta_range'}.")
+    if _tfm_val == "x_flow" and _arch == "soft_moe":
+        raise ValueError("--flow-arch soft_moe is supported only for theta_flow/theta_path_integral.")
     if _tfm_val == "x_flow" and _arch == "film_fourier":
         if _fx_omega_mode == "theta_range":
             lo = float(getattr(args, "theta_low", -6.0))
@@ -2043,7 +2050,7 @@ def run_shared_fisher_estimation(
         theta_std = float(np.std(theta_score_fit))
         theta_dim_flow = int(theta_score_fit.shape[1]) if theta_score_fit.ndim >= 2 else 1
         flow_score_arch = str(flow_arch).strip().lower()
-        flow_prior_arch = str(flow_arch).strip().lower()
+        flow_prior_arch = "mlp" if flow_score_arch == "soft_moe" else str(flow_arch).strip().lower()
         theta_onehot_state = bool(getattr(args, "theta_flow_onehot_state", False))
         if theta_onehot_state:
             if theta_field_method != "theta_flow":
@@ -2081,6 +2088,11 @@ def run_shared_fisher_estimation(
                 f" theta_fourier_post_omega_in_net={float(_om_eff):.6g}"
                 f" theta_fourier_post_linear={not bool(getattr(args, 'flow_theta_fourier_no_linear', False))}"
                 f" theta_fourier_post_bias={not bool(getattr(args, 'flow_theta_fourier_no_bias', False))}"
+            )
+        elif flow_score_arch == "soft_moe":
+            _xf_post = (
+                f" moe_post_num_experts={int(getattr(args, 'flow_moe_num_experts', 4))}"
+                f" moe_post_router_temp={float(getattr(args, 'flow_moe_router_temperature', 1.0)):.6g}"
             )
         _xf_prior = ""
         if flow_prior_arch == "film":
@@ -2124,6 +2136,25 @@ def run_shared_fisher_estimation(
                 depth=int(getattr(args, "flow_depth", 3)),
                 use_logit_time=True,
                 theta_dim=theta_dim_flow,
+            ).to(device)
+        elif flow_score_arch == "soft_moe":
+            post_ckpt_hparams = {
+                "x_dim": int(args.x_dim),
+                "hidden_dim": int(getattr(args, "flow_hidden_dim", 128)),
+                "depth": int(getattr(args, "flow_depth", 3)),
+                "use_logit_time": True,
+                "theta_dim": int(theta_dim_flow),
+                "num_experts": int(getattr(args, "flow_moe_num_experts", 4)),
+                "router_temperature": float(getattr(args, "flow_moe_router_temperature", 1.0)),
+            }
+            post_model = ConditionalThetaFlowVelocitySoftMoE(
+                x_dim=args.x_dim,
+                hidden_dim=int(getattr(args, "flow_hidden_dim", 128)),
+                depth=int(getattr(args, "flow_depth", 3)),
+                use_logit_time=True,
+                theta_dim=theta_dim_flow,
+                num_experts=int(getattr(args, "flow_moe_num_experts", 4)),
+                router_temperature=float(getattr(args, "flow_moe_router_temperature", 1.0)),
             ).to(device)
         elif flow_score_arch == "film":
             post_ckpt_hparams = {
@@ -2179,7 +2210,7 @@ def run_shared_fisher_estimation(
                 theta_fourier_include_bias=not bool(getattr(args, "flow_theta_fourier_no_bias", False)),
             ).to(device)
         else:
-            raise ValueError("--flow-arch must be one of {'mlp','film','film_fourier'}.")
+            raise ValueError("--flow-arch must be one of {'mlp','soft_moe','film','film_fourier'}.")
         post_train_out = train_conditional_theta_flow_model(
             model=post_model,
             theta_train=theta_score_fit,
@@ -2197,7 +2228,7 @@ def run_shared_fisher_estimation(
             restore_best=bool(getattr(args, "flow_restore_best", True)),
             scheduler_name=str(getattr(args, "flow_scheduler", "cosine")),
             endpoint_loss_weight=(
-                float(getattr(args, "flow_endpoint_loss_weight", 0.1))
+                float(getattr(args, "flow_endpoint_loss_weight", 0.0))
                 if theta_field_method == "theta_flow"
                 else 0.0
             ),

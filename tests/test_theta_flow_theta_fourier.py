@@ -11,6 +11,7 @@ import torch
 from fisher.cli_shared_fisher import add_estimation_arguments
 from fisher.h_matrix import HMatrixEstimator
 from fisher.models import (
+    ConditionalThetaFlowVelocitySoftMoE,
     ConditionalThetaFlowVelocityThetaFourierFiLMPerLayer,
     ConditionalThetaFlowVelocityThetaFourierMLP,
     PriorThetaFlowVelocityThetaFourierFiLMPerLayer,
@@ -24,6 +25,23 @@ from fisher.shared_fisher_est import (
 
 
 class TestThetaFlowThetaFourier(unittest.TestCase):
+    def test_conditional_theta_soft_moe_forward_shape(self) -> None:
+        m = ConditionalThetaFlowVelocitySoftMoE(
+            x_dim=4,
+            hidden_dim=16,
+            depth=2,
+            theta_dim=1,
+            num_experts=3,
+            router_temperature=0.8,
+        )
+        b = 5
+        theta_t = torch.randn(b, 1)
+        x = torch.randn(b, 4)
+        t = torch.rand(b, 1)
+        out = m(theta_t, x, t)
+        self.assertEqual(tuple(out.shape), (b, 1))
+        self.assertTrue(torch.isfinite(out).all())
+
     def test_conditional_forward_shape(self) -> None:
         m = ConditionalThetaFlowVelocityThetaFourierMLP(
             x_dim=4,
@@ -81,6 +99,23 @@ class TestThetaFlowThetaFourier(unittest.TestCase):
                 "theta_flow",
                 "--flow-arch",
                 "film_fourier",
+            ]
+        )
+        validate_estimation_args(args)
+
+    def test_validate_accepts_theta_flow_soft_moe(self) -> None:
+        parser = argparse.ArgumentParser()
+        add_estimation_arguments(parser)
+        args = parser.parse_args(
+            [
+                "--theta-field-method",
+                "theta_flow",
+                "--flow-arch",
+                "soft_moe",
+                "--flow-moe-num-experts",
+                "3",
+                "--flow-moe-router-temperature",
+                "0.7",
             ]
         )
         validate_estimation_args(args)
