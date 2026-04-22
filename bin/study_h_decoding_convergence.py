@@ -23,7 +23,8 @@ log-likelihood Bayes ratios; prior + posterior theta-flows), ``--theta-field-met
 (same training as theta_flow but H from velocity-to-score plus trapezoid integral along sorted ``theta``),
 ``--theta-field-method x_flow`` (conditional x-space FM likelihood; no prior model),
 ``--theta-field-method ctsm_v`` (pair-conditioned CTSM-v time-score integration; no prior model), and
-``--theta-field-method nf`` (conditional normalizing flow log p(theta|x); no prior model).
+``--theta-field-method nf`` (conditional normalizing flow log p(theta|x) with an NF prior
+for posterior-minus-prior log-ratio construction).
 Flow methods use ``--flow-arch``: ``mlp``, ``film`` (FiLM with raw-theta embeddings), or
 ``film_fourier`` for ``theta_flow`` / ``theta_path_integral`` / ``x_flow``.
 ``film_fourier`` uses FiLM conditioning with Fourier theta features
@@ -58,7 +59,12 @@ import tempfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, NamedTuple, NotRequired, TypedDict, cast
+from typing import Any, NamedTuple, TypedDict, cast
+
+try:
+    from typing import NotRequired
+except ImportError:  # Python <3.11
+    from typing_extensions import NotRequired
 
 _repo_root = Path(__file__).resolve().parent.parent
 _bin_dir = Path(__file__).resolve().parent
@@ -83,12 +89,16 @@ from fisher.hellinger_gt import (
 )
 from fisher.nf_hellinger import (
     ConditionalThetaNF,
+    PriorThetaNF,
     compute_c_matrix_nf,
     compute_delta_l as compute_delta_l_nf,
     compute_h_directed as compute_h_directed_nf,
+    compute_log_p_theta_prior_nf,
+    compute_ratio_matrix_posterior_minus_prior,
     require_zuko_for_nf,
     symmetrize as symmetrize_nf,
     train_conditional_nf,
+    train_prior_nf,
 )
 from fisher.evaluation import log_p_x_given_theta
 from fisher.shared_dataset_io import SharedDatasetBundle, load_shared_dataset_npz
@@ -451,6 +461,54 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.05,
         help="NF method only: EMA alpha for validation monitor.",
     )
+    p.add_argument(
+        "--nf-prior-epochs",
+        type=int,
+        default=None,
+        help="NF method only: optional prior-NF epochs override (default: --nf-epochs).",
+    )
+    p.add_argument(
+        "--nf-prior-batch-size",
+        type=int,
+        default=None,
+        help="NF method only: optional prior-NF batch size override (default: --nf-batch-size).",
+    )
+    p.add_argument(
+        "--nf-prior-lr",
+        type=float,
+        default=None,
+        help="NF method only: optional prior-NF learning rate override (default: --nf-lr).",
+    )
+    p.add_argument(
+        "--nf-prior-hidden-dim",
+        type=int,
+        default=None,
+        help="NF method only: optional prior-NF hidden size override (default: --nf-hidden-dim).",
+    )
+    p.add_argument(
+        "--nf-prior-transforms",
+        type=int,
+        default=None,
+        help="NF method only: optional prior-NF transform count override (default: --nf-transforms).",
+    )
+    p.add_argument(
+        "--nf-prior-early-patience",
+        type=int,
+        default=None,
+        help="NF method only: optional prior-NF early-stop patience override (default: --nf-early-patience).",
+    )
+    p.add_argument(
+        "--nf-prior-early-min-delta",
+        type=float,
+        default=None,
+        help="NF method only: optional prior-NF early-stop min delta override (default: --nf-early-min-delta).",
+    )
+    p.add_argument(
+        "--nf-prior-early-ema-alpha",
+        type=float,
+        default=None,
+        help="NF method only: optional prior-NF EMA alpha override (default: --nf-early-ema-alpha).",
+    )
     add_estimation_arguments(p)
     p.set_defaults(
         output_dir=str(Path(DATA_DIR) / "h_decoding_convergence"),
@@ -503,6 +561,32 @@ def _validate_cli(args: argparse.Namespace) -> None:
         alpha = float(getattr(args, "nf_early_ema_alpha", 0.0))
         if not np.isfinite(alpha) or alpha <= 0.0 or alpha > 1.0:
             raise ValueError("--nf-early-ema-alpha must be in (0, 1].")
+        _pe = getattr(args, "nf_prior_epochs", None)
+        if _pe is not None and int(_pe) < 1:
+            raise ValueError("--nf-prior-epochs must be >= 1.")
+        _pb = getattr(args, "nf_prior_batch_size", None)
+        if _pb is not None and int(_pb) < 1:
+            raise ValueError("--nf-prior-batch-size must be >= 1.")
+        _plr = getattr(args, "nf_prior_lr", None)
+        if _plr is not None and float(_plr) <= 0.0:
+            raise ValueError("--nf-prior-lr must be > 0.")
+        _ph = getattr(args, "nf_prior_hidden_dim", None)
+        if _ph is not None and int(_ph) < 1:
+            raise ValueError("--nf-prior-hidden-dim must be >= 1.")
+        _pt = getattr(args, "nf_prior_transforms", None)
+        if _pt is not None and int(_pt) < 1:
+            raise ValueError("--nf-prior-transforms must be >= 1.")
+        _pp = getattr(args, "nf_prior_early_patience", None)
+        if _pp is not None and int(_pp) < 0:
+            raise ValueError("--nf-prior-early-patience must be >= 0.")
+        _pm = getattr(args, "nf_prior_early_min_delta", None)
+        if _pm is not None and float(_pm) < 0.0:
+            raise ValueError("--nf-prior-early-min-delta must be >= 0.")
+        _pa = getattr(args, "nf_prior_early_ema_alpha", None)
+        if _pa is not None:
+            pa = float(_pa)
+            if (not np.isfinite(pa)) or pa <= 0.0 or pa > 1.0:
+                raise ValueError("--nf-prior-early-ema-alpha must be in (0, 1].")
     else:
         validate_estimation_args(args)
     if int(args.num_theta_bins) < 1:
@@ -771,12 +855,33 @@ def _estimate_one(
             raise ValueError("NF method expects x arrays to be 2D.")
         if theta_train.size < 1 or theta_val.size < 1:
             raise ValueError("NF method requires non-empty train and validation splits.")
+        nf_epochs = int(getattr(args, "nf_epochs", 2000))
+        nf_batch_size = int(getattr(args, "nf_batch_size", 256))
+        nf_lr = float(getattr(args, "nf_lr", 1e-3))
+        nf_hidden_dim = int(getattr(args, "nf_hidden_dim", 128))
+        nf_context_dim = int(getattr(args, "nf_context_dim", 32))
+        nf_transforms = int(getattr(args, "nf_transforms", 5))
+        nf_early_patience = int(getattr(args, "nf_early_patience", 300))
+        nf_early_min_delta = float(getattr(args, "nf_early_min_delta", 1e-4))
+        nf_early_ema_alpha = float(getattr(args, "nf_early_ema_alpha", 0.05))
+        nf_prior_epochs = int(getattr(args, "nf_prior_epochs", nf_epochs) or nf_epochs)
+        nf_prior_batch_size = int(getattr(args, "nf_prior_batch_size", nf_batch_size) or nf_batch_size)
+        nf_prior_lr = float(getattr(args, "nf_prior_lr", nf_lr) or nf_lr)
+        nf_prior_hidden_dim = int(getattr(args, "nf_prior_hidden_dim", nf_hidden_dim) or nf_hidden_dim)
+        nf_prior_transforms = int(getattr(args, "nf_prior_transforms", nf_transforms) or nf_transforms)
+        nf_prior_early_patience = int(getattr(args, "nf_prior_early_patience", nf_early_patience) or nf_early_patience)
+        nf_prior_early_min_delta = float(
+            getattr(args, "nf_prior_early_min_delta", nf_early_min_delta) or nf_early_min_delta
+        )
+        nf_prior_early_ema_alpha = float(
+            getattr(args, "nf_prior_early_ema_alpha", nf_early_ema_alpha) or nf_early_ema_alpha
+        )
 
         model = ConditionalThetaNF(
             x_dim=int(x_all.shape[1]),
-            context_dim=int(getattr(args, "nf_context_dim", 32)),
-            hidden_dim=int(getattr(args, "nf_hidden_dim", 128)),
-            transforms=int(getattr(args, "nf_transforms", 5)),
+            context_dim=nf_context_dim,
+            hidden_dim=nf_hidden_dim,
+            transforms=nf_transforms,
         ).to(dev)
         train_out = train_conditional_nf(
             model=model,
@@ -785,12 +890,28 @@ def _estimate_one(
             theta_val=theta_val,
             x_val=x_val,
             device=dev,
-            epochs=int(getattr(args, "nf_epochs", 2000)),
-            batch_size=int(getattr(args, "nf_batch_size", 256)),
-            lr=float(getattr(args, "nf_lr", 1e-3)),
-            patience=int(getattr(args, "nf_early_patience", 300)),
-            min_delta=float(getattr(args, "nf_early_min_delta", 1e-4)),
-            ema_alpha=float(getattr(args, "nf_early_ema_alpha", 0.05)),
+            epochs=nf_epochs,
+            batch_size=nf_batch_size,
+            lr=nf_lr,
+            patience=nf_early_patience,
+            min_delta=nf_early_min_delta,
+            ema_alpha=nf_early_ema_alpha,
+        )
+        prior_model = PriorThetaNF(
+            hidden_dim=nf_prior_hidden_dim,
+            transforms=nf_prior_transforms,
+        ).to(dev)
+        prior_out = train_prior_nf(
+            model=prior_model,
+            theta_train=theta_train,
+            theta_val=theta_val,
+            device=dev,
+            epochs=nf_prior_epochs,
+            batch_size=nf_prior_batch_size,
+            lr=nf_prior_lr,
+            patience=nf_prior_early_patience,
+            min_delta=nf_prior_early_min_delta,
+            ema_alpha=nf_prior_early_ema_alpha,
         )
         c_matrix = compute_c_matrix_nf(
             model=model,
@@ -799,7 +920,16 @@ def _estimate_one(
             device=dev,
             pair_batch_size=int(getattr(args, "nf_pair_batch_size", 65536)),
         )
-        delta_l = compute_delta_l_nf(c_matrix)
+        log_p_theta_prior = compute_log_p_theta_prior_nf(
+            model=prior_model,
+            theta_all=theta_all,
+            device=dev,
+        )
+        r_matrix = compute_ratio_matrix_posterior_minus_prior(
+            c_matrix_post=c_matrix,
+            log_p_theta_prior=log_p_theta_prior,
+        )
+        delta_l = compute_delta_l_nf(r_matrix)
         h_sym = symmetrize_nf(compute_h_directed_nf(delta_l))
 
         np.savez_compressed(
@@ -807,21 +937,23 @@ def _estimate_one(
             theta_used=np.asarray(theta_all, dtype=np.float64),
             h_sym=np.asarray(h_sym, dtype=np.float64),
             c_matrix=np.asarray(c_matrix, dtype=np.float64),
+            c_matrix_ratio=np.asarray(r_matrix, dtype=np.float64),
+            log_p_theta_prior=np.asarray(log_p_theta_prior, dtype=np.float64),
             delta_l_matrix=np.asarray(delta_l, dtype=np.float64),
             h_field_method=np.asarray(["nf"], dtype=object),
-            h_eval_scalar_name=np.asarray(["nf_log_prob_delta"], dtype=object),
+            h_eval_scalar_name=np.asarray(["nf_log_ratio_post_minus_prior"], dtype=object),
             sigma_eval=np.asarray([np.nan], dtype=np.float64),
         )
         np.savez_compressed(
             os.path.join(output_dir, "score_prior_training_losses.npz"),
             theta_field_method=np.asarray(["nf"], dtype=object),
-            prior_enable=np.bool_(False),
+            prior_enable=np.bool_(True),
             score_train_losses=np.asarray(train_out["train_losses"], dtype=np.float64),
             score_val_losses=np.asarray(train_out["val_losses"], dtype=np.float64),
             score_val_monitor_losses=np.asarray(train_out["val_ema_losses"], dtype=np.float64),
-            prior_train_losses=np.asarray([], dtype=np.float64),
-            prior_val_losses=np.asarray([], dtype=np.float64),
-            prior_val_monitor_losses=np.asarray([], dtype=np.float64),
+            prior_train_losses=np.asarray(prior_out["train_losses"], dtype=np.float64),
+            prior_val_losses=np.asarray(prior_out["val_losses"], dtype=np.float64),
+            prior_val_monitor_losses=np.asarray(prior_out["val_ema_losses"], dtype=np.float64),
         )
         loaded_nf = SimpleNamespace(
             h_sym=np.asarray(h_sym, dtype=np.float64),
@@ -2500,12 +2632,12 @@ def main(argv: list[str] | None = None) -> None:
     elif tfm == "nf":
         print(
             f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
-            "(conditional normalizing flow p(theta|x), no prior model)",
+            "(conditional normalizing flow posterior + learned prior)",
             flush=True,
         )
         print(
-            "[convergence] nf mode builds C[i,j]=log p(theta_j|x_i), then DeltaL=C-diag(C), "
-            "and H via 1-sech(DeltaL/2).",
+            "[convergence] nf mode builds C_post[i,j]=log p(theta_j|x_i), learns log p(theta_j), "
+            "forms R=C_post-log p(theta_j), then DeltaL=R-diag(R), and H via 1-sech(DeltaL/2).",
             flush=True,
         )
     else:

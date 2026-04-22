@@ -57,6 +57,30 @@ class ConditionalThetaNF(nn.Module):
         return self.distribution(x).log_prob(theta.reshape(-1, 1))
 
 
+class PriorThetaNF(nn.Module):
+    """Unconditional NSF model for p(theta)."""
+
+    def __init__(
+        self,
+        *,
+        hidden_dim: int,
+        transforms: int,
+    ) -> None:
+        super().__init__()
+        require_zuko_for_nf()
+        self.flow = zuko.flows.NSF(  # type: ignore[union-attr]
+            features=1,
+            transforms=int(transforms),
+            hidden_features=[int(hidden_dim), int(hidden_dim)],
+        )
+
+    def distribution(self) -> torch.distributions.Distribution:
+        return self.flow()
+
+    def log_prob(self, theta: torch.Tensor) -> torch.Tensor:
+        return self.distribution().log_prob(theta.reshape(-1, 1))
+
+
 def train_conditional_nf(
     *,
     model: ConditionalThetaNF,
@@ -133,6 +157,78 @@ def train_conditional_nf(
     }
 
 
+def train_prior_nf(
+    *,
+    model: PriorThetaNF,
+    theta_train: np.ndarray,
+    theta_val: np.ndarray,
+    device: torch.device,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    patience: int,
+    min_delta: float,
+    ema_alpha: float,
+) -> dict[str, Any]:
+    """Train unconditional prior NF by NLL with EMA-monitored early stopping."""
+    ttr = torch.from_numpy(np.asarray(theta_train, dtype=np.float32).reshape(-1, 1)).to(device)
+    tva = torch.from_numpy(np.asarray(theta_val, dtype=np.float32).reshape(-1, 1)).to(device)
+    ntr = int(ttr.shape[0])
+    if ntr < 1:
+        raise ValueError("Prior NF training requires at least one training sample.")
+    opt = torch.optim.Adam(model.parameters(), lr=float(lr))
+
+    train_losses: list[float] = []
+    val_losses: list[float] = []
+    val_ema_losses: list[float] = []
+    best_state: dict[str, torch.Tensor] | None = None
+    best_ema = float("inf")
+    best_epoch = 0
+    bad = 0
+    ema: float | None = None
+
+    for ep in range(1, int(epochs) + 1):
+        model.train()
+        idx = torch.randint(0, ntr, (int(batch_size),), device=device)
+        loss = -model.log_prob(ttr[idx]).mean()
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+
+        tr = float(loss.detach().cpu().item())
+        train_losses.append(tr)
+
+        model.eval()
+        with torch.no_grad():
+            va = float((-model.log_prob(tva).mean()).detach().cpu().item())
+        val_losses.append(va)
+        ema = va if ema is None else (float(ema_alpha) * va + (1.0 - float(ema_alpha)) * float(ema))
+        val_ema_losses.append(float(ema))
+
+        if float(ema) < (best_ema - float(min_delta)):
+            best_ema = float(ema)
+            best_epoch = ep
+            bad = 0
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        else:
+            bad += 1
+
+        if bad >= int(patience):
+            break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    return {
+        "train_losses": np.asarray(train_losses, dtype=np.float64),
+        "val_losses": np.asarray(val_losses, dtype=np.float64),
+        "val_ema_losses": np.asarray(val_ema_losses, dtype=np.float64),
+        "best_epoch": int(best_epoch),
+        "stopped_epoch": int(len(train_losses)),
+        "best_val_ema": float(best_ema),
+    }
+
+
 def compute_c_matrix_nf(
     *,
     model: ConditionalThetaNF,
@@ -172,6 +268,45 @@ def compute_c_matrix_nf(
     return c
 
 
+def compute_log_p_theta_prior_nf(
+    *,
+    model: PriorThetaNF,
+    theta_all: np.ndarray,
+    device: torch.device,
+    batch_size: int = 65536,
+) -> np.ndarray:
+    """Compute log p(theta_j) on theta grid."""
+    theta_vec = np.asarray(theta_all, dtype=np.float64).reshape(-1)
+    n = int(theta_vec.shape[0])
+    if n < 1:
+        raise ValueError("Need at least one theta sample.")
+    bs = max(1, int(batch_size))
+    out = np.empty(n, dtype=np.float64)
+    theta_t = torch.from_numpy(theta_vec.astype(np.float32))
+    model.eval()
+    with torch.no_grad():
+        for i0 in range(0, n, bs):
+            i1 = min(n, i0 + bs)
+            tb = theta_t[i0:i1].to(device)
+            lp = model.log_prob(tb)
+            out[i0:i1] = lp.detach().cpu().numpy().reshape(-1).astype(np.float64, copy=False)
+    return out
+
+
+def compute_ratio_matrix_posterior_minus_prior(
+    c_matrix_post: np.ndarray,
+    log_p_theta_prior: np.ndarray,
+) -> np.ndarray:
+    """R[i,j] = log p(theta_j|x_i) - log p(theta_j)."""
+    c = np.asarray(c_matrix_post, dtype=np.float64)
+    lp = np.asarray(log_p_theta_prior, dtype=np.float64).reshape(-1)
+    if c.ndim != 2 or c.shape[0] != c.shape[1]:
+        raise ValueError("Posterior C matrix must be square.")
+    if int(c.shape[1]) != int(lp.size):
+        raise ValueError(f"Prior log-prob size mismatch: c cols={c.shape[1]} vs prior={lp.size}.")
+    return c - lp.reshape(1, -1)
+
+
 def compute_delta_l(c_matrix: np.ndarray) -> np.ndarray:
     c = np.asarray(c_matrix, dtype=np.float64)
     if c.ndim != 2 or c.shape[0] != c.shape[1]:
@@ -181,10 +316,11 @@ def compute_delta_l(c_matrix: np.ndarray) -> np.ndarray:
 
 
 def compute_h_directed(delta_l: np.ndarray) -> np.ndarray:
-    dl = np.asarray(delta_l, dtype=np.float64)
-    h = 1.0 - (1.0 / np.cosh(0.5 * dl))
+    z = 0.5 * np.asarray(delta_l, dtype=np.float64)
+    z = np.clip(z, -60.0, 60.0)
+    h = 1.0 - (1.0 / np.cosh(z))
     np.fill_diagonal(h, 0.0)
-    return np.clip(h, 0.0, 1.0)
+    return h
 
 
 def symmetrize(h_directed: np.ndarray) -> np.ndarray:

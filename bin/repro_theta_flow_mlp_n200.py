@@ -143,6 +143,54 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--nf-early-patience", type=int, default=300, help="NF method only: early-stop patience.")
     p.add_argument("--nf-early-min-delta", type=float, default=1e-4, help="NF method only: early min delta.")
     p.add_argument("--nf-early-ema-alpha", type=float, default=0.05, help="NF method only: EMA alpha.")
+    p.add_argument(
+        "--nf-prior-epochs",
+        type=int,
+        default=None,
+        help="NF method only: optional prior-NF override for --nf-prior-epochs.",
+    )
+    p.add_argument(
+        "--nf-prior-batch-size",
+        type=int,
+        default=None,
+        help="NF method only: optional prior-NF override for --nf-prior-batch-size.",
+    )
+    p.add_argument(
+        "--nf-prior-lr",
+        type=float,
+        default=None,
+        help="NF method only: optional prior-NF override for --nf-prior-lr.",
+    )
+    p.add_argument(
+        "--nf-prior-hidden-dim",
+        type=int,
+        default=None,
+        help="NF method only: optional prior-NF override for --nf-prior-hidden-dim.",
+    )
+    p.add_argument(
+        "--nf-prior-transforms",
+        type=int,
+        default=None,
+        help="NF method only: optional prior-NF override for --nf-prior-transforms.",
+    )
+    p.add_argument(
+        "--nf-prior-early-patience",
+        type=int,
+        default=None,
+        help="NF method only: optional prior-NF override for --nf-prior-early-patience.",
+    )
+    p.add_argument(
+        "--nf-prior-early-min-delta",
+        type=float,
+        default=None,
+        help="NF method only: optional prior-NF override for --nf-prior-early-min-delta.",
+    )
+    p.add_argument(
+        "--nf-prior-early-ema-alpha",
+        type=float,
+        default=None,
+        help="NF method only: optional prior-NF override for --nf-prior-early-ema-alpha.",
+    )
     return p
 
 
@@ -290,6 +338,22 @@ def _run_convergence(
             "--nf-early-ema-alpha",
             str(float(args.nf_early_ema_alpha)),
         ]
+        if args.nf_prior_epochs is not None:
+            cmd += ["--nf-prior-epochs", str(int(args.nf_prior_epochs))]
+        if args.nf_prior_batch_size is not None:
+            cmd += ["--nf-prior-batch-size", str(int(args.nf_prior_batch_size))]
+        if args.nf_prior_lr is not None:
+            cmd += ["--nf-prior-lr", str(float(args.nf_prior_lr))]
+        if args.nf_prior_hidden_dim is not None:
+            cmd += ["--nf-prior-hidden-dim", str(int(args.nf_prior_hidden_dim))]
+        if args.nf_prior_transforms is not None:
+            cmd += ["--nf-prior-transforms", str(int(args.nf_prior_transforms))]
+        if args.nf_prior_early_patience is not None:
+            cmd += ["--nf-prior-early-patience", str(int(args.nf_prior_early_patience))]
+        if args.nf_prior_early_min_delta is not None:
+            cmd += ["--nf-prior-early-min-delta", str(float(args.nf_prior_early_min_delta))]
+        if args.nf_prior_early_ema_alpha is not None:
+            cmd += ["--nf-prior-early-ema-alpha", str(float(args.nf_prior_early_ema_alpha))]
     print(f"[repro] running convergence ({method})...", flush=True)
     result = subprocess.run(cmd, cwd=str(_repo_root), check=False)
     if result.returncode != 0:
