@@ -55,7 +55,6 @@ from fisher.ctsm_models import (
 )
 from fisher.ctsm_objectives import ctsm_v_pair_conditioned_loss
 from fisher.ctsm_paths import TwoSB
-from fisher.ot_cfm_core import train_conditional_x_ot_cfm_model
 from fisher.shared_dataset_io import (
     SHARED_DATASET_META_KEYS,
     apply_sigma_defaults_for_dataset_family,
@@ -126,7 +125,7 @@ def require_device(name: str) -> torch.device:
 
 def normalize_theta_field_method(method: str) -> str:
     m = str(method).strip().lower()
-    if m in ("theta_flow", "theta_path_integral", "x_flow", "ot_cfm", "ctsm_v"):
+    if m in ("theta_flow", "theta_path_integral", "x_flow", "ctsm_v"):
         return m
     legacy_names = (
         "flow",
@@ -137,12 +136,12 @@ def normalize_theta_field_method(method: str) -> str:
     if m in legacy_names:
         raise ValueError(
             "Legacy --theta-field-method is removed. Use one of "
-            "{'theta_flow', 'theta_path_integral', 'x_flow', 'ot_cfm', 'ctsm_v'}. "
+            "{'theta_flow', 'theta_path_integral', 'x_flow', 'ctsm_v'}. "
             "theta_flow = theta-space flow ODE log-likelihood Bayes ratios; "
             "theta_path_integral = velocity-to-score plus trapezoid integral along sorted theta."
         )
     raise ValueError(
-        "--theta-field-method must be one of {'theta_flow','theta_path_integral','x_flow','ot_cfm','ctsm_v'}."
+        "--theta-field-method must be one of {'theta_flow','theta_path_integral','x_flow','ctsm_v'}."
     )
 
 
@@ -1066,8 +1065,10 @@ def validate_estimation_args(args: Any) -> None:
         raise ValueError("--flow-batch-size must be >= 1.")
     if float(getattr(args, "flow_lr", 0.0)) <= 0.0:
         raise ValueError("--flow-lr must be positive.")
-    if float(getattr(args, "ot_cfm_sigma", 0.0)) <= 0.0:
-        raise ValueError("--ot-cfm-sigma must be positive.")
+    if float(getattr(args, "flow_endpoint_loss_weight", 0.1)) < 0.0:
+        raise ValueError("--flow-endpoint-loss-weight must be non-negative.")
+    if int(getattr(args, "flow_endpoint_steps", 20)) < 1:
+        raise ValueError("--flow-endpoint-steps must be >= 1.")
     if int(getattr(args, "flow_early_patience", 1)) < 1:
         raise ValueError("--flow-early-patience must be >= 1.")
     if float(getattr(args, "flow_early_min_delta", 0.0)) < 0.0:
@@ -1094,7 +1095,7 @@ def validate_estimation_args(args: Any) -> None:
         raise ValueError("--flow-x-theta-fourier-k must be >= 0.")
     if _fx_omega_mode not in ("fixed", "theta_range"):
         raise ValueError("--flow-x-theta-fourier-omega-mode must be one of {'fixed', 'theta_range'}.")
-    if _tfm_val in ("x_flow", "ot_cfm") and _arch == "film_fourier":
+    if _tfm_val == "x_flow" and _arch == "film_fourier":
         if _fx_omega_mode == "theta_range":
             lo = float(getattr(args, "theta_low", -6.0))
             hi = float(getattr(args, "theta_high", 6.0))
@@ -1112,7 +1113,7 @@ def validate_estimation_args(args: Any) -> None:
         theta_feat_dim = (1 if _fx_inc_bias else 0) + (1 if _fx_inc_lin else 0) + 2 * _fx_k
         if theta_feat_dim < 1:
             raise ValueError(
-                "x_flow / ot_cfm film_fourier: theta feature dim is 0. Use "
+                "x_flow film_fourier: theta feature dim is 0. Use "
                 "--flow-x-theta-fourier-k >= 1 or keep linear/bias features enabled."
             )
     _ft_post_k = int(getattr(args, "flow_theta_fourier_k", 4))
@@ -1178,13 +1179,13 @@ def validate_estimation_args(args: Any) -> None:
     if (
         bool(getattr(args, "compute_h_matrix", False))
         and not bool(getattr(args, "prior_enable", True))
-        and _tfm_val not in ("x_flow", "ot_cfm")
+        and _tfm_val != "x_flow"
     ):
         raise ValueError("--compute-h-matrix requires prior score; do not use --no-prior-score.")
     if bool(getattr(args, "skip_shared_fisher_gt_compare", False)):
         if not bool(getattr(args, "compute_h_matrix", False)):
             raise ValueError("--skip-shared-fisher-gt-compare requires --compute-h-matrix.")
-        if not bool(getattr(args, "prior_enable", True)) and _tfm_val not in ("x_flow", "ot_cfm"):
+        if not bool(getattr(args, "prior_enable", True)) and _tfm_val != "x_flow":
             raise ValueError("--skip-shared-fisher-gt-compare requires prior score; do not use --no-prior-score.")
     if int(getattr(args, "ctsm_epochs", 1)) < 1:
         raise ValueError("--ctsm-epochs must be >= 1.")
@@ -1826,7 +1827,7 @@ def run_shared_fisher_estimation(
         print(f"[training_losses] saved {tnpz}")
         return
 
-    if theta_field_method in ("x_flow", "ot_cfm"):
+    if theta_field_method == "x_flow":
         if not bool(getattr(args, "compute_h_matrix", False)):
             raise RuntimeError(f"{theta_field_method} requires --compute-h-matrix to produce output artifacts.")
         theta_std = float(np.std(theta_score_fit))
@@ -1849,8 +1850,6 @@ def run_shared_fisher_estimation(
                 f" theta_fourier_bias={not bool(getattr(args, 'flow_x_theta_fourier_no_bias', False))}"
             )
             _xf_extra = " film_x_trunk" + _xf_extra
-        if theta_field_method == "ot_cfm":
-            _xf_extra = f"{_xf_extra} ot_cfm_sigma={float(getattr(args, 'ot_cfm_sigma', 0.4)):.6g}"
         _xf_twostage = bool(getattr(args, "flow_x_two_stage_mean_theta_pretrain", False)) and theta_field_method == "x_flow"
         _e_tot = int(getattr(args, "flow_epochs", 10000))
         _e1 = _e_tot // 2
@@ -1873,45 +1872,24 @@ def run_shared_fisher_estimation(
             args=args,
             device=device,
         )
-        if theta_field_method == "ot_cfm":
-            post_train_out = train_conditional_x_ot_cfm_model(
-                model=x_flow_model,
-                theta_train=theta_score_fit,
-                x_train=x_score_fit,
-                epochs=int(getattr(args, "flow_epochs", 10000)),
-                batch_size=int(getattr(args, "flow_batch_size", 256)),
-                lr=float(getattr(args, "flow_lr", 1e-3)),
-                device=device,
-                sigma=float(getattr(args, "ot_cfm_sigma", 0.4)),
-                theta_val=theta_score_val,
-                x_val=x_score_val,
-                early_stopping_patience=int(getattr(args, "flow_early_patience", 1000)),
-                early_stopping_min_delta=float(getattr(args, "flow_early_min_delta", 1e-4)),
-                early_stopping_ema_alpha=float(getattr(args, "flow_early_ema_alpha", 0.05)),
-                restore_best=bool(getattr(args, "flow_restore_best", True)),
-                scheduler_name=str(getattr(args, "flow_scheduler", "cosine")),
-                weight_decay=float(getattr(args, "score_weight_decay", 0.0)),
-                max_grad_norm=float(getattr(args, "score_max_grad_norm", 0.0)),
-            )
-        else:
-            post_train_out = train_conditional_x_flow_model(
-                model=x_flow_model,
-                theta_train=theta_score_fit,
-                x_train=x_score_fit,
-                epochs=int(getattr(args, "flow_epochs", 10000)),
-                batch_size=int(getattr(args, "flow_batch_size", 256)),
-                lr=float(getattr(args, "flow_lr", 1e-3)),
-                device=device,
-                log_every=max(1, args.log_every),
-                theta_val=theta_score_val,
-                x_val=x_score_val,
-                early_stopping_patience=int(getattr(args, "flow_early_patience", 1000)),
-                early_stopping_min_delta=float(getattr(args, "flow_early_min_delta", 1e-4)),
-                early_stopping_ema_alpha=float(getattr(args, "flow_early_ema_alpha", 0.05)),
-                restore_best=bool(getattr(args, "flow_restore_best", True)),
-                scheduler_name=str(getattr(args, "flow_scheduler", "cosine")),
-                two_stage_mean_theta_pretrain=_xf_twostage,
-            )
+        post_train_out = train_conditional_x_flow_model(
+            model=x_flow_model,
+            theta_train=theta_score_fit,
+            x_train=x_score_fit,
+            epochs=int(getattr(args, "flow_epochs", 10000)),
+            batch_size=int(getattr(args, "flow_batch_size", 256)),
+            lr=float(getattr(args, "flow_lr", 1e-3)),
+            device=device,
+            log_every=max(1, args.log_every),
+            theta_val=theta_score_val,
+            x_val=x_score_val,
+            early_stopping_patience=int(getattr(args, "flow_early_patience", 1000)),
+            early_stopping_min_delta=float(getattr(args, "flow_early_min_delta", 1e-4)),
+            early_stopping_ema_alpha=float(getattr(args, "flow_early_ema_alpha", 0.05)),
+            restore_best=bool(getattr(args, "flow_restore_best", True)),
+            scheduler_name=str(getattr(args, "flow_scheduler", "cosine")),
+            two_stage_mean_theta_pretrain=_xf_twostage,
+        )
         if theta_field_method == "x_flow" and post_train_out.get("flow_x_two_stage"):
             print(
                 "[x_flow] two-stage training finished: "
@@ -1930,7 +1908,7 @@ def run_shared_fisher_estimation(
 
         post_loss_fig = os.path.join(args.output_dir, "score_loss_vs_epoch.png")
         epochs_arr = np.arange(1, post_train_losses.size + 1)
-        _train_label = "OT-CFM" if theta_field_method == "ot_cfm" else "X-flow"
+        _train_label = "X-flow"
         plt.figure(figsize=(8.8, 5.0))
         plt.plot(epochs_arr, post_train_losses, color="#1f77b4", linewidth=2.0, label=f"{_train_label} train loss")
         if post_val_losses.size == post_train_losses.size and np.any(np.isfinite(post_val_losses)):
@@ -1967,10 +1945,7 @@ def run_shared_fisher_estimation(
             )
         plt.xlabel("Epoch")
         plt.ylabel("Loss")
-        if theta_field_method == "ot_cfm":
-            plt.title("Conditional x-velocity training (ot_cfm objective)")
-        else:
-            plt.title("Conditional x-flow training (x_flow)")
+        plt.title("Conditional x-flow training (x_flow)")
         plt.grid(alpha=0.25, linestyle="--", linewidth=0.8)
         plt.legend()
         plt.tight_layout()
@@ -2008,13 +1983,8 @@ def run_shared_fisher_estimation(
             args, h_result, suffix
         )
         print(
-            (
-                "[summary] ot_cfm mode completed (H-matrix only path; "
-                "OT-CFM-trained conditional x-velocity evaluated via ODESolver likelihood for log p(x|theta))."
-                if theta_field_method == "ot_cfm"
-                else "[summary] x_flow mode completed (H-matrix only path; "
-                "ODESolver.compute_likelihood on conditional x-flow for log p(x|theta))."
-            )
+            "[summary] x_flow mode completed (H-matrix only path; "
+            "ODESolver.compute_likelihood on conditional x-flow for log p(x|theta))."
         )
         print("Saved artifacts:")
         print(f"  - {post_loss_fig}")
@@ -2226,6 +2196,12 @@ def run_shared_fisher_estimation(
             early_stopping_ema_alpha=float(getattr(args, "flow_early_ema_alpha", 0.05)),
             restore_best=bool(getattr(args, "flow_restore_best", True)),
             scheduler_name=str(getattr(args, "flow_scheduler", "cosine")),
+            endpoint_loss_weight=(
+                float(getattr(args, "flow_endpoint_loss_weight", 0.1))
+                if theta_field_method == "theta_flow"
+                else 0.0
+            ),
+            endpoint_ode_steps=int(getattr(args, "flow_endpoint_steps", 20)),
         )
         post_train_losses = np.asarray(post_train_out["train_losses"], dtype=np.float64)
         post_val_losses = np.asarray(post_train_out["val_losses"], dtype=np.float64)

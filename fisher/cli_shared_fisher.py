@@ -111,8 +111,7 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         help=(
             "Likelihood-ratio field method: theta_flow (theta-space flow ODE log-likelihood Bayes ratios "
             "log p(theta|x)-log p(theta)), theta_path_integral (velocity-to-score plus trapezoid integral "
-            "along sorted theta), x_flow (conditional x-space flow ODE log p(x|theta)), "
-            "ot_cfm (conditional x-space OT-CFM training with x-flow likelihood evaluation), or "
+            "along sorted theta), x_flow (conditional x-space flow ODE log p(x|theta)), or "
             "ctsm_v (pair-conditioned CTSM-v time-score integration)."
         ),
     )
@@ -257,12 +256,22 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--flow-batch-size", type=int, default=256)
     p.add_argument("--flow-lr", type=float, default=1e-3)
     p.add_argument(
-        "--ot-cfm-sigma",
+        "--flow-endpoint-loss-weight",
         type=float,
-        default=0.4,
+        default=0.1,
         help=(
-            "ot_cfm only: Gaussian bridge noise scale sigma used by TorchCFM "
-            "ExactOptimalTransportConditionalFlowMatcher."
+            "theta_flow only: auxiliary endpoint reconstruction weight lambda for "
+            "loss = flow_matching + lambda * ||theta_1_hat - theta||^2. "
+            "Set 0 to disable."
+        ),
+    )
+    p.add_argument(
+        "--flow-endpoint-steps",
+        type=int,
+        default=20,
+        help=(
+            "theta_flow only: fixed rollout steps in t in [0,1] for endpoint theta_1_hat "
+            "used by --flow-endpoint-loss-weight."
         ),
     )
     p.add_argument("--flow-hidden-dim", type=int, default=128)

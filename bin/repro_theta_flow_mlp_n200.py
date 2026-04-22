@@ -9,6 +9,8 @@ This script intentionally exposes only a tiny CLI surface and fixes the rest:
 - theta in [theta-low, theta-high] (default 0, 3; was [-6,6] in make_dataset)
 - theta_field_method = theta_flow or nf
 - flow_arch = mlp (theta_flow only)
+- theta_flow endpoint auxiliary loss can be controlled via
+  --flow-endpoint-loss-weight and --flow-endpoint-steps (theta_flow only)
 - n_ref = 1000
 - n in --n (default 200) as the sole --n-list value; --n-ref (default 1000) for reference subset
 - num_theta_bins = 10
@@ -141,6 +143,24 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Optional theta-flow override: --prior-batch-size.",
+    )
+    p.add_argument(
+        "--flow-endpoint-loss-weight",
+        type=float,
+        default=None,
+        help=(
+            "Optional theta-flow override for study_h_decoding_convergence: "
+            "--flow-endpoint-loss-weight (0 disables endpoint term)."
+        ),
+    )
+    p.add_argument(
+        "--flow-endpoint-steps",
+        type=int,
+        default=None,
+        help=(
+            "Optional theta-flow override for study_h_decoding_convergence: "
+            "--flow-endpoint-steps."
+        ),
     )
     p.add_argument("--nf-epochs", type=int, default=2000, help="NF method only: training epochs.")
     p.add_argument("--nf-batch-size", type=int, default=256, help="NF method only: batch size.")
@@ -329,6 +349,10 @@ def _run_convergence(
             cmd += ["--flow-batch-size", str(int(args.flow_batch_size))]
         if args.prior_batch_size is not None:
             cmd += ["--prior-batch-size", str(int(args.prior_batch_size))]
+        if args.flow_endpoint_loss_weight is not None:
+            cmd += ["--flow-endpoint-loss-weight", str(float(args.flow_endpoint_loss_weight))]
+        if args.flow_endpoint_steps is not None:
+            cmd += ["--flow-endpoint-steps", str(int(args.flow_endpoint_steps))]
     else:
         cmd += [
             "--nf-epochs",
