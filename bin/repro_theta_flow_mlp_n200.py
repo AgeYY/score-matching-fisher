@@ -2,7 +2,7 @@
 """Minimal reproducer for theta-flow/NF convergence at fixed n=200.
 
 This script intentionally exposes only a tiny CLI surface and fixes the rest:
-- dataset_family = randamp_gaussian
+- dataset_family = --dataset-family (default randamp_gaussian; also cosine_gaussian_sqrtd)
 - x_dim = --x-dim (default 2)
 - obs_noise_scale = 0.5 (TEMPORARY: half the family baseline noise; restore to 1.0 for default)
 - n_total = 3000, train_frac = 0.7, seed = 7
@@ -42,25 +42,32 @@ import torch
 _TEMP_OBS_NOISE_SCALE = 0.5
 
 
-def _default_output_dir(x_dim: int) -> str:
+def _default_output_dir(x_dim: int, dataset_family: str) -> str:
     return str(
         Path("data")
-        / f"repro_theta_flow_mlp_n200_randamp_gaussian_xdim{x_dim}_obsnoise0p5"
+        / f"repro_theta_flow_mlp_n200_{dataset_family}_xdim{x_dim}_obsnoise0p5"
     )
 
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
-            "Minimal fixed reproducer for theta_flow + mlp on randamp_gaussian "
-            "with convergence n_list=200."
+            "Minimal fixed reproducer for theta_flow + mlp on randamp_gaussian or "
+            "cosine_gaussian_sqrtd with convergence n_list=200."
         )
+    )
+    p.add_argument(
+        "--dataset-family",
+        type=str,
+        default="randamp_gaussian",
+        choices=["randamp_gaussian", "cosine_gaussian_sqrtd"],
+        help="Generative family for the shared NPZ and study (default: randamp_gaussian).",
     )
     p.add_argument(
         "--x-dim",
         type=int,
         default=2,
-        help="Observation dimension x ∈ R^{d} (randamp_gaussian; default 2).",
+        help="Observation dimension x ∈ R^{d} (default 2).",
     )
     p.add_argument(
         "--output-dir",
@@ -68,8 +75,8 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Directory for generated dataset + study artifacts. "
-            "If omitted, uses data/repro_theta_flow_mlp_n200_randamp_gaussian_xdim{d}_obsnoise0p5 "
-            "for the chosen --x-dim."
+            "If omitted, uses data/repro_theta_flow_mlp_n200_{dataset_family}_xdim{d}_obsnoise0p5 "
+            "for the chosen --dataset-family and --x-dim."
         ),
     )
     p.add_argument(
@@ -126,12 +133,12 @@ def _normalize_output_dir(raw: str) -> Path:
     return _repo_root / p
 
 
-def _write_dataset(dataset_npz: Path, *, x_dim: int) -> None:
+def _write_dataset(dataset_npz: Path, *, x_dim: int, dataset_family: str) -> None:
     # Build namespace via the shared dataset parser to stay aligned with family recipes.
     ds_parser = argparse.ArgumentParser(add_help=False)
     add_dataset_arguments(ds_parser)
     ds_args = ds_parser.parse_args([])
-    ds_args.dataset_family = "randamp_gaussian"
+    ds_args.dataset_family = str(dataset_family)
     ds_args.x_dim = int(x_dim)
     ds_args.obs_noise_scale = float(_TEMP_OBS_NOISE_SCALE)
     ds_args.n_total = 3000
@@ -151,7 +158,8 @@ def _write_dataset(dataset_npz: Path, *, x_dim: int) -> None:
     va_idx = perm[n_train:].astype(np.int64, copy=False)
 
     meta = meta_dict_from_args(ds_args)
-    meta["randamp_mu_amp_per_dim"] = dataset._randamp_amp.tolist()
+    if hasattr(dataset, "_randamp_amp"):
+        meta["randamp_mu_amp_per_dim"] = dataset._randamp_amp.tolist()
     save_shared_dataset_npz(
         str(dataset_npz),
         meta=meta,
@@ -183,6 +191,7 @@ def _run_convergence(
     method: str,
     out_dir: Path,
     dataset_npz: Path,
+    dataset_family: str,
     n: int,
     n_ref: int,
     args: argparse.Namespace,
@@ -197,7 +206,7 @@ def _run_convergence(
         "--dataset-npz",
         str(dataset_npz),
         "--dataset-family",
-        "randamp_gaussian",
+        str(dataset_family),
         "--output-dir",
         str(out_dir),
         "--theta-field-method",
@@ -263,7 +272,8 @@ def main() -> None:
     x_dim = int(args.x_dim)
     if x_dim < 2:
         raise ValueError(f"--x-dim must be >= 2, got {x_dim}.")
-    out_raw = args.output_dir if args.output_dir is not None else _default_output_dir(x_dim)
+    dataset_family = str(args.dataset_family)
+    out_raw = args.output_dir if args.output_dir is not None else _default_output_dir(x_dim, dataset_family)
     out_dir = _normalize_output_dir(out_raw)
     os.makedirs(out_dir, exist_ok=True)
 
@@ -273,8 +283,11 @@ def main() -> None:
     n = 200
     n_ref = 1000
     dataset_npz = out_dir / "shared_dataset.npz"
-    _write_dataset(dataset_npz, x_dim=x_dim)
-    print(f"[repro] x_dim={x_dim} dataset_npz={dataset_npz}", flush=True)
+    _write_dataset(dataset_npz, x_dim=x_dim, dataset_family=dataset_family)
+    print(
+        f"[repro] dataset_family={dataset_family} x_dim={x_dim} dataset_npz={dataset_npz}",
+        flush=True,
+    )
     method = str(args.method).strip().lower()
     run_theta = method in ("theta-flow", "both")
     run_nf = method in ("nf", "both")
@@ -286,6 +299,7 @@ def main() -> None:
             method="theta_flow",
             out_dir=theta_dir,
             dataset_npz=dataset_npz,
+            dataset_family=dataset_family,
             n=n,
             n_ref=n_ref,
             args=args,
@@ -297,6 +311,7 @@ def main() -> None:
             method="nf",
             out_dir=nf_dir,
             dataset_npz=dataset_npz,
+            dataset_family=dataset_family,
             n=n,
             n_ref=n_ref,
             args=args,

@@ -104,6 +104,69 @@ def _sqrt_h_like(mat: np.ndarray) -> np.ndarray:
     return out
 
 
+def _offdiag_gt_xy(
+    est: np.ndarray, gt: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Off-diagonal pairs (x=GT, y=estimated) for scatter; same mask as ``matrix_corr_offdiag_pearson``."""
+    aa = np.asarray(est, dtype=np.float64)
+    bb = np.asarray(gt, dtype=np.float64)
+    if aa.shape != bb.shape or aa.ndim != 2 or aa.shape[0] != aa.shape[1]:
+        raise ValueError("offdiag_gt_xy requires equal square matrices.")
+    n = aa.shape[0]
+    if n < 2:
+        return (
+            np.asarray([], dtype=np.float64),
+            np.asarray([], dtype=np.float64),
+            0,
+        )
+    off = ~np.eye(n, dtype=bool)
+    mask = off & np.isfinite(aa) & np.isfinite(bb)
+    n_pts = int(np.sum(mask))
+    return bb[mask], aa[mask], n_pts
+
+
+def _plot_estimated_vs_gt_h_scatter(
+    ax: plt.Axes,
+    *,
+    est: np.ndarray,
+    gt: np.ndarray,
+    n: int,
+    r_offdiag: float,
+) -> None:
+    """Scatter of off-diagonal estimated sqrt(H) vs MC GT (x=GT, y=est); y=x reference."""
+    x_gt, y_est, n_pts = _offdiag_gt_xy(est, gt)
+    if n_pts < 1:
+        ax.text(
+            0.5,
+            0.5,
+            f"n={n}\nno off-diagonal pairs",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+            fontsize=9,
+        )
+        ax.set_axis_off()
+        return
+    ax.scatter(x_gt, y_est, s=8, alpha=0.5, c="#1f77b4", edgecolors="none")
+    lo = float(np.min([np.min(x_gt), np.min(y_est)]))
+    hi = float(np.max([np.max(x_gt), np.max(y_est)]))
+    if hi <= lo:
+        hi = lo + 1e-9
+    pad = 0.03 * (hi - lo)
+    ax.plot([lo - pad, hi + pad], [lo - pad, hi + pad], color="gray", linestyle="--", linewidth=1.0, label="y = x")
+    ax.set_xlim(lo - pad, hi + pad)
+    ax.set_ylim(lo - pad, hi + pad)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel(r"GT off-diag: $\sqrt{H^2}$ (MC)", fontsize=8)
+    ax.set_ylabel(r"Est. off-diag: $\sqrt{H_{\mathrm{sym}}^2}$ binned", fontsize=8)
+    ax.set_title(
+        f"n={n}  Pearson $r$={float(r_offdiag):.4f}  (N={n_pts})",
+        fontsize=9,
+    )
+    ax.grid(True, alpha=0.35)
+    ax.legend(loc="lower right", fontsize=7)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
@@ -111,7 +174,7 @@ def build_parser() -> argparse.ArgumentParser:
             "sqrt(binned H_sym) to sqrt(MC generative H^2) and pairwise decoding to the n_ref-subset decoding matrix. "
             "The n_ref matrix-panel column uses MC GT sqrt(H^2) for the top row (no n_ref model training). "
             "Also writes h_decoding_convergence_combined.{png,svg} (matrix panel + correlation curves + "
-            "training-loss panel in one figure) and h_decoding_training_losses_panel.{png,svg} "
+            "off-diagonal est-vs-GT H scatter + training-loss panel in one figure) and h_decoding_training_losses_panel.{png,svg} "
             "(standalone training-loss panel, one column per n)."
         )
     )
@@ -907,14 +970,16 @@ def _save_combined_convergence_figure(
     out_png_path: str,
     dpi: int = 160,
 ) -> str:
-    """Single figure with matrix panel, correlation curves, training-loss panel, and optional diagnostic.
+    """Single figure with matrix panel, correlation curves, est-vs-GT scatter, training-loss panel, and optional diagnostic.
 
     PNG is raster as usual. SVG keeps the right-hand curve as vector paths (not a single
     embedded screenshot); heatmaps still use matplotlib's normal SVG image handling for ``imshow``.
 
-    Top row is matrix panel (left) + correlation curves (right). Middle row spans both columns
-    and mirrors the standalone training-loss panel. Bottom row spans both columns and embeds
-    the fixed-x posterior+tuning diagnostic image when available.
+    Top row is matrix panel (left) + correlation curves (right). Second row spans both columns
+    with off-diagonal scatter(s): estimated binned ``sqrt(H_sym^2)`` vs MC GT ``sqrt(H^2)`` (one
+    per ``n`` in ``--n-list``). Third row spans both columns and mirrors the standalone
+    training-loss panel. Bottom row spans both columns and embeds the fixed-x posterior+tuning
+    diagnostic image when available.
     """
     crv_w, crv_h = _H_DECODING_CURVE_FIGSIZE_IN
     if crv_h <= 0:
@@ -927,13 +992,26 @@ def _save_combined_convergence_figure(
     bot_h = float(l_h)
     fig_w = max(m_w + (top_h * (float(crv_w) / float(crv_h))), l_w)
     # Constrained layout: colorbars make tight_layout warn and mis-place panels.
+    scatter_h = 2.8
     diag_h = 5.2
-    fig = plt.figure(figsize=(fig_w, top_h + bot_h + diag_h), dpi=dpi, layout="constrained")
+    if len(h_mats) < 2 or len(h_mats) != len(ns) + 1:
+        raise ValueError(
+            "h_mats must have length len(ns)+1 (sweep columns + one GT / n_ref column) for "
+            f"est-vs-GT scatter; got len(h_mats)={len(h_mats)} len(ns)={len(ns)}."
+        )
+    if int(np.asarray(corr_h, dtype=np.float64).ravel().size) != len(ns):
+        raise ValueError("corr_h must have one entry per n in --n-list.")
+    h_gt = h_mats[-1]
+    fig = plt.figure(
+        figsize=(fig_w, top_h + scatter_h + bot_h + diag_h),
+        dpi=dpi,
+        layout="constrained",
+    )
     gs0 = fig.add_gridspec(
-        3,
+        4,
         2,
         width_ratios=[m_w, top_h * (float(crv_w) / float(crv_h))],
-        height_ratios=[top_h, bot_h, diag_h],
+        height_ratios=[top_h, scatter_h, bot_h, diag_h],
     )
     gs_left = gs0[0, 0].subgridspec(2, n_cols)
     axes_m = np.empty((2, n_cols), dtype=object)
@@ -958,7 +1036,23 @@ def _save_combined_convergence_figure(
         axis_labelsize=13.0,
         legend_fontsize=10.0,
     )
-    gs_loss = gs0[1, :].subgridspec(2, n_loss_cols)
+    n_scat = int(len(ns))
+    gs_s = gs0[1, :].subgridspec(1, max(1, n_scat))
+    for j, n in enumerate(ns):
+        ax_s = fig.add_subplot(gs_s[0, j])
+        _plot_estimated_vs_gt_h_scatter(
+            ax_s,
+            est=np.asarray(h_mats[j], dtype=np.float64),
+            gt=np.asarray(h_gt, dtype=np.float64),
+            n=int(n),
+            r_offdiag=float(corr_h[j]),
+        )
+    if n_scat == 0:
+        ax0 = fig.add_subplot(gs_s[0, 0])
+        ax0.text(0.5, 0.5, "empty n-list", ha="center", va="center", transform=ax0.transAxes, fontsize=9)
+        ax0.set_axis_off()
+
+    gs_loss = gs0[2, :].subgridspec(2, n_loss_cols)
     axes_loss = np.empty((2, n_loss_cols), dtype=object)
     row0_ylabel = "score / posterior loss"
     row1_ylabel = "prior loss"
@@ -1042,7 +1136,7 @@ def _save_combined_convergence_figure(
             )
             axes_loss[1, j].set_axis_off()
 
-    ax_diag = fig.add_subplot(gs0[2, :])
+    ax_diag = fig.add_subplot(gs0[3, :])
     if diagnostic_png_path is None or not os.path.isfile(str(diagnostic_png_path)):
         ax_diag.text(
             0.5,
