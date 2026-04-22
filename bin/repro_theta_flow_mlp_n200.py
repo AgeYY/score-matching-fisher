@@ -14,6 +14,9 @@ This script intentionally exposes only a tiny CLI surface and fixes the rest:
 - n_ref = 1000
 - n in --n (default 200) as the sole --n-list value; --n-ref (default 1000) for reference subset
 - num_theta_bins = 10
+- optional ``--theta-filter-union`` (default on): keep only theta in
+  [-3.5,-2.5] U [-3.5+2pi,-2.5+2pi] and resample until n_total; use
+  ``--no-theta-filter-union`` for unfiltered uniform [theta-low, theta-high]
 
 It creates a shared dataset NPZ, then runs ``bin/study_h_decoding_convergence.py``
 with fixed settings and prints the resulting metrics. Method selection supports
@@ -29,10 +32,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 _repo_root = Path(__file__).resolve().parent.parent
 if str(_repo_root) not in sys.path:
@@ -50,16 +55,28 @@ import torch
 _TEMP_OBS_NOISE_SCALE = 0.5
 # Total joint (theta, x) rows written by this repro; study requires n_pool >= max(--n, --n-ref).
 _DATASET_N_TOTAL = 3000
+# Fixed union filter (used when --theta-filter-union): two windows one period 2pi apart.
+_THETA_UNION_A = -3.5
+_THETA_UNION_B = -2.5
+# Proposed joint rows per resampling batch when filtering (wide vs rare acceptance).
+_THETA_UNION_CHUNK = 16_384
+_THETA_UNION_MAX_ROUNDS = 100_000
 
 
 def _default_output_dir(
-    x_dim: int, dataset_family: str, *, theta_low: float, theta_high: float, n_sweep: int
+    x_dim: int,
+    dataset_family: str,
+    *,
+    theta_low: float,
+    theta_high: float,
+    n_sweep: int,
+    theta_filter_union: bool,
 ) -> str:
     th = f"th{float(theta_low):g}_{float(theta_high):g}".replace(".", "p")
-    return str(
-        Path("data")
-        / f"repro_theta_flow_mlp_n{int(n_sweep)}_{dataset_family}_xdim{x_dim}_obsnoise0p5_{th}"
-    )
+    tail = f"repro_theta_flow_mlp_n{int(n_sweep)}_{dataset_family}_xdim{x_dim}_obsnoise0p5_{th}"
+    if theta_filter_union:
+        tail = f"{tail}_thunion2pi"
+    return str(Path("data") / tail)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -107,13 +124,22 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Uniform theta support upper bound (default: 6).",
     )
     p.add_argument(
+        "--theta-filter-union",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Restrict rows to theta in [-3.5,-2.5] U [-3.5+2pi,-2.5+2pi], resampling joint draws "
+            "until n_total (default: on). Use --no-theta-filter-union for unfiltered data."
+        ),
+    )
+    p.add_argument(
         "--output-dir",
         type=str,
         default=None,
         help=(
             "Directory for generated dataset + study artifacts. "
             "If omitted, uses data/repro_theta_flow_mlp_n{n}_{dataset_family}_xdim{d}_obsnoise0p5_th{lo}_{hi} "
-            "for the chosen --n, --dataset-family, --x-dim, and --theta-low/--theta-high."
+            "with optional _thunion2pi when --theta-filter-union is on."
         ),
     )
     p.add_argument(
@@ -248,6 +274,52 @@ def _normalize_output_dir(raw: str) -> Path:
     return _repo_root / p
 
 
+def _theta_in_union_m2pi(theta: np.ndarray) -> np.ndarray:
+    """True where theta is in [a,b] or [a+2pi, b+2pi] with a=-3.5, b=-2.5."""
+    t = np.asarray(theta, dtype=np.float64).reshape(-1)
+    tau = 2.0 * math.pi
+    a, b = _THETA_UNION_A, _THETA_UNION_B
+    return ((t >= a) & (t <= b)) | ((t >= a + tau) & (t <= b + tau))
+
+
+def _sample_joint_respecting_theta_union(
+    dataset: Any,
+    n_target: int,
+    *,
+    chunk_size: int = _THETA_UNION_CHUNK,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Draw joint samples, keeping only rows whose theta lies in the fixed two-window union.
+
+    The underlying generative is still p(x|theta) with uniform theta on [theta_low, theta_high]
+    in the sampler, but we reject-and-resample on theta until we have n_target accepted rows
+    (each accepted row is a valid draw from the conditional at that theta).
+    """
+    th_list: list[np.ndarray] = []
+    x_list: list[np.ndarray] = []
+    got = 0
+    rounds = 0
+    while got < n_target:
+        rounds += 1
+        if rounds > _THETA_UNION_MAX_ROUNDS:
+            raise RuntimeError(
+                f"theta union filter: could not collect n={n_target} joint rows after {rounds} "
+                f"proposals of size {chunk_size} each; ensure [--theta-low,--theta-high] "
+                f"overlaps the filter intervals or use --no-theta-filter-union."
+            )
+        th, xx = dataset.sample_joint(int(chunk_size))
+        m = _theta_in_union_m2pi(th)
+        if not np.any(m):
+            continue
+        th_list.append(np.asarray(th[m], dtype=np.float64, copy=False))
+        x_list.append(np.asarray(xx[m], dtype=np.float64, copy=False))
+        got += int(m.sum())
+    theta_all = np.vstack(th_list)
+    x_all = np.vstack(x_list)
+    if theta_all.shape[0] < n_target:
+        raise RuntimeError("internal: union filter returned fewer than n_target rows")
+    return theta_all[:n_target], x_all[:n_target]
+
+
 def _write_dataset(
     dataset_npz: Path,
     *,
@@ -255,6 +327,7 @@ def _write_dataset(
     dataset_family: str,
     theta_low: float,
     theta_high: float,
+    theta_filter_union: bool,
 ) -> None:
     # Build namespace via the shared dataset parser to stay aligned with family recipes.
     ds_parser = argparse.ArgumentParser(add_help=False)
@@ -277,7 +350,10 @@ def _write_dataset(
     rng = np.random.default_rng(int(ds_args.seed))
     dataset = build_dataset_from_args(ds_args)
     n_total = int(ds_args.n_total)
-    theta_all, x_all = dataset.sample_joint(n_total)
+    if theta_filter_union:
+        theta_all, x_all = _sample_joint_respecting_theta_union(dataset, n_total)
+    else:
+        theta_all, x_all = dataset.sample_joint(n_total)
 
     perm = rng.permutation(n_total)
     n_train = int(float(ds_args.train_frac) * n_total)
@@ -288,6 +364,13 @@ def _write_dataset(
     meta = meta_dict_from_args(ds_args)
     if hasattr(dataset, "_randamp_amp"):
         meta["randamp_mu_amp_per_dim"] = dataset._randamp_amp.tolist()
+    if theta_filter_union:
+        tau = 2.0 * math.pi
+        meta["repro_theta_filter_union"] = True
+        meta["repro_theta_filter_intervals"] = [
+            [float(_THETA_UNION_A), float(_THETA_UNION_B)],
+            [float(_THETA_UNION_A + tau), float(_THETA_UNION_B + tau)],
+        ]
     save_shared_dataset_npz(
         str(dataset_npz),
         meta=meta,
@@ -439,8 +522,14 @@ def main() -> None:
             f"max(--n, --n-ref)={need} but shared dataset n_total={_DATASET_N_TOTAL}; "
             f"raise _DATASET_N_TOTAL in {Path(__file__).name} or use smaller --n / --n-ref."
         )
+    theta_filter = bool(getattr(args, "theta_filter_union", True))
     out_raw = args.output_dir if args.output_dir is not None else _default_output_dir(
-        x_dim, dataset_family, theta_low=theta_lo, theta_high=theta_hi, n_sweep=n_sweep
+        x_dim,
+        dataset_family,
+        theta_low=theta_lo,
+        theta_high=theta_hi,
+        n_sweep=n_sweep,
+        theta_filter_union=theta_filter,
     )
     out_dir = _normalize_output_dir(out_raw)
     os.makedirs(out_dir, exist_ok=True)
@@ -456,10 +545,12 @@ def main() -> None:
         dataset_family=dataset_family,
         theta_low=theta_lo,
         theta_high=theta_hi,
+        theta_filter_union=theta_filter,
     )
     print(
         f"[repro] dataset_family={dataset_family} x_dim={x_dim} "
-        f"theta_range=[{theta_lo}, {theta_hi}] dataset_npz={dataset_npz}",
+        f"theta_range=[{theta_lo}, {theta_hi}] theta_filter_union={theta_filter} "
+        f"dataset_npz={dataset_npz}",
         flush=True,
     )
     method = str(args.method).strip().lower()
