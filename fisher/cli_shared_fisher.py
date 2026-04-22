@@ -111,7 +111,8 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         help=(
             "Likelihood-ratio field method: theta_flow (theta-space flow ODE log-likelihood Bayes ratios "
             "log p(theta|x)-log p(theta)), theta_path_integral (velocity-to-score plus trapezoid integral "
-            "along sorted theta), x_flow (conditional x-space flow ODE log p(x|theta)), or "
+            "along sorted theta), x_flow (conditional x-space flow ODE log p(x|theta)), "
+            "ot_cfm (conditional x-space OT-CFM training with x-flow likelihood evaluation), or "
             "ctsm_v (pair-conditioned CTSM-v time-score integration)."
         ),
     )
@@ -255,6 +256,15 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--flow-epochs", type=int, default=10000)
     p.add_argument("--flow-batch-size", type=int, default=256)
     p.add_argument("--flow-lr", type=float, default=1e-3)
+    p.add_argument(
+        "--ot-cfm-sigma",
+        type=float,
+        default=0.4,
+        help=(
+            "ot_cfm only: Gaussian bridge noise scale sigma used by TorchCFM "
+            "ExactOptimalTransportConditionalFlowMatcher."
+        ),
+    )
     p.add_argument("--flow-hidden-dim", type=int, default=128)
     p.add_argument("--flow-depth", type=int, default=3)
     p.add_argument("--flow-scheduler", type=str, default="cosine", choices=["cosine", "vp", "linear_vp"])

@@ -10,7 +10,7 @@ This script intentionally exposes only a tiny CLI surface and fixes the rest:
 - theta_field_method = theta_flow or nf
 - flow_arch = mlp (theta_flow only)
 - n_ref = 1000
-- n_list = 200
+- n in --n (default 200) as the sole --n-list value; --n-ref (default 1000) for reference subset
 - num_theta_bins = 10
 
 It creates a shared dataset NPZ, then runs ``bin/study_h_decoding_convergence.py``
@@ -46,15 +46,17 @@ import torch
 # TEMPORARY: <1.0 reduces Gaussian observation noise (see --obs-noise-scale in make_dataset.py).
 # Restore to 1.0 when the low-noise experiment is done.
 _TEMP_OBS_NOISE_SCALE = 0.5
+# Total joint (theta, x) rows written by this repro; study requires n_pool >= max(--n, --n-ref).
+_DATASET_N_TOTAL = 3000
 
 
 def _default_output_dir(
-    x_dim: int, dataset_family: str, *, theta_low: float, theta_high: float
+    x_dim: int, dataset_family: str, *, theta_low: float, theta_high: float, n_sweep: int
 ) -> str:
     th = f"th{float(theta_low):g}_{float(theta_high):g}".replace(".", "p")
     return str(
         Path("data")
-        / f"repro_theta_flow_mlp_n200_{dataset_family}_xdim{x_dim}_obsnoise0p5_{th}"
+        / f"repro_theta_flow_mlp_n{int(n_sweep)}_{dataset_family}_xdim{x_dim}_obsnoise0p5_{th}"
     )
 
 
@@ -62,8 +64,20 @@ def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
             "Minimal fixed reproducer for theta_flow + mlp on randamp_gaussian or "
-            "cosine_gaussian_sqrtd with convergence n_list=200."
+            "cosine_gaussian_sqrtd; convergence uses a single --n-list value from --n."
         )
+    )
+    p.add_argument(
+        "--n",
+        type=int,
+        default=200,
+        help="Training subset size (sole entry in --n-list for study_h_decoding; default: 200).",
+    )
+    p.add_argument(
+        "--n-ref",
+        type=int,
+        default=1000,
+        help="Reference subset size; must be >= --n and <= shared dataset n_total (default: 1000).",
     )
     p.add_argument(
         "--dataset-family",
@@ -96,8 +110,8 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Directory for generated dataset + study artifacts. "
-            "If omitted, uses data/repro_theta_flow_mlp_n200_{dataset_family}_xdim{d}_obsnoise0p5_th{lo}_{hi} "
-            "for the chosen --dataset-family, --x-dim, and --theta-low/--theta-high."
+            "If omitted, uses data/repro_theta_flow_mlp_n{n}_{dataset_family}_xdim{d}_obsnoise0p5_th{lo}_{hi} "
+            "for the chosen --n, --dataset-family, --x-dim, and --theta-low/--theta-high."
         ),
     )
     p.add_argument(
@@ -223,7 +237,7 @@ def _write_dataset(
             f"require --theta-high > --theta-low; got [{ds_args.theta_low}, {ds_args.theta_high}]."
         )
     ds_args.obs_noise_scale = float(_TEMP_OBS_NOISE_SCALE)
-    ds_args.n_total = 3000
+    ds_args.n_total = int(_DATASET_N_TOTAL)
     ds_args.train_frac = 0.7
     ds_args.seed = 7
 
@@ -373,8 +387,20 @@ def main() -> None:
     dataset_family = str(args.dataset_family)
     theta_lo = float(args.theta_low)
     theta_hi = float(args.theta_high)
+    n_sweep = int(args.n)
+    n_ref = int(args.n_ref)
+    if n_sweep < 1:
+        raise ValueError(f"--n must be >= 1, got {n_sweep}.")
+    if n_ref < n_sweep:
+        raise ValueError(f"require --n-ref >= --n; got n_ref={n_ref} and n={n_sweep}.")
+    need = max(n_ref, n_sweep)
+    if need > int(_DATASET_N_TOTAL):
+        raise ValueError(
+            f"max(--n, --n-ref)={need} but shared dataset n_total={_DATASET_N_TOTAL}; "
+            f"raise _DATASET_N_TOTAL in {Path(__file__).name} or use smaller --n / --n-ref."
+        )
     out_raw = args.output_dir if args.output_dir is not None else _default_output_dir(
-        x_dim, dataset_family, theta_low=theta_lo, theta_high=theta_hi
+        x_dim, dataset_family, theta_low=theta_lo, theta_high=theta_hi, n_sweep=n_sweep
     )
     out_dir = _normalize_output_dir(out_raw)
     os.makedirs(out_dir, exist_ok=True)
@@ -382,8 +408,7 @@ def main() -> None:
     if args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but unavailable. Per repo policy, do not fallback silently.")
 
-    n = 200
-    n_ref = 1000
+    n = n_sweep
     dataset_npz = out_dir / "shared_dataset.npz"
     _write_dataset(
         dataset_npz,
