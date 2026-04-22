@@ -42,6 +42,46 @@ class TestThetaFlowThetaFourier(unittest.TestCase):
         self.assertEqual(tuple(out.shape), (b, 1))
         self.assertTrue(torch.isfinite(out).all())
 
+    def test_conditional_theta_soft_moe_shared_backbone_linear_heads(self) -> None:
+        """Soft-MoE uses one shared SiLU backbone and one Linear per expert (not deep expert MLPs)."""
+        m = ConditionalThetaFlowVelocitySoftMoE(
+            x_dim=4,
+            hidden_dim=16,
+            depth=2,
+            theta_dim=1,
+            num_experts=4,
+            router_temperature=1.0,
+        )
+        self.assertIsInstance(m.backbone, torch.nn.Sequential)
+        self.assertEqual(len(list(m.backbone.children())), 4)  # 2×(Linear, SiLU)
+        self.assertEqual(len(m.expert_heads), 4)
+        for h in m.expert_heads:
+            self.assertIsInstance(h, torch.nn.Linear)
+            self.assertEqual(h.in_features, 16)
+            self.assertEqual(h.out_features, 1)
+        self.assertIsInstance(m.router, torch.nn.Linear)
+        self.assertEqual(m.router.out_features, 4)
+
+    def test_conditional_theta_soft_moe_depth_zero_identity_backbone(self) -> None:
+        m = ConditionalThetaFlowVelocitySoftMoE(
+            x_dim=4,
+            hidden_dim=16,
+            depth=0,
+            theta_dim=1,
+            num_experts=2,
+        )
+        self.assertIsInstance(m.backbone, torch.nn.Identity)
+        self.assertEqual(len(m.expert_heads), 2)
+        # feats dim = 1 + 4 + 1 = 6
+        self.assertEqual(m.expert_heads[0].in_features, 6)
+        b = 3
+        theta_t = torch.randn(b, 1)
+        x = torch.randn(b, 4)
+        t = torch.rand(b, 1)
+        out = m(theta_t, x, t)
+        self.assertEqual(tuple(out.shape), (b, 1))
+        self.assertTrue(torch.isfinite(out).all())
+
     def test_conditional_forward_shape(self) -> None:
         m = ConditionalThetaFlowVelocityThetaFourierMLP(
             x_dim=4,

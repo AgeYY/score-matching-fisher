@@ -2091,6 +2091,7 @@ def run_shared_fisher_estimation(
             )
         elif flow_score_arch == "soft_moe":
             _xf_post = (
+                f" moe_post_shared_backbone=true moe_post_linear_expert_heads=true"
                 f" moe_post_num_experts={int(getattr(args, 'flow_moe_num_experts', 4))}"
                 f" moe_post_router_temp={float(getattr(args, 'flow_moe_router_temperature', 1.0)):.6g}"
             )
@@ -2146,6 +2147,8 @@ def run_shared_fisher_estimation(
                 "theta_dim": int(theta_dim_flow),
                 "num_experts": int(getattr(args, "flow_moe_num_experts", 4)),
                 "router_temperature": float(getattr(args, "flow_moe_router_temperature", 1.0)),
+                "moe_shared_backbone": True,
+                "moe_linear_expert_heads": True,
             }
             post_model = ConditionalThetaFlowVelocitySoftMoE(
                 x_dim=args.x_dim,
