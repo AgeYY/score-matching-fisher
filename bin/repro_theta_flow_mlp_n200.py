@@ -6,7 +6,7 @@ This script intentionally exposes only a tiny CLI surface and fixes the rest:
 - x_dim = --x-dim (default 2)
 - obs_noise_scale = 0.5 (TEMPORARY: half the family baseline noise; restore to 1.0 for default)
 - n_total = 3000, train_frac = 0.7, seed = 7
-- theta in [theta-low, theta-high] (default 0, 3; was [-6,6] in make_dataset)
+- theta in [theta-low, theta-high] (default -6, 6)
 - theta_field_method = theta_flow or nf
 - flow_arch = mlp (theta_flow only)
 - theta_flow auxiliary conditional likelihood loss can be controlled via
@@ -97,14 +97,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--theta-low",
         type=float,
-        default=0.0,
-        help="Uniform theta support lower bound (default: 0.0; make_dataset default is -6).",
+        default=-6.0,
+        help="Uniform theta support lower bound (default: -6).",
     )
     p.add_argument(
         "--theta-high",
         type=float,
-        default=3.0,
-        help="Uniform theta support upper bound (default: 3.0; make_dataset default is 6).",
+        default=6.0,
+        help="Uniform theta support upper bound (default: 6).",
     )
     p.add_argument(
         "--output-dir",
@@ -161,6 +161,18 @@ def _build_parser() -> argparse.ArgumentParser:
             "Optional theta-flow override for study_h_decoding_convergence: "
             "--flow-endpoint-steps (ODE steps for auxiliary likelihood term)."
         ),
+    )
+    p.add_argument(
+        "--flow-depth",
+        type=int,
+        default=None,
+        help="Optional theta-flow override: --flow-depth (MLP hidden layers; 1 = single hidden block).",
+    )
+    p.add_argument(
+        "--prior-depth",
+        type=int,
+        default=None,
+        help="Optional theta-flow override: --prior-depth (prior flow MLP depth).",
     )
     p.add_argument("--nf-epochs", type=int, default=2000, help="NF method only: training epochs.")
     p.add_argument("--nf-batch-size", type=int, default=256, help="NF method only: batch size.")
@@ -353,6 +365,10 @@ def _run_convergence(
             cmd += ["--flow-endpoint-loss-weight", str(float(args.flow_endpoint_loss_weight))]
         if args.flow_endpoint_steps is not None:
             cmd += ["--flow-endpoint-steps", str(int(args.flow_endpoint_steps))]
+        if args.flow_depth is not None:
+            cmd += ["--flow-depth", str(int(args.flow_depth))]
+        if args.prior_depth is not None:
+            cmd += ["--prior-depth", str(int(args.prior_depth))]
     else:
         cmd += [
             "--nf-epochs",
