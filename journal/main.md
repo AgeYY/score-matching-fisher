@@ -16,6 +16,7 @@ Collected markdown notes in `journal/notes/`: long-form chapters (moved from the
 
 ## 2026-04
 
+- [2026-04-22 OT-CFM vs CFM 2D bimodal benchmark (`tests/ot_cfm_torchcfm.py`): TorchCFM matchers, data split, MMD, Markdown + commands](notes/2026-04-22-ot-cfm-bimodal-2d-benchmark.md)
 - [2026-04-22 Fixed-$x$ posterior panel: model curve (softmax + KDE) vs “GT” (generative $x\mid\theta$ + uniform prior); methods detail + `study_h_decoding_convergence` pointers](notes/2026-04-22-fixed-x-posterior-model-vs-approx-gt.md)
 - [2026-04-21 H-decoding: generative mean LLR vs binned model $\Delta L$ (10D `cosine_gaussian_sqrtd`, $n=200`, repro; Markdown + commands)](notes/2026-04-21-h-decoding-llr-scatter-generative-vs-model-delta-l.md)
 - [2026-04-20 PR-autoencoder embedding for `randamp_gaussian_sqrtd`: theta-flow H-decoding convergence with 2D latent mapped to 10D and 50D](notes/2026-04-20-randamp-sqrtd-pr-autoencoder-hdecoding-thetaflow.md)
