@@ -16,6 +16,7 @@ Collected markdown notes in `journal/notes/`: long-form chapters (moved from the
 
 ## 2026-04
 
+- [2026-04-21 H-decoding: generative mean LLR vs binned model $\Delta L$ (10D `cosine_gaussian_sqrtd`, $n=200`, repro; Markdown + commands)](notes/2026-04-21-h-decoding-llr-scatter-generative-vs-model-delta-l.md)
 - [2026-04-20 PR-autoencoder embedding for `randamp_gaussian_sqrtd`: theta-flow H-decoding convergence with 2D latent mapped to 10D and 50D](notes/2026-04-20-randamp-sqrtd-pr-autoencoder-hdecoding-thetaflow.md)
 - [2026-04-18 Rename: `theta_flow` = θ-space ODE Bayes-ratio; `theta_path_integral` = velocity→score + θ-axis integral (hard break)](notes/2026-04-18-theta-flow-rename-and-bayes-ratio.md)
 - [2026-04-18 CTSM-v log-likelihood ratio on continuous parametric Gaussian family $p_t(x)=\mathcal{N}(2t-1,1)$: $(x,t)$ dataset, random held-out $(t_i,t_j)$ pairs, and reproducibility with `--ctsm-max-epochs 10000 --ctsm-early-patience 1000`](notes/2026-04-18-ctsm-v-parametric-gaussian-t-log-ratio.md)

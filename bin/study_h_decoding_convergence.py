@@ -35,11 +35,16 @@ target), while the bottom row still shows pairwise decoding on the ``n_ref`` dat
 
 **Visualization-only:** Pass ``--visualization-only`` to reload ``h_decoding_convergence_results.npz``
 from ``--output-dir`` and regenerate figures/CSV/summary without retraining (requires a prior full run
-and ``training_losses/n_*.npz`` for the loss panel).
+and ``training_losses/n_*.npz`` for the loss panel). If
+``sweep_runs/n_<max(n_list)>/h_matrix_results*.npz`` exists but the fixed-$x$ diagnostic was never
+written (older runs), the script may **backfill**
+``sweep_runs/.../diagnostics/theta_flow_single_x_posterior_hist.png`` so the combined figure can embed it.
 
 **NPZ semantics:** Arrays ``h_binned_columns``, ``h_binned_ref``, and the key ``hellinger_gt_sq_mc``
 hold **square-root** matrices for this study (legacy key name ``hellinger_gt_sq_mc``; values are
-``sqrt(H^2)``, not ``H^2``).
+``sqrt(H^2)``, not ``H^2``). LLR diagnostics (newer runs) add ``gt_mean_llr_one_sided_mc``,
+``llr_binned_columns``, and ``corr_llr_binned_vs_gt_mc`` (binned model ``\\Delta L`` vs one-sided
+generative mean log-likelihood ratios; see ``fisher/hellinger_gt.py``).
 """
 
 from __future__ import annotations
@@ -53,7 +58,7 @@ import tempfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, NamedTuple, TypedDict
+from typing import Any, NamedTuple, NotRequired, TypedDict, cast
 
 _repo_root = Path(__file__).resolve().parent.parent
 _bin_dir = Path(__file__).resolve().parent
@@ -71,7 +76,11 @@ import torch
 
 import visualize_h_matrix_binned as vhb
 from fisher.cli_shared_fisher import add_estimation_arguments
-from fisher.hellinger_gt import bin_centers_from_edges, estimate_hellinger_sq_one_sided_mc
+from fisher.hellinger_gt import (
+    bin_centers_from_edges,
+    estimate_hellinger_sq_one_sided_mc,
+    estimate_mean_llr_one_sided_mc,
+)
 from fisher.nf_hellinger import (
     ConditionalThetaNF,
     compute_c_matrix_nf,
@@ -81,6 +90,7 @@ from fisher.nf_hellinger import (
     symmetrize as symmetrize_nf,
     train_conditional_nf,
 )
+from fisher.evaluation import log_p_x_given_theta
 from fisher.shared_dataset_io import SharedDatasetBundle, load_shared_dataset_npz
 from fisher.shared_fisher_est import (
     build_dataset_from_meta,
@@ -161,6 +171,88 @@ def _plot_estimated_vs_gt_h_scatter(
     ax.set_ylabel(r"Est. off-diag: $\sqrt{H_{\mathrm{sym}}^2}$ binned", fontsize=8)
     ax.set_title(
         f"n={n}  Pearson $r$={float(r_offdiag):.4f}  (N={n_pts})",
+        fontsize=9,
+    )
+    ax.grid(True, alpha=0.35)
+    ax.legend(loc="lower right", fontsize=7)
+
+
+def _h_matrix_results_npz_basename(*, dataset_family: str) -> str:
+    suf = "_non_gauss" if str(dataset_family) == "cosine_gmm" else "_theta_cov"
+    return f"h_matrix_results{suf}.npz"
+
+
+def _load_delta_l_from_run_dir(run_dir: str, *, dataset_family: str) -> np.ndarray:
+    p = os.path.join(run_dir, _h_matrix_results_npz_basename(dataset_family=dataset_family))
+    if not os.path.isfile(p):
+        p_cov = os.path.join(run_dir, "h_matrix_results_theta_cov.npz")
+        if os.path.isfile(p_cov):
+            p = p_cov
+    if not os.path.isfile(p):
+        raise FileNotFoundError(
+            f"expected H npz for LLR: {p} (also tried h_matrix_results_theta_cov.npz in {run_dir})"
+        )
+    z = np.load(p, allow_pickle=True)
+    if "delta_l_matrix" not in z.files:
+        raise KeyError(
+            f"{p} has no delta_l_matrix; re-run with h_save_intermediates or use a method that stores ΔL (e.g. nf)."
+        )
+    return np.asarray(z["delta_l_matrix"], dtype=np.float64)
+
+
+def _metrics_delta_l_binned(
+    delta_l: np.ndarray,
+    subset: SweepSubset,
+    n_bins: int,
+) -> np.ndarray:
+    """Bin-average directed ΔL (same contract as binned h_sym)."""
+    dl_binned, _ = vhb.average_matrix_by_bins(
+        np.asarray(delta_l, dtype=np.float64),
+        subset.bin_all,
+        n_bins,
+    )
+    return dl_binned
+
+
+def _plot_estimated_vs_gt_llr_scatter(
+    ax: plt.Axes,
+    *,
+    est: np.ndarray,
+    gt: np.ndarray,
+    n: int,
+    r_offdiag: float,
+) -> None:
+    """Scatter of off-diagonal binned model ΔL vs generative one-sided mean log p(x|θ')-log p(x|θ)."""
+    x_gt, y_est, n_pts = _offdiag_gt_xy(est, gt)
+    if n_pts < 1:
+        ax.text(
+            0.5,
+            0.5,
+            f"n={n}\nno off-diagonal LLR pairs",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+            fontsize=9,
+        )
+        ax.set_axis_off()
+        return
+    ax.scatter(x_gt, y_est, s=8, alpha=0.5, c="#2ca02c", edgecolors="none")
+    lo = float(np.min([np.min(x_gt), np.min(y_est)]))
+    hi = float(np.max([np.max(x_gt), np.max(y_est)]))
+    if hi <= lo:
+        hi = lo + 1e-9
+    pad = 0.03 * (hi - lo)
+    ax.plot([lo - pad, hi + pad], [lo - pad, hi + pad], color="gray", linestyle="--", linewidth=1.0, label="y = x")
+    ax.set_xlim(lo - pad, hi + pad)
+    ax.set_ylim(lo - pad, hi + pad)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel(
+        "GT off-diag: " + r"$E_x[\log p(x|\theta_j)-\log p(x|\theta_i)]$ (MC, gen.)",
+        fontsize=7,
+    )
+    ax.set_ylabel("Est. off-diag: binned " + r"$\Delta L$ (model)", fontsize=7)
+    ax.set_title(
+        f"n={n}  LLR  Pearson $r$={float(r_offdiag):.4f}  (N={n_pts})",
         fontsize=9,
     )
     ax.grid(True, alpha=0.35)
@@ -577,6 +669,8 @@ def _make_full_args(args: argparse.Namespace, meta: dict) -> SimpleNamespace:
     setattr(full_args, "compute_h_matrix", True)
     setattr(full_args, "h_restore_original_order", True)
     setattr(full_args, "skip_shared_fisher_gt_compare", True)
+    # Save delta_l_matrix in h_matrix_results*.npz for LLR binned vs generative mean LLR scatter.
+    setattr(full_args, "h_save_intermediates", True)
     validate_estimation_args(full_args)
     return full_args
 
@@ -767,6 +861,414 @@ def _save_figure_png_svg(fig: plt.Figure, path_png: str, *, dpi: int = 160) -> s
     path_svg = str(Path(path_png).with_suffix(".svg"))
     fig.savefig(path_svg)
     return path_svg
+
+
+def _log_std_normal_scalar(theta_flat: np.ndarray) -> np.ndarray:
+    t = np.asarray(theta_flat, dtype=np.float64).reshape(-1)
+    return -0.5 * t * t - 0.5 * float(np.log(2.0 * np.pi))
+
+
+def _stable_softmax_log(logp: np.ndarray) -> np.ndarray:
+    z = np.asarray(logp, dtype=np.float64).reshape(-1)
+    z = z - float(np.max(z))
+    e = np.exp(np.clip(z, -700.0, 700.0))
+    s = float(np.sum(e))
+    if (not np.isfinite(s)) or s <= 0.0:
+        u = np.full_like(e, 1.0 / max(e.size, 1))
+        return u
+    return e / s
+
+
+def _normalize_density_trapz(theta_grid: np.ndarray, density: np.ndarray) -> np.ndarray:
+    t = np.asarray(theta_grid, dtype=np.float64).reshape(-1)
+    q = np.asarray(density, dtype=np.float64).reshape(-1)
+    if t.size != q.size or t.size < 2:
+        return np.zeros_like(t, dtype=np.float64)
+    q = np.where(np.isfinite(q), np.maximum(q, 0.0), 0.0)
+    z = float(np.trapezoid(q, t))
+    if (not np.isfinite(z)) or z <= 0.0:
+        span = float(np.max(t) - np.min(t))
+        if span <= 0.0:
+            return np.full_like(t, 1.0 / max(t.size, 1), dtype=np.float64)
+        return np.full_like(t, 1.0 / span, dtype=np.float64)
+    return q / z
+
+
+def _weighted_kde_density(
+    theta_samples: np.ndarray,
+    weights: np.ndarray,
+    theta_dense: np.ndarray,
+) -> np.ndarray:
+    th = np.asarray(theta_samples, dtype=np.float64).reshape(-1)
+    w = np.asarray(weights, dtype=np.float64).reshape(-1)
+    td = np.asarray(theta_dense, dtype=np.float64).reshape(-1)
+    if th.size < 2 or w.size != th.size or td.size < 2:
+        return np.zeros_like(td, dtype=np.float64)
+    w = np.where(np.isfinite(w), np.maximum(w, 0.0), 0.0)
+    sw = float(np.sum(w))
+    if sw <= 0.0 or (not np.isfinite(sw)):
+        w = np.full_like(w, 1.0 / max(w.size, 1), dtype=np.float64)
+    else:
+        w = w / sw
+
+    mu = float(np.sum(w * th))
+    var = float(np.sum(w * (th - mu) ** 2))
+    sigma = float(np.sqrt(max(var, 1e-12)))
+    n_eff = float(1.0 / max(np.sum(w * w), 1e-12))
+    # Weighted Silverman rule with range/spacing floor for robustness.
+    h = 1.06 * sigma * max(n_eff, 2.0) ** (-0.2)
+    span = float(np.max(th) - np.min(th))
+    diffs = np.diff(np.sort(np.unique(th)))
+    min_step = float(np.median(diffs)) if diffs.size > 0 else (span / max(th.size - 1, 1))
+    floor_h = max(span / 200.0, min_step * 0.5, 1e-3)
+    h = float(max(h, floor_h))
+
+    z = (td[:, None] - th[None, :]) / h
+    kern = np.exp(-0.5 * np.clip(z * z, 0.0, 1e6)) / (np.sqrt(2.0 * np.pi) * h)
+    q = kern @ w
+    return _normalize_density_trapz(td, q)
+
+
+def _approx_gt_posterior_density(
+    *,
+    dataset: Any,
+    x_fixed: np.ndarray,
+    theta_dense: np.ndarray,
+    theta_low: float,
+    theta_high: float,
+) -> np.ndarray:
+    td = np.asarray(theta_dense, dtype=np.float64).reshape(-1)
+    x1 = np.asarray(x_fixed, dtype=np.float64).reshape(1, -1)
+    if td.size < 2:
+        return np.zeros_like(td, dtype=np.float64)
+    x_rep = np.repeat(x1, repeats=td.size, axis=0)
+    tcol = td.reshape(-1, 1)
+    ll = np.asarray(log_p_x_given_theta(x_rep, tcol, dataset), dtype=np.float64).reshape(-1)
+    if ll.size != td.size:
+        raise ValueError(f"log_p_x_given_theta returned {ll.size}, expected {td.size}.")
+    width = float(theta_high - theta_low)
+    if width <= 0.0:
+        raise ValueError(f"theta range must satisfy high>low, got [{theta_low}, {theta_high}].")
+    log_prior = -np.log(width)
+    log_post = ll + float(log_prior)
+    z = log_post - float(np.max(log_post))
+    q = np.exp(np.clip(z, -700.0, 700.0))
+    return _normalize_density_trapz(td, q)
+
+
+def _select_two_fixed_x_indices(n: int, *, perm_seed: int, n_subset: int) -> tuple[int, int]:
+    i_a = (int(perm_seed) * 1_000_003 + 17 * int(n_subset)) % int(n)
+    if int(n) <= 1:
+        return int(i_a), int(i_a)
+    hop = max(1, int(n) // 2)
+    i_b = (int(i_a) + int(hop)) % int(n)
+    if int(i_b) == int(i_a):
+        i_b = (int(i_a) + 1) % int(n)
+    return int(i_a), int(i_b)
+
+
+def _plot_fixed_x_column(
+    *,
+    ax_top: plt.Axes,
+    ax_bot: plt.Axes,
+    i_fix: int,
+    hfm: str,
+    c: np.ndarray,
+    th_flat: np.ndarray,
+    xa: np.ndarray,
+    th_grid: np.ndarray,
+    mu: np.ndarray,
+    dataset: Any,
+    lo: float,
+    hi: float,
+) -> None:
+    c_row = np.asarray(c[int(i_fix), :], dtype=np.float64).reshape(-1)
+    if hfm == "theta_flow":
+        logp = c_row + _log_std_normal_scalar(th_flat)
+    elif hfm == "nf":
+        logp = c_row
+    else:
+        logp = c_row
+    w = _stable_softmax_log(logp)
+    order = np.argsort(th_flat, kind="mergesort")
+    th_s = th_flat[order]
+    w_s = w[order]
+    q_model = _weighted_kde_density(th_s, w_s, th_grid)
+
+    x_fixed = np.asarray(xa[int(i_fix)], dtype=np.float64).reshape(-1)
+    x0 = float(x_fixed[0]) if x_fixed.size else float("nan")
+    xn = float(np.linalg.norm(x_fixed))
+    q_gt = _approx_gt_posterior_density(
+        dataset=dataset,
+        x_fixed=x_fixed,
+        theta_dense=th_grid,
+        theta_low=lo,
+        theta_high=hi,
+    )
+    j_map = int(np.argmax(w))
+    theta_map = float(th_flat[j_map])
+
+    ax_top.fill_between(th_s, 0.0, w_s, color="#1f77b4", alpha=0.22, step="mid")
+    ax_top.plot(th_s, w_s, "o", color="#1f77b4", ms=2, alpha=0.55, label="Posterior mass on θ samples")
+    ax_top.plot(th_grid, q_model, color="#1f77b4", lw=1.6, label="Model posterior (approx)")
+    ax_top.plot(th_grid, q_gt, color="#d62728", lw=1.5, ls="--", label="GT posterior (approx)")
+    ax_top.set_ylabel("density")
+    ax_top.set_title(
+        f"Fixed-$x$ posterior diagnostics  (row $i$={int(i_fix)},  method={hfm})",
+        fontsize=9,
+    )
+    ax_top.legend(loc="upper right", fontsize=7)
+    ax_top.annotate(
+        f"x[0]={x0:.3g}  ||x||={xn:.3g}  theta_map={theta_map:.3g}",
+        xy=(0.5, 1.12),
+        xycoords="axes fraction",
+        ha="center",
+        fontsize=7,
+    )
+
+    d_dim = int(mu.shape[1]) if mu.ndim == 2 else 1
+    d_plot = int(min(3, max(d_dim, 1)))
+    for dd in range(d_plot):
+        col = "black" if dd == 0 else f"C{dd + 1}"
+        mu_d = np.asarray(mu[:, dd], dtype=np.float64).reshape(-1)
+        ax_bot.plot(
+            th_grid,
+            mu_d,
+            color=col,
+            lw=1.0,
+            label=fr"GT $\mu_{{{dd}}}(\theta)$" if d_plot > 1 else r"GT $\mu_0(\theta)$ (1st dim)",
+        )
+        if dd < int(x_fixed.size):
+            x_dd = float(x_fixed[dd])
+            ax_bot.axhline(
+                x_dd,
+                color=col,
+                ls="--",
+                lw=0.8,
+                alpha=0.65,
+                label=fr"$x_{{{dd}}}$ fixed={x_dd:.3g}",
+            )
+    tmn = float(np.clip(theta_map, lo, hi))
+    jmap = int(np.argmin(np.abs(th_grid - tmn))) if th_grid.size else 0
+    y_mark = float(np.asarray(mu[jmap, 0], dtype=np.float64)) if mu.size else float("nan")
+    ax_bot.axvline(tmn, color="#1f77b4", alpha=0.45, ls="--", lw=0.9)
+    ax_bot.scatter([tmn], [y_mark], s=22, zorder=4, color="#1f77b4")
+    ax_bot.set_ylabel("mean / fixed-x")
+    ax_bot.set_xlabel(r"$\theta$")
+    ax_bot.set_title(r"Generative mean $\mu(\theta)$, fixed-$x$ component guides, and grid MAP $\theta$", fontsize=8)
+    ax_bot.legend(loc="best", fontsize=6, ncol=2)
+
+
+def _write_fixed_x_posterior_diagnostic(
+    *,
+    run_dir: str,
+    persistent_diagnostics_dir: str,
+    meta: dict[str, Any],
+    perm_seed: int,
+    n_subset: int,
+    x_aligned: np.ndarray,
+) -> str | None:
+    """Write ``theta_flow_single_x_posterior_hist`` PNG+SVG for embedding in the combined figure.
+
+    Uses ``c_matrix`` from ``h_matrix_results*.npz`` (requires ``h_save_intermediates``) and
+    a deterministic row index ``i`` derived from ``perm_seed`` and ``n_subset``.
+
+    - ``theta_flow``: ``C[i,j] = log p(θ_j|x_i) - log p(θ_j)`` (std-normal base); we add
+      ``log p(θ_j)`` back for a softmax "posterior mass" on the training θ grid.
+    - ``nf``: ``C[i,j] = log p(θ_j|x_i)`` directly.
+    - Other H-field methods: soft-max the C row (scale may be method-specific) for a coarse view.
+    """
+    os.makedirs(persistent_diagnostics_dir, exist_ok=True)
+    out_base = os.path.join(persistent_diagnostics_dir, "theta_flow_single_x_posterior_hist")
+    out_png = out_base + ".png"
+
+    ds_fam = str(meta.get("dataset_family", ""))
+    suffix = "_non_gauss" if ds_fam == "cosine_gmm" else "_theta_cov"
+    h_path = os.path.join(run_dir, f"h_matrix_results{suffix}.npz")
+    if not os.path.isfile(h_path):
+        print(f"[convergence] fixed-x diagnostic: missing {h_path}", flush=True)
+        return None
+    z = np.load(h_path, allow_pickle=True)
+    if "c_matrix" not in z.files:
+        fig, ax = plt.subplots(1, 1, figsize=(6.2, 2.2), dpi=120, layout="tight")
+        ax.text(
+            0.5,
+            0.5,
+            "c_matrix not in H-matrix npz (need h_save_intermediates=True).",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+        )
+        ax.set_axis_off()
+        _save_figure_png_svg(fig, out_png, dpi=120)
+        plt.close(fig)
+        return out_png
+
+    c = np.asarray(z["c_matrix"], dtype=np.float64)
+    theta_u = np.asarray(z["theta_used"], dtype=np.float64)
+    if c.ndim != 2 or c.shape[0] != c.shape[1]:
+        print(f"[convergence] fixed-x diagnostic: bad c_matrix shape {getattr(c, 'shape', None)}", flush=True)
+        return None
+    n = int(c.shape[0])
+    if n < 2:
+        return None
+    if theta_u.ndim == 2 and int(theta_u.shape[1]) > 1:
+        fig, ax = plt.subplots(1, 1, figsize=(6.2, 2.2), dpi=120, layout="tight")
+        ax.text(
+            0.5,
+            0.5,
+            "Fixed-x posterior diagnostic: requires scalar theta (N×1) for C-row softmax.",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+        )
+        ax.set_axis_off()
+        _save_figure_png_svg(fig, out_png, dpi=120)
+        plt.close(fig)
+        return out_png
+
+    th_flat = np.asarray(theta_u, dtype=np.float64).reshape(-1)
+    xa = np.asarray(x_aligned, dtype=np.float64)
+    if int(xa.shape[0]) != n:
+        print(
+            f"[convergence] fixed-x diagnostic: x length {xa.shape[0]} != c rows {n}",
+            flush=True,
+        )
+        return None
+
+    hfm_raw = "theta_flow"
+    if "h_field_method" in z.files:
+        raw = z["h_field_method"]
+        try:
+            hfm_raw = str(np.asarray(raw).reshape(-1)[0])
+        except (TypeError, ValueError, IndexError):
+            hfm_raw = str(hfm_raw)
+    hfm = str(hfm_raw).strip().lower()
+    i_fix_a, i_fix_b = _select_two_fixed_x_indices(
+        n,
+        perm_seed=int(perm_seed),
+        n_subset=int(n_subset),
+    )
+    try:
+        dataset = build_dataset_from_meta(meta)
+        lo = float(meta["theta_low"])
+        hi = float(meta["theta_high"])
+        th_grid = np.linspace(lo, hi, 400, dtype=np.float64)
+        tcol = th_grid.reshape(-1, 1)
+        mu = np.asarray(dataset.tuning_curve(tcol), dtype=np.float64)
+    except Exception as e:  # noqa: BLE001
+        fig, axes = plt.subplots(1, 2, figsize=(12.0, 3.2), dpi=120, sharey=True, layout="tight")
+        for ax, i_fix in zip(np.asarray(axes).reshape(-1), (i_fix_a, i_fix_b)):
+            c_row = np.asarray(c[int(i_fix), :], dtype=np.float64).reshape(-1)
+            logp = c_row + _log_std_normal_scalar(th_flat) if hfm == "theta_flow" else c_row
+            w = _stable_softmax_log(logp)
+            order = np.argsort(th_flat, kind="mergesort")
+            th_s = th_flat[order]
+            w_s = w[order]
+            x_fixed = np.asarray(xa[int(i_fix)], dtype=np.float64).reshape(-1)
+            x0 = float(x_fixed[0]) if x_fixed.size else float("nan")
+            xn = float(np.linalg.norm(x_fixed))
+            j_map = int(np.argmax(w))
+            theta_map = float(th_flat[j_map])
+            ax.fill_between(th_s, 0.0, w_s, color="#1f77b4", alpha=0.35, step="mid")
+            ax.plot(th_s, w_s, "o-", color="#1f77b4", ms=2, lw=0.8, label="softmax C row (weights on θ grid)")
+            ax.set_ylabel("mass")
+            ax.set_xlabel(r"$\theta$")
+            ax.set_title(
+                f"fixed $x$  i={int(i_fix)}  method={hfm}\n(posterior overlay failed: {e!s})",
+                fontsize=8,
+            )
+            ax.annotate(
+                f"x[0]={x0:.3g}  ||x||={xn:.3g}  theta_map={theta_map:.3g}",
+                xy=(0.5, 1.02),
+                xycoords="axes fraction",
+                ha="center",
+                fontsize=7,
+            )
+        _save_figure_png_svg(fig, out_png, dpi=120)
+        plt.close(fig)
+        print(f"[convergence] fixed-x diagnostic -> {out_png}", flush=True)
+        return out_png
+
+    fig, axs = plt.subplots(2, 2, figsize=(12.8, 5.0), dpi=120, sharex="col", layout="tight")
+    ax00 = cast(plt.Axes, axs[0, 0])
+    ax01 = cast(plt.Axes, axs[0, 1])
+    ax10 = cast(plt.Axes, axs[1, 0])
+    ax11 = cast(plt.Axes, axs[1, 1])
+    _plot_fixed_x_column(
+        ax_top=ax00,
+        ax_bot=ax10,
+        i_fix=int(i_fix_a),
+        hfm=hfm,
+        c=c,
+        th_flat=th_flat,
+        xa=xa,
+        th_grid=th_grid,
+        mu=mu,
+        dataset=dataset,
+        lo=lo,
+        hi=hi,
+    )
+    _plot_fixed_x_column(
+        ax_top=ax01,
+        ax_bot=ax11,
+        i_fix=int(i_fix_b),
+        hfm=hfm,
+        c=c,
+        th_flat=th_flat,
+        xa=xa,
+        th_grid=th_grid,
+        mu=mu,
+        dataset=dataset,
+        lo=lo,
+        hi=hi,
+    )
+
+    _save_figure_png_svg(fig, out_png, dpi=120)
+    plt.close(fig)
+    print(f"[convergence] fixed-x diagnostic -> {out_png}", flush=True)
+    return out_png
+
+
+def _backfill_fixed_x_posterior_diagnostic_if_missing(
+    *,
+    output_dir: str,
+    bundle: SharedDatasetBundle,
+    meta: dict[str, Any],
+    ns: list[int],
+    perm_seed: int,
+    n_pool: int,
+) -> None:
+    """If ``h_decoding_convergence_combined`` expects a diagnostic PNG but only an H-matrix NPZ exists (e.g. old run), write it."""
+    n_max = int(max(ns))
+    diag_png = os.path.join(
+        output_dir,
+        "sweep_runs",
+        f"n_{n_max:06d}",
+        "diagnostics",
+        "theta_flow_single_x_posterior_hist.png",
+    )
+    if os.path.isfile(diag_png):
+        return
+    run_dir = os.path.join(output_dir, "sweep_runs", f"n_{n_max:06d}")
+    ds_fam = str(meta.get("dataset_family", ""))
+    suffix = "_non_gauss" if ds_fam == "cosine_gmm" else "_theta_cov"
+    h_path = os.path.join(run_dir, f"h_matrix_results{suffix}.npz")
+    if not os.path.isfile(h_path):
+        return
+    rng = np.random.default_rng(int(perm_seed))
+    perm = rng.permutation(int(n_pool))
+    sub = perm[:n_max]
+    x_aligned = np.asarray(bundle.x_all[sub], dtype=np.float64)
+    per_diag = os.path.join(output_dir, "sweep_runs", f"n_{n_max:06d}", "diagnostics")
+    _write_fixed_x_posterior_diagnostic(
+        run_dir=run_dir,
+        persistent_diagnostics_dir=per_diag,
+        meta=meta,
+        perm_seed=int(perm_seed),
+        n_subset=int(n_max),
+        x_aligned=x_aligned,
+    )
 
 
 def _load_per_n_training_loss_npz(path: str) -> dict[str, Any]:
@@ -969,17 +1471,18 @@ def _save_combined_convergence_figure(
     diagnostic_png_path: str | None,
     out_png_path: str,
     dpi: int = 160,
+    llr_gt: np.ndarray | None = None,
+    llr_est_mats: list[np.ndarray] | None = None,
+    corr_llr: np.ndarray | None = None,
 ) -> str:
-    """Single figure with matrix panel, correlation curves, est-vs-GT scatter, training-loss panel, and optional diagnostic.
+    """Single figure with matrix panel, correlation curves, H and LLR est-vs-GT scatters, losses, and optional diagnostic.
 
     PNG is raster as usual. SVG keeps the right-hand curve as vector paths (not a single
     embedded screenshot); heatmaps still use matplotlib's normal SVG image handling for ``imshow``.
 
-    Top row is matrix panel (left) + correlation curves (right). Second row spans both columns
-    with off-diagonal scatter(s): estimated binned ``sqrt(H_sym^2)`` vs MC GT ``sqrt(H^2)`` (one
-    per ``n`` in ``--n-list``). Third row spans both columns and mirrors the standalone
-    training-loss panel. Bottom row spans both columns and embeds the fixed-x posterior+tuning
-    diagnostic image when available.
+    With LLR data: top row = matrix + curves; then H scatter row; then LLR scatter row (binned
+    model ``ΔL`` vs generative one-sided mean LLR); then training losses; then diagnostic.
+    If ``llr_gt``/``llr_est_mats``/``corr_llr`` are omitted, the LLR row is skipped (older runs).
     """
     crv_w, crv_h = _H_DECODING_CURVE_FIGSIZE_IN
     if crv_h <= 0:
@@ -993,6 +1496,7 @@ def _save_combined_convergence_figure(
     fig_w = max(m_w + (top_h * (float(crv_w) / float(crv_h))), l_w)
     # Constrained layout: colorbars make tight_layout warn and mis-place panels.
     scatter_h = 2.8
+    llr_h = 2.8
     diag_h = 5.2
     if len(h_mats) < 2 or len(h_mats) != len(ns) + 1:
         raise ValueError(
@@ -1002,16 +1506,26 @@ def _save_combined_convergence_figure(
     if int(np.asarray(corr_h, dtype=np.float64).ravel().size) != len(ns):
         raise ValueError("corr_h must have one entry per n in --n-list.")
     h_gt = h_mats[-1]
-    fig = plt.figure(
-        figsize=(fig_w, top_h + scatter_h + bot_h + diag_h),
-        dpi=dpi,
-        layout="constrained",
+    use_llr = (
+        llr_gt is not None
+        and llr_est_mats is not None
+        and corr_llr is not None
+        and int(np.asarray(corr_llr, dtype=np.float64).ravel().size) == len(ns)
+        and len(llr_est_mats) == len(ns)
     )
+    if use_llr and np.asarray(llr_gt, dtype=np.float64).shape != (int(n_bins), int(n_bins)):
+        raise ValueError("llr_gt must be (n_bins, n_bins).")
+    n_grid_rows = 5 if use_llr else 4
+    fig_h = top_h + scatter_h + (llr_h if use_llr else 0.0) + bot_h + diag_h
+    fig = plt.figure(figsize=(fig_w, fig_h), dpi=dpi, layout="constrained")
+    height_rows = [top_h, scatter_h, bot_h, diag_h]
+    if use_llr:
+        height_rows = [top_h, scatter_h, llr_h, bot_h, diag_h]
     gs0 = fig.add_gridspec(
-        4,
+        n_grid_rows,
         2,
         width_ratios=[m_w, top_h * (float(crv_w) / float(crv_h))],
-        height_ratios=[top_h, scatter_h, bot_h, diag_h],
+        height_ratios=height_rows,
     )
     gs_left = gs0[0, 0].subgridspec(2, n_cols)
     axes_m = np.empty((2, n_cols), dtype=object)
@@ -1052,7 +1566,20 @@ def _save_combined_convergence_figure(
         ax0.text(0.5, 0.5, "empty n-list", ha="center", va="center", transform=ax0.transAxes, fontsize=9)
         ax0.set_axis_off()
 
-    gs_loss = gs0[2, :].subgridspec(2, n_loss_cols)
+    loss_row = 3 if use_llr else 2
+    if use_llr and llr_gt is not None and llr_est_mats is not None and corr_llr is not None:
+        gs_llr = gs0[2, :].subgridspec(1, max(1, n_scat))
+        for j, n in enumerate(ns):
+            ax_l = fig.add_subplot(gs_llr[0, j])
+            _plot_estimated_vs_gt_llr_scatter(
+                ax_l,
+                est=np.asarray(llr_est_mats[j], dtype=np.float64),
+                gt=np.asarray(llr_gt, dtype=np.float64),
+                n=int(n),
+                r_offdiag=float(corr_llr[j]),
+            )
+
+    gs_loss = gs0[loss_row, :].subgridspec(2, n_loss_cols)
     axes_loss = np.empty((2, n_loss_cols), dtype=object)
     row0_ylabel = "score / posterior loss"
     row1_ylabel = "prior loss"
@@ -1136,7 +1663,8 @@ def _save_combined_convergence_figure(
             )
             axes_loss[1, j].set_axis_off()
 
-    ax_diag = fig.add_subplot(gs0[3, :])
+    diag_row = 4 if use_llr else 3
+    ax_diag = fig.add_subplot(gs0[diag_row, :])
     if diagnostic_png_path is None or not os.path.isfile(str(diagnostic_png_path)):
         ax_diag.text(
             0.5,
@@ -1433,6 +1961,10 @@ class CachedConvergenceBundle(TypedDict):
     gt_seed: int
     gt_symmetrize: bool
     out_npz: str
+    # Optional: LLR scatter (newer full runs)
+    llr_gt_mean_one_sided_mc: NotRequired[np.ndarray]
+    llr_binned_columns: NotRequired[np.ndarray]
+    corr_llr_binned_vs_gt_mc: NotRequired[np.ndarray]
 
 
 def _load_cached_convergence_results(output_dir: str) -> CachedConvergenceBundle:
@@ -1482,24 +2014,31 @@ def _load_cached_convergence_results(output_dir: str) -> CachedConvergenceBundle
     sym_raw = z["gt_hellinger_symmetrize"] if "gt_hellinger_symmetrize" in z.files else np.int32(0)
     gt_symmetrize = bool(int(np.asarray(sym_raw).reshape(-1)[0]))
 
-    return CachedConvergenceBundle(
-        n=np.asarray(z["n"], dtype=np.int64).ravel(),
-        corr_h=np.asarray(z["corr_h_binned_vs_gt_mc"], dtype=np.float64).ravel(),
-        corr_clf=np.asarray(z["corr_clf_vs_ref"], dtype=np.float64).ravel(),
-        wall_s=np.asarray(z["wall_seconds"], dtype=np.float64).ravel(),
-        h_cols=h_cols,
-        clf_cols=clf_cols,
-        n_ref=int(np.asarray(z["n_ref"]).reshape(-1)[0]),
-        perm_seed=int(np.asarray(z["perm_seed"]).reshape(-1)[0]) if "perm_seed" in z.files else 0,
-        base_seed=int(np.asarray(z["convergence_base_seed"]).reshape(-1)[0]) if "convergence_base_seed" in z.files else 0,
-        meta_seed=int(np.asarray(z["dataset_meta_seed"]).reshape(-1)[0]) if "dataset_meta_seed" in z.files else 0,
-        edges=np.asarray(z["theta_bin_edges"], dtype=np.float64),
-        centers=np.asarray(centers, dtype=np.float64).ravel(),
-        gt_n_mc=gt_n_mc,
-        gt_seed=gt_seed,
-        gt_symmetrize=gt_symmetrize,
-        out_npz=os.path.abspath(out_npz),
-    )
+    base_bundle: dict[str, Any] = {
+        "n": np.asarray(z["n"], dtype=np.int64).ravel(),
+        "corr_h": np.asarray(z["corr_h_binned_vs_gt_mc"], dtype=np.float64).ravel(),
+        "corr_clf": np.asarray(z["corr_clf_vs_ref"], dtype=np.float64).ravel(),
+        "wall_s": np.asarray(z["wall_seconds"], dtype=np.float64).ravel(),
+        "h_cols": h_cols,
+        "clf_cols": clf_cols,
+        "n_ref": int(np.asarray(z["n_ref"]).reshape(-1)[0]),
+        "perm_seed": int(np.asarray(z["perm_seed"]).reshape(-1)[0]) if "perm_seed" in z.files else 0,
+        "base_seed": int(np.asarray(z["convergence_base_seed"]).reshape(-1)[0]) if "convergence_base_seed" in z.files else 0,
+        "meta_seed": int(np.asarray(z["dataset_meta_seed"]).reshape(-1)[0]) if "dataset_meta_seed" in z.files else 0,
+        "edges": np.asarray(z["theta_bin_edges"], dtype=np.float64),
+        "centers": np.asarray(centers, dtype=np.float64).ravel(),
+        "gt_n_mc": gt_n_mc,
+        "gt_seed": gt_seed,
+        "gt_symmetrize": gt_symmetrize,
+        "out_npz": os.path.abspath(out_npz),
+    }
+    if "gt_mean_llr_one_sided_mc" in z.files:
+        base_bundle["llr_gt_mean_one_sided_mc"] = np.asarray(z["gt_mean_llr_one_sided_mc"], dtype=np.float64)
+    if "llr_binned_columns" in z.files:
+        base_bundle["llr_binned_columns"] = np.asarray(z["llr_binned_columns"], dtype=np.float64)
+    if "corr_llr_binned_vs_gt_mc" in z.files:
+        base_bundle["corr_llr_binned_vs_gt_mc"] = np.asarray(z["corr_llr_binned_vs_gt_mc"], dtype=np.float64).ravel()
+    return cast(CachedConvergenceBundle, base_bundle)
 
 
 def _validate_cached_matches_cli(args: argparse.Namespace, cached: CachedConvergenceBundle, ns: list[int]) -> None:
@@ -1547,6 +2086,8 @@ def _render_convergence_figures_and_summary(
     per_n_loss_rows: list[dict[str, str]],
     err_msg: list[str],
     visualization_only: bool,
+    llr_cols: np.ndarray | None = None,
+    corr_llr: np.ndarray | None = None,
 ) -> None:
     """Write CSV, figures, manifest, training-loss panel, summary, and print artifact paths."""
     csv_path = os.path.join(args.output_dir, "h_decoding_convergence_results.csv")
@@ -1557,11 +2098,20 @@ def _render_convergence_figures_and_summary(
                 "n",
                 "corr_h_binned_vs_gt_mc",
                 "corr_clf_vs_ref",
+                "corr_llr_binned_vs_gt_mc",
                 "wall_seconds",
             ]
         )
         for i, n in enumerate(ns):
-            w.writerow([n, corr_h[i], corr_clf[i], wall_s[i]])
+            r_llr: float | str
+            if (
+                corr_llr is not None
+                and int(np.asarray(corr_llr, dtype=np.float64).ravel().size) > i
+            ):
+                r_llr = float(np.asarray(corr_llr, dtype=np.float64).ravel()[i])
+            else:
+                r_llr = ""
+            w.writerow([n, corr_h[i], corr_clf[i], r_llr, wall_s[i]])
 
     fig_path = os.path.join(args.output_dir, "h_decoding_convergence.png")
     fig, ax = plt.subplots(1, 1, figsize=_H_DECODING_CURVE_FIGSIZE_IN)
@@ -1607,6 +2157,18 @@ def _render_convergence_figures_and_summary(
         "theta_flow_single_x_posterior_hist.png",
     )
     diagnostic_png_use = diagnostic_png if os.path.isfile(diagnostic_png) else None
+    llr_est: list[np.ndarray] | None = None
+    llr_gt: np.ndarray | None = None
+    corr_llr_a: np.ndarray | None = None
+    if (
+        llr_cols is not None
+        and int(llr_cols.shape[0]) == len(ns) + 1
+        and corr_llr is not None
+        and int(np.asarray(corr_llr, dtype=np.float64).ravel().size) == len(ns)
+    ):
+        llr_gt = np.asarray(llr_cols[-1], dtype=np.float64)
+        llr_est = [np.asarray(llr_cols[j], dtype=np.float64) for j in range(len(ns))]
+        corr_llr_a = np.asarray(corr_llr, dtype=np.float64).ravel()
     combined_svg = _save_combined_convergence_figure(
         h_mats=list(h_cols),
         clf_mats=list(clf_cols),
@@ -1620,6 +2182,9 @@ def _render_convergence_figures_and_summary(
         diagnostic_png_path=diagnostic_png_use,
         out_png_path=combined_path,
         dpi=160,
+        llr_gt=llr_gt,
+        llr_est_mats=llr_est,
+        corr_llr=corr_llr_a,
     )
 
     loss_panel_png = os.path.join(args.output_dir, "h_decoding_training_losses_panel.png")
@@ -1662,6 +2227,10 @@ def _render_convergence_figures_and_summary(
         )
         sf.write(
             "# h_binned_columns last column: MC GT sqrt(H^2) (not DSM/flow); hellinger_gt_sq_mc key stores sqrt(H^2).\n"
+        )
+        sf.write(
+            "# corr_llr_binned_vs_gt_mc: off-diagonal Pearson r, binned model \\Delta L vs "
+            "one-sided generative mean LLR E_x[log p(x|θ_j)-log p(x|θ_i)] (MC; GT uses llr_binned_columns last column).\n"
         )
         sf.write(
             f"gt_hellinger_n_mc: {int(gt_n_mc)}  # MC samples per bin row; floor(n_ref / num_theta_bins)\n"
@@ -1765,6 +2334,16 @@ def main(argv: list[str] | None = None) -> None:
             "regenerating figures from cached NPZ.",
             flush=True,
         )
+        _backfill_fixed_x_posterior_diagnostic_if_missing(
+            output_dir=args.output_dir,
+            bundle=bundle,
+            meta=meta,
+            ns=ns,
+            perm_seed=int(cached["perm_seed"]),
+            n_pool=n_pool,
+        )
+        _llr_c = cached.get("llr_binned_columns")
+        _corr_llr_c = cached.get("corr_llr_binned_vs_gt_mc")
         _render_convergence_figures_and_summary(
             args=args,
             meta=meta,
@@ -1786,6 +2365,8 @@ def main(argv: list[str] | None = None) -> None:
             per_n_loss_rows=per_n_loss_rows_viz,
             err_msg=[],
             visualization_only=True,
+            llr_cols=None if _llr_c is None else np.asarray(_llr_c, dtype=np.float64),
+            corr_llr=None if _corr_llr_c is None else np.asarray(_corr_llr_c, dtype=np.float64).ravel(),
         )
         return
 
@@ -1855,6 +2436,17 @@ def main(argv: list[str] | None = None) -> None:
         f"[convergence] GT Hellinger (MC likelihood) n_bins={n_bins} n_mc={gt_n_mc} "
         f"(n_bins*n_mc={n_bins * gt_n_mc} <= n_ref={int(args.n_ref)}) wall time: {time.time() - t_gt0:.1f}s "
         f"(H track uses sqrt(H^2) vs sqrt(binned h_sym))",
+        flush=True,
+    )
+    t_llr0 = time.time()
+    llr_gt_mc = estimate_mean_llr_one_sided_mc(
+        dataset_for_gt,
+        centers,
+        n_mc=gt_n_mc,
+    )
+    print(
+        f"[convergence] GT one-sided mean LLR (MC likelihood) n_bins={n_bins} n_mc={gt_n_mc} "
+        f"wall time: {time.time() - t_llr0:.1f}s (LLR track: E_x[log p(x|θ_j)-log p(x|θ_i)] vs binned ΔL).",
         flush=True,
     )
 
@@ -1958,6 +2550,7 @@ def main(argv: list[str] | None = None) -> None:
         clf_acc_ref=clf_ref,
         # Legacy key name: stores sqrt(H^2) from MC (not raw H^2); see module docstring.
         hellinger_gt_sq_mc=h_gt_sqrt,
+        gt_mean_llr_one_sided_mc=np.asarray(llr_gt_mc, dtype=np.float64),
         h_binned_ref_is_gt_mc=np.int32(1),
         theta_bin_centers=centers,
         gt_hellinger_n_mc=np.int64(gt_n_mc),
@@ -1975,11 +2568,14 @@ def main(argv: list[str] | None = None) -> None:
 
     corr_h = np.full(len(ns), np.nan, dtype=np.float64)
     corr_clf = np.full(len(ns), np.nan, dtype=np.float64)
+    corr_llr = np.full(len(ns), np.nan, dtype=np.float64)
     wall_s = np.full(len(ns), np.nan, dtype=np.float64)
     err_msg: list[str] = []
     h_sweep: list[np.ndarray] = []
     clf_sweep: list[np.ndarray] = []
+    llr_sweep: list[np.ndarray] = []
     per_n_loss_rows: list[dict[str, str]] = []
+    ds_fam = str(meta.get("dataset_family", "cosine_gaussian"))
 
     sweep_root = os.path.join(args.output_dir, "sweep_runs")
     if bool(args.keep_intermediate):
@@ -2009,12 +2605,26 @@ def main(argv: list[str] | None = None) -> None:
                 bin_idx_all=bin_idx_all,
                 theta_state_all=theta_state_all,
             )
-            loaded_n, _, _ = _estimate_one(
+            loaded_n, x_aligned, _ = _estimate_one(
                 args=args,
                 meta=meta,
                 bundle=subset_n.bundle,
                 output_dir=run_dir,
                 n_bins=n_bins,
+            )
+            per_diag = os.path.join(
+                args.output_dir,
+                "sweep_runs",
+                f"n_{int(n):06d}",
+                "diagnostics",
+            )
+            _write_fixed_x_posterior_diagnostic(
+                run_dir=run_dir,
+                persistent_diagnostics_dir=per_diag,
+                meta=meta,
+                perm_seed=int(perm_seed),
+                n_subset=int(n),
+                x_aligned=x_aligned,
             )
             h_n, clf_n = _metrics_fixed_edges(
                 loaded_n,
@@ -2029,9 +2639,13 @@ def main(argv: list[str] | None = None) -> None:
             wall_s[k] = time.time() - t1
             h_sweep.append(np.asarray(h_n_sqrt, dtype=np.float64))
             clf_sweep.append(np.asarray(clf_n, dtype=np.float64))
+            delta_l_in = _load_delta_l_from_run_dir(run_dir, dataset_family=ds_fam)
+            llr_n = _metrics_delta_l_binned(delta_l_in, subset_n, n_bins)
+            llr_sweep.append(np.asarray(llr_n, dtype=np.float64))
+            corr_llr[k] = vhb.matrix_corr_offdiag_pearson(llr_n, np.asarray(llr_gt_mc, dtype=np.float64))
             print(
                 f"[convergence] n={n}  corr_h={corr_h[k]:.4f}  corr_clf={corr_clf[k]:.4f}  "
-                f"wall={wall_s[k]:.1f}s",
+                f"corr_llr={corr_llr[k]:.4f}  wall={wall_s[k]:.1f}s",
                 flush=True,
             )
             run_loss_npz = os.path.join(run_dir, "score_prior_training_losses.npz")
@@ -2081,13 +2695,15 @@ def main(argv: list[str] | None = None) -> None:
             "Per-n sweep failed (including required training-loss collection).\n"
             f"{msg}"
         )
-    if len(h_sweep) != len(ns) or len(clf_sweep) != len(ns):
+    if len(h_sweep) != len(ns) or len(clf_sweep) != len(ns) or len(llr_sweep) != len(ns):
         raise RuntimeError(
             "Missing binned matrices for some n (partial failures). "
             "Fix errors above or re-run with a smaller n-list."
         )
     h_cols = np.stack(h_sweep + [h_ref], axis=0)
     clf_cols = np.stack(clf_sweep + [clf_ref], axis=0)
+    llr_ref = np.asarray(llr_gt_mc, dtype=np.float64)
+    llr_cols = np.stack(llr_sweep + [llr_ref], axis=0)
     column_n = np.asarray(list(ns) + [int(args.n_ref)], dtype=np.int64)
 
     out_npz = os.path.join(args.output_dir, "h_decoding_convergence_results.npz")
@@ -2113,6 +2729,9 @@ def main(argv: list[str] | None = None) -> None:
         h_binned_columns=h_cols,
         clf_acc_columns=clf_cols,
         column_n=column_n,
+        gt_mean_llr_one_sided_mc=np.asarray(llr_gt_mc, dtype=np.float64),
+        llr_binned_columns=llr_cols,
+        corr_llr_binned_vs_gt_mc=corr_llr,
     )
 
     _render_convergence_figures_and_summary(
@@ -2136,6 +2755,8 @@ def main(argv: list[str] | None = None) -> None:
         per_n_loss_rows=per_n_loss_rows,
         err_msg=err_msg,
         visualization_only=False,
+        llr_cols=llr_cols,
+        corr_llr=corr_llr,
     )
 
 

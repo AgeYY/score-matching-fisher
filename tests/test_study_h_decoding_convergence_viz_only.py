@@ -75,13 +75,17 @@ class TestStudyHDecodingConvergenceVizOnly(unittest.TestCase):
             clf_cols = np.full((len(ns_list) + 1, n_bins, n_bins), 0.6, dtype=np.float64)
             corr_h = np.array([0.9, 0.91], dtype=np.float64)
             corr_clf = np.array([0.8, 0.82], dtype=np.float64)
+            corr_llr = np.array([0.4, 0.41], dtype=np.float64)
             wall_s = np.array([1.0, 2.0], dtype=np.float64)
+            llr_gt = np.full((n_bins, n_bins), 0.12, dtype=np.float64)
+            llr_cols = np.full((len(ns_list) + 1, n_bins, n_bins), 0.12, dtype=np.float64)
             results_npz = out_dir / "h_decoding_convergence_results.npz"
             np.savez_compressed(
                 results_npz,
                 n=np.asarray(ns_list, dtype=np.int64),
                 corr_h_binned_vs_gt_mc=corr_h,
                 corr_clf_vs_ref=corr_clf,
+                corr_llr_binned_vs_gt_mc=corr_llr,
                 wall_seconds=wall_s,
                 n_ref=np.int64(n_ref),
                 perm_seed=np.int64(seed),
@@ -98,6 +102,8 @@ class TestStudyHDecodingConvergenceVizOnly(unittest.TestCase):
                 h_binned_columns=h_cols,
                 clf_acc_columns=clf_cols,
                 column_n=np.asarray(ns_list + [n_ref], dtype=np.int64),
+                gt_mean_llr_one_sided_mc=llr_gt,
+                llr_binned_columns=llr_cols,
             )
             loss_dir = out_dir / "training_losses"
             loss_dir.mkdir()

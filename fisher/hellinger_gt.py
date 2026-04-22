@@ -83,3 +83,45 @@ def estimate_hellinger_sq_one_sided_mc(
     if symmetrize:
         h2 = 0.5 * (h2 + h2.T)
     return h2
+
+
+def estimate_mean_llr_one_sided_mc(
+    dataset: Any,
+    bin_centers: NDArray[np.float64],
+    *,
+    n_mc: int,
+) -> NDArray[np.float64]:
+    """Monte Carlo estimate of one-sided mean log-likelihood ratio between bin-conditional models.
+
+    For each pair of bin indices (i, j) with ``theta_i = centers[i]``, ``theta_j = centers[j]``,
+    with samples ``x ~ p(x | theta_i)``:
+
+        (LLR_gen)_{ij} = E_{x ~ p(x|theta_i)}[ log p(x|theta_j) - log p(x|theta_i) ].
+
+    Uses the same row-wise sampling protocol and ``n_mc`` as
+    :func:`estimate_hellinger_sq_one_sided_mc` (one MC batch per row ``i``).
+    The result is **directional** (not symmetric in general); diagonals are 0.0.
+    """
+    centers = np.asarray(bin_centers, dtype=np.float64).reshape(-1)
+    n_bins = int(centers.size)
+    if n_bins < 1:
+        raise ValueError("bin_centers must be non-empty.")
+    if n_mc < 1:
+        raise ValueError("n_mc must be >= 1.")
+
+    out = np.zeros((n_bins, n_bins), dtype=np.float64)
+    for i in range(n_bins):
+        theta_i = float(centers[i])
+        t_col = np.full((n_mc, 1), theta_i, dtype=np.float64)
+        x = dataset.sample_x(t_col)
+        lp_i = np.asarray(log_p_x_given_theta(x, t_col, dataset), dtype=np.float64).reshape(-1)
+        if lp_i.shape[0] != n_mc:
+            raise ValueError(f"log_p_x_given_theta length mismatch: got {lp_i.shape[0]}, expected {n_mc}.")
+
+        for j in range(n_bins):
+            theta_j = float(centers[j])
+            t_j = np.full((n_mc, 1), theta_j, dtype=np.float64)
+            lp_j = np.asarray(log_p_x_given_theta(x, t_j, dataset), dtype=np.float64).reshape(-1)
+            out[i, j] = float(np.mean(lp_j - lp_i))
+    np.fill_diagonal(out, 0.0)
+    return out

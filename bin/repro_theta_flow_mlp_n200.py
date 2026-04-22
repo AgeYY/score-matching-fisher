@@ -6,6 +6,7 @@ This script intentionally exposes only a tiny CLI surface and fixes the rest:
 - x_dim = --x-dim (default 2)
 - obs_noise_scale = 0.5 (TEMPORARY: half the family baseline noise; restore to 1.0 for default)
 - n_total = 3000, train_frac = 0.7, seed = 7
+- theta in [theta-low, theta-high] (default 0, 3; was [-6,6] in make_dataset)
 - theta_field_method = theta_flow or nf
 - flow_arch = mlp (theta_flow only)
 - n_ref = 1000
@@ -15,6 +16,11 @@ This script intentionally exposes only a tiny CLI surface and fixes the rest:
 It creates a shared dataset NPZ, then runs ``bin/study_h_decoding_convergence.py``
 with fixed settings and prints the resulting metrics. Method selection supports
 theta-flow only, NF only, or both (into separate subdirectories).
+
+Convergence outputs include ``h_decoding_convergence_combined.{png,svg}`` and a fixed-$x$
+posterior + GT tuning diagnostic at
+``sweep_runs/n_000200/diagnostics/theta_flow_single_x_posterior_hist.{png,svg}`` (embedded in the
+combined figure).
 """
 
 from __future__ import annotations
@@ -42,10 +48,13 @@ import torch
 _TEMP_OBS_NOISE_SCALE = 0.5
 
 
-def _default_output_dir(x_dim: int, dataset_family: str) -> str:
+def _default_output_dir(
+    x_dim: int, dataset_family: str, *, theta_low: float, theta_high: float
+) -> str:
+    th = f"th{float(theta_low):g}_{float(theta_high):g}".replace(".", "p")
     return str(
         Path("data")
-        / f"repro_theta_flow_mlp_n200_{dataset_family}_xdim{x_dim}_obsnoise0p5"
+        / f"repro_theta_flow_mlp_n200_{dataset_family}_xdim{x_dim}_obsnoise0p5_{th}"
     )
 
 
@@ -70,13 +79,25 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Observation dimension x ∈ R^{d} (default 2).",
     )
     p.add_argument(
+        "--theta-low",
+        type=float,
+        default=0.0,
+        help="Uniform theta support lower bound (default: 0.0; make_dataset default is -6).",
+    )
+    p.add_argument(
+        "--theta-high",
+        type=float,
+        default=3.0,
+        help="Uniform theta support upper bound (default: 3.0; make_dataset default is 6).",
+    )
+    p.add_argument(
         "--output-dir",
         type=str,
         default=None,
         help=(
             "Directory for generated dataset + study artifacts. "
-            "If omitted, uses data/repro_theta_flow_mlp_n200_{dataset_family}_xdim{d}_obsnoise0p5 "
-            "for the chosen --dataset-family and --x-dim."
+            "If omitted, uses data/repro_theta_flow_mlp_n200_{dataset_family}_xdim{d}_obsnoise0p5_th{lo}_{hi} "
+            "for the chosen --dataset-family, --x-dim, and --theta-low/--theta-high."
         ),
     )
     p.add_argument(
@@ -133,13 +154,26 @@ def _normalize_output_dir(raw: str) -> Path:
     return _repo_root / p
 
 
-def _write_dataset(dataset_npz: Path, *, x_dim: int, dataset_family: str) -> None:
+def _write_dataset(
+    dataset_npz: Path,
+    *,
+    x_dim: int,
+    dataset_family: str,
+    theta_low: float,
+    theta_high: float,
+) -> None:
     # Build namespace via the shared dataset parser to stay aligned with family recipes.
     ds_parser = argparse.ArgumentParser(add_help=False)
     add_dataset_arguments(ds_parser)
     ds_args = ds_parser.parse_args([])
     ds_args.dataset_family = str(dataset_family)
     ds_args.x_dim = int(x_dim)
+    ds_args.theta_low = float(theta_low)
+    ds_args.theta_high = float(theta_high)
+    if float(ds_args.theta_high) <= float(ds_args.theta_low):
+        raise ValueError(
+            f"require --theta-high > --theta-low; got [{ds_args.theta_low}, {ds_args.theta_high}]."
+        )
     ds_args.obs_noise_scale = float(_TEMP_OBS_NOISE_SCALE)
     ds_args.n_total = 3000
     ds_args.train_frac = 0.7
@@ -273,7 +307,11 @@ def main() -> None:
     if x_dim < 2:
         raise ValueError(f"--x-dim must be >= 2, got {x_dim}.")
     dataset_family = str(args.dataset_family)
-    out_raw = args.output_dir if args.output_dir is not None else _default_output_dir(x_dim, dataset_family)
+    theta_lo = float(args.theta_low)
+    theta_hi = float(args.theta_high)
+    out_raw = args.output_dir if args.output_dir is not None else _default_output_dir(
+        x_dim, dataset_family, theta_low=theta_lo, theta_high=theta_hi
+    )
     out_dir = _normalize_output_dir(out_raw)
     os.makedirs(out_dir, exist_ok=True)
 
@@ -283,9 +321,16 @@ def main() -> None:
     n = 200
     n_ref = 1000
     dataset_npz = out_dir / "shared_dataset.npz"
-    _write_dataset(dataset_npz, x_dim=x_dim, dataset_family=dataset_family)
+    _write_dataset(
+        dataset_npz,
+        x_dim=x_dim,
+        dataset_family=dataset_family,
+        theta_low=theta_lo,
+        theta_high=theta_hi,
+    )
     print(
-        f"[repro] dataset_family={dataset_family} x_dim={x_dim} dataset_npz={dataset_npz}",
+        f"[repro] dataset_family={dataset_family} x_dim={x_dim} "
+        f"theta_range=[{theta_lo}, {theta_hi}] dataset_npz={dataset_npz}",
         flush=True,
     )
     method = str(args.method).strip().lower()
