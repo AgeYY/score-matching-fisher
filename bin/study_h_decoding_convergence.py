@@ -673,9 +673,9 @@ def _validate_cli(args: argparse.Namespace) -> None:
     if use_acc_mds:
         tfm = str(getattr(args, "theta_field_method", "theta_flow")).strip().lower()
         arch = str(getattr(args, "flow_arch", "mlp")).strip().lower()
-        if tfm != "theta_flow":
+        if tfm not in ("theta_flow", "x_flow"):
             raise ValueError(
-                "--theta-flow-acc-mds-state requires --theta-field-method theta_flow "
+                "--theta-flow-acc-mds-state requires --theta-field-method in {theta_flow, x_flow} "
                 f"(got {getattr(args, 'theta_field_method', None)!r})."
             )
         if arch != "mlp":
@@ -751,6 +751,7 @@ def _theta_mds_embedding_from_accuracy(
 def _write_acc_mds_h_matrix_figure(
     *,
     out_dir: str,
+    method_tag: str,
     n: int,
     h_sqrt: np.ndarray,
     h_gt_sqrt: np.ndarray,
@@ -762,7 +763,8 @@ def _write_acc_mds_h_matrix_figure(
     if (not np.isfinite(vmax)) or vmax <= 0.0:
         vmax = 1.0
     im0 = axes[0].imshow(h_sqrt, origin="lower", vmin=0.0, vmax=vmax, cmap="viridis", interpolation="nearest")
-    axes[0].set_title(rf"Acc-MDS theta-flow $\sqrt{{H^2}}$ (n={int(n)})", fontsize=10)
+    method_label = "x-flow" if str(method_tag).strip().lower() == "x_flow" else "theta-flow"
+    axes[0].set_title(rf"Acc-MDS {method_label} $\sqrt{{H^2}}$ (n={int(n)})", fontsize=10)
     axes[0].set_xlabel(r"$\theta$ bin")
     axes[0].set_ylabel(r"$\theta$ bin")
     fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.03)
@@ -771,7 +773,8 @@ def _write_acc_mds_h_matrix_figure(
     axes[1].set_xlabel(r"$\theta$ bin")
     axes[1].set_ylabel(r"$\theta$ bin")
     fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.03)
-    png = os.path.join(out_dir, f"h_theta_flow_acc_mds_n_{int(n):06d}.png")
+    tag = "x_flow" if str(method_tag).strip().lower() == "x_flow" else "theta_flow"
+    png = os.path.join(out_dir, f"h_{tag}_acc_mds_n_{int(n):06d}.png")
     svg = str(Path(png).with_suffix(".svg"))
     fig.savefig(png, dpi=220)
     fig.savefig(svg)
@@ -2644,8 +2647,9 @@ def main(argv: list[str] | None = None) -> None:
             flush=True,
         )
     elif use_acc_mds_state:
+        tfm_acc = str(getattr(args, "theta_field_method", "theta_flow")).strip().lower()
         print(
-            "[convergence] theta_flow acc-MDS state enabled: per-n pairwise accuracy -> "
+            f"[convergence] {tfm_acc} acc-MDS state enabled: per-n pairwise accuracy -> "
             "clipped H lower bound -> classical MDS embedding.",
             flush=True,
         )
@@ -2687,6 +2691,7 @@ def main(argv: list[str] | None = None) -> None:
     ref_dir = os.path.join(args.output_dir, "reference")
     os.makedirs(ref_dir, exist_ok=True)
     tfm = str(getattr(args, "theta_field_method", "theta_flow")).strip().lower()
+    acc_mds_tag = "x_flow" if tfm == "x_flow" else "theta_flow"
     if tfm == "theta_flow":
         print(
             f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
@@ -2918,12 +2923,13 @@ def main(argv: list[str] | None = None) -> None:
             if use_acc_mds_state:
                 fig_png, fig_svg = _write_acc_mds_h_matrix_figure(
                     out_dir=args.output_dir,
+                    method_tag=acc_mds_tag,
                     n=int(n),
                     h_sqrt=np.asarray(h_n_sqrt, dtype=np.float64),
                     h_gt_sqrt=np.asarray(h_gt_sqrt, dtype=np.float64),
                     corr_h=float(corr_h[k]),
                 )
-                npz_acc_mds = os.path.join(args.output_dir, f"h_theta_flow_acc_mds_n_{int(n):06d}.npz")
+                npz_acc_mds = os.path.join(args.output_dir, f"h_{acc_mds_tag}_acc_mds_n_{int(n):06d}.npz")
                 np.savez_compressed(
                     npz_acc_mds,
                     n=np.int64(n),
@@ -2934,8 +2940,9 @@ def main(argv: list[str] | None = None) -> None:
                     theta_bin_centers=np.asarray(centers, dtype=np.float64),
                     theta_flow_acc_mds_dim=np.int64(int(getattr(args, "theta_flow_acc_mds_dim", 5))),
                     theta_flow_acc_mds_mixed_prior_raw=np.int32(0),
+                    theta_field_method=np.asarray([str(tfm)], dtype=object),
                 )
-                csv_acc_mds = os.path.join(args.output_dir, f"h_theta_flow_acc_mds_n_{int(n):06d}.csv")
+                csv_acc_mds = os.path.join(args.output_dir, f"h_{acc_mds_tag}_acc_mds_n_{int(n):06d}.csv")
                 with open(csv_acc_mds, "w", encoding="utf-8", newline="") as fcsv:
                     w = csv.writer(fcsv)
                     w.writerow(["row_bin", "col_bin", "h_sqrt"])

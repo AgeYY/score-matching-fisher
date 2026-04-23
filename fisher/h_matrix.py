@@ -414,14 +414,12 @@ class HMatrixEstimator:
 
     def compute_x_conditional_loglik_matrix(self, theta_sorted: np.ndarray, x_sorted: np.ndarray) -> np.ndarray:
         """Estimate C_ij = log p(x_i | theta_j) via conditional x-flow ODE likelihood (one solver call per block)."""
-        theta_grid_col = self._theta_as_matrix(theta_sorted)
-        if theta_grid_col.shape[1] != 1:
-            raise ValueError("compute_x_conditional_loglik_matrix requires scalar theta (shape (N,1)).")
-        n = int(theta_grid_col.shape[0])
+        theta_grid = self._theta_as_matrix(theta_sorted)
+        n = int(theta_grid.shape[0])
         if n < 1:
             raise ValueError("Need at least one sample to compute H-matrix.")
         row_block = max(1, int(self.pair_batch_size // n))
-        theta_grid_col = np.asarray(theta_grid_col, dtype=np.float32)
+        theta_grid = np.asarray(theta_grid, dtype=np.float32)
         c = np.zeros((n, n), dtype=np.float64)
         self.model_post.eval()
         if self._flow_x_likelihood_solver is None:
@@ -431,7 +429,7 @@ class HMatrixEstimator:
             xb = np.asarray(x_sorted[i0:i1], dtype=np.float32)
             b = int(i1 - i0)
             x_rep = np.repeat(xb, repeats=n, axis=0)
-            theta_tile = np.tile(theta_grid_col, (b, 1))
+            theta_tile = np.tile(theta_grid, (b, 1))
             x_t = torch.from_numpy(x_rep).to(self.device)
             theta_t = torch.from_numpy(theta_tile).to(self.device)
             time_grid = torch.linspace(1.0, 0.0, self.flow_ode_steps + 1, device=x_t.device, dtype=x_t.dtype)

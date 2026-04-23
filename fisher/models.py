@@ -997,6 +997,7 @@ class ConditionalXFlowVelocity(nn.Module):
     def __init__(
         self,
         x_dim: int = 2,
+        theta_dim: int = 1,
         hidden_dim: int = 128,
         depth: int = 3,
         use_logit_time: bool = True,
@@ -1004,9 +1005,12 @@ class ConditionalXFlowVelocity(nn.Module):
         super().__init__()
         if x_dim < 1:
             raise ValueError("x_dim must be >= 1.")
+        if int(theta_dim) < 1:
+            raise ValueError("theta_dim must be >= 1.")
         self.x_dim = int(x_dim)
+        self.theta_dim = int(theta_dim)
         self.use_logit_time = bool(use_logit_time)
-        in_dim = x_dim + 1 + 1  # x_t, theta, t
+        in_dim = self.x_dim + self.theta_dim + 1  # x_t, theta, t
         layers: list[nn.Module] = []
         for _ in range(depth):
             layers.append(nn.Linear(in_dim, hidden_dim))
@@ -1016,6 +1020,14 @@ class ConditionalXFlowVelocity(nn.Module):
         self.net = nn.Sequential(*layers)
 
     def forward(self, x_t: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        if theta.ndim == 1:
+            if self.theta_dim != 1:
+                raise ValueError(f"theta is 1D but theta_dim={self.theta_dim}; expected shape (B,{self.theta_dim}).")
+            theta = theta.unsqueeze(-1)
+        if theta.ndim != 2 or theta.shape[-1] != self.theta_dim:
+            raise ValueError(
+                f"theta must be 2D with last dim theta_dim={self.theta_dim}; got shape {tuple(theta.shape)}"
+            )
         if t.ndim == 1:
             t = t.unsqueeze(-1)
         if self.use_logit_time:

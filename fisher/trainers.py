@@ -1022,10 +1022,21 @@ def train_conditional_x_flow_model(
             raise ValueError("two_stage_mean_theta_pretrain requires flow_epochs >= 2.")
         e1 = int(epochs) // 2
         e2 = int(epochs) - e1
-        mean_theta = float(np.mean(np.asarray(theta_train, dtype=np.float64).reshape(-1)))
+        theta_arr = np.asarray(theta_train, dtype=np.float64)
+        if theta_arr.ndim == 1:
+            theta_mean_pretrain: float | np.ndarray = float(np.mean(theta_arr))
+        elif theta_arr.ndim == 2:
+            theta_mean_pretrain = np.asarray(np.mean(theta_arr, axis=0), dtype=np.float64).reshape(-1)
+        else:
+            raise ValueError(f"theta_train must be 1D or 2D; got shape {theta_arr.shape}.")
+        theta_mean_msg = (
+            f"{float(theta_mean_pretrain):.6f}"
+            if np.isscalar(theta_mean_pretrain)
+            else np.array2string(np.asarray(theta_mean_pretrain), precision=6, separator=", ")
+        )
         print(
             f"[x_flow] two_stage_mean_theta_pretrain=True stage1_epochs={e1} stage2_epochs={e2} "
-            f"theta_mean={mean_theta:.6f}"
+            f"theta_mean={theta_mean_msg}"
         )
         out1 = _train_conditional_x_flow_phase(
             model=model,
@@ -1043,7 +1054,7 @@ def train_conditional_x_flow_model(
             early_stopping_ema_alpha=early_stopping_ema_alpha,
             restore_best=restore_best,
             scheduler_name=scheduler_name,
-            fixed_theta=float(mean_theta),
+            fixed_theta=theta_mean_pretrain,
             phase_label="stage1_mean_theta",
             epoch_base=0,
             total_epochs_label=int(epochs),
@@ -1085,7 +1096,7 @@ def train_conditional_x_flow_model(
             "flow_x_two_stage": True,
             "stage1_epochs": int(e1),
             "stage2_epochs": int(e2),
-            "theta_mean_pretrain": float(mean_theta),
+            "theta_mean_pretrain": np.asarray(theta_mean_pretrain, dtype=np.float64),
             "stage1_best_epoch_local": int(out1["best_epoch"]),
             "stage2_best_epoch_local": int(out2["best_epoch"]),
             "stage_boundary_epoch": int(actual_e1),
@@ -1136,7 +1147,7 @@ def _train_conditional_x_flow_phase(
     early_stopping_ema_alpha: float,
     restore_best: bool,
     scheduler_name: str,
-    fixed_theta: float | None,
+    fixed_theta: float | np.ndarray | None,
     phase_label: str,
     epoch_base: int,
     total_epochs_label: int,
@@ -1173,7 +1184,19 @@ def _train_conditional_x_flow_phase(
             tb = tb.to(device, non_blocking=True)
             xb = xb.to(device, non_blocking=True)
             if fixed_theta is not None:
-                tb = torch.full_like(tb, float(fixed_theta))
+                if np.isscalar(fixed_theta):
+                    tb = torch.full_like(tb, float(fixed_theta))
+                else:
+                    fixed_vec = np.asarray(fixed_theta, dtype=np.float32).reshape(-1)
+                    if tb.ndim != 2:
+                        raise ValueError(f"Expected batched 2D theta tensor; got shape {tuple(tb.shape)}")
+                    if fixed_vec.shape[0] != tb.shape[1]:
+                        raise ValueError(
+                            "fixed_theta dimension mismatch: "
+                            f"fixed_dim={fixed_vec.shape[0]} theta_batch_dim={tb.shape[1]}"
+                        )
+                    fixed_t = torch.from_numpy(fixed_vec).to(device=tb.device, dtype=tb.dtype).unsqueeze(0)
+                    tb = fixed_t.expand(tb.shape[0], -1)
             x0 = torch.randn_like(xb)
             t = torch.rand(xb.shape[0], device=xb.device)
             path_sample = path.sample(t=t, x_0=x0, x_1=xb)
@@ -1195,7 +1218,19 @@ def _train_conditional_x_flow_phase(
                     tb = tb.to(device, non_blocking=True)
                     xb = xb.to(device, non_blocking=True)
                     if fixed_theta is not None:
-                        tb = torch.full_like(tb, float(fixed_theta))
+                        if np.isscalar(fixed_theta):
+                            tb = torch.full_like(tb, float(fixed_theta))
+                        else:
+                            fixed_vec = np.asarray(fixed_theta, dtype=np.float32).reshape(-1)
+                            if tb.ndim != 2:
+                                raise ValueError(f"Expected batched 2D theta tensor; got shape {tuple(tb.shape)}")
+                            if fixed_vec.shape[0] != tb.shape[1]:
+                                raise ValueError(
+                                    "fixed_theta dimension mismatch: "
+                                    f"fixed_dim={fixed_vec.shape[0]} theta_batch_dim={tb.shape[1]}"
+                                )
+                            fixed_t = torch.from_numpy(fixed_vec).to(device=tb.device, dtype=tb.dtype).unsqueeze(0)
+                            tb = fixed_t.expand(tb.shape[0], -1)
                     x0 = torch.randn_like(xb)
                     t = torch.rand(xb.shape[0], device=xb.device)
                     path_sample = path.sample(t=t, x_0=x0, x_1=xb)

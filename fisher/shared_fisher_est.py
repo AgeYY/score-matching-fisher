@@ -1570,11 +1570,13 @@ def build_conditional_x_velocity_model(
     flow_arch: str,
     args: Any,
     device: torch.device,
+    theta_dim: int = 1,
 ) -> torch.nn.Module:
     arch = str(flow_arch).strip().lower()
     if arch == "mlp":
         return ConditionalXFlowVelocity(
             x_dim=int(args.x_dim),
+            theta_dim=int(theta_dim),
             hidden_dim=int(getattr(args, "flow_hidden_dim", 128)),
             depth=int(getattr(args, "flow_depth", 3)),
             use_logit_time=True,
@@ -1841,7 +1843,13 @@ def run_shared_fisher_estimation(
         if not bool(getattr(args, "compute_h_matrix", False)):
             raise RuntimeError(f"{theta_field_method} requires --compute-h-matrix to produce output artifacts.")
         theta_std = float(np.std(theta_score_fit))
+        theta_dim_x_flow = int(theta_score_fit.shape[1]) if theta_score_fit.ndim >= 2 else 1
         flow_score_arch = str(flow_arch).strip().lower()
+        if theta_dim_x_flow != 1 and flow_score_arch != "mlp":
+            raise ValueError(
+                "x_flow with multidimensional theta embedding currently supports --flow-arch mlp only "
+                f"(got flow_arch={flow_score_arch!r}, theta_dim={theta_dim_x_flow})."
+            )
         _xf_extra = ""
         if flow_score_arch == "film":
             _xf_extra = (
@@ -1868,7 +1876,7 @@ def run_shared_fisher_estimation(
             f"[{theta_field_method}] "
             f"fit={theta_score_fit.shape[0]} val={theta_score_val.shape[0]} "
             f"scheduler={getattr(args, 'flow_scheduler', 'cosine')} method={theta_field_method} "
-            f"x_dim={int(args.x_dim)} theta_std={theta_std:.6f}"
+            f"x_dim={int(args.x_dim)} theta_std={theta_std:.6f} theta_dim={theta_dim_x_flow}"
             f" two_stage_mean_theta_pretrain={_xf_twostage}"
             + (
                 f" (stage1_epochs={_e1} stage2_epochs={_e2})"
@@ -1881,6 +1889,7 @@ def run_shared_fisher_estimation(
             flow_arch=flow_score_arch,
             args=args,
             device=device,
+            theta_dim=theta_dim_x_flow,
         )
         post_train_out = train_conditional_x_flow_model(
             model=x_flow_model,
@@ -1901,9 +1910,15 @@ def run_shared_fisher_estimation(
             two_stage_mean_theta_pretrain=_xf_twostage,
         )
         if theta_field_method == "x_flow" and post_train_out.get("flow_x_two_stage"):
+            theta_mean_pre = np.asarray(post_train_out["theta_mean_pretrain"], dtype=np.float64).reshape(-1)
+            theta_mean_pre_str = (
+                f"{float(theta_mean_pre[0]):.6f}"
+                if theta_mean_pre.size == 1
+                else np.array2string(theta_mean_pre, precision=4, separator=", ")
+            )
             print(
                 "[x_flow] two-stage training finished: "
-                f"theta_mean_pretrain={float(post_train_out['theta_mean_pretrain']):.6f} "
+                f"theta_mean_pretrain={theta_mean_pre_str} "
                 f"stage_boundary_epoch={int(post_train_out['stage_boundary_epoch'])} "
                 f"best_epoch={int(post_train_out['best_epoch'])} "
                 f"best_val_smooth={float(post_train_out['best_val_loss']):.6f}"
