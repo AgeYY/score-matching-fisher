@@ -343,10 +343,15 @@ def hellinger_figure_labels(h_field_method: str) -> tuple[str, str, str]:
 
 def theta_for_h_matrix_alignment(bundle: SharedDatasetBundle, full_args: SimpleNamespace) -> np.ndarray:
     mode = str(getattr(full_args, "score_fisher_eval_data", "full"))
+    def _theta_out(arr: np.ndarray) -> np.ndarray:
+        t = np.asarray(arr, dtype=np.float64)
+        if t.ndim == 2 and int(t.shape[1]) == 1:
+            return t.reshape(-1)
+        return t
     if mode == "full":
-        return np.asarray(bundle.theta_all, dtype=np.float64).reshape(-1)
+        return _theta_out(bundle.theta_all)
     if mode == "score_eval":
-        return np.asarray(bundle.theta_eval, dtype=np.float64).reshape(-1)
+        return _theta_out(bundle.theta_eval)
     raise ValueError(f"Unknown score_fisher_eval_data: {mode}")
 
 
@@ -638,7 +643,11 @@ def load_h_matrix(ctx: RunContext) -> LoadedHMatrix:
 
     h_npz = np.load(h_path, allow_pickle=True)
     h_sym = np.asarray(h_npz["h_sym"], dtype=np.float64)
-    theta_used = np.asarray(h_npz["theta_used"], dtype=np.float64).reshape(-1)
+    theta_used_arr = np.asarray(h_npz["theta_used"], dtype=np.float64)
+    if theta_used_arr.ndim == 2 and int(theta_used_arr.shape[1]) == 1:
+        theta_used = theta_used_arr.reshape(-1)
+    else:
+        theta_used = theta_used_arr
     h_field_method = str(h_npz["h_field_method"][0]) if "h_field_method" in h_npz.files else "dsm"
     h_eval_scalar_name = (
         str(h_npz["h_eval_scalar_name"][0]) if "h_eval_scalar_name" in h_npz.files else "sigma_eval"

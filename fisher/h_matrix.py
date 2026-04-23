@@ -346,17 +346,31 @@ class HMatrixEstimator:
                 g[i0:i1, :] = (f_post - f_prior).astype(np.float64)
         return g
 
-    def compute_log_ratio_matrix(self, theta_sorted: np.ndarray, x_sorted: np.ndarray) -> np.ndarray:
+    def compute_log_ratio_matrix(
+        self,
+        theta_sorted: np.ndarray,
+        x_sorted: np.ndarray,
+        *,
+        theta_prior_sorted: np.ndarray | None = None,
+    ) -> np.ndarray:
         """Directly estimate per-pair log-likelihood ratio matrix via flow ODE likelihoods.
 
         r[i,j] = log p(theta_j | x_i) - log p(theta_j).
         """
-        theta_grid_col = self._theta_as_matrix(theta_sorted)
-        n = int(theta_grid_col.shape[0])
+        theta_post_grid_col = self._theta_as_matrix(theta_sorted)
+        theta_prior_grid_col = (
+            self._theta_as_matrix(theta_prior_sorted)
+            if theta_prior_sorted is not None
+            else theta_post_grid_col
+        )
+        n = int(theta_post_grid_col.shape[0])
+        if int(theta_prior_grid_col.shape[0]) != n:
+            raise ValueError("theta_prior_sorted must have same number of rows as theta_sorted.")
         if n < 1:
             raise ValueError("Need at least one sample to compute H-matrix.")
         row_block = max(1, int(self.pair_batch_size // n))
-        theta_grid_col = np.asarray(theta_grid_col, dtype=np.float32)
+        theta_post_grid_col = np.asarray(theta_post_grid_col, dtype=np.float32)
+        theta_prior_grid_col = np.asarray(theta_prior_grid_col, dtype=np.float32)
         r = np.zeros((n, n), dtype=np.float64)
         self.model_post.eval()
         if self.model_prior is not None:
@@ -367,13 +381,17 @@ class HMatrixEstimator:
             i1 = min(n, i0 + row_block)
             xb = np.asarray(x_sorted[i0:i1], dtype=np.float32)
             b = int(i1 - i0)
-            theta_tile = np.tile(theta_grid_col, (b, 1))
+            theta_post_tile = np.tile(theta_post_grid_col, (b, 1))
+            theta_prior_tile = np.tile(theta_prior_grid_col, (b, 1))
             x_rep = np.repeat(xb, repeats=n, axis=0)
-            theta_t = torch.from_numpy(theta_tile).to(self.device)
+            theta_post_t = torch.from_numpy(theta_post_tile).to(self.device)
+            theta_prior_t = torch.from_numpy(theta_prior_tile).to(self.device)
             x_t = torch.from_numpy(x_rep).to(self.device)
-            time_grid = torch.linspace(1.0, 0.0, self.flow_ode_steps + 1, device=theta_t.device, dtype=theta_t.dtype)
+            time_grid = torch.linspace(
+                1.0, 0.0, self.flow_ode_steps + 1, device=theta_post_t.device, dtype=theta_post_t.dtype
+            )
             _, log_post = self._flow_likelihood_solver_post.compute_likelihood(
-                x_1=theta_t,
+                x_1=theta_post_t,
                 log_p0=self._standard_normal_log_prob,
                 step_size=None,
                 method=self.flow_likelihood_method,
@@ -383,7 +401,7 @@ class HMatrixEstimator:
                 x_cond=x_t,
             )
             _, log_prior = self._flow_likelihood_solver_prior.compute_likelihood(
-                x_1=theta_t,
+                x_1=theta_prior_t,
                 log_p0=self._standard_normal_log_prob,
                 step_size=None,
                 method=self.flow_likelihood_method,
@@ -505,14 +523,27 @@ class HMatrixEstimator:
     def _permute_back(mat_sorted: np.ndarray, inv_perm: np.ndarray) -> np.ndarray:
         return mat_sorted[np.ix_(inv_perm, inv_perm)]
 
-    def run(self, theta: np.ndarray, x: np.ndarray, *, restore_original_order: bool = False) -> HMatrixResult:
+    def run(
+        self,
+        theta: np.ndarray,
+        x: np.ndarray,
+        *,
+        theta_prior: np.ndarray | None = None,
+        restore_original_order: bool = False,
+    ) -> HMatrixResult:
         theta_col = self._theta_as_matrix(theta)
         theta_sorted, x_sorted, perm, inv_perm = self.sort_by_theta(theta_col, x)
+        theta_prior_sorted = None
+        if theta_prior is not None:
+            theta_prior_col = self._theta_as_matrix(theta_prior)
+            if int(theta_prior_col.shape[0]) != int(theta_col.shape[0]):
+                raise ValueError("theta_prior must have same number of rows as theta.")
+            theta_prior_sorted = np.asarray(theta_prior_col[perm], dtype=np.float64)
         if theta_sorted.shape[1] == 1 and np.any(np.diff(theta_sorted[:, 0]) < 0.0):
             raise ValueError("sort_by_theta produced a non-monotone theta sequence.")
 
         if self.field_method == "theta_flow":
-            c_sorted = self.compute_log_ratio_matrix(theta_sorted, x_sorted)
+            c_sorted = self.compute_log_ratio_matrix(theta_sorted, x_sorted, theta_prior_sorted=theta_prior_sorted)
             delta_sorted = self.compute_delta_l(c_sorted)
             g_sorted = np.zeros_like(c_sorted, dtype=np.float64)
         elif self.field_method == "flow_x_likelihood":

@@ -101,6 +101,7 @@ from fisher.nf_hellinger import (
     train_prior_nf,
 )
 from fisher.evaluation import log_p_x_given_theta
+from fisher.score_distance import classical_mds_from_distances
 from fisher.shared_dataset_io import SharedDatasetBundle, load_shared_dataset_npz
 from fisher.shared_fisher_est import (
     build_dataset_from_meta,
@@ -404,6 +405,20 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--theta-flow-acc-mds-state",
+        action="store_true",
+        help=(
+            "theta_flow only: build per-n theta state by pairwise decoding accuracy -> clipped H lower bound "
+            "-> classical MDS embedding; then train theta-flow on embedded theta."
+        ),
+    )
+    p.add_argument(
+        "--theta-flow-acc-mds-dim",
+        type=int,
+        default=5,
+        help="Embedding dimension for --theta-flow-acc-mds-state (default: 5).",
+    )
+    p.add_argument(
         "--clf-min-class-count",
         type=int,
         default=5,
@@ -605,8 +620,14 @@ def _validate_cli(args: argparse.Namespace) -> None:
     use_onehot = bool(getattr(args, "theta_flow_onehot_state", False))
     use_fourier = bool(getattr(args, "theta_flow_fourier_state", False))
     use_segmented = bool(getattr(args, "theta_flow_segmented", False))
+    use_acc_mds = bool(getattr(args, "theta_flow_acc_mds_state", False))
     if use_onehot and use_fourier:
         raise ValueError("Use only one theta-flow state override: one-hot or Fourier, not both.")
+    if use_acc_mds and (use_onehot or use_fourier or use_segmented):
+        raise ValueError(
+            "--theta-flow-acc-mds-state is exclusive with --theta-flow-onehot-state, "
+            "--theta-flow-fourier-state, and --theta-flow-segmented."
+        )
     if use_segmented and use_onehot:
         raise ValueError("Use only one theta-flow mode: segmented or one-hot, not both.")
     if use_segmented and use_fourier:
@@ -649,6 +670,21 @@ def _validate_cli(args: argparse.Namespace) -> None:
                 "--theta-flow-segmented requires --theta-field-method theta_flow "
                 f"(got {getattr(args, 'theta_field_method', None)!r})."
             )
+    if use_acc_mds:
+        tfm = str(getattr(args, "theta_field_method", "theta_flow")).strip().lower()
+        arch = str(getattr(args, "flow_arch", "mlp")).strip().lower()
+        if tfm != "theta_flow":
+            raise ValueError(
+                "--theta-flow-acc-mds-state requires --theta-field-method theta_flow "
+                f"(got {getattr(args, 'theta_field_method', None)!r})."
+            )
+        if arch != "mlp":
+            raise ValueError(
+                "--theta-flow-acc-mds-state currently supports --flow-arch mlp only "
+                f"(got {getattr(args, 'flow_arch', None)!r})."
+            )
+        if int(getattr(args, "theta_flow_acc_mds_dim", 0)) < 1:
+            raise ValueError("--theta-flow-acc-mds-dim must be >= 1.")
     _parse_n_list(args.n_list)  # syntax check only; pool size checked in main
 
 
@@ -682,6 +718,65 @@ def _build_theta_fourier_state(
         cols.append(np.cos(phase).reshape(-1, 1))
     out = np.concatenate(cols, axis=1).astype(np.float64, copy=False)
     return out, ref_range, period, theta_center
+
+
+def _accuracy_to_h_lb_clipped(acc: np.ndarray) -> np.ndarray:
+    a = np.asarray(acc, dtype=np.float64)
+    h = np.full_like(a, np.nan, dtype=np.float64)
+    finite = np.isfinite(a)
+    a_clip = np.clip(a[finite], 0.5, 1.0)
+    h[finite] = np.sqrt(np.clip(2.0 * a_clip - 1.0, 0.0, 1.0))
+    if h.ndim == 2 and h.shape[0] == h.shape[1]:
+        np.fill_diagonal(h, 0.0)
+    return h
+
+
+def _theta_mds_embedding_from_accuracy(
+    acc: np.ndarray,
+    *,
+    emb_dim: int,
+) -> np.ndarray:
+    h_dist = _accuracy_to_h_lb_clipped(acc)
+    h_dist = np.asarray(0.5 * (h_dist + h_dist.T), dtype=np.float64)
+    np.fill_diagonal(h_dist, 0.0)
+    out = classical_mds_from_distances(h_dist, n_components=int(emb_dim))
+    emb = np.asarray(out.embedding, dtype=np.float64)
+    if emb.ndim != 2 or emb.shape[0] != h_dist.shape[0] or emb.shape[1] != int(emb_dim):
+        raise ValueError(
+            f"MDS embedding shape mismatch: got {emb.shape}, expected ({h_dist.shape[0]}, {int(emb_dim)})."
+        )
+    return emb
+
+
+def _write_acc_mds_h_matrix_figure(
+    *,
+    out_dir: str,
+    n: int,
+    h_sqrt: np.ndarray,
+    h_gt_sqrt: np.ndarray,
+    corr_h: float,
+) -> tuple[str, str]:
+    os.makedirs(out_dir, exist_ok=True)
+    fig, axes = plt.subplots(1, 2, figsize=(8.8, 3.9), constrained_layout=True)
+    vmax = float(np.nanmax(np.asarray([h_sqrt, h_gt_sqrt], dtype=np.float64)))
+    if (not np.isfinite(vmax)) or vmax <= 0.0:
+        vmax = 1.0
+    im0 = axes[0].imshow(h_sqrt, origin="lower", vmin=0.0, vmax=vmax, cmap="viridis", interpolation="nearest")
+    axes[0].set_title(rf"Acc-MDS theta-flow $\sqrt{{H^2}}$ (n={int(n)})", fontsize=10)
+    axes[0].set_xlabel(r"$\theta$ bin")
+    axes[0].set_ylabel(r"$\theta$ bin")
+    fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.03)
+    im1 = axes[1].imshow(h_gt_sqrt, origin="lower", vmin=0.0, vmax=vmax, cmap="viridis", interpolation="nearest")
+    axes[1].set_title(rf"GT MC $\sqrt{{H^2}}$ (r={float(corr_h):.4f})", fontsize=10)
+    axes[1].set_xlabel(r"$\theta$ bin")
+    axes[1].set_ylabel(r"$\theta$ bin")
+    fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.03)
+    png = os.path.join(out_dir, f"h_theta_flow_acc_mds_n_{int(n):06d}.png")
+    svg = str(Path(png).with_suffix(".svg"))
+    fig.savefig(png, dpi=220)
+    fig.savefig(svg)
+    plt.close(fig)
+    return png, svg
 
 
 class SweepSubset(NamedTuple):
@@ -2525,6 +2620,7 @@ def main(argv: list[str] | None = None) -> None:
     edges, edge_lo, edge_hi = vhb.theta_bin_edges(theta_ref, n_bins)
     bin_idx_all = vhb.theta_to_bin_index(theta_scalar_all, edges, n_bins)
     theta_state_all: np.ndarray | None = None
+    use_acc_mds_state = bool(getattr(args, "theta_flow_acc_mds_state", False))
     if bool(getattr(args, "theta_flow_onehot_state", False)):
         theta_state_all = np.eye(n_bins, dtype=np.float64)[bin_idx_all]
         print(
@@ -2545,6 +2641,12 @@ def main(argv: list[str] | None = None) -> None:
             f"period={theta_fourier_period:.6g} "
             f"(mult={float(args.theta_flow_fourier_period_mult):.3g}, ref_range={theta_fourier_ref_range:.6g}, "
             f"center={theta_fourier_center:.6g}, include_linear={bool(args.theta_flow_fourier_include_linear)})",
+            flush=True,
+        )
+    elif use_acc_mds_state:
+        print(
+            "[convergence] theta_flow acc-MDS state enabled: per-n pairwise accuracy -> "
+            "clipped H lower bound -> classical MDS embedding.",
             flush=True,
         )
 
@@ -2706,6 +2808,7 @@ def main(argv: list[str] | None = None) -> None:
     h_sweep: list[np.ndarray] = []
     clf_sweep: list[np.ndarray] = []
     llr_sweep: list[np.ndarray] = []
+    h_acc_mds_corr: list[float] = []
     per_n_loss_rows: list[dict[str, str]] = []
     ds_fam = str(meta.get("dataset_family", "cosine_gaussian"))
 
@@ -2729,7 +2832,7 @@ def main(argv: list[str] | None = None) -> None:
 
         try:
             t1 = time.time()
-            subset_n = _subset_bundle(
+            subset_n_raw = _subset_bundle(
                 bundle,
                 perm,
                 int(n),
@@ -2737,6 +2840,42 @@ def main(argv: list[str] | None = None) -> None:
                 bin_idx_all=bin_idx_all,
                 theta_state_all=theta_state_all,
             )
+            subset_n = subset_n_raw
+            if use_acc_mds_state:
+                clf_for_embed = _pairwise_clf_from_bundle(
+                    args=args,
+                    meta=meta,
+                    subset=subset_n_raw,
+                    output_dir=run_dir,
+                    n_bins=n_bins,
+                    clf_min_class_count=int(args.clf_min_class_count),
+                    clf_random_state=clf_rs,
+                )
+                emb_bins = _theta_mds_embedding_from_accuracy(
+                    clf_for_embed,
+                    emb_dim=int(getattr(args, "theta_flow_acc_mds_dim", 5)),
+                )
+                theta_state_embed_all = np.asarray(emb_bins[subset_n_raw.bin_all], dtype=np.float64)
+                n_train_sub = int(subset_n_raw.bundle.theta_train.shape[0])
+                theta_state_embed_train = theta_state_embed_all[:n_train_sub]
+                theta_state_embed_val = theta_state_embed_all[n_train_sub:]
+                subset_n = SweepSubset(
+                    bundle=SharedDatasetBundle(
+                        meta=subset_n_raw.bundle.meta,
+                        theta_all=theta_state_embed_all,
+                        x_all=subset_n_raw.bundle.x_all,
+                        train_idx=subset_n_raw.bundle.train_idx,
+                        validation_idx=subset_n_raw.bundle.validation_idx,
+                        theta_train=theta_state_embed_train,
+                        x_train=subset_n_raw.bundle.x_train,
+                        theta_validation=theta_state_embed_val,
+                        x_validation=subset_n_raw.bundle.x_validation,
+                    ),
+                    bin_all=subset_n_raw.bin_all,
+                    bin_train=subset_n_raw.bin_train,
+                    bin_validation=subset_n_raw.bin_validation,
+                )
+
             loaded_n, x_aligned, _ = _estimate_one(
                 args=args,
                 meta=meta,
@@ -2771,10 +2910,45 @@ def main(argv: list[str] | None = None) -> None:
             wall_s[k] = time.time() - t1
             h_sweep.append(np.asarray(h_n_sqrt, dtype=np.float64))
             clf_sweep.append(np.asarray(clf_n, dtype=np.float64))
+            h_acc_mds_corr.append(float(corr_h[k]))
             delta_l_in = _load_delta_l_from_run_dir(run_dir, dataset_family=ds_fam)
             llr_n = _metrics_delta_l_binned(delta_l_in, subset_n, n_bins)
             llr_sweep.append(np.asarray(llr_n, dtype=np.float64))
             corr_llr[k] = vhb.matrix_corr_offdiag_pearson(llr_n, np.asarray(llr_gt_mc, dtype=np.float64))
+            if use_acc_mds_state:
+                fig_png, fig_svg = _write_acc_mds_h_matrix_figure(
+                    out_dir=args.output_dir,
+                    n=int(n),
+                    h_sqrt=np.asarray(h_n_sqrt, dtype=np.float64),
+                    h_gt_sqrt=np.asarray(h_gt_sqrt, dtype=np.float64),
+                    corr_h=float(corr_h[k]),
+                )
+                npz_acc_mds = os.path.join(args.output_dir, f"h_theta_flow_acc_mds_n_{int(n):06d}.npz")
+                np.savez_compressed(
+                    npz_acc_mds,
+                    n=np.int64(n),
+                    h_sqrt=np.asarray(h_n_sqrt, dtype=np.float64),
+                    h_gt_sqrt=np.asarray(h_gt_sqrt, dtype=np.float64),
+                    corr_h_vs_gt=np.float64(corr_h[k]),
+                    theta_bin_edges=np.asarray(edges, dtype=np.float64),
+                    theta_bin_centers=np.asarray(centers, dtype=np.float64),
+                    theta_flow_acc_mds_dim=np.int64(int(getattr(args, "theta_flow_acc_mds_dim", 5))),
+                    theta_flow_acc_mds_mixed_prior_raw=np.int32(0),
+                )
+                csv_acc_mds = os.path.join(args.output_dir, f"h_theta_flow_acc_mds_n_{int(n):06d}.csv")
+                with open(csv_acc_mds, "w", encoding="utf-8", newline="") as fcsv:
+                    w = csv.writer(fcsv)
+                    w.writerow(["row_bin", "col_bin", "h_sqrt"])
+                    hs = np.asarray(h_n_sqrt, dtype=np.float64)
+                    for ii in range(hs.shape[0]):
+                        for jj in range(hs.shape[1]):
+                            w.writerow([int(ii), int(jj), float(hs[ii, jj])])
+                    w.writerow([])
+                    w.writerow(["corr_h_vs_gt_offdiag_pearson", float(corr_h[k])])
+                print(
+                    f"[convergence] acc-MDS final H matrix artifacts n={n}: {fig_png}, {fig_svg}, {csv_acc_mds}, {npz_acc_mds}",
+                    flush=True,
+                )
             print(
                 f"[convergence] n={n}  corr_h={corr_h[k]:.4f}  corr_clf={corr_clf[k]:.4f}  "
                 f"corr_llr={corr_llr[k]:.4f}  wall={wall_s[k]:.1f}s",
@@ -2843,6 +3017,11 @@ def main(argv: list[str] | None = None) -> None:
         out_npz,
         n=np.asarray(ns, dtype=np.int64),
         corr_h_binned_vs_gt_mc=corr_h,
+        corr_h_acc_mds_vs_gt_mc=(
+            np.asarray(h_acc_mds_corr, dtype=np.float64)
+            if use_acc_mds_state
+            else np.asarray([], dtype=np.float64)
+        ),
         corr_clf_vs_ref=corr_clf,
         wall_seconds=wall_s,
         n_ref=np.int64(args.n_ref),

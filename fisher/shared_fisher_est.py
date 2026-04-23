@@ -1633,6 +1633,9 @@ def run_shared_fisher_estimation(
     x_score_fit = np.asarray(x_train, dtype=np.float64)
     theta_score_val = np.asarray(theta_validation, dtype=np.float64)
     x_score_val = np.asarray(x_validation, dtype=np.float64)
+    theta_prior_fit_override = getattr(args, "theta_flow_prior_theta_train_override", None)
+    theta_prior_val_override = getattr(args, "theta_flow_prior_theta_validation_override", None)
+    theta_prior_all_override = getattr(args, "theta_flow_prior_theta_all_override", None)
     if theta_score_fit.shape[0] < 1 or theta_score_val.shape[0] < 1:
         raise ValueError(
             "Shared Fisher estimation requires non-empty train and validation splits. "
@@ -2049,8 +2052,35 @@ def run_shared_fisher_estimation(
             raise ValueError("--flow-eval-t must be in [0, 1].")
         theta_std = float(np.std(theta_score_fit))
         theta_dim_flow = int(theta_score_fit.shape[1]) if theta_score_fit.ndim >= 2 else 1
+        theta_prior_fit = (
+            np.asarray(theta_prior_fit_override, dtype=np.float64)
+            if theta_prior_fit_override is not None
+            else theta_score_fit
+        )
+        theta_prior_val = (
+            np.asarray(theta_prior_val_override, dtype=np.float64)
+            if theta_prior_val_override is not None
+            else theta_score_val
+        )
+        theta_prior_all = (
+            np.asarray(theta_prior_all_override, dtype=np.float64)
+            if theta_prior_all_override is not None
+            else np.asarray(theta_all, dtype=np.float64)
+        )
+        if theta_prior_fit.shape[0] != theta_score_fit.shape[0]:
+            raise ValueError("theta_flow prior override train rows must match posterior train rows.")
+        if theta_prior_val.shape[0] != theta_score_val.shape[0]:
+            raise ValueError("theta_flow prior override validation rows must match posterior validation rows.")
+        if theta_prior_all.shape[0] != np.asarray(theta_all).shape[0]:
+            raise ValueError("theta_flow prior override all rows must match theta_all rows.")
+        theta_dim_prior_flow = int(theta_prior_fit.shape[1]) if theta_prior_fit.ndim >= 2 else 1
         flow_score_arch = str(flow_arch).strip().lower()
         flow_prior_arch = "mlp" if flow_score_arch == "soft_moe" else str(flow_arch).strip().lower()
+        if theta_dim_prior_flow != 1 and flow_prior_arch != "mlp":
+            raise ValueError(
+                "theta_flow prior override with non-scalar theta currently supports prior flow_arch=mlp only "
+                f"(got prior={flow_prior_arch!r}, theta_dim_prior={theta_dim_prior_flow})."
+            )
         theta_onehot_state = bool(getattr(args, "theta_flow_onehot_state", False))
         if theta_onehot_state:
             if theta_field_method != "theta_flow":
@@ -2071,7 +2101,8 @@ def run_shared_fisher_estimation(
             f"fit={theta_score_fit.shape[0]} val={theta_score_val.shape[0]} "
             f"scheduler={getattr(args, 'flow_scheduler', 'cosine')} method={theta_field_method} "
             f"t_eval={flow_eval_t:.6f} "
-            f"theta_std={theta_std:.6f} theta_dim={theta_dim_flow} theta_repr={theta_repr}"
+            f"theta_std={theta_std:.6f} theta_dim={theta_dim_flow} theta_repr={theta_repr} "
+            f"prior_theta_dim={theta_dim_prior_flow}"
         )
         _xf_post = ""
         if flow_score_arch == "film":
@@ -2284,13 +2315,13 @@ def run_shared_fisher_estimation(
                 "hidden_dim": int(getattr(args, "prior_hidden_dim", 128)),
                 "depth": int(getattr(args, "prior_depth", 3)),
                 "use_logit_time": True,
-                "theta_dim": int(theta_dim_flow),
+                "theta_dim": int(theta_dim_prior_flow),
             }
             prior_model_flow = PriorThetaFlowVelocity(
                 hidden_dim=int(getattr(args, "prior_hidden_dim", 128)),
                 depth=int(getattr(args, "prior_depth", 3)),
                 use_logit_time=True,
-                theta_dim=theta_dim_flow,
+                theta_dim=theta_dim_prior_flow,
             ).to(device)
         elif flow_prior_arch == "film":
             prior_ckpt_hparams = {
@@ -2345,13 +2376,13 @@ def run_shared_fisher_estimation(
             raise ValueError("--flow-arch must be one of {'mlp','film','film_fourier'}.")
         prior_train_out = train_prior_theta_flow_model(
             model=prior_model_flow,
-            theta_train=theta_score_fit,
+            theta_train=theta_prior_fit,
             epochs=int(getattr(args, "prior_epochs", 10000)),
             batch_size=int(getattr(args, "prior_batch_size", 256)),
             lr=float(getattr(args, "prior_lr", 1e-3)),
             device=device,
             log_every=max(1, args.log_every),
-            theta_val=theta_score_val,
+            theta_val=theta_prior_val,
             early_stopping_patience=int(getattr(args, "prior_early_patience", 1000)),
             early_stopping_min_delta=float(getattr(args, "prior_early_min_delta", 1e-4)),
             early_stopping_ema_alpha=float(getattr(args, "prior_early_ema_alpha", 0.05)),
@@ -2420,7 +2451,7 @@ def run_shared_fisher_estimation(
             theta_field_method=theta_field_method,
             flow_arch=flow_prior_arch,
             flow_scheduler=str(getattr(args, "flow_scheduler", "cosine")),
-            theta_dim_flow=theta_dim_flow,
+            theta_dim_flow=theta_dim_prior_flow,
             model_hparams=prior_ckpt_hparams,
             args=args,
         )
@@ -2455,6 +2486,7 @@ def run_shared_fisher_estimation(
             h_result = h_estimator.run(
                 theta=theta_h_matrix,
                 x=x_h_matrix,
+                theta_prior=theta_prior_all,
                 restore_original_order=bool(getattr(args, "h_restore_original_order", False)),
             )
 
