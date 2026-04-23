@@ -93,3 +93,35 @@ def test_train_theta_flow_endpoint_loss_enabled_tracks_component_losses() -> Non
     assert len(out["val_endpoint_losses"]) == 2
     assert np.all(np.isfinite(np.asarray(out["val_losses"], dtype=np.float64)))
     assert np.all(np.isfinite(np.asarray(out["val_endpoint_losses"], dtype=np.float64)))
+
+
+def test_train_theta_flow_progressive_x_unmask_tracks_stage_metadata() -> None:
+    torch.manual_seed(0)
+    rng = np.random.default_rng(7)
+    theta = rng.standard_normal((30, 1)).astype(np.float32)
+    x = rng.standard_normal((30, 3)).astype(np.float32)
+    theta_tr, x_tr = theta[:24], x[:24]
+    theta_va, x_va = theta[24:], x[24:]
+    model = ConditionalThetaFlowVelocity(x_dim=3, hidden_dim=16, depth=2).to(torch.device("cpu"))
+    out = train_conditional_theta_flow_model(
+        model=model,
+        theta_train=theta_tr,
+        x_train=x_tr,
+        epochs=2,
+        batch_size=6,
+        lr=1e-3,
+        device=torch.device("cpu"),
+        log_every=99,
+        theta_val=theta_va,
+        x_val=x_va,
+        early_stopping_patience=100,
+        endpoint_loss_weight=0.0,
+        endpoint_ode_steps=3,
+        progressive_x_unmask=True,
+    )
+    assert bool(out["theta_flow_progressive_x_unmask"])
+    assert int(out["progressive_stage_count"]) == 3
+    assert list(out["progressive_stage_unmasked_dims"]) == [1, 2, 3]
+    assert list(out["progressive_stage_boundary_epochs"]) == [2, 4, 6]
+    assert len(out["train_losses"]) == 6
+    assert len(out["val_losses"]) == 6

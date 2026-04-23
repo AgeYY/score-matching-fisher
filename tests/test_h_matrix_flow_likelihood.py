@@ -83,6 +83,20 @@ class TestHMatrixFlowLikelihood(unittest.TestCase):
         args = parser.parse_args(["--theta-field-method", "theta_flow", "--flow-arch", "mlp"])
         validate_estimation_args(args)
 
+    def test_validate_accepts_theta_flow_progressive_x_unmask(self) -> None:
+        parser = argparse.ArgumentParser()
+        add_estimation_arguments(parser)
+        args = parser.parse_args(
+            [
+                "--theta-field-method",
+                "theta_flow",
+                "--flow-arch",
+                "mlp",
+                "--theta-flow-progressive-x-unmask",
+            ]
+        )
+        validate_estimation_args(args)
+
     def test_validate_estimation_args_accepts_theta_path_integral(self) -> None:
         parser = argparse.ArgumentParser()
         add_estimation_arguments(parser)

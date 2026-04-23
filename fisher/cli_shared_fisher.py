@@ -304,6 +304,16 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         ),
     )
     p.add_argument(
+        "--theta-flow-progressive-x-unmask",
+        action="store_true",
+        default=False,
+        help=(
+            "theta_flow only: progressive conditional training over x features with fixed order "
+            "x1 -> x1..x2 -> ... -> x1..xd. Each stage zero-masks still-hidden dimensions and "
+            "runs full --flow-epochs with stage-wise early stopping; stage k+1 warm-starts from stage k."
+        ),
+    )
+    p.add_argument(
         "--flow-arch",
         type=str,
         default="mlp",

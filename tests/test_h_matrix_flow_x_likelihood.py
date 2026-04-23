@@ -305,6 +305,15 @@ class TestHMatrixFlowXLikelihood(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_estimation_args(args)
 
+    def test_validate_theta_flow_progressive_x_unmask_requires_theta_flow(self) -> None:
+        parser = argparse.ArgumentParser()
+        add_estimation_arguments(parser)
+        args = parser.parse_args([])
+        args.theta_field_method = "x_flow"
+        args.theta_flow_progressive_x_unmask = True
+        with self.assertRaises(ValueError):
+            validate_estimation_args(args)
+
     def test_train_conditional_x_flow_single_stage_no_two_stage_metadata(self) -> None:
         torch.manual_seed(0)
         model = ConditionalXFlowVelocity(x_dim=2, hidden_dim=16, depth=1, use_logit_time=True)

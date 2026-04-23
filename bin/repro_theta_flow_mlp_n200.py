@@ -220,6 +220,15 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Theta-flow soft_moe only: optional override for --flow-moe-router-temperature.",
     )
+    p.add_argument(
+        "--theta-flow-progressive-x-unmask",
+        action="store_true",
+        default=False,
+        help=(
+            "Theta-flow only: progressive conditional training where stages unmask x features "
+            "in fixed order x1 -> x1..x2 -> ... -> x1..xd."
+        ),
+    )
     p.add_argument("--nf-epochs", type=int, default=2000, help="NF method only: training epochs.")
     p.add_argument("--nf-batch-size", type=int, default=256, help="NF method only: batch size.")
     p.add_argument("--nf-lr", type=float, default=1e-3, help="NF method only: learning rate.")
@@ -456,6 +465,8 @@ def _run_convergence(
     ]
     if str(method) == "theta_flow":
         cmd += ["--flow-arch", str(args.flow_arch)]
+        if bool(getattr(args, "theta_flow_progressive_x_unmask", False)):
+            cmd += ["--theta-flow-progressive-x-unmask"]
         if args.flow_epochs is not None:
             cmd += ["--flow-epochs", str(int(args.flow_epochs))]
         if args.prior_epochs is not None:

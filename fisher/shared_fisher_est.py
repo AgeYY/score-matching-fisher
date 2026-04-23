@@ -1062,6 +1062,10 @@ def validate_estimation_args(args: Any) -> None:
             raise ValueError(
                 "--flow-x-two-stage-mean-theta-pretrain requires --flow-epochs >= 2 (split floor(E/2) + remainder)."
             )
+    if bool(getattr(args, "theta_flow_progressive_x_unmask", False)) and _tfm_val != "theta_flow":
+        raise ValueError(
+            "--theta-flow-progressive-x-unmask is only valid with --theta-field-method theta_flow."
+        )
     if int(getattr(args, "flow_batch_size", 1)) < 1:
         raise ValueError("--flow-batch-size must be >= 1.")
     if float(getattr(args, "flow_lr", 0.0)) <= 0.0:
@@ -2122,6 +2126,14 @@ def run_shared_fisher_estimation(
             f"zero_out_prior={bool(getattr(args, 'flow_prior_zero_out_init', False))} "
             f"{_xf_post}{_xf_prior}"
         )
+        _tf_prog = bool(getattr(args, "theta_flow_progressive_x_unmask", False)) and theta_field_method == "theta_flow"
+        if _tf_prog:
+            print(
+                f"[{theta_field_method}] progressive_x_unmask enabled: "
+                f"stages=x_dim={int(args.x_dim)} order=x1..xd "
+                f"epochs_per_stage={int(getattr(args, 'flow_epochs', 10000))} "
+                "mask_value=0.0 val_policy=masked"
+            )
 
         if flow_score_arch == "mlp":
             post_ckpt_hparams = {
@@ -2236,7 +2248,17 @@ def run_shared_fisher_estimation(
                 else 0.0
             ),
             endpoint_ode_steps=int(getattr(args, "flow_endpoint_steps", 20)),
+            progressive_x_unmask=_tf_prog,
         )
+        if bool(post_train_out.get("theta_flow_progressive_x_unmask", False)):
+            stage_count = int(post_train_out.get("progressive_stage_count", 0))
+            boundaries = list(post_train_out.get("progressive_stage_boundary_epochs", []))
+            print(
+                f"[{theta_field_method}] progressive training finished: "
+                f"stage_count={stage_count} stage_boundaries={boundaries} "
+                f"best_epoch={int(post_train_out['best_epoch'])} "
+                f"best_val_smooth={float(post_train_out['best_val_loss']):.6f}"
+            )
         post_train_losses = np.asarray(post_train_out["train_losses"], dtype=np.float64)
         post_val_losses = np.asarray(post_train_out["val_losses"], dtype=np.float64)
         post_val_monitor_losses = np.asarray(post_train_out.get("val_monitor_losses", []), dtype=np.float64)
@@ -2260,6 +2282,18 @@ def run_shared_fisher_estimation(
                 linestyle="--",
                 label=f"Theta-flow val EMA (α={getattr(args, 'flow_early_ema_alpha', 0.05):g})",
             )
+        if bool(post_train_out.get("theta_flow_progressive_x_unmask", False)):
+            stage_boundaries = [int(v) for v in list(post_train_out.get("progressive_stage_boundary_epochs", []))]
+            for i, sb in enumerate(stage_boundaries, start=1):
+                if 1 <= sb < post_train_losses.size:
+                    plt.axvline(
+                        sb,
+                        color="#7f7f7f",
+                        linestyle="-",
+                        linewidth=1.2,
+                        alpha=0.8,
+                        label=(f"Stage boundary {i}" if i == 1 else None),
+                    )
         if 1 <= post_best_epoch <= post_train_losses.size:
             plt.axvline(post_best_epoch, color="#2ca02c", linestyle="--", linewidth=1.5, label=f"Best epoch {post_best_epoch}")
         if 1 <= post_stopped_epoch <= post_train_losses.size:

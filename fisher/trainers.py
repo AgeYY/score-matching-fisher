@@ -1272,7 +1272,209 @@ def train_conditional_theta_flow_model(
     scheduler_name: str = "cosine",
     endpoint_loss_weight: float = 0.0,
     endpoint_ode_steps: int = 20,
-) -> dict[str, float | int | bool | list[float]]:
+    *,
+    progressive_x_unmask: bool = False,
+) -> dict[str, float | int | bool | list[float] | list[int]]:
+    return _train_conditional_theta_flow(
+        model=model,
+        theta_train=theta_train,
+        x_train=x_train,
+        epochs=epochs,
+        batch_size=batch_size,
+        lr=lr,
+        device=device,
+        log_every=log_every,
+        theta_val=theta_val,
+        x_val=x_val,
+        early_stopping_patience=early_stopping_patience,
+        early_stopping_min_delta=early_stopping_min_delta,
+        early_stopping_ema_alpha=early_stopping_ema_alpha,
+        restore_best=restore_best,
+        scheduler_name=scheduler_name,
+        endpoint_loss_weight=endpoint_loss_weight,
+        endpoint_ode_steps=endpoint_ode_steps,
+        progressive_x_unmask=progressive_x_unmask,
+    )
+
+
+def _train_conditional_theta_flow(
+    *,
+    model: ConditionalThetaFlowVelocity
+    | ConditionalThetaFlowVelocityFiLMPerLayer
+    | ConditionalThetaFlowVelocityThetaFourierMLP,
+    theta_train: np.ndarray,
+    x_train: np.ndarray,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    device: torch.device,
+    log_every: int,
+    theta_val: np.ndarray | None,
+    x_val: np.ndarray | None,
+    early_stopping_patience: int,
+    early_stopping_min_delta: float,
+    early_stopping_ema_alpha: float,
+    restore_best: bool,
+    scheduler_name: str,
+    endpoint_loss_weight: float,
+    endpoint_ode_steps: int,
+    progressive_x_unmask: bool,
+) -> dict[str, float | int | bool | list[float] | list[int]]:
+    if not bool(progressive_x_unmask):
+        return _train_conditional_theta_flow_phase(
+            model=model,
+            theta_train=theta_train,
+            x_train=x_train,
+            epochs=int(epochs),
+            batch_size=batch_size,
+            lr=lr,
+            device=device,
+            log_every=log_every,
+            theta_val=theta_val,
+            x_val=x_val,
+            early_stopping_patience=early_stopping_patience,
+            early_stopping_min_delta=early_stopping_min_delta,
+            early_stopping_ema_alpha=early_stopping_ema_alpha,
+            restore_best=restore_best,
+            scheduler_name=scheduler_name,
+            endpoint_loss_weight=endpoint_loss_weight,
+            endpoint_ode_steps=endpoint_ode_steps,
+            phase_label="",
+            epoch_base=0,
+            total_epochs_label=int(epochs),
+        )
+
+    x_fit = np.asarray(x_train, dtype=np.float32)
+    if x_fit.ndim != 2:
+        raise ValueError("progressive_x_unmask expects x_train shape (N, d).")
+    x_dim = int(x_fit.shape[1])
+    if x_dim < 1:
+        raise ValueError("progressive_x_unmask expects x_train with at least one feature.")
+    if x_val is not None:
+        xv = np.asarray(x_val)
+        if xv.ndim != 2 or int(xv.shape[1]) != x_dim:
+            raise ValueError("progressive_x_unmask expects x_val shape (N, d) with the same d as x_train.")
+
+    print(
+        "[theta_flow] progressive_x_unmask=True "
+        f"stages={x_dim} epochs_per_stage={int(epochs)} "
+        "mask_value=0.0 stage_val_policy=masked"
+    )
+
+    tr_all: list[float] = []
+    tr_fm_all: list[float] = []
+    tr_ep_all: list[float] = []
+    va_all: list[float] = []
+    va_fm_all: list[float] = []
+    va_ep_all: list[float] = []
+    vm_all: list[float] = []
+    boundaries: list[int] = []
+    unmasked_dims: list[int] = []
+    epoch_base = 0
+    out_last: dict[str, float | int | bool | list[float] | list[int]] | None = None
+    stopped_any = False
+    for k in range(1, x_dim + 1):
+        x_stage = _theta_flow_mask_x_tail(x_train, keep_prefix_dims=k)
+        x_val_stage = _theta_flow_mask_x_tail(x_val, keep_prefix_dims=k) if x_val is not None else None
+        print(f"[theta_flow] progressive stage={k}/{x_dim} unmasked_dims=1..{k} masked_dims={x_dim-k}")
+        out_k = _train_conditional_theta_flow_phase(
+            model=model,
+            theta_train=theta_train,
+            x_train=x_stage,
+            epochs=int(epochs),
+            batch_size=batch_size,
+            lr=lr,
+            device=device,
+            log_every=log_every,
+            theta_val=theta_val,
+            x_val=x_val_stage,
+            early_stopping_patience=early_stopping_patience,
+            early_stopping_min_delta=early_stopping_min_delta,
+            early_stopping_ema_alpha=early_stopping_ema_alpha,
+            restore_best=restore_best,
+            scheduler_name=scheduler_name,
+            endpoint_loss_weight=endpoint_loss_weight,
+            endpoint_ode_steps=endpoint_ode_steps,
+            phase_label=f"stage{k}_x1_to_x{k}",
+            epoch_base=epoch_base,
+            total_epochs_label=x_dim * int(epochs),
+        )
+        tr_all.extend(list(out_k["train_losses"]))  # type: ignore[index]
+        tr_fm_all.extend(list(out_k["train_fm_losses"]))  # type: ignore[index]
+        tr_ep_all.extend(list(out_k["train_endpoint_losses"]))  # type: ignore[index]
+        va_all.extend(list(out_k["val_losses"]))  # type: ignore[index]
+        va_fm_all.extend(list(out_k["val_fm_losses"]))  # type: ignore[index]
+        va_ep_all.extend(list(out_k["val_endpoint_losses"]))  # type: ignore[index]
+        vm_all.extend(list(out_k["val_monitor_losses"]))  # type: ignore[index]
+        epoch_base += int(len(out_k["train_losses"]))  # type: ignore[index]
+        boundaries.append(int(epoch_base))
+        unmasked_dims.append(int(k))
+        stopped_any = bool(stopped_any or bool(out_k["stopped_early"]))
+        out_last = out_k
+    if out_last is None:
+        raise RuntimeError("progressive_x_unmask internal error: no stage outputs.")
+    best_epoch_local = int(out_last["best_epoch"])
+    stopped_epoch_local = int(out_last["stopped_epoch"])
+    stage_start = int(boundaries[-2]) if len(boundaries) >= 2 else 0
+    return {
+        "train_losses": tr_all,
+        "train_fm_losses": tr_fm_all,
+        "train_endpoint_losses": tr_ep_all,
+        "val_losses": va_all,
+        "val_fm_losses": va_fm_all,
+        "val_endpoint_losses": va_ep_all,
+        "val_monitor_losses": vm_all,
+        "best_val_loss": float(out_last["best_val_loss"]),
+        "best_epoch": int(stage_start + best_epoch_local),
+        "stopped_epoch": int(stage_start + stopped_epoch_local),
+        "stopped_early": bool(stopped_any),
+        "theta_flow_progressive_x_unmask": True,
+        "progressive_stage_count": int(x_dim),
+        "progressive_stage_unmasked_dims": [int(v) for v in unmasked_dims],
+        "progressive_stage_boundary_epochs": [int(v) for v in boundaries],
+    }
+
+
+def _theta_flow_mask_x_tail(x: np.ndarray | None, *, keep_prefix_dims: int) -> np.ndarray | None:
+    if x is None:
+        return None
+    xx = np.asarray(x, dtype=np.float32)
+    if xx.ndim != 2:
+        raise ValueError("theta_flow x masking expects 2D x arrays.")
+    k = int(keep_prefix_dims)
+    if k < 1 or k > int(xx.shape[1]):
+        raise ValueError(f"keep_prefix_dims must be in [1, x_dim], got {k} for x_dim={int(xx.shape[1])}.")
+    out = np.array(xx, copy=True)
+    if k < out.shape[1]:
+        out[:, k:] = 0.0
+    return out
+
+
+def _train_conditional_theta_flow_phase(
+    *,
+    model: ConditionalThetaFlowVelocity
+    | ConditionalThetaFlowVelocityFiLMPerLayer
+    | ConditionalThetaFlowVelocityThetaFourierMLP,
+    theta_train: np.ndarray,
+    x_train: np.ndarray,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    device: torch.device,
+    log_every: int,
+    theta_val: np.ndarray | None,
+    x_val: np.ndarray | None,
+    early_stopping_patience: int,
+    early_stopping_min_delta: float,
+    early_stopping_ema_alpha: float,
+    restore_best: bool,
+    scheduler_name: str,
+    endpoint_loss_weight: float,
+    endpoint_ode_steps: int,
+    phase_label: str,
+    epoch_base: int,
+    total_epochs_label: int,
+) -> dict[str, float | int | bool | list[float] | list[int]]:
     path = _make_flow_matching_path(scheduler_name=scheduler_name)
     endpoint_weight = float(endpoint_loss_weight)
     endpoint_steps = int(endpoint_ode_steps)
@@ -1306,6 +1508,7 @@ def train_conditional_theta_flow_model(
     alpha = float(early_stopping_ema_alpha)
     if not (0.0 < alpha <= 1.0):
         raise ValueError("early_stopping_ema_alpha must be in (0, 1].")
+    tag = f" {phase_label}" if str(phase_label) else ""
 
     for epoch in range(1, epochs + 1):
         epoch_losses: list[float] = []
@@ -1394,10 +1597,11 @@ def train_conditional_theta_flow_model(
             val_endpoint_losses.append(float("nan"))
         val_losses.append(mean_val_loss)
 
-        if epoch == 1 or epoch % log_every == 0 or epoch == epochs:
+        global_ep = int(epoch_base) + epoch
+        if epoch == 1 or epoch % log_every == 0 or epoch == int(epochs):
             if has_val:
                 msg = (
-                    f"[epoch {epoch:4d}/{epochs}] theta_flow_train={mean_train_loss:.6f} "
+                    f"[epoch {global_ep:4d}/{total_epochs_label}]{tag} theta_flow_train={mean_train_loss:.6f} "
                     f"val_loss={mean_val_loss:.6f} val_smooth={val_monitor_losses[-1]:.6f} "
                     f"best_smooth={best_val_loss:.6f} best_epoch={best_epoch}"
                 )
@@ -1410,7 +1614,7 @@ def train_conditional_theta_flow_model(
                     msg
                 )
             else:
-                msg = f"[epoch {epoch:4d}/{epochs}] theta_flow_loss={mean_train_loss:.6f}"
+                msg = f"[epoch {global_ep:4d}/{total_epochs_label}]{tag} theta_flow_loss={mean_train_loss:.6f}"
                 if endpoint_enabled:
                     msg = (
                         f"{msg} endpoint_lambda={endpoint_weight:.6g} "
@@ -1422,14 +1626,14 @@ def train_conditional_theta_flow_model(
             stopped_early = True
             stopped_epoch = epoch
             print(
-                f"[early-stop] epoch={epoch} best_epoch={best_epoch} "
+                f"[early-stop]{tag} epoch={epoch} (global={global_ep}) best_epoch={best_epoch} "
                 f"best_smooth={best_val_loss:.6f} patience={early_stopping_patience}"
             )
             break
 
     if has_val and restore_best and best_state is not None:
         model.load_state_dict(best_state)
-        print(f"[restore-best] restored epoch={best_epoch} val_smooth={best_val_loss:.6f}")
+        print(f"[restore-best]{tag} restored epoch={best_epoch} val_smooth={best_val_loss:.6f}")
 
     return {
         "train_losses": train_losses,
