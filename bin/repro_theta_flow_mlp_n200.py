@@ -15,9 +15,9 @@ This script intentionally exposes only a tiny CLI surface and fixes the rest:
 - n_ref = 1000
 - n in --n (default 200) as the sole --n-list value; --n-ref (default 1000) for reference subset
 - num_theta_bins = 10
-- optional ``--theta-filter-union`` (default on): keep only theta in
-  [-3.5,-2.5] U [-3.5+2pi,-2.5+2pi] and resample until n_total; use
-  ``--no-theta-filter-union`` for unfiltered uniform [theta-low, theta-high]
+- optional ``--theta-filter-union`` (default off): when enabled, keep only
+  theta in [-3.5,-2.5] U [-3.5+2pi,-2.5+2pi] and resample until n_total.
+  Default behavior uses unfiltered uniform [theta-low, theta-high].
 
 It creates a shared dataset NPZ, then runs ``bin/study_h_decoding_convergence.py``
 with fixed settings and prints the resulting metrics. Method selection supports
@@ -127,10 +127,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--theta-filter-union",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help=(
             "Restrict rows to theta in [-3.5,-2.5] U [-3.5+2pi,-2.5+2pi], resampling joint draws "
-            "until n_total (default: on). Use --no-theta-filter-union for unfiltered data."
+            "until n_total (default: off; full [theta-low, theta-high])."
         ),
     )
     p.add_argument(
@@ -140,7 +140,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Directory for generated dataset + study artifacts. "
             "If omitted, uses data/repro_theta_flow_mlp_n{n}_{dataset_family}_xdim{d}_obsnoise0p5_th{lo}_{hi} "
-            "with optional _thunion2pi when --theta-filter-union is on."
+            "with optional _thunion2pi when --theta-filter-union is enabled."
         ),
     )
     p.add_argument(
@@ -546,7 +546,7 @@ def main() -> None:
             f"max(--n, --n-ref)={need} but shared dataset n_total={_DATASET_N_TOTAL}; "
             f"raise _DATASET_N_TOTAL in {Path(__file__).name} or use smaller --n / --n-ref."
         )
-    theta_filter = bool(getattr(args, "theta_filter_union", True))
+    theta_filter = bool(getattr(args, "theta_filter_union", False))
     out_raw = args.output_dir if args.output_dir is not None else _default_output_dir(
         x_dim,
         dataset_family,
