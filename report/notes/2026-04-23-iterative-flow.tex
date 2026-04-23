@@ -1,0 +1,55 @@
+\section{Iterative Flow}
+
+Consider a conditional distribution $p(x \mid \theta)$ with continuous parameter $\theta \in \mathbb{R}^m$. Given paired data $(\theta, x)$, we wish to estimate the Hellinger distance between two conditionals, $p(x \mid \theta_1)$ and $p(x \mid \theta_2)$.
+
+A straightforward approach is to bin the data near $\theta_1$ and $\theta_2$, train a binary classifier on $x$, and convert its performance into an estimate of the Hellinger distance (see Methods). Binning, however, discards the continuity of $\theta$: only samples falling in the chosen bins contribute, and estimates need not vary smoothly as $\theta_1$ and $\theta_2$ move. Kernel weighting avoids hard bins but introduces a fixed bandwidth and still does not provide flexible exploitation of the information from nearby $\theta$.
+
+We propose a method that more directly exploits continuity in $\theta$. Write $p_1 = p(x \mid \theta_1)$, $p_2 = p(x \mid \theta_2)$, and $\ell(x) = \log \frac{p_1(x)}{p_2(x)}$. The squared Hellinger distance admits the symmetric representation
+\begin{equation}
+\label{eq:H2-sym-sech}
+H^2\bigl(p_1, p_2\bigr)
+=
+\tfrac{1}{2} \,
+\mathbb{E}_{X_1 \sim p_1,\, X_2 \sim p_2}
+\bigl[
+\psi(X_1) + \psi(X_2)
+\bigr],
+\qquad
+\psi(x) := 1 - \operatorname{sech}\!\left( \tfrac{1}{2} \ell(x) \right).
+\end{equation}
+
+The expectation can be approximated by Monte Carlo once $\log p(x \mid \theta)$ is available, so the remaining task is log-likelihood estimation along the $\theta$.
+
+Flow matching provides an ODE whose solution yields $\log p(x \mid \theta)$ via the instantaneous change-of-variables formula. A natural idea is therefore to train a conditional flow on $(\theta, x)$: the velocity network takes $(\theta, t, x_t)$ and predicts the $x$-space velocity that gradually maps a standard Gaussian to $p(x \mid \theta)$. Because $\theta$ is an explicit input, the velocity network can interpolate across $\theta$. Concretely, one fits the flow, evaluates $\log p(x \mid \theta)$, and plugs into \eqref{eq:H2-sym-sech} for estimating the Hellinger distance (see Methods).
+
+This baseline works well when $p(x \mid \theta)$ is not periodic in $\theta$ (see figure). However, it fails under periodicity (see Figure). One possible reason is that the velocity network (an MLP) bias toward low-frequency variation in $\theta$. With limited data, they may treat far-separated $\theta$ as unrelated, breaking up periodic structure.
+
+Ultimately, we want that the estimation of likelihood at $\theta$ utilizes information from "nearby" $\theta$. "Nearby" here should be interpreted both as close in the raw $\theta$ value, but also close in the distributional sense---small Hellinger distance. Periodicity is the clearest example: $\theta$ is as informative about $p(\cdot \mid \theta)$ as $\theta + T$, but a network fed raw $\theta$ may not utilize this.
+
+If we already have a rough Hellinger distance estimation---for instance from the classical binned classifier---we can embed $\theta$ into coordinates $\tilde{\theta}$ in which Euclidean distance better tracks distributional distance. Networks conditioning on $\tilde{\theta}$ can then share information from "nearby" $\tilde{\theta}$ values.
+
+This idea motivates our iterative procedure (see Methods). We form an initial matrix of Hellinger distances $\sqrt{H^2(\theta_i, \theta_j)}$ with the binned classifier, embed the $\theta_i$ into $\tilde{\theta}_i$ by metric multidimensional scaling (see Methods), and retrain the flow on $(\tilde{\theta}, x)$. The updated flow yields refined Hellinger estimates; we re-embed and repeat. This iterative method shows best performance on both periodic and non-periodic data (see Figure).
+
+\subsection{Estimating Hellinger distance with flow matching}
+
+Let $t\in[0,1]$ interpolate between a tractable base density $p_0$ on $\mathbb{R}^d$ (e.g.\ standard Gaussian) and the model distribution $p_1$ over observations.
+The learned time-dependent and stimulus-dependent velocity field $v_t:\mathbb{R}^d\to\mathbb{R}^d$ defines the probability-flow ODE
+\begin{equation}
+  \frac{\mathrm{d}}{\mathrm{d}t}\, x_t(\theta) = v_t(x_t; \theta),
+\end{equation}
+whose time-$t$ marginal density we denote $p_t$.
+Along a trajectory $\{x_t\}_{t\in[0,1]}$, the instantaneous change-of-variables formula gives
+\begin{equation}
+  \frac{\mathrm{d}}{\mathrm{d}t}\, \log p_t(x_t | \theta)
+  = -\,\mathrm{div}\, v_t(x_t; \theta)
+  = -\,\mathrm{tr}\!\bigl(\nabla_x v_t(x_t; \theta)\bigr),
+\end{equation}
+so, writing $x_1=x$ for a sample from $p_1$ and $x_0$ for its preimage under the flow,
+\begin{equation}
+  \log p_1(x | \theta)
+  = \log p_0(x_0)
+    - \int_0^1 \mathrm{div}\, v_t(x_t; \theta)\,\mathrm{d}t.
+\end{equation}
+To evaluate $\log p_1(x | \theta)$, one integrates the ODE (typically \emph{backward} from $x$ at $t=1$ to $x_0(\theta)$ at $t=0$) and accumulates the divergence along that $t$-parameterized path.
+
+Once we have $\log p_1(x | \theta)$, we can estimate the log likelihood ratio by $\log p_1(x | \theta_i) - \log p_1(x | \theta_j)$, thus estimating the Hellinger distance.
