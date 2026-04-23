@@ -2191,6 +2191,7 @@ class CachedConvergenceBundle(TypedDict):
     gt_seed: int
     gt_symmetrize: bool
     out_npz: str
+    theta_bin_source: NotRequired[str]
     # Optional: LLR scatter (newer full runs)
     llr_gt_mean_one_sided_mc: NotRequired[np.ndarray]
     llr_binned_columns: NotRequired[np.ndarray]
@@ -2262,6 +2263,8 @@ def _load_cached_convergence_results(output_dir: str) -> CachedConvergenceBundle
         "gt_symmetrize": gt_symmetrize,
         "out_npz": os.path.abspath(out_npz),
     }
+    if "theta_bin_source" in z.files:
+        base_bundle["theta_bin_source"] = str(np.asarray(z["theta_bin_source"]).reshape(-1)[0])
     if "gt_mean_llr_one_sided_mc" in z.files:
         base_bundle["llr_gt_mean_one_sided_mc"] = np.asarray(z["gt_mean_llr_one_sided_mc"], dtype=np.float64)
     if "llr_binned_columns" in z.files:
@@ -2318,6 +2321,7 @@ def _render_convergence_figures_and_summary(
     visualization_only: bool,
     llr_cols: np.ndarray | None = None,
     corr_llr: np.ndarray | None = None,
+    theta_bin_source: str | None = None,
 ) -> None:
     """Write CSV, figures, manifest, training-loss panel, summary, and print artifact paths."""
     csv_path = os.path.join(args.output_dir, "h_decoding_convergence_results.csv")
@@ -2442,6 +2446,8 @@ def _render_convergence_figures_and_summary(
         "training_losses_dir": loss_dir,
         "training_losses_manifest": manifest_path,
     }
+    if theta_bin_source is not None:
+        paths_out["theta_bin_source"] = str(theta_bin_source)
     if visualization_only:
         paths_out["mode"] = "visualization-only (figures/csv/summary regenerated from cached NPZ)"
     if err_msg:
@@ -2597,6 +2603,7 @@ def main(argv: list[str] | None = None) -> None:
             visualization_only=True,
             llr_cols=None if _llr_c is None else np.asarray(_llr_c, dtype=np.float64),
             corr_llr=None if _corr_llr_c is None else np.asarray(_corr_llr_c, dtype=np.float64).ravel(),
+            theta_bin_source=str(cached.get("theta_bin_source", "cached_or_legacy")),
         )
         return
 
@@ -2620,7 +2627,20 @@ def main(argv: list[str] | None = None) -> None:
         )
     theta_scalar_all = theta_raw_all.reshape(-1)
     theta_ref = np.asarray(theta_scalar_all[perm[: int(args.n_ref)]], dtype=np.float64).reshape(-1)
-    edges, edge_lo, edge_hi = vhb.theta_bin_edges(theta_ref, n_bins)
+    edges, edge_lo, edge_hi, theta_bin_source = vhb.canonical_theta_bin_edges(
+        meta=meta,
+        theta_ref=theta_ref,
+        n_bins=n_bins,
+    )
+    if theta_bin_source == "theta_ref_fallback":
+        print(
+            "[convergence] WARNING: canonical theta-bin metadata missing; using theta_ref min/max for bin edges.",
+            flush=True,
+        )
+    print(
+        f"[convergence] theta-bin edges source={theta_bin_source} range=[{edge_lo:.6g}, {edge_hi:.6g}] n_bins={n_bins}",
+        flush=True,
+    )
     bin_idx_all = vhb.theta_to_bin_index(theta_scalar_all, edges, n_bins)
     theta_state_all: np.ndarray | None = None
     use_acc_mds_state = bool(getattr(args, "theta_flow_acc_mds_state", False))
@@ -3037,6 +3057,7 @@ def main(argv: list[str] | None = None) -> None:
         dataset_meta_seed=np.int64(meta["seed"]),
         theta_bin_edges=edges,
         theta_bin_centers=centers,
+        theta_bin_source=np.asarray([theta_bin_source], dtype=object),
         # Legacy key name: sqrt(H^2) from MC; see module docstring.
         hellinger_gt_sq_mc=h_gt_sqrt,
         gt_hellinger_n_mc=np.int64(gt_n_mc),
@@ -3075,6 +3096,7 @@ def main(argv: list[str] | None = None) -> None:
         visualization_only=False,
         llr_cols=llr_cols,
         corr_llr=corr_llr,
+        theta_bin_source=theta_bin_source,
     )
 
 

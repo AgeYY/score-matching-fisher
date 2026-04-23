@@ -113,6 +113,7 @@ class BinnedMetrics:
     edges: np.ndarray
     edge_lo: float
     edge_hi: float
+    edge_source: str
     centers: np.ndarray
     bin_idx: np.ndarray
     x_aligned: np.ndarray
@@ -262,6 +263,55 @@ def theta_bin_edges(
         raise ValueError(f"Invalid theta range for binning: [{lo}, {hi}]")
     edges = np.linspace(lo, hi, n_bins + 1, dtype=np.float64)
     return edges, lo, hi
+
+
+def canonical_theta_bin_edges(
+    *,
+    meta: dict[str, Any],
+    theta_ref: np.ndarray,
+    n_bins: int,
+) -> tuple[np.ndarray, float, float, str]:
+    """Resolve canonical theta-bin edges with metadata-first priority.
+
+    Priority:
+    1) ``meta['repro_theta_bin_edges']`` (exact edges, length n_bins+1).
+    2) ``meta['repro_theta_binning_range']`` or ``meta['theta_low/theta_high']``.
+    3) Fallback to min/max of ``theta_ref``.
+    """
+    if n_bins < 1:
+        raise ValueError("--num-theta-bins must be >= 1.")
+
+    if "repro_theta_bin_edges" in meta:
+        edges = np.asarray(meta["repro_theta_bin_edges"], dtype=np.float64).reshape(-1)
+        if int(edges.size) != int(n_bins + 1):
+            raise ValueError(
+                f"meta repro_theta_bin_edges has length {edges.size}, expected {n_bins + 1} for n_bins={n_bins}."
+            )
+        if not np.all(np.isfinite(edges)):
+            raise ValueError("meta repro_theta_bin_edges contains non-finite values.")
+        if np.any(np.diff(edges) <= 0.0):
+            raise ValueError("meta repro_theta_bin_edges must be strictly increasing.")
+        return edges, float(edges[0]), float(edges[-1]), "meta_edges"
+
+    lo: float | None = None
+    hi: float | None = None
+    if "repro_theta_binning_range" in meta:
+        rr = np.asarray(meta["repro_theta_binning_range"], dtype=np.float64).reshape(-1)
+        if rr.size == 2 and np.all(np.isfinite(rr)):
+            lo, hi = float(rr[0]), float(rr[1])
+    if lo is None or hi is None:
+        if "theta_low" in meta and "theta_high" in meta:
+            lo = float(meta["theta_low"])
+            hi = float(meta["theta_high"])
+    if lo is not None and hi is not None:
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            raise ValueError(f"Invalid metadata theta range: [{lo}, {hi}]")
+        edges = np.linspace(lo, hi, n_bins + 1, dtype=np.float64)
+        src = "meta_binning_range" if "repro_theta_binning_range" in meta else "meta_theta_range"
+        return edges, float(lo), float(hi), src
+
+    edges, lo_fb, hi_fb = theta_bin_edges(theta_ref, n_bins)
+    return edges, float(lo_fb), float(hi_fb), "theta_ref_fallback"
 
 
 def theta_to_bin_index(theta: np.ndarray, edges: np.ndarray, n_bins: int) -> np.ndarray:
@@ -696,7 +746,16 @@ def compute_binned_metrics(ctx: RunContext, loaded: LoadedHMatrix) -> BinnedMetr
     args = ctx.args
     x_chk = _validate_alignment(ctx, loaded)
 
-    edges, edge_lo, edge_hi = theta_bin_edges(loaded.theta_used, n_bins)
+    edges, edge_lo, edge_hi, edge_source = canonical_theta_bin_edges(
+        meta=ctx.meta,
+        theta_ref=loaded.theta_used,
+        n_bins=n_bins,
+    )
+    if edge_source == "theta_ref_fallback":
+        print(
+            "[h_binned] WARNING: canonical theta-bin metadata missing; using theta_used min/max for bin edges.",
+            flush=True,
+        )
     bin_idx = theta_to_bin_index(loaded.theta_used, edges, n_bins)
     centers = 0.5 * (edges[:-1] + edges[1:])
 
@@ -738,6 +797,7 @@ def compute_binned_metrics(ctx: RunContext, loaded: LoadedHMatrix) -> BinnedMetr
         edges=edges,
         edge_lo=edge_lo,
         edge_hi=edge_hi,
+        edge_source=edge_source,
         centers=centers,
         bin_idx=bin_idx,
         x_aligned=x_chk,
@@ -947,6 +1007,7 @@ def write_results_npz(ctx: RunContext, loaded: LoadedHMatrix, metrics: BinnedMet
         num_theta_bins=np.asarray([ctx.config.n_bins], dtype=np.int64),
         theta_bin_edge_lo=np.asarray([metrics.edge_lo], dtype=np.float64),
         theta_bin_edge_hi=np.asarray([metrics.edge_hi], dtype=np.float64),
+        theta_bin_source=np.asarray([metrics.edge_source], dtype=object),
         h_field_method=np.asarray([loaded.h_field_method], dtype=object),
         h_eval_scalar_name=np.asarray([loaded.h_eval_scalar_name], dtype=object),
         h_eval_scalar_value=np.asarray([loaded.h_eval_scalar_value], dtype=np.float64),
@@ -1217,7 +1278,10 @@ def write_summary(
         f.write(f"h_field_method: {loaded.h_field_method}\n")
         f.write(f"{loaded.h_eval_scalar_name}: {loaded.h_eval_scalar_value}\n")
         f.write(f"num_theta_bins: {n_bins}\n")
-        f.write(f"theta_bin_edges: [{metrics.edge_lo}, {metrics.edge_hi}] (min/max of theta_used from H-matrix)\n")
+        f.write(
+            f"theta_bin_edges: [{metrics.edge_lo}, {metrics.edge_hi}] "
+            f"(source={metrics.edge_source})\n"
+        )
         f.write(f"h_binned finite cells: {n_finite} nan cells: {n_nan}\n")
         if n_finite > 0:
             f.write(
