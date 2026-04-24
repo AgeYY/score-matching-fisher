@@ -83,7 +83,7 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--train-frac",
         type=float,
-        default=0.7,
+        default=0.8,
         help=(
             "Fraction of n_total in train_idx; remainder is validation_idx. "
             "Use a value in (0, 1) so score training, H-matrix evaluation, and pairwise CLF "

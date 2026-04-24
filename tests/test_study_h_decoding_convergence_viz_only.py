@@ -72,8 +72,10 @@ class TestStudyHDecodingConvergenceVizOnly(unittest.TestCase):
             centers = 0.5 * (edges[:-1] + edges[1:])
             n_mc = n_ref // n_bins
             h_cols = np.full((len(ns_list) + 1, n_bins, n_bins), 0.5, dtype=np.float64)
+            clf_h_cols = np.full((len(ns_list) + 1, n_bins, n_bins), 0.55, dtype=np.float64)
             clf_cols = np.full((len(ns_list) + 1, n_bins, n_bins), 0.6, dtype=np.float64)
             corr_h = np.array([0.9, 0.91], dtype=np.float64)
+            corr_clf_h = np.array([0.87, 0.88], dtype=np.float64)
             corr_clf = np.array([0.8, 0.82], dtype=np.float64)
             corr_llr = np.array([0.4, 0.41], dtype=np.float64)
             wall_s = np.array([1.0, 2.0], dtype=np.float64)
@@ -84,6 +86,7 @@ class TestStudyHDecodingConvergenceVizOnly(unittest.TestCase):
                 results_npz,
                 n=np.asarray(ns_list, dtype=np.int64),
                 corr_h_binned_vs_gt_mc=corr_h,
+                corr_clf_h_binned_vs_gt_mc=corr_clf_h,
                 corr_clf_vs_ref=corr_clf,
                 corr_llr_binned_vs_gt_mc=corr_llr,
                 wall_seconds=wall_s,
@@ -99,6 +102,7 @@ class TestStudyHDecodingConvergenceVizOnly(unittest.TestCase):
                 gt_hellinger_seed=np.int64(seed),
                 gt_hellinger_symmetrize=np.int32(0),
                 h_binned_ref_is_gt_mc=np.int32(1),
+                clf_h_binned_columns=clf_h_cols,
                 h_binned_columns=h_cols,
                 clf_acc_columns=clf_cols,
                 column_n=np.asarray(ns_list + [n_ref], dtype=np.int64),

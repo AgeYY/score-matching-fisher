@@ -79,6 +79,7 @@ from global_setting import DATA_DIR
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from sklearn.linear_model import LogisticRegression
 
 import visualize_h_matrix_binned as vhb
 from fisher.cli_shared_fisher import add_estimation_arguments
@@ -907,6 +908,100 @@ def _metrics_fixed_edges(
     return h_binned, clf_acc
 
 
+def _classifier_initialized_hellinger_sq_binned(
+    subset: SweepSubset,
+    n_bins: int,
+    *,
+    min_class_count: int,
+    random_state: int,
+) -> np.ndarray:
+    r"""Classifier-initialized binned H^2 estimate from pairwise bin logistic logits.
+
+    For each bin pair (i, j), train a binary logistic classifier on the subset train split
+    (class-balanced sample weights). Let ``u = \hat{\ell}_{ij}(x)`` be the classifier
+    logit and ``psi(u) = 1 - sech(u/2)``. Estimate
+
+      H^2_{ij} = 0.5 * mean_{x in bin i} psi(u) + 0.5 * mean_{x in bin j} psi(u),
+
+    using hard bin assignments on the subset full pool (``x_all``/``bin_all``).
+    """
+    x_tr = np.asarray(subset.bundle.x_train, dtype=np.float64)
+    x_ev = np.asarray(subset.bundle.x_all, dtype=np.float64)
+    bi_tr = np.asarray(subset.bin_train, dtype=np.int64).reshape(-1)
+    bi_ev = np.asarray(subset.bin_all, dtype=np.int64).reshape(-1)
+    if x_tr.ndim != 2 or x_ev.ndim != 2 or x_tr.shape[1] != x_ev.shape[1]:
+        raise ValueError("x_train and x_all must be 2D with matching feature dim.")
+    if x_tr.shape[0] != bi_tr.shape[0] or x_ev.shape[0] != bi_ev.shape[0]:
+        raise ValueError("x_* and bin_* must have the same number of rows.")
+    if int(min_class_count) < 1:
+        raise ValueError("min_class_count must be >= 1.")
+
+    out = np.full((int(n_bins), int(n_bins)), np.nan, dtype=np.float64)
+    rs = int(random_state)
+    for i in range(int(n_bins)):
+        for j in range(i + 1, int(n_bins)):
+            ia_tr = np.flatnonzero(bi_tr == i)
+            jb_tr = np.flatnonzero(bi_tr == j)
+            ni_tr, nj_tr = int(ia_tr.size), int(jb_tr.size)
+            if ni_tr < int(min_class_count) or nj_tr < int(min_class_count):
+                continue
+            ia_ev = np.flatnonzero(bi_ev == i)
+            jb_ev = np.flatnonzero(bi_ev == j)
+            ni_ev, nj_ev = int(ia_ev.size), int(jb_ev.size)
+            if ni_ev < 1 or nj_ev < 1:
+                continue
+
+            x_pair_tr = np.vstack([x_tr[ia_tr], x_tr[jb_tr]])
+            y_pair_tr = np.concatenate(
+                [np.zeros(ni_tr, dtype=np.int64), np.ones(nj_tr, dtype=np.int64)]
+            )
+            # Balanced priors with sklearn-compatible scale:
+            # keep total sample weight ~= n_pair so regularization strength is not
+            # unintentionally amplified (weights summing to 1 would over-shrink logits).
+            n_pair_tr = ni_tr + nj_tr
+            w_pair_tr = np.concatenate(
+                [
+                    np.full(ni_tr, 0.5 * float(n_pair_tr) / float(ni_tr), dtype=np.float64),
+                    np.full(nj_tr, 0.5 * float(n_pair_tr) / float(nj_tr), dtype=np.float64),
+                ]
+            )
+            x_pair_ev = np.vstack([x_ev[ia_ev], x_ev[jb_ev]])
+            try:
+                clf = LogisticRegression(solver="lbfgs", random_state=rs)
+                clf.fit(x_pair_tr, y_pair_tr, sample_weight=w_pair_tr)
+                logits = np.asarray(clf.decision_function(x_pair_ev), dtype=np.float64).reshape(-1)
+            except Exception:
+                continue
+
+            logits_half = np.clip(0.5 * logits, -60.0, 60.0)
+            psi = 1.0 - (1.0 / np.cosh(logits_half))
+            psi_i = psi[:ni_ev]
+            psi_j = psi[ni_ev:]
+            h2_ij = 0.5 * float(np.mean(psi_i)) + 0.5 * float(np.mean(psi_j))
+            out[i, j] = h2_ij
+            out[j, i] = h2_ij
+
+    # Robust symmetrization in case only one directed entry is finite for a pair.
+    for i in range(int(n_bins)):
+        for j in range(i + 1, int(n_bins)):
+            a = float(out[i, j]) if np.isfinite(out[i, j]) else np.nan
+            b = float(out[j, i]) if np.isfinite(out[j, i]) else np.nan
+            if np.isfinite(a) and np.isfinite(b):
+                v = 0.5 * (a + b)
+            elif np.isfinite(a):
+                v = a
+            elif np.isfinite(b):
+                v = b
+            else:
+                continue
+            out[i, j] = v
+            out[j, i] = v
+    finite = np.isfinite(out)
+    out[finite] = np.clip(out[finite], 0.0, 1.0)
+    np.fill_diagonal(out, 0.0)
+    return out
+
+
 def _pairwise_clf_from_bundle(
     *,
     args: argparse.Namespace,
@@ -1689,12 +1784,14 @@ def _render_training_losses_panel(
 
 def _save_combined_convergence_figure(
     *,
+    clf_h_mats: list[np.ndarray],
     h_mats: list[np.ndarray],
     clf_mats: list[np.ndarray],
     col_labels: list[str],
     n_bins: int,
     theta_centers: np.ndarray,
     ns: list[int],
+    corr_clf_h: np.ndarray,
     corr_h: np.ndarray,
     corr_clf: np.ndarray,
     loss_dir: str,
@@ -1719,7 +1816,7 @@ def _save_combined_convergence_figure(
         raise ValueError("_H_DECODING_CURVE_FIGSIZE_IN height must be > 0.")
     n_cols = len(h_mats)
     n_loss_cols = len(ns)
-    m_w, m_h = 2.8 * n_cols, 5.0
+    m_w, m_h = 2.8 * n_cols, 7.2
     l_w, l_h = max(2.6 * n_loss_cols, 6.0), 5.8
     top_h = float(m_h)
     bot_h = float(l_h)
@@ -1757,13 +1854,15 @@ def _save_combined_convergence_figure(
         width_ratios=[m_w, top_h * (float(crv_w) / float(crv_h))],
         height_ratios=height_rows,
     )
-    gs_left = gs0[0, 0].subgridspec(2, n_cols)
-    axes_m = np.empty((2, n_cols), dtype=object)
+    gs_left = gs0[0, 0].subgridspec(3, n_cols)
+    axes_m = np.empty((3, n_cols), dtype=object)
     for c in range(n_cols):
         axes_m[0, c] = fig.add_subplot(gs_left[0, c])
         axes_m[1, c] = fig.add_subplot(gs_left[1, c])
+        axes_m[2, c] = fig.add_subplot(gs_left[2, c])
     _populate_matrix_panel_axes(
         axes_m,
+        clf_h_mats=clf_h_mats,
         h_mats=h_mats,
         clf_mats=clf_mats,
         col_labels=col_labels,
@@ -1774,6 +1873,7 @@ def _save_combined_convergence_figure(
     _populate_convergence_curve_ax(
         ax_c,
         list(ns),
+        corr_clf_h,
         corr_h,
         corr_clf,
         tick_labelsize=13.0,
@@ -1972,13 +2072,20 @@ def _matrix_axes_show_top_right_spines(ax: Any) -> None:
 def _populate_matrix_panel_axes(
     axes: np.ndarray,
     *,
+    clf_h_mats: list[np.ndarray],
     h_mats: list[np.ndarray],
     clf_mats: list[np.ndarray],
     col_labels: list[str],
     n_bins: int,
     theta_centers: np.ndarray,
 ) -> None:
-    """Draw 2 × n_cols heatmaps on existing axes (shared with standalone matrix panel + combined figure)."""
+    """Draw 3 × n_cols heatmaps on existing axes (shared with standalone matrix panel + combined figure).
+
+    Row order:
+    1) Method ``sqrt(H^2)``
+    2) Classifier-init ``sqrt(H^2)``
+    3) Pairwise decoding
+    """
     tc = np.asarray(theta_centers, dtype=np.float64).ravel()
     if int(tc.size) != int(n_bins):
         raise ValueError(f"theta_centers length {tc.size} must match n_bins={n_bins}.")
@@ -1990,10 +2097,10 @@ def _populate_matrix_panel_axes(
     _matrix_tick_labelsize = 11
     _matrix_colorbar_tick_labelsize = 11
     n_cols = len(h_mats)
-    if n_cols != len(clf_mats) or n_cols != len(col_labels):
-        raise ValueError("h_mats, clf_mats, col_labels length mismatch.")
-    if axes.shape != (2, n_cols):
-        raise ValueError(f"axes must be shape (2, {n_cols}); got {axes.shape}.")
+    if n_cols != len(clf_h_mats) or n_cols != len(clf_mats) or n_cols != len(col_labels):
+        raise ValueError("clf_h_mats, h_mats, clf_mats, col_labels length mismatch.")
+    if axes.shape != (3, n_cols):
+        raise ValueError(f"axes must be shape (3, {n_cols}); got {axes.shape}.")
 
     vmin_h, vmax_h = 0.0, 1.0
     vmin_c, vmax_c = _finite_min_max(clf_mats)
@@ -2002,9 +2109,30 @@ def _populate_matrix_panel_axes(
     cmap = "viridis"
 
     for c in range(n_cols):
-        ax0 = axes[0, c]
-        im0 = ax0.imshow(
+        ax00 = axes[0, c]
+        im00 = ax00.imshow(
             h_mats[c],
+            vmin=vmin_h,
+            vmax=vmax_h,
+            cmap=cmap,
+            aspect="equal",
+            origin="lower",
+        )
+        ax00.set_title(col_labels[c], fontsize=10)
+        ax00.set_xticks(tick_pos)
+        ax00.set_xticklabels(tick_labs, rotation=x_rot, ha="right" if x_rot else "center", fontsize=_matrix_tick_labelsize)
+        ax00.set_yticks(tick_pos)
+        ax00.set_yticklabels(tick_labs, fontsize=_matrix_tick_labelsize)
+        ax00.tick_params(axis="both", labelsize=_matrix_tick_labelsize)
+        _matrix_axes_show_top_right_spines(ax00)
+        if c == 0:
+            ax00.set_ylabel(r"$\sqrt{H^2}$", fontsize=11)
+        _cb00 = plt.colorbar(im00, ax=ax00, fraction=0.046, pad=0.04)
+        _cb00.ax.tick_params(labelsize=_matrix_colorbar_tick_labelsize)
+
+        ax0 = axes[1, c]
+        im0 = ax0.imshow(
+            clf_h_mats[c],
             vmin=vmin_h,
             vmax=vmax_h,
             cmap=cmap,
@@ -2019,11 +2147,11 @@ def _populate_matrix_panel_axes(
         ax0.tick_params(axis="both", labelsize=_matrix_tick_labelsize)
         _matrix_axes_show_top_right_spines(ax0)
         if c == 0:
-            ax0.set_ylabel(r"$\sqrt{H^2}$", fontsize=11)
+            ax0.set_ylabel("Classifier-init\n" + r"$\sqrt{H^2}$", fontsize=11)
         _cb0 = plt.colorbar(im0, ax=ax0, fraction=0.046, pad=0.04)
         _cb0.ax.tick_params(labelsize=_matrix_colorbar_tick_labelsize)
 
-        ax1 = axes[1, c]
+        ax1 = axes[2, c]
         im1 = ax1.imshow(
             clf_mats[c],
             vmin=vmin_c,
@@ -2048,6 +2176,7 @@ def _populate_matrix_panel_axes(
 def _populate_convergence_curve_ax(
     ax: plt.Axes,
     ns: list[int],
+    corr_clf_h: np.ndarray,
     corr_h: np.ndarray,
     corr_clf: np.ndarray,
     *,
@@ -2061,8 +2190,18 @@ def _populate_convergence_curve_ax(
     The combined figure passes larger values so the right panel stays readable at reduced width.
     """
     ns_list = [int(x) for x in ns]
+    cch = np.asarray(corr_clf_h, dtype=np.float64).ravel()
     ch = np.asarray(corr_h, dtype=np.float64).ravel()
     cc = np.asarray(corr_clf, dtype=np.float64).ravel()
+    ax.plot(
+        ns_list,
+        cch,
+        color="#2ca02c",
+        linewidth=1.8,
+        marker="^",
+        markersize=5,
+        label="classifier-init H matrix",
+    )
     ax.plot(
         ns_list,
         ch,
@@ -2098,6 +2237,7 @@ def _populate_convergence_curve_ax(
 
 def _render_matrix_panel(
     *,
+    clf_h_mats: list[np.ndarray],
     h_mats: list[np.ndarray],
     clf_mats: list[np.ndarray],
     col_labels: list[str],
@@ -2105,11 +2245,12 @@ def _render_matrix_panel(
     n_bins: int,
     theta_centers: np.ndarray,
 ) -> None:
-    """Two rows: sqrt(binned H_sym) vs sqrt(GT H^2), pairwise decoding."""
+    """Three rows: method sqrt(H^2), classifier-init sqrt(H^2), pairwise decoding."""
     n_cols = len(h_mats)
-    fig, axes = plt.subplots(2, n_cols, figsize=(2.8 * n_cols, 5.0), squeeze=False)
+    fig, axes = plt.subplots(3, n_cols, figsize=(2.8 * n_cols, 7.2), squeeze=False)
     _populate_matrix_panel_axes(
         axes,
+        clf_h_mats=clf_h_mats,
         h_mats=h_mats,
         clf_mats=clf_mats,
         col_labels=col_labels,
@@ -2176,9 +2317,11 @@ class CachedConvergenceBundle(TypedDict):
     """Arrays loaded from ``h_decoding_convergence_results.npz`` for visualization-only mode."""
 
     n: np.ndarray
+    corr_clf_h: np.ndarray
     corr_h: np.ndarray
     corr_clf: np.ndarray
     wall_s: np.ndarray
+    clf_h_cols: np.ndarray
     h_cols: np.ndarray
     clf_cols: np.ndarray
     n_ref: int
@@ -2227,6 +2370,14 @@ def _load_cached_convergence_results(output_dir: str) -> CachedConvergenceBundle
         raise ValueError("h_binned_columns / clf_acc_columns must be 3D (columns, bins, bins).")
     if h_cols.shape != clf_cols.shape:
         raise ValueError("h_binned_columns and clf_acc_columns shape mismatch.")
+    if "clf_h_binned_columns" in z.files:
+        clf_h_cols = np.asarray(z["clf_h_binned_columns"], dtype=np.float64)
+        if clf_h_cols.shape != h_cols.shape:
+            raise ValueError("clf_h_binned_columns shape mismatch with h_binned_columns.")
+    else:
+        # Legacy cache fallback: render the new row with NaNs, keeping n_ref as Approx GT.
+        clf_h_cols = np.full_like(h_cols, np.nan, dtype=np.float64)
+        clf_h_cols[-1, :, :] = np.asarray(h_cols[-1], dtype=np.float64)
 
     edges = np.asarray(z["theta_bin_edges"], dtype=np.float64).ravel()
     n_bins_file = int(h_cols.shape[1])
@@ -2247,9 +2398,15 @@ def _load_cached_convergence_results(output_dir: str) -> CachedConvergenceBundle
 
     base_bundle: dict[str, Any] = {
         "n": np.asarray(z["n"], dtype=np.int64).ravel(),
+        "corr_clf_h": (
+            np.asarray(z["corr_clf_h_binned_vs_gt_mc"], dtype=np.float64).ravel()
+            if "corr_clf_h_binned_vs_gt_mc" in z.files
+            else np.full_like(np.asarray(z["corr_h_binned_vs_gt_mc"], dtype=np.float64).ravel(), np.nan)
+        ),
         "corr_h": np.asarray(z["corr_h_binned_vs_gt_mc"], dtype=np.float64).ravel(),
         "corr_clf": np.asarray(z["corr_clf_vs_ref"], dtype=np.float64).ravel(),
         "wall_s": np.asarray(z["wall_seconds"], dtype=np.float64).ravel(),
+        "clf_h_cols": clf_h_cols,
         "h_cols": h_cols,
         "clf_cols": clf_cols,
         "n_ref": int(np.asarray(z["n_ref"]).reshape(-1)[0]),
@@ -2310,9 +2467,11 @@ def _render_convergence_figures_and_summary(
     gt_n_mc: int,
     gt_seed: int,
     gt_symmetrize_effective: bool,
+    corr_clf_h: np.ndarray,
     corr_h: np.ndarray,
     corr_clf: np.ndarray,
     wall_s: np.ndarray,
+    clf_h_cols: np.ndarray,
     h_cols: np.ndarray,
     clf_cols: np.ndarray,
     out_npz: str,
@@ -2331,6 +2490,7 @@ def _render_convergence_figures_and_summary(
             [
                 "n",
                 "corr_h_binned_vs_gt_mc",
+                "corr_clf_h_binned_vs_gt_mc",
                 "corr_clf_vs_ref",
                 "corr_llr_binned_vs_gt_mc",
                 "wall_seconds",
@@ -2345,18 +2505,19 @@ def _render_convergence_figures_and_summary(
                 r_llr = float(np.asarray(corr_llr, dtype=np.float64).ravel()[i])
             else:
                 r_llr = ""
-            w.writerow([n, corr_h[i], corr_clf[i], r_llr, wall_s[i]])
+            w.writerow([n, corr_h[i], corr_clf_h[i], corr_clf[i], r_llr, wall_s[i]])
 
     fig_path = os.path.join(args.output_dir, "h_decoding_convergence.png")
     fig, ax = plt.subplots(1, 1, figsize=_H_DECODING_CURVE_FIGSIZE_IN)
-    _populate_convergence_curve_ax(ax, list(ns), corr_h, corr_clf)
+    _populate_convergence_curve_ax(ax, list(ns), corr_clf_h, corr_h, corr_clf)
     fig.tight_layout()
     conv_svg = _save_figure_png_svg(fig, fig_path, dpi=160)
     plt.close(fig)
 
     matrix_panel_path = os.path.join(args.output_dir, "h_decoding_matrices_panel.png")
-    col_labels = [f"n={n}" for n in ns] + [f"Approx GT, n_ref={int(args.n_ref)}"]
+    col_labels = [f"n={n}" for n in ns] + [f"Approx GT matrix, n_ref={int(args.n_ref)}"]
     _render_matrix_panel(
+        clf_h_mats=list(clf_h_cols),
         h_mats=list(h_cols),
         clf_mats=list(clf_cols),
         col_labels=col_labels,
@@ -2404,12 +2565,14 @@ def _render_convergence_figures_and_summary(
         llr_est = [np.asarray(llr_cols[j], dtype=np.float64) for j in range(len(ns))]
         corr_llr_a = np.asarray(corr_llr, dtype=np.float64).ravel()
     combined_svg = _save_combined_convergence_figure(
+        clf_h_mats=list(clf_h_cols),
         h_mats=list(h_cols),
         clf_mats=list(clf_cols),
         col_labels=col_labels,
         n_bins=n_bins,
         theta_centers=theta_centers,
         ns=list(ns),
+        corr_clf_h=corr_clf_h,
         corr_h=corr_h,
         corr_clf=corr_clf,
         loss_dir=loss_dir,
@@ -2455,6 +2618,9 @@ def _render_convergence_figures_and_summary(
     _write_summary(summary_path, args, meta, perm_seed, n_pool, ref_dir, paths_out, per_n_loss_rows)
     with open(summary_path, "a", encoding="utf-8") as sf:
         sf.write("\n# Correlation targets (Pearson r off-diagonal; matrix_corr_offdiag_pearson)\n")
+        sf.write(
+            "# corr_clf_h_binned_vs_gt_mc: Pearson r, off-diagonal classifier-init sqrt(H^2) vs sqrt(generative GT H^2) (MC one-sided Hellinger).\n"
+        )
         sf.write(
             "# corr_h_binned_vs_gt_mc: Pearson r, off-diagonal binned sqrt(H_sym) vs sqrt(generative GT H^2) (MC one-sided Hellinger).\n"
         )
@@ -2593,8 +2759,10 @@ def main(argv: list[str] | None = None) -> None:
             gt_seed=int(cached["gt_seed"]),
             gt_symmetrize_effective=bool(cached["gt_symmetrize"]),
             corr_h=cached["corr_h"],
+            corr_clf_h=cached["corr_clf_h"],
             corr_clf=cached["corr_clf"],
             wall_s=cached["wall_s"],
+            clf_h_cols=cached["clf_h_cols"],
             h_cols=cached["h_cols"],
             clf_cols=cached["clf_cols"],
             out_npz=cached["out_npz"],
@@ -2826,10 +2994,12 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     corr_h = np.full(len(ns), np.nan, dtype=np.float64)
+    corr_clf_h = np.full(len(ns), np.nan, dtype=np.float64)
     corr_clf = np.full(len(ns), np.nan, dtype=np.float64)
     corr_llr = np.full(len(ns), np.nan, dtype=np.float64)
     wall_s = np.full(len(ns), np.nan, dtype=np.float64)
     err_msg: list[str] = []
+    clf_h_sweep: list[np.ndarray] = []
     h_sweep: list[np.ndarray] = []
     clf_sweep: list[np.ndarray] = []
     llr_sweep: list[np.ndarray] = []
@@ -2930,9 +3100,18 @@ def main(argv: list[str] | None = None) -> None:
                 clf_rs,
             )
             h_n_sqrt = _sqrt_h_like(h_n)
+            clf_h_sq_n = _classifier_initialized_hellinger_sq_binned(
+                subset_n,
+                n_bins,
+                min_class_count=int(args.clf_min_class_count),
+                random_state=clf_rs,
+            )
+            clf_h_n_sqrt = _sqrt_h_like(clf_h_sq_n)
+            corr_clf_h[k] = vhb.matrix_corr_offdiag_pearson(clf_h_n_sqrt, h_gt_sqrt)
             corr_h[k] = vhb.matrix_corr_offdiag_pearson(h_n_sqrt, h_gt_sqrt)
             corr_clf[k] = vhb.matrix_corr_offdiag_pearson(clf_n, clf_ref)
             wall_s[k] = time.time() - t1
+            clf_h_sweep.append(np.asarray(clf_h_n_sqrt, dtype=np.float64))
             h_sweep.append(np.asarray(h_n_sqrt, dtype=np.float64))
             clf_sweep.append(np.asarray(clf_n, dtype=np.float64))
             h_acc_mds_corr.append(float(corr_h[k]))
@@ -2978,7 +3157,7 @@ def main(argv: list[str] | None = None) -> None:
                 )
             print(
                 f"[convergence] n={n}  corr_h={corr_h[k]:.4f}  corr_clf={corr_clf[k]:.4f}  "
-                f"corr_llr={corr_llr[k]:.4f}  wall={wall_s[k]:.1f}s",
+                f"corr_clf_h={corr_clf_h[k]:.4f}  corr_llr={corr_llr[k]:.4f}  wall={wall_s[k]:.1f}s",
                 flush=True,
             )
             run_loss_npz = os.path.join(run_dir, "score_prior_training_losses.npz")
@@ -3028,11 +3207,18 @@ def main(argv: list[str] | None = None) -> None:
             "Per-n sweep failed (including required training-loss collection).\n"
             f"{msg}"
         )
-    if len(h_sweep) != len(ns) or len(clf_sweep) != len(ns) or len(llr_sweep) != len(ns):
+    if (
+        len(clf_h_sweep) != len(ns)
+        or len(h_sweep) != len(ns)
+        or len(clf_sweep) != len(ns)
+        or len(llr_sweep) != len(ns)
+    ):
         raise RuntimeError(
             "Missing binned matrices for some n (partial failures). "
             "Fix errors above or re-run with a smaller n-list."
         )
+    clf_h_ref = np.asarray(h_ref, dtype=np.float64)
+    clf_h_cols = np.stack(clf_h_sweep + [clf_h_ref], axis=0)
     h_cols = np.stack(h_sweep + [h_ref], axis=0)
     clf_cols = np.stack(clf_sweep + [clf_ref], axis=0)
     llr_ref = np.asarray(llr_gt_mc, dtype=np.float64)
@@ -3044,6 +3230,7 @@ def main(argv: list[str] | None = None) -> None:
         out_npz,
         n=np.asarray(ns, dtype=np.int64),
         corr_h_binned_vs_gt_mc=corr_h,
+        corr_clf_h_binned_vs_gt_mc=corr_clf_h,
         corr_h_acc_mds_vs_gt_mc=(
             np.asarray(h_acc_mds_corr, dtype=np.float64)
             if use_acc_mds_state
@@ -3065,6 +3252,7 @@ def main(argv: list[str] | None = None) -> None:
         gt_hellinger_seed=np.int64(gt_seed),
         gt_hellinger_symmetrize=np.int32(1 if bool(args.gt_hellinger_symmetrize) else 0),
         h_binned_ref_is_gt_mc=np.int32(1),
+        clf_h_binned_columns=clf_h_cols,
         h_binned_columns=h_cols,
         clf_acc_columns=clf_cols,
         column_n=column_n,
@@ -3086,8 +3274,10 @@ def main(argv: list[str] | None = None) -> None:
         gt_seed=int(gt_seed),
         gt_symmetrize_effective=bool(args.gt_hellinger_symmetrize),
         corr_h=corr_h,
+        corr_clf_h=corr_clf_h,
         corr_clf=corr_clf,
         wall_s=wall_s,
+        clf_h_cols=clf_h_cols,
         h_cols=h_cols,
         clf_cols=clf_cols,
         out_npz=out_npz,

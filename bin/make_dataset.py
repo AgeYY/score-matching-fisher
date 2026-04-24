@@ -44,7 +44,7 @@ Run ``python bin/make_dataset.py --help`` for argparse defaults and exact wordin
 
 - ``--n-total`` / ``--num-samples`` (default 3000) — Number of joint ``(θ, x)`` draws before splitting.
 
-- ``--train-frac`` (default 0.7) — Fraction of indices assigned to ``train_idx``. The remainder is
+- ``--train-frac`` (default 0.8) — Fraction of indices assigned to ``train_idx``. The remainder is
   ``validation_idx`` (held-out). Must be in ``(0, 1]``. Values ``< 1`` are required for shared Fisher /
   H-matrix / pairwise-CLF pipelines that need a non-empty validation slice.
 
