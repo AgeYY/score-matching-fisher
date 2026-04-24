@@ -20,6 +20,13 @@ import study_h_decoding_convergence as shc  # noqa: E402
 
 
 class TestClassifierInitializedHellinger(unittest.TestCase):
+    def test_parser_defaults_include_auto_heim_knobs(self) -> None:
+        parser = shc.build_parser()
+        args = parser.parse_args(["--dataset-npz", "dummy.npz"])
+        self.assertEqual(int(args.heim_flow_iters), 5)
+        self.assertEqual(int(args.heim_flow_max_iters), 20)
+        self.assertAlmostEqual(float(args.heim_flow_convergence_tol), 0.02, places=12)
+
     def test_classifier_initialized_matrix_shape_symmetry_range_sparse(self) -> None:
         rng = np.random.default_rng(123)
         n_bins = 4
@@ -80,6 +87,135 @@ class TestClassifierInitializedHellinger(unittest.TestCase):
         finite = np.isfinite(h2)
         self.assertTrue(np.all((h2[finite] >= 0.0) & (h2[finite] <= 1.0)))
         self.assertTrue(np.any(~finite))
+
+    def test_euclidean_initialized_matrix_shape_symmetry_range_sparse(self) -> None:
+        rng = np.random.default_rng(321)
+        n_bins = 4
+        n_per_bin_full = [24, 22, 20, 3]
+        x_dim = 3
+
+        x_all_parts: list[np.ndarray] = []
+        bin_all_parts: list[np.ndarray] = []
+        for b, n_b in enumerate(n_per_bin_full):
+            mu = np.array([0.5 * float(b), -0.2 * float(b), 0.1 * float(b)], dtype=np.float64)
+            x_b = rng.normal(loc=mu, scale=0.3, size=(int(n_b), x_dim))
+            x_all_parts.append(x_b)
+            bin_all_parts.append(np.full(int(n_b), int(b), dtype=np.int64))
+        x_all = np.vstack(x_all_parts)
+        bin_all = np.concatenate(bin_all_parts)
+
+        n_total = int(x_all.shape[0])
+        n_train = int(0.7 * n_total)
+        tr_idx = np.arange(0, n_train, dtype=np.int64)
+        va_idx = np.arange(n_train, n_total, dtype=np.int64)
+        theta_dummy = np.zeros((n_total, 1), dtype=np.float64)
+        subset = shc.SweepSubset(
+            bundle=SharedDatasetBundle(
+                meta={"seed": 321, "train_frac": 0.7},
+                theta_all=theta_dummy,
+                x_all=np.asarray(x_all, dtype=np.float64),
+                train_idx=tr_idx,
+                validation_idx=va_idx,
+                theta_train=np.asarray(theta_dummy[tr_idx], dtype=np.float64),
+                x_train=np.asarray(x_all[tr_idx], dtype=np.float64),
+                theta_validation=np.asarray(theta_dummy[va_idx], dtype=np.float64),
+                x_validation=np.asarray(x_all[va_idx], dtype=np.float64),
+            ),
+            bin_all=np.asarray(bin_all, dtype=np.int64),
+            bin_train=np.asarray(bin_all[tr_idx], dtype=np.int64),
+            bin_validation=np.asarray(bin_all[va_idx], dtype=np.int64),
+        )
+
+        h2 = shc._euclidean_initialized_hellinger_sq_binned(
+            subset,
+            n_bins,
+            min_bin_count=8,
+        )
+
+        self.assertEqual(h2.shape, (n_bins, n_bins))
+        self.assertTrue(np.allclose(h2, h2.T, equal_nan=True))
+        self.assertTrue(np.allclose(np.diag(h2), 0.0))
+
+        finite = np.isfinite(h2)
+        self.assertTrue(np.all((h2[finite] >= 0.0) & (h2[finite] <= 1.0)))
+        self.assertTrue(np.any(~finite))
+
+    def test_validate_cli_accepts_heim_flow_with_x_flow(self) -> None:
+        parser = shc.build_parser()
+        args = parser.parse_args(
+            [
+                "--dataset-npz",
+                "dummy.npz",
+                "--theta-field-method",
+                "x_flow",
+                "--flow-arch",
+                "mlp",
+                "--heim-flow-enable",
+                "--heim-flow-iters",
+                "2",
+                "--heim-flow-mds-dim",
+                "3",
+            ]
+        )
+        shc._validate_cli(args)
+
+    def test_validate_cli_rejects_heim_flow_with_acc_mds(self) -> None:
+        parser = shc.build_parser()
+        args = parser.parse_args(
+            [
+                "--dataset-npz",
+                "dummy.npz",
+                "--theta-field-method",
+                "x_flow",
+                "--flow-arch",
+                "mlp",
+                "--heim-flow-enable",
+                "--theta-flow-acc-mds-state",
+            ]
+        )
+        with self.assertRaises(ValueError):
+            shc._validate_cli(args)
+
+    def test_validate_cli_accepts_heim_flow_auto_mode_with_positive_tol(self) -> None:
+        parser = shc.build_parser()
+        args = parser.parse_args(
+            [
+                "--dataset-npz",
+                "dummy.npz",
+                "--theta-field-method",
+                "x_flow",
+                "--flow-arch",
+                "mlp",
+                "--heim-flow-enable",
+                "--heim-flow-iters",
+                "0",
+                "--heim-flow-max-iters",
+                "12",
+                "--heim-flow-convergence-tol",
+                "0.01",
+            ]
+        )
+        shc._validate_cli(args)
+
+    def test_validate_cli_rejects_heim_flow_auto_mode_without_positive_tol(self) -> None:
+        parser = shc.build_parser()
+        args = parser.parse_args(
+            [
+                "--dataset-npz",
+                "dummy.npz",
+                "--theta-field-method",
+                "x_flow",
+                "--flow-arch",
+                "mlp",
+                "--heim-flow-enable",
+                "--heim-flow-iters",
+                "0",
+                "--heim-flow-convergence-tol",
+                "0",
+            ]
+        )
+        with self.assertRaises(ValueError):
+            shc._validate_cli(args)
 
 
 if __name__ == "__main__":

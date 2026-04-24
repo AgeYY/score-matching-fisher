@@ -92,64 +92,87 @@ and uses each matrix to construct an embedded coordinate system for the next rou
 
 \subsubsection{Initialization of the Hellinger distance matrix}
 
-For each anchor $\vartheta_i$, define normalized local weights
+We initialize the Hellinger distance matrix using a simple shared-Gaussian approximation.
+We first divide the parameter space into bins
+\[
+    \mathcal B_1,\dots,\mathcal B_M,
+\]
+and let
+\[
+    I_i=\{n:\theta_n\in \mathcal B_i\}
+\]
+denote the samples assigned to bin $i$. Within each bin, we estimate the conditional mean by
 \begin{equation}
-\label{eq:anchor-weights}
-    \alpha_{ni}
+    \widehat\mu_i
     =
-    \frac{K_h(\theta_n-\vartheta_i)}
-    {\sum_{m=1}^N K_h(\theta_m-\vartheta_i)},
-    \qquad
-    \sum_{n=1}^N \alpha_{ni}=1,
+    \frac{1}{|I_i|}
+    \sum_{n\in I_i} x_n .
 \end{equation}
-where $K_h$ is either a hard binning kernel or a smooth kernel with bandwidth $h$. These weights define a local empirical approximation to $p(x\mid \vartheta_i)$.
+We assume that the conditional distribution in each bin is approximately Gaussian with bin-dependent mean but shared covariance:
+\begin{equation}
+    p(x\mid \theta\in\mathcal B_i)
+    \approx
+    \mathcal N(\widehat\mu_i,\Sigma).
+\end{equation}
 
-For each anchor pair $(i,j)$, train a binary classifier $c_{ij}(x)\in(0,1)$ that distinguishes the two locally weighted empirical distributions. We use balanced class priors for this artificial classification problem:
+To estimate the shared noise covariance, we compute residuals within each bin,
 \begin{equation}
-\label{eq:weighted-clf-loss}
-    \mathcal{L}_{ij}^{\mathrm{clf}}
-    =
-    -\frac{1}{2}\sum_{n=1}^N \alpha_{ni}\log c_{ij}(x_n)
-    -\frac{1}{2}\sum_{n=1}^N \alpha_{nj}\log\!\left(1-c_{ij}(x_n)\right).
+    r_n=x_n-\widehat\mu_i,
+    \qquad n\in I_i.
 \end{equation}
-The normalization in \eqref{eq:anchor-weights} and the factors $1/2$ in \eqref{eq:weighted-clf-loss} imply equal class priors, regardless of how many raw samples lie near each anchor. Under the optimal classifier,
+We then concatenate residuals across all bins and compute the empirical residual covariance
 \begin{equation}
-    \operatorname{logit} c_{ij}^*(x)
+    S_{\mathrm{res}}
     =
-    \log \frac{p(x\mid \vartheta_i)}{p(x\mid \vartheta_j)}.
+    \frac{1}{N-M}
+    \sum_{i=1}^M
+    \sum_{n\in I_i}
+    r_n r_n^\top .
 \end{equation}
-Therefore we initialize the log-likelihood ratio by
+To obtain a stable precision matrix, we use a Ledoit--Wolf shrinkage estimate of the shared covariance:
 \begin{equation}
-    \widehat{\ell}_{ij}^{(0)}(x)
+    \widehat\Sigma_{\mathrm{LW}}
     =
-    \log\frac{c_{ij}(x)}{1-c_{ij}(x)}.
-\end{equation}
-The initial squared Hellinger estimate is
-\begin{equation}
-\label{eq:H-init}
-    \widehat H_{ij}^{2,(0)}
-    =
-    \frac{1}{2}\sum_{n=1}^N
-    \alpha_{ni}\,\psi\!\left(\widehat{\ell}_{ij}^{(0)}(x_n)\right)
+    (1-\rho)S_{\mathrm{res}}
     +
-    \frac{1}{2}\sum_{n=1}^N
-    \alpha_{nj}\,\psi\!\left(\widehat{\ell}_{ij}^{(0)}(x_n)\right),
+    \rho\,\frac{\operatorname{tr}(S_{\mathrm{res}})}{d}I,
 \end{equation}
-where $\psi(u)=1-\operatorname{sech}(u/2)$.
-We then symmetrize and clip the estimate:
+where the shrinkage coefficient $\rho\in[0,1]$ is chosen analytically by the Ledoit--Wolf procedure. We define the corresponding precision matrix as
+\begin{equation}
+    \widehat\Lambda_{\mathrm{LW}}
+    =
+    \widehat\Sigma_{\mathrm{LW}}^{-1}.
+\end{equation}
+
+Under the shared-Gaussian approximation, the squared Hellinger distance between bins $i$ and $j$ has the closed form
 \begin{equation}
     \widehat H_{ij}^{2,(0)}
-    \leftarrow
-    \operatorname{clip}\!\left(
-    \frac{\widehat H_{ij}^{2,(0)}+\widehat H_{ji}^{2,(0)}}{2},
-    0,1
-    \right),
-    \qquad
-    \widehat H_{ii}^{2,(0)}=0.
+    =
+    1-
+    \exp\left[
+    -\frac{1}{8}
+    (\widehat\mu_i-\widehat\mu_j)^\top
+    \widehat\Lambda_{\mathrm{LW}}
+    (\widehat\mu_i-\widehat\mu_j)
+    \right].
 \end{equation}
-Finally, the initial MDS dissimilarity matrix is
+Therefore, the initial MDS dissimilarity matrix is
 \begin{equation}
-    D_{ij}^{(0)} = \sqrt{\widehat H_{ij}^{2,(0)}}.
+    D_{ij}^{(0)}
+    =
+    \widehat H_{ij}^{(0)}
+    =
+    \sqrt{
+    1-
+    \exp\left[
+    -\frac{1}{8}
+    (\widehat\mu_i-\widehat\mu_j)^\top
+    \widehat\Lambda_{\mathrm{LW}}
+    (\widehat\mu_i-\widehat\mu_j)
+    \right]
+    },
+    \qquad
+    D_{ii}^{(0)}=0.
 \end{equation}
 
 \subsubsection{Metric MDS embedding of the anchor parameters}
@@ -224,23 +247,62 @@ For anchor pair $(i,j)$, the flow-based log-likelihood ratio is
     -
     \log \widehat p_k(x\mid z_j^{(k)}).
 \end{equation}
-Using the original local weights $\alpha_{ni}$ and $\alpha_{nj}$ from \eqref{eq:anchor-weights}, update the squared Hellinger distance by
+
+Once the log-likelihood ratio is available, the Hellinger update follows the sample-wise construction in the Hellinger note. Define
+\begin{equation}
+    \psi(u)
+    =
+    1-\operatorname{sech}\!\left(\frac{u}{2}\right).
+\end{equation}
+Because $\operatorname{sech}$ is even, $\psi(\widehat{\ell}_{ij}^{(k+1)}(x))$ is the same sample-wise contribution whether the ratio is written as $\log \widehat p_i-\log \widehat p_j$ or with the opposite sign.
+
+Let $I_i$ denote the samples assigned to the local neighborhood or bin of anchor $\vartheta_i$. The two Monte Carlo averages
+\begin{equation}
+    \widehat m_{i\to j}^{(k+1)}
+    =
+    \frac{1}{|I_i|}
+    \sum_{n\in I_i}
+    \psi\!\left(\widehat{\ell}_{ij}^{(k+1)}(x_n)\right),
+    \qquad
+    \widehat m_{j\to i}^{(k+1)}
+    =
+    \frac{1}{|I_j|}
+    \sum_{n\in I_j}
+    \psi\!\left(\widehat{\ell}_{ij}^{(k+1)}(x_n)\right)
+\end{equation}
+estimate the two expectations in the symmetric identity
+\begin{equation}
+    H^2(p_i,p_j)
+    =
+    \frac{1}{2}
+    \mathbb E_{X_i\sim p_i}
+    \left[
+    \psi(\ell_{ij}(X_i))
+    \right]
+    +
+    \frac{1}{2}
+    \mathbb E_{X_j\sim p_j}
+    \left[
+    \psi(\ell_{ij}(X_j))
+    \right].
+\end{equation}
+Therefore the flow-based squared Hellinger update is
 \begin{equation}
 \label{eq:H-update}
     \widehat H_{ij}^{2,(k+1)}
     =
-    \frac{1}{2}\sum_{n=1}^N
-    \alpha_{ni}\,\psi\!\left(\widehat{\ell}_{ij}^{(k+1)}(x_n)\right)
+    \frac{1}{2}
+    \widehat m_{i\to j}^{(k+1)}
     +
-    \frac{1}{2}\sum_{n=1}^N
-    \alpha_{nj}\,\psi\!\left(\widehat{\ell}_{ij}^{(k+1)}(x_n)\right).
+    \frac{1}{2}
+    \widehat m_{j\to i}^{(k+1)}.
 \end{equation}
-Then symmetrize and clip:
+After computing all pairs, clip numerical errors and set the diagonal to zero:
 \begin{equation}
     \widehat H_{ij}^{2,(k+1)}
     \leftarrow
     \operatorname{clip}\!\left(
-    \frac{\widehat H_{ij}^{2,(k+1)}+\widehat H_{ji}^{2,(k+1)}}{2},
+    \widehat H_{ij}^{2,(k+1)},
     0,1
     \right),
     \qquad
@@ -259,16 +321,17 @@ No damping is applied; each iteration uses the newly estimated Hellinger distanc
 The full HeIM-Flow procedure is:
 \begin{enumerate}
     \item Choose anchor parameters $\{\vartheta_i\}_{i=1}^M$.
-    \item Compute local weights $\alpha_{ni}$ around each anchor.
-    \item Initialize $D^{(0)}$ with pairwise classifier-based Hellinger estimates.
+    \item Assign samples to anchor neighborhoods or bins $I_1,\ldots,I_M$.
+    \item Initialize $D^{(0)}$ with the shared-Gaussian Hellinger estimate.
     \item For $k=0,1,\ldots,K-1$:
     \begin{enumerate}
         \item Apply metric MDS to $D^{(k)}$ to obtain anchor embeddings $Z^{(k)}=\{z_i^{(k)}\}_{i=1}^M$.
         \item Construct a linear interpolation map $g^{(k)}$ from $\vartheta_i$ to $z_i^{(k)}$.
         \item Embed all training parameters by $\tilde{\theta}_n^{(k)}=g^{(k)}(\theta_n)$.
         \item Train a conditional flow-matching model on $\{(\tilde{\theta}_n^{(k)},x_n)\}_{n=1}^N$.
-        \item Evaluate flow-based log-likelihood ratios using \eqref{eq:flow-llr}.
-        \item Update the Hellinger matrix using \eqref{eq:H-update} and set $D^{(k+1)}=\sqrt{\widehat H^{2,(k+1)}}$.
+        \item Evaluate flow-based log-likelihood ratios using \eqref{eq:flow-llr} for every anchor pair.
+        \item Convert the log-likelihood ratios into sample-wise contributions with $1-\operatorname{sech}(\widehat{\ell}/2)$.
+        \item Average those contributions over the two anchor neighborhoods using \eqref{eq:H-update}, then set $D^{(k+1)}=\sqrt{\widehat H^{2,(k+1)}}$.
     \end{enumerate}
 \end{enumerate}
 The algorithm can be run for a fixed number of iterations or until the Hellinger matrix stabilizes, for example when

@@ -79,6 +79,7 @@ from global_setting import DATA_DIR
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from sklearn.covariance import LedoitWolf
 from sklearn.linear_model import LogisticRegression
 
 import visualize_h_matrix_binned as vhb
@@ -102,6 +103,7 @@ from fisher.nf_hellinger import (
     train_prior_nf,
 )
 from fisher.evaluation import log_p_x_given_theta
+from fisher.heim_flow import HeimFlowConfig, HeimIterationInput, HeimIterationOutput, run_heim_flow
 from fisher.score_distance import classical_mds_from_distances
 from fisher.shared_dataset_io import SharedDatasetBundle, load_shared_dataset_npz
 from fisher.shared_fisher_est import (
@@ -420,6 +422,57 @@ def build_parser() -> argparse.ArgumentParser:
         help="Embedding dimension for --theta-flow-acc-mds-state (default: 5).",
     )
     p.add_argument(
+        "--heim-flow-enable",
+        action="store_true",
+        help=(
+            "Enable iterative HeIM-Flow: initialize binned H^2, apply MDS embedding, "
+            "train flow on embedded state, update H^2 from flow likelihood, and iterate."
+        ),
+    )
+    p.add_argument(
+        "--heim-flow-iters",
+        type=int,
+        default=5,
+        help=(
+            "HeIM-Flow iterations. Set K>=1 for fixed budget; set 0 for auto mode "
+            "(stop on --heim-flow-convergence-tol, capped by --heim-flow-max-iters). "
+            "Default: 5."
+        ),
+    )
+    p.add_argument(
+        "--heim-flow-max-iters",
+        type=int,
+        default=20,
+        help="HeIM-Flow auto mode safety cap when --heim-flow-iters=0 (default: 20).",
+    )
+    p.add_argument(
+        "--heim-flow-mds-dim",
+        type=int,
+        default=0,
+        help=(
+            "HeIM-Flow MDS embedding dimension r. "
+            "0 (default) uses r=max(1, num_theta_bins-1) (anchor-count minus one). "
+            "Set >0 to override manually."
+        ),
+    )
+    p.add_argument(
+        "--heim-flow-init-mode",
+        type=str,
+        default="euclidean",
+        choices=["euclidean", "classifier"],
+        help="HeIM-Flow D^(0) initializer (default: euclidean).",
+    )
+    p.add_argument(
+        "--heim-flow-convergence-tol",
+        type=float,
+        default=0.02,
+        help=(
+            "Relative Frobenius convergence threshold on successive HeIM distance matrices. "
+            "In auto mode (--heim-flow-iters=0), must be >0. "
+            "In fixed-K mode, <=0 disables early stop. Default: 0.02."
+        ),
+    )
+    p.add_argument(
         "--clf-min-class-count",
         type=int,
         default=5,
@@ -622,12 +675,17 @@ def _validate_cli(args: argparse.Namespace) -> None:
     use_fourier = bool(getattr(args, "theta_flow_fourier_state", False))
     use_segmented = bool(getattr(args, "theta_flow_segmented", False))
     use_acc_mds = bool(getattr(args, "theta_flow_acc_mds_state", False))
+    use_heim_flow = bool(getattr(args, "heim_flow_enable", False))
     if use_onehot and use_fourier:
         raise ValueError("Use only one theta-flow state override: one-hot or Fourier, not both.")
     if use_acc_mds and (use_onehot or use_fourier or use_segmented):
         raise ValueError(
             "--theta-flow-acc-mds-state is exclusive with --theta-flow-onehot-state, "
             "--theta-flow-fourier-state, and --theta-flow-segmented."
+        )
+    if use_heim_flow and (use_onehot or use_fourier or use_segmented or use_acc_mds):
+        raise ValueError(
+            "--heim-flow-enable is exclusive with theta-flow state overrides and --theta-flow-acc-mds-state."
         )
     if use_segmented and use_onehot:
         raise ValueError("Use only one theta-flow mode: segmented or one-hot, not both.")
@@ -686,6 +744,33 @@ def _validate_cli(args: argparse.Namespace) -> None:
             )
         if int(getattr(args, "theta_flow_acc_mds_dim", 0)) < 1:
             raise ValueError("--theta-flow-acc-mds-dim must be >= 1.")
+    if use_heim_flow:
+        tfm = str(getattr(args, "theta_field_method", "theta_flow")).strip().lower()
+        arch = str(getattr(args, "flow_arch", "mlp")).strip().lower()
+        if tfm not in ("theta_flow", "x_flow"):
+            raise ValueError(
+                "--heim-flow-enable requires --theta-field-method in {theta_flow, x_flow} "
+                f"(got {getattr(args, 'theta_field_method', None)!r})."
+            )
+        if arch != "mlp":
+            raise ValueError(
+                "--heim-flow-enable currently supports --flow-arch mlp only "
+                f"(got {getattr(args, 'flow_arch', None)!r})."
+            )
+        iters_req = int(getattr(args, "heim_flow_iters", 0))
+        if iters_req < 0:
+            raise ValueError("--heim-flow-iters must be >= 0 (0 means auto mode).")
+        max_iters = int(getattr(args, "heim_flow_max_iters", 20))
+        if max_iters < 1:
+            raise ValueError("--heim-flow-max-iters must be >= 1.")
+        mds_req = int(getattr(args, "heim_flow_mds_dim", 0))
+        if mds_req < 0:
+            raise ValueError("--heim-flow-mds-dim must be >= 0 (0 means auto: max(1, num_theta_bins-1)).")
+        tol = float(getattr(args, "heim_flow_convergence_tol", 0.0))
+        if not np.isfinite(tol):
+            raise ValueError("--heim-flow-convergence-tol must be finite.")
+        if iters_req == 0 and tol <= 0.0:
+            raise ValueError("--heim-flow-convergence-tol must be > 0 when --heim-flow-iters=0 (auto mode).")
     _parse_n_list(args.n_list)  # syntax check only; pool size checked in main
 
 
@@ -776,6 +861,40 @@ def _write_acc_mds_h_matrix_figure(
     fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.03)
     tag = "x_flow" if str(method_tag).strip().lower() == "x_flow" else "theta_flow"
     png = os.path.join(out_dir, f"h_{tag}_acc_mds_n_{int(n):06d}.png")
+    svg = str(Path(png).with_suffix(".svg"))
+    fig.savefig(png, dpi=220)
+    fig.savefig(svg)
+    plt.close(fig)
+    return png, svg
+
+
+def _write_heim_flow_h_matrix_figure(
+    *,
+    out_dir: str,
+    method_tag: str,
+    n: int,
+    h_sqrt: np.ndarray,
+    h_gt_sqrt: np.ndarray,
+    corr_h: float,
+) -> tuple[str, str]:
+    os.makedirs(out_dir, exist_ok=True)
+    fig, axes = plt.subplots(1, 2, figsize=(8.8, 3.9), constrained_layout=True)
+    vmax = float(np.nanmax(np.asarray([h_sqrt, h_gt_sqrt], dtype=np.float64)))
+    if (not np.isfinite(vmax)) or vmax <= 0.0:
+        vmax = 1.0
+    im0 = axes[0].imshow(h_sqrt, origin="lower", vmin=0.0, vmax=vmax, cmap="viridis", interpolation="nearest")
+    method_label = "x-flow" if str(method_tag).strip().lower() == "x_flow" else "theta-flow"
+    axes[0].set_title(rf"HeIM-Flow {method_label} $\sqrt{{H^2}}$ (n={int(n)})", fontsize=10)
+    axes[0].set_xlabel(r"$\theta$ bin")
+    axes[0].set_ylabel(r"$\theta$ bin")
+    fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.03)
+    im1 = axes[1].imshow(h_gt_sqrt, origin="lower", vmin=0.0, vmax=vmax, cmap="viridis", interpolation="nearest")
+    axes[1].set_title(rf"GT MC $\sqrt{{H^2}}$ (r={float(corr_h):.4f})", fontsize=10)
+    axes[1].set_xlabel(r"$\theta$ bin")
+    axes[1].set_ylabel(r"$\theta$ bin")
+    fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.03)
+    tag = "x_flow" if str(method_tag).strip().lower() == "x_flow" else "theta_flow"
+    png = os.path.join(out_dir, f"h_{tag}_heim_flow_n_{int(n):06d}.png")
     svg = str(Path(png).with_suffix(".svg"))
     fig.savefig(png, dpi=220)
     fig.savefig(svg)
@@ -1002,6 +1121,76 @@ def _classifier_initialized_hellinger_sq_binned(
     return out
 
 
+def _euclidean_initialized_hellinger_sq_binned(
+    subset: SweepSubset,
+    n_bins: int,
+    *,
+    min_bin_count: int,
+) -> np.ndarray:
+    r"""Shared-Gaussian/Mahalanobis initialized binned H^2 estimate.
+
+    This implements the initialization in
+    ``report/notes/2026-04-23-HeIM_Flow_method.tex``: estimate per-bin means,
+    fit a Ledoit-Wolf shared residual covariance, then use the closed-form
+    shared-covariance Gaussian Hellinger distance.
+    """
+    x_all = np.asarray(subset.bundle.x_all, dtype=np.float64)
+    bi_all = np.asarray(subset.bin_all, dtype=np.int64).reshape(-1)
+    nb = int(n_bins)
+    min_count = int(min_bin_count)
+    if x_all.ndim != 2:
+        raise ValueError("x_all must be 2D.")
+    if x_all.shape[0] != bi_all.shape[0]:
+        raise ValueError("x_all and bin_all must have the same number of rows.")
+    if nb < 1:
+        raise ValueError("n_bins must be >= 1.")
+    if min_count < 1:
+        raise ValueError("min_bin_count must be >= 1.")
+
+    means = np.full((nb, int(x_all.shape[1])), np.nan, dtype=np.float64)
+    valid = np.zeros(nb, dtype=bool)
+    residuals: list[np.ndarray] = []
+    for b in range(nb):
+        idx = np.flatnonzero(bi_all == b)
+        if int(idx.size) < min_count:
+            continue
+        xb = np.asarray(x_all[idx], dtype=np.float64)
+        mu = np.mean(xb, axis=0)
+        means[b, :] = mu
+        valid[b] = True
+        residuals.append(xb - mu)
+
+    out = np.full((nb, nb), np.nan, dtype=np.float64)
+    np.fill_diagonal(out, 0.0)
+    if int(np.sum(valid)) < 2 or not residuals:
+        return out
+
+    resid = np.vstack(residuals)
+    if resid.shape[0] < 2:
+        return out
+    try:
+        lw = LedoitWolf().fit(resid)
+        precision = np.asarray(lw.precision_, dtype=np.float64)
+    except Exception:
+        return out
+
+    for i in range(nb):
+        if not valid[i]:
+            continue
+        for j in range(i + 1, nb):
+            if not valid[j]:
+                continue
+            diff = means[i] - means[j]
+            maha2 = float(diff @ precision @ diff)
+            if not np.isfinite(maha2):
+                continue
+            h2_ij = 1.0 - float(np.exp(-0.125 * max(0.0, maha2)))
+            h2_ij = float(np.clip(h2_ij, 0.0, 1.0))
+            out[i, j] = h2_ij
+            out[j, i] = h2_ij
+    return out
+
+
 def _pairwise_clf_from_bundle(
     *,
     args: argparse.Namespace,
@@ -1178,6 +1367,144 @@ def _estimate_one(
             f"x/H row mismatch: x_aligned={x_aligned.shape[0]} theta_used={loaded.theta_used.shape[0]}"
         )
     return loaded, x_aligned, ctx.device
+
+
+def _run_heim_flow_for_subset(
+    *,
+    args: argparse.Namespace,
+    meta: dict,
+    subset: SweepSubset,
+    output_dir: str,
+    n_bins: int,
+    dataset_family: str,
+) -> tuple[np.ndarray, np.ndarray, vhb.LoadedHMatrix, np.ndarray]:
+    """Run iterative HeIM-Flow for one subset and return final binned H^2 + clf matrix."""
+    clf_rs = int(meta["seed"]) if int(args.clf_random_state) < 0 else int(args.clf_random_state)
+    mds_req = int(getattr(args, "heim_flow_mds_dim", 0))
+    if mds_req == 0:
+        mds_eff = max(1, int(n_bins) - 1)
+    else:
+        mds_eff = int(mds_req)
+    iters_req = int(getattr(args, "heim_flow_iters", 5))
+    max_iters = int(getattr(args, "heim_flow_max_iters", 20))
+    n_iters_eff = int(max_iters) if iters_req == 0 else int(iters_req)
+    cfg = HeimFlowConfig(
+        n_bins=int(n_bins),
+        n_iters=n_iters_eff,
+        mds_dim=int(mds_eff),
+        init_mode=str(getattr(args, "heim_flow_init_mode", "euclidean")),
+        min_class_count=int(getattr(args, "clf_min_class_count", 5)),
+        min_bin_count=int(getattr(args, "clf_min_class_count", 5)),
+        clf_random_state=clf_rs,
+        convergence_tol=float(getattr(args, "heim_flow_convergence_tol", 0.02)),
+    )
+    os.makedirs(output_dir, exist_ok=True)
+    last_run: dict[str, Any] = {}
+
+    def _estimate_cb(payload: HeimIterationInput) -> HeimIterationOutput:
+        os.makedirs(payload.output_dir, exist_ok=True)
+        iter_bundle = SharedDatasetBundle(
+            meta=subset.bundle.meta,
+            theta_all=np.asarray(payload.theta_state_all, dtype=np.float64),
+            x_all=np.asarray(subset.bundle.x_all, dtype=np.float64),
+            train_idx=subset.bundle.train_idx,
+            validation_idx=subset.bundle.validation_idx,
+            theta_train=np.asarray(payload.theta_state_train, dtype=np.float64),
+            x_train=np.asarray(subset.bundle.x_train, dtype=np.float64),
+            theta_validation=np.asarray(payload.theta_state_validation, dtype=np.float64),
+            x_validation=np.asarray(subset.bundle.x_validation, dtype=np.float64),
+        )
+        loaded_k, x_aligned_k, _dev = _estimate_one(
+            args=args,
+            meta=meta,
+            bundle=iter_bundle,
+            output_dir=payload.output_dir,
+            n_bins=n_bins,
+        )
+        last_run["loaded"] = loaded_k
+        last_run["x_aligned"] = x_aligned_k
+        suffix_base = _h_matrix_results_npz_basename(dataset_family=dataset_family)
+        h_npz_k = os.path.join(payload.output_dir, suffix_base)
+        if (not os.path.isfile(h_npz_k)) and suffix_base != "h_matrix_results_theta_cov.npz":
+            alt = os.path.join(payload.output_dir, "h_matrix_results_theta_cov.npz")
+            if os.path.isfile(alt):
+                h_npz_k = alt
+        delta_l_k = _load_delta_l_from_run_dir(payload.output_dir, dataset_family=dataset_family)
+        return HeimIterationOutput(
+            h2_binned=None,
+            delta_l_matrix=np.asarray(delta_l_k, dtype=np.float64),
+            h_sym_matrix=np.asarray(loaded_k.h_sym, dtype=np.float64),
+            metadata={
+                "iter_output_dir": payload.output_dir,
+                "h_npz_path": h_npz_k,
+            },
+        )
+
+    heim_root = os.path.join(output_dir, "heim_flow")
+    heim_out = run_heim_flow(
+        x_all=np.asarray(subset.bundle.x_all, dtype=np.float64),
+        x_train=np.asarray(subset.bundle.x_train, dtype=np.float64),
+        x_validation=np.asarray(subset.bundle.x_validation, dtype=np.float64),
+        bin_all=np.asarray(subset.bin_all, dtype=np.int64),
+        bin_train=np.asarray(subset.bin_train, dtype=np.int64),
+        bin_validation=np.asarray(subset.bin_validation, dtype=np.int64),
+        output_root=heim_root,
+        cfg=cfg,
+        estimate_callback=_estimate_cb,
+    )
+
+    if not last_run:
+        raise RuntimeError("HeIM-Flow callback did not produce any iteration output.")
+    final_md = heim_out.iteration_metadata[-1] if heim_out.iteration_metadata else {}
+    final_iter_dir = str(final_md.get("iter_output_dir", "")).strip()
+    if not final_iter_dir:
+        final_iter_dir = os.path.join(heim_root, f"iter_{len(heim_out.history_embedding)-1:03d}")
+    final_h_npz = os.path.join(final_iter_dir, _h_matrix_results_npz_basename(dataset_family=dataset_family))
+    if (not os.path.isfile(final_h_npz)) and dataset_family != "cosine_gmm":
+        alt_h = os.path.join(final_iter_dir, "h_matrix_results_theta_cov.npz")
+        if os.path.isfile(alt_h):
+            final_h_npz = alt_h
+    if os.path.isfile(final_h_npz):
+        shutil.copy2(final_h_npz, os.path.join(output_dir, os.path.basename(final_h_npz)))
+    final_loss_npz = os.path.join(final_iter_dir, "score_prior_training_losses.npz")
+    if os.path.isfile(final_loss_npz):
+        shutil.copy2(final_loss_npz, os.path.join(output_dir, "score_prior_training_losses.npz"))
+
+    heim_npz = os.path.join(output_dir, "heim_flow_iterations.npz")
+    np.savez_compressed(
+        heim_npz,
+        init_h2=np.asarray(heim_out.init_h2, dtype=np.float64),
+        final_h2=np.asarray(heim_out.final_h2, dtype=np.float64),
+        final_d=np.asarray(heim_out.final_d, dtype=np.float64),
+        final_embedding=np.asarray(heim_out.final_embedding, dtype=np.float64),
+        final_theta_state_all=np.asarray(heim_out.final_theta_state_all, dtype=np.float64),
+        rel_change_history=np.asarray(heim_out.rel_change_history, dtype=np.float64),
+        heim_iters_requested=np.int64(iters_req),
+        heim_iters_effective_budget=np.int64(cfg.n_iters),
+        heim_iters_completed=np.int64(len(heim_out.rel_change_history)),
+        heim_iters_auto_mode=np.int64(1 if iters_req == 0 else 0),
+        heim_flow_max_iters=np.int64(max_iters),
+        heim_flow_convergence_tol=np.float64(float(cfg.convergence_tol)),
+        heim_mds_dim=np.int64(cfg.mds_dim),
+        heim_mds_dim_requested=np.int64(int(mds_req)),
+        heim_mds_dim_effective=np.int64(int(mds_eff)),
+        heim_n_bins=np.int64(int(n_bins)),
+        heim_init_mode=np.asarray([cfg.init_mode], dtype=object),
+    )
+
+    clf_n = _pairwise_clf_from_bundle(
+        args=args,
+        meta=meta,
+        subset=subset,
+        output_dir=output_dir,
+        n_bins=n_bins,
+        clf_min_class_count=int(args.clf_min_class_count),
+        clf_random_state=clf_rs,
+    )
+    loaded_final = cast(vhb.LoadedHMatrix, last_run["loaded"])
+    x_aligned_final = np.asarray(last_run["x_aligned"], dtype=np.float64)
+    h2_binned_final = np.asarray(heim_out.final_h2, dtype=np.float64)
+    return h2_binned_final, np.asarray(clf_n, dtype=np.float64), loaded_final, x_aligned_final
 
 
 def _save_figure_png_svg(fig: plt.Figure, path_png: str, *, dpi: int = 160) -> str:
@@ -1785,6 +2112,7 @@ def _render_training_losses_panel(
 def _save_combined_convergence_figure(
     *,
     clf_h_mats: list[np.ndarray],
+    euclidean_h_mats: list[np.ndarray],
     h_mats: list[np.ndarray],
     clf_mats: list[np.ndarray],
     col_labels: list[str],
@@ -1792,6 +2120,7 @@ def _save_combined_convergence_figure(
     theta_centers: np.ndarray,
     ns: list[int],
     corr_clf_h: np.ndarray,
+    corr_euclidean_h: np.ndarray,
     corr_h: np.ndarray,
     corr_clf: np.ndarray,
     loss_dir: str,
@@ -1816,7 +2145,7 @@ def _save_combined_convergence_figure(
         raise ValueError("_H_DECODING_CURVE_FIGSIZE_IN height must be > 0.")
     n_cols = len(h_mats)
     n_loss_cols = len(ns)
-    m_w, m_h = 2.8 * n_cols, 7.2
+    m_w, m_h = 2.8 * n_cols, 9.6
     l_w, l_h = max(2.6 * n_loss_cols, 6.0), 5.8
     top_h = float(m_h)
     bot_h = float(l_h)
@@ -1854,15 +2183,17 @@ def _save_combined_convergence_figure(
         width_ratios=[m_w, top_h * (float(crv_w) / float(crv_h))],
         height_ratios=height_rows,
     )
-    gs_left = gs0[0, 0].subgridspec(3, n_cols)
-    axes_m = np.empty((3, n_cols), dtype=object)
+    gs_left = gs0[0, 0].subgridspec(4, n_cols)
+    axes_m = np.empty((4, n_cols), dtype=object)
     for c in range(n_cols):
         axes_m[0, c] = fig.add_subplot(gs_left[0, c])
         axes_m[1, c] = fig.add_subplot(gs_left[1, c])
         axes_m[2, c] = fig.add_subplot(gs_left[2, c])
+        axes_m[3, c] = fig.add_subplot(gs_left[3, c])
     _populate_matrix_panel_axes(
         axes_m,
         clf_h_mats=clf_h_mats,
+        euclidean_h_mats=euclidean_h_mats,
         h_mats=h_mats,
         clf_mats=clf_mats,
         col_labels=col_labels,
@@ -1874,6 +2205,7 @@ def _save_combined_convergence_figure(
         ax_c,
         list(ns),
         corr_clf_h,
+        corr_euclidean_h,
         corr_h,
         corr_clf,
         tick_labelsize=13.0,
@@ -2073,18 +2405,20 @@ def _populate_matrix_panel_axes(
     axes: np.ndarray,
     *,
     clf_h_mats: list[np.ndarray],
+    euclidean_h_mats: list[np.ndarray],
     h_mats: list[np.ndarray],
     clf_mats: list[np.ndarray],
     col_labels: list[str],
     n_bins: int,
     theta_centers: np.ndarray,
 ) -> None:
-    """Draw 3 × n_cols heatmaps on existing axes (shared with standalone matrix panel + combined figure).
+    """Draw 4 × n_cols heatmaps on existing axes (shared with standalone matrix panel + combined figure).
 
     Row order:
     1) Method ``sqrt(H^2)``
     2) Classifier-init ``sqrt(H^2)``
-    3) Pairwise decoding
+    3) Shared-Gaussian Euclidean-init ``sqrt(H^2)``
+    4) Pairwise decoding
     """
     tc = np.asarray(theta_centers, dtype=np.float64).ravel()
     if int(tc.size) != int(n_bins):
@@ -2097,10 +2431,15 @@ def _populate_matrix_panel_axes(
     _matrix_tick_labelsize = 11
     _matrix_colorbar_tick_labelsize = 11
     n_cols = len(h_mats)
-    if n_cols != len(clf_h_mats) or n_cols != len(clf_mats) or n_cols != len(col_labels):
-        raise ValueError("clf_h_mats, h_mats, clf_mats, col_labels length mismatch.")
-    if axes.shape != (3, n_cols):
-        raise ValueError(f"axes must be shape (3, {n_cols}); got {axes.shape}.")
+    if (
+        n_cols != len(clf_h_mats)
+        or n_cols != len(euclidean_h_mats)
+        or n_cols != len(clf_mats)
+        or n_cols != len(col_labels)
+    ):
+        raise ValueError("clf_h_mats, euclidean_h_mats, h_mats, clf_mats, col_labels length mismatch.")
+    if axes.shape != (4, n_cols):
+        raise ValueError(f"axes must be shape (4, {n_cols}); got {axes.shape}.")
 
     vmin_h, vmax_h = 0.0, 1.0
     vmin_c, vmax_c = _finite_min_max(clf_mats)
@@ -2151,7 +2490,28 @@ def _populate_matrix_panel_axes(
         _cb0 = plt.colorbar(im0, ax=ax0, fraction=0.046, pad=0.04)
         _cb0.ax.tick_params(labelsize=_matrix_colorbar_tick_labelsize)
 
-        ax1 = axes[2, c]
+        ax01 = axes[2, c]
+        im01 = ax01.imshow(
+            euclidean_h_mats[c],
+            vmin=vmin_h,
+            vmax=vmax_h,
+            cmap=cmap,
+            aspect="equal",
+            origin="lower",
+        )
+        ax01.set_title(col_labels[c], fontsize=10)
+        ax01.set_xticks(tick_pos)
+        ax01.set_xticklabels(tick_labs, rotation=x_rot, ha="right" if x_rot else "center", fontsize=_matrix_tick_labelsize)
+        ax01.set_yticks(tick_pos)
+        ax01.set_yticklabels(tick_labs, fontsize=_matrix_tick_labelsize)
+        ax01.tick_params(axis="both", labelsize=_matrix_tick_labelsize)
+        _matrix_axes_show_top_right_spines(ax01)
+        if c == 0:
+            ax01.set_ylabel("Euclidean-init\n" + r"$\sqrt{H^2}$", fontsize=11)
+        _cb01 = plt.colorbar(im01, ax=ax01, fraction=0.046, pad=0.04)
+        _cb01.ax.tick_params(labelsize=_matrix_colorbar_tick_labelsize)
+
+        ax1 = axes[3, c]
         im1 = ax1.imshow(
             clf_mats[c],
             vmin=vmin_c,
@@ -2177,6 +2537,7 @@ def _populate_convergence_curve_ax(
     ax: plt.Axes,
     ns: list[int],
     corr_clf_h: np.ndarray,
+    corr_euclidean_h: np.ndarray,
     corr_h: np.ndarray,
     corr_clf: np.ndarray,
     *,
@@ -2191,6 +2552,7 @@ def _populate_convergence_curve_ax(
     """
     ns_list = [int(x) for x in ns]
     cch = np.asarray(corr_clf_h, dtype=np.float64).ravel()
+    ceh = np.asarray(corr_euclidean_h, dtype=np.float64).ravel()
     ch = np.asarray(corr_h, dtype=np.float64).ravel()
     cc = np.asarray(corr_clf, dtype=np.float64).ravel()
     ax.plot(
@@ -2201,6 +2563,15 @@ def _populate_convergence_curve_ax(
         marker="^",
         markersize=5,
         label="classifier-init H matrix",
+    )
+    ax.plot(
+        ns_list,
+        ceh,
+        color="#9467bd",
+        linewidth=1.8,
+        marker="D",
+        markersize=4.5,
+        label="Euclidean-init H matrix",
     )
     ax.plot(
         ns_list,
@@ -2238,6 +2609,7 @@ def _populate_convergence_curve_ax(
 def _render_matrix_panel(
     *,
     clf_h_mats: list[np.ndarray],
+    euclidean_h_mats: list[np.ndarray],
     h_mats: list[np.ndarray],
     clf_mats: list[np.ndarray],
     col_labels: list[str],
@@ -2245,12 +2617,13 @@ def _render_matrix_panel(
     n_bins: int,
     theta_centers: np.ndarray,
 ) -> None:
-    """Three rows: method sqrt(H^2), classifier-init sqrt(H^2), pairwise decoding."""
+    """Four rows: method, classifier-init, Euclidean-init, pairwise decoding."""
     n_cols = len(h_mats)
-    fig, axes = plt.subplots(3, n_cols, figsize=(2.8 * n_cols, 7.2), squeeze=False)
+    fig, axes = plt.subplots(4, n_cols, figsize=(2.8 * n_cols, 9.6), squeeze=False)
     _populate_matrix_panel_axes(
         axes,
         clf_h_mats=clf_h_mats,
+        euclidean_h_mats=euclidean_h_mats,
         h_mats=h_mats,
         clf_mats=clf_mats,
         col_labels=col_labels,
@@ -2318,10 +2691,12 @@ class CachedConvergenceBundle(TypedDict):
 
     n: np.ndarray
     corr_clf_h: np.ndarray
+    corr_euclidean_h: np.ndarray
     corr_h: np.ndarray
     corr_clf: np.ndarray
     wall_s: np.ndarray
     clf_h_cols: np.ndarray
+    euclidean_h_cols: np.ndarray
     h_cols: np.ndarray
     clf_cols: np.ndarray
     n_ref: int
@@ -2378,6 +2753,14 @@ def _load_cached_convergence_results(output_dir: str) -> CachedConvergenceBundle
         # Legacy cache fallback: render the new row with NaNs, keeping n_ref as Approx GT.
         clf_h_cols = np.full_like(h_cols, np.nan, dtype=np.float64)
         clf_h_cols[-1, :, :] = np.asarray(h_cols[-1], dtype=np.float64)
+    if "euclidean_h_binned_columns" in z.files:
+        euclidean_h_cols = np.asarray(z["euclidean_h_binned_columns"], dtype=np.float64)
+        if euclidean_h_cols.shape != h_cols.shape:
+            raise ValueError("euclidean_h_binned_columns shape mismatch with h_binned_columns.")
+    else:
+        # Legacy cache fallback: render the Euclidean row with NaNs, keeping n_ref as Approx GT.
+        euclidean_h_cols = np.full_like(h_cols, np.nan, dtype=np.float64)
+        euclidean_h_cols[-1, :, :] = np.asarray(h_cols[-1], dtype=np.float64)
 
     edges = np.asarray(z["theta_bin_edges"], dtype=np.float64).ravel()
     n_bins_file = int(h_cols.shape[1])
@@ -2403,10 +2786,16 @@ def _load_cached_convergence_results(output_dir: str) -> CachedConvergenceBundle
             if "corr_clf_h_binned_vs_gt_mc" in z.files
             else np.full_like(np.asarray(z["corr_h_binned_vs_gt_mc"], dtype=np.float64).ravel(), np.nan)
         ),
+        "corr_euclidean_h": (
+            np.asarray(z["corr_euclidean_h_binned_vs_gt_mc"], dtype=np.float64).ravel()
+            if "corr_euclidean_h_binned_vs_gt_mc" in z.files
+            else np.full_like(np.asarray(z["corr_h_binned_vs_gt_mc"], dtype=np.float64).ravel(), np.nan)
+        ),
         "corr_h": np.asarray(z["corr_h_binned_vs_gt_mc"], dtype=np.float64).ravel(),
         "corr_clf": np.asarray(z["corr_clf_vs_ref"], dtype=np.float64).ravel(),
         "wall_s": np.asarray(z["wall_seconds"], dtype=np.float64).ravel(),
         "clf_h_cols": clf_h_cols,
+        "euclidean_h_cols": euclidean_h_cols,
         "h_cols": h_cols,
         "clf_cols": clf_cols,
         "n_ref": int(np.asarray(z["n_ref"]).reshape(-1)[0]),
@@ -2468,10 +2857,12 @@ def _render_convergence_figures_and_summary(
     gt_seed: int,
     gt_symmetrize_effective: bool,
     corr_clf_h: np.ndarray,
+    corr_euclidean_h: np.ndarray,
     corr_h: np.ndarray,
     corr_clf: np.ndarray,
     wall_s: np.ndarray,
     clf_h_cols: np.ndarray,
+    euclidean_h_cols: np.ndarray,
     h_cols: np.ndarray,
     clf_cols: np.ndarray,
     out_npz: str,
@@ -2491,6 +2882,7 @@ def _render_convergence_figures_and_summary(
                 "n",
                 "corr_h_binned_vs_gt_mc",
                 "corr_clf_h_binned_vs_gt_mc",
+                "corr_euclidean_h_binned_vs_gt_mc",
                 "corr_clf_vs_ref",
                 "corr_llr_binned_vs_gt_mc",
                 "wall_seconds",
@@ -2505,11 +2897,11 @@ def _render_convergence_figures_and_summary(
                 r_llr = float(np.asarray(corr_llr, dtype=np.float64).ravel()[i])
             else:
                 r_llr = ""
-            w.writerow([n, corr_h[i], corr_clf_h[i], corr_clf[i], r_llr, wall_s[i]])
+            w.writerow([n, corr_h[i], corr_clf_h[i], corr_euclidean_h[i], corr_clf[i], r_llr, wall_s[i]])
 
     fig_path = os.path.join(args.output_dir, "h_decoding_convergence.png")
     fig, ax = plt.subplots(1, 1, figsize=_H_DECODING_CURVE_FIGSIZE_IN)
-    _populate_convergence_curve_ax(ax, list(ns), corr_clf_h, corr_h, corr_clf)
+    _populate_convergence_curve_ax(ax, list(ns), corr_clf_h, corr_euclidean_h, corr_h, corr_clf)
     fig.tight_layout()
     conv_svg = _save_figure_png_svg(fig, fig_path, dpi=160)
     plt.close(fig)
@@ -2518,6 +2910,7 @@ def _render_convergence_figures_and_summary(
     col_labels = [f"n={n}" for n in ns] + [f"Approx GT matrix, n_ref={int(args.n_ref)}"]
     _render_matrix_panel(
         clf_h_mats=list(clf_h_cols),
+        euclidean_h_mats=list(euclidean_h_cols),
         h_mats=list(h_cols),
         clf_mats=list(clf_cols),
         col_labels=col_labels,
@@ -2566,6 +2959,7 @@ def _render_convergence_figures_and_summary(
         corr_llr_a = np.asarray(corr_llr, dtype=np.float64).ravel()
     combined_svg = _save_combined_convergence_figure(
         clf_h_mats=list(clf_h_cols),
+        euclidean_h_mats=list(euclidean_h_cols),
         h_mats=list(h_cols),
         clf_mats=list(clf_cols),
         col_labels=col_labels,
@@ -2573,6 +2967,7 @@ def _render_convergence_figures_and_summary(
         theta_centers=theta_centers,
         ns=list(ns),
         corr_clf_h=corr_clf_h,
+        corr_euclidean_h=corr_euclidean_h,
         corr_h=corr_h,
         corr_clf=corr_clf,
         loss_dir=loss_dir,
@@ -2620,6 +3015,9 @@ def _render_convergence_figures_and_summary(
         sf.write("\n# Correlation targets (Pearson r off-diagonal; matrix_corr_offdiag_pearson)\n")
         sf.write(
             "# corr_clf_h_binned_vs_gt_mc: Pearson r, off-diagonal classifier-init sqrt(H^2) vs sqrt(generative GT H^2) (MC one-sided Hellinger).\n"
+        )
+        sf.write(
+            "# corr_euclidean_h_binned_vs_gt_mc: Pearson r, off-diagonal shared-Gaussian Euclidean-init sqrt(H^2) vs sqrt(generative GT H^2) (MC one-sided Hellinger).\n"
         )
         sf.write(
             "# corr_h_binned_vs_gt_mc: Pearson r, off-diagonal binned sqrt(H_sym) vs sqrt(generative GT H^2) (MC one-sided Hellinger).\n"
@@ -2760,9 +3158,11 @@ def main(argv: list[str] | None = None) -> None:
             gt_symmetrize_effective=bool(cached["gt_symmetrize"]),
             corr_h=cached["corr_h"],
             corr_clf_h=cached["corr_clf_h"],
+            corr_euclidean_h=cached["corr_euclidean_h"],
             corr_clf=cached["corr_clf"],
             wall_s=cached["wall_s"],
             clf_h_cols=cached["clf_h_cols"],
+            euclidean_h_cols=cached["euclidean_h_cols"],
             h_cols=cached["h_cols"],
             clf_cols=cached["clf_cols"],
             out_npz=cached["out_npz"],
@@ -2812,6 +3212,7 @@ def main(argv: list[str] | None = None) -> None:
     bin_idx_all = vhb.theta_to_bin_index(theta_scalar_all, edges, n_bins)
     theta_state_all: np.ndarray | None = None
     use_acc_mds_state = bool(getattr(args, "theta_flow_acc_mds_state", False))
+    use_heim_flow_state = bool(getattr(args, "heim_flow_enable", False))
     if bool(getattr(args, "theta_flow_onehot_state", False)):
         theta_state_all = np.eye(n_bins, dtype=np.float64)[bin_idx_all]
         print(
@@ -2839,6 +3240,23 @@ def main(argv: list[str] | None = None) -> None:
         print(
             f"[convergence] {tfm_acc} acc-MDS state enabled: per-n pairwise accuracy -> "
             "clipped H lower bound -> classical MDS embedding.",
+            flush=True,
+        )
+    elif use_heim_flow_state:
+        tfm_heim = str(getattr(args, "theta_field_method", "theta_flow")).strip().lower()
+        iters_req = int(getattr(args, "heim_flow_iters", 5))
+        max_iters = int(getattr(args, "heim_flow_max_iters", 20))
+        tol = float(getattr(args, "heim_flow_convergence_tol", 0.02))
+        auto_mode = iters_req == 0
+        iters_eff = int(max_iters) if auto_mode else int(iters_req)
+        mds_req = int(getattr(args, "heim_flow_mds_dim", 0))
+        mds_eff = max(1, int(n_bins) - 1) if mds_req == 0 else int(mds_req)
+        print(
+            f"[convergence] {tfm_heim} HeIM-Flow enabled: init={str(getattr(args, 'heim_flow_init_mode', 'euclidean'))} "
+            f"iter_mode={'auto' if auto_mode else 'fixed'} "
+            f"iters_requested={iters_req} iters_effective_budget={iters_eff} "
+            f"tol={tol:.6g} max_iters={max_iters} "
+            f"mds_dim_req={mds_req} mds_dim_eff={mds_eff} (req=0 -> max(1, num_theta_bins-1)).",
             flush=True,
         )
 
@@ -2995,11 +3413,13 @@ def main(argv: list[str] | None = None) -> None:
 
     corr_h = np.full(len(ns), np.nan, dtype=np.float64)
     corr_clf_h = np.full(len(ns), np.nan, dtype=np.float64)
+    corr_euclidean_h = np.full(len(ns), np.nan, dtype=np.float64)
     corr_clf = np.full(len(ns), np.nan, dtype=np.float64)
     corr_llr = np.full(len(ns), np.nan, dtype=np.float64)
     wall_s = np.full(len(ns), np.nan, dtype=np.float64)
     err_msg: list[str] = []
     clf_h_sweep: list[np.ndarray] = []
+    euclidean_h_sweep: list[np.ndarray] = []
     h_sweep: list[np.ndarray] = []
     clf_sweep: list[np.ndarray] = []
     llr_sweep: list[np.ndarray] = []
@@ -3070,14 +3490,32 @@ def main(argv: list[str] | None = None) -> None:
                     bin_train=subset_n_raw.bin_train,
                     bin_validation=subset_n_raw.bin_validation,
                 )
-
-            loaded_n, x_aligned, _ = _estimate_one(
-                args=args,
-                meta=meta,
-                bundle=subset_n.bundle,
-                output_dir=run_dir,
-                n_bins=n_bins,
-            )
+            if use_heim_flow_state:
+                h_n, clf_n, loaded_n, x_aligned = _run_heim_flow_for_subset(
+                    args=args,
+                    meta=meta,
+                    subset=subset_n_raw,
+                    output_dir=run_dir,
+                    n_bins=n_bins,
+                    dataset_family=ds_fam,
+                )
+                subset_for_metrics = subset_n_raw
+            else:
+                loaded_n, x_aligned, _ = _estimate_one(
+                    args=args,
+                    meta=meta,
+                    bundle=subset_n.bundle,
+                    output_dir=run_dir,
+                    n_bins=n_bins,
+                )
+                h_n, clf_n = _metrics_fixed_edges(
+                    loaded_n,
+                    subset_n,
+                    n_bins,
+                    int(args.clf_min_class_count),
+                    clf_rs,
+                )
+                subset_for_metrics = subset_n
             per_diag = os.path.join(
                 args.output_dir,
                 "sweep_runs",
@@ -3092,31 +3530,32 @@ def main(argv: list[str] | None = None) -> None:
                 n_subset=int(n),
                 x_aligned=x_aligned,
             )
-            h_n, clf_n = _metrics_fixed_edges(
-                loaded_n,
-                subset_n,
-                n_bins,
-                int(args.clf_min_class_count),
-                clf_rs,
-            )
             h_n_sqrt = _sqrt_h_like(h_n)
             clf_h_sq_n = _classifier_initialized_hellinger_sq_binned(
-                subset_n,
+                subset_for_metrics,
                 n_bins,
                 min_class_count=int(args.clf_min_class_count),
                 random_state=clf_rs,
             )
             clf_h_n_sqrt = _sqrt_h_like(clf_h_sq_n)
+            euclidean_h_sq_n = _euclidean_initialized_hellinger_sq_binned(
+                subset_for_metrics,
+                n_bins,
+                min_bin_count=int(args.clf_min_class_count),
+            )
+            euclidean_h_n_sqrt = _sqrt_h_like(euclidean_h_sq_n)
             corr_clf_h[k] = vhb.matrix_corr_offdiag_pearson(clf_h_n_sqrt, h_gt_sqrt)
+            corr_euclidean_h[k] = vhb.matrix_corr_offdiag_pearson(euclidean_h_n_sqrt, h_gt_sqrt)
             corr_h[k] = vhb.matrix_corr_offdiag_pearson(h_n_sqrt, h_gt_sqrt)
             corr_clf[k] = vhb.matrix_corr_offdiag_pearson(clf_n, clf_ref)
             wall_s[k] = time.time() - t1
             clf_h_sweep.append(np.asarray(clf_h_n_sqrt, dtype=np.float64))
+            euclidean_h_sweep.append(np.asarray(euclidean_h_n_sqrt, dtype=np.float64))
             h_sweep.append(np.asarray(h_n_sqrt, dtype=np.float64))
             clf_sweep.append(np.asarray(clf_n, dtype=np.float64))
             h_acc_mds_corr.append(float(corr_h[k]))
             delta_l_in = _load_delta_l_from_run_dir(run_dir, dataset_family=ds_fam)
-            llr_n = _metrics_delta_l_binned(delta_l_in, subset_n, n_bins)
+            llr_n = _metrics_delta_l_binned(delta_l_in, subset_for_metrics, n_bins)
             llr_sweep.append(np.asarray(llr_n, dtype=np.float64))
             corr_llr[k] = vhb.matrix_corr_offdiag_pearson(llr_n, np.asarray(llr_gt_mc, dtype=np.float64))
             if use_acc_mds_state:
@@ -3155,9 +3594,59 @@ def main(argv: list[str] | None = None) -> None:
                     f"[convergence] acc-MDS final H matrix artifacts n={n}: {fig_png}, {fig_svg}, {csv_acc_mds}, {npz_acc_mds}",
                     flush=True,
                 )
+            if use_heim_flow_state:
+                fig_png_hf, fig_svg_hf = _write_heim_flow_h_matrix_figure(
+                    out_dir=args.output_dir,
+                    method_tag=acc_mds_tag,
+                    n=int(n),
+                    h_sqrt=np.asarray(h_n_sqrt, dtype=np.float64),
+                    h_gt_sqrt=np.asarray(h_gt_sqrt, dtype=np.float64),
+                    corr_h=float(corr_h[k]),
+                )
+                npz_heim = os.path.join(args.output_dir, f"h_{acc_mds_tag}_heim_flow_n_{int(n):06d}.npz")
+                np.savez_compressed(
+                    npz_heim,
+                    n=np.int64(n),
+                    h_sqrt=np.asarray(h_n_sqrt, dtype=np.float64),
+                    h_gt_sqrt=np.asarray(h_gt_sqrt, dtype=np.float64),
+                    corr_h_vs_gt=np.float64(corr_h[k]),
+                    theta_bin_edges=np.asarray(edges, dtype=np.float64),
+                    theta_bin_centers=np.asarray(centers, dtype=np.float64),
+                    num_theta_bins=np.int64(int(n_bins)),
+                    heim_flow_iters_requested=np.int64(int(getattr(args, "heim_flow_iters", 5))),
+                    heim_flow_iters_effective_budget=np.int64(
+                        int(getattr(args, "heim_flow_max_iters", 20))
+                        if int(getattr(args, "heim_flow_iters", 5)) == 0
+                        else int(getattr(args, "heim_flow_iters", 5))
+                    ),
+                    heim_flow_iters_auto_mode=np.int64(1 if int(getattr(args, "heim_flow_iters", 5)) == 0 else 0),
+                    heim_flow_max_iters=np.int64(int(getattr(args, "heim_flow_max_iters", 20))),
+                    heim_flow_convergence_tol=np.float64(float(getattr(args, "heim_flow_convergence_tol", 0.02))),
+                    heim_flow_mds_dim_requested=np.int64(int(getattr(args, "heim_flow_mds_dim", 0))),
+                    heim_flow_mds_dim_effective=np.int64(
+                        int(max(1, int(n_bins) - 1) if int(getattr(args, "heim_flow_mds_dim", 0)) == 0 else int(getattr(args, "heim_flow_mds_dim", 0)))
+                    ),
+                    heim_flow_init_mode=np.asarray([str(getattr(args, "heim_flow_init_mode", "euclidean"))], dtype=object),
+                    theta_field_method=np.asarray([str(tfm)], dtype=object),
+                )
+                csv_heim = os.path.join(args.output_dir, f"h_{acc_mds_tag}_heim_flow_n_{int(n):06d}.csv")
+                with open(csv_heim, "w", encoding="utf-8", newline="") as fcsv:
+                    w = csv.writer(fcsv)
+                    w.writerow(["row_bin", "col_bin", "h_sqrt"])
+                    hs = np.asarray(h_n_sqrt, dtype=np.float64)
+                    for ii in range(hs.shape[0]):
+                        for jj in range(hs.shape[1]):
+                            w.writerow([int(ii), int(jj), float(hs[ii, jj])])
+                    w.writerow([])
+                    w.writerow(["corr_h_vs_gt_offdiag_pearson", float(corr_h[k])])
+                print(
+                    f"[convergence] HeIM-Flow final H matrix artifacts n={n}: {fig_png_hf}, {fig_svg_hf}, {csv_heim}, {npz_heim}",
+                    flush=True,
+                )
             print(
                 f"[convergence] n={n}  corr_h={corr_h[k]:.4f}  corr_clf={corr_clf[k]:.4f}  "
-                f"corr_clf_h={corr_clf_h[k]:.4f}  corr_llr={corr_llr[k]:.4f}  wall={wall_s[k]:.1f}s",
+                f"corr_clf_h={corr_clf_h[k]:.4f}  corr_euclidean_h={corr_euclidean_h[k]:.4f}  "
+                f"corr_llr={corr_llr[k]:.4f}  wall={wall_s[k]:.1f}s",
                 flush=True,
             )
             run_loss_npz = os.path.join(run_dir, "score_prior_training_losses.npz")
@@ -3209,6 +3698,7 @@ def main(argv: list[str] | None = None) -> None:
         )
     if (
         len(clf_h_sweep) != len(ns)
+        or len(euclidean_h_sweep) != len(ns)
         or len(h_sweep) != len(ns)
         or len(clf_sweep) != len(ns)
         or len(llr_sweep) != len(ns)
@@ -3218,7 +3708,9 @@ def main(argv: list[str] | None = None) -> None:
             "Fix errors above or re-run with a smaller n-list."
         )
     clf_h_ref = np.asarray(h_ref, dtype=np.float64)
+    euclidean_h_ref = np.asarray(h_ref, dtype=np.float64)
     clf_h_cols = np.stack(clf_h_sweep + [clf_h_ref], axis=0)
+    euclidean_h_cols = np.stack(euclidean_h_sweep + [euclidean_h_ref], axis=0)
     h_cols = np.stack(h_sweep + [h_ref], axis=0)
     clf_cols = np.stack(clf_sweep + [clf_ref], axis=0)
     llr_ref = np.asarray(llr_gt_mc, dtype=np.float64)
@@ -3231,6 +3723,7 @@ def main(argv: list[str] | None = None) -> None:
         n=np.asarray(ns, dtype=np.int64),
         corr_h_binned_vs_gt_mc=corr_h,
         corr_clf_h_binned_vs_gt_mc=corr_clf_h,
+        corr_euclidean_h_binned_vs_gt_mc=corr_euclidean_h,
         corr_h_acc_mds_vs_gt_mc=(
             np.asarray(h_acc_mds_corr, dtype=np.float64)
             if use_acc_mds_state
@@ -3253,6 +3746,7 @@ def main(argv: list[str] | None = None) -> None:
         gt_hellinger_symmetrize=np.int32(1 if bool(args.gt_hellinger_symmetrize) else 0),
         h_binned_ref_is_gt_mc=np.int32(1),
         clf_h_binned_columns=clf_h_cols,
+        euclidean_h_binned_columns=euclidean_h_cols,
         h_binned_columns=h_cols,
         clf_acc_columns=clf_cols,
         column_n=column_n,
@@ -3275,9 +3769,11 @@ def main(argv: list[str] | None = None) -> None:
         gt_symmetrize_effective=bool(args.gt_hellinger_symmetrize),
         corr_h=corr_h,
         corr_clf_h=corr_clf_h,
+        corr_euclidean_h=corr_euclidean_h,
         corr_clf=corr_clf,
         wall_s=wall_s,
         clf_h_cols=clf_h_cols,
+        euclidean_h_cols=euclidean_h_cols,
         h_cols=h_cols,
         clf_cols=clf_cols,
         out_npz=out_npz,
