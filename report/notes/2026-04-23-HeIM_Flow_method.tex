@@ -35,6 +35,18 @@ Ultimately, we want likelihood estimation at $\theta$ to utilize information fro
 
 If we already have a rough Hellinger distance estimate, for instance from a binned or kernel-weighted classifier, we can embed the anchor parameters into coordinates $\tilde{\theta}$ in which Euclidean distance better tracks distributional distance. A conditional flow trained on $(\tilde{\theta},x)$ can then share information between parameters that are close in the estimated distributional geometry. This motivates HeIM-Flow: an iterative procedure that alternates between estimating Hellinger distances with a conditional flow and re-embedding the parameter space with metric multidimensional scaling (MDS).
 
+In practice, HeIM-Flow recovers a Hellinger-distance matrix (and associated decoding quality) that tracks an approximate ground truth well when the observation dimension $d$ is moderate or small, but performance degrades sharply when $d$ is large: estimated matrices and off-diagonal Pearson correlations to the reference remain strong in 10D yet are substantially weaker in 100D for comparable sample sizes.
+
+\FloatBarrier
+\begin{figure}[!htbp]
+  \centering
+  \includegraphics[width=\linewidth]{notes/figures/2026-04-23-heim-dim-compare/heim_10d_vs_100d_hdecoding.png}
+  \caption{%
+  HeIM-Flow in low versus high data dimension, on the same style of binned-$\sqrt{H^2}$ and classifier-based estimates. Top: $d=10$; bottom: $d=100$. Left: heatmap grids of estimated distance matrices and pairwise decoding, across sample sizes $n$, compared to an approximate ground-truth matrix. Right: Pearson correlation of off-diagonal entries between each estimate and the approximate ground truth. In 10D, correlations grow toward near-perfect agreement as $n$ increases; in 100D, they remain much lower, illustrating that the method is effective in low dimension but far less so in a high-dimensional regime.%
+  }
+  \label{fig:heim-low-vs-high-dim}
+\end{figure}
+
 \subsection{Method 1: Estimating log likelihood ratio with flow matching}
 \label{sec:flow-matching}
 

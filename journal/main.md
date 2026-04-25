@@ -16,6 +16,8 @@ Collected markdown notes in `journal/notes/`: long-form chapters (moved from the
 
 ## 2026-04
 
+- [2026-04-25 x-flow (`--theta-field-method x_flow`): conditional $x$-space flow matching, ODE $\log p(x\mid\theta)$, and H-decoding / Hellinger matrix pipeline (`flow_x_likelihood`)](notes/2026-04-25-x-flow-conditional-likelihood-hellinger-h-decoding.md)
+
 - [2026-04-24 H-decoding convergence on 50D `randamp_gaussian_sqrtd` with `theta_flow` + MLP (default `n_list`), including classifier-init method details and reproducible command](notes/2026-04-24-h-decoding-randamp-sqrtd-50d-theta-flow-mlp-defaultn-classifier-init.md)
 
 - [2026-04-23 x-flow on 10D `cosine_gaussian_sqrtd`: vanilla vs accuracy-MDS theta embedding (n=200 noise=0.5 and n=100 noise=1.0), reproducible commands + matrix figures](notes/2026-04-23-xflow-mds-vs-vanilla-cosine-sqrtd-xdim10.md)
