@@ -16,6 +16,8 @@ Collected markdown notes in `journal/notes/`: long-form chapters (moved from the
 
 ## 2026-04
 
+- [2026-04-25 Flow matching + analytical diagonal Gaussian **velocity prior** on 2D banana (`tests/fm_gaussian_velocity_prior.py`): MMD/geometry improve with $\lambda_0$; prior math cross-refs + repro](notes/2026-04-25-fm-gaussian-velocity-prior-banana.md)
+
 - [2026-04-25 x-flow (`--theta-field-method x_flow`): conditional $x$-space flow matching, ODE $\log p(x\mid\theta)$, and H-decoding / Hellinger matrix pipeline (`flow_x_likelihood`)](notes/2026-04-25-x-flow-conditional-likelihood-hellinger-h-decoding.md)
 
 - [2026-04-24 H-decoding convergence on 50D `randamp_gaussian_sqrtd` with `theta_flow` + MLP (default `n_list`), including classifier-init method details and reproducible command](notes/2026-04-24-h-decoding-randamp-sqrtd-50d-theta-flow-mlp-defaultn-classifier-init.md)
