@@ -1,0 +1,422 @@
+\section{Hellinger distance estimation using iterative MDS embedding and flow matching (HeIM-Flow)}
+
+\subsection{Results}
+
+Consider a conditional distribution $p(x \mid \theta)$ with continuous parameter $\theta \in \mathbb{R}^m$. Given paired data $(\theta, x)$, we wish to estimate the Hellinger distance between two conditionals, $p(x \mid \theta_1)$ and $p(x \mid \theta_2)$.
+
+A straightforward approach is to bin the data near $\theta_1$ and $\theta_2$, train a binary classifier on $x$, and convert its output into an estimate of the Hellinger distance. Binning, however, discards the continuity of $\theta$: only samples falling in the chosen bins contribute, and estimates need not vary smoothly as $\theta_1$ and $\theta_2$ move. Kernel weighting avoids hard bins but introduces a fixed bandwidth and still does not provide flexible exploitation of the information from nearby $\theta$.
+
+We propose a method that more directly exploits continuity in $\theta$. Write $p_1 = p(x \mid \theta_1)$, $p_2 = p(x \mid \theta_2)$, and
+\begin{equation}
+    \ell_{12}(x) = \log \frac{p_1(x)}{p_2(x)}.
+\end{equation}
+The squared Hellinger distance admits the symmetric representation
+\begin{equation}
+\label{eq:H2-sym-sech}
+H^2\bigl(p_1, p_2\bigr)
+=
+\frac{1}{2}\,
+\mathbb{E}_{X_1 \sim p_1}
+\left[\psi\bigl(\ell_{12}(X_1)\bigr)\right]
++
+\frac{1}{2}\,
+\mathbb{E}_{X_2 \sim p_2}
+\left[\psi\bigl(\ell_{12}(X_2)\bigr)\right],
+\qquad
+\psi(u) := 1 - \operatorname{sech}\!\left( \frac{u}{2} \right).
+\end{equation}
+Since $\operatorname{sech}$ is an even function, the same function $\psi(\ell_{12}(x))$ can be evaluated for samples from either distribution. Thus, once the log-likelihood ratio $\ell_{12}(x)$ is available, the Hellinger distance can be approximated by Monte Carlo.
+
+Flow matching provides an ODE whose solution yields $\log p(x \mid \theta)$ via the instantaneous change-of-variables formula. A natural baseline is therefore to train a conditional flow on $(\theta, x)$: the velocity network takes $\theta$ as an explicit conditioning variable, so the model can interpolate across nearby parameter values. Concretely, one fits the flow, evaluates $\log p(x \mid \theta)$, and plugs the resulting log-likelihood ratios into \eqref{eq:H2-sym-sech} for estimating the Hellinger distance.
+
+This baseline works well when $p(x \mid \theta)$ varies smoothly in the raw parameter $\theta$. However, it can fail when the distribution is periodic or otherwise folded in $\theta$. One possible reason is that a standard neural network conditioning on raw $\theta$ has a bias toward simple low-frequency variation in the input coordinate. With limited data, it may treat far-separated but distributionally similar parameters, such as $\theta$ and $\theta+T$, as unrelated.
+
+Ultimately, we want likelihood estimation at $\theta$ to utilize information from nearby values of $\theta$. Here ``nearby'' should be interpreted not only in the raw parameter space, but also in the distributional sense: two parameters should be nearby if their conditional distributions have small Hellinger distance. Periodicity is the clearest example: $\theta$ is as informative about $p(\cdot \mid \theta)$ as $\theta+T$, but a network fed only raw $\theta$ may not exploit this equivalence.
+
+If we already have a rough Hellinger distance estimate, for instance from a binned or kernel-weighted classifier, we can embed the anchor parameters into coordinates $\tilde{\theta}$ in which Euclidean distance better tracks distributional distance. A conditional flow trained on $(\tilde{\theta},x)$ can then share information between parameters that are close in the estimated distributional geometry. This motivates HeIM-Flow: an iterative procedure that alternates between estimating Hellinger distances with a conditional flow and re-embedding the parameter space with metric multidimensional scaling (MDS).
+
+\subsection{Method 1: Estimating log likelihood ratio with flow matching}
+\label{sec:flow-matching}
+
+Let $t\in[0,1]$ interpolate between a tractable base density $p_0$ on $\mathbb{R}^d$ (e.g.\ standard Gaussian) and the model distribution $p_1$ over observations.
+The learned time-dependent and stimulus-dependent velocity field $v_t:\mathbb{R}^d\to\mathbb{R}^d$ defines the probability-flow ODE
+\begin{equation}
+  \frac{\mathrm{d}}{\mathrm{d}t}\, x_t(\theta) = v_t(x_t; \theta),
+\end{equation}
+whose time-$t$ marginal density we denote $p_t$.
+Along a trajectory $\{x_t\}_{t\in[0,1]}$, the instantaneous change-of-variables formula gives
+\begin{equation}
+  \frac{\mathrm{d}}{\mathrm{d}t}\, \log p_t(x_t \mid \theta)
+  = -\,\mathrm{div}\, v_t(x_t; \theta)
+  = -\,\mathrm{tr}\!\bigl(\nabla_x v_t(x_t; \theta)\bigr),
+\end{equation}
+so, writing $x_1=x$ for a sample from $p_1$ and $x_0$ for its preimage under the flow,
+\begin{equation}
+  \log p_1(x \mid \theta)
+  = \log p_0(x_0)
+    - \int_0^1 \mathrm{div}\, v_t(x_t; \theta)\,\mathrm{d}t.
+\end{equation}
+To evaluate $\log p_1(x \mid \theta)$, one integrates the ODE, typically backward from $x$ at $t=1$ to $x_0(\theta)$ at $t=0$, and accumulates the divergence along the trajectory.
+
+Once we have $\log p_1(x \mid \theta)$, we can estimate the log-likelihood ratio by
+\begin{equation}
+    \widehat{\ell}_{ij}(x)
+    =
+    \log \widehat p(x \mid \theta_i)
+    -
+    \log \widehat p(x \mid \theta_j),
+\end{equation}
+and then plug $\widehat{\ell}_{ij}(x)$ into \eqref{eq:H2-sym-sech} to estimate the Hellinger distance.
+
+\subsection{Method 2: HeIM-Flow procedure}
+
+Let
+\begin{equation}
+    \mathcal{D}=\{(\theta_n,x_n)\}_{n=1}^N,
+    \qquad
+    \theta_n\in\mathbb{R}^m,
+    \qquad
+    x_n\in\mathbb{R}^d.
+\end{equation}
+Choose a set of anchor parameters
+\begin{equation}
+    \mathcal{A}=\{\vartheta_i\}_{i=1}^M.
+\end{equation}
+The anchors may be all unique stimulus values, a regular grid in parameter space, or a representative subset of the observed $\theta$ values. HeIM-Flow estimates a sequence of Hellinger distance matrices
+\begin{equation}
+    D^{(k)}\in\mathbb{R}^{M\times M},
+    \qquad
+    D_{ij}^{(k)}\approx H\!\left(p(x\mid \vartheta_i),p(x\mid \vartheta_j)\right),
+\end{equation}
+and uses each matrix to construct an embedded coordinate system for the next round of flow fitting.
+
+\subsubsection{Initialization of the Hellinger distance matrix}
+
+We initialize the Hellinger distance matrix using a simple shared-Gaussian approximation.
+We first divide the parameter space into bins
+\[
+    \mathcal B_1,\dots,\mathcal B_M,
+\]
+and let
+\[
+    I_i=\{n:\theta_n\in \mathcal B_i\}
+\]
+denote the samples assigned to bin $i$. Within each bin, we estimate the conditional mean by
+\begin{equation}
+    \widehat\mu_i
+    =
+    \frac{1}{|I_i|}
+    \sum_{n\in I_i} x_n .
+\end{equation}
+We assume that the conditional distribution in each bin is approximately Gaussian with bin-dependent mean but shared covariance:
+\begin{equation}
+    p(x\mid \theta\in\mathcal B_i)
+    \approx
+    \mathcal N(\widehat\mu_i,\Sigma).
+\end{equation}
+
+To estimate the shared noise covariance, we compute residuals within each bin,
+\begin{equation}
+    r_n=x_n-\widehat\mu_i,
+    \qquad n\in I_i.
+\end{equation}
+We then concatenate residuals across all bins and compute the empirical residual covariance
+\begin{equation}
+    S_{\mathrm{res}}
+    =
+    \frac{1}{N-M}
+    \sum_{i=1}^M
+    \sum_{n\in I_i}
+    r_n r_n^\top .
+\end{equation}
+To obtain a stable precision matrix, we use a Ledoit--Wolf shrinkage estimate of the shared covariance:
+\begin{equation}
+    \widehat\Sigma_{\mathrm{LW}}
+    =
+    (1-\rho)S_{\mathrm{res}}
+    +
+    \rho\,\frac{\operatorname{tr}(S_{\mathrm{res}})}{d}I,
+\end{equation}
+where the shrinkage coefficient $\rho\in[0,1]$ is chosen analytically by the Ledoit--Wolf procedure. We define the corresponding precision matrix as
+\begin{equation}
+    \widehat\Lambda_{\mathrm{LW}}
+    =
+    \widehat\Sigma_{\mathrm{LW}}^{-1}.
+\end{equation}
+
+Under the shared-Gaussian approximation, the squared Hellinger distance between bins $i$ and $j$ has the closed form
+\begin{equation}
+    \widehat H_{ij}^{2,(0)}
+    =
+    1-
+    \exp\left[
+    -\frac{1}{8}
+    (\widehat\mu_i-\widehat\mu_j)^\top
+    \widehat\Lambda_{\mathrm{LW}}
+    (\widehat\mu_i-\widehat\mu_j)
+    \right].
+\end{equation}
+Therefore, the initial MDS dissimilarity matrix is
+\begin{equation}
+    D_{ij}^{(0)}
+    =
+    \widehat H_{ij}^{(0)}
+    =
+    \sqrt{
+    1-
+    \exp\left[
+    -\frac{1}{8}
+    (\widehat\mu_i-\widehat\mu_j)^\top
+    \widehat\Lambda_{\mathrm{LW}}
+    (\widehat\mu_i-\widehat\mu_j)
+    \right]
+    },
+    \qquad
+    D_{ii}^{(0)}=0.
+\end{equation}
+
+\subsubsection{Metric MDS embedding of the anchor parameters}
+
+Given the current Hellinger distance matrix $D^{(k)}$, metric MDS finds anchor embeddings
+\begin{equation}
+    z_i^{(k)}\in\mathbb{R}^r,
+    \qquad
+    i=1,\ldots,M,
+\end{equation}
+such that Euclidean distances between the embedded anchors approximate the estimated Hellinger distances. Specifically,
+\begin{equation}
+\label{eq:mds-stress}
+    Z^{(k)}
+    =
+    \arg\min_{z_1,\ldots,z_M\in\mathbb{R}^r}
+    \sum_{i<j}
+    \left(
+    \|z_i-z_j\|_2 - D_{ij}^{(k)}
+    \right)^2,
+\end{equation}
+where $Z^{(k)}\in\mathbb{R}^{M\times r}$ has row vectors $(z_i^{(k)})^\top$. The embedding dimension $r$ is a user-chosen hyperparameter. If $\theta$ is one-dimensional but the distribution is periodic, $r=2$ is often a natural choice because the distributional geometry may be closer to a circle than a line.
+
+\subsubsection{Linear interpolation from anchors to training samples}
+
+MDS provides embedded coordinates only for the anchors. To train a conditional flow on all samples, we extend the anchor embedding to arbitrary $\theta$ by linear interpolation. Denote this interpolation map by
+\begin{equation}
+    g^{(k)}:\mathbb{R}^m\to\mathbb{R}^r,
+    \qquad
+    \tilde{\theta}^{(k)}=g^{(k)}(\theta).
+\end{equation}
+For one-dimensional ordered anchors, if
+\begin{equation}
+    \vartheta_i\leq \theta \leq \vartheta_{i+1},
+\end{equation}
+then
+\begin{equation}
+\label{eq:linear-interp}
+    g^{(k)}(\theta)
+    =
+    (1-\lambda)z_i^{(k)}+\lambda z_{i+1}^{(k)},
+    \qquad
+    \lambda
+    =
+    \frac{\theta-\vartheta_i}{\vartheta_{i+1}-\vartheta_i}.
+\end{equation}
+If $\theta$ is periodic, interpolation is performed circularly so that the last and first anchors are also adjacent. For multi-dimensional grid anchors, the same idea can be implemented with multilinear interpolation. For scattered anchors, one can use simplex-based barycentric interpolation.
+
+The embedded coordinate of each training sample is then
+\begin{equation}
+    \tilde{\theta}_n^{(k)} = g^{(k)}(\theta_n).
+\end{equation}
+
+\subsubsection{Flow-based update of the Hellinger distance matrix}
+
+At iteration $k$, train a conditional flow-matching model on the embedded dataset
+\begin{equation}
+    \widetilde{\mathcal D}^{(k)}
+    =
+    \{(\tilde{\theta}_n^{(k)},x_n)\}_{n=1}^N.
+\end{equation}
+The specific flow-matching path is not fixed by HeIM-Flow; any path can be used as long as the resulting conditional flow allows evaluation of (see \ref{sec:flow-matching})
+\begin{equation}
+    \log \widehat p_k(x\mid \tilde{\theta}).
+\end{equation}
+For anchor pair $(i,j)$, the flow-based log-likelihood ratio is
+\begin{equation}
+\label{eq:flow-llr}
+    \widehat{\ell}_{ij}^{(k+1)}(x)
+    =
+    \log \widehat p_k(x\mid z_i^{(k)})
+    -
+    \log \widehat p_k(x\mid z_j^{(k)}).
+\end{equation}
+
+Once the log-likelihood ratio is available, the Hellinger update follows the sample-wise construction in the Hellinger note. Define
+\begin{equation}
+    \psi(u)
+    =
+    1-\operatorname{sech}\!\left(\frac{u}{2}\right).
+\end{equation}
+Because $\operatorname{sech}$ is even, $\psi(\widehat{\ell}_{ij}^{(k+1)}(x))$ is the same sample-wise contribution whether the ratio is written as $\log \widehat p_i-\log \widehat p_j$ or with the opposite sign.
+
+Let $I_i$ denote the samples assigned to the local neighborhood or bin of anchor $\vartheta_i$. The two Monte Carlo averages
+\begin{equation}
+    \widehat m_{i\to j}^{(k+1)}
+    =
+    \frac{1}{|I_i|}
+    \sum_{n\in I_i}
+    \psi\!\left(\widehat{\ell}_{ij}^{(k+1)}(x_n)\right),
+    \qquad
+    \widehat m_{j\to i}^{(k+1)}
+    =
+    \frac{1}{|I_j|}
+    \sum_{n\in I_j}
+    \psi\!\left(\widehat{\ell}_{ij}^{(k+1)}(x_n)\right)
+\end{equation}
+estimate the two expectations in the symmetric identity
+\begin{equation}
+    H^2(p_i,p_j)
+    =
+    \frac{1}{2}
+    \mathbb E_{X_i\sim p_i}
+    \left[
+    \psi(\ell_{ij}(X_i))
+    \right]
+    +
+    \frac{1}{2}
+    \mathbb E_{X_j\sim p_j}
+    \left[
+    \psi(\ell_{ij}(X_j))
+    \right].
+\end{equation}
+Therefore the flow-based squared Hellinger update is
+\begin{equation}
+\label{eq:H-update}
+    \widehat H_{ij}^{2,(k+1)}
+    =
+    \frac{1}{2}
+    \widehat m_{i\to j}^{(k+1)}
+    +
+    \frac{1}{2}
+    \widehat m_{j\to i}^{(k+1)}.
+\end{equation}
+After computing all pairs, clip numerical errors and set the diagonal to zero:
+\begin{equation}
+    \widehat H_{ij}^{2,(k+1)}
+    \leftarrow
+    \operatorname{clip}\!\left(
+    \widehat H_{ij}^{2,(k+1)},
+    0,1
+    \right),
+    \qquad
+    \widehat H_{ii}^{2,(k+1)}=0.
+\end{equation}
+The next MDS dissimilarity matrix is obtained directly from the updated Hellinger estimate:
+\begin{equation}
+    D_{ij}^{(k+1)}
+    =
+    \sqrt{\widehat H_{ij}^{2,(k+1)}}.
+\end{equation}
+No damping is applied; each iteration uses the newly estimated Hellinger distance matrix directly.
+
+\subsubsection{Iterative algorithm}
+
+The full HeIM-Flow procedure is:
+\begin{enumerate}
+    \item Choose anchor parameters $\{\vartheta_i\}_{i=1}^M$.
+    \item Assign samples to anchor neighborhoods or bins $I_1,\ldots,I_M$.
+    \item Initialize $D^{(0)}$ with the shared-Gaussian Hellinger estimate.
+    \item For $k=0,1,\ldots,K-1$:
+    \begin{enumerate}
+        \item Apply metric MDS to $D^{(k)}$ to obtain anchor embeddings $Z^{(k)}=\{z_i^{(k)}\}_{i=1}^M$.
+        \item Construct a linear interpolation map $g^{(k)}$ from $\vartheta_i$ to $z_i^{(k)}$.
+        \item Embed all training parameters by $\tilde{\theta}_n^{(k)}=g^{(k)}(\theta_n)$.
+        \item Train a conditional flow-matching model on $\{(\tilde{\theta}_n^{(k)},x_n)\}_{n=1}^N$.
+        \item Evaluate flow-based log-likelihood ratios using \eqref{eq:flow-llr} for every anchor pair.
+        \item Convert the log-likelihood ratios into sample-wise contributions with $1-\operatorname{sech}(\widehat{\ell}/2)$.
+        \item Average those contributions over the two anchor neighborhoods using \eqref{eq:H-update}, then set $D^{(k+1)}=\sqrt{\widehat H^{2,(k+1)}}$.
+    \end{enumerate}
+\end{enumerate}
+The algorithm can be run for a fixed number of iterations or until the Hellinger matrix stabilizes, for example when
+\begin{equation}
+    \frac{\|D^{(k+1)}-D^{(k)}\|_F}{\|D^{(k)}\|_F}
+\end{equation}
+becomes sufficiently small.
+
+The output of HeIM-Flow is the final Hellinger distance matrix $D^{(K)}$, the final distributional embedding $Z^{(K)}$, the interpolation map $g^{(K)}$, and the final conditional flow model $\widehat p_K(x\mid \tilde\theta)$.
+
+\subsection{Method 3: Estimating Hellinger distance using binary classifiers}
+\label{sec:implemented-clf-init}
+
+We use a classifier-based binned estimator to estimate the Hellinger distance. The procedure has three steps: binning the parameter samples, fitting a balanced binary classifier for each bin pair, and converting the fitted classifier logits into an estimated Hellinger distance.
+
+We first partition the $\theta$ domain into fixed equal-width bins and assign each sample to a hard bin index. For each bin pair $(i,j)$, we form a binary classification problem using only samples whose $\theta$ values fall into bins $i$ or $j$. The classifier is trained on the train split only, while the final Hellinger estimate is evaluated on the full subset pool, namely the union of train and validation samples restricted to bins $i$ and $j$. Validation samples are never used along.
+
+For each bin pair $(i,j)$, we fit a linear logistic classifier
+\begin{equation}
+    f_{ij}(x)=\beta_{ij}^{\top}x+b_{ij},
+\end{equation}
+where samples from bin $i$ are assigned label $1$ and samples from bin $j$ are assigned label $0$. Let $\sigma(u)=(1+e^{-u})^{-1}$. If there are $n_i$ and $n_j$ train samples from bins $i$ and $j$, respectively, and
+\begin{equation}
+    n_{\mathrm{pair}}=n_i+n_j,
+\end{equation}
+then we balance the two classes using sample weights
+\begin{equation}
+    w_i=\frac{1}{2}\frac{n_{\mathrm{pair}}}{n_i},
+    \qquad
+    w_j=\frac{1}{2}\frac{n_{\mathrm{pair}}}{n_j}.
+\end{equation}
+The weighted logistic objective is therefore
+\begin{equation}
+\label{eq:implemented-weighted-logistic-loss}
+    \mathcal{L}_{ij}^{\mathrm{wlogit}}(\beta_{ij},b_{ij})
+    =
+    -\sum_{x\in\mathcal{X}^{\mathrm{tr}}_i} w_i \log \sigma\!\left(f_{ij}(x)\right)
+    -\sum_{x\in\mathcal{X}^{\mathrm{tr}}_j} w_j \log \!\left(1-\sigma\!\left(f_{ij}(x)\right)\right),
+\end{equation}
+where $\mathcal{X}^{\mathrm{tr}}_i$ and $\mathcal{X}^{\mathrm{tr}}_j$ denote the train-split samples from bins $i$ and $j$. This weighting makes the two classes contribute equally to the classifier fit, because
+\begin{equation}
+    n_iw_i=n_jw_j=\frac{1}{2}n_{\mathrm{pair}}.
+\end{equation}
+At the same time,
+\begin{equation}
+    n_iw_i+n_jw_j=n_{\mathrm{pair}},
+\end{equation}
+
+After fitting the classifier, we use its logit as an estimate of the log-likelihood ratio between the two bin-conditional distributions:
+\begin{equation}
+    \widehat{\ell}_{ij}(x)
+    =
+    \operatorname{logit}\,\widehat c_{ij}(x)
+    =
+    f_{ij}(x).
+\end{equation}
+Using the symmetric Hellinger transform $\psi(u)=1-\operatorname{sech}(u/2)$, we estimate the squared Hellinger distance between bins $i$ and $j$ by evaluating the fitted classifier on the full-pool samples from the two bins:
+\begin{equation}
+\label{eq:implemented-clf-h2}
+    \widehat H^2_{ij,\mathrm{clf}}
+    =
+    \frac{1}{2}\,\frac{1}{|\mathcal X_i|}
+    \sum_{x\in \mathcal X_i}
+    \psi\!\left(\widehat{\ell}_{ij}(x)\right)
+    +
+    \frac{1}{2}\,\frac{1}{|\mathcal X_j|}
+    \sum_{x\in \mathcal X_j}
+    \psi\!\left(\widehat{\ell}_{ij}(x)\right),
+\end{equation}
+where $\mathcal X_i$ and $\mathcal X_j$ denote the full-pool samples in bins $i$ and $j$. The class-balancing weights are used only during classifier fitting. They affect the fitted parameters $\beta_{ij}$ and $b_{ij}$, and hence the estimated logit $\widehat{\ell}_{ij}(x)$, but the Hellinger estimate itself is computed as an unweighted within-bin average over the evaluation pool.
+
+Finally, we symmetrize and clip the estimated squared Hellinger matrix:
+\begin{equation}
+    \widehat H^2_{ij,\mathrm{clf}}
+    \leftarrow
+    \operatorname{clip}\!\left(
+    \frac{\widehat H^2_{ij,\mathrm{clf}}+\widehat H^2_{ji,\mathrm{clf}}}{2},
+    0,1
+    \right),
+    \qquad
+    \widehat H^2_{ii,\mathrm{clf}}=0.
+\end{equation}
+For visualization and comparison, we use the corresponding Hellinger distance
+\begin{equation}
+    \widehat D^{\mathrm{clf}}_{ij}
+    =
+    \sqrt{\widehat H^2_{ij,\mathrm{clf}}}.
+\end{equation}
