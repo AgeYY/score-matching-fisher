@@ -53,6 +53,10 @@ class TestHMatrixFlowLikelihood(unittest.TestCase):
         out = est.run(theta=theta, x=x, restore_original_order=False)
         self.assertEqual(out.field_method, "theta_flow")
         self.assertEqual(out.eval_scalar_name, "flow_ode_t_span")
+        self.assertIsNotNone(out.log_p_theta_posterior_matrix)
+        self.assertIsNotNone(out.log_p_theta_prior_matrix)
+        self.assertIsNotNone(out.log_p_theta_ratio_matrix)
+        np.testing.assert_allclose(out.c_matrix, out.log_p_theta_ratio_matrix, atol=0.0, rtol=0.0)
         self.assertLess(float(np.max(np.abs(out.delta_l_matrix))), 1e-9)
         self.assertLess(float(np.max(np.abs(out.h_sym))), 1e-9)
 
@@ -73,6 +77,18 @@ class TestHMatrixFlowLikelihood(unittest.TestCase):
         x = np.stack([np.sin(theta.reshape(-1)), np.cos(theta.reshape(-1))], axis=1).astype(np.float64)
         out = est.run(theta=theta, x=x, restore_original_order=False)
         self.assertTrue(np.isfinite(out.c_matrix).all())
+        self.assertIsNotNone(out.log_p_theta_posterior_matrix)
+        self.assertIsNotNone(out.log_p_theta_prior_matrix)
+        self.assertIsNotNone(out.log_p_theta_ratio_matrix)
+        self.assertTrue(np.isfinite(out.log_p_theta_posterior_matrix).all())
+        self.assertTrue(np.isfinite(out.log_p_theta_prior_matrix).all())
+        self.assertTrue(np.isfinite(out.log_p_theta_ratio_matrix).all())
+        np.testing.assert_allclose(
+            out.log_p_theta_ratio_matrix,
+            out.log_p_theta_posterior_matrix - out.log_p_theta_prior_matrix,
+            atol=1e-12,
+            rtol=1e-12,
+        )
         self.assertTrue(np.isfinite(out.delta_l_matrix).all())
         self.assertTrue(np.isfinite(out.h_sym).all())
         self.assertEqual(out.flow_score_mode, "direct_ode_likelihood")

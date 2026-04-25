@@ -324,6 +324,14 @@ def _save_h_matrix_dsm_artifacts(
         h_payload["g_matrix"] = h_result.g_matrix
         h_payload["c_matrix"] = h_result.c_matrix
         h_payload["delta_l_matrix"] = h_result.delta_l_matrix
+        if h_result.log_p_theta_posterior_matrix is not None:
+            h_payload["log_p_theta_posterior_matrix"] = h_result.log_p_theta_posterior_matrix
+        if h_result.log_p_theta_prior_matrix is not None:
+            h_payload["log_p_theta_prior_matrix"] = h_result.log_p_theta_prior_matrix
+            h_payload["log_p_theta_prior"] = np.asarray(h_result.log_p_theta_prior_matrix[0], dtype=np.float64)
+        if h_result.log_p_theta_ratio_matrix is not None:
+            h_payload["c_matrix_ratio"] = h_result.log_p_theta_ratio_matrix
+            h_payload["log_p_x_given_theta_minus_log_p_x_matrix"] = h_result.log_p_theta_ratio_matrix
     np.savez(h_npz_path, **h_payload)
 
     h_summary_path = os.path.join(args.output_dir, f"h_matrix_summary{suffix}.txt")
@@ -346,6 +354,8 @@ def _save_h_matrix_dsm_artifacts(
         if h_result.flow_score_mode is not None:
             hf.write(f"flow_score_mode: {h_result.flow_score_mode}\n")
         hf.write(f"h_save_intermediates: {bool(getattr(args, 'h_save_intermediates', False))}\n")
+        if h_result.log_p_theta_ratio_matrix is not None:
+            hf.write("theta_flow_ratio_semantics: log p(theta|x) - log p(theta) = log p(x|theta) - log p(x)\n")
 
     h_fig_path = os.path.join(args.output_dir, f"h_matrix_sym_heatmap{suffix}.png")
     plt.figure(figsize=(6.2, 5.6))
