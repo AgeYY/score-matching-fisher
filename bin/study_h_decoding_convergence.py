@@ -456,6 +456,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--heim-flow-distance-transform",
+        type=str,
+        default="hellinger",
+        choices=["hellinger", "bhattacharyya"],
+        help=(
+            "Distance used for HeIM MDS embedding and convergence. "
+            "'hellinger' uses sqrt(H^2); 'bhattacharyya' uses -log(1-H^2). "
+            "Default: hellinger."
+        ),
+    )
+    p.add_argument(
         "--heim-flow-init-mode",
         type=str,
         default="euclidean",
@@ -766,6 +777,9 @@ def _validate_cli(args: argparse.Namespace) -> None:
         mds_req = int(getattr(args, "heim_flow_mds_dim", 0))
         if mds_req < 0:
             raise ValueError("--heim-flow-mds-dim must be >= 0 (0 means auto: max(1, num_theta_bins-1)).")
+        dist_transform = str(getattr(args, "heim_flow_distance_transform", "hellinger")).strip().lower()
+        if dist_transform not in ("hellinger", "bhattacharyya"):
+            raise ValueError("--heim-flow-distance-transform must be one of {hellinger, bhattacharyya}.")
         tol = float(getattr(args, "heim_flow_convergence_tol", 0.0))
         if not np.isfinite(tol):
             raise ValueError("--heim-flow-convergence-tol must be finite.")
@@ -1393,6 +1407,7 @@ def _run_heim_flow_for_subset(
         n_iters=n_iters_eff,
         mds_dim=int(mds_eff),
         init_mode=str(getattr(args, "heim_flow_init_mode", "euclidean")),
+        distance_transform=str(getattr(args, "heim_flow_distance_transform", "hellinger")),
         min_class_count=int(getattr(args, "clf_min_class_count", 5)),
         min_bin_count=int(getattr(args, "clf_min_class_count", 5)),
         clf_random_state=clf_rs,
@@ -1490,6 +1505,7 @@ def _run_heim_flow_for_subset(
         heim_mds_dim_effective=np.int64(int(mds_eff)),
         heim_n_bins=np.int64(int(n_bins)),
         heim_init_mode=np.asarray([cfg.init_mode], dtype=object),
+        heim_distance_transform=np.asarray([cfg.distance_transform], dtype=object),
     )
 
     clf_n = _pairwise_clf_from_bundle(

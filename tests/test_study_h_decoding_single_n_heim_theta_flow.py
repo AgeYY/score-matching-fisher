@@ -22,6 +22,8 @@ class TestSingleNHeimThetaFlowScript(unittest.TestCase):
         self.assertEqual(int(args.n), 200)
         self.assertEqual(int(args.heim_flow_max_iters), 20)
         self.assertAlmostEqual(float(args.heim_flow_convergence_tol), 0.02, places=12)
+        self.assertEqual(single_theta_heim.HEIM_DISTANCE_TRANSFORM, "bhattacharyya")
+        self.assertEqual(str(args.heim_flow_distance_transform), "hellinger")
 
     def test_validation_binned_matrix_uses_validation_block_only(self) -> None:
         mat = np.asarray(

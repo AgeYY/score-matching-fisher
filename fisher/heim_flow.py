@@ -25,6 +25,7 @@ class HeimFlowConfig:
     n_iters: int
     mds_dim: int
     init_mode: str = "euclidean"
+    distance_transform: str = "hellinger"
     min_class_count: int = 5
     min_bin_count: int = 5
     clf_random_state: int = 7
@@ -80,11 +81,18 @@ def _sanitize_h2_matrix(h2: np.ndarray, *, clip_low: float, clip_high: float) ->
     return out
 
 
-def _distance_from_h2(h2: np.ndarray) -> np.ndarray:
+def _distance_from_h2(h2: np.ndarray, *, transform: str = "hellinger") -> np.ndarray:
     out = np.asarray(h2, dtype=np.float64)
     finite = np.isfinite(out)
     d = np.full_like(out, np.nan, dtype=np.float64)
-    d[finite] = np.sqrt(np.clip(out[finite], 0.0, 1.0))
+    mode = str(transform).strip().lower()
+    if mode == "hellinger":
+        d[finite] = np.sqrt(np.clip(out[finite], 0.0, 1.0))
+    elif mode == "bhattacharyya":
+        h2 = np.clip(out[finite], 0.0, np.nextafter(1.0, 0.0))
+        d[finite] = -np.log1p(-h2)
+    else:
+        raise ValueError("transform must be one of {'hellinger','bhattacharyya'}.")
     np.fill_diagonal(d, 0.0)
     return d
 
@@ -343,6 +351,9 @@ def run_heim_flow(
     mode = str(cfg.init_mode).strip().lower()
     if mode not in ("euclidean", "classifier"):
         raise ValueError("cfg.init_mode must be one of {'euclidean','classifier'}.")
+    distance_transform = str(cfg.distance_transform).strip().lower()
+    if distance_transform not in ("hellinger", "bhattacharyya"):
+        raise ValueError("cfg.distance_transform must be one of {'hellinger','bhattacharyya'}.")
 
     if mode == "euclidean":
         h2_k = initialize_h2_euclidean(
@@ -362,7 +373,7 @@ def run_heim_flow(
             random_state=int(cfg.clf_random_state),
         )
     h2_k = _sanitize_h2_matrix(h2_k, clip_low=float(cfg.clip_low), clip_high=float(cfg.clip_high))
-    d_k = _distance_from_h2(h2_k)
+    d_k = _distance_from_h2(h2_k, transform=distance_transform)
 
     history_h2: list[np.ndarray] = [np.asarray(h2_k, dtype=np.float64)]
     history_d: list[np.ndarray] = [np.asarray(d_k, dtype=np.float64)]
@@ -439,7 +450,7 @@ def run_heim_flow(
             raise ValueError("estimate_callback must provide at least one of delta_l_matrix/h2_binned/h_sym_matrix.")
 
         h2_next = _sanitize_h2_matrix(h2_next, clip_low=float(cfg.clip_low), clip_high=float(cfg.clip_high))
-        d_next = _distance_from_h2(h2_next)
+        d_next = _distance_from_h2(h2_next, transform=distance_transform)
         denom = float(np.linalg.norm(d_k, ord="fro"))
         numer = float(np.linalg.norm(d_next - d_k, ord="fro"))
         rel = numer / max(denom, 1e-12)
@@ -449,6 +460,7 @@ def run_heim_flow(
         md["fro_rel_change"] = float(rel)
         md["embedding_method"] = "metric_mds"
         md["embedding_warm_start"] = bool(k > 0)
+        md["distance_transform"] = distance_transform
         iteration_metadata.append(md)
 
         history_h2.append(np.asarray(h2_next, dtype=np.float64))

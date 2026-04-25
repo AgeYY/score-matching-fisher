@@ -124,6 +124,89 @@ class TestHeimFlow(unittest.TestCase):
         self.assertTrue(all(md.get("embedding_method") == "metric_mds" for md in out.iteration_metadata))
         self.assertEqual([bool(md.get("embedding_warm_start")) for md in out.iteration_metadata], [False, True, True])
 
+    def test_bhattacharyya_distance_transform_and_mds_input(self) -> None:
+        h2 = np.asarray(
+            [
+                [0.0, 0.25, 1.0],
+                [0.25, 0.0, 0.75],
+                [1.0, 0.75, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        d = heim_flow_mod._distance_from_h2(h2, transform="bhattacharyya")
+        expected = -np.log1p(-np.clip(h2, 0.0, np.nextafter(1.0, 0.0)))
+        np.fill_diagonal(expected, 0.0)
+        np.testing.assert_allclose(d, expected, rtol=0.0, atol=1e-12)
+        self.assertTrue(np.all(np.isfinite(d)))
+        self.assertTrue(np.allclose(np.diag(d), 0.0))
+
+        x_all = np.zeros((6, 2), dtype=np.float64)
+        bin_all = np.asarray([0, 0, 1, 1, 2, 2], dtype=np.int64)
+        x_train = x_all[:3]
+        x_val = x_all[3:]
+        bin_train = bin_all[:3]
+        bin_val = bin_all[3:]
+        h2_init = np.asarray(
+            [
+                [0.0, 0.25, 0.75],
+                [0.25, 0.0, 0.5],
+                [0.75, 0.5, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        expected_init_d = heim_flow_mod._distance_from_h2(h2_init, transform="bhattacharyya")
+        seen_metric_distances: list[np.ndarray] = []
+
+        def _fake_estimate(payload: HeimIterationInput) -> HeimIterationOutput:
+            return HeimIterationOutput(h2_binned=h2_init, delta_l_matrix=None, h_sym_matrix=None, metadata={})
+
+        def _fake_classical_mds(distance: np.ndarray, *, n_components: int) -> np.ndarray:
+            np.testing.assert_allclose(distance, expected_init_d, rtol=0.0, atol=1e-12)
+            return np.zeros((3, int(n_components)), dtype=np.float64)
+
+        def _fake_metric_mds(
+            distance: np.ndarray,
+            *,
+            n_components: int,
+            init_embedding: np.ndarray | None = None,
+        ) -> np.ndarray:
+            seen_metric_distances.append(np.asarray(distance, dtype=np.float64))
+            return np.zeros((3, int(n_components)), dtype=np.float64)
+
+        cfg = HeimFlowConfig(
+            n_bins=3,
+            n_iters=1,
+            mds_dim=2,
+            init_mode="euclidean",
+            distance_transform="bhattacharyya",
+            min_bin_count=1,
+            min_class_count=1,
+            convergence_tol=0.0,
+        )
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(
+            heim_flow_mod, "initialize_h2_euclidean", return_value=h2_init
+        ), mock.patch.object(
+            heim_flow_mod, "_mds_embedding_from_distance", side_effect=_fake_classical_mds
+        ), mock.patch.object(
+            heim_flow_mod, "_metric_mds_embedding_from_distance", side_effect=_fake_metric_mds
+        ):
+            out = run_heim_flow(
+                x_all=x_all,
+                x_train=x_train,
+                x_validation=x_val,
+                bin_all=bin_all,
+                bin_train=bin_train,
+                bin_validation=bin_val,
+                output_root=td,
+                cfg=cfg,
+                estimate_callback=_fake_estimate,
+            )
+
+        self.assertEqual(len(seen_metric_distances), 1)
+        np.testing.assert_allclose(seen_metric_distances[0], expected_init_d, rtol=0.0, atol=1e-12)
+        np.testing.assert_allclose(out.final_d, expected_init_d, rtol=0.0, atol=1e-12)
+        self.assertEqual(out.iteration_metadata[0].get("distance_transform"), "bhattacharyya")
+
     def test_run_heim_flow_stops_early_with_positive_convergence_tol(self) -> None:
         rng = np.random.default_rng(9)
         n_bins = 3

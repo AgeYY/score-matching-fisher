@@ -22,6 +22,7 @@ import study_h_decoding_convergence as shc
 import study_h_decoding_single_n_heim as single_x_heim
 
 FORCED_TRAIN_FRAC = single_x_heim.FORCED_TRAIN_FRAC
+HEIM_DISTANCE_TRANSFORM = "bhattacharyya"
 
 
 def build_parser():
@@ -294,6 +295,7 @@ def main(argv: list[str] | None = None) -> None:
     args.theta_flow_fourier_state = False
     args.theta_flow_segmented = False
     args.theta_flow_acc_mds_state = False
+    args.heim_flow_distance_transform = HEIM_DISTANCE_TRANSFORM
     args.visualization_only = False
 
     shc._validate_cli(args)
@@ -369,6 +371,7 @@ def main(argv: list[str] | None = None) -> None:
     heim_npz = os.path.join(args.output_dir, "heim_flow_iterations.npz")
     z_heim = np.load(heim_npz, allow_pickle=True)
     iters_done = int(np.asarray(z_heim["heim_iters_completed"]).reshape(-1)[0])
+    heim_distance_transform = str(np.asarray(z_heim["heim_distance_transform"], dtype=object).reshape(-1)[0])
     if iters_done < 1:
         raise ValueError("HeIM run completed zero iterations; cannot compute final validation-only H estimate.")
     final_iter_dir = os.path.join(args.output_dir, "heim_flow", f"iter_{iters_done - 1:03d}")
@@ -425,6 +428,7 @@ def main(argv: list[str] | None = None) -> None:
         heim_iters_requested=np.asarray(z_heim["heim_iters_requested"]).reshape(-1)[0],
         heim_iters_effective_budget=np.asarray(z_heim["heim_iters_effective_budget"]).reshape(-1)[0],
         heim_iters_completed=np.asarray(z_heim["heim_iters_completed"]).reshape(-1)[0],
+        heim_distance_transform=np.asarray([heim_distance_transform], dtype=object),
     )
 
     summary = os.path.join(args.output_dir, "single_n_heim_theta_flow_summary.txt")
@@ -439,6 +443,9 @@ def main(argv: list[str] | None = None) -> None:
         sf.write(f"n_validation: {int(n_validation)}\n")
         sf.write(f"num_theta_bins: {int(n_bins)}\n")
         sf.write("hellinger_eval_pool: validation_only\n")
+        sf.write(f"heim_distance_transform: {heim_distance_transform}\n")
+        sf.write("heim_embedding_distance: Bhattacharyya D=-log(1-H^2)\n")
+        sf.write("heim_h_diagnostics: H panels remain sqrt(H^2) for GT Hellinger comparison\n")
         sf.write(f"theta_bin_source: {theta_bin_source}\n")
         sf.write(f"gt_hellinger_n_mc: {int(gt_n_mc)}\n")
         sf.write(f"gt_hellinger_seed: {int(gt_seed)}\n")
