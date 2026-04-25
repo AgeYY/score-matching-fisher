@@ -22,6 +22,7 @@ from fisher.models import (
 from fisher.shared_fisher_est import effective_flow_x_theta_fourier_omega, run_shared_fisher_estimation, validate_estimation_args
 from fisher.trainers import train_conditional_x_flow_model
 from fisher.trainers import (
+    BinnedDiagGaussianXPrior,
     KnnDiagGaussianXPrior,
     analytical_diag_gaussian_x_prior_velocity,
     sample_diag_gaussian_x_prior_path,
@@ -139,6 +140,8 @@ class TestHMatrixFlowXLikelihood(unittest.TestCase):
         add_estimation_arguments(parser)
         args = parser.parse_args(["--theta-field-method", "x_flow_reg", "--flow-arch", "mlp"])
         validate_estimation_args(args)
+        self.assertEqual(args.flow_x_reg_prior_method, "binned")
+        self.assertEqual(args.flow_x_reg_bin_n_bins, 10)
 
     def test_validate_rejects_bad_x_flow_reg_parameters(self) -> None:
         parser = argparse.ArgumentParser()
@@ -147,6 +150,11 @@ class TestHMatrixFlowXLikelihood(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_estimation_args(args)
         args = parser.parse_args(["--theta-field-method", "x_flow_reg", "--flow-x-reg-knn-k", "0"])
+        with self.assertRaises(ValueError):
+            validate_estimation_args(args)
+        args = parser.parse_args(
+            ["--theta-field-method", "x_flow_reg", "--flow-x-reg-bin-n-bins", "0"]
+        )
         with self.assertRaises(ValueError):
             validate_estimation_args(args)
 
@@ -375,6 +383,30 @@ class TestHMatrixFlowXLikelihood(unittest.TestCase):
         self.assertTrue(torch.allclose(prior.global_var, expected_global_var, atol=1e-6))
         self.assertTrue(torch.allclose(var[0], expected_global_var, atol=1e-6))
 
+    def test_binned_x_prior_uses_bin_mean_and_global_residual_variance(self) -> None:
+        theta_train = np.asarray([[-0.9], [-0.7], [-0.2], [0.2], [0.7], [0.9]], dtype=np.float64)
+        x_train = np.asarray(
+            [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [9.0, 10.0], [11.0, 12.0], [13.0, 14.0]],
+            dtype=np.float64,
+        )
+        prior = BinnedDiagGaussianXPrior(
+            theta_train=theta_train,
+            x_train=x_train,
+            n_bins=2,
+            variance_floor=1e-8,
+            device=torch.device("cpu"),
+        )
+        mu, var = prior.query(torch.asarray([[-0.8], [0.8]], dtype=torch.float32))
+        expected_mu = torch.tensor([[3.0, 4.0], [11.0, 12.0]], dtype=torch.float32)
+        self.assertTrue(torch.allclose(mu, expected_mu, atol=1e-6))
+        expected_train_mu = torch.tensor(
+            [[3.0, 4.0], [3.0, 4.0], [3.0, 4.0], [11.0, 12.0], [11.0, 12.0], [11.0, 12.0]],
+            dtype=torch.float32,
+        )
+        expected_global_var = (torch.from_numpy(x_train.astype(np.float32)) - expected_train_mu).square().mean(dim=0)
+        self.assertTrue(torch.allclose(prior.global_var, expected_global_var, atol=1e-6))
+        self.assertTrue(torch.allclose(var[0], expected_global_var, atol=1e-6))
+
     def test_x_flow_reg_prior_velocity_is_scheduler_aware(self) -> None:
         dtype = torch.float64
         for scheduler_name in ("cosine", "vp"):
@@ -411,6 +443,8 @@ class TestHMatrixFlowXLikelihood(unittest.TestCase):
         self.assertEqual(len(out["train_losses"]), 2)
         self.assertEqual(len(out["train_fm_losses"]), 2)
         self.assertEqual(len(out["train_prior_losses"]), 2)
+        self.assertEqual(out["flow_x_prior_regularization_method"], "binned")
+        self.assertEqual(out["flow_x_prior_regularization_bin_n_bins"], 10)
         self.assertTrue(np.all(np.isfinite(out["train_prior_losses"])))
         self.assertGreater(float(np.max(out["train_prior_losses"])), 0.0)
 
@@ -513,6 +547,8 @@ class TestHMatrixFlowXLikelihood(unittest.TestCase):
             z = np.load(loss_npz, allow_pickle=True)
             self.assertEqual(str(z["theta_field_method"].reshape(-1)[0]), "x_flow_reg")
             self.assertAlmostEqual(float(z["flow_x_reg_lambda"]), 0.01)
+            self.assertEqual(str(z["flow_x_reg_prior_method"].reshape(-1)[0]), "binned")
+            self.assertEqual(int(z["flow_x_reg_bin_n_bins"]), 10)
             self.assertEqual(int(z["flow_x_reg_knn_k"]), 8)
             self.assertEqual(tuple(z["flow_x_reg_prior_losses"].shape), (2,))
             self.assertTrue(np.isfinite(z["flow_x_reg_prior_losses"]).all())
@@ -587,6 +623,7 @@ class TestHMatrixFlowXLikelihood(unittest.TestCase):
             self.assertEqual(str(z["flow_x_save_checkpoint"].reshape(-1)[0]), str(root / "target_lambda0p1.pt"))
             self.assertAlmostEqual(float(z["flow_x_init_checkpoint_source_lambda"]), 1000.0)
             self.assertAlmostEqual(float(z["flow_x_reg_lambda"]), 0.1)
+            self.assertEqual(str(z["flow_x_reg_prior_method"].reshape(-1)[0]), "binned")
 
 
 if __name__ == "__main__":

@@ -1091,6 +1091,12 @@ def validate_estimation_args(args: Any) -> None:
         raise ValueError("--flow-cond-embed-depth must be >= 1.")
     if float(getattr(args, "flow_x_reg_lambda", 0.01)) < 0.0:
         raise ValueError("--flow-x-reg-lambda must be non-negative.")
+    _fx_reg_method = str(getattr(args, "flow_x_reg_prior_method", "binned")).strip().lower()
+    setattr(args, "flow_x_reg_prior_method", _fx_reg_method)
+    if _fx_reg_method not in ("binned", "knn"):
+        raise ValueError("--flow-x-reg-prior-method must be one of {'binned', 'knn'}.")
+    if int(getattr(args, "flow_x_reg_bin_n_bins", 10)) < 1:
+        raise ValueError("--flow-x-reg-bin-n-bins must be >= 1.")
     if int(getattr(args, "flow_x_reg_knn_k", 64)) < 1:
         raise ValueError("--flow-x-reg-knn-k must be >= 1.")
     if float(getattr(args, "flow_x_reg_bandwidth_floor", 1e-6)) <= 0.0:
@@ -1103,6 +1109,11 @@ def validate_estimation_args(args: Any) -> None:
         raise ValueError("--flow-prior-cond-embed-depth must be >= 1.")
     if _arch not in ("mlp", "soft_moe", "film", "film_fourier"):
         raise ValueError("--flow-arch must be one of {'mlp','soft_moe','film','film_fourier'}.")
+    _fbn = int(getattr(args, "flow_bottleneck_dim", 0))
+    if _fbn < 0:
+        raise ValueError("--flow-bottleneck-dim must be >= 0 (0 disables the readout bottleneck).")
+    if _fbn > 0 and str(_arch).strip().lower() != "mlp":
+        raise ValueError("--flow-bottleneck-dim > 0 is only supported with --flow-arch mlp.")
     if int(getattr(args, "flow_moe_num_experts", 4)) < 1:
         raise ValueError("--flow-moe-num-experts must be >= 1.")
     if float(getattr(args, "flow_moe_router_temperature", 1.0)) <= 0.0:
@@ -1278,6 +1289,8 @@ def _save_dsm_score_prior_training_losses_npz(
     prior_lr_last: float = float("nan"),
     theta_field_method: str = "theta_flow",
     flow_x_reg_lambda: float = 0.0,
+    flow_x_reg_prior_method: str = "binned",
+    flow_x_reg_bin_n_bins: int = 0,
     flow_x_reg_knn_k: int = 0,
     flow_x_reg_bandwidth_floor: float = float("nan"),
     flow_x_reg_variance_floor: float = float("nan"),
@@ -1328,6 +1341,8 @@ def _save_dsm_score_prior_training_losses_npz(
         prior_n_total_steps=np.int64(prior_n_total_steps),
         prior_lr_last=np.float64(prior_lr_last),
         flow_x_reg_lambda=np.float64(flow_x_reg_lambda),
+        flow_x_reg_prior_method=np.asarray([str(flow_x_reg_prior_method)], dtype=object),
+        flow_x_reg_bin_n_bins=np.int64(flow_x_reg_bin_n_bins),
         flow_x_reg_knn_k=np.int64(flow_x_reg_knn_k),
         flow_x_reg_bandwidth_floor=np.float64(flow_x_reg_bandwidth_floor),
         flow_x_reg_variance_floor=np.float64(flow_x_reg_variance_floor),
@@ -1414,10 +1429,13 @@ def _x_flow_checkpoint_metadata(
         "x_dim": int(getattr(args, "x_dim", -1)),
         "flow_hidden_dim": int(getattr(args, "flow_hidden_dim", 128)),
         "flow_depth": int(getattr(args, "flow_depth", 3)),
+        "flow_bottleneck_dim": int(getattr(args, "flow_bottleneck_dim", 0)),
         "flow_x_two_stage_mean_theta_pretrain": bool(
             getattr(args, "flow_x_two_stage_mean_theta_pretrain", False)
         ),
         "flow_x_reg_lambda": float(getattr(args, "flow_x_reg_lambda", 0.0)),
+        "flow_x_reg_prior_method": str(getattr(args, "flow_x_reg_prior_method", "binned")).strip().lower(),
+        "flow_x_reg_bin_n_bins": int(getattr(args, "flow_x_reg_bin_n_bins", 10)),
         "flow_x_reg_knn_k": int(getattr(args, "flow_x_reg_knn_k", 0)),
         "flow_x_reg_bandwidth_floor": float(getattr(args, "flow_x_reg_bandwidth_floor", float("nan"))),
         "flow_x_reg_variance_floor": float(getattr(args, "flow_x_reg_variance_floor", float("nan"))),
@@ -1552,11 +1570,19 @@ def _load_x_flow_model_checkpoint(
         "x_dim",
         "flow_hidden_dim",
         "flow_depth",
-        "flow_x_reg_knn_k",
-        "flow_x_reg_bandwidth_floor",
+        "flow_bottleneck_dim",
+        "flow_x_reg_prior_method",
+        "flow_x_reg_bin_n_bins",
         "flow_x_reg_variance_floor",
-        "flow_x_reg_weighted_var_correction",
     ]
+    if str(expected["flow_x_reg_prior_method"]) == "knn":
+        comparable_keys.extend(
+            [
+                "flow_x_reg_knn_k",
+                "flow_x_reg_bandwidth_floor",
+                "flow_x_reg_weighted_var_correction",
+            ]
+        )
     arch = str(flow_arch).strip().lower()
     if arch == "film":
         comparable_keys.extend(
@@ -1582,6 +1608,8 @@ def _load_x_flow_model_checkpoint(
         )
     for key in comparable_keys:
         if key not in payload:
+            if key == "flow_bottleneck_dim" and int(expected["flow_bottleneck_dim"]) == 0:
+                continue
             raise ValueError(f"x-flow init checkpoint is missing metadata key {key!r}: {resolved}")
         tol = 1e-8 if isinstance(expected[key], float) else 0.0
         _assert_checkpoint_value_equal(key=key, got=payload[key], expected=expected[key], tol=tol)
@@ -1827,6 +1855,7 @@ def build_conditional_x_velocity_model(
             hidden_dim=int(getattr(args, "flow_hidden_dim", 128)),
             depth=int(getattr(args, "flow_depth", 3)),
             use_logit_time=True,
+            bottleneck_dim=int(getattr(args, "flow_bottleneck_dim", 0)),
         ).to(device)
     if arch == "film":
         return ConditionalXFlowVelocityFiLMPerLayer(
@@ -2108,6 +2137,8 @@ def run_shared_fisher_estimation(
             _xf_extra = " film_x_trunk" + _xf_extra
         _xf_twostage = bool(getattr(args, "flow_x_two_stage_mean_theta_pretrain", False)) and theta_field_method in ("x_flow", "x_flow_reg")
         _xf_reg_lambda = float(getattr(args, "flow_x_reg_lambda", 0.01)) if theta_field_method == "x_flow_reg" else 0.0
+        _xf_reg_method = str(getattr(args, "flow_x_reg_prior_method", "binned")).strip().lower()
+        _xf_reg_bins = int(getattr(args, "flow_x_reg_bin_n_bins", 10))
         _e_tot = int(getattr(args, "flow_epochs", 10000))
         _e1 = _e_tot // 2
         _e2 = _e_tot - _e1
@@ -2118,6 +2149,13 @@ def run_shared_fisher_estimation(
             f"x_dim={int(args.x_dim)} theta_std={theta_std:.6f}"
             f" two_stage_mean_theta_pretrain={_xf_twostage}"
             f" prior_reg_lambda={_xf_reg_lambda:g}"
+            f" prior_reg_method={_xf_reg_method}"
+            + (f" prior_reg_bins={_xf_reg_bins}" if _xf_reg_method == "binned" else "")
+            + (
+                f" prior_reg_knn_k={int(getattr(args, 'flow_x_reg_knn_k', 64))}"
+                if _xf_reg_method == "knn"
+                else ""
+            )
             + (
                 f" (stage1_epochs={_e1} stage2_epochs={_e2})"
                 if _xf_twostage
@@ -2173,7 +2211,9 @@ def run_shared_fisher_estimation(
             scheduler_name=flow_scheduler_name,
             two_stage_mean_theta_pretrain=_xf_twostage,
             prior_regularization_lambda=_xf_reg_lambda,
+            prior_regularization_method=_xf_reg_method,
             prior_regularization_knn_k=int(getattr(args, "flow_x_reg_knn_k", 64)),
+            prior_regularization_bin_n_bins=_xf_reg_bins,
             prior_regularization_bandwidth_floor=float(getattr(args, "flow_x_reg_bandwidth_floor", 1e-6)),
             prior_regularization_variance_floor=float(getattr(args, "flow_x_reg_variance_floor", 1e-6)),
             prior_regularization_weighted_var_correction=bool(
@@ -2342,6 +2382,8 @@ def run_shared_fisher_estimation(
             prior_lr_last=float("nan"),
             theta_field_method=theta_field_method,
             flow_x_reg_lambda=_xf_reg_lambda,
+            flow_x_reg_prior_method=_xf_reg_method if theta_field_method == "x_flow_reg" else "",
+            flow_x_reg_bin_n_bins=_xf_reg_bins if theta_field_method == "x_flow_reg" else 0,
             flow_x_reg_knn_k=int(getattr(args, "flow_x_reg_knn_k", 64)) if theta_field_method == "x_flow_reg" else 0,
             flow_x_reg_bandwidth_floor=float(getattr(args, "flow_x_reg_bandwidth_floor", 1e-6)),
             flow_x_reg_variance_floor=float(getattr(args, "flow_x_reg_variance_floor", 1e-6)),

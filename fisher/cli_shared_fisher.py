@@ -277,6 +277,16 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument("--flow-hidden-dim", type=int, default=128)
     p.add_argument("--flow-depth", type=int, default=3)
+    p.add_argument(
+        "--flow-bottleneck-dim",
+        type=int,
+        default=0,
+        help=(
+            "x_flow MLP (flow_arch=mlp) only: if >0, insert a readout bottleneck of this width: "
+            "body ends at --flow-hidden-dim, then Linear(H,bottleneck)+SiLU+Linear(bottleneck,x_dim). "
+            "0 keeps the original single Linear(H,x_dim) readout."
+        ),
+    )
     p.add_argument("--flow-scheduler", type=str, default="cosine", choices=["cosine", "vp", "linear_vp"])
     p.add_argument(
         "--flow-eval-t",
@@ -326,19 +336,36 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         "--flow-x-reg-lambda",
         type=float,
         default=0.1,
-        help="x_flow_reg only: weight for KNN diagonal Gaussian velocity-prior regularization.",
+        help="x_flow_reg only: weight for diagonal Gaussian velocity-prior regularization.",
+    )
+    p.add_argument(
+        "--flow-x-reg-prior-method",
+        type=str,
+        default="binned",
+        choices=["binned", "knn"],
+        help=(
+            "x_flow_reg only: prior distribution estimator for regularization. "
+            "'binned' uses equal-width theta-bin means plus shared diagonal variance; "
+            "'knn' uses the legacy KNN-kernel mean plus shared diagonal variance."
+        ),
+    )
+    p.add_argument(
+        "--flow-x-reg-bin-n-bins",
+        type=int,
+        default=10,
+        help="x_flow_reg + --flow-x-reg-prior-method binned only: number of equal-width theta bins.",
     )
     p.add_argument(
         "--flow-x-reg-knn-k",
         type=int,
         default=64,
-        help="x_flow_reg only: number of theta-nearest neighbors used by the local Gaussian x prior.",
+        help="x_flow_reg + --flow-x-reg-prior-method knn only: number of theta-nearest neighbors.",
     )
     p.add_argument(
         "--flow-x-reg-bandwidth-floor",
         type=float,
         default=1e-6,
-        help="x_flow_reg only: minimum Gaussian-kernel bandwidth in theta KNN space.",
+        help="x_flow_reg + --flow-x-reg-prior-method knn only: minimum Gaussian-kernel bandwidth.",
     )
     p.add_argument(
         "--flow-x-reg-variance-floor",

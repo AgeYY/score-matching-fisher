@@ -2941,9 +2941,16 @@ def main(argv: list[str] | None = None) -> None:
             flush=True,
         )
         if tfm == "x_flow_reg":
+            _reg_method = str(getattr(args, "flow_x_reg_prior_method", "binned")).strip().lower()
+            _reg_detail = (
+                f"equal-width binned Gaussian prior (bins={int(getattr(args, 'flow_x_reg_bin_n_bins', 10))})"
+                if _reg_method == "binned"
+                else f"KNN Gaussian prior (k={int(getattr(args, 'flow_x_reg_knn_k', 64))})"
+            )
             print(
                 "[convergence] x_flow_reg mode uses ODE likelihood on x-space flow log p(x|theta) "
-                f"after KNN Gaussian velocity-prior regularization (lambda={float(getattr(args, 'flow_x_reg_lambda', 0.01)):g}).",
+                f"after {_reg_detail} velocity-prior regularization "
+                f"(lambda={float(getattr(args, 'flow_x_reg_lambda', 0.01)):g}).",
                 flush=True,
             )
         else:
@@ -3048,7 +3055,8 @@ def main(argv: list[str] | None = None) -> None:
         setattr(source_args, "_convergence_perm_seed", int(perm_seed))
         print(
             "[convergence] warm-start source sweep enabled: "
-            f"--theta-field-method=x_flow_reg --flow-x-reg-lambda={source_lam_f:g}; "
+            f"--theta-field-method=x_flow_reg --flow-x-reg-lambda={source_lam_f:g} "
+            f"--flow-x-reg-prior-method={getattr(source_args, 'flow_x_reg_prior_method', 'binned')}; "
             f"checkpoints -> {os.path.join(args.output_dir, warm_source_checkpoint_dir)}",
             flush=True,
         )
@@ -3116,7 +3124,8 @@ def main(argv: list[str] | None = None) -> None:
     prior_row_label: str | None = None
     if prior_row_lambda is not None:
         prior_lam_f = float(prior_row_lambda)
-        prior_row_label = rf"$\sqrt{{H^2}}$, x-flow-reg $\lambda$={prior_lam_f:g}"
+        _prior_method_label = str(getattr(args, "flow_x_reg_prior_method", "binned")).strip().lower()
+        prior_row_label = rf"$\sqrt{{H^2}}$, x-flow-reg {_prior_method_label} $\lambda$={prior_lam_f:g}"
         aux_args = argparse.Namespace(**vars(args))
         setattr(aux_args, "theta_field_method", "x_flow_reg")
         setattr(aux_args, "flow_x_reg_lambda", prior_lam_f)
@@ -3126,7 +3135,8 @@ def main(argv: list[str] | None = None) -> None:
         aux_loss_dir = f"training_losses_prior_lambda{safe_lam}"
         print(
             "[convergence] auxiliary prior row enabled: "
-            f"--theta-field-method=x_flow_reg --flow-x-reg-lambda={prior_lam_f:g}; "
+            f"--theta-field-method=x_flow_reg --flow-x-reg-lambda={prior_lam_f:g} "
+            f"--flow-x-reg-prior-method={getattr(aux_args, 'flow_x_reg_prior_method', 'binned')}; "
             f"runs -> {os.path.join(args.output_dir, aux_run_root)}",
             flush=True,
         )

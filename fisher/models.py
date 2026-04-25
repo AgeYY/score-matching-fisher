@@ -1000,20 +1000,31 @@ class ConditionalXFlowVelocity(nn.Module):
         hidden_dim: int = 128,
         depth: int = 3,
         use_logit_time: bool = True,
+        *,
+        bottleneck_dim: int = 0,
     ) -> None:
         super().__init__()
         if x_dim < 1:
             raise ValueError("x_dim must be >= 1.")
         self.x_dim = int(x_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.bottleneck_dim = int(bottleneck_dim) if int(bottleneck_dim) > 0 else 0
         self.use_logit_time = bool(use_logit_time)
         in_dim = x_dim + 1 + 1  # x_t, theta, t
-        layers: list[nn.Module] = []
+        body: list[nn.Module] = []
         for _ in range(depth):
-            layers.append(nn.Linear(in_dim, hidden_dim))
-            layers.append(nn.SiLU())
+            body.append(nn.Linear(in_dim, hidden_dim))
+            body.append(nn.SiLU())
             in_dim = hidden_dim
-        layers.append(nn.Linear(hidden_dim, x_dim))
-        self.net = nn.Sequential(*layers)
+        self.body = nn.Sequential(*body)
+        if self.bottleneck_dim > 0:
+            self.readout = nn.Sequential(
+                nn.Linear(hidden_dim, self.bottleneck_dim),
+                nn.SiLU(),
+                nn.Linear(self.bottleneck_dim, x_dim),
+            )
+        else:
+            self.readout = nn.Linear(hidden_dim, x_dim)
 
     def forward(self, x_t: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         if t.ndim == 1:
@@ -1024,7 +1035,8 @@ class ConditionalXFlowVelocity(nn.Module):
         else:
             t_feat = t
         feats = torch.cat([x_t, theta, t_feat], dim=-1)
-        return self.net(feats)
+        h = self.body(feats)
+        return self.readout(h)
 
     @torch.no_grad()
     def predict_velocity(self, x_t: torch.Tensor, theta: torch.Tensor, t_eval: float) -> torch.Tensor:
