@@ -37,6 +37,8 @@ class TestSingleNHeimScript(unittest.TestCase):
         n_bins = 3
         n = 6
         bin_all = np.asarray([0, 0, 1, 1, 2, 2], dtype=np.int64)
+        n_train = 2
+        bin_validation = np.asarray(bin_all[n_train:], dtype=np.int64)
         h_gt_sqrt = np.asarray(
             [
                 [0.0, 0.6, 0.7],
@@ -96,7 +98,8 @@ class TestSingleNHeimScript(unittest.TestCase):
                 n=n,
                 dataset_family="cosine_gaussian_sqrtd",
                 n_bins=n_bins,
-                bin_all=bin_all,
+                n_train=n_train,
+                bin_validation=bin_validation,
                 h_gt_sqrt=h_gt_sqrt,
             )
 
@@ -110,6 +113,34 @@ class TestSingleNHeimScript(unittest.TestCase):
             self.assertEqual(rows[0]["fro_rel_change"], "")
             self.assertAlmostEqual(float(rows[1]["fro_rel_change"]), float(rel_hist[0]), places=12)
             self.assertAlmostEqual(float(rows[2]["fro_rel_change"]), float(rel_hist[1]), places=12)
+
+    def test_h_sqrt_from_iter_run_uses_validation_block_only(self) -> None:
+        n_bins = 2
+        n_train = 2
+        bin_validation = np.asarray([0, 1], dtype=np.int64)
+        # Build a 4x4 h_sym where train block has large values that must be ignored.
+        h_sym = np.asarray(
+            [
+                [0.0, 1.0, 0.9, 0.9],
+                [1.0, 0.0, 0.9, 0.9],
+                [0.9, 0.9, 0.0, 0.25],
+                [0.9, 0.9, 0.25, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        with tempfile.TemporaryDirectory() as td:
+            iter_dir = Path(td)
+            np.savez_compressed(iter_dir / "h_matrix_results_theta_cov.npz", h_sym=h_sym)
+            out = single_heim._h_sqrt_from_iter_run(
+                iter_dir=str(iter_dir),
+                dataset_family="cosine_gaussian_sqrtd",
+                n_train=n_train,
+                bin_validation=bin_validation,
+                n_bins=n_bins,
+            )
+        expected_h2 = np.asarray([[0.0, 0.25], [0.25, 0.0]], dtype=np.float64)
+        expected = np.sqrt(expected_h2)
+        np.testing.assert_allclose(out, expected, atol=1e-12, rtol=0.0)
 
 
 if __name__ == "__main__":

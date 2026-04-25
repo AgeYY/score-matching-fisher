@@ -26,6 +26,8 @@ import numpy as np
 
 import study_h_decoding_convergence as shc
 
+FORCED_TRAIN_FRAC = 0.7
+
 
 def build_parser() -> argparse.ArgumentParser:
     p = shc.build_parser()
@@ -80,7 +82,8 @@ def _h_sqrt_from_iter_run(
     *,
     iter_dir: str,
     dataset_family: str,
-    bin_all: np.ndarray,
+    n_train: int,
+    bin_validation: np.ndarray,
     n_bins: int,
 ) -> np.ndarray:
     p = os.path.join(iter_dir, shc._h_matrix_results_npz_basename(dataset_family=dataset_family))
@@ -94,7 +97,14 @@ def _h_sqrt_from_iter_run(
     if "h_sym" not in z.files:
         raise KeyError(f"{p} missing h_sym.")
     h_sym = np.asarray(z["h_sym"], dtype=np.float64)
-    h_binned, _ = shc.vhb.average_matrix_by_bins(h_sym, np.asarray(bin_all, dtype=np.int64), int(n_bins))
+    h_sym_val = np.asarray(h_sym[int(n_train) :, int(n_train) :], dtype=np.float64)
+    bin_val = np.asarray(bin_validation, dtype=np.int64).reshape(-1)
+    if h_sym_val.shape[0] != bin_val.shape[0]:
+        raise ValueError(
+            "Validation slice shape mismatch between h_sym and bin_validation: "
+            f"{h_sym_val.shape[0]} vs {bin_val.shape[0]}."
+        )
+    h_binned, _ = shc.vhb.average_matrix_by_bins(h_sym_val, bin_val, int(n_bins))
     return shc._sqrt_h_like(h_binned)
 
 
@@ -104,7 +114,8 @@ def _render_iteration_visualizations(
     n: int,
     dataset_family: str,
     n_bins: int,
-    bin_all: np.ndarray,
+    n_train: int,
+    bin_validation: np.ndarray,
     h_gt_sqrt: np.ndarray,
 ) -> list[dict[str, str]]:
     heim_npz = os.path.join(output_dir, "heim_flow_iterations.npz")
@@ -147,7 +158,8 @@ def _render_iteration_visualizations(
         h_k_sqrt = _h_sqrt_from_iter_run(
             iter_dir=iter_dir,
             dataset_family=dataset_family,
-            bin_all=bin_all,
+            n_train=int(n_train),
+            bin_validation=np.asarray(bin_validation, dtype=np.int64),
             n_bins=n_bins,
         )
         corr_k = float(shc.vhb.matrix_corr_offdiag_pearson(h_k_sqrt, h_gt_sqrt))
@@ -240,16 +252,24 @@ def main(argv: list[str] | None = None) -> None:
         flush=True,
     )
     bin_idx_all = shc.vhb.theta_to_bin_index(theta_scalar_all, edges, n_bins)
-    subset = shc._subset_bundle(bundle, perm, n, meta, bin_idx_all=bin_idx_all, theta_state_all=None)
+    meta_for_split = dict(meta)
+    meta_for_split["train_frac"] = float(FORCED_TRAIN_FRAC)
+    subset = shc._subset_bundle(bundle, perm, n, meta_for_split, bin_idx_all=bin_idx_all, theta_state_all=None)
+    n_train = int(np.asarray(subset.bundle.x_train).shape[0])
+    n_validation = int(np.asarray(subset.bundle.x_validation).shape[0])
+    if n_validation < 1:
+        raise ValueError("Validation split is empty; cannot run validation-only Hellinger evaluation.")
 
     dataset_for_gt = shc.build_dataset_from_meta(meta)
     gt_seed = base_seed if int(args.gt_hellinger_seed) < 0 else int(args.gt_hellinger_seed)
     if hasattr(dataset_for_gt, "rng"):
         dataset_for_gt.rng = np.random.default_rng(gt_seed)
     centers = shc.bin_centers_from_edges(edges)
-    gt_n_mc = int(n) // n_bins
+    gt_n_mc = int(n_validation) // n_bins
     if gt_n_mc < 1:
-        raise ValueError(f"Need n//num_theta_bins >= 1 for GT MC; got n={n} n_bins={n_bins}.")
+        raise ValueError(
+            f"Need n_validation//num_theta_bins >= 1 for GT MC; got n_validation={n_validation} n_bins={n_bins}."
+        )
     h_gt_mc = shc.estimate_hellinger_sq_one_sided_mc(
         dataset_for_gt,
         centers,
@@ -258,7 +278,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     h_gt_sqrt = shc._sqrt_h_like(h_gt_mc)
 
-    h2_final, _clf_n, _loaded_final, _x_aligned = shc._run_heim_flow_for_subset(
+    _h2_final, _clf_n, _loaded_final, _x_aligned = shc._run_heim_flow_for_subset(
         args=args,
         meta=meta,
         subset=subset,
@@ -266,7 +286,19 @@ def main(argv: list[str] | None = None) -> None:
         n_bins=n_bins,
         dataset_family=str(args.dataset_family),
     )
-    h_final_sqrt = shc._sqrt_h_like(np.asarray(h2_final, dtype=np.float64))
+    heim_npz = os.path.join(args.output_dir, "heim_flow_iterations.npz")
+    z_heim = np.load(heim_npz, allow_pickle=True)
+    iters_done = int(np.asarray(z_heim["heim_iters_completed"]).reshape(-1)[0])
+    if iters_done < 1:
+        raise ValueError("HeIM run completed zero iterations; cannot compute final validation-only H estimate.")
+    final_iter_dir = os.path.join(args.output_dir, "heim_flow", f"iter_{iters_done - 1:03d}")
+    h_final_sqrt = _h_sqrt_from_iter_run(
+        iter_dir=final_iter_dir,
+        dataset_family=str(args.dataset_family),
+        n_train=int(n_train),
+        bin_validation=np.asarray(subset.bin_validation, dtype=np.int64),
+        n_bins=n_bins,
+    )
     corr_final = float(shc.vhb.matrix_corr_offdiag_pearson(h_final_sqrt, h_gt_sqrt))
     fig_png, fig_svg = shc._write_heim_flow_h_matrix_figure(
         out_dir=args.output_dir,
@@ -281,12 +313,11 @@ def main(argv: list[str] | None = None) -> None:
         n=int(n),
         dataset_family=str(args.dataset_family),
         n_bins=n_bins,
-        bin_all=np.asarray(subset.bin_all, dtype=np.int64),
+        n_train=int(n_train),
+        bin_validation=np.asarray(subset.bin_validation, dtype=np.int64),
         h_gt_sqrt=np.asarray(h_gt_sqrt, dtype=np.float64),
     )
 
-    heim_npz = os.path.join(args.output_dir, "heim_flow_iterations.npz")
-    z_heim = np.load(heim_npz, allow_pickle=True)
     out_npz = os.path.join(args.output_dir, "single_n_heim_results.npz")
     np.savez_compressed(
         out_npz,
@@ -297,6 +328,10 @@ def main(argv: list[str] | None = None) -> None:
         h_gt_sqrt=np.asarray(h_gt_sqrt, dtype=np.float64),
         h_final_sqrt=np.asarray(h_final_sqrt, dtype=np.float64),
         corr_h_vs_gt_offdiag=np.float64(corr_final),
+        train_frac_used=np.float64(float(FORCED_TRAIN_FRAC)),
+        n_train=np.int64(int(n_train)),
+        n_validation=np.int64(int(n_validation)),
+        hellinger_eval_pool=np.asarray(["validation_only"], dtype=object),
         rel_change_history=np.asarray(z_heim["rel_change_history"], dtype=np.float64),
         heim_iters_requested=np.asarray(z_heim["heim_iters_requested"]).reshape(-1)[0],
         heim_iters_effective_budget=np.asarray(z_heim["heim_iters_effective_budget"]).reshape(-1)[0],
@@ -310,7 +345,11 @@ def main(argv: list[str] | None = None) -> None:
         sf.write(f"dataset_family: {args.dataset_family}\n")
         sf.write(f"output_dir: {args.output_dir}\n")
         sf.write(f"n: {int(n)}\n")
+        sf.write(f"train_frac_used: {float(FORCED_TRAIN_FRAC):.6g}\n")
+        sf.write(f"n_train: {int(n_train)}\n")
+        sf.write(f"n_validation: {int(n_validation)}\n")
         sf.write(f"num_theta_bins: {int(n_bins)}\n")
+        sf.write("hellinger_eval_pool: validation_only\n")
         sf.write(f"theta_bin_source: {theta_bin_source}\n")
         sf.write(f"gt_hellinger_n_mc: {int(gt_n_mc)}\n")
         sf.write(f"gt_hellinger_seed: {int(gt_seed)}\n")
