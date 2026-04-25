@@ -126,7 +126,7 @@ def require_device(name: str) -> torch.device:
 
 def normalize_theta_field_method(method: str) -> str:
     m = str(method).strip().lower()
-    if m in ("theta_flow", "theta_path_integral", "x_flow", "ctsm_v"):
+    if m in ("theta_flow", "theta_path_integral", "x_flow", "x_flow_reg", "ctsm_v"):
         return m
     legacy_names = (
         "flow",
@@ -137,12 +137,12 @@ def normalize_theta_field_method(method: str) -> str:
     if m in legacy_names:
         raise ValueError(
             "Legacy --theta-field-method is removed. Use one of "
-            "{'theta_flow', 'theta_path_integral', 'x_flow', 'ctsm_v'}. "
+            "{'theta_flow', 'theta_path_integral', 'x_flow', 'x_flow_reg', 'ctsm_v'}. "
             "theta_flow = theta-space flow ODE log-likelihood Bayes ratios; "
             "theta_path_integral = velocity-to-score plus trapezoid integral along sorted theta."
         )
     raise ValueError(
-        "--theta-field-method must be one of {'theta_flow','theta_path_integral','x_flow','ctsm_v'}."
+        "--theta-field-method must be one of {'theta_flow','theta_path_integral','x_flow','x_flow_reg','ctsm_v'}."
     )
 
 
@@ -1054,9 +1054,9 @@ def validate_estimation_args(args: Any) -> None:
     if int(getattr(args, "flow_epochs", 1)) < 1:
         raise ValueError("--flow-epochs must be >= 1.")
     if bool(getattr(args, "flow_x_two_stage_mean_theta_pretrain", False)):
-        if _tfm_val != "x_flow":
+        if _tfm_val not in ("x_flow", "x_flow_reg"):
             raise ValueError(
-                "--flow-x-two-stage-mean-theta-pretrain is only valid with --theta-field-method x_flow."
+                "--flow-x-two-stage-mean-theta-pretrain is only valid with --theta-field-method x_flow or x_flow_reg."
             )
         if int(getattr(args, "flow_epochs", 1)) < 2:
             raise ValueError(
@@ -1082,6 +1082,14 @@ def validate_estimation_args(args: Any) -> None:
         raise ValueError("--flow-cond-embed-dim must be >= 1.")
     if int(getattr(args, "flow_cond_embed_depth", 1)) < 1:
         raise ValueError("--flow-cond-embed-depth must be >= 1.")
+    if float(getattr(args, "flow_x_reg_lambda", 0.01)) < 0.0:
+        raise ValueError("--flow-x-reg-lambda must be non-negative.")
+    if int(getattr(args, "flow_x_reg_knn_k", 64)) < 1:
+        raise ValueError("--flow-x-reg-knn-k must be >= 1.")
+    if float(getattr(args, "flow_x_reg_bandwidth_floor", 1e-6)) <= 0.0:
+        raise ValueError("--flow-x-reg-bandwidth-floor must be positive.")
+    if float(getattr(args, "flow_x_reg_variance_floor", 1e-6)) <= 0.0:
+        raise ValueError("--flow-x-reg-variance-floor must be positive.")
     if int(getattr(args, "flow_prior_cond_embed_dim", 16)) < 1:
         raise ValueError("--flow-prior-cond-embed-dim must be >= 1.")
     if int(getattr(args, "flow_prior_cond_embed_depth", 1)) < 1:
@@ -1100,9 +1108,9 @@ def validate_estimation_args(args: Any) -> None:
         raise ValueError("--flow-x-theta-fourier-k must be >= 0.")
     if _fx_omega_mode not in ("fixed", "theta_range"):
         raise ValueError("--flow-x-theta-fourier-omega-mode must be one of {'fixed', 'theta_range'}.")
-    if _tfm_val == "x_flow" and _arch == "soft_moe":
+    if _tfm_val in ("x_flow", "x_flow_reg") and _arch == "soft_moe":
         raise ValueError("--flow-arch soft_moe is supported only for theta_flow/theta_path_integral.")
-    if _tfm_val == "x_flow" and _arch == "film_fourier":
+    if _tfm_val in ("x_flow", "x_flow_reg") and _arch == "film_fourier":
         if _fx_omega_mode == "theta_range":
             lo = float(getattr(args, "theta_low", -6.0))
             hi = float(getattr(args, "theta_high", 6.0))
@@ -1186,13 +1194,13 @@ def validate_estimation_args(args: Any) -> None:
     if (
         bool(getattr(args, "compute_h_matrix", False))
         and not bool(getattr(args, "prior_enable", True))
-        and _tfm_val != "x_flow"
+        and _tfm_val not in ("x_flow", "x_flow_reg")
     ):
         raise ValueError("--compute-h-matrix requires prior score; do not use --no-prior-score.")
     if bool(getattr(args, "skip_shared_fisher_gt_compare", False)):
         if not bool(getattr(args, "compute_h_matrix", False)):
             raise ValueError("--skip-shared-fisher-gt-compare requires --compute-h-matrix.")
-        if not bool(getattr(args, "prior_enable", True)) and _tfm_val != "x_flow":
+        if not bool(getattr(args, "prior_enable", True)) and _tfm_val not in ("x_flow", "x_flow_reg"):
             raise ValueError("--skip-shared-fisher-gt-compare requires prior score; do not use --no-prior-score.")
     if int(getattr(args, "ctsm_epochs", 1)) < 1:
         raise ValueError("--ctsm-epochs must be >= 1.")
@@ -1262,6 +1270,13 @@ def _save_dsm_score_prior_training_losses_npz(
     prior_n_total_steps: int = 0,
     prior_lr_last: float = float("nan"),
     theta_field_method: str = "theta_flow",
+    flow_x_reg_lambda: float = 0.0,
+    flow_x_reg_knn_k: int = 0,
+    flow_x_reg_bandwidth_floor: float = float("nan"),
+    flow_x_reg_variance_floor: float = float("nan"),
+    flow_x_reg_weighted_var_correction: bool = False,
+    flow_x_reg_prior_losses: np.ndarray | None = None,
+    flow_x_reg_fm_losses: np.ndarray | None = None,
 ) -> str:
     """Write per-run training curves for posterior and optional prior (DSM score or theta-flow)."""
     path = os.path.join(output_dir, "score_prior_training_losses.npz")
@@ -1302,6 +1317,19 @@ def _save_dsm_score_prior_training_losses_npz(
         prior_n_clipped_steps=np.int64(prior_n_clipped_steps),
         prior_n_total_steps=np.int64(prior_n_total_steps),
         prior_lr_last=np.float64(prior_lr_last),
+        flow_x_reg_lambda=np.float64(flow_x_reg_lambda),
+        flow_x_reg_knn_k=np.int64(flow_x_reg_knn_k),
+        flow_x_reg_bandwidth_floor=np.float64(flow_x_reg_bandwidth_floor),
+        flow_x_reg_variance_floor=np.float64(flow_x_reg_variance_floor),
+        flow_x_reg_weighted_var_correction=np.bool_(flow_x_reg_weighted_var_correction),
+        flow_x_reg_prior_losses=np.asarray(
+            [] if flow_x_reg_prior_losses is None else flow_x_reg_prior_losses,
+            dtype=np.float64,
+        ),
+        flow_x_reg_fm_losses=np.asarray(
+            [] if flow_x_reg_fm_losses is None else flow_x_reg_fm_losses,
+            dtype=np.float64,
+        ),
     )
     return path
 
@@ -1834,7 +1862,7 @@ def run_shared_fisher_estimation(
         print(f"[training_losses] saved {tnpz}")
         return
 
-    if theta_field_method == "x_flow":
+    if theta_field_method in ("x_flow", "x_flow_reg"):
         if not bool(getattr(args, "compute_h_matrix", False)):
             raise RuntimeError(f"{theta_field_method} requires --compute-h-matrix to produce output artifacts.")
         theta_std = float(np.std(theta_score_fit))
@@ -1857,7 +1885,8 @@ def run_shared_fisher_estimation(
                 f" theta_fourier_bias={not bool(getattr(args, 'flow_x_theta_fourier_no_bias', False))}"
             )
             _xf_extra = " film_x_trunk" + _xf_extra
-        _xf_twostage = bool(getattr(args, "flow_x_two_stage_mean_theta_pretrain", False)) and theta_field_method == "x_flow"
+        _xf_twostage = bool(getattr(args, "flow_x_two_stage_mean_theta_pretrain", False)) and theta_field_method in ("x_flow", "x_flow_reg")
+        _xf_reg_lambda = float(getattr(args, "flow_x_reg_lambda", 0.01)) if theta_field_method == "x_flow_reg" else 0.0
         _e_tot = int(getattr(args, "flow_epochs", 10000))
         _e1 = _e_tot // 2
         _e2 = _e_tot - _e1
@@ -1867,6 +1896,7 @@ def run_shared_fisher_estimation(
             f"scheduler={getattr(args, 'flow_scheduler', 'cosine')} method={theta_field_method} "
             f"x_dim={int(args.x_dim)} theta_std={theta_std:.6f}"
             f" two_stage_mean_theta_pretrain={_xf_twostage}"
+            f" prior_reg_lambda={_xf_reg_lambda:g}"
             + (
                 f" (stage1_epochs={_e1} stage2_epochs={_e2})"
                 if _xf_twostage
@@ -1896,8 +1926,15 @@ def run_shared_fisher_estimation(
             restore_best=bool(getattr(args, "flow_restore_best", True)),
             scheduler_name=str(getattr(args, "flow_scheduler", "cosine")),
             two_stage_mean_theta_pretrain=_xf_twostage,
+            prior_regularization_lambda=_xf_reg_lambda,
+            prior_regularization_knn_k=int(getattr(args, "flow_x_reg_knn_k", 64)),
+            prior_regularization_bandwidth_floor=float(getattr(args, "flow_x_reg_bandwidth_floor", 1e-6)),
+            prior_regularization_variance_floor=float(getattr(args, "flow_x_reg_variance_floor", 1e-6)),
+            prior_regularization_weighted_var_correction=bool(
+                getattr(args, "flow_x_reg_weighted_var_correction", True)
+            ),
         )
-        if theta_field_method == "x_flow" and post_train_out.get("flow_x_two_stage"):
+        if theta_field_method in ("x_flow", "x_flow_reg") and post_train_out.get("flow_x_two_stage"):
             print(
                 "[x_flow] two-stage training finished: "
                 f"theta_mean_pretrain={float(post_train_out['theta_mean_pretrain']):.6f} "
@@ -1906,6 +1943,8 @@ def run_shared_fisher_estimation(
                 f"best_val_smooth={float(post_train_out['best_val_loss']):.6f}"
             )
         post_train_losses = np.asarray(post_train_out["train_losses"], dtype=np.float64)
+        post_train_fm_losses = np.asarray(post_train_out.get("train_fm_losses", []), dtype=np.float64)
+        post_train_prior_losses = np.asarray(post_train_out.get("train_prior_losses", []), dtype=np.float64)
         post_val_losses = np.asarray(post_train_out["val_losses"], dtype=np.float64)
         post_val_monitor_losses = np.asarray(post_train_out.get("val_monitor_losses", []), dtype=np.float64)
         post_best_epoch = int(post_train_out["best_epoch"])
@@ -1929,7 +1968,7 @@ def run_shared_fisher_estimation(
                 linestyle="--",
                 label=f"{_train_label} val EMA (α={getattr(args, 'flow_early_ema_alpha', 0.05):g})",
             )
-        if theta_field_method == "x_flow" and post_train_out.get("flow_x_two_stage"):
+        if theta_field_method in ("x_flow", "x_flow_reg") and post_train_out.get("flow_x_two_stage"):
             sb = int(post_train_out["stage_boundary_epoch"])
             if 1 <= sb < post_train_losses.size:
                 plt.axvline(
@@ -1952,7 +1991,7 @@ def run_shared_fisher_estimation(
             )
         plt.xlabel("Epoch")
         plt.ylabel("Loss")
-        plt.title("Conditional x-flow training (x_flow)")
+        plt.title(f"Conditional x-flow training ({theta_field_method})")
         plt.grid(alpha=0.25, linestyle="--", linewidth=0.8)
         plt.legend()
         plt.tight_layout()
@@ -1990,7 +2029,7 @@ def run_shared_fisher_estimation(
             args, h_result, suffix
         )
         print(
-            "[summary] x_flow mode completed (H-matrix only path; "
+            f"[summary] {theta_field_method} mode completed (H-matrix only path; "
             "ODESolver.compute_likelihood on conditional x-flow for log p(x|theta))."
         )
         print("Saved artifacts:")
@@ -2037,6 +2076,13 @@ def run_shared_fisher_estimation(
             prior_n_total_steps=0,
             prior_lr_last=float("nan"),
             theta_field_method=theta_field_method,
+            flow_x_reg_lambda=_xf_reg_lambda,
+            flow_x_reg_knn_k=int(getattr(args, "flow_x_reg_knn_k", 64)) if theta_field_method == "x_flow_reg" else 0,
+            flow_x_reg_bandwidth_floor=float(getattr(args, "flow_x_reg_bandwidth_floor", 1e-6)),
+            flow_x_reg_variance_floor=float(getattr(args, "flow_x_reg_variance_floor", 1e-6)),
+            flow_x_reg_weighted_var_correction=bool(getattr(args, "flow_x_reg_weighted_var_correction", True)),
+            flow_x_reg_prior_losses=post_train_prior_losses,
+            flow_x_reg_fm_losses=post_train_fm_losses,
         )
         print(f"[training_losses] saved {tnpz}")
         return

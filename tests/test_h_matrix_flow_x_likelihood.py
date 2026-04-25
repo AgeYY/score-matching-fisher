@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import math
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -17,8 +19,14 @@ from fisher.models import (
     ConditionalXFlowVelocityThetaFourierFiLMPerLayer,
     ConditionalXFlowVelocityThetaFourierMLP,
 )
-from fisher.shared_fisher_est import effective_flow_x_theta_fourier_omega, validate_estimation_args
+from fisher.shared_fisher_est import effective_flow_x_theta_fourier_omega, run_shared_fisher_estimation, validate_estimation_args
 from fisher.trainers import train_conditional_x_flow_model
+from fisher.trainers import (
+    KnnDiagGaussianXPrior,
+    analytical_diag_gaussian_x_prior_velocity,
+    sample_diag_gaussian_x_prior_path,
+    _make_flow_scheduler,
+)
 
 
 class _ThetaInvariantXFlow(ConditionalXFlowVelocity):
@@ -125,6 +133,22 @@ class TestHMatrixFlowXLikelihood(unittest.TestCase):
         add_estimation_arguments(parser)
         args = parser.parse_args(["--theta-field-method", "x_flow", "--flow-arch", "mlp"])
         validate_estimation_args(args)
+
+    def test_validate_estimation_args_accepts_x_flow_reg(self) -> None:
+        parser = argparse.ArgumentParser()
+        add_estimation_arguments(parser)
+        args = parser.parse_args(["--theta-field-method", "x_flow_reg", "--flow-arch", "mlp"])
+        validate_estimation_args(args)
+
+    def test_validate_rejects_bad_x_flow_reg_parameters(self) -> None:
+        parser = argparse.ArgumentParser()
+        add_estimation_arguments(parser)
+        args = parser.parse_args(["--theta-field-method", "x_flow_reg", "--flow-x-reg-lambda", "-1"])
+        with self.assertRaises(ValueError):
+            validate_estimation_args(args)
+        args = parser.parse_args(["--theta-field-method", "x_flow_reg", "--flow-x-reg-knn-k", "0"])
+        with self.assertRaises(ValueError):
+            validate_estimation_args(args)
 
     def test_validate_rejects_legacy_flow_score_arch_indep_mlp(self) -> None:
         parser = argparse.ArgumentParser()
@@ -327,6 +351,69 @@ class TestHMatrixFlowXLikelihood(unittest.TestCase):
         self.assertNotIn("flow_x_two_stage", out)
         self.assertEqual(len(out["train_losses"]), 2)
 
+    def test_knn_x_prior_uses_local_mean_and_global_residual_variance(self) -> None:
+        theta_train = np.asarray([[0.0], [0.1], [10.0]], dtype=np.float64)
+        x_train = np.asarray([[1.0, 2.0], [3.0, 6.0], [100.0, 200.0]], dtype=np.float64)
+        prior = KnnDiagGaussianXPrior(
+            theta_train=theta_train,
+            x_train=x_train,
+            k=2,
+            bandwidth_floor=1.0,
+            variance_floor=1e-3,
+            weighted_var_correction=False,
+            device=torch.device("cpu"),
+        )
+        mu, var = prior.query(torch.asarray([[0.05], [10.0]], dtype=torch.float32))
+        self.assertTrue(torch.allclose(mu[0], torch.tensor([2.0, 4.0]), atol=3e-3))
+        self.assertFalse(torch.allclose(mu[0], mu[1]))
+        self.assertTrue(torch.allclose(var[0], var[1]))
+
+        theta_t = torch.from_numpy(theta_train.astype(np.float32))
+        x_t = torch.from_numpy(x_train.astype(np.float32))
+        train_mu = prior._query_local_mean(theta_t)
+        expected_global_var = torch.clamp((x_t - train_mu).square().mean(dim=0), min=1e-3)
+        self.assertTrue(torch.allclose(prior.global_var, expected_global_var, atol=1e-6))
+        self.assertTrue(torch.allclose(var[0], expected_global_var, atol=1e-6))
+
+    def test_x_flow_reg_prior_velocity_is_scheduler_aware(self) -> None:
+        dtype = torch.float64
+        for scheduler_name in ("cosine", "vp"):
+            scheduler = _make_flow_scheduler(scheduler_name)
+            mu = torch.tensor([[0.4, -0.7], [0.2, 0.5]], dtype=dtype)
+            var = torch.tensor([[1.3, 0.6], [0.9, 1.1]], dtype=dtype)
+            t = torch.full((2, 1), 0.3, dtype=dtype)
+            x_t = sample_diag_gaussian_x_prior_path(t, mu, var, scheduler)
+            v = analytical_diag_gaussian_x_prior_velocity(x_t, t, mu, var, scheduler)
+            self.assertEqual(tuple(v.shape), (2, 2))
+            self.assertTrue(torch.isfinite(v).all())
+
+    def test_train_conditional_x_flow_with_prior_regularization_records_losses(self) -> None:
+        torch.manual_seed(0)
+        model = ConditionalXFlowVelocity(x_dim=2, hidden_dim=16, depth=1, use_logit_time=True)
+        theta = np.linspace(-1.0, 1.0, 40, dtype=np.float64).reshape(-1, 1)
+        x = np.concatenate([np.cos(theta), np.sin(theta)], axis=1).astype(np.float64)
+        out = train_conditional_x_flow_model(
+            model=model,
+            theta_train=theta[:32],
+            x_train=x[:32],
+            epochs=2,
+            batch_size=8,
+            lr=1e-2,
+            device=torch.device("cpu"),
+            log_every=99,
+            theta_val=theta[32:],
+            x_val=x[32:],
+            early_stopping_patience=100,
+            scheduler_name="vp",
+            prior_regularization_lambda=0.01,
+            prior_regularization_knn_k=8,
+        )
+        self.assertEqual(len(out["train_losses"]), 2)
+        self.assertEqual(len(out["train_fm_losses"]), 2)
+        self.assertEqual(len(out["train_prior_losses"]), 2)
+        self.assertTrue(np.all(np.isfinite(out["train_prior_losses"])))
+        self.assertGreater(float(np.max(out["train_prior_losses"])), 0.0)
+
     def test_train_conditional_x_flow_two_stage_merges_history(self) -> None:
         torch.manual_seed(0)
         model = ConditionalXFlowVelocity(x_dim=2, hidden_dim=16, depth=1, use_logit_time=True)
@@ -377,6 +464,58 @@ class TestHMatrixFlowXLikelihood(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             validate_estimation_args(args)
+
+    def test_shared_estimation_x_flow_reg_runs_and_records_metadata(self) -> None:
+        parser = argparse.ArgumentParser()
+        add_estimation_arguments(parser)
+        args = parser.parse_args([])
+        args.theta_field_method = "x_flow_reg"
+        args.compute_h_matrix = True
+        args.prior_enable = False
+        args.device = "cpu"
+        args.x_dim = 2
+        args.dataset_family = "cosine_gaussian"
+        args.h_restore_original_order = True
+        args.h_batch_size = 128
+        args.h_save_intermediates = True
+        args.seed = 5
+        args.log_every = 99
+        args.flow_epochs = 2
+        args.flow_batch_size = 8
+        args.flow_hidden_dim = 16
+        args.flow_depth = 1
+        args.flow_early_patience = 100
+        args.flow_scheduler = "vp"
+        args.flow_x_reg_lambda = 0.01
+        args.flow_x_reg_knn_k = 8
+
+        n = 24
+        theta_all = np.linspace(-1.0, 1.0, n, dtype=np.float64).reshape(-1, 1)
+        x_all = np.concatenate([np.cos(theta_all), np.sin(theta_all)], axis=1).astype(np.float64)
+        split = n // 2
+        with tempfile.TemporaryDirectory() as td:
+            args.output_dir = str(Path(td))
+            run_shared_fisher_estimation(
+                args,
+                dataset=object(),
+                theta_all=theta_all,
+                x_all=x_all,
+                theta_train=theta_all[:split],
+                x_train=x_all[:split],
+                theta_validation=theta_all[split:],
+                x_validation=x_all[split:],
+                rng=np.random.default_rng(0),
+            )
+            out_dir = Path(td)
+            self.assertTrue((out_dir / "h_matrix_results_theta_cov.npz").is_file())
+            loss_npz = out_dir / "score_prior_training_losses.npz"
+            self.assertTrue(loss_npz.is_file())
+            z = np.load(loss_npz, allow_pickle=True)
+            self.assertEqual(str(z["theta_field_method"].reshape(-1)[0]), "x_flow_reg")
+            self.assertAlmostEqual(float(z["flow_x_reg_lambda"]), 0.01)
+            self.assertEqual(int(z["flow_x_reg_knn_k"]), 8)
+            self.assertEqual(tuple(z["flow_x_reg_prior_losses"].shape), (2,))
+            self.assertTrue(np.isfinite(z["flow_x_reg_prior_losses"]).all())
 
 
 if __name__ == "__main__":

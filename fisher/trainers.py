@@ -920,6 +920,115 @@ def _make_flow_matching_path(scheduler_name: str):
     return AffineProbPath(scheduler=scheduler_lookup[name]())
 
 
+def _make_flow_scheduler(scheduler_name: str):
+    name = str(scheduler_name).strip().lower()
+    try:
+        from flow_matching.path.scheduler import CosineScheduler, LinearVPScheduler, VPScheduler
+    except ImportError as e:
+        raise ImportError(
+            "Flow matching training requires the `flow_matching` package. "
+            "Install it in your environment before using --method flow."
+        ) from e
+
+    scheduler_lookup = {
+        "cosine": CosineScheduler,
+        "vp": VPScheduler,
+        "linear_vp": LinearVPScheduler,
+    }
+    if name not in scheduler_lookup:
+        supported = ", ".join(sorted(scheduler_lookup.keys()))
+        raise ValueError(f"Unknown flow scheduler '{scheduler_name}'. Supported: {supported}.")
+    return scheduler_lookup[name]()
+
+
+class KnnDiagGaussianXPrior:
+    """KNN-kernel mean with a global diagonal residual variance for p(x | theta)."""
+
+    def __init__(
+        self,
+        theta_train: np.ndarray,
+        x_train: np.ndarray,
+        *,
+        k: int,
+        bandwidth_floor: float = 1e-6,
+        variance_floor: float = 1e-6,
+        weighted_var_correction: bool = True,
+        device: torch.device,
+    ) -> None:
+        theta_np = np.asarray(theta_train, dtype=np.float32)
+        x_np = np.asarray(x_train, dtype=np.float32)
+        if theta_np.ndim == 1:
+            theta_np = theta_np.reshape(-1, 1)
+        if x_np.ndim != 2:
+            raise ValueError("KnnDiagGaussianXPrior expects x_train to be a 2D array.")
+        if theta_np.shape[0] != x_np.shape[0]:
+            raise ValueError("theta_train and x_train must have the same number of rows.")
+        if theta_np.shape[0] < 1:
+            raise ValueError("KnnDiagGaussianXPrior requires at least one training sample.")
+        self.theta_train = torch.from_numpy(theta_np).to(device=device)
+        self.x_train = torch.from_numpy(x_np).to(device=device)
+        self.k = max(1, min(int(k), int(theta_np.shape[0])))
+        self.bandwidth_floor = float(bandwidth_floor)
+        self.variance_floor = float(variance_floor)
+        self.weighted_var_correction = bool(weighted_var_correction)
+        train_mu = self._query_local_mean(self.theta_train)
+        residual = self.x_train - train_mu
+        self.global_var = torch.clamp(residual.square().mean(dim=0), min=self.variance_floor)
+
+    def _query_local_mean(self, theta: torch.Tensor) -> torch.Tensor:
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        theta = theta.to(device=self.theta_train.device, dtype=self.theta_train.dtype)
+        d = torch.cdist(theta, self.theta_train, p=2)
+        neighbor_d, neighbor_idx = torch.topk(d, k=self.k, dim=1, largest=False, sorted=True)
+        h = torch.clamp(neighbor_d[:, -1:], min=self.bandwidth_floor)
+        weights = torch.exp(-0.5 * (neighbor_d / h).square())
+        weights = weights / torch.clamp(weights.sum(dim=1, keepdim=True), min=1e-12)
+        x_neighbors = self.x_train[neighbor_idx]
+        return torch.sum(weights[..., None] * x_neighbors, dim=1)
+
+    def query(self, theta: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        mu = self._query_local_mean(theta)
+        var = self.global_var.reshape(1, -1).expand(mu.shape[0], -1)
+        return mu, var
+
+
+def analytical_diag_gaussian_x_prior_velocity(
+    x: torch.Tensor,
+    t: torch.Tensor,
+    mu: torch.Tensor,
+    var: torch.Tensor,
+    scheduler: object,
+) -> torch.Tensor:
+    if t.ndim == 1:
+        t = t.unsqueeze(-1)
+    schedule = scheduler(t)
+    alpha = schedule.alpha_t
+    sigma = schedule.sigma_t
+    d_alpha = schedule.d_alpha_t
+    d_sigma = schedule.d_sigma_t
+    mu = mu.to(device=x.device, dtype=x.dtype)
+    var = var.to(device=x.device, dtype=x.dtype)
+    denom = sigma.square() + alpha.square() * var
+    gain = (sigma * d_sigma + alpha * d_alpha * var) / denom
+    return d_alpha * mu + gain * (x - alpha * mu)
+
+
+def sample_diag_gaussian_x_prior_path(
+    t: torch.Tensor,
+    mu: torch.Tensor,
+    var: torch.Tensor,
+    scheduler: object,
+) -> torch.Tensor:
+    if t.ndim == 1:
+        t = t.unsqueeze(-1)
+    schedule = scheduler(t)
+    alpha = schedule.alpha_t
+    sigma = schedule.sigma_t
+    std_t = torch.sqrt(sigma.square() + alpha.square() * var)
+    return alpha * mu + std_t * torch.randn_like(mu)
+
+
 def _standard_normal_log_prob(theta: torch.Tensor) -> torch.Tensor:
     theta_flat = theta.reshape(theta.shape[0], -1)
     return -0.5 * (theta_flat.pow(2).sum(dim=1) + theta_flat.shape[1] * math.log(2.0 * math.pi))
@@ -1010,6 +1119,11 @@ def train_conditional_x_flow_model(
     scheduler_name: str = "cosine",
     *,
     two_stage_mean_theta_pretrain: bool = False,
+    prior_regularization_lambda: float = 0.0,
+    prior_regularization_knn_k: int = 64,
+    prior_regularization_bandwidth_floor: float = 1e-6,
+    prior_regularization_variance_floor: float = 1e-6,
+    prior_regularization_weighted_var_correction: bool = True,
 ) -> dict[str, float | int | bool | list[float] | list[int]]:
     """Train conditional x-flow velocity. Optional two-stage: mean-theta pretrain then conditional finetune.
 
@@ -1047,6 +1161,11 @@ def train_conditional_x_flow_model(
             phase_label="stage1_mean_theta",
             epoch_base=0,
             total_epochs_label=int(epochs),
+            prior_regularization_lambda=prior_regularization_lambda,
+            prior_regularization_knn_k=prior_regularization_knn_k,
+            prior_regularization_bandwidth_floor=prior_regularization_bandwidth_floor,
+            prior_regularization_variance_floor=prior_regularization_variance_floor,
+            prior_regularization_weighted_var_correction=prior_regularization_weighted_var_correction,
         )
         actual_e1 = len(out1["train_losses"])
         out2 = _train_conditional_x_flow_phase(
@@ -1069,13 +1188,22 @@ def train_conditional_x_flow_model(
             phase_label="stage2_conditional",
             epoch_base=actual_e1,
             total_epochs_label=int(epochs),
+            prior_regularization_lambda=prior_regularization_lambda,
+            prior_regularization_knn_k=prior_regularization_knn_k,
+            prior_regularization_bandwidth_floor=prior_regularization_bandwidth_floor,
+            prior_regularization_variance_floor=prior_regularization_variance_floor,
+            prior_regularization_weighted_var_correction=prior_regularization_weighted_var_correction,
         )
         tr = list(out1["train_losses"]) + list(out2["train_losses"])
         va = list(out1["val_losses"]) + list(out2["val_losses"])
         vm = list(out1["val_monitor_losses"]) + list(out2["val_monitor_losses"])
+        fm = list(out1.get("train_fm_losses", [])) + list(out2.get("train_fm_losses", []))
+        pr = list(out1.get("train_prior_losses", [])) + list(out2.get("train_prior_losses", []))
         # Final model uses stage-2 best checkpoint (already restored inside phase 2).
         return {
             "train_losses": tr,
+            "train_fm_losses": fm,
+            "train_prior_losses": pr,
             "val_losses": va,
             "val_monitor_losses": vm,
             "best_val_loss": float(out2["best_val_loss"]),
@@ -1089,6 +1217,8 @@ def train_conditional_x_flow_model(
             "stage1_best_epoch_local": int(out1["best_epoch"]),
             "stage2_best_epoch_local": int(out2["best_epoch"]),
             "stage_boundary_epoch": int(actual_e1),
+            "flow_x_prior_regularization_lambda": float(prior_regularization_lambda),
+            "flow_x_prior_regularization_knn_k": int(prior_regularization_knn_k),
         }
 
     return _train_conditional_x_flow_phase(
@@ -1111,6 +1241,11 @@ def train_conditional_x_flow_model(
         phase_label="",
         epoch_base=0,
         total_epochs_label=int(epochs),
+        prior_regularization_lambda=prior_regularization_lambda,
+        prior_regularization_knn_k=prior_regularization_knn_k,
+        prior_regularization_bandwidth_floor=prior_regularization_bandwidth_floor,
+        prior_regularization_variance_floor=prior_regularization_variance_floor,
+        prior_regularization_weighted_var_correction=prior_regularization_weighted_var_correction,
     )
 
 
@@ -1140,10 +1275,31 @@ def _train_conditional_x_flow_phase(
     phase_label: str,
     epoch_base: int,
     total_epochs_label: int,
+    prior_regularization_lambda: float,
+    prior_regularization_knn_k: int,
+    prior_regularization_bandwidth_floor: float,
+    prior_regularization_variance_floor: float,
+    prior_regularization_weighted_var_correction: bool,
 ) -> dict[str, float | int | bool | list[float] | list[int]]:
     path = _make_flow_matching_path(scheduler_name=scheduler_name)
+    prior_scheduler = _make_flow_scheduler(scheduler_name=scheduler_name)
     loader = to_score_loader(theta_train, x_train, batch_size=batch_size, shuffle=True)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    prior_lambda = float(prior_regularization_lambda)
+    prior_enabled = prior_lambda > 0.0
+    x_prior = (
+        KnnDiagGaussianXPrior(
+            theta_train=theta_train,
+            x_train=x_train,
+            k=int(prior_regularization_knn_k),
+            bandwidth_floor=float(prior_regularization_bandwidth_floor),
+            variance_floor=float(prior_regularization_variance_floor),
+            weighted_var_correction=bool(prior_regularization_weighted_var_correction),
+            device=device,
+        )
+        if prior_enabled
+        else None
+    )
     has_val = theta_val is not None and x_val is not None and len(theta_val) > 0
     val_loader = (
         to_score_loader(theta_val, x_val, batch_size=batch_size, shuffle=False)
@@ -1151,6 +1307,8 @@ def _train_conditional_x_flow_phase(
         else None
     )
     train_losses: list[float] = []
+    train_fm_losses: list[float] = []
+    train_prior_losses: list[float] = []
     val_losses: list[float] = []
     val_monitor_losses: list[float] = []
     best_val_loss = float("inf")
@@ -1168,6 +1326,8 @@ def _train_conditional_x_flow_phase(
 
     for epoch in range(1, int(epochs) + 1):
         epoch_losses: list[float] = []
+        epoch_fm_losses: list[float] = []
+        epoch_prior_losses: list[float] = []
         model.train()
         for tb, xb in loader:
             tb = tb.to(device, non_blocking=True)
@@ -1178,13 +1338,33 @@ def _train_conditional_x_flow_phase(
             t = torch.rand(xb.shape[0], device=xb.device)
             path_sample = path.sample(t=t, x_0=x0, x_1=xb)
             pred = model(path_sample.x_t, tb, path_sample.t)
-            loss = torch.mean((pred - path_sample.dx_t) ** 2)
+            fm_loss = torch.mean((pred - path_sample.dx_t) ** 2)
+            prior_loss = torch.zeros((), device=xb.device, dtype=xb.dtype)
+            if x_prior is not None:
+                prior_mu, prior_var = x_prior.query(tb)
+                t_prior = torch.rand((xb.shape[0], 1), device=xb.device, dtype=xb.dtype)
+                x_prior_t = sample_diag_gaussian_x_prior_path(t_prior, prior_mu, prior_var, prior_scheduler)
+                target_prior = analytical_diag_gaussian_x_prior_velocity(
+                    x_prior_t,
+                    t_prior,
+                    prior_mu,
+                    prior_var,
+                    prior_scheduler,
+                )
+                prior_loss = torch.mean((model(x_prior_t, tb, t_prior) - target_prior) ** 2)
+            loss = fm_loss + prior_lambda * prior_loss
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
             epoch_losses.append(float(loss.item()))
+            epoch_fm_losses.append(float(fm_loss.item()))
+            epoch_prior_losses.append(float(prior_loss.item()))
         mean_train_loss = float(np.mean(epoch_losses))
+        mean_train_fm_loss = float(np.mean(epoch_fm_losses))
+        mean_train_prior_loss = float(np.mean(epoch_prior_losses))
         train_losses.append(mean_train_loss)
+        train_fm_losses.append(mean_train_fm_loss)
+        train_prior_losses.append(mean_train_prior_loss)
 
         mean_val_loss = float("nan")
         if has_val and val_loader is not None:
@@ -1222,11 +1402,15 @@ def _train_conditional_x_flow_phase(
             if has_val:
                 print(
                     f"[epoch {global_ep:4d}/{total_epochs_label}]{tag} flow_train={mean_train_loss:.6f} "
+                    f"fm={mean_train_fm_loss:.6f} prior={mean_train_prior_loss:.6f} "
                     f"val_loss={mean_val_loss:.6f} val_smooth={val_monitor_losses[-1]:.6f} "
                     f"best_smooth={best_val_loss:.6f} best_epoch={best_epoch}"
                 )
             else:
-                print(f"[epoch {global_ep:4d}/{total_epochs_label}]{tag} flow_loss={mean_train_loss:.6f}")
+                print(
+                    f"[epoch {global_ep:4d}/{total_epochs_label}]{tag} flow_loss={mean_train_loss:.6f} "
+                    f"fm={mean_train_fm_loss:.6f} prior={mean_train_prior_loss:.6f}"
+                )
 
         if has_val and patience_counter >= early_stopping_patience:
             stopped_early = True
@@ -1243,12 +1427,16 @@ def _train_conditional_x_flow_phase(
 
     return {
         "train_losses": train_losses,
+        "train_fm_losses": train_fm_losses,
+        "train_prior_losses": train_prior_losses,
         "val_losses": val_losses,
         "val_monitor_losses": val_monitor_losses,
         "best_val_loss": float(best_val_loss),
         "best_epoch": int(best_epoch),
         "stopped_epoch": int(stopped_epoch),
         "stopped_early": bool(stopped_early),
+        "flow_x_prior_regularization_lambda": float(prior_lambda),
+        "flow_x_prior_regularization_knn_k": int(prior_regularization_knn_k),
     }
 
 

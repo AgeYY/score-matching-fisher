@@ -111,7 +111,8 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         help=(
             "Likelihood-ratio field method: theta_flow (theta-space flow ODE log-likelihood Bayes ratios "
             "log p(theta|x)-log p(theta)), theta_path_integral (velocity-to-score plus trapezoid integral "
-            "along sorted theta), x_flow (conditional x-space flow ODE log p(x|theta)), or "
+            "along sorted theta), x_flow (conditional x-space flow ODE log p(x|theta)), "
+            "x_flow_reg (x_flow with KNN Gaussian velocity-prior regularization), or "
             "ctsm_v (pair-conditioned CTSM-v time-score integration)."
         ),
     )
@@ -298,10 +299,45 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         action="store_true",
         default=False,
         help=(
-            "x_flow only: split --flow-epochs 50/50 — stage 1 trains with theta fixed at "
+            "x_flow/x_flow_reg only: split --flow-epochs 50/50 — stage 1 trains with theta fixed at "
             "mean(theta on score-fit split) (unconditional-like); stage 2 finetunes with true per-sample theta. "
             "Odd E: stage1=floor(E/2), stage2=E-stage1 (extra epoch to stage 2). Requires --flow-epochs >= 2."
         ),
+    )
+    p.add_argument(
+        "--flow-x-reg-lambda",
+        type=float,
+        default=0.1,
+        help="x_flow_reg only: weight for KNN diagonal Gaussian velocity-prior regularization.",
+    )
+    p.add_argument(
+        "--flow-x-reg-knn-k",
+        type=int,
+        default=64,
+        help="x_flow_reg only: number of theta-nearest neighbors used by the local Gaussian x prior.",
+    )
+    p.add_argument(
+        "--flow-x-reg-bandwidth-floor",
+        type=float,
+        default=1e-6,
+        help="x_flow_reg only: minimum Gaussian-kernel bandwidth in theta KNN space.",
+    )
+    p.add_argument(
+        "--flow-x-reg-variance-floor",
+        type=float,
+        default=1e-6,
+        help="x_flow_reg only: minimum diagonal variance for the local Gaussian x prior.",
+    )
+    p.add_argument(
+        "--flow-x-reg-weighted-var-correction",
+        action="store_true",
+        default=True,
+        help="x_flow_reg only: apply weighted variance correction for local diagonal variance.",
+    )
+    p.add_argument(
+        "--no-flow-x-reg-weighted-var-correction",
+        action="store_false",
+        dest="flow_x_reg_weighted_var_correction",
     )
     p.add_argument(
         "--flow-arch",
@@ -309,7 +345,7 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         default="mlp",
         choices=["mlp", "soft_moe", "film", "film_fourier"],
         help=(
-            "Flow architecture shared by theta_flow, theta_path_integral, and x_flow: "
+            "Flow architecture shared by theta_flow, theta_path_integral, x_flow, and x_flow_reg: "
             "mlp, soft_moe (dense soft gating over MLP experts), "
             "film (FiLM blocks with embedded raw theta), or "
             "film_fourier (FiLM blocks with Fourier theta features)."
@@ -509,7 +545,7 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         type=int,
         default=4,
         help=(
-            "x_flow + --flow-arch film_fourier: number of harmonic pairs "
+            "x_flow/x_flow_reg + --flow-arch film_fourier: number of harmonic pairs "
             "(sin, cos) for theta encoding. Ignored for other methods."
         ),
     )
@@ -519,7 +555,7 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         default="theta_range",
         choices=["theta_range", "fixed"],
         help=(
-            "x_flow + film_fourier: how to set omega in sin(k*omega*theta). "
+            "x_flow/x_flow_reg + film_fourier: how to set omega in sin(k*omega*theta). "
             "theta_range (default): omega_eff = (2*pi / (theta_high-theta_low)) * mult, where mult is "
             "--flow-x-theta-fourier-omega, so the k=1 harmonic has period (theta_high-theta_low)/mult. "
             "fixed: use --flow-x-theta-fourier-omega as omega directly (e.g. 1 gives period 2*pi)."
@@ -530,7 +566,7 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         type=float,
         default=1.0,
         help=(
-            "x_flow + film_fourier: with --flow-x-theta-fourier-omega-mode fixed, this is omega. "
+            "x_flow/x_flow_reg + film_fourier: with --flow-x-theta-fourier-omega-mode fixed, this is omega. "
             "With theta_range, this is a positive multiplier mult on (2*pi/span) (default 1 => fundamental period "
             "equals theta_high-theta_low)."
         ),
@@ -539,13 +575,13 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         "--flow-x-theta-fourier-no-linear",
         action="store_true",
         default=False,
-        help="x_flow + film_fourier: drop raw theta from the theta feature vector.",
+        help="x_flow/x_flow_reg + film_fourier: drop raw theta from the theta feature vector.",
     )
     p.add_argument(
         "--flow-x-theta-fourier-no-bias",
         action="store_true",
         default=False,
-        help="x_flow + film_fourier: drop constant 1 from the theta feature vector.",
+        help="x_flow/x_flow_reg + film_fourier: drop constant 1 from the theta feature vector.",
     )
     p.add_argument(
         "--ctsm-epochs",

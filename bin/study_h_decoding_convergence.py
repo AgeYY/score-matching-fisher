@@ -22,13 +22,14 @@ field method. Supported methods are ``--theta-field-method theta_flow`` (theta-s
 log-likelihood Bayes ratios; prior + posterior theta-flows), ``--theta-field-method theta_path_integral``
 (same training as theta_flow but H from velocity-to-score plus trapezoid integral along sorted ``theta``),
 ``--theta-field-method x_flow`` (conditional x-space FM likelihood; no prior model),
+``--theta-field-method x_flow_reg`` (same x-space FM likelihood with KNN Gaussian velocity-prior regularization),
 ``--theta-field-method ctsm_v`` (pair-conditioned CTSM-v time-score integration; no prior model), and
 ``--theta-field-method nf`` (conditional normalizing flow log p(theta|x) with an NF prior
 for posterior-minus-prior log-ratio construction).
 Flow methods use ``--flow-arch``: ``mlp``, ``film`` (FiLM with raw-theta embeddings), or
-``film_fourier`` for ``theta_flow`` / ``theta_path_integral`` / ``x_flow``.
+``film_fourier`` for ``theta_flow`` / ``theta_path_integral`` / ``x_flow`` / ``x_flow_reg``.
 ``film_fourier`` uses FiLM conditioning with Fourier theta features
-(``--flow-theta-fourier-*`` for ``theta_flow`` / ``theta_path_integral`` and ``--flow-x-theta-fourier-*`` for ``x_flow``).
+(``--flow-theta-fourier-*`` for ``theta_flow`` / ``theta_path_integral`` and ``--flow-x-theta-fourier-*`` for ``x_flow`` / ``x_flow_reg``).
 The **reference column** (``n_ref``) does **not** run learned H
 training: the
 matrix-panel top row shows **MC generative** ``sqrt(H^2)`` (same as the H correlation
@@ -1538,6 +1539,8 @@ def _render_training_losses_panel(
             post_lab = "theta-path-integral score"
         elif tfm == "x_flow":
             post_lab = "x-flow direct likelihood"
+        elif tfm == "x_flow_reg":
+            post_lab = "x-flow-reg direct likelihood"
         elif tfm == "ctsm_v":
             post_lab = "pair-conditioned CTSM-v"
         elif tfm == "nf":
@@ -1756,6 +1759,8 @@ def _save_combined_convergence_figure(
             post_lab = "theta-path-integral score"
         elif tfm == "x_flow":
             post_lab = "x-flow direct likelihood"
+        elif tfm == "x_flow_reg":
+            post_lab = "x-flow-reg direct likelihood"
         elif tfm == "ctsm_v":
             post_lab = "pair-conditioned CTSM-v"
         elif tfm == "nf":
@@ -2607,17 +2612,24 @@ def main(argv: list[str] | None = None) -> None:
             "(path.velocity_to_epsilon then s=-eps/sigma_t) and trapezoid integral along sorted theta.",
             flush=True,
         )
-    elif tfm == "x_flow":
+    elif tfm in ("x_flow", "x_flow_reg"):
         print(
             f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
             f"(flow_arch={getattr(args, 'flow_arch', 'mlp')}; conditional x-flow only)",
             flush=True,
         )
-        print(
-            "[convergence] x_flow mode uses ODE likelihood on x-space flow log p(x|theta) "
-            "(no prior model).",
-            flush=True,
-        )
+        if tfm == "x_flow_reg":
+            print(
+                "[convergence] x_flow_reg mode uses ODE likelihood on x-space flow log p(x|theta) "
+                f"after KNN Gaussian velocity-prior regularization (lambda={float(getattr(args, 'flow_x_reg_lambda', 0.01)):g}).",
+                flush=True,
+            )
+        else:
+            print(
+                "[convergence] x_flow mode uses ODE likelihood on x-space flow log p(x|theta) "
+                "(no prior model).",
+                flush=True,
+            )
     elif tfm == "ctsm_v":
         print(
             f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
@@ -2643,7 +2655,7 @@ def main(argv: list[str] | None = None) -> None:
     else:
         raise ValueError(
             f"Unsupported --theta-field-method={tfm!r}; use "
-            "theta_flow, theta_path_integral, x_flow, ctsm_v, or nf."
+            "theta_flow, theta_path_integral, x_flow, x_flow_reg, ctsm_v, or nf."
         )
     print(
         "[convergence] n_ref reference: no learned H training at n_ref; matrix-panel top row = MC GT sqrt(H^2); "
@@ -2864,6 +2876,7 @@ def main(argv: list[str] | None = None) -> None:
         gt_mean_llr_one_sided_mc=np.asarray(llr_gt_mc, dtype=np.float64),
         llr_binned_columns=llr_cols,
         corr_llr_binned_vs_gt_mc=corr_llr,
+        theta_field_method=np.asarray([tfm], dtype=object),
     )
 
     _render_convergence_figures_and_summary(
