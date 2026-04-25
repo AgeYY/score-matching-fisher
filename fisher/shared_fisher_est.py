@@ -1062,6 +1062,13 @@ def validate_estimation_args(args: Any) -> None:
             raise ValueError(
                 "--flow-x-two-stage-mean-theta-pretrain requires --flow-epochs >= 2 (split floor(E/2) + remainder)."
             )
+    _flow_x_save_checkpoint = str(getattr(args, "flow_x_save_checkpoint", "") or "").strip()
+    _flow_x_init_checkpoint = str(getattr(args, "flow_x_init_checkpoint", "") or "").strip()
+    if (_flow_x_save_checkpoint or _flow_x_init_checkpoint) and _tfm_val not in ("x_flow", "x_flow_reg"):
+        raise ValueError(
+            "--flow-x-save-checkpoint and --flow-x-init-checkpoint are only valid with "
+            "--theta-field-method x_flow or x_flow_reg."
+        )
     if int(getattr(args, "flow_batch_size", 1)) < 1:
         raise ValueError("--flow-batch-size must be >= 1.")
     if float(getattr(args, "flow_lr", 0.0)) <= 0.0:
@@ -1277,6 +1284,9 @@ def _save_dsm_score_prior_training_losses_npz(
     flow_x_reg_weighted_var_correction: bool = False,
     flow_x_reg_prior_losses: np.ndarray | None = None,
     flow_x_reg_fm_losses: np.ndarray | None = None,
+    flow_x_init_checkpoint: str = "",
+    flow_x_save_checkpoint: str = "",
+    flow_x_init_checkpoint_source_lambda: float = float("nan"),
 ) -> str:
     """Write per-run training curves for posterior and optional prior (DSM score or theta-flow)."""
     path = os.path.join(output_dir, "score_prior_training_losses.npz")
@@ -1322,6 +1332,9 @@ def _save_dsm_score_prior_training_losses_npz(
         flow_x_reg_bandwidth_floor=np.float64(flow_x_reg_bandwidth_floor),
         flow_x_reg_variance_floor=np.float64(flow_x_reg_variance_floor),
         flow_x_reg_weighted_var_correction=np.bool_(flow_x_reg_weighted_var_correction),
+        flow_x_init_checkpoint=np.asarray([str(flow_x_init_checkpoint)], dtype=object),
+        flow_x_save_checkpoint=np.asarray([str(flow_x_save_checkpoint)], dtype=object),
+        flow_x_init_checkpoint_source_lambda=np.float64(flow_x_init_checkpoint_source_lambda),
         flow_x_reg_prior_losses=np.asarray(
             [] if flow_x_reg_prior_losses is None else flow_x_reg_prior_losses,
             dtype=np.float64,
@@ -1367,6 +1380,214 @@ def _save_theta_flow_model_checkpoint(
     }
     torch.save(payload, path)
     return path
+
+
+def _resolve_output_relative_path(output_dir: str, path: str) -> str:
+    """Resolve ``path`` relative to ``output_dir`` unless it is already absolute."""
+    p = str(path or "").strip()
+    if not p:
+        return ""
+    if os.path.isabs(p):
+        return p
+    return os.path.abspath(os.path.join(output_dir, p))
+
+
+def _x_flow_checkpoint_metadata(
+    *,
+    args: Any,
+    theta_field_method: str,
+    flow_arch: str,
+    flow_scheduler: str,
+    model: torch.nn.Module,
+    theta_score_fit: np.ndarray,
+    theta_score_val: np.ndarray,
+) -> dict[str, Any]:
+    """Collect x-flow checkpoint metadata that must match for warm starts."""
+    arch = str(flow_arch).strip().lower()
+    meta: dict[str, Any] = {
+        "checkpoint_version": 1,
+        "model_role": "conditional_x_flow",
+        "model_class": type(model).__name__,
+        "theta_field_method": str(theta_field_method),
+        "flow_arch": arch,
+        "flow_scheduler": str(flow_scheduler),
+        "x_dim": int(getattr(args, "x_dim", -1)),
+        "flow_hidden_dim": int(getattr(args, "flow_hidden_dim", 128)),
+        "flow_depth": int(getattr(args, "flow_depth", 3)),
+        "flow_x_two_stage_mean_theta_pretrain": bool(
+            getattr(args, "flow_x_two_stage_mean_theta_pretrain", False)
+        ),
+        "flow_x_reg_lambda": float(getattr(args, "flow_x_reg_lambda", 0.0)),
+        "flow_x_reg_knn_k": int(getattr(args, "flow_x_reg_knn_k", 0)),
+        "flow_x_reg_bandwidth_floor": float(getattr(args, "flow_x_reg_bandwidth_floor", float("nan"))),
+        "flow_x_reg_variance_floor": float(getattr(args, "flow_x_reg_variance_floor", float("nan"))),
+        "flow_x_reg_weighted_var_correction": bool(
+            getattr(args, "flow_x_reg_weighted_var_correction", True)
+        ),
+        "seed": int(getattr(args, "seed", -1)),
+        "n_score_fit": int(np.asarray(theta_score_fit).shape[0]),
+        "n_score_val": int(np.asarray(theta_score_val).shape[0]),
+    }
+    if arch == "film":
+        meta.update(
+            {
+                "flow_use_layer_norm": bool(getattr(args, "flow_use_layer_norm", False)),
+                "flow_gated_film": bool(getattr(args, "flow_gated_film", False)),
+                "flow_zero_out_init": bool(getattr(args, "flow_zero_out_init", False)),
+                "flow_cond_embed_dim": int(getattr(args, "flow_cond_embed_dim", 16)),
+                "flow_cond_embed_depth": int(getattr(args, "flow_cond_embed_depth", 1)),
+                "flow_cond_embed_act": str(getattr(args, "flow_cond_embed_act", "silu")),
+            }
+        )
+    if arch == "film_fourier":
+        om_eff, _ = effective_flow_x_theta_fourier_omega(args)
+        meta.update(
+            {
+                "flow_x_theta_fourier_k": int(getattr(args, "flow_x_theta_fourier_k", 4)),
+                "flow_x_theta_fourier_omega_mode": str(
+                    getattr(args, "flow_x_theta_fourier_omega_mode", "theta_range")
+                ).strip().lower(),
+                "flow_x_theta_fourier_omega": float(getattr(args, "flow_x_theta_fourier_omega", 1.0)),
+                "flow_x_theta_fourier_omega_effective": float(om_eff),
+                "flow_x_theta_fourier_include_linear": not bool(
+                    getattr(args, "flow_x_theta_fourier_no_linear", False)
+                ),
+                "flow_x_theta_fourier_include_bias": not bool(
+                    getattr(args, "flow_x_theta_fourier_no_bias", False)
+                ),
+            }
+        )
+    return meta
+
+
+def _save_x_flow_model_checkpoint(
+    *,
+    output_dir: str,
+    path: str,
+    model: torch.nn.Module,
+    args: Any,
+    theta_field_method: str,
+    flow_arch: str,
+    flow_scheduler: str,
+    theta_score_fit: np.ndarray,
+    theta_score_val: np.ndarray,
+    train_out: dict[str, Any],
+    init_checkpoint_path: str,
+) -> str:
+    """Save a conditional x-flow checkpoint after best-state restoration."""
+    resolved = _resolve_output_relative_path(output_dir, path)
+    if not resolved:
+        raise ValueError("Internal error: empty x-flow checkpoint save path.")
+    os.makedirs(os.path.dirname(resolved), exist_ok=True)
+    metadata = _x_flow_checkpoint_metadata(
+        args=args,
+        theta_field_method=theta_field_method,
+        flow_arch=flow_arch,
+        flow_scheduler=flow_scheduler,
+        model=model,
+        theta_score_fit=theta_score_fit,
+        theta_score_val=theta_score_val,
+    )
+    payload = {
+        **metadata,
+        "state_dict": model.state_dict(),
+        "best_epoch": int(train_out.get("best_epoch", 0)),
+        "stopped_epoch": int(train_out.get("stopped_epoch", 0)),
+        "best_val_loss": float(train_out.get("best_val_loss", float("nan"))),
+        "init_checkpoint_path": str(init_checkpoint_path),
+    }
+    torch.save(payload, resolved)
+    return resolved
+
+
+def _assert_checkpoint_value_equal(
+    *,
+    key: str,
+    got: Any,
+    expected: Any,
+    tol: float = 0.0,
+) -> None:
+    if isinstance(expected, float):
+        if not math.isclose(float(got), float(expected), rel_tol=0.0, abs_tol=tol):
+            raise ValueError(f"x-flow checkpoint metadata mismatch for {key}: got {got!r}, expected {expected!r}")
+        return
+    if got != expected:
+        raise ValueError(f"x-flow checkpoint metadata mismatch for {key}: got {got!r}, expected {expected!r}")
+
+
+def _load_x_flow_model_checkpoint(
+    *,
+    model: torch.nn.Module,
+    args: Any,
+    path: str,
+    theta_field_method: str,
+    flow_arch: str,
+    flow_scheduler: str,
+    theta_score_fit: np.ndarray,
+    theta_score_val: np.ndarray,
+    device: torch.device,
+) -> dict[str, Any]:
+    """Load a conditional x-flow warm-start checkpoint after metadata validation."""
+    resolved = _resolve_output_relative_path(str(getattr(args, "output_dir", ".")), path)
+    if not os.path.isfile(resolved):
+        raise FileNotFoundError(f"x-flow init checkpoint does not exist: {resolved}")
+    payload = torch.load(resolved, map_location=device)
+    if not isinstance(payload, dict) or "state_dict" not in payload:
+        raise ValueError(f"x-flow init checkpoint is missing a state_dict: {resolved}")
+    expected = _x_flow_checkpoint_metadata(
+        args=args,
+        theta_field_method=theta_field_method,
+        flow_arch=flow_arch,
+        flow_scheduler=flow_scheduler,
+        model=model,
+        theta_score_fit=theta_score_fit,
+        theta_score_val=theta_score_val,
+    )
+    comparable_keys = [
+        "model_role",
+        "model_class",
+        "theta_field_method",
+        "flow_arch",
+        "flow_scheduler",
+        "x_dim",
+        "flow_hidden_dim",
+        "flow_depth",
+        "flow_x_reg_knn_k",
+        "flow_x_reg_bandwidth_floor",
+        "flow_x_reg_variance_floor",
+        "flow_x_reg_weighted_var_correction",
+    ]
+    arch = str(flow_arch).strip().lower()
+    if arch == "film":
+        comparable_keys.extend(
+            [
+                "flow_use_layer_norm",
+                "flow_gated_film",
+                "flow_zero_out_init",
+                "flow_cond_embed_dim",
+                "flow_cond_embed_depth",
+                "flow_cond_embed_act",
+            ]
+        )
+    if arch == "film_fourier":
+        comparable_keys.extend(
+            [
+                "flow_x_theta_fourier_k",
+                "flow_x_theta_fourier_omega_mode",
+                "flow_x_theta_fourier_omega",
+                "flow_x_theta_fourier_omega_effective",
+                "flow_x_theta_fourier_include_linear",
+                "flow_x_theta_fourier_include_bias",
+            ]
+        )
+    for key in comparable_keys:
+        if key not in payload:
+            raise ValueError(f"x-flow init checkpoint is missing metadata key {key!r}: {resolved}")
+        tol = 1e-8 if isinstance(expected[key], float) else 0.0
+        _assert_checkpoint_value_equal(key=key, got=payload[key], expected=expected[key], tol=tol)
+    model.load_state_dict(payload["state_dict"])
+    payload["checkpoint_path"] = resolved
+    return payload
 
 
 def merge_meta_into_args(meta: dict[str, Any], est_ns: Any) -> Any:
@@ -1909,6 +2130,31 @@ def run_shared_fisher_estimation(
             args=args,
             device=device,
         )
+        flow_scheduler_name = str(getattr(args, "flow_scheduler", "cosine"))
+        flow_x_init_checkpoint = _resolve_output_relative_path(
+            args.output_dir,
+            str(getattr(args, "flow_x_init_checkpoint", "") or ""),
+        )
+        flow_x_init_source_lambda = float("nan")
+        if flow_x_init_checkpoint:
+            init_payload = _load_x_flow_model_checkpoint(
+                model=x_flow_model,
+                args=args,
+                path=flow_x_init_checkpoint,
+                theta_field_method=theta_field_method,
+                flow_arch=flow_score_arch,
+                flow_scheduler=flow_scheduler_name,
+                theta_score_fit=theta_score_fit,
+                theta_score_val=theta_score_val,
+                device=device,
+            )
+            flow_x_init_source_lambda = float(init_payload.get("flow_x_reg_lambda", float("nan")))
+            print(
+                "[x_flow_checkpoint] "
+                f"initialized from {flow_x_init_checkpoint} "
+                f"(source_lambda={flow_x_init_source_lambda:g})",
+                flush=True,
+            )
         post_train_out = train_conditional_x_flow_model(
             model=x_flow_model,
             theta_train=theta_score_fit,
@@ -1924,7 +2170,7 @@ def run_shared_fisher_estimation(
             early_stopping_min_delta=float(getattr(args, "flow_early_min_delta", 1e-4)),
             early_stopping_ema_alpha=float(getattr(args, "flow_early_ema_alpha", 0.05)),
             restore_best=bool(getattr(args, "flow_restore_best", True)),
-            scheduler_name=str(getattr(args, "flow_scheduler", "cosine")),
+            scheduler_name=flow_scheduler_name,
             two_stage_mean_theta_pretrain=_xf_twostage,
             prior_regularization_lambda=_xf_reg_lambda,
             prior_regularization_knn_k=int(getattr(args, "flow_x_reg_knn_k", 64)),
@@ -1934,6 +2180,25 @@ def run_shared_fisher_estimation(
                 getattr(args, "flow_x_reg_weighted_var_correction", True)
             ),
         )
+        flow_x_save_checkpoint = _resolve_output_relative_path(
+            args.output_dir,
+            str(getattr(args, "flow_x_save_checkpoint", "") or ""),
+        )
+        if flow_x_save_checkpoint:
+            saved_ckpt = _save_x_flow_model_checkpoint(
+                output_dir=args.output_dir,
+                path=flow_x_save_checkpoint,
+                model=x_flow_model,
+                args=args,
+                theta_field_method=theta_field_method,
+                flow_arch=flow_score_arch,
+                flow_scheduler=flow_scheduler_name,
+                theta_score_fit=theta_score_fit,
+                theta_score_val=theta_score_val,
+                train_out=post_train_out,
+                init_checkpoint_path=flow_x_init_checkpoint,
+            )
+            print(f"[x_flow_checkpoint] saved {saved_ckpt}", flush=True)
         if theta_field_method in ("x_flow", "x_flow_reg") and post_train_out.get("flow_x_two_stage"):
             print(
                 "[x_flow] two-stage training finished: "
@@ -2083,6 +2348,9 @@ def run_shared_fisher_estimation(
             flow_x_reg_weighted_var_correction=bool(getattr(args, "flow_x_reg_weighted_var_correction", True)),
             flow_x_reg_prior_losses=post_train_prior_losses,
             flow_x_reg_fm_losses=post_train_fm_losses,
+            flow_x_init_checkpoint=flow_x_init_checkpoint,
+            flow_x_save_checkpoint=flow_x_save_checkpoint,
+            flow_x_init_checkpoint_source_lambda=flow_x_init_source_lambda,
         )
         print(f"[training_losses] saved {tnpz}")
         return

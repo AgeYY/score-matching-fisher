@@ -305,6 +305,24 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         ),
     )
     p.add_argument(
+        "--flow-x-save-checkpoint",
+        type=str,
+        default="",
+        help=(
+            "x_flow/x_flow_reg only: save the restored-best conditional x-flow model checkpoint to this path. "
+            "Relative paths are resolved under --output-dir."
+        ),
+    )
+    p.add_argument(
+        "--flow-x-init-checkpoint",
+        type=str,
+        default="",
+        help=(
+            "x_flow/x_flow_reg only: initialize the conditional x-flow model from this checkpoint before training. "
+            "The checkpoint architecture metadata must match the current run."
+        ),
+    )
+    p.add_argument(
         "--flow-x-reg-lambda",
         type=float,
         default=0.1,

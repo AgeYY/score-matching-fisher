@@ -432,6 +432,25 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--prior-row-flow-x-reg-lambda",
+        type=float,
+        default=None,
+        help=(
+            "If set, add an auxiliary matrix-panel H row computed by a second x_flow_reg sweep "
+            "with this KNN Gaussian velocity-prior regularization weight. The first H row remains "
+            "the user-selected --theta-field-method."
+        ),
+    )
+    p.add_argument(
+        "--warm-start-flow-x-reg-source-lambda",
+        type=float,
+        default=None,
+        help=(
+            "If set, train an x_flow_reg source sweep with this lambda, save per-n checkpoints, "
+            "then run the primary sweep initialized from the matching source checkpoint."
+        ),
+    )
+    p.add_argument(
         "--gt-hellinger-seed",
         type=int,
         default=-1,
@@ -594,6 +613,11 @@ def _validate_cli(args: argparse.Namespace) -> None:
         raise ValueError("--num-theta-bins must be >= 1.")
     if int(args.clf_min_class_count) < 1:
         raise ValueError("--clf-min-class-count must be >= 1.")
+    prior_row_lam = getattr(args, "prior_row_flow_x_reg_lambda", None)
+    if prior_row_lam is not None:
+        prior_row_lam_f = float(prior_row_lam)
+        if not np.isfinite(prior_row_lam_f) or prior_row_lam_f <= 0.0:
+            raise ValueError("--prior-row-flow-x-reg-lambda must be a finite positive number.")
     n_ref = int(args.n_ref)
     n_bins_cli = int(args.num_theta_bins)
     if n_ref < 2:
@@ -650,6 +674,13 @@ def _validate_cli(args: argparse.Namespace) -> None:
                 "--theta-flow-segmented requires --theta-field-method theta_flow "
                 f"(got {getattr(args, 'theta_field_method', None)!r})."
             )
+    warm_lam = getattr(args, "warm_start_flow_x_reg_source_lambda", None)
+    if warm_lam is not None:
+        tfm = str(getattr(args, "theta_field_method", "theta_flow")).strip().lower()
+        if tfm != "x_flow_reg":
+            raise ValueError("--warm-start-flow-x-reg-source-lambda requires --theta-field-method x_flow_reg.")
+        if not np.isfinite(float(warm_lam)) or float(warm_lam) < 0.0:
+            raise ValueError("--warm-start-flow-x-reg-source-lambda must be a finite non-negative number.")
     _parse_n_list(args.n_list)  # syntax check only; pool size checked in main
 
 
@@ -831,6 +862,212 @@ def _pairwise_clf_from_bundle(
         random_state=int(clf_random_state),
     )
     return clf_acc
+
+
+class PerNSweepResult(NamedTuple):
+    corr_h: np.ndarray
+    corr_clf: np.ndarray
+    corr_llr: np.ndarray
+    wall_s: np.ndarray
+    h_sweep: list[np.ndarray]
+    clf_sweep: list[np.ndarray]
+    llr_sweep: list[np.ndarray]
+    per_n_loss_rows: list[dict[str, str]]
+
+
+def _run_per_n_method_sweep(
+    *,
+    args: argparse.Namespace,
+    meta: dict,
+    bundle: SharedDatasetBundle,
+    perm: np.ndarray,
+    ns: list[int],
+    n_bins: int,
+    bin_idx_all: np.ndarray,
+    theta_state_all: np.ndarray | None,
+    h_gt_sqrt: np.ndarray,
+    clf_ref: np.ndarray,
+    llr_gt_mc: np.ndarray,
+    clf_random_state: int,
+    run_root_name: str,
+    loss_dir_name: str,
+    sweep_label: str,
+    loss_note: str,
+    save_checkpoint_dir_name: str | None = None,
+    init_checkpoint_dir_name: str | None = None,
+) -> PerNSweepResult:
+    corr_h = np.full(len(ns), np.nan, dtype=np.float64)
+    corr_clf = np.full(len(ns), np.nan, dtype=np.float64)
+    corr_llr = np.full(len(ns), np.nan, dtype=np.float64)
+    wall_s = np.full(len(ns), np.nan, dtype=np.float64)
+    err_msg: list[str] = []
+    h_sweep: list[np.ndarray] = []
+    clf_sweep: list[np.ndarray] = []
+    llr_sweep: list[np.ndarray] = []
+    per_n_loss_rows: list[dict[str, str]] = []
+    ds_fam = str(meta.get("dataset_family", "cosine_gaussian"))
+
+    sweep_root = os.path.join(args.output_dir, run_root_name)
+    loss_dir = os.path.join(args.output_dir, loss_dir_name)
+    save_checkpoint_dir = (
+        os.path.join(args.output_dir, save_checkpoint_dir_name)
+        if save_checkpoint_dir_name
+        else None
+    )
+    init_checkpoint_dir = (
+        os.path.join(args.output_dir, init_checkpoint_dir_name)
+        if init_checkpoint_dir_name
+        else None
+    )
+    os.makedirs(loss_dir, exist_ok=True)
+    if save_checkpoint_dir is not None:
+        os.makedirs(save_checkpoint_dir, exist_ok=True)
+    if bool(args.keep_intermediate):
+        os.makedirs(sweep_root, exist_ok=True)
+    print(
+        f"[convergence] per-n training sweep ({sweep_label}) is enabled; "
+        f"collecting training_losses from each run artifact.",
+        flush=True,
+    )
+
+    for k, n in enumerate(ns):
+        run_dir: str
+        tmp_ctx: tempfile.TemporaryDirectory[str] | None = None
+        if bool(args.keep_intermediate):
+            run_dir = os.path.join(sweep_root, f"n_{n:06d}")
+            os.makedirs(run_dir, exist_ok=True)
+        else:
+            tmp_ctx = tempfile.TemporaryDirectory(prefix=f"h_conv_n{n}_", dir=args.output_dir)
+            run_dir = tmp_ctx.name
+
+        try:
+            t1 = time.time()
+            subset_n = _subset_bundle(
+                bundle,
+                perm,
+                int(n),
+                meta,
+                bin_idx_all=bin_idx_all,
+                theta_state_all=theta_state_all,
+            )
+            run_args = argparse.Namespace(**vars(args))
+            if save_checkpoint_dir is not None:
+                setattr(
+                    run_args,
+                    "flow_x_save_checkpoint",
+                    os.path.join(save_checkpoint_dir, f"n_{int(n):06d}.pt"),
+                )
+            if init_checkpoint_dir is not None:
+                init_ckpt = os.path.join(init_checkpoint_dir, f"n_{int(n):06d}.pt")
+                if not os.path.isfile(init_ckpt):
+                    raise FileNotFoundError(f"Missing warm-start source checkpoint for n={n}: {init_ckpt}")
+                setattr(run_args, "flow_x_init_checkpoint", init_ckpt)
+            loaded_n, x_aligned, _ = _estimate_one(
+                args=run_args,
+                meta=meta,
+                bundle=subset_n.bundle,
+                output_dir=run_dir,
+                n_bins=n_bins,
+            )
+            per_diag = os.path.join(
+                args.output_dir,
+                run_root_name,
+                f"n_{int(n):06d}",
+                "diagnostics",
+            )
+            _write_fixed_x_posterior_diagnostic(
+                run_dir=run_dir,
+                persistent_diagnostics_dir=per_diag,
+                meta=meta,
+                perm_seed=int(getattr(args, "_convergence_perm_seed", 0)),
+                n_subset=int(n),
+                x_aligned=x_aligned,
+            )
+            h_n, clf_n = _metrics_fixed_edges(
+                loaded_n,
+                subset_n,
+                n_bins,
+                int(args.clf_min_class_count),
+                int(clf_random_state),
+            )
+            h_n_sqrt = _sqrt_h_like(h_n)
+            corr_h[k] = vhb.matrix_corr_offdiag_pearson(h_n_sqrt, h_gt_sqrt)
+            corr_clf[k] = vhb.matrix_corr_offdiag_pearson(clf_n, clf_ref)
+            wall_s[k] = time.time() - t1
+            h_sweep.append(np.asarray(h_n_sqrt, dtype=np.float64))
+            clf_sweep.append(np.asarray(clf_n, dtype=np.float64))
+            delta_l_in = _load_delta_l_from_run_dir(run_dir, dataset_family=ds_fam)
+            llr_n = _metrics_delta_l_binned(delta_l_in, subset_n, n_bins)
+            llr_sweep.append(np.asarray(llr_n, dtype=np.float64))
+            corr_llr[k] = vhb.matrix_corr_offdiag_pearson(llr_n, np.asarray(llr_gt_mc, dtype=np.float64))
+            print(
+                f"[convergence] {sweep_label} n={n}  corr_h={corr_h[k]:.4f}  "
+                f"corr_clf={corr_clf[k]:.4f}  corr_llr={corr_llr[k]:.4f}  wall={wall_s[k]:.1f}s",
+                flush=True,
+            )
+            run_loss_npz = os.path.join(run_dir, "score_prior_training_losses.npz")
+            run_loss_npz_abs = os.path.abspath(run_loss_npz)
+            if not os.path.isfile(run_loss_npz_abs):
+                raise FileNotFoundError(
+                    f"Expected per-n training loss artifact is missing: {run_loss_npz_abs}"
+                )
+            dst_loss_npz_abs = os.path.abspath(os.path.join(loss_dir, f"n_{n:06d}.npz"))
+            shutil.copy2(run_loss_npz_abs, dst_loss_npz_abs)
+            per_n_loss_rows.append(
+                {
+                    "n": str(n),
+                    "status": "copied",
+                    "run_dir": os.path.abspath(run_dir),
+                    "src": run_loss_npz_abs,
+                    "dst": dst_loss_npz_abs,
+                    "note": loss_note,
+                }
+            )
+            print(
+                f"[convergence] {sweep_label} n={n} training_loss copied -> {dst_loss_npz_abs}",
+                flush=True,
+            )
+        except Exception as e:
+            err_msg.append(f"n={n}: {e!r}")
+            print(f"[convergence] ERROR {sweep_label} n={n}: {e}")
+            per_n_loss_rows.append(
+                {
+                    "n": str(n),
+                    "status": "error",
+                    "run_dir": os.path.abspath(run_dir),
+                    "src": os.path.abspath(os.path.join(run_dir, "score_prior_training_losses.npz")),
+                    "dst": os.path.abspath(os.path.join(loss_dir, f"n_{n:06d}.npz")),
+                    "note": repr(e),
+                }
+            )
+        finally:
+            if tmp_ctx is not None:
+                tmp_ctx.cleanup()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    if err_msg:
+        msg = "\n".join([f"  - {m}" for m in err_msg[:20]])
+        raise RuntimeError(
+            f"Per-n sweep failed for {sweep_label} (including required training-loss collection).\n"
+            f"{msg}"
+        )
+    if len(h_sweep) != len(ns) or len(clf_sweep) != len(ns) or len(llr_sweep) != len(ns):
+        raise RuntimeError(
+            f"Missing binned matrices for some n in {sweep_label} (partial failures). "
+            "Fix errors above or re-run with a smaller n-list."
+        )
+
+    return PerNSweepResult(
+        corr_h=corr_h,
+        corr_clf=corr_clf,
+        corr_llr=corr_llr,
+        wall_s=wall_s,
+        h_sweep=h_sweep,
+        clf_sweep=clf_sweep,
+        llr_sweep=llr_sweep,
+        per_n_loss_rows=per_n_loss_rows,
+    )
 
 
 def _estimate_one(
@@ -1609,6 +1846,7 @@ def _save_combined_convergence_figure(
     llr_gt: np.ndarray | None = None,
     llr_est_mats: list[np.ndarray] | None = None,
     corr_llr: np.ndarray | None = None,
+    extra_h_rows: list[tuple[str, list[np.ndarray]]] | None = None,
 ) -> str:
     """Single figure with matrix panel, correlation curves, H and LLR est-vs-GT scatters, losses, and optional diagnostic.
 
@@ -1624,7 +1862,8 @@ def _save_combined_convergence_figure(
         raise ValueError("_H_DECODING_CURVE_FIGSIZE_IN height must be > 0.")
     n_cols = len(h_mats)
     n_loss_cols = len(ns)
-    m_w, m_h = 2.8 * n_cols, 5.0
+    n_matrix_rows = 2 + len(extra_h_rows or [])
+    m_w, m_h = 2.8 * n_cols, 2.5 * n_matrix_rows
     l_w, l_h = max(2.6 * n_loss_cols, 6.0), 5.8
     top_h = float(m_h)
     bot_h = float(l_h)
@@ -1662,11 +1901,11 @@ def _save_combined_convergence_figure(
         width_ratios=[m_w, top_h * (float(crv_w) / float(crv_h))],
         height_ratios=height_rows,
     )
-    gs_left = gs0[0, 0].subgridspec(2, n_cols)
-    axes_m = np.empty((2, n_cols), dtype=object)
-    for c in range(n_cols):
-        axes_m[0, c] = fig.add_subplot(gs_left[0, c])
-        axes_m[1, c] = fig.add_subplot(gs_left[1, c])
+    gs_left = gs0[0, 0].subgridspec(n_matrix_rows, n_cols)
+    axes_m = np.empty((n_matrix_rows, n_cols), dtype=object)
+    for r in range(n_matrix_rows):
+        for c in range(n_cols):
+            axes_m[r, c] = fig.add_subplot(gs_left[r, c])
     _populate_matrix_panel_axes(
         axes_m,
         h_mats=h_mats,
@@ -1674,6 +1913,7 @@ def _save_combined_convergence_figure(
         col_labels=col_labels,
         n_bins=n_bins,
         theta_centers=theta_centers,
+        extra_h_rows=extra_h_rows,
     )
     ax_c = fig.add_subplot(gs0[0, 1])
     _populate_convergence_curve_ax(
@@ -1884,8 +2124,9 @@ def _populate_matrix_panel_axes(
     col_labels: list[str],
     n_bins: int,
     theta_centers: np.ndarray,
+    extra_h_rows: list[tuple[str, list[np.ndarray]]] | None = None,
 ) -> None:
-    """Draw 2 × n_cols heatmaps on existing axes (shared with standalone matrix panel + combined figure)."""
+    """Draw H heatmap rows plus one decoding row on existing axes."""
     tc = np.asarray(theta_centers, dtype=np.float64).ravel()
     if int(tc.size) != int(n_bins):
         raise ValueError(f"theta_centers length {tc.size} must match n_bins={n_bins}.")
@@ -1896,11 +2137,18 @@ def _populate_matrix_panel_axes(
     x_rot = 45 if len(tick_pos) > 6 else 0
     _matrix_tick_labelsize = 11
     _matrix_colorbar_tick_labelsize = 11
+    extra_rows = extra_h_rows or []
+    h_rows = [(r"$\sqrt{H^2}$, user method", h_mats)] + list(extra_rows)
+    n_h_rows = len(h_rows)
+    n_rows = n_h_rows + 1
     n_cols = len(h_mats)
     if n_cols != len(clf_mats) or n_cols != len(col_labels):
         raise ValueError("h_mats, clf_mats, col_labels length mismatch.")
-    if axes.shape != (2, n_cols):
-        raise ValueError(f"axes must be shape (2, {n_cols}); got {axes.shape}.")
+    for label, mats in extra_rows:
+        if len(mats) != n_cols:
+            raise ValueError(f"extra H row {label!r} has {len(mats)} columns; expected {n_cols}.")
+    if axes.shape != (n_rows, n_cols):
+        raise ValueError(f"axes must be shape ({n_rows}, {n_cols}); got {axes.shape}.")
 
     vmin_h, vmax_h = 0.0, 1.0
     vmin_c, vmax_c = _finite_min_max(clf_mats)
@@ -1909,28 +2157,35 @@ def _populate_matrix_panel_axes(
     cmap = "viridis"
 
     for c in range(n_cols):
-        ax0 = axes[0, c]
-        im0 = ax0.imshow(
-            h_mats[c],
-            vmin=vmin_h,
-            vmax=vmax_h,
-            cmap=cmap,
-            aspect="equal",
-            origin="lower",
-        )
-        ax0.set_title(col_labels[c], fontsize=10)
-        ax0.set_xticks(tick_pos)
-        ax0.set_xticklabels(tick_labs, rotation=x_rot, ha="right" if x_rot else "center", fontsize=_matrix_tick_labelsize)
-        ax0.set_yticks(tick_pos)
-        ax0.set_yticklabels(tick_labs, fontsize=_matrix_tick_labelsize)
-        ax0.tick_params(axis="both", labelsize=_matrix_tick_labelsize)
-        _matrix_axes_show_top_right_spines(ax0)
-        if c == 0:
-            ax0.set_ylabel(r"$\sqrt{H^2}$", fontsize=11)
-        _cb0 = plt.colorbar(im0, ax=ax0, fraction=0.046, pad=0.04)
-        _cb0.ax.tick_params(labelsize=_matrix_colorbar_tick_labelsize)
+        for r, (row_label, row_mats) in enumerate(h_rows):
+            ax0 = axes[r, c]
+            im0 = ax0.imshow(
+                row_mats[c],
+                vmin=vmin_h,
+                vmax=vmax_h,
+                cmap=cmap,
+                aspect="equal",
+                origin="lower",
+            )
+            if r == 0:
+                ax0.set_title(col_labels[c], fontsize=10)
+            ax0.set_xticks(tick_pos)
+            ax0.set_xticklabels(
+                tick_labs,
+                rotation=x_rot,
+                ha="right" if x_rot else "center",
+                fontsize=_matrix_tick_labelsize,
+            )
+            ax0.set_yticks(tick_pos)
+            ax0.set_yticklabels(tick_labs, fontsize=_matrix_tick_labelsize)
+            ax0.tick_params(axis="both", labelsize=_matrix_tick_labelsize)
+            _matrix_axes_show_top_right_spines(ax0)
+            if c == 0:
+                ax0.set_ylabel(row_label, fontsize=11)
+            _cb0 = plt.colorbar(im0, ax=ax0, fraction=0.046, pad=0.04)
+            _cb0.ax.tick_params(labelsize=_matrix_colorbar_tick_labelsize)
 
-        ax1 = axes[1, c]
+        ax1 = axes[n_h_rows, c]
         im1 = ax1.imshow(
             clf_mats[c],
             vmin=vmin_c,
@@ -2011,10 +2266,12 @@ def _render_matrix_panel(
     out_path: str,
     n_bins: int,
     theta_centers: np.ndarray,
+    extra_h_rows: list[tuple[str, list[np.ndarray]]] | None = None,
 ) -> None:
-    """Two rows: sqrt(binned H_sym) vs sqrt(GT H^2), pairwise decoding."""
+    """H rows: primary plus optional auxiliaries; final row: pairwise decoding."""
     n_cols = len(h_mats)
-    fig, axes = plt.subplots(2, n_cols, figsize=(2.8 * n_cols, 5.0), squeeze=False)
+    n_rows = 2 + len(extra_h_rows or [])
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(2.8 * n_cols, 2.5 * n_rows), squeeze=False)
     _populate_matrix_panel_axes(
         axes,
         h_mats=h_mats,
@@ -2022,6 +2279,7 @@ def _render_matrix_panel(
         col_labels=col_labels,
         n_bins=n_bins,
         theta_centers=theta_centers,
+        extra_h_rows=extra_h_rows,
     )
     fig.tight_layout()
     fig.subplots_adjust(hspace=0.12)
@@ -2102,6 +2360,10 @@ class CachedConvergenceBundle(TypedDict):
     llr_gt_mean_one_sided_mc: NotRequired[np.ndarray]
     llr_binned_columns: NotRequired[np.ndarray]
     corr_llr_binned_vs_gt_mc: NotRequired[np.ndarray]
+    prior_row_h_binned_columns: NotRequired[np.ndarray]
+    prior_row_label: NotRequired[str]
+    prior_row_flow_x_reg_lambda: NotRequired[float]
+    prior_row_corr_h_binned_vs_gt_mc: NotRequired[np.ndarray]
 
 
 def _load_cached_convergence_results(output_dir: str) -> CachedConvergenceBundle:
@@ -2175,6 +2437,21 @@ def _load_cached_convergence_results(output_dir: str) -> CachedConvergenceBundle
         base_bundle["llr_binned_columns"] = np.asarray(z["llr_binned_columns"], dtype=np.float64)
     if "corr_llr_binned_vs_gt_mc" in z.files:
         base_bundle["corr_llr_binned_vs_gt_mc"] = np.asarray(z["corr_llr_binned_vs_gt_mc"], dtype=np.float64).ravel()
+    if "prior_row_h_binned_columns" in z.files:
+        base_bundle["prior_row_h_binned_columns"] = np.asarray(z["prior_row_h_binned_columns"], dtype=np.float64)
+    if "prior_row_label" in z.files:
+        raw_label = z["prior_row_label"]
+        if np.asarray(raw_label).size > 0:
+            base_bundle["prior_row_label"] = str(np.asarray(raw_label).reshape(-1)[0])
+    if "prior_row_flow_x_reg_lambda" in z.files:
+        base_bundle["prior_row_flow_x_reg_lambda"] = float(
+            np.asarray(z["prior_row_flow_x_reg_lambda"]).reshape(-1)[0]
+        )
+    if "prior_row_corr_h_binned_vs_gt_mc" in z.files:
+        base_bundle["prior_row_corr_h_binned_vs_gt_mc"] = np.asarray(
+            z["prior_row_corr_h_binned_vs_gt_mc"],
+            dtype=np.float64,
+        ).ravel()
     return cast(CachedConvergenceBundle, base_bundle)
 
 
@@ -2225,6 +2502,9 @@ def _render_convergence_figures_and_summary(
     visualization_only: bool,
     llr_cols: np.ndarray | None = None,
     corr_llr: np.ndarray | None = None,
+    prior_row_h_cols: np.ndarray | None = None,
+    prior_row_label: str | None = None,
+    prior_row_loss_rows: list[dict[str, str]] | None = None,
 ) -> None:
     """Write CSV, figures, manifest, training-loss panel, summary, and print artifact paths."""
     csv_path = os.path.join(args.output_dir, "h_decoding_convergence_results.csv")
@@ -2259,6 +2539,15 @@ def _render_convergence_figures_and_summary(
 
     matrix_panel_path = os.path.join(args.output_dir, "h_decoding_matrices_panel.png")
     col_labels = [f"n={n}" for n in ns] + [f"Approx GT, n_ref={int(args.n_ref)}"]
+    extra_h_rows: list[tuple[str, list[np.ndarray]]] = []
+    if prior_row_h_cols is not None:
+        prior_label = prior_row_label or r"$\sqrt{H^2}$, x-flow-reg prior"
+        prior_arr = np.asarray(prior_row_h_cols, dtype=np.float64)
+        if prior_arr.shape != np.asarray(h_cols, dtype=np.float64).shape:
+            raise ValueError(
+                f"prior_row_h_cols shape {prior_arr.shape} must match h_cols shape {np.asarray(h_cols).shape}."
+            )
+        extra_h_rows.append((prior_label, [np.asarray(prior_arr[j], dtype=np.float64) for j in range(prior_arr.shape[0])]))
     _render_matrix_panel(
         h_mats=list(h_cols),
         clf_mats=list(clf_cols),
@@ -2266,6 +2555,7 @@ def _render_convergence_figures_and_summary(
         out_path=matrix_panel_path,
         n_bins=n_bins,
         theta_centers=theta_centers,
+        extra_h_rows=extra_h_rows,
     )
 
     loss_dir = os.path.join(args.output_dir, "training_losses")
@@ -2284,6 +2574,24 @@ def _render_convergence_figures_and_summary(
                     note=row["note"],
                 )
             )
+    prior_row_manifest_path = ""
+    if prior_row_loss_rows:
+        prior_loss_dir = os.path.dirname(os.path.abspath(prior_row_loss_rows[0]["dst"]))
+        os.makedirs(prior_loss_dir, exist_ok=True)
+        prior_row_manifest_path = os.path.join(prior_loss_dir, "manifest.txt")
+        with open(prior_row_manifest_path, "w", encoding="utf-8") as mf:
+            mf.write("# n\tstatus\trun_dir\tsrc_loss_npz\tdst_loss_npz\tnote\n")
+            for row in prior_row_loss_rows:
+                mf.write(
+                    "{n}\t{status}\t{run_dir}\t{src}\t{dst}\t{note}\n".format(
+                        n=row["n"],
+                        status=row["status"],
+                        run_dir=row["run_dir"],
+                        src=row["src"],
+                        dst=row["dst"],
+                        note=row["note"],
+                    )
+                )
 
     combined_path = os.path.join(args.output_dir, "h_decoding_convergence_combined.png")
     diagnostic_png = os.path.join(
@@ -2322,6 +2630,7 @@ def _render_convergence_figures_and_summary(
         llr_gt=llr_gt,
         llr_est_mats=llr_est,
         corr_llr=corr_llr_a,
+        extra_h_rows=extra_h_rows,
     )
 
     loss_panel_png = os.path.join(args.output_dir, "h_decoding_training_losses_panel.png")
@@ -2349,6 +2658,9 @@ def _render_convergence_figures_and_summary(
         "training_losses_dir": loss_dir,
         "training_losses_manifest": manifest_path,
     }
+    if prior_row_h_cols is not None:
+        paths_out["prior_row_label"] = prior_row_label or ""
+        paths_out["prior_row_training_losses_manifest"] = prior_row_manifest_path
     if visualization_only:
         paths_out["mode"] = "visualization-only (figures/csv/summary regenerated from cached NPZ)"
     if err_msg:
@@ -2380,6 +2692,12 @@ def _render_convergence_figures_and_summary(
         )
         sf.write(f"gt_hellinger_seed: {int(gt_seed)}\n")
         sf.write(f"gt_hellinger_symmetrize: {bool(gt_symmetrize_effective)}\n")
+        if prior_row_h_cols is not None:
+            sf.write("\n# Auxiliary prior row\n")
+            sf.write(f"prior_row_label: {prior_row_label or ''}\n")
+            sf.write(
+                "prior_row_h_binned_columns: auxiliary H row columns, last column reuses MC GT sqrt(H^2).\n"
+            )
 
     tag = "[convergence] Saved (visualization-only):" if visualization_only else "[convergence] Saved:"
     print(tag)
@@ -2481,6 +2799,8 @@ def main(argv: list[str] | None = None) -> None:
         )
         _llr_c = cached.get("llr_binned_columns")
         _corr_llr_c = cached.get("corr_llr_binned_vs_gt_mc")
+        _prior_row_h_c = cached.get("prior_row_h_binned_columns")
+        _prior_row_label_c = cached.get("prior_row_label")
         _render_convergence_figures_and_summary(
             args=args,
             meta=meta,
@@ -2504,6 +2824,8 @@ def main(argv: list[str] | None = None) -> None:
             visualization_only=True,
             llr_cols=None if _llr_c is None else np.asarray(_llr_c, dtype=np.float64),
             corr_llr=None if _corr_llr_c is None else np.asarray(_corr_llr_c, dtype=np.float64).ravel(),
+            prior_row_h_cols=None if _prior_row_h_c is None else np.asarray(_prior_row_h_c, dtype=np.float64),
+            prior_row_label=None if _prior_row_label_c is None else str(_prior_row_label_c),
         )
         return
 
@@ -2685,9 +3007,6 @@ def main(argv: list[str] | None = None) -> None:
     )
     print(f"[convergence] reference (GT + decoding) wall time: {time.time() - t0:.1f}s")
 
-    loss_dir = os.path.join(args.output_dir, "training_losses")
-    os.makedirs(loss_dir, exist_ok=True)
-
     np.savez_compressed(
         os.path.join(args.output_dir, "h_decoding_convergence_reference.npz"),
         h_binned_ref=h_ref,
@@ -2710,140 +3029,127 @@ def main(argv: list[str] | None = None) -> None:
         n_ref=np.int64(args.n_ref),
     )
 
-    corr_h = np.full(len(ns), np.nan, dtype=np.float64)
-    corr_clf = np.full(len(ns), np.nan, dtype=np.float64)
-    corr_llr = np.full(len(ns), np.nan, dtype=np.float64)
-    wall_s = np.full(len(ns), np.nan, dtype=np.float64)
-    err_msg: list[str] = []
-    h_sweep: list[np.ndarray] = []
-    clf_sweep: list[np.ndarray] = []
-    llr_sweep: list[np.ndarray] = []
-    per_n_loss_rows: list[dict[str, str]] = []
-    ds_fam = str(meta.get("dataset_family", "cosine_gaussian"))
-
-    sweep_root = os.path.join(args.output_dir, "sweep_runs")
-    if bool(args.keep_intermediate):
-        os.makedirs(sweep_root, exist_ok=True)
-    print(
-        "[convergence] per-n training sweep is enabled; collecting training_losses from each run artifact.",
-        flush=True,
+    setattr(args, "_convergence_perm_seed", int(perm_seed))
+    warm_source_lambda = getattr(args, "warm_start_flow_x_reg_source_lambda", None)
+    warm_source_checkpoint_dir: str | None = None
+    primary_save_checkpoint_dir: str | None = None
+    if warm_source_lambda is not None:
+        source_lam_f = float(warm_source_lambda)
+        safe_source_lam = f"{source_lam_f:g}".replace("-", "m").replace(".", "p")
+        target_lam_f = float(getattr(args, "flow_x_reg_lambda", 0.0))
+        safe_target_lam = f"{target_lam_f:g}".replace("-", "m").replace(".", "p")
+        warm_source_checkpoint_dir = f"warm_source_lambda{safe_source_lam}_checkpoints"
+        primary_save_checkpoint_dir = (
+            f"warm_target_lambda{safe_target_lam}_from_lambda{safe_source_lam}_checkpoints"
+        )
+        source_args = argparse.Namespace(**vars(args))
+        setattr(source_args, "theta_field_method", "x_flow_reg")
+        setattr(source_args, "flow_x_reg_lambda", source_lam_f)
+        setattr(source_args, "_convergence_perm_seed", int(perm_seed))
+        print(
+            "[convergence] warm-start source sweep enabled: "
+            f"--theta-field-method=x_flow_reg --flow-x-reg-lambda={source_lam_f:g}; "
+            f"checkpoints -> {os.path.join(args.output_dir, warm_source_checkpoint_dir)}",
+            flush=True,
+        )
+        _run_per_n_method_sweep(
+            args=source_args,
+            meta=meta,
+            bundle=bundle,
+            perm=perm,
+            ns=ns,
+            n_bins=n_bins,
+            bin_idx_all=bin_idx_all,
+            theta_state_all=theta_state_all,
+            h_gt_sqrt=h_gt_sqrt,
+            clf_ref=clf_ref,
+            llr_gt_mc=llr_gt_mc,
+            clf_random_state=clf_rs,
+            run_root_name=f"sweep_runs_warm_source_lambda{safe_source_lam}",
+            loss_dir_name=f"training_losses_warm_source_lambda{safe_source_lam}",
+            sweep_label=f"warm-source-lambda{source_lam_f:g}",
+            loss_note=f"from warm-start source sweep lambda={source_lam_f:g}",
+            save_checkpoint_dir_name=warm_source_checkpoint_dir,
+        )
+        print(
+            "[convergence] primary sweep will warm-start each n from matching source checkpoint "
+            f"and train target lambda={target_lam_f:g}.",
+            flush=True,
+        )
+    primary_sweep = _run_per_n_method_sweep(
+        args=args,
+        meta=meta,
+        bundle=bundle,
+        perm=perm,
+        ns=ns,
+        n_bins=n_bins,
+        bin_idx_all=bin_idx_all,
+        theta_state_all=theta_state_all,
+        h_gt_sqrt=h_gt_sqrt,
+        clf_ref=clf_ref,
+        llr_gt_mc=llr_gt_mc,
+        clf_random_state=clf_rs,
+        run_root_name="sweep_runs",
+        loss_dir_name="training_losses",
+        sweep_label="primary-warm-start" if warm_source_checkpoint_dir is not None else "primary",
+        loss_note=(
+            f"from warm-start target sweep initialized from {warm_source_checkpoint_dir}"
+            if warm_source_checkpoint_dir is not None
+            else "from per-n training sweep run"
+        ),
+        save_checkpoint_dir_name=primary_save_checkpoint_dir,
+        init_checkpoint_dir_name=warm_source_checkpoint_dir,
     )
+    corr_h = primary_sweep.corr_h
+    corr_clf = primary_sweep.corr_clf
+    corr_llr = primary_sweep.corr_llr
+    wall_s = primary_sweep.wall_s
+    h_sweep = primary_sweep.h_sweep
+    clf_sweep = primary_sweep.clf_sweep
+    llr_sweep = primary_sweep.llr_sweep
+    per_n_loss_rows = primary_sweep.per_n_loss_rows
 
-    for k, n in enumerate(ns):
-        run_dir: str
-        tmp_ctx: tempfile.TemporaryDirectory[str] | None = None
-        if bool(args.keep_intermediate):
-            run_dir = os.path.join(sweep_root, f"n_{n:06d}")
-            os.makedirs(run_dir, exist_ok=True)
-        else:
-            tmp_ctx = tempfile.TemporaryDirectory(prefix=f"h_conv_n{n}_", dir=args.output_dir)
-            run_dir = tmp_ctx.name
-
-        try:
-            t1 = time.time()
-            subset_n = _subset_bundle(
-                bundle,
-                perm,
-                int(n),
-                meta,
-                bin_idx_all=bin_idx_all,
-                theta_state_all=theta_state_all,
-            )
-            loaded_n, x_aligned, _ = _estimate_one(
-                args=args,
-                meta=meta,
-                bundle=subset_n.bundle,
-                output_dir=run_dir,
-                n_bins=n_bins,
-            )
-            per_diag = os.path.join(
-                args.output_dir,
-                "sweep_runs",
-                f"n_{int(n):06d}",
-                "diagnostics",
-            )
-            _write_fixed_x_posterior_diagnostic(
-                run_dir=run_dir,
-                persistent_diagnostics_dir=per_diag,
-                meta=meta,
-                perm_seed=int(perm_seed),
-                n_subset=int(n),
-                x_aligned=x_aligned,
-            )
-            h_n, clf_n = _metrics_fixed_edges(
-                loaded_n,
-                subset_n,
-                n_bins,
-                int(args.clf_min_class_count),
-                clf_rs,
-            )
-            h_n_sqrt = _sqrt_h_like(h_n)
-            corr_h[k] = vhb.matrix_corr_offdiag_pearson(h_n_sqrt, h_gt_sqrt)
-            corr_clf[k] = vhb.matrix_corr_offdiag_pearson(clf_n, clf_ref)
-            wall_s[k] = time.time() - t1
-            h_sweep.append(np.asarray(h_n_sqrt, dtype=np.float64))
-            clf_sweep.append(np.asarray(clf_n, dtype=np.float64))
-            delta_l_in = _load_delta_l_from_run_dir(run_dir, dataset_family=ds_fam)
-            llr_n = _metrics_delta_l_binned(delta_l_in, subset_n, n_bins)
-            llr_sweep.append(np.asarray(llr_n, dtype=np.float64))
-            corr_llr[k] = vhb.matrix_corr_offdiag_pearson(llr_n, np.asarray(llr_gt_mc, dtype=np.float64))
-            print(
-                f"[convergence] n={n}  corr_h={corr_h[k]:.4f}  corr_clf={corr_clf[k]:.4f}  "
-                f"corr_llr={corr_llr[k]:.4f}  wall={wall_s[k]:.1f}s",
-                flush=True,
-            )
-            run_loss_npz = os.path.join(run_dir, "score_prior_training_losses.npz")
-            run_loss_npz_abs = os.path.abspath(run_loss_npz)
-            if not os.path.isfile(run_loss_npz_abs):
-                raise FileNotFoundError(
-                    f"Expected per-n training loss artifact is missing: {run_loss_npz_abs}"
-                )
-            dst_loss_npz_abs = os.path.abspath(os.path.join(loss_dir, f"n_{n:06d}.npz"))
-            shutil.copy2(run_loss_npz_abs, dst_loss_npz_abs)
-            per_n_loss_rows.append(
-                {
-                    "n": str(n),
-                    "status": "copied",
-                    "run_dir": os.path.abspath(run_dir),
-                    "src": run_loss_npz_abs,
-                    "dst": dst_loss_npz_abs,
-                    "note": "from per-n training sweep run",
-                }
-            )
-            print(
-                f"[convergence] n={n} training_loss copied -> {dst_loss_npz_abs}",
-                flush=True,
-            )
-        except Exception as e:
-            err_msg.append(f"n={n}: {e!r}")
-            print(f"[convergence] ERROR n={n}: {e}")
-            per_n_loss_rows.append(
-                {
-                    "n": str(n),
-                    "status": "error",
-                    "run_dir": os.path.abspath(run_dir),
-                    "src": os.path.abspath(os.path.join(run_dir, "score_prior_training_losses.npz")),
-                    "dst": os.path.abspath(os.path.join(loss_dir, f"n_{n:06d}.npz")),
-                    "note": repr(e),
-                }
-            )
-        finally:
-            if tmp_ctx is not None:
-                tmp_ctx.cleanup()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    if err_msg:
-        msg = "\n".join([f"  - {m}" for m in err_msg[:20]])
-        raise RuntimeError(
-            "Per-n sweep failed (including required training-loss collection).\n"
-            f"{msg}"
+    prior_row_lambda = getattr(args, "prior_row_flow_x_reg_lambda", None)
+    prior_row_sweep: PerNSweepResult | None = None
+    prior_row_h_cols: np.ndarray | None = None
+    prior_row_llr_cols: np.ndarray | None = None
+    prior_row_label: str | None = None
+    if prior_row_lambda is not None:
+        prior_lam_f = float(prior_row_lambda)
+        prior_row_label = rf"$\sqrt{{H^2}}$, x-flow-reg $\lambda$={prior_lam_f:g}"
+        aux_args = argparse.Namespace(**vars(args))
+        setattr(aux_args, "theta_field_method", "x_flow_reg")
+        setattr(aux_args, "flow_x_reg_lambda", prior_lam_f)
+        setattr(aux_args, "_convergence_perm_seed", int(perm_seed))
+        safe_lam = f"{prior_lam_f:g}".replace("-", "m").replace(".", "p")
+        aux_run_root = f"sweep_runs_prior_lambda{safe_lam}"
+        aux_loss_dir = f"training_losses_prior_lambda{safe_lam}"
+        print(
+            "[convergence] auxiliary prior row enabled: "
+            f"--theta-field-method=x_flow_reg --flow-x-reg-lambda={prior_lam_f:g}; "
+            f"runs -> {os.path.join(args.output_dir, aux_run_root)}",
+            flush=True,
         )
-    if len(h_sweep) != len(ns) or len(clf_sweep) != len(ns) or len(llr_sweep) != len(ns):
-        raise RuntimeError(
-            "Missing binned matrices for some n (partial failures). "
-            "Fix errors above or re-run with a smaller n-list."
+        prior_row_sweep = _run_per_n_method_sweep(
+            args=aux_args,
+            meta=meta,
+            bundle=bundle,
+            perm=perm,
+            ns=ns,
+            n_bins=n_bins,
+            bin_idx_all=bin_idx_all,
+            theta_state_all=None,
+            h_gt_sqrt=h_gt_sqrt,
+            clf_ref=clf_ref,
+            llr_gt_mc=llr_gt_mc,
+            clf_random_state=clf_rs,
+            run_root_name=aux_run_root,
+            loss_dir_name=aux_loss_dir,
+            sweep_label=f"prior-row-lambda{prior_lam_f:g}",
+            loss_note=f"from auxiliary x_flow_reg prior-row sweep lambda={prior_lam_f:g}",
         )
+        prior_row_h_cols = np.stack(prior_row_sweep.h_sweep + [h_ref], axis=0)
+        prior_row_llr_cols = np.stack(prior_row_sweep.llr_sweep + [np.asarray(llr_gt_mc, dtype=np.float64)], axis=0)
     h_cols = np.stack(h_sweep + [h_ref], axis=0)
     clf_cols = np.stack(clf_sweep + [clf_ref], axis=0)
     llr_ref = np.asarray(llr_gt_mc, dtype=np.float64)
@@ -2851,33 +3157,62 @@ def main(argv: list[str] | None = None) -> None:
     column_n = np.asarray(list(ns) + [int(args.n_ref)], dtype=np.int64)
 
     out_npz = os.path.join(args.output_dir, "h_decoding_convergence_results.npz")
-    np.savez_compressed(
-        out_npz,
-        n=np.asarray(ns, dtype=np.int64),
-        corr_h_binned_vs_gt_mc=corr_h,
-        corr_clf_vs_ref=corr_clf,
-        wall_seconds=wall_s,
-        n_ref=np.int64(args.n_ref),
-        perm_seed=np.int64(perm_seed),
-        convergence_base_seed=np.int64(base_seed),
-        dataset_meta_seed=np.int64(meta["seed"]),
-        theta_bin_edges=edges,
-        theta_bin_centers=centers,
+    result_payload: dict[str, Any] = {
+        "n": np.asarray(ns, dtype=np.int64),
+        "corr_h_binned_vs_gt_mc": corr_h,
+        "corr_clf_vs_ref": corr_clf,
+        "wall_seconds": wall_s,
+        "n_ref": np.int64(args.n_ref),
+        "perm_seed": np.int64(perm_seed),
+        "convergence_base_seed": np.int64(base_seed),
+        "dataset_meta_seed": np.int64(meta["seed"]),
+        "theta_bin_edges": edges,
+        "theta_bin_centers": centers,
         # Legacy key name: sqrt(H^2) from MC; see module docstring.
-        hellinger_gt_sq_mc=h_gt_sqrt,
-        gt_hellinger_n_mc=np.int64(gt_n_mc),
-        gt_hellinger_n_ref_budget=np.int64(args.n_ref),
-        gt_hellinger_seed=np.int64(gt_seed),
-        gt_hellinger_symmetrize=np.int32(1 if bool(args.gt_hellinger_symmetrize) else 0),
-        h_binned_ref_is_gt_mc=np.int32(1),
-        h_binned_columns=h_cols,
-        clf_acc_columns=clf_cols,
-        column_n=column_n,
-        gt_mean_llr_one_sided_mc=np.asarray(llr_gt_mc, dtype=np.float64),
-        llr_binned_columns=llr_cols,
-        corr_llr_binned_vs_gt_mc=corr_llr,
-        theta_field_method=np.asarray([tfm], dtype=object),
-    )
+        "hellinger_gt_sq_mc": h_gt_sqrt,
+        "gt_hellinger_n_mc": np.int64(gt_n_mc),
+        "gt_hellinger_n_ref_budget": np.int64(args.n_ref),
+        "gt_hellinger_seed": np.int64(gt_seed),
+        "gt_hellinger_symmetrize": np.int32(1 if bool(args.gt_hellinger_symmetrize) else 0),
+        "h_binned_ref_is_gt_mc": np.int32(1),
+        "h_binned_columns": h_cols,
+        "clf_acc_columns": clf_cols,
+        "column_n": column_n,
+        "gt_mean_llr_one_sided_mc": np.asarray(llr_gt_mc, dtype=np.float64),
+        "llr_binned_columns": llr_cols,
+        "corr_llr_binned_vs_gt_mc": corr_llr,
+        "theta_field_method": np.asarray([tfm], dtype=object),
+    }
+    if warm_source_lambda is not None:
+        result_payload.update(
+            {
+                "warm_start_flow_x_reg_source_lambda": np.float64(float(warm_source_lambda)),
+                "warm_start_flow_x_reg_target_lambda": np.float64(
+                    float(getattr(args, "flow_x_reg_lambda", 0.0))
+                ),
+                "warm_start_source_checkpoint_dir": np.asarray(
+                    [os.path.abspath(os.path.join(args.output_dir, warm_source_checkpoint_dir or ""))],
+                    dtype=object,
+                ),
+                "warm_start_target_checkpoint_dir": np.asarray(
+                    [os.path.abspath(os.path.join(args.output_dir, primary_save_checkpoint_dir or ""))],
+                    dtype=object,
+                ),
+            }
+        )
+    if prior_row_sweep is not None and prior_row_h_cols is not None:
+        result_payload.update(
+            {
+                "prior_row_h_binned_columns": prior_row_h_cols,
+                "prior_row_corr_h_binned_vs_gt_mc": prior_row_sweep.corr_h,
+                "prior_row_wall_seconds": prior_row_sweep.wall_s,
+                "prior_row_llr_binned_columns": prior_row_llr_cols,
+                "prior_row_corr_llr_binned_vs_gt_mc": prior_row_sweep.corr_llr,
+                "prior_row_flow_x_reg_lambda": np.float64(float(prior_row_lambda)),
+                "prior_row_label": np.asarray([prior_row_label or ""], dtype=object),
+            }
+        )
+    np.savez_compressed(out_npz, **result_payload)
 
     _render_convergence_figures_and_summary(
         args=args,
@@ -2898,10 +3233,13 @@ def main(argv: list[str] | None = None) -> None:
         clf_cols=clf_cols,
         out_npz=out_npz,
         per_n_loss_rows=per_n_loss_rows,
-        err_msg=err_msg,
+        err_msg=[],
         visualization_only=False,
         llr_cols=llr_cols,
         corr_llr=corr_llr,
+        prior_row_h_cols=prior_row_h_cols,
+        prior_row_label=prior_row_label,
+        prior_row_loss_rows=None if prior_row_sweep is None else prior_row_sweep.per_n_loss_rows,
     )
 
 

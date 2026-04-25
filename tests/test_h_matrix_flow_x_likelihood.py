@@ -516,6 +516,77 @@ class TestHMatrixFlowXLikelihood(unittest.TestCase):
             self.assertEqual(int(z["flow_x_reg_knn_k"]), 8)
             self.assertEqual(tuple(z["flow_x_reg_prior_losses"].shape), (2,))
             self.assertTrue(np.isfinite(z["flow_x_reg_prior_losses"]).all())
+            self.assertEqual(str(z["flow_x_init_checkpoint"].reshape(-1)[0]), "")
+
+    def test_shared_estimation_x_flow_reg_checkpoint_warm_start(self) -> None:
+        parser = argparse.ArgumentParser()
+        add_estimation_arguments(parser)
+        args = parser.parse_args([])
+        args.theta_field_method = "x_flow_reg"
+        args.compute_h_matrix = True
+        args.prior_enable = False
+        args.device = "cpu"
+        args.x_dim = 2
+        args.dataset_family = "cosine_gaussian"
+        args.h_restore_original_order = True
+        args.h_batch_size = 128
+        args.h_save_intermediates = True
+        args.seed = 5
+        args.log_every = 99
+        args.flow_epochs = 1
+        args.flow_batch_size = 8
+        args.flow_hidden_dim = 16
+        args.flow_depth = 1
+        args.flow_early_patience = 100
+        args.flow_scheduler = "vp"
+        args.flow_x_reg_lambda = 1000.0
+        args.flow_x_reg_knn_k = 8
+
+        n = 24
+        theta_all = np.linspace(-1.0, 1.0, n, dtype=np.float64).reshape(-1, 1)
+        x_all = np.concatenate([np.cos(theta_all), np.sin(theta_all)], axis=1).astype(np.float64)
+        split = n // 2
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source_dir = root / "source"
+            target_dir = root / "target"
+            source_ckpt = root / "source_lambda1000.pt"
+            args.output_dir = str(source_dir)
+            args.flow_x_save_checkpoint = str(source_ckpt)
+            run_shared_fisher_estimation(
+                args,
+                dataset=object(),
+                theta_all=theta_all,
+                x_all=x_all,
+                theta_train=theta_all[:split],
+                x_train=x_all[:split],
+                theta_validation=theta_all[split:],
+                x_validation=x_all[split:],
+                rng=np.random.default_rng(0),
+            )
+            self.assertTrue(source_ckpt.is_file())
+
+            target_args = argparse.Namespace(**vars(args))
+            target_args.output_dir = str(target_dir)
+            target_args.flow_x_reg_lambda = 0.1
+            target_args.flow_x_init_checkpoint = str(source_ckpt)
+            target_args.flow_x_save_checkpoint = str(root / "target_lambda0p1.pt")
+            run_shared_fisher_estimation(
+                target_args,
+                dataset=object(),
+                theta_all=theta_all,
+                x_all=x_all,
+                theta_train=theta_all[:split],
+                x_train=x_all[:split],
+                theta_validation=theta_all[split:],
+                x_validation=x_all[split:],
+                rng=np.random.default_rng(0),
+            )
+            z = np.load(target_dir / "score_prior_training_losses.npz", allow_pickle=True)
+            self.assertEqual(str(z["flow_x_init_checkpoint"].reshape(-1)[0]), str(source_ckpt))
+            self.assertEqual(str(z["flow_x_save_checkpoint"].reshape(-1)[0]), str(root / "target_lambda0p1.pt"))
+            self.assertAlmostEqual(float(z["flow_x_init_checkpoint_source_lambda"]), 1000.0)
+            self.assertAlmostEqual(float(z["flow_x_reg_lambda"]), 0.1)
 
 
 if __name__ == "__main__":
