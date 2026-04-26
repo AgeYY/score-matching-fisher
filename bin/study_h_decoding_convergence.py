@@ -1897,18 +1897,24 @@ def _load_per_n_training_loss_npz(path: str) -> dict[str, Any]:
         "score_train_losses": _arr("score_train_losses"),
         "score_val_losses": _arr("score_val_losses"),
         "score_val_monitor_losses": _arr("score_val_monitor_losses"),
+        "score_train_endpoint_losses": _arr("score_train_endpoint_losses"),
+        "score_val_endpoint_losses": _arr("score_val_endpoint_losses"),
         "prior_train_losses": _arr("prior_train_losses"),
         "prior_val_losses": _arr("prior_val_losses"),
         "prior_val_monitor_losses": _arr("prior_val_monitor_losses"),
         "theta_pre_post_pretrain_train_losses": _arr("theta_pre_post_pretrain_train_losses"),
         "theta_pre_post_pretrain_reg_train_losses": _arr("theta_pre_post_pretrain_reg_train_losses"),
+        "theta_pre_post_pretrain_endpoint_train_losses": _arr("theta_pre_post_pretrain_endpoint_train_losses"),
         "theta_pre_post_pretrain_val_losses": _arr("theta_pre_post_pretrain_val_losses"),
         "theta_pre_post_pretrain_reg_val_losses": _arr("theta_pre_post_pretrain_reg_val_losses"),
+        "theta_pre_post_pretrain_endpoint_val_losses": _arr("theta_pre_post_pretrain_endpoint_val_losses"),
         "theta_pre_post_pretrain_val_monitor_losses": _arr("theta_pre_post_pretrain_val_monitor_losses"),
         "theta_pre_post_finetune_train_losses": _arr("theta_pre_post_finetune_train_losses"),
         "theta_pre_post_finetune_fm_train_losses": _arr("theta_pre_post_finetune_fm_train_losses"),
+        "theta_pre_post_finetune_endpoint_train_losses": _arr("theta_pre_post_finetune_endpoint_train_losses"),
         "theta_pre_post_finetune_val_losses": _arr("theta_pre_post_finetune_val_losses"),
         "theta_pre_post_finetune_fm_val_losses": _arr("theta_pre_post_finetune_fm_val_losses"),
+        "theta_pre_post_finetune_endpoint_val_losses": _arr("theta_pre_post_finetune_endpoint_val_losses"),
         "theta_pre_post_finetune_val_monitor_losses": _arr("theta_pre_post_finetune_val_monitor_losses"),
     }
 
@@ -3295,6 +3301,12 @@ def main(argv: list[str] | None = None) -> None:
         elif tfm == "theta_flow_pre_post":
             _ft_ep = int(getattr(args, "flow_theta_pre_post_finetune_epochs", 10000))
             _pre_synth = int(getattr(args, "flow_theta_pre_post_pretrain_synthetic_size", 0))
+            _endpoint_weight = float(getattr(args, "flow_endpoint_loss_weight", 0.0))
+            _endpoint_msg = (
+                f" plus conditional NLL (lambda={_endpoint_weight:.6g}, steps={int(getattr(args, 'flow_endpoint_steps', 20))})"
+                if _endpoint_weight > 0.0
+                else ""
+            )
             _pre_synth_online = bool(
                 getattr(args, "flow_theta_pre_post_pretrain_resample_synthetic_each_epoch", False)
             )
@@ -3317,7 +3329,7 @@ def main(argv: list[str] | None = None) -> None:
             if _ft_ep < 1:
                 print(
                     "[convergence] theta_flow_pre_post: pretrains the posterior theta-flow on binned Gaussian "
-                    "synthetic-pair regularization only (unweighted FM MSE); readout real-data fine-tuning is **skipped** "
+                    f"synthetic-pair regularization FM MSE{_endpoint_msg}; readout real-data fine-tuning is **skipped** "
                     f"(fine_epochs=0; flow_theta_reg_lambda_metadata={float(getattr(args, 'flow_theta_reg_lambda', 0.01)):.6g} "
                     f"(NPZ only, not applied to pretrain loss); "
                     f"bins={int(getattr(args, 'flow_theta_reg_bin_n_bins', 10))}; "
@@ -3327,8 +3339,8 @@ def main(argv: list[str] | None = None) -> None:
             else:
                 print(
                     "[convergence] theta_flow_pre_post pretrains the posterior theta-flow on binned Gaussian "
-                    "synthetic-pair regularization only (unweighted FM MSE), then freezes all but the readout for real-data FM "
-                    f"fine-tuning (readout-only real-data FM MSE; flow_theta_reg_lambda_metadata={float(getattr(args, 'flow_theta_reg_lambda', 0.01)):.6g} "
+                    f"synthetic-pair regularization FM MSE{_endpoint_msg}, then freezes all but the readout for real-data FM "
+                    f"fine-tuning (readout-only real-data FM MSE{_endpoint_msg}; flow_theta_reg_lambda_metadata={float(getattr(args, 'flow_theta_reg_lambda', 0.01)):.6g} "
                     f"NPZ-only; "
                     f"bins={int(getattr(args, 'flow_theta_reg_bin_n_bins', 10))}; "
                     f"fine_epochs={_ft_ep}; pretrain_patience={_pre_patience_eff}; {_pre_synth_msg}).",

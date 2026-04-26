@@ -1092,10 +1092,10 @@ def validate_estimation_args(args: Any) -> None:
         raise ValueError("--flow-endpoint-loss-weight must be non-negative.")
     if int(getattr(args, "flow_endpoint_steps", 20)) < 1:
         raise ValueError("--flow-endpoint-steps must be >= 1.")
-    if _tfm_val in ("theta_flow_reg", "theta_flow_pre_post") and float(getattr(args, "flow_endpoint_loss_weight", 0.0)) > 0.0:
+    if _tfm_val == "theta_flow_reg" and float(getattr(args, "flow_endpoint_loss_weight", 0.0)) > 0.0:
         raise ValueError(
             "--flow-endpoint-loss-weight is not supported with --theta-field-method "
-            "theta_flow_reg or theta_flow_pre_post."
+            "theta_flow_reg."
         )
     if float(getattr(args, "flow_theta_reg_lambda", 0.01)) < 0.0:
         raise ValueError("--flow-theta-reg-lambda must be non-negative.")
@@ -1389,6 +1389,10 @@ def _save_dsm_score_prior_training_losses_npz(
     prior_n_total_steps: int = 0,
     prior_lr_last: float = float("nan"),
     theta_field_method: str = "theta_flow",
+    flow_endpoint_loss_weight: float = 0.0,
+    flow_endpoint_steps: int = 0,
+    score_train_endpoint_losses: np.ndarray | None = None,
+    score_val_endpoint_losses: np.ndarray | None = None,
     flow_x_reg_lambda: float = 0.0,
     flow_x_reg_prior_method: str = "binned",
     flow_x_reg_bin_n_bins: int = 0,
@@ -1405,8 +1409,10 @@ def _save_dsm_score_prior_training_losses_npz(
     flow_theta_reg_fm_losses: np.ndarray | None = None,
     theta_pre_post_pretrain_train_losses: np.ndarray | None = None,
     theta_pre_post_pretrain_reg_train_losses: np.ndarray | None = None,
+    theta_pre_post_pretrain_endpoint_train_losses: np.ndarray | None = None,
     theta_pre_post_pretrain_val_losses: np.ndarray | None = None,
     theta_pre_post_pretrain_reg_val_losses: np.ndarray | None = None,
+    theta_pre_post_pretrain_endpoint_val_losses: np.ndarray | None = None,
     theta_pre_post_pretrain_val_monitor_losses: np.ndarray | None = None,
     theta_pre_post_pretrain_synthetic_size: int = 0,
     theta_pre_post_pretrain_synthetic_train_size: int = 0,
@@ -1415,8 +1421,10 @@ def _save_dsm_score_prior_training_losses_npz(
     theta_pre_post_pretrain_early_stopping_patience: int = 0,
     theta_pre_post_finetune_train_losses: np.ndarray | None = None,
     theta_pre_post_finetune_fm_train_losses: np.ndarray | None = None,
+    theta_pre_post_finetune_endpoint_train_losses: np.ndarray | None = None,
     theta_pre_post_finetune_val_losses: np.ndarray | None = None,
     theta_pre_post_finetune_fm_val_losses: np.ndarray | None = None,
+    theta_pre_post_finetune_endpoint_val_losses: np.ndarray | None = None,
     theta_pre_post_finetune_val_monitor_losses: np.ndarray | None = None,
     theta_pre_post_readout_trainable_params: int = 0,
     flow_x_init_checkpoint: str = "",
@@ -1447,6 +1455,16 @@ def _save_dsm_score_prior_training_losses_npz(
         score_n_clipped_steps=np.int64(score_n_clipped_steps),
         score_n_total_steps=np.int64(score_n_total_steps),
         score_lr_last=np.float64(score_lr_last),
+        flow_endpoint_loss_weight=np.float64(flow_endpoint_loss_weight),
+        flow_endpoint_steps=np.int64(flow_endpoint_steps),
+        score_train_endpoint_losses=np.asarray(
+            [] if score_train_endpoint_losses is None else score_train_endpoint_losses,
+            dtype=np.float64,
+        ),
+        score_val_endpoint_losses=np.asarray(
+            [] if score_val_endpoint_losses is None else score_val_endpoint_losses,
+            dtype=np.float64,
+        ),
         prior_enable=np.bool_(prior_enable),
         prior_train_losses=np.asarray(prior_train_losses, dtype=np.float64),
         prior_val_losses=np.asarray(prior_val_losses, dtype=np.float64),
@@ -1499,12 +1517,20 @@ def _save_dsm_score_prior_training_losses_npz(
             [] if theta_pre_post_pretrain_reg_train_losses is None else theta_pre_post_pretrain_reg_train_losses,
             dtype=np.float64,
         ),
+        theta_pre_post_pretrain_endpoint_train_losses=np.asarray(
+            [] if theta_pre_post_pretrain_endpoint_train_losses is None else theta_pre_post_pretrain_endpoint_train_losses,
+            dtype=np.float64,
+        ),
         theta_pre_post_pretrain_val_losses=np.asarray(
             [] if theta_pre_post_pretrain_val_losses is None else theta_pre_post_pretrain_val_losses,
             dtype=np.float64,
         ),
         theta_pre_post_pretrain_reg_val_losses=np.asarray(
             [] if theta_pre_post_pretrain_reg_val_losses is None else theta_pre_post_pretrain_reg_val_losses,
+            dtype=np.float64,
+        ),
+        theta_pre_post_pretrain_endpoint_val_losses=np.asarray(
+            [] if theta_pre_post_pretrain_endpoint_val_losses is None else theta_pre_post_pretrain_endpoint_val_losses,
             dtype=np.float64,
         ),
         theta_pre_post_pretrain_val_monitor_losses=np.asarray(
@@ -1528,12 +1554,20 @@ def _save_dsm_score_prior_training_losses_npz(
             [] if theta_pre_post_finetune_fm_train_losses is None else theta_pre_post_finetune_fm_train_losses,
             dtype=np.float64,
         ),
+        theta_pre_post_finetune_endpoint_train_losses=np.asarray(
+            [] if theta_pre_post_finetune_endpoint_train_losses is None else theta_pre_post_finetune_endpoint_train_losses,
+            dtype=np.float64,
+        ),
         theta_pre_post_finetune_val_losses=np.asarray(
             [] if theta_pre_post_finetune_val_losses is None else theta_pre_post_finetune_val_losses,
             dtype=np.float64,
         ),
         theta_pre_post_finetune_fm_val_losses=np.asarray(
             [] if theta_pre_post_finetune_fm_val_losses is None else theta_pre_post_finetune_fm_val_losses,
+            dtype=np.float64,
+        ),
+        theta_pre_post_finetune_endpoint_val_losses=np.asarray(
+            [] if theta_pre_post_finetune_endpoint_val_losses is None else theta_pre_post_finetune_endpoint_val_losses,
             dtype=np.float64,
         ),
         theta_pre_post_finetune_val_monitor_losses=np.asarray(
@@ -2835,6 +2869,8 @@ def run_shared_fisher_estimation(
                 pretrain_resample_synthetic_each_epoch=bool(
                     getattr(args, "flow_theta_pre_post_pretrain_resample_synthetic_each_epoch", False)
                 ),
+                endpoint_loss_weight=float(getattr(args, "flow_endpoint_loss_weight", 0.0)),
+                endpoint_ode_steps=int(getattr(args, "flow_endpoint_steps", 20)),
             )
         else:
             post_train_out = train_conditional_theta_flow_model(
@@ -2874,6 +2910,8 @@ def run_shared_fisher_estimation(
         post_val_monitor_losses = np.asarray(post_train_out.get("val_monitor_losses", []), dtype=np.float64)
         post_train_fm_losses = np.asarray(post_train_out.get("train_fm_losses", []), dtype=np.float64)
         post_train_reg_losses = np.asarray(post_train_out.get("train_reg_losses", []), dtype=np.float64)
+        post_train_endpoint_losses = np.asarray(post_train_out.get("train_endpoint_losses", []), dtype=np.float64)
+        post_val_endpoint_losses = np.asarray(post_train_out.get("val_endpoint_losses", []), dtype=np.float64)
         post_best_epoch = int(post_train_out["best_epoch"])
         post_stopped_epoch = int(post_train_out["stopped_epoch"])
         post_stopped_early = bool(post_train_out["stopped_early"])
@@ -3190,6 +3228,10 @@ def run_shared_fisher_estimation(
                 prior_n_total_steps=int(prior_train_out.get("n_total_steps", 0)),
                 prior_lr_last=float(prior_train_out.get("lr_last", float("nan"))),
                 theta_field_method=theta_field_method,
+                flow_endpoint_loss_weight=float(post_train_out.get("flow_endpoint_loss_weight", 0.0)),
+                flow_endpoint_steps=int(post_train_out.get("flow_endpoint_steps", 0)),
+                score_train_endpoint_losses=post_train_endpoint_losses,
+                score_val_endpoint_losses=post_val_endpoint_losses,
                 flow_theta_reg_lambda=(
                     float(getattr(args, "flow_theta_reg_lambda", 0.01))
                     if theta_field_method in ("theta_flow_reg", "theta_flow_pre_post")
@@ -3211,12 +3253,20 @@ def run_shared_fisher_estimation(
                     post_train_out.get("theta_pre_post_pretrain_reg_train_losses", []),
                     dtype=np.float64,
                 ),
+                theta_pre_post_pretrain_endpoint_train_losses=np.asarray(
+                    post_train_out.get("theta_pre_post_pretrain_endpoint_train_losses", []),
+                    dtype=np.float64,
+                ),
                 theta_pre_post_pretrain_val_losses=np.asarray(
                     post_train_out.get("theta_pre_post_pretrain_val_losses", []),
                     dtype=np.float64,
                 ),
                 theta_pre_post_pretrain_reg_val_losses=np.asarray(
                     post_train_out.get("theta_pre_post_pretrain_reg_val_losses", []),
+                    dtype=np.float64,
+                ),
+                theta_pre_post_pretrain_endpoint_val_losses=np.asarray(
+                    post_train_out.get("theta_pre_post_pretrain_endpoint_val_losses", []),
                     dtype=np.float64,
                 ),
                 theta_pre_post_pretrain_val_monitor_losses=np.asarray(
@@ -3246,12 +3296,20 @@ def run_shared_fisher_estimation(
                     post_train_out.get("theta_pre_post_finetune_fm_train_losses", []),
                     dtype=np.float64,
                 ),
+                theta_pre_post_finetune_endpoint_train_losses=np.asarray(
+                    post_train_out.get("theta_pre_post_finetune_endpoint_train_losses", []),
+                    dtype=np.float64,
+                ),
                 theta_pre_post_finetune_val_losses=np.asarray(
                     post_train_out.get("theta_pre_post_finetune_val_losses", []),
                     dtype=np.float64,
                 ),
                 theta_pre_post_finetune_fm_val_losses=np.asarray(
                     post_train_out.get("theta_pre_post_finetune_fm_val_losses", []),
+                    dtype=np.float64,
+                ),
+                theta_pre_post_finetune_endpoint_val_losses=np.asarray(
+                    post_train_out.get("theta_pre_post_finetune_endpoint_val_losses", []),
                     dtype=np.float64,
                 ),
                 theta_pre_post_finetune_val_monitor_losses=np.asarray(

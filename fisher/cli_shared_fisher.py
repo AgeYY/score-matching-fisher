@@ -263,7 +263,7 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         type=float,
         default=0.0,
         help=(
-            "theta_flow only: auxiliary conditional likelihood weight lambda for "
+            "theta_flow/theta_flow_pre_post only: auxiliary conditional likelihood weight lambda for "
             "loss = flow_matching + lambda * (-mean log p(theta|x)). "
             "Default 0 disables; set >0 to enable."
         ),
@@ -273,7 +273,7 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         type=int,
         default=20,
         help=(
-            "theta_flow only: ODE integration steps for the auxiliary "
+            "theta_flow/theta_flow_pre_post only: ODE integration steps for the auxiliary "
             "-mean log p(theta|x) likelihood term."
         ),
     )

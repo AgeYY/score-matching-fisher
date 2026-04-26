@@ -118,6 +118,22 @@ class TestHMatrixFlowLikelihood(unittest.TestCase):
                 "theta_flow_pre_post",
                 "--flow-arch",
                 "mlp",
+                "--flow-endpoint-loss-weight",
+                "0.05",
+                "--flow-endpoint-steps",
+                "2",
+            ]
+        )
+        validate_estimation_args(args)
+        self.assertAlmostEqual(float(args.flow_endpoint_loss_weight), 0.05)
+        self.assertEqual(int(args.flow_endpoint_steps), 2)
+
+        args = parser.parse_args(
+            [
+                "--theta-field-method",
+                "theta_flow_pre_post",
+                "--flow-arch",
+                "mlp",
                 "--flow-theta-pre-post-pretrain-synthetic-size",
                 "20",
                 "--flow-theta-pre-post-pretrain-resample-synthetic-each-epoch",
@@ -347,6 +363,48 @@ class TestHMatrixFlowLikelihood(unittest.TestCase):
                 unchanged.append(same)
         self.assertTrue(any(changed))
         self.assertTrue(all(unchanged))
+
+    def test_train_conditional_theta_flow_pre_post_endpoint_loss_records_both_phases(self) -> None:
+        torch.manual_seed(0)
+        np.random.seed(0)
+        n = 28
+        split = 18
+        theta = np.linspace(-1.0, 1.0, n, dtype=np.float64).reshape(-1, 1)
+        x = np.concatenate([np.cos(theta), np.sin(theta)], axis=1).astype(np.float64)
+        model = ConditionalThetaFlowVelocity(x_dim=2, hidden_dim=16, depth=1).to(torch.device("cpu"))
+        out = train_conditional_theta_flow_pre_post_model(
+            model=model,
+            theta_train=theta[:split],
+            x_train=x[:split],
+            pretrain_epochs=1,
+            finetune_epochs=1,
+            batch_size=8,
+            pretrain_lr=1e-3,
+            finetune_lr=1e-3,
+            device=torch.device("cpu"),
+            log_every=99,
+            scheduler_name="vp",
+            theta_val=theta[split:],
+            x_val=x[split:],
+            theta_prior_regularization_lambda=0.01,
+            theta_prior_regularization_bin_n_bins=4,
+            pretrain_synthetic_size=20,
+            endpoint_loss_weight=0.01,
+            endpoint_ode_steps=2,
+        )
+        self.assertAlmostEqual(float(out["flow_endpoint_loss_weight"]), 0.01)
+        self.assertEqual(int(out["flow_endpoint_steps"]), 2)
+        for key in (
+            "theta_pre_post_pretrain_endpoint_train_losses",
+            "theta_pre_post_pretrain_endpoint_val_losses",
+            "theta_pre_post_finetune_endpoint_train_losses",
+            "theta_pre_post_finetune_endpoint_val_losses",
+        ):
+            vals = np.asarray(out[key], dtype=np.float64)
+            self.assertEqual(tuple(vals.shape), (1,))
+            self.assertTrue(np.isfinite(vals).all(), key)
+        self.assertEqual(len(out["train_endpoint_losses"]), 2)
+        self.assertTrue(np.isfinite(np.asarray(out["train_endpoint_losses"], dtype=np.float64)).all())
 
     def test_train_conditional_theta_flow_pre_post_transformer_freezes_backbone(self) -> None:
         torch.manual_seed(0)

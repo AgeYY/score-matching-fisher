@@ -1952,10 +1952,14 @@ def train_conditional_theta_flow_pre_post_model(
     theta_prior_regularization_variance_floor: float = 1e-6,
     pretrain_synthetic_size: int = 0,
     pretrain_resample_synthetic_each_epoch: bool = False,
+    endpoint_loss_weight: float = 0.0,
+    endpoint_ode_steps: int = 20,
 ) -> dict[str, float | int | bool | list[float]]:
-    """Two-stage theta-flow training: unweighted synthetic regularization-FM pretrain, readout-only real-data fine-tune."""
+    """Two-stage theta-flow training: synthetic regularization-FM pretrain, readout-only real-data fine-tune."""
     path = _make_flow_matching_path(scheduler_name=scheduler_name)
     reg_lambda = float(theta_prior_regularization_lambda)
+    endpoint_weight = float(endpoint_loss_weight)
+    endpoint_steps = int(endpoint_ode_steps)
     if int(pretrain_epochs) < 1:
         raise ValueError("pretrain_epochs must be >= 1.")
     if int(finetune_epochs) < 0:
@@ -1970,6 +1974,10 @@ def train_conditional_theta_flow_pre_post_model(
         raise ValueError("theta_prior_regularization_bin_n_bins must be >= 1.")
     if float(theta_prior_regularization_variance_floor) <= 0.0:
         raise ValueError("theta_prior_regularization_variance_floor must be positive.")
+    if endpoint_weight < 0.0:
+        raise ValueError("endpoint_loss_weight must be >= 0.")
+    if endpoint_steps < 1:
+        raise ValueError("endpoint_ode_steps must be >= 1.")
     if int(pretrain_synthetic_size) < 0:
         raise ValueError("pretrain_synthetic_size must be >= 0.")
     if bool(pretrain_resample_synthetic_each_epoch) and int(pretrain_synthetic_size) <= 0:
@@ -1984,6 +1992,7 @@ def train_conditional_theta_flow_pre_post_model(
     alpha = float(early_stopping_ema_alpha)
     if not (0.0 < alpha <= 1.0):
         raise ValueError("early_stopping_ema_alpha must be in (0, 1].")
+    endpoint_enabled = endpoint_weight > 0.0
 
     x_reg_prior = BinnedDiagGaussianXPrior(
         theta_train=theta_train,
@@ -2060,8 +2069,10 @@ def train_conditional_theta_flow_pre_post_model(
 
     pre_train_losses: list[float] = []
     pre_train_reg_losses: list[float] = []
+    pre_train_endpoint_losses: list[float] = []
     pre_val_losses: list[float] = []
     pre_val_reg_losses: list[float] = []
+    pre_val_endpoint_losses: list[float] = []
     pre_val_monitor_losses: list[float] = []
     pre_best_val_loss = float("inf")
     pre_best_epoch = 0
@@ -2075,6 +2086,7 @@ def train_conditional_theta_flow_pre_post_model(
     for epoch in range(1, int(pretrain_epochs) + 1):
         epoch_losses: list[float] = []
         epoch_reg_losses: list[float] = []
+        epoch_endpoint_losses: list[float] = []
         epoch_pre_loader = pre_loader
         epoch_pre_val_loader = pre_val_loader
         epoch_pre_has_val = pre_has_val
@@ -2098,24 +2110,39 @@ def train_conditional_theta_flow_pre_post_model(
             reg_path_sample = path.sample(t=t_reg, x_0=theta0_reg, x_1=tb)
             reg_pred = model(reg_path_sample.x_t, x_reg, reg_path_sample.t)
             reg_loss = torch.mean((reg_pred - reg_path_sample.dx_t) ** 2)
-            # Pretrain optimizes the synthetic regularization FM term only (no lambda scale).
-            loss = reg_loss
+            if endpoint_enabled:
+                endpoint_loss = _theta_flow_conditional_nll_aux_loss(
+                    model=model,
+                    theta_target=tb,
+                    x_cond=x_reg,
+                    n_steps=endpoint_steps,
+                    enable_grad=True,
+                )
+                loss = reg_loss + endpoint_weight * endpoint_loss
+            else:
+                endpoint_loss = torch.zeros((), device=tb.device, dtype=tb.dtype)
+                loss = reg_loss
             pre_optimizer.zero_grad(set_to_none=True)
             loss.backward()
             pre_optimizer.step()
             epoch_losses.append(float(loss.item()))
             epoch_reg_losses.append(float(reg_loss.item()))
+            epoch_endpoint_losses.append(float(endpoint_loss.item()))
         mean_train_loss = float(np.mean(epoch_losses))
         mean_train_reg_loss = float(np.mean(epoch_reg_losses))
+        mean_train_endpoint_loss = float(np.mean(epoch_endpoint_losses))
         pre_train_losses.append(mean_train_loss)
         pre_train_reg_losses.append(mean_train_reg_loss)
+        pre_train_endpoint_losses.append(mean_train_endpoint_loss)
 
         mean_val_loss = float("nan")
         mean_val_reg_loss = float("nan")
+        mean_val_endpoint_loss = float("nan")
         if epoch_pre_has_val and epoch_pre_val_loader is not None:
             model.eval()
             val_epoch_losses: list[float] = []
             val_epoch_reg_losses: list[float] = []
+            val_epoch_endpoint_losses: list[float] = []
             with torch.no_grad():
                 for tb, xb in epoch_pre_val_loader:
                     tb = tb.to(device, non_blocking=True)
@@ -2129,11 +2156,24 @@ def train_conditional_theta_flow_pre_post_model(
                     reg_path_sample = path.sample(t=t_reg, x_0=theta0_reg, x_1=tb)
                     reg_pred = model(reg_path_sample.x_t, x_reg, reg_path_sample.t)
                     val_reg_loss = torch.mean((reg_pred - reg_path_sample.dx_t) ** 2)
-                    val_loss = val_reg_loss
+                    if endpoint_enabled:
+                        val_endpoint_loss = _theta_flow_conditional_nll_aux_loss(
+                            model=model,
+                            theta_target=tb,
+                            x_cond=x_reg,
+                            n_steps=endpoint_steps,
+                            enable_grad=False,
+                        )
+                        val_loss = val_reg_loss + endpoint_weight * val_endpoint_loss
+                    else:
+                        val_endpoint_loss = torch.zeros((), device=tb.device, dtype=tb.dtype)
+                        val_loss = val_reg_loss
                     val_epoch_losses.append(float(val_loss.item()))
                     val_epoch_reg_losses.append(float(val_reg_loss.item()))
+                    val_epoch_endpoint_losses.append(float(val_endpoint_loss.item()))
             mean_val_loss = float(np.mean(val_epoch_losses))
             mean_val_reg_loss = float(np.mean(val_epoch_reg_losses))
+            mean_val_endpoint_loss = float(np.mean(val_epoch_endpoint_losses))
             pre_val_ema = _ema_update_val_monitor(pre_val_ema, mean_val_loss, alpha)
             smooth_val_loss = pre_val_ema
             if smooth_val_loss < (pre_best_val_loss - early_stopping_min_delta):
@@ -2148,20 +2188,33 @@ def train_conditional_theta_flow_pre_post_model(
             pre_val_monitor_losses.append(float("nan"))
         pre_val_losses.append(mean_val_loss)
         pre_val_reg_losses.append(mean_val_reg_loss)
+        pre_val_endpoint_losses.append(mean_val_endpoint_loss)
 
         if epoch == 1 or epoch % log_every == 0 or epoch == int(pretrain_epochs):
             if epoch_pre_has_val:
-                print(
-                    f"[pretrain {epoch:4d}/{int(pretrain_epochs)}] pretrain_reg_fm_mse={mean_train_loss:.6f} "
+                msg = (
+                    f"[pretrain {epoch:4d}/{int(pretrain_epochs)}] pretrain_reg_fm_mse={mean_train_reg_loss:.6f} "
                     f"val_loss={mean_val_loss:.6f} val_smooth={pre_val_monitor_losses[-1]:.6f} "
                     f"best_smooth={pre_best_val_loss:.6f} best_epoch={pre_best_epoch} "
                     f"flow_theta_reg_lambda_metadata={reg_lambda:.6g} (not used to scale pretrain loss)"
                 )
+                if endpoint_enabled:
+                    msg = (
+                        f"{msg} endpoint_lambda={endpoint_weight:.6g} "
+                        f"train_endpoint_mean={mean_train_endpoint_loss:.6f} (nll)"
+                    )
+                print(msg)
             else:
-                print(
-                    f"[pretrain {epoch:4d}/{int(pretrain_epochs)}] pretrain_reg_fm_mse={mean_train_loss:.6f} "
+                msg = (
+                    f"[pretrain {epoch:4d}/{int(pretrain_epochs)}] pretrain_reg_fm_mse={mean_train_reg_loss:.6f} "
                     f"flow_theta_reg_lambda_metadata={reg_lambda:.6g} (not used to scale pretrain loss)"
                 )
+                if endpoint_enabled:
+                    msg = (
+                        f"{msg} endpoint_lambda={endpoint_weight:.6g} "
+                        f"train_endpoint_mean={mean_train_endpoint_loss:.6f} (nll)"
+                    )
+                print(msg)
         if epoch_pre_has_val and pre_patience_counter >= pre_patience_limit:
             pre_stopped_early = True
             pre_stopped_epoch = epoch
@@ -2179,8 +2232,10 @@ def train_conditional_theta_flow_pre_post_model(
 
     ft_train_losses: list[float] = []
     ft_train_fm_losses: list[float] = []
+    ft_train_endpoint_losses: list[float] = []
     ft_val_losses: list[float] = []
     ft_val_fm_losses: list[float] = []
+    ft_val_endpoint_losses: list[float] = []
     ft_val_monitor_losses: list[float] = []
     ft_best_val_loss = float("inf")
     ft_best_epoch = 0
@@ -2202,6 +2257,8 @@ def train_conditional_theta_flow_pre_post_model(
 
         for epoch in range(1, int(finetune_epochs) + 1):
             epoch_losses: list[float] = []
+            epoch_fm_losses: list[float] = []
+            epoch_endpoint_losses: list[float] = []
             model.train()
             for tb, xb in loader:
                 tb = tb.to(device, non_blocking=True)
@@ -2210,19 +2267,40 @@ def train_conditional_theta_flow_pre_post_model(
                 theta0 = torch.randn_like(tb)
                 path_sample = path.sample(t=t, x_0=theta0, x_1=tb)
                 pred = model(path_sample.x_t, xb, path_sample.t)
-                loss = torch.mean((pred - path_sample.dx_t) ** 2)
+                fm_loss = torch.mean((pred - path_sample.dx_t) ** 2)
+                if endpoint_enabled:
+                    endpoint_loss = _theta_flow_conditional_nll_aux_loss(
+                        model=model,
+                        theta_target=tb,
+                        x_cond=xb,
+                        n_steps=endpoint_steps,
+                        enable_grad=True,
+                    )
+                    loss = fm_loss + endpoint_weight * endpoint_loss
+                else:
+                    endpoint_loss = torch.zeros((), device=tb.device, dtype=tb.dtype)
+                    loss = fm_loss
                 finetune_optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 finetune_optimizer.step()
                 epoch_losses.append(float(loss.item()))
+                epoch_fm_losses.append(float(fm_loss.item()))
+                epoch_endpoint_losses.append(float(endpoint_loss.item()))
             mean_train_loss = float(np.mean(epoch_losses))
+            mean_train_fm_loss = float(np.mean(epoch_fm_losses))
+            mean_train_endpoint_loss = float(np.mean(epoch_endpoint_losses))
             ft_train_losses.append(mean_train_loss)
-            ft_train_fm_losses.append(mean_train_loss)
+            ft_train_fm_losses.append(mean_train_fm_loss)
+            ft_train_endpoint_losses.append(mean_train_endpoint_loss)
 
             mean_val_loss = float("nan")
+            mean_val_fm_loss = float("nan")
+            mean_val_endpoint_loss = float("nan")
             if has_val and val_loader is not None:
                 model.eval()
                 val_epoch_losses: list[float] = []
+                val_epoch_fm_losses: list[float] = []
+                val_epoch_endpoint_losses: list[float] = []
                 with torch.no_grad():
                     for tb, xb in val_loader:
                         tb = tb.to(device, non_blocking=True)
@@ -2231,9 +2309,25 @@ def train_conditional_theta_flow_pre_post_model(
                         theta0 = torch.randn_like(tb)
                         path_sample = path.sample(t=t, x_0=theta0, x_1=tb)
                         pred = model(path_sample.x_t, xb, path_sample.t)
-                        val_loss = torch.mean((pred - path_sample.dx_t) ** 2)
+                        val_fm_loss = torch.mean((pred - path_sample.dx_t) ** 2)
+                        if endpoint_enabled:
+                            val_endpoint_loss = _theta_flow_conditional_nll_aux_loss(
+                                model=model,
+                                theta_target=tb,
+                                x_cond=xb,
+                                n_steps=endpoint_steps,
+                                enable_grad=False,
+                            )
+                            val_loss = val_fm_loss + endpoint_weight * val_endpoint_loss
+                        else:
+                            val_endpoint_loss = torch.zeros((), device=tb.device, dtype=tb.dtype)
+                            val_loss = val_fm_loss
                         val_epoch_losses.append(float(val_loss.item()))
+                        val_epoch_fm_losses.append(float(val_fm_loss.item()))
+                        val_epoch_endpoint_losses.append(float(val_endpoint_loss.item()))
                 mean_val_loss = float(np.mean(val_epoch_losses))
+                mean_val_fm_loss = float(np.mean(val_epoch_fm_losses))
+                mean_val_endpoint_loss = float(np.mean(val_epoch_endpoint_losses))
                 ft_val_ema = _ema_update_val_monitor(ft_val_ema, mean_val_loss, alpha)
                 smooth_val_loss = ft_val_ema
                 if smooth_val_loss < (ft_best_val_loss - early_stopping_min_delta):
@@ -2247,21 +2341,34 @@ def train_conditional_theta_flow_pre_post_model(
             else:
                 ft_val_monitor_losses.append(float("nan"))
             ft_val_losses.append(mean_val_loss)
-            ft_val_fm_losses.append(mean_val_loss)
+            ft_val_fm_losses.append(mean_val_fm_loss)
+            ft_val_endpoint_losses.append(mean_val_endpoint_loss)
 
             if epoch == 1 or epoch % log_every == 0 or epoch == int(finetune_epochs):
                 if has_val:
-                    print(
-                        f"[finetune {epoch:4d}/{int(finetune_epochs)}] theta_flow_readout_fm={mean_train_loss:.6f} "
+                    msg = (
+                        f"[finetune {epoch:4d}/{int(finetune_epochs)}] theta_flow_readout_fm={mean_train_fm_loss:.6f} "
                         f"val_loss={mean_val_loss:.6f} val_smooth={ft_val_monitor_losses[-1]:.6f} "
                         f"best_smooth={ft_best_val_loss:.6f} best_epoch={ft_best_epoch} "
                         f"trainable_readout_params={n_readout_params}"
                     )
+                    if endpoint_enabled:
+                        msg = (
+                            f"{msg} endpoint_lambda={endpoint_weight:.6g} "
+                            f"train_endpoint_mean={mean_train_endpoint_loss:.6f} (nll)"
+                        )
+                    print(msg)
                 else:
-                    print(
-                        f"[finetune {epoch:4d}/{int(finetune_epochs)}] theta_flow_readout_fm={mean_train_loss:.6f} "
+                    msg = (
+                        f"[finetune {epoch:4d}/{int(finetune_epochs)}] theta_flow_readout_fm={mean_train_fm_loss:.6f} "
                         f"trainable_readout_params={n_readout_params}"
                     )
+                    if endpoint_enabled:
+                        msg = (
+                            f"{msg} endpoint_lambda={endpoint_weight:.6g} "
+                            f"train_endpoint_mean={mean_train_endpoint_loss:.6f} (nll)"
+                        )
+                    print(msg)
             if has_val and ft_patience_counter >= early_stopping_patience:
                 ft_stopped_early = True
                 ft_stopped_epoch = epoch
@@ -2281,8 +2388,10 @@ def train_conditional_theta_flow_pre_post_model(
     val_monitor_losses = pre_val_monitor_losses + ft_val_monitor_losses
     train_fm_losses = [float("nan")] * len(pre_train_losses) + ft_train_fm_losses
     train_reg_losses = pre_train_reg_losses + [float("nan")] * len(ft_train_losses)
+    train_endpoint_losses = pre_train_endpoint_losses + ft_train_endpoint_losses
     val_fm_losses = [float("nan")] * len(pre_val_losses) + ft_val_fm_losses
     val_reg_losses = pre_val_reg_losses + [float("nan")] * len(ft_val_losses)
+    val_endpoint_losses = pre_val_endpoint_losses + ft_val_endpoint_losses
 
     if int(finetune_epochs) == 0:
         combined_best_val = float(pre_best_val_loss)
@@ -2299,16 +2408,18 @@ def train_conditional_theta_flow_pre_post_model(
         "train_losses": train_losses,
         "train_fm_losses": train_fm_losses,
         "train_reg_losses": train_reg_losses,
-        "train_endpoint_losses": [float("nan")] * len(train_losses),
+        "train_endpoint_losses": train_endpoint_losses,
         "val_losses": val_losses,
         "val_fm_losses": val_fm_losses,
         "val_reg_losses": val_reg_losses,
-        "val_endpoint_losses": [float("nan")] * len(val_losses),
+        "val_endpoint_losses": val_endpoint_losses,
         "val_monitor_losses": val_monitor_losses,
         "best_val_loss": combined_best_val,
         "best_epoch": combined_best_epoch,
         "stopped_epoch": combined_stopped_epoch,
         "stopped_early": combined_stopped_early,
+        "flow_endpoint_loss_weight": float(endpoint_weight),
+        "flow_endpoint_steps": int(endpoint_steps),
         "flow_theta_reg_lambda": float(reg_lambda),
         "flow_theta_reg_bin_n_bins": int(theta_prior_regularization_bin_n_bins),
         "flow_theta_reg_variance_floor": float(theta_prior_regularization_variance_floor),
@@ -2319,8 +2430,10 @@ def train_conditional_theta_flow_pre_post_model(
         "theta_pre_post_pretrain_early_stopping_patience": int(pre_patience_limit),
         "theta_pre_post_pretrain_train_losses": pre_train_losses,
         "theta_pre_post_pretrain_reg_train_losses": pre_train_reg_losses,
+        "theta_pre_post_pretrain_endpoint_train_losses": pre_train_endpoint_losses,
         "theta_pre_post_pretrain_val_losses": pre_val_losses,
         "theta_pre_post_pretrain_reg_val_losses": pre_val_reg_losses,
+        "theta_pre_post_pretrain_endpoint_val_losses": pre_val_endpoint_losses,
         "theta_pre_post_pretrain_val_monitor_losses": pre_val_monitor_losses,
         "theta_pre_post_pretrain_best_epoch": int(pre_best_epoch),
         "theta_pre_post_pretrain_stopped_epoch": int(pre_stopped_epoch),
@@ -2328,8 +2441,10 @@ def train_conditional_theta_flow_pre_post_model(
         "theta_pre_post_pretrain_best_val_loss": float(pre_best_val_loss),
         "theta_pre_post_finetune_train_losses": ft_train_losses,
         "theta_pre_post_finetune_fm_train_losses": ft_train_fm_losses,
+        "theta_pre_post_finetune_endpoint_train_losses": ft_train_endpoint_losses,
         "theta_pre_post_finetune_val_losses": ft_val_losses,
         "theta_pre_post_finetune_fm_val_losses": ft_val_fm_losses,
+        "theta_pre_post_finetune_endpoint_val_losses": ft_val_endpoint_losses,
         "theta_pre_post_finetune_val_monitor_losses": ft_val_monitor_losses,
         "theta_pre_post_finetune_best_epoch": int(ft_best_epoch),
         "theta_pre_post_finetune_stopped_epoch": int(ft_stopped_epoch),

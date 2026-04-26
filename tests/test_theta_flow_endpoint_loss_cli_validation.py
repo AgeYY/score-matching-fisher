@@ -26,6 +26,22 @@ def test_validate_accepts_theta_flow_endpoint_defaults() -> None:
     assert int(args.flow_endpoint_steps) == 20
 
 
+def test_validate_accepts_theta_flow_pre_post_endpoint_loss() -> None:
+    args = parse_full_args(
+        [
+            "--theta-field-method",
+            "theta_flow_pre_post",
+            "--flow-endpoint-loss-weight",
+            "0.05",
+            "--flow-endpoint-steps",
+            "2",
+        ]
+    )
+    validate_estimation_args(args)
+    assert float(args.flow_endpoint_loss_weight) == pytest.approx(0.05)
+    assert int(args.flow_endpoint_steps) == 2
+
+
 def test_validate_rejects_negative_theta_flow_endpoint_weight() -> None:
     args = parse_full_args(["--flow-endpoint-loss-weight", "-0.01"])
     with pytest.raises(ValueError, match="--flow-endpoint-loss-weight must be non-negative."):
