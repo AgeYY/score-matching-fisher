@@ -3311,8 +3311,9 @@ def main(argv: list[str] | None = None) -> None:
             if _ft_ep < 1:
                 print(
                     "[convergence] theta_flow_pre_post: pretrains the posterior theta-flow on binned Gaussian "
-                    "synthetic-pair regularization only; readout real-data fine-tuning is **skipped** "
-                    f"(fine_epochs=0; reg lambda={float(getattr(args, 'flow_theta_reg_lambda', 0.01)):.6g}; "
+                    "synthetic-pair regularization only (unweighted FM MSE); readout real-data fine-tuning is **skipped** "
+                    f"(fine_epochs=0; flow_theta_reg_lambda_metadata={float(getattr(args, 'flow_theta_reg_lambda', 0.01)):.6g} "
+                    f"(NPZ only, not applied to pretrain loss); "
                     f"bins={int(getattr(args, 'flow_theta_reg_bin_n_bins', 10))}; "
                     f"pretrain_patience={_pre_patience_eff}; {_pre_synth_msg}).",
                     flush=True,
@@ -3320,8 +3321,9 @@ def main(argv: list[str] | None = None) -> None:
             else:
                 print(
                     "[convergence] theta_flow_pre_post pretrains the posterior theta-flow on binned Gaussian "
-                    "synthetic-pair regularization only, then freezes all but the readout for real-data FM "
-                    f"fine-tuning (lambda={float(getattr(args, 'flow_theta_reg_lambda', 0.01)):.6g}; "
+                    "synthetic-pair regularization only (unweighted FM MSE), then freezes all but the readout for real-data FM "
+                    f"fine-tuning (readout-only real-data FM MSE; flow_theta_reg_lambda_metadata={float(getattr(args, 'flow_theta_reg_lambda', 0.01)):.6g} "
+                    f"NPZ-only; "
                     f"bins={int(getattr(args, 'flow_theta_reg_bin_n_bins', 10))}; "
                     f"fine_epochs={_ft_ep}; pretrain_patience={_pre_patience_eff}; {_pre_synth_msg}).",
                     flush=True,

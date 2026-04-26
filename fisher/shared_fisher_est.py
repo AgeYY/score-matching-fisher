@@ -1097,8 +1097,7 @@ def validate_estimation_args(args: Any) -> None:
         )
     if float(getattr(args, "flow_theta_reg_lambda", 0.01)) < 0.0:
         raise ValueError("--flow-theta-reg-lambda must be non-negative.")
-    if _tfm_val == "theta_flow_pre_post" and float(getattr(args, "flow_theta_reg_lambda", 0.01)) <= 0.0:
-        raise ValueError("--flow-theta-reg-lambda must be positive with --theta-field-method theta_flow_pre_post.")
+    # theta_flow_pre_post: pretrain FM loss is unweighted; this flag is kept for NPZ/plot metadata only.
     if int(getattr(args, "flow_theta_reg_bin_n_bins", 10)) < 1:
         raise ValueError("--flow-theta-reg-bin-n-bins must be >= 1.")
     if float(getattr(args, "flow_theta_reg_variance_floor", 1e-6)) <= 0.0:

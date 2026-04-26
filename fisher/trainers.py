@@ -1947,7 +1947,7 @@ def train_conditional_theta_flow_pre_post_model(
     pretrain_synthetic_size: int = 0,
     pretrain_resample_synthetic_each_epoch: bool = False,
 ) -> dict[str, float | int | bool | list[float]]:
-    """Two-stage theta-flow training: synthetic regularization pretrain, readout-only data fine-tune."""
+    """Two-stage theta-flow training: unweighted synthetic regularization-FM pretrain, readout-only real-data fine-tune."""
     path = _make_flow_matching_path(scheduler_name=scheduler_name)
     reg_lambda = float(theta_prior_regularization_lambda)
     if int(pretrain_epochs) < 1:
@@ -1958,8 +1958,8 @@ def train_conditional_theta_flow_pre_post_model(
         raise ValueError("pretrain_lr must be positive.")
     if int(finetune_epochs) >= 1 and float(finetune_lr) <= 0.0:
         raise ValueError("finetune_lr must be positive when finetune_epochs > 0.")
-    if reg_lambda <= 0.0:
-        raise ValueError("theta_prior_regularization_lambda must be positive for theta_flow_pre_post.")
+    if reg_lambda < 0.0:
+        raise ValueError("theta_prior_regularization_lambda must be non-negative (stored for metadata; pretrain loss is unweighted FM MSE).")
     if int(theta_prior_regularization_bin_n_bins) < 1:
         raise ValueError("theta_prior_regularization_bin_n_bins must be >= 1.")
     if float(theta_prior_regularization_variance_floor) <= 0.0:
@@ -2092,7 +2092,8 @@ def train_conditional_theta_flow_pre_post_model(
             reg_path_sample = path.sample(t=t_reg, x_0=theta0_reg, x_1=tb)
             reg_pred = model(reg_path_sample.x_t, x_reg, reg_path_sample.t)
             reg_loss = torch.mean((reg_pred - reg_path_sample.dx_t) ** 2)
-            loss = reg_lambda * reg_loss
+            # Pretrain optimizes the synthetic regularization FM term only (no lambda scale).
+            loss = reg_loss
             pre_optimizer.zero_grad(set_to_none=True)
             loss.backward()
             pre_optimizer.step()
@@ -2122,7 +2123,7 @@ def train_conditional_theta_flow_pre_post_model(
                     reg_path_sample = path.sample(t=t_reg, x_0=theta0_reg, x_1=tb)
                     reg_pred = model(reg_path_sample.x_t, x_reg, reg_path_sample.t)
                     val_reg_loss = torch.mean((reg_pred - reg_path_sample.dx_t) ** 2)
-                    val_loss = reg_lambda * val_reg_loss
+                    val_loss = val_reg_loss
                     val_epoch_losses.append(float(val_loss.item()))
                     val_epoch_reg_losses.append(float(val_reg_loss.item()))
             mean_val_loss = float(np.mean(val_epoch_losses))
@@ -2145,15 +2146,15 @@ def train_conditional_theta_flow_pre_post_model(
         if epoch == 1 or epoch % log_every == 0 or epoch == int(pretrain_epochs):
             if epoch_pre_has_val:
                 print(
-                    f"[pretrain {epoch:4d}/{int(pretrain_epochs)}] theta_flow_reg_only={mean_train_loss:.6f} "
+                    f"[pretrain {epoch:4d}/{int(pretrain_epochs)}] pretrain_reg_fm_mse={mean_train_loss:.6f} "
                     f"val_loss={mean_val_loss:.6f} val_smooth={pre_val_monitor_losses[-1]:.6f} "
                     f"best_smooth={pre_best_val_loss:.6f} best_epoch={pre_best_epoch} "
-                    f"theta_reg_lambda={reg_lambda:.6g} train_reg_mean={mean_train_reg_loss:.6f}"
+                    f"flow_theta_reg_lambda_metadata={reg_lambda:.6g} (not used to scale pretrain loss)"
                 )
             else:
                 print(
-                    f"[pretrain {epoch:4d}/{int(pretrain_epochs)}] theta_flow_reg_only={mean_train_loss:.6f} "
-                    f"theta_reg_lambda={reg_lambda:.6g} train_reg_mean={mean_train_reg_loss:.6f}"
+                    f"[pretrain {epoch:4d}/{int(pretrain_epochs)}] pretrain_reg_fm_mse={mean_train_loss:.6f} "
+                    f"flow_theta_reg_lambda_metadata={reg_lambda:.6g} (not used to scale pretrain loss)"
                 )
         if epoch_pre_has_val and pre_patience_counter >= pre_patience_limit:
             pre_stopped_early = True

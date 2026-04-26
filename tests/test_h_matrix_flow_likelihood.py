@@ -135,6 +135,19 @@ class TestHMatrixFlowLikelihood(unittest.TestCase):
                 "theta_flow_pre_post",
                 "--flow-arch",
                 "mlp",
+                "--flow-theta-reg-lambda",
+                "0",
+            ]
+        )
+        validate_estimation_args(args)
+        self.assertEqual(float(args.flow_theta_reg_lambda), 0.0)
+
+        args = parser.parse_args(
+            [
+                "--theta-field-method",
+                "theta_flow_pre_post",
+                "--flow-arch",
+                "mlp",
                 "--flow-theta-pre-post-pretrain-resample-synthetic-each-epoch",
             ]
         )
@@ -315,6 +328,12 @@ class TestHMatrixFlowLikelihood(unittest.TestCase):
         self.assertEqual(len(out["theta_pre_post_finetune_fm_train_losses"]), 1)
         self.assertGreater(float(np.max(out["theta_pre_post_pretrain_reg_train_losses"])), 0.0)
         self.assertGreater(float(np.max(out["theta_pre_post_finetune_fm_train_losses"])), 0.0)
+        self.assertTrue(
+            np.allclose(
+                np.asarray(out["theta_pre_post_pretrain_train_losses"], dtype=np.float64),
+                np.asarray(out["theta_pre_post_pretrain_reg_train_losses"], dtype=np.float64),
+            )
+        )
         start_state = out["theta_pre_post_finetune_start_state"]
         final_state = model.state_dict()
         changed = []
@@ -389,6 +408,49 @@ class TestHMatrixFlowLikelihood(unittest.TestCase):
         self.assertFalse(bool(out["theta_pre_post_pretrain_resample_synthetic_each_epoch"]))
         self.assertEqual(int(out["theta_pre_post_pretrain_early_stopping_patience"]), 7)
         self.assertEqual(len(out["theta_pre_post_finetune_fm_train_losses"]), 0)
+        self.assertTrue(
+            np.allclose(
+                np.asarray(out["theta_pre_post_pretrain_train_losses"], dtype=np.float64),
+                np.asarray(out["theta_pre_post_pretrain_reg_train_losses"], dtype=np.float64),
+            )
+        )
+        self.assertTrue(
+            np.allclose(
+                np.asarray(out["theta_pre_post_pretrain_val_losses"], dtype=np.float64),
+                np.asarray(out["theta_pre_post_pretrain_reg_val_losses"], dtype=np.float64),
+            )
+        )
+
+    def test_train_conditional_theta_flow_pre_post_accepts_zero_flow_theta_reg_lambda_metadata(self) -> None:
+        """Pretrain loss does not use lambda; value 0 is valid for stored metadata only."""
+        torch.manual_seed(0)
+        np.random.seed(0)
+        n = 24
+        split = 16
+        theta = np.linspace(-1.0, 1.0, n, dtype=np.float64).reshape(-1, 1)
+        x = np.concatenate([np.cos(theta), np.sin(theta)], axis=1).astype(np.float64)
+        model = ConditionalThetaFlowVelocity(x_dim=2, hidden_dim=16, depth=1).to(torch.device("cpu"))
+        out = train_conditional_theta_flow_pre_post_model(
+            model=model,
+            theta_train=theta[:split],
+            x_train=x[:split],
+            pretrain_epochs=1,
+            finetune_epochs=0,
+            batch_size=8,
+            pretrain_lr=1e-3,
+            finetune_lr=1e-3,
+            device=torch.device("cpu"),
+            log_every=99,
+            scheduler_name="vp",
+            theta_val=theta[split:],
+            x_val=x[split:],
+            theta_prior_regularization_lambda=0.0,
+            theta_prior_regularization_bin_n_bins=4,
+            pretrain_synthetic_size=20,
+            pretrain_early_stopping_patience=7,
+        )
+        self.assertEqual(float(out["flow_theta_reg_lambda"]), 0.0)
+        self.assertGreater(float(np.max(out["theta_pre_post_pretrain_reg_train_losses"])), 0.0)
 
     def test_train_conditional_theta_flow_pre_post_online_synthetic_records_mode(self) -> None:
         torch.manual_seed(0)
@@ -425,6 +487,18 @@ class TestHMatrixFlowLikelihood(unittest.TestCase):
         self.assertEqual(len(out["theta_pre_post_pretrain_train_losses"]), 2)
         self.assertEqual(len(out["theta_pre_post_pretrain_val_losses"]), 2)
         self.assertEqual(len(out["theta_pre_post_finetune_fm_train_losses"]), 0)
+        self.assertTrue(
+            np.allclose(
+                np.asarray(out["theta_pre_post_pretrain_train_losses"], dtype=np.float64),
+                np.asarray(out["theta_pre_post_pretrain_reg_train_losses"], dtype=np.float64),
+            )
+        )
+        self.assertTrue(
+            np.allclose(
+                np.asarray(out["theta_pre_post_pretrain_val_losses"], dtype=np.float64),
+                np.asarray(out["theta_pre_post_pretrain_reg_val_losses"], dtype=np.float64),
+            )
+        )
 
     def test_shared_estimation_theta_flow_reg_runs_and_records_metadata(self) -> None:
         parser = argparse.ArgumentParser()
