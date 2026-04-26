@@ -227,7 +227,9 @@ def test_rejects_invalid_theta_field_rows_arch() -> None:
     ]
     r = subprocess.run(cmd, cwd=str(repo), capture_output=True, text=True)
     assert r.returncode != 0
-    assert "--flow-arch must be one of {'mlp','soft_moe','film','film_fourier'}." in (r.stderr + r.stdout)
+    assert "--flow-arch must be one of {'mlp','soft_moe','film','film_fourier','transformer'}." in (
+        r.stderr + r.stdout
+    )
 
 
 def test_rejects_theta_field_rows_arch_on_non_flow_method() -> None:

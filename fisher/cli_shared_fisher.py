@@ -463,13 +463,14 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         "--flow-arch",
         type=str,
         default="mlp",
-        choices=["mlp", "soft_moe", "film", "film_fourier"],
+        choices=["mlp", "soft_moe", "film", "film_fourier", "transformer"],
         help=(
             "Flow architecture shared by theta_flow, theta_flow_reg, theta_flow_pre_post, "
             "theta_path_integral, x_flow, and x_flow_reg: "
             "mlp, soft_moe (dense soft gating over MLP experts), "
             "film (FiLM blocks with embedded raw theta), or "
-            "film_fourier (FiLM blocks with Fourier theta features)."
+            "film_fourier (FiLM blocks with Fourier theta features), or "
+            "transformer (theta-flow latent-token transformer)."
         ),
     )
     p.add_argument(
@@ -483,6 +484,36 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         type=float,
         default=1.0,
         help="Posterior soft_moe only: router softmax temperature (>0).",
+    )
+    p.add_argument(
+        "--flow-transformer-heads",
+        type=int,
+        default=4,
+        help="Theta-flow transformer only: number of attention heads for posterior and prior encoders.",
+    )
+    p.add_argument(
+        "--flow-transformer-ff-mult",
+        type=int,
+        default=4,
+        help="Theta-flow transformer only: feed-forward hidden multiplier relative to --flow-hidden-dim / --prior-hidden-dim.",
+    )
+    p.add_argument(
+        "--flow-transformer-dropout",
+        type=float,
+        default=0.0,
+        help="Theta-flow transformer only: TransformerEncoder dropout in [0,1).",
+    )
+    p.add_argument(
+        "--flow-transformer-x-tokens",
+        type=int,
+        default=8,
+        help="Theta-flow transformer posterior only: number of latent tokens projected from x.",
+    )
+    p.add_argument(
+        "--flow-prior-transformer-latent-tokens",
+        type=int,
+        default=2,
+        help="Theta-flow transformer prior only: number of learned latent tokens.",
     )
     p.add_argument(
         "--flow-score-arch",

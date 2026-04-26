@@ -14,8 +14,10 @@ from fisher.models import (
     ConditionalThetaFlowVelocitySoftMoE,
     ConditionalThetaFlowVelocityThetaFourierFiLMPerLayer,
     ConditionalThetaFlowVelocityThetaFourierMLP,
+    ConditionalThetaFlowVelocityTransformer,
     PriorThetaFlowVelocityThetaFourierFiLMPerLayer,
     PriorThetaFlowVelocityThetaFourierMLP,
+    PriorThetaFlowVelocityTransformer,
 )
 from fisher.shared_fisher_est import (
     effective_flow_theta_fourier_omega_post,
@@ -223,6 +225,93 @@ class TestThetaFlowThetaFourier(unittest.TestCase):
         out = m(theta_t, t)
         self.assertEqual(tuple(out.shape), (b, 1))
         self.assertTrue(torch.isfinite(out).all())
+
+    def test_conditional_theta_transformer_forward_shape(self) -> None:
+        m = ConditionalThetaFlowVelocityTransformer(
+            x_dim=4,
+            hidden_dim=16,
+            depth=1,
+            theta_dim=2,
+            num_heads=4,
+            ff_mult=2,
+            dropout=0.0,
+            x_tokens=3,
+        )
+        b = 5
+        theta_t = torch.randn(b, 2)
+        x = torch.randn(b, 4)
+        t = torch.rand(b, 1)
+        out = m(theta_t, x, t)
+        self.assertEqual(tuple(out.shape), (b, 2))
+        self.assertTrue(torch.isfinite(out).all())
+
+    def test_prior_theta_transformer_forward_shape(self) -> None:
+        m = PriorThetaFlowVelocityTransformer(
+            hidden_dim=16,
+            depth=1,
+            theta_dim=2,
+            num_heads=4,
+            ff_mult=2,
+            dropout=0.0,
+            latent_tokens=3,
+        )
+        b = 5
+        theta_t = torch.randn(b, 2)
+        t = torch.rand(b, 1)
+        out = m(theta_t, t)
+        self.assertEqual(tuple(out.shape), (b, 2))
+        self.assertTrue(torch.isfinite(out).all())
+
+    def test_validate_accepts_theta_flow_transformer_methods(self) -> None:
+        parser = argparse.ArgumentParser()
+        add_estimation_arguments(parser)
+        for method in ("theta_flow", "theta_flow_reg", "theta_flow_pre_post"):
+            args = parser.parse_args(
+                [
+                    "--theta-field-method",
+                    method,
+                    "--flow-arch",
+                    "transformer",
+                    "--flow-hidden-dim",
+                    "16",
+                    "--prior-hidden-dim",
+                    "16",
+                    "--flow-transformer-heads",
+                    "4",
+                    "--flow-transformer-x-tokens",
+                    "3",
+                    "--flow-prior-transformer-latent-tokens",
+                    "2",
+                ]
+            )
+            validate_estimation_args(args)
+
+    def test_validate_rejects_transformer_bad_head_divisibility(self) -> None:
+        parser = argparse.ArgumentParser()
+        add_estimation_arguments(parser)
+        args = parser.parse_args(
+            [
+                "--theta-field-method",
+                "theta_flow",
+                "--flow-arch",
+                "transformer",
+                "--flow-hidden-dim",
+                "10",
+                "--prior-hidden-dim",
+                "16",
+                "--flow-transformer-heads",
+                "4",
+            ]
+        )
+        with self.assertRaises(ValueError):
+            validate_estimation_args(args)
+
+    def test_validate_rejects_transformer_for_x_flow(self) -> None:
+        parser = argparse.ArgumentParser()
+        add_estimation_arguments(parser)
+        args = parser.parse_args(["--theta-field-method", "x_flow", "--flow-arch", "transformer"])
+        with self.assertRaises(ValueError):
+            validate_estimation_args(args)
 
     def test_flow_likelihood_h_matrix_smoke_fourier_models(self) -> None:
         torch.manual_seed(0)

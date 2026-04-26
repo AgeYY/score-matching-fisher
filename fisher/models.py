@@ -342,6 +342,187 @@ class PriorThetaFlowVelocity(nn.Module):
         return self.forward(theta, t)
 
 
+class ConditionalThetaFlowVelocityTransformer(nn.Module):
+    """Conditional theta-flow velocity using latent x tokens and a transformer encoder."""
+
+    def __init__(
+        self,
+        x_dim: int = 2,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        use_logit_time: bool = True,
+        *,
+        theta_dim: int = 1,
+        num_heads: int = 4,
+        ff_mult: int = 4,
+        dropout: float = 0.0,
+        x_tokens: int = 8,
+    ) -> None:
+        super().__init__()
+        if x_dim < 2:
+            raise ValueError("x_dim must be >= 2.")
+        if int(theta_dim) < 1:
+            raise ValueError("theta_dim must be >= 1.")
+        if int(hidden_dim) < 1:
+            raise ValueError("hidden_dim must be >= 1.")
+        if int(depth) < 1:
+            raise ValueError("depth must be >= 1.")
+        if int(num_heads) < 1:
+            raise ValueError("num_heads must be >= 1.")
+        if int(hidden_dim) % int(num_heads) != 0:
+            raise ValueError("hidden_dim must be divisible by num_heads.")
+        if int(ff_mult) < 1:
+            raise ValueError("ff_mult must be >= 1.")
+        if not (0.0 <= float(dropout) < 1.0):
+            raise ValueError("dropout must be in [0, 1).")
+        if int(x_tokens) < 1:
+            raise ValueError("x_tokens must be >= 1.")
+        self.x_dim = int(x_dim)
+        self.theta_dim = int(theta_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.depth = int(depth)
+        self.use_logit_time = bool(use_logit_time)
+        self.num_heads = int(num_heads)
+        self.ff_mult = int(ff_mult)
+        self.dropout = float(dropout)
+        self.x_tokens = int(x_tokens)
+
+        self.theta_proj = nn.Linear(self.theta_dim, self.hidden_dim)
+        self.time_proj = nn.Linear(1, self.hidden_dim)
+        self.x_proj = nn.Linear(self.x_dim, self.x_tokens * self.hidden_dim)
+        self.type_embed = nn.Parameter(torch.empty(1, 2 + self.x_tokens, self.hidden_dim))
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.hidden_dim,
+            nhead=self.num_heads,
+            dim_feedforward=self.hidden_dim * self.ff_mult,
+            dropout=self.dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=self.depth)
+        self.out = nn.Linear(2 * self.hidden_dim, self.theta_dim)
+        nn.init.normal_(self.type_embed, mean=0.0, std=0.02)
+
+    def _t_feat(self, t: torch.Tensor) -> torch.Tensor:
+        if t.ndim == 1:
+            t = t.unsqueeze(-1)
+        if self.use_logit_time:
+            t_clip = torch.clamp(t, min=1e-4, max=1.0 - 1e-4)
+            return torch.log(t_clip) - torch.log1p(-t_clip)
+        return t
+
+    def forward(self, theta_t: torch.Tensor, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        if theta_t.ndim == 1:
+            theta_t = theta_t.unsqueeze(-1)
+        if theta_t.shape[-1] != self.theta_dim:
+            raise ValueError(f"theta_t last dim {theta_t.shape[-1]} != theta_dim={self.theta_dim}")
+        if x.shape[-1] != self.x_dim:
+            raise ValueError(f"x last dim {x.shape[-1]} != x_dim={self.x_dim}")
+        t_feat = self._t_feat(t)
+        theta_tok = self.theta_proj(theta_t).unsqueeze(1)
+        time_tok = self.time_proj(t_feat).unsqueeze(1)
+        x_tok = self.x_proj(x).reshape(x.shape[0], self.x_tokens, self.hidden_dim)
+        tokens = torch.cat([theta_tok, time_tok, x_tok], dim=1) + self.type_embed
+        encoded = self.encoder(tokens)
+        pooled = torch.cat([encoded[:, 0, :], encoded[:, 2:, :].mean(dim=1)], dim=-1)
+        return self.out(pooled)
+
+    @torch.no_grad()
+    def predict_velocity(self, theta: torch.Tensor, x: torch.Tensor, t_eval: float) -> torch.Tensor:
+        self.eval()
+        t = torch.full((theta.shape[0], 1), float(t_eval), device=theta.device)
+        return self.forward(theta, x, t)
+
+
+class PriorThetaFlowVelocityTransformer(nn.Module):
+    """Prior theta-flow velocity using theta/time tokens plus learned latent tokens."""
+
+    def __init__(
+        self,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        use_logit_time: bool = True,
+        *,
+        theta_dim: int = 1,
+        num_heads: int = 4,
+        ff_mult: int = 4,
+        dropout: float = 0.0,
+        latent_tokens: int = 2,
+    ) -> None:
+        super().__init__()
+        if int(theta_dim) < 1:
+            raise ValueError("theta_dim must be >= 1.")
+        if int(hidden_dim) < 1:
+            raise ValueError("hidden_dim must be >= 1.")
+        if int(depth) < 1:
+            raise ValueError("depth must be >= 1.")
+        if int(num_heads) < 1:
+            raise ValueError("num_heads must be >= 1.")
+        if int(hidden_dim) % int(num_heads) != 0:
+            raise ValueError("hidden_dim must be divisible by num_heads.")
+        if int(ff_mult) < 1:
+            raise ValueError("ff_mult must be >= 1.")
+        if not (0.0 <= float(dropout) < 1.0):
+            raise ValueError("dropout must be in [0, 1).")
+        if int(latent_tokens) < 1:
+            raise ValueError("latent_tokens must be >= 1.")
+        self.theta_dim = int(theta_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.depth = int(depth)
+        self.use_logit_time = bool(use_logit_time)
+        self.num_heads = int(num_heads)
+        self.ff_mult = int(ff_mult)
+        self.dropout = float(dropout)
+        self.latent_tokens = int(latent_tokens)
+
+        self.theta_proj = nn.Linear(self.theta_dim, self.hidden_dim)
+        self.time_proj = nn.Linear(1, self.hidden_dim)
+        self.latent = nn.Parameter(torch.empty(1, self.latent_tokens, self.hidden_dim))
+        self.type_embed = nn.Parameter(torch.empty(1, 2 + self.latent_tokens, self.hidden_dim))
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.hidden_dim,
+            nhead=self.num_heads,
+            dim_feedforward=self.hidden_dim * self.ff_mult,
+            dropout=self.dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=self.depth)
+        self.out = nn.Linear(2 * self.hidden_dim, self.theta_dim)
+        nn.init.normal_(self.latent, mean=0.0, std=0.02)
+        nn.init.normal_(self.type_embed, mean=0.0, std=0.02)
+
+    def _t_feat(self, t: torch.Tensor) -> torch.Tensor:
+        if t.ndim == 1:
+            t = t.unsqueeze(-1)
+        if self.use_logit_time:
+            t_clip = torch.clamp(t, min=1e-4, max=1.0 - 1e-4)
+            return torch.log(t_clip) - torch.log1p(-t_clip)
+        return t
+
+    def forward(self, theta_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        if theta_t.ndim == 1:
+            theta_t = theta_t.unsqueeze(-1)
+        if theta_t.shape[-1] != self.theta_dim:
+            raise ValueError(f"theta_t last dim {theta_t.shape[-1]} != theta_dim={self.theta_dim}")
+        t_feat = self._t_feat(t)
+        theta_tok = self.theta_proj(theta_t).unsqueeze(1)
+        time_tok = self.time_proj(t_feat).unsqueeze(1)
+        latent_tok = self.latent.expand(theta_t.shape[0], -1, -1)
+        tokens = torch.cat([theta_tok, time_tok, latent_tok], dim=1) + self.type_embed
+        encoded = self.encoder(tokens)
+        pooled = torch.cat([encoded[:, 0, :], encoded[:, 2:, :].mean(dim=1)], dim=-1)
+        return self.out(pooled)
+
+    @torch.no_grad()
+    def predict_velocity(self, theta: torch.Tensor, t_eval: float) -> torch.Tensor:
+        self.eval()
+        t = torch.full((theta.shape[0], 1), float(t_eval), device=theta.device)
+        return self.forward(theta, t)
+
+
 class ConditionalThetaFlowVelocityThetaFourierMLP(nn.Module):
     """Conditional theta-flow velocity v(theta_t, x, t) with theta features [1, theta] plus sin/cos harmonics.
 

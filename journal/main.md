@@ -16,6 +16,8 @@ Collected markdown notes in `journal/notes/`: long-form chapters (moved from the
 
 ## 2026-04
 
+- [2026-04-26 Theta-flow **`transformer`** (posterior $x$ tokens + prior latents) on 2D `cosine_gaussian_sqrtd` / PR-100D: architecture, CLI, H-decoding run + Markdown repro](notes/2026-04-26-theta-flow-transformer-2d-cosine-sqrtd-h-decoding.md)
+
 - [2026-04-25 Flow matching + analytical diagonal Gaussian **velocity prior** on 2D banana (`tests/fm_gaussian_velocity_prior.py`): MMD/geometry improve with $\lambda_0$; prior math cross-refs + repro](notes/2026-04-25-fm-gaussian-velocity-prior-banana.md)
 
 - [2026-04-25 x-flow (`--theta-field-method x_flow`): conditional $x$-space flow matching, ODE $\log p(x\mid\theta)$, and H-decoding / Hellinger matrix pipeline (`flow_x_likelihood`)](notes/2026-04-25-x-flow-conditional-likelihood-hellinger-h-decoding.md)

@@ -12,6 +12,7 @@ from fisher.cli_shared_fisher import add_estimation_arguments
 from fisher.h_matrix import HMatrixEstimator
 from fisher.models import (
     ConditionalThetaFlowVelocity,
+    ConditionalThetaFlowVelocityTransformer,
     PriorThetaFlowVelocity,
 )
 from fisher.shared_fisher_est import run_shared_fisher_estimation, validate_estimation_args
@@ -341,6 +342,51 @@ class TestHMatrixFlowLikelihood(unittest.TestCase):
         for name, start_tensor in start_state.items():
             same = torch.equal(final_state[name].detach().cpu(), start_tensor)
             if name.startswith("net.2."):
+                changed.append(not same)
+            else:
+                unchanged.append(same)
+        self.assertTrue(any(changed))
+        self.assertTrue(all(unchanged))
+
+    def test_train_conditional_theta_flow_pre_post_transformer_freezes_backbone(self) -> None:
+        torch.manual_seed(0)
+        theta = np.linspace(-1.0, 1.0, 18, dtype=np.float64).reshape(-1, 1)
+        x = np.concatenate([np.cos(theta), np.sin(theta)], axis=1).astype(np.float64)
+        model = ConditionalThetaFlowVelocityTransformer(
+            x_dim=2,
+            hidden_dim=8,
+            depth=1,
+            theta_dim=1,
+            num_heads=2,
+            ff_mult=2,
+            dropout=0.0,
+            x_tokens=2,
+        ).to(torch.device("cpu"))
+        out = train_conditional_theta_flow_pre_post_model(
+            model=model,
+            theta_train=theta,
+            x_train=x,
+            pretrain_epochs=1,
+            finetune_epochs=1,
+            batch_size=6,
+            pretrain_lr=1e-3,
+            finetune_lr=1e-3,
+            device=torch.device("cpu"),
+            log_every=99,
+            scheduler_name="vp",
+            theta_prior_regularization_lambda=0.01,
+            theta_prior_regularization_bin_n_bins=3,
+        )
+        self.assertEqual(len(out["theta_pre_post_pretrain_reg_train_losses"]), 1)
+        self.assertEqual(len(out["theta_pre_post_finetune_fm_train_losses"]), 1)
+        self.assertGreater(int(out["theta_pre_post_readout_trainable_params"]), 0)
+        start_state = out["theta_pre_post_finetune_start_state"]
+        final_state = model.state_dict()
+        changed = []
+        unchanged = []
+        for name, start_tensor in start_state.items():
+            same = torch.equal(final_state[name].detach().cpu(), start_tensor)
+            if name.startswith("out."):
                 changed.append(not same)
             else:
                 unchanged.append(same)

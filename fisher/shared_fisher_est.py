@@ -34,6 +34,7 @@ from fisher.models import (
     ConditionalThetaFlowVelocitySoftMoE,
     ConditionalThetaFlowVelocityThetaFourierFiLMPerLayer,
     ConditionalThetaFlowVelocityThetaFourierMLP,
+    ConditionalThetaFlowVelocityTransformer,
     ConditionalXFlowVelocity,
     ConditionalXFlowVelocityFiLMPerLayer,
     ConditionalXFlowVelocityIndependentMLP,
@@ -47,6 +48,7 @@ from fisher.models import (
     PriorThetaFlowVelocityFiLMPerLayer,
     PriorThetaFlowVelocityThetaFourierFiLMPerLayer,
     PriorThetaFlowVelocityThetaFourierMLP,
+    PriorThetaFlowVelocityTransformer,
 )
 from fisher.dataset_family_recipes import raise_if_legacy_dataset_family, raise_if_removed_dataset_family
 from fisher.ctsm_models import (
@@ -159,9 +161,9 @@ def normalize_theta_field_method(method: str) -> str:
 
 def normalize_flow_arch(args: Any) -> str:
     arch = str(getattr(args, "flow_arch", "mlp")).strip().lower()
-    if arch in ("mlp", "soft_moe", "film", "film_fourier"):
+    if arch in ("mlp", "soft_moe", "film", "film_fourier", "transformer"):
         return arch
-    raise ValueError("--flow-arch must be one of {'mlp','soft_moe','film','film_fourier'}.")
+    raise ValueError("--flow-arch must be one of {'mlp','soft_moe','film','film_fourier','transformer'}.")
 
 
 def build_posterior_score_model(
@@ -970,11 +972,11 @@ def validate_estimation_args(args: Any) -> None:
     legacy_flow_prior_arch = getattr(args, "flow_prior_arch", None)
     if legacy_flow_score_arch is not None:
         raise ValueError(
-            "Legacy --flow-score-arch is removed. Use --flow-arch {mlp,soft_moe,film,film_fourier}."
+            "Legacy --flow-score-arch is removed. Use --flow-arch {mlp,soft_moe,film,film_fourier,transformer}."
         )
     if legacy_flow_prior_arch is not None:
         raise ValueError(
-            "Legacy --flow-prior-arch is removed. Use --flow-arch {mlp,soft_moe,film,film_fourier}."
+            "Legacy --flow-prior-arch is removed. Use --flow-arch {mlp,soft_moe,film,film_fourier,transformer}."
         )
     if args.score_eval_sigmas < 1:
         raise ValueError("--score-eval-sigmas must be >= 1.")
@@ -1181,13 +1183,34 @@ def validate_estimation_args(args: Any) -> None:
         raise ValueError("--flow-prior-cond-embed-dim must be >= 1.")
     if int(getattr(args, "flow_prior_cond_embed_depth", 1)) < 1:
         raise ValueError("--flow-prior-cond-embed-depth must be >= 1.")
-    if _arch not in ("mlp", "soft_moe", "film", "film_fourier"):
-        raise ValueError("--flow-arch must be one of {'mlp','soft_moe','film','film_fourier'}.")
+    if _arch not in ("mlp", "soft_moe", "film", "film_fourier", "transformer"):
+        raise ValueError("--flow-arch must be one of {'mlp','soft_moe','film','film_fourier','transformer'}.")
     _fbn = int(getattr(args, "flow_bottleneck_dim", 0))
     if _fbn < 0:
         raise ValueError("--flow-bottleneck-dim must be >= 0 (0 disables the readout bottleneck).")
     if _fbn > 0 and str(_arch).strip().lower() != "mlp":
         raise ValueError("--flow-bottleneck-dim > 0 is only supported with --flow-arch mlp.")
+    if int(getattr(args, "flow_transformer_heads", 4)) < 1:
+        raise ValueError("--flow-transformer-heads must be >= 1.")
+    if int(getattr(args, "flow_transformer_ff_mult", 4)) < 1:
+        raise ValueError("--flow-transformer-ff-mult must be >= 1.")
+    if not (0.0 <= float(getattr(args, "flow_transformer_dropout", 0.0)) < 1.0):
+        raise ValueError("--flow-transformer-dropout must be in [0, 1).")
+    if int(getattr(args, "flow_transformer_x_tokens", 8)) < 1:
+        raise ValueError("--flow-transformer-x-tokens must be >= 1.")
+    if int(getattr(args, "flow_prior_transformer_latent_tokens", 2)) < 1:
+        raise ValueError("--flow-prior-transformer-latent-tokens must be >= 1.")
+    if _arch == "transformer":
+        if _tfm_val not in ("theta_flow", "theta_flow_reg", "theta_flow_pre_post", "theta_path_integral"):
+            raise ValueError("--flow-arch transformer is supported only for theta-flow methods.")
+        if int(getattr(args, "flow_hidden_dim", 128)) % int(getattr(args, "flow_transformer_heads", 4)) != 0:
+            raise ValueError("--flow-hidden-dim must be divisible by --flow-transformer-heads.")
+        if int(getattr(args, "prior_hidden_dim", 128)) % int(getattr(args, "flow_transformer_heads", 4)) != 0:
+            raise ValueError("--prior-hidden-dim must be divisible by --flow-transformer-heads.")
+        if int(getattr(args, "flow_depth", 3)) < 1:
+            raise ValueError("--flow-depth must be >= 1 for --flow-arch transformer.")
+        if int(getattr(args, "prior_depth", 3)) < 1:
+            raise ValueError("--prior-depth must be >= 1 for --flow-arch transformer.")
     if int(getattr(args, "flow_moe_num_experts", 4)) < 1:
         raise ValueError("--flow-moe-num-experts must be >= 1.")
     if float(getattr(args, "flow_moe_router_temperature", 1.0)) <= 0.0:
@@ -1202,6 +1225,8 @@ def validate_estimation_args(args: Any) -> None:
         raise ValueError("--flow-x-theta-fourier-omega-mode must be one of {'fixed', 'theta_range'}.")
     if _tfm_val in ("x_flow", "x_flow_reg") and _arch == "soft_moe":
         raise ValueError("--flow-arch soft_moe is supported only for theta-flow methods.")
+    if _tfm_val in ("x_flow", "x_flow_reg") and _arch == "transformer":
+        raise ValueError("--flow-arch transformer is supported only for theta-flow methods.")
     if _tfm_val in ("x_flow", "x_flow_reg") and _arch == "film_fourier":
         if _fx_omega_mode == "theta_range":
             lo = float(getattr(args, "theta_low", -6.0))
@@ -2615,6 +2640,13 @@ def run_shared_fisher_estimation(
                 f" moe_post_num_experts={int(getattr(args, 'flow_moe_num_experts', 4))}"
                 f" moe_post_router_temp={float(getattr(args, 'flow_moe_router_temperature', 1.0)):.6g}"
             )
+        elif flow_score_arch == "transformer":
+            _xf_post = (
+                f" transformer_post_heads={int(getattr(args, 'flow_transformer_heads', 4))}"
+                f" transformer_post_ff_mult={int(getattr(args, 'flow_transformer_ff_mult', 4))}"
+                f" transformer_post_dropout={float(getattr(args, 'flow_transformer_dropout', 0.0)):.6g}"
+                f" transformer_post_x_tokens={int(getattr(args, 'flow_transformer_x_tokens', 8))}"
+            )
         _xf_prior = ""
         if flow_prior_arch == "film":
             _xf_prior = (
@@ -2630,6 +2662,13 @@ def run_shared_fisher_estimation(
                 f" theta_fourier_prior_omega_in_net={float(_om_eff_p):.6g}"
                 f" theta_fourier_prior_linear={not bool(getattr(args, 'flow_prior_theta_fourier_no_linear', False))}"
                 f" theta_fourier_prior_bias={not bool(getattr(args, 'flow_prior_theta_fourier_no_bias', False))}"
+            )
+        elif flow_prior_arch == "transformer":
+            _xf_prior = (
+                f" transformer_prior_heads={int(getattr(args, 'flow_transformer_heads', 4))}"
+                f" transformer_prior_ff_mult={int(getattr(args, 'flow_transformer_ff_mult', 4))}"
+                f" transformer_prior_dropout={float(getattr(args, 'flow_transformer_dropout', 0.0)):.6g}"
+                f" transformer_prior_latent_tokens={int(getattr(args, 'flow_prior_transformer_latent_tokens', 2))}"
             )
         print(
             f"[{theta_field_method}] arch "
@@ -2732,8 +2771,31 @@ def run_shared_fisher_estimation(
                 theta_fourier_include_linear=not bool(getattr(args, "flow_theta_fourier_no_linear", False)),
                 theta_fourier_include_bias=not bool(getattr(args, "flow_theta_fourier_no_bias", False)),
             ).to(device)
+        elif flow_score_arch == "transformer":
+            post_ckpt_hparams = {
+                "x_dim": int(args.x_dim),
+                "hidden_dim": int(getattr(args, "flow_hidden_dim", 128)),
+                "depth": int(getattr(args, "flow_depth", 3)),
+                "use_logit_time": True,
+                "theta_dim": int(theta_dim_flow),
+                "num_heads": int(getattr(args, "flow_transformer_heads", 4)),
+                "ff_mult": int(getattr(args, "flow_transformer_ff_mult", 4)),
+                "dropout": float(getattr(args, "flow_transformer_dropout", 0.0)),
+                "x_tokens": int(getattr(args, "flow_transformer_x_tokens", 8)),
+            }
+            post_model = ConditionalThetaFlowVelocityTransformer(
+                x_dim=int(args.x_dim),
+                hidden_dim=int(getattr(args, "flow_hidden_dim", 128)),
+                depth=int(getattr(args, "flow_depth", 3)),
+                use_logit_time=True,
+                theta_dim=theta_dim_flow,
+                num_heads=int(getattr(args, "flow_transformer_heads", 4)),
+                ff_mult=int(getattr(args, "flow_transformer_ff_mult", 4)),
+                dropout=float(getattr(args, "flow_transformer_dropout", 0.0)),
+                x_tokens=int(getattr(args, "flow_transformer_x_tokens", 8)),
+            ).to(device)
         else:
-            raise ValueError("--flow-arch must be one of {'mlp','soft_moe','film','film_fourier'}.")
+            raise ValueError("--flow-arch must be one of {'mlp','soft_moe','film','film_fourier','transformer'}.")
         if theta_field_method == "theta_flow_pre_post":
             _prepost_pre_epochs = getattr(args, "flow_theta_pre_post_pretrain_epochs", None)
             if _prepost_pre_epochs is None:
@@ -2923,8 +2985,29 @@ def run_shared_fisher_estimation(
                 theta_fourier_include_linear=not bool(getattr(args, "flow_prior_theta_fourier_no_linear", False)),
                 theta_fourier_include_bias=not bool(getattr(args, "flow_prior_theta_fourier_no_bias", False)),
             ).to(device)
+        elif flow_prior_arch == "transformer":
+            prior_ckpt_hparams = {
+                "hidden_dim": int(getattr(args, "prior_hidden_dim", 128)),
+                "depth": int(getattr(args, "prior_depth", 3)),
+                "use_logit_time": True,
+                "theta_dim": int(theta_dim_flow),
+                "num_heads": int(getattr(args, "flow_transformer_heads", 4)),
+                "ff_mult": int(getattr(args, "flow_transformer_ff_mult", 4)),
+                "dropout": float(getattr(args, "flow_transformer_dropout", 0.0)),
+                "latent_tokens": int(getattr(args, "flow_prior_transformer_latent_tokens", 2)),
+            }
+            prior_model_flow = PriorThetaFlowVelocityTransformer(
+                hidden_dim=int(getattr(args, "prior_hidden_dim", 128)),
+                depth=int(getattr(args, "prior_depth", 3)),
+                use_logit_time=True,
+                theta_dim=theta_dim_flow,
+                num_heads=int(getattr(args, "flow_transformer_heads", 4)),
+                ff_mult=int(getattr(args, "flow_transformer_ff_mult", 4)),
+                dropout=float(getattr(args, "flow_transformer_dropout", 0.0)),
+                latent_tokens=int(getattr(args, "flow_prior_transformer_latent_tokens", 2)),
+            ).to(device)
         else:
-            raise ValueError("--flow-arch must be one of {'mlp','film','film_fourier'}.")
+            raise ValueError("--flow-arch must be one of {'mlp','film','film_fourier','transformer'}.")
         prior_train_out = train_prior_theta_flow_model(
             model=prior_model_flow,
             theta_train=theta_score_fit,

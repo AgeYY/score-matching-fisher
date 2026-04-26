@@ -16,6 +16,7 @@ from fisher.models import (
     ConditionalThetaFlowVelocitySoftMoE,
     ConditionalThetaFlowVelocityThetaFourierFiLMPerLayer,
     ConditionalThetaFlowVelocityThetaFourierMLP,
+    ConditionalThetaFlowVelocityTransformer,
     ConditionalXFlowVelocity,
     ConditionalXFlowVelocityFiLMPerLayer,
     ConditionalXFlowVelocityIndependentMLP,
@@ -27,6 +28,7 @@ from fisher.models import (
     PriorThetaFlowVelocity,
     PriorThetaFlowVelocityFiLMPerLayer,
     PriorThetaFlowVelocityThetaFourierMLP,
+    PriorThetaFlowVelocityTransformer,
     PriorScore1D,
     PriorScore1DFiLMPerLayer,
     UnconditionalXFlowVelocity,
@@ -1182,7 +1184,8 @@ def _theta_flow_conditional_nll_aux_loss(
     *,
     model: ConditionalThetaFlowVelocity
     | ConditionalThetaFlowVelocityFiLMPerLayer
-    | ConditionalThetaFlowVelocityThetaFourierMLP,
+    | ConditionalThetaFlowVelocityThetaFourierMLP
+    | ConditionalThetaFlowVelocityTransformer,
     theta_target: torch.Tensor,
     x_cond: torch.Tensor,
     n_steps: int,
@@ -1611,7 +1614,8 @@ def train_conditional_theta_flow_model(
     | ConditionalThetaFlowVelocityFiLMPerLayer
     | ConditionalThetaFlowVelocitySoftMoE
     | ConditionalThetaFlowVelocityThetaFourierFiLMPerLayer
-    | ConditionalThetaFlowVelocityThetaFourierMLP,
+    | ConditionalThetaFlowVelocityThetaFourierMLP
+    | ConditionalThetaFlowVelocityTransformer,
     theta_train: np.ndarray,
     x_train: np.ndarray,
     epochs: int,
@@ -1885,6 +1889,7 @@ def _theta_flow_readout_modules(model: nn.Module) -> list[nn.Module]:
         (
             ConditionalThetaFlowVelocityFiLMPerLayer,
             ConditionalThetaFlowVelocityThetaFourierFiLMPerLayer,
+            ConditionalThetaFlowVelocityTransformer,
         ),
     ):
         out = getattr(model, "out", None)
@@ -1923,7 +1928,8 @@ def train_conditional_theta_flow_pre_post_model(
     | ConditionalThetaFlowVelocityFiLMPerLayer
     | ConditionalThetaFlowVelocitySoftMoE
     | ConditionalThetaFlowVelocityThetaFourierFiLMPerLayer
-    | ConditionalThetaFlowVelocityThetaFourierMLP,
+    | ConditionalThetaFlowVelocityThetaFourierMLP
+    | ConditionalThetaFlowVelocityTransformer,
     theta_train: np.ndarray,
     x_train: np.ndarray,
     pretrain_epochs: int,
@@ -2337,7 +2343,8 @@ def train_conditional_theta_flow_pre_post_model(
 def train_prior_theta_flow_model(
     model: PriorThetaFlowVelocity
     | PriorThetaFlowVelocityFiLMPerLayer
-    | PriorThetaFlowVelocityThetaFourierMLP,
+    | PriorThetaFlowVelocityThetaFourierMLP
+    | PriorThetaFlowVelocityTransformer,
     theta_train: np.ndarray,
     epochs: int,
     batch_size: int,

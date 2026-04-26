@@ -30,8 +30,9 @@ regularization-only pretraining followed by readout-only real-data fine-tuning),
 ``--theta-field-method ctsm_v`` (pair-conditioned CTSM-v time-score integration; no prior model), and
 ``--theta-field-method nf`` (conditional normalizing flow log p(theta|x) with an NF prior
 for posterior-minus-prior log-ratio construction).
-Flow methods use ``--flow-arch``: ``mlp``, ``film`` (FiLM with raw-theta embeddings), or
-``film_fourier`` for ``theta_flow`` / ``theta_flow_reg`` / ``theta_flow_pre_post`` /
+Flow methods use ``--flow-arch``: ``mlp``, ``film`` (FiLM with raw-theta embeddings),
+``film_fourier``, or ``transformer`` (theta-flow methods only).
+``film_fourier`` applies to ``theta_flow`` / ``theta_flow_reg`` / ``theta_flow_pre_post`` /
 ``theta_path_integral`` / ``x_flow`` / ``x_flow_reg``.
 ``film_fourier`` uses FiLM conditioning with Fourier theta features
 (``--flow-theta-fourier-*`` for ``theta_flow`` / ``theta_flow_reg`` /
@@ -634,6 +635,7 @@ def build_parser() -> argparse.ArgumentParser:
         output_dir=str(Path(DATA_DIR) / "h_decoding_convergence"),
         theta_field_method="theta_flow",
         flow_arch="mlp",
+        flow_endpoint_loss_weight=0.0,
         flow_epochs=10000,
         flow_theta_pre_post_pretrain_epochs=10000,
         flow_theta_pre_post_finetune_epochs=10000,
@@ -1104,7 +1106,11 @@ def _run_per_n_method_sweep(
             run_dir = os.path.join(sweep_root, f"n_{n:06d}")
             os.makedirs(run_dir, exist_ok=True)
         else:
-            tmp_ctx = tempfile.TemporaryDirectory(prefix=f"h_conv_n{n}_", dir=args.output_dir)
+            # TemporaryDirectory cleanup can spuriously fail on some filesystems (e.g. "Directory not
+            # empty" on NFS) if writers race teardown; ignore cleanup errors to avoid losing results.
+            tmp_ctx = tempfile.TemporaryDirectory(
+                prefix=f"h_conv_n{n}_", dir=args.output_dir, ignore_cleanup_errors=True
+            )
             run_dir = tmp_ctx.name
 
         try:
