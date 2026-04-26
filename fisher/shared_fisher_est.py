@@ -1108,14 +1108,27 @@ def validate_estimation_args(args: Any) -> None:
         _prepost_pre_epochs = getattr(args, "flow_epochs", 1)
     if int(_prepost_pre_epochs) < 1:
         raise ValueError("--flow-theta-pre-post-pretrain-epochs must be >= 1.")
+    if int(getattr(args, "flow_theta_pre_post_pretrain_synthetic_size", 0)) < 0:
+        raise ValueError("--flow-theta-pre-post-pretrain-synthetic-size must be >= 0.")
+    if (
+        bool(getattr(args, "flow_theta_pre_post_pretrain_resample_synthetic_each_epoch", False))
+        and int(getattr(args, "flow_theta_pre_post_pretrain_synthetic_size", 0)) <= 0
+    ):
+        raise ValueError(
+            "--flow-theta-pre-post-pretrain-resample-synthetic-each-epoch requires "
+            "--flow-theta-pre-post-pretrain-synthetic-size > 0."
+        )
+    _prepost_pre_patience = getattr(args, "flow_theta_pre_post_pretrain_early_patience", None)
+    if _prepost_pre_patience is not None and int(_prepost_pre_patience) < 1:
+        raise ValueError("--flow-theta-pre-post-pretrain-early-patience must be >= 1 when set.")
     _prepost_ft_epochs = getattr(args, "flow_theta_pre_post_finetune_epochs", 10000)
-    if int(_prepost_ft_epochs) < 1:
-        raise ValueError("--flow-theta-pre-post-finetune-epochs must be >= 1.")
+    if int(_prepost_ft_epochs) < 0:
+        raise ValueError("--flow-theta-pre-post-finetune-epochs must be >= 0 (0 skips readout fine-tuning).")
     _prepost_ft_lr = getattr(args, "flow_theta_pre_post_finetune_lr", None)
     if _prepost_ft_lr is None:
         _prepost_ft_lr = getattr(args, "flow_lr", 1e-3)
-    if float(_prepost_ft_lr) <= 0.0:
-        raise ValueError("--flow-theta-pre-post-finetune-lr must be positive.")
+    if int(_prepost_ft_epochs) >= 1 and float(_prepost_ft_lr) <= 0.0:
+        raise ValueError("--flow-theta-pre-post-finetune-lr must be positive when fine-tune epochs > 0.")
     if _tfm_val in ("theta_flow", "theta_flow_reg", "theta_flow_pre_post", "theta_path_integral"):
         default_x_reg = {
             "flow_x_reg_lambda": 0.1,
@@ -1371,6 +1384,11 @@ def _save_dsm_score_prior_training_losses_npz(
     theta_pre_post_pretrain_val_losses: np.ndarray | None = None,
     theta_pre_post_pretrain_reg_val_losses: np.ndarray | None = None,
     theta_pre_post_pretrain_val_monitor_losses: np.ndarray | None = None,
+    theta_pre_post_pretrain_synthetic_size: int = 0,
+    theta_pre_post_pretrain_synthetic_train_size: int = 0,
+    theta_pre_post_pretrain_synthetic_val_size: int = 0,
+    theta_pre_post_pretrain_resample_synthetic_each_epoch: bool = False,
+    theta_pre_post_pretrain_early_stopping_patience: int = 0,
     theta_pre_post_finetune_train_losses: np.ndarray | None = None,
     theta_pre_post_finetune_fm_train_losses: np.ndarray | None = None,
     theta_pre_post_finetune_val_losses: np.ndarray | None = None,
@@ -1468,6 +1486,15 @@ def _save_dsm_score_prior_training_losses_npz(
         theta_pre_post_pretrain_val_monitor_losses=np.asarray(
             [] if theta_pre_post_pretrain_val_monitor_losses is None else theta_pre_post_pretrain_val_monitor_losses,
             dtype=np.float64,
+        ),
+        theta_pre_post_pretrain_synthetic_size=np.int64(theta_pre_post_pretrain_synthetic_size),
+        theta_pre_post_pretrain_synthetic_train_size=np.int64(theta_pre_post_pretrain_synthetic_train_size),
+        theta_pre_post_pretrain_synthetic_val_size=np.int64(theta_pre_post_pretrain_synthetic_val_size),
+        theta_pre_post_pretrain_resample_synthetic_each_epoch=np.bool_(
+            theta_pre_post_pretrain_resample_synthetic_each_epoch
+        ),
+        theta_pre_post_pretrain_early_stopping_patience=np.int64(
+            theta_pre_post_pretrain_early_stopping_patience
         ),
         theta_pre_post_finetune_train_losses=np.asarray(
             [] if theta_pre_post_finetune_train_losses is None else theta_pre_post_finetune_train_losses,
@@ -2729,6 +2756,11 @@ def run_shared_fisher_estimation(
                 theta_val=theta_score_val,
                 x_val=x_score_val,
                 early_stopping_patience=int(getattr(args, "flow_early_patience", 1000)),
+                pretrain_early_stopping_patience=(
+                    None
+                    if getattr(args, "flow_theta_pre_post_pretrain_early_patience", None) is None
+                    else int(getattr(args, "flow_theta_pre_post_pretrain_early_patience"))
+                ),
                 early_stopping_min_delta=float(getattr(args, "flow_early_min_delta", 1e-4)),
                 early_stopping_ema_alpha=float(getattr(args, "flow_early_ema_alpha", 0.05)),
                 restore_best=bool(getattr(args, "flow_restore_best", True)),
@@ -2737,6 +2769,10 @@ def run_shared_fisher_estimation(
                 theta_prior_regularization_bin_n_bins=int(getattr(args, "flow_theta_reg_bin_n_bins", 10)),
                 theta_prior_regularization_variance_floor=float(
                     getattr(args, "flow_theta_reg_variance_floor", 1e-6)
+                ),
+                pretrain_synthetic_size=int(getattr(args, "flow_theta_pre_post_pretrain_synthetic_size", 0)),
+                pretrain_resample_synthetic_each_epoch=bool(
+                    getattr(args, "flow_theta_pre_post_pretrain_resample_synthetic_each_epoch", False)
                 ),
             )
         else:
@@ -3104,6 +3140,21 @@ def run_shared_fisher_estimation(
                 theta_pre_post_pretrain_val_monitor_losses=np.asarray(
                     post_train_out.get("theta_pre_post_pretrain_val_monitor_losses", []),
                     dtype=np.float64,
+                ),
+                theta_pre_post_pretrain_synthetic_size=int(
+                    post_train_out.get("theta_pre_post_pretrain_synthetic_size", 0)
+                ),
+                theta_pre_post_pretrain_synthetic_train_size=int(
+                    post_train_out.get("theta_pre_post_pretrain_synthetic_train_size", 0)
+                ),
+                theta_pre_post_pretrain_synthetic_val_size=int(
+                    post_train_out.get("theta_pre_post_pretrain_synthetic_val_size", 0)
+                ),
+                theta_pre_post_pretrain_resample_synthetic_each_epoch=bool(
+                    post_train_out.get("theta_pre_post_pretrain_resample_synthetic_each_epoch", False)
+                ),
+                theta_pre_post_pretrain_early_stopping_patience=int(
+                    post_train_out.get("theta_pre_post_pretrain_early_stopping_patience", 0)
                 ),
                 theta_pre_post_finetune_train_losses=np.asarray(
                     post_train_out.get("theta_pre_post_finetune_train_losses", []),

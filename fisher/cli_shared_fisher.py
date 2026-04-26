@@ -305,10 +305,44 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         ),
     )
     p.add_argument(
+        "--flow-theta-pre-post-pretrain-synthetic-size",
+        type=int,
+        default=0,
+        help=(
+            "theta_flow_pre_post only: if >0, pretrain on this many fixed synthetic rows sampled from "
+            "the fitted binned Gaussian p(x|theta), split by the dataset train fraction. With "
+            "--flow-theta-pre-post-pretrain-resample-synthetic-each-epoch, this is the number of "
+            "fresh synthetic rows sampled per pretrain epoch. "
+            "Default 0 keeps the legacy per-epoch synthetic resampling over the post-training split."
+        ),
+    )
+    p.add_argument(
+        "--flow-theta-pre-post-pretrain-resample-synthetic-each-epoch",
+        action="store_true",
+        default=False,
+        help=(
+            "theta_flow_pre_post only: when --flow-theta-pre-post-pretrain-synthetic-size > 0, "
+            "resample a fresh synthetic pool of that size at the start of every pretrain epoch "
+            "instead of reusing one fixed pool."
+        ),
+    )
+    p.add_argument(
+        "--flow-theta-pre-post-pretrain-early-patience",
+        type=int,
+        default=None,
+        help=(
+            "theta_flow_pre_post only: early-stopping patience for the pretrain stage only. "
+            "Default: --flow-early-patience."
+        ),
+    )
+    p.add_argument(
         "--flow-theta-pre-post-finetune-epochs",
         type=int,
         default=10000,
-        help="theta_flow_pre_post only: readout-only data fine-tuning epochs after regularization pretraining.",
+        help=(
+            "theta_flow_pre_post only: readout-only data fine-tuning epochs after regularization pretraining. "
+            "Set to 0 to skip fine-tuning and use the pretrain-only posterior (still runs pretrain)."
+        ),
     )
     p.add_argument(
         "--flow-theta-pre-post-finetune-lr",

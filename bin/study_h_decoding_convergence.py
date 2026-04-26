@@ -65,6 +65,7 @@ import shutil
 import sys
 import tempfile
 import time
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, NamedTuple, TypedDict, cast
@@ -89,6 +90,7 @@ import numpy as np
 import torch
 
 import visualize_h_matrix_binned as vhb
+from fisher.dataset_visualization import pca_project
 from fisher.cli_shared_fisher import add_estimation_arguments
 from fisher.hellinger_gt import (
     bin_centers_from_edges,
@@ -130,6 +132,56 @@ def _sqrt_h_like(mat: np.ndarray) -> np.ndarray:
     finite = np.isfinite(h)
     out[finite] = np.sqrt(np.clip(h[finite], 0.0, 1.0))
     return out
+
+
+def _x_pca_bundle(
+    bundle: SharedDatasetBundle,
+    *,
+    n_components: int,
+) -> SharedDatasetBundle:
+    """Project all bundle ``x`` arrays onto the first ``k`` PCs of ``x_all`` (SVD, centered)."""
+    if int(n_components) <= 0:
+        return bundle
+    x_all = np.asarray(bundle.x_all, dtype=np.float64)
+    if x_all.ndim != 2:
+        raise ValueError("PCA requires 2D x_all.")
+    n, d = int(x_all.shape[0]), int(x_all.shape[1])
+    k_req = min(int(n_components), n, d)
+    if k_req < 1:
+        raise ValueError("PCA: need positive n_components and valid x shape.")
+    # If we cannot reduce below ambient dimension, keep raw x (avoids a pure rotation of full-rank data).
+    if k_req >= d:
+        print(
+            f"[convergence] x PCA: requested/allowed k={k_req} but x_dim={d}; keeping raw x (no reduction).",
+            flush=True,
+        )
+        return bundle
+    k = k_req
+    proj_all, x_mean, basis = pca_project(x_all, n_components=k)
+    if int(n_components) > k:
+        print(
+            f"[convergence] x PCA: requested n_components={int(n_components)} but using k={k} (min of n, d, request).",
+            flush=True,
+        )
+
+    def _t(x: np.ndarray) -> np.ndarray:
+        x0 = np.asarray(x, dtype=np.float64)
+        if x0.ndim != 2 or int(x0.shape[1]) != d:
+            raise ValueError("PCA transform requires x with same num_features as x_all.")
+        return (x0 - x_mean) @ basis
+
+    new_meta = dict(bundle.meta)
+    new_meta["x_dim"] = int(k)
+    new_meta["x_pca_n_components"] = int(k)
+    new_meta["x_pca_fitted_n"] = int(n)
+    new_meta["x_pca_from_dim"] = int(d)
+    return replace(
+        bundle,
+        meta=new_meta,
+        x_all=proj_all.astype(np.float64, copy=False),
+        x_train=_t(bundle.x_train).astype(np.float64, copy=False),
+        x_validation=_t(bundle.x_validation).astype(np.float64, copy=False),
+    )
 
 
 def _meta_for_gt_hellinger_mc(meta: dict[str, Any]) -> dict[str, Any]:
@@ -344,6 +396,16 @@ def build_parser() -> argparse.ArgumentParser:
             "Expected generative family stored in the NPZ meta; must match make_dataset.py "
             "when the archive was created. Default: randamp_gaussian_sqrtd (random-amplitude "
             "Gaussian bumps + sqrt(x_dim) observation-noise scaling)."
+        ),
+    )
+    p.add_argument(
+        "--x-pca-dim",
+        type=int,
+        default=10,
+        help=(
+            "If >0, project x onto this many leading PCs of centered x_all (SVD) before the sweep, "
+            "and update meta x_dim. Applies to x_all, x_train, and x_validation consistently. "
+            "0 leaves x unchanged (raw ambient features)."
         ),
     )
     p.add_argument(
@@ -572,6 +634,9 @@ def build_parser() -> argparse.ArgumentParser:
         output_dir=str(Path(DATA_DIR) / "h_decoding_convergence"),
         theta_field_method="theta_flow",
         flow_arch="mlp",
+        flow_epochs=10000,
+        flow_theta_pre_post_pretrain_epochs=10000,
+        flow_theta_pre_post_finetune_epochs=10000,
         score_early_ema_alpha=0.05,
         prior_early_ema_alpha=0.05,
         score_early_ema_warmup_epochs=0,
@@ -651,6 +716,8 @@ def _validate_cli(args: argparse.Namespace) -> None:
         raise ValueError("--num-theta-bins must be >= 1.")
     if int(args.clf_min_class_count) < 1:
         raise ValueError("--clf-min-class-count must be >= 1.")
+    if int(getattr(args, "x_pca_dim", 0)) < 0:
+        raise ValueError("--x-pca-dim must be >= 0.")
     prior_row_lam = getattr(args, "prior_row_flow_x_reg_lambda", None)
     if prior_row_lam is not None:
         prior_row_lam_f = float(prior_row_lam)
@@ -2996,6 +3063,20 @@ def main(argv: list[str] | None = None) -> None:
             f"NPZ meta dataset_family={meta_family!r} does not match --dataset-family={str(args.dataset_family)!r}. "
             "Regenerate with matching make_dataset.py --dataset-family, or pass --dataset-family to match the NPZ."
         )
+    if int(getattr(args, "x_pca_dim", 0)) > 0:
+        k = int(args.x_pca_dim)
+        print(
+            f"[convergence] projecting x to first {k} PCs (SVD, centered on x_all) for learned models; "
+            "GT Hellinger / LLR MC still uses the generative toy from meta (see [convergence] GT line).",
+            flush=True,
+        )
+        bundle = _x_pca_bundle(bundle, n_components=k)
+        meta = bundle.meta
+        print(
+            f"[convergence] after x PCA: x_all.shape={tuple(bundle.x_all.shape)} "
+            f"meta[x_dim]={int(meta.get('x_dim', -1))}",
+            flush=True,
+        )
     n_pool = int(bundle.theta_all.shape[0])
     need = max(int(args.n_ref), max(ns))
     if n_pool < need:
@@ -3206,14 +3287,45 @@ def main(argv: list[str] | None = None) -> None:
                 flush=True,
             )
         elif tfm == "theta_flow_pre_post":
-            print(
-                "[convergence] theta_flow_pre_post pretrains the posterior theta-flow on binned Gaussian "
-                "synthetic-pair regularization only, then freezes all but the readout for real-data FM "
-                f"fine-tuning (lambda={float(getattr(args, 'flow_theta_reg_lambda', 0.01)):.6g}; "
-                f"bins={int(getattr(args, 'flow_theta_reg_bin_n_bins', 10))}; "
-                f"fine_epochs={int(getattr(args, 'flow_theta_pre_post_finetune_epochs', 10000))}).",
-                flush=True,
+            _ft_ep = int(getattr(args, "flow_theta_pre_post_finetune_epochs", 10000))
+            _pre_synth = int(getattr(args, "flow_theta_pre_post_pretrain_synthetic_size", 0))
+            _pre_synth_online = bool(
+                getattr(args, "flow_theta_pre_post_pretrain_resample_synthetic_each_epoch", False)
             )
+            _pre_patience = getattr(args, "flow_theta_pre_post_pretrain_early_patience", None)
+            _pre_patience_eff = (
+                int(getattr(args, "flow_early_patience", 1000))
+                if _pre_patience is None
+                else int(_pre_patience)
+            )
+            _pre_synth_msg = (
+                (
+                    f"online synthetic pretrain pool per_epoch_total={_pre_synth} "
+                    "resampled each epoch and split by dataset train fraction"
+                )
+                if _pre_synth > 0 and _pre_synth_online
+                else f"fixed synthetic pretrain pool total={_pre_synth} split by dataset train fraction"
+                if _pre_synth > 0
+                else "legacy pretrain over the per-n post-training split with per-batch synthetic x resampling"
+            )
+            if _ft_ep < 1:
+                print(
+                    "[convergence] theta_flow_pre_post: pretrains the posterior theta-flow on binned Gaussian "
+                    "synthetic-pair regularization only; readout real-data fine-tuning is **skipped** "
+                    f"(fine_epochs=0; reg lambda={float(getattr(args, 'flow_theta_reg_lambda', 0.01)):.6g}; "
+                    f"bins={int(getattr(args, 'flow_theta_reg_bin_n_bins', 10))}; "
+                    f"pretrain_patience={_pre_patience_eff}; {_pre_synth_msg}).",
+                    flush=True,
+                )
+            else:
+                print(
+                    "[convergence] theta_flow_pre_post pretrains the posterior theta-flow on binned Gaussian "
+                    "synthetic-pair regularization only, then freezes all but the readout for real-data FM "
+                    f"fine-tuning (lambda={float(getattr(args, 'flow_theta_reg_lambda', 0.01)):.6g}; "
+                    f"bins={int(getattr(args, 'flow_theta_reg_bin_n_bins', 10))}; "
+                    f"fine_epochs={_ft_ep}; pretrain_patience={_pre_patience_eff}; {_pre_synth_msg}).",
+                    flush=True,
+                )
     elif tfm == "theta_path_integral":
         print(
             f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "

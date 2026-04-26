@@ -106,7 +106,53 @@ class TestHMatrixFlowLikelihood(unittest.TestCase):
         args = parser.parse_args(["--theta-field-method", "theta_flow_pre_post", "--flow-arch", "mlp"])
         validate_estimation_args(args)
         self.assertEqual(args.flow_theta_pre_post_finetune_epochs, 10000)
+        self.assertEqual(args.flow_theta_pre_post_pretrain_synthetic_size, 0)
+        self.assertFalse(args.flow_theta_pre_post_pretrain_resample_synthetic_each_epoch)
+        self.assertIsNone(args.flow_theta_pre_post_pretrain_early_patience)
         self.assertAlmostEqual(float(args.flow_theta_reg_lambda), 0.01)
+
+        args = parser.parse_args(
+            [
+                "--theta-field-method",
+                "theta_flow_pre_post",
+                "--flow-arch",
+                "mlp",
+                "--flow-theta-pre-post-pretrain-synthetic-size",
+                "20",
+                "--flow-theta-pre-post-pretrain-resample-synthetic-each-epoch",
+                "--flow-theta-pre-post-pretrain-early-patience",
+                "10",
+            ]
+        )
+        validate_estimation_args(args)
+        self.assertEqual(args.flow_theta_pre_post_pretrain_synthetic_size, 20)
+        self.assertTrue(args.flow_theta_pre_post_pretrain_resample_synthetic_each_epoch)
+        self.assertEqual(args.flow_theta_pre_post_pretrain_early_patience, 10)
+
+        args = parser.parse_args(
+            [
+                "--theta-field-method",
+                "theta_flow_pre_post",
+                "--flow-arch",
+                "mlp",
+                "--flow-theta-pre-post-pretrain-resample-synthetic-each-epoch",
+            ]
+        )
+        with self.assertRaises(ValueError):
+            validate_estimation_args(args)
+
+        args = parser.parse_args(
+            [
+                "--theta-field-method",
+                "theta_flow_pre_post",
+                "--flow-arch",
+                "mlp",
+                "--flow-theta-pre-post-pretrain-early-patience",
+                "0",
+            ]
+        )
+        with self.assertRaises(ValueError):
+            validate_estimation_args(args)
 
     def test_validate_rejects_bad_theta_flow_reg_parameters(self) -> None:
         parser = argparse.ArgumentParser()
@@ -282,6 +328,104 @@ class TestHMatrixFlowLikelihood(unittest.TestCase):
         self.assertTrue(any(changed))
         self.assertTrue(all(unchanged))
 
+    def test_train_conditional_theta_flow_pre_post_zero_finetune_skips_readout_phase(self) -> None:
+        torch.manual_seed(0)
+        n = 24
+        split = n // 2
+        theta = np.linspace(-1.0, 1.0, n, dtype=np.float64).reshape(-1, 1)
+        x = np.concatenate([np.cos(theta), np.sin(theta)], axis=1).astype(np.float64)
+        model = ConditionalThetaFlowVelocity(x_dim=2, hidden_dim=16, depth=1).to(torch.device("cpu"))
+        out = train_conditional_theta_flow_pre_post_model(
+            model=model,
+            theta_train=theta[:split],
+            x_train=x[:split],
+            pretrain_epochs=1,
+            finetune_epochs=0,
+            batch_size=8,
+            pretrain_lr=1e-3,
+            finetune_lr=1e-3,
+            device=torch.device("cpu"),
+            log_every=99,
+            scheduler_name="vp",
+            theta_val=theta[split:],
+            x_val=x[split:],
+            theta_prior_regularization_lambda=0.01,
+            theta_prior_regularization_bin_n_bins=4,
+        )
+        self.assertEqual(len(out["theta_pre_post_finetune_fm_train_losses"]), 0)
+        self.assertEqual(int(out["theta_pre_post_readout_trainable_params"]), 0)
+        self.assertEqual(float(out["best_val_loss"]), float(out["theta_pre_post_pretrain_best_val_loss"]))
+
+    def test_train_conditional_theta_flow_pre_post_synthetic_pretrain_records_sizes(self) -> None:
+        torch.manual_seed(0)
+        np.random.seed(0)
+        n = 30
+        split = 18
+        theta = np.linspace(-1.0, 1.0, n, dtype=np.float64).reshape(-1, 1)
+        x = np.concatenate([np.cos(theta), np.sin(theta)], axis=1).astype(np.float64)
+        model = ConditionalThetaFlowVelocity(x_dim=2, hidden_dim=16, depth=1).to(torch.device("cpu"))
+        out = train_conditional_theta_flow_pre_post_model(
+            model=model,
+            theta_train=theta[:split],
+            x_train=x[:split],
+            pretrain_epochs=1,
+            finetune_epochs=0,
+            batch_size=8,
+            pretrain_lr=1e-3,
+            finetune_lr=1e-3,
+            device=torch.device("cpu"),
+            log_every=99,
+            scheduler_name="vp",
+            theta_val=theta[split:],
+            x_val=x[split:],
+            theta_prior_regularization_lambda=0.01,
+            theta_prior_regularization_bin_n_bins=4,
+            pretrain_synthetic_size=20,
+            pretrain_early_stopping_patience=7,
+        )
+        self.assertEqual(int(out["theta_pre_post_pretrain_synthetic_size"]), 20)
+        self.assertEqual(int(out["theta_pre_post_pretrain_synthetic_train_size"]), 12)
+        self.assertEqual(int(out["theta_pre_post_pretrain_synthetic_val_size"]), 8)
+        self.assertFalse(bool(out["theta_pre_post_pretrain_resample_synthetic_each_epoch"]))
+        self.assertEqual(int(out["theta_pre_post_pretrain_early_stopping_patience"]), 7)
+        self.assertEqual(len(out["theta_pre_post_finetune_fm_train_losses"]), 0)
+
+    def test_train_conditional_theta_flow_pre_post_online_synthetic_records_mode(self) -> None:
+        torch.manual_seed(0)
+        np.random.seed(0)
+        n = 30
+        split = 18
+        theta = np.linspace(-1.0, 1.0, n, dtype=np.float64).reshape(-1, 1)
+        x = np.concatenate([np.cos(theta), np.sin(theta)], axis=1).astype(np.float64)
+        model = ConditionalThetaFlowVelocity(x_dim=2, hidden_dim=16, depth=1).to(torch.device("cpu"))
+        out = train_conditional_theta_flow_pre_post_model(
+            model=model,
+            theta_train=theta[:split],
+            x_train=x[:split],
+            pretrain_epochs=2,
+            finetune_epochs=0,
+            batch_size=8,
+            pretrain_lr=1e-3,
+            finetune_lr=1e-3,
+            device=torch.device("cpu"),
+            log_every=99,
+            scheduler_name="vp",
+            theta_val=theta[split:],
+            x_val=x[split:],
+            theta_prior_regularization_lambda=0.01,
+            theta_prior_regularization_bin_n_bins=4,
+            pretrain_synthetic_size=20,
+            pretrain_resample_synthetic_each_epoch=True,
+            pretrain_early_stopping_patience=7,
+        )
+        self.assertEqual(int(out["theta_pre_post_pretrain_synthetic_size"]), 20)
+        self.assertEqual(int(out["theta_pre_post_pretrain_synthetic_train_size"]), 12)
+        self.assertEqual(int(out["theta_pre_post_pretrain_synthetic_val_size"]), 8)
+        self.assertTrue(bool(out["theta_pre_post_pretrain_resample_synthetic_each_epoch"]))
+        self.assertEqual(len(out["theta_pre_post_pretrain_train_losses"]), 2)
+        self.assertEqual(len(out["theta_pre_post_pretrain_val_losses"]), 2)
+        self.assertEqual(len(out["theta_pre_post_finetune_fm_train_losses"]), 0)
+
     def test_shared_estimation_theta_flow_reg_runs_and_records_metadata(self) -> None:
         parser = argparse.ArgumentParser()
         add_estimation_arguments(parser)
@@ -363,6 +507,9 @@ class TestHMatrixFlowLikelihood(unittest.TestCase):
         args.flow_epochs = 1
         args.flow_theta_pre_post_pretrain_epochs = 1
         args.flow_theta_pre_post_finetune_epochs = 1
+        args.flow_theta_pre_post_pretrain_synthetic_size = 20
+        args.flow_theta_pre_post_pretrain_resample_synthetic_each_epoch = True
+        args.flow_theta_pre_post_pretrain_early_patience = 9
         args.prior_epochs = 1
         args.flow_batch_size = 8
         args.prior_batch_size = 8
@@ -401,6 +548,11 @@ class TestHMatrixFlowLikelihood(unittest.TestCase):
             self.assertEqual(str(z["theta_field_method"].reshape(-1)[0]), "theta_flow_pre_post")
             self.assertEqual(tuple(z["theta_pre_post_pretrain_reg_train_losses"].shape), (1,))
             self.assertEqual(tuple(z["theta_pre_post_finetune_fm_train_losses"].shape), (1,))
+            self.assertEqual(int(z["theta_pre_post_pretrain_synthetic_size"]), 20)
+            self.assertEqual(int(z["theta_pre_post_pretrain_synthetic_train_size"]), 10)
+            self.assertEqual(int(z["theta_pre_post_pretrain_synthetic_val_size"]), 10)
+            self.assertTrue(bool(z["theta_pre_post_pretrain_resample_synthetic_each_epoch"]))
+            self.assertEqual(int(z["theta_pre_post_pretrain_early_stopping_patience"]), 9)
             self.assertGreater(int(z["theta_pre_post_readout_trainable_params"]), 0)
 
 
