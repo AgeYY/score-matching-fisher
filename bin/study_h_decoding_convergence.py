@@ -1011,6 +1011,48 @@ def _stable_softmax_log(logp: np.ndarray) -> np.ndarray:
     return e / s
 
 
+def _npz_row_or_vector(
+    z: Any | None,
+    key: str,
+    *,
+    row: int,
+    n: int,
+) -> np.ndarray | None:
+    if z is None or key not in getattr(z, "files", ()):
+        return None
+    arr = np.asarray(z[key], dtype=np.float64)
+    if arr.ndim == 2 and arr.shape[0] > int(row) and arr.shape[1] == int(n):
+        return np.asarray(arr[int(row), :], dtype=np.float64).reshape(-1)
+    if arr.ndim == 1 and arr.size == int(n):
+        return np.asarray(arr, dtype=np.float64).reshape(-1)
+    return None
+
+
+def _model_posterior_log_weights_for_fixed_x(
+    *,
+    hfm: str,
+    c_row: np.ndarray,
+    h_npz: Any | None,
+    row: int,
+) -> tuple[np.ndarray, str]:
+    c = np.asarray(c_row, dtype=np.float64).reshape(-1)
+    method = str(hfm).strip().lower()
+    if method == "theta_flow":
+        log_post = _npz_row_or_vector(h_npz, "theta_flow_log_post_matrix", row=int(row), n=c.size)
+        if log_post is not None:
+            return log_post, "learned posterior log-density"
+        log_prior = _npz_row_or_vector(h_npz, "theta_flow_log_prior_matrix", row=int(row), n=c.size)
+        if log_prior is not None:
+            return c + log_prior, "ratio + learned prior log-density"
+        print(
+            "[convergence] fixed-x diagnostic: theta_flow artifact lacks learned posterior/prior "
+            "log-density fields; using ratio row as a uniform-prior fallback.",
+            flush=True,
+        )
+        return c, "ratio-only fallback"
+    return c, "posterior log-density" if method == "nf" else "matrix row"
+
+
 def _normalize_density_trapz(theta_grid: np.ndarray, density: np.ndarray) -> np.ndarray:
     t = np.asarray(theta_grid, dtype=np.float64).reshape(-1)
     q = np.asarray(density, dtype=np.float64).reshape(-1)
@@ -1113,14 +1155,15 @@ def _plot_fixed_x_column(
     dataset: Any,
     lo: float,
     hi: float,
+    h_npz: Any | None = None,
 ) -> None:
     c_row = np.asarray(c[int(i_fix), :], dtype=np.float64).reshape(-1)
-    if hfm == "theta_flow":
-        logp = c_row + _log_std_normal_scalar(th_flat)
-    elif hfm == "nf":
-        logp = c_row
-    else:
-        logp = c_row
+    logp, logp_source = _model_posterior_log_weights_for_fixed_x(
+        hfm=hfm,
+        c_row=c_row,
+        h_npz=h_npz,
+        row=int(i_fix),
+    )
     w = _stable_softmax_log(logp)
     order = np.argsort(th_flat, kind="mergesort")
     th_s = th_flat[order]
@@ -1142,7 +1185,7 @@ def _plot_fixed_x_column(
 
     ax_top.fill_between(th_s, 0.0, w_s, color="#1f77b4", alpha=0.22, step="mid")
     ax_top.plot(th_s, w_s, "o", color="#1f77b4", ms=2, alpha=0.55, label="Posterior mass on θ samples")
-    ax_top.plot(th_grid, q_model, color="#1f77b4", lw=1.6, label="Model posterior (approx)")
+    ax_top.plot(th_grid, q_model, color="#1f77b4", lw=1.6, label=f"Model posterior (approx; {logp_source})")
     ax_top.plot(th_grid, q_gt, color="#d62728", lw=1.5, ls="--", label="GT posterior (approx)")
     ax_top.set_ylabel("density")
     ax_top.set_title(
@@ -1292,7 +1335,12 @@ def _write_fixed_x_posterior_diagnostic(
         fig, axes = plt.subplots(1, 2, figsize=(12.0, 3.2), dpi=120, sharey=True, layout="tight")
         for ax, i_fix in zip(np.asarray(axes).reshape(-1), (i_fix_a, i_fix_b)):
             c_row = np.asarray(c[int(i_fix), :], dtype=np.float64).reshape(-1)
-            logp = c_row + _log_std_normal_scalar(th_flat) if hfm == "theta_flow" else c_row
+            logp, logp_source = _model_posterior_log_weights_for_fixed_x(
+                hfm=hfm,
+                c_row=c_row,
+                h_npz=z,
+                row=int(i_fix),
+            )
             w = _stable_softmax_log(logp)
             order = np.argsort(th_flat, kind="mergesort")
             th_s = th_flat[order]
@@ -1303,7 +1351,15 @@ def _write_fixed_x_posterior_diagnostic(
             j_map = int(np.argmax(w))
             theta_map = float(th_flat[j_map])
             ax.fill_between(th_s, 0.0, w_s, color="#1f77b4", alpha=0.35, step="mid")
-            ax.plot(th_s, w_s, "o-", color="#1f77b4", ms=2, lw=0.8, label="softmax C row (weights on θ grid)")
+            ax.plot(
+                th_s,
+                w_s,
+                "o-",
+                color="#1f77b4",
+                ms=2,
+                lw=0.8,
+                label=f"softmax weights ({logp_source})",
+            )
             ax.set_ylabel("mass")
             ax.set_xlabel(r"$\theta$")
             ax.set_title(
@@ -1340,6 +1396,7 @@ def _write_fixed_x_posterior_diagnostic(
         dataset=dataset,
         lo=lo,
         hi=hi,
+        h_npz=z,
     )
     _plot_fixed_x_column(
         ax_top=ax01,
@@ -1354,6 +1411,7 @@ def _write_fixed_x_posterior_diagnostic(
         dataset=dataset,
         lo=lo,
         hi=hi,
+        h_npz=z,
     )
 
     _save_figure_png_svg(fig, out_png, dpi=120)

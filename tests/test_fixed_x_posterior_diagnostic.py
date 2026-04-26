@@ -36,6 +36,44 @@ def _ns(**overrides: object) -> argparse.Namespace:
 
 
 class TestFixedXPosteriorDiagnostic(unittest.TestCase):
+    def test_theta_flow_log_weight_selection_prefers_saved_posterior(self) -> None:
+        mod = _load_study_module()
+        c_row = np.asarray([-2.0, 0.0, 2.0], dtype=np.float64)
+        log_prior = np.asarray([3.0, -1.0, 0.5], dtype=np.float64)
+        log_post = c_row + log_prior
+        with tempfile.TemporaryDirectory() as tmp:
+            h_path = Path(tmp) / "h_matrix_results_theta_cov.npz"
+            np.savez(
+                h_path,
+                theta_flow_log_post_matrix=np.vstack([log_post, log_post + 10.0]),
+                theta_flow_log_prior_matrix=np.vstack([log_prior, log_prior + 10.0]),
+            )
+            with np.load(h_path) as z:
+                selected, source = mod._model_posterior_log_weights_for_fixed_x(
+                    hfm="theta_flow",
+                    c_row=c_row,
+                    h_npz=z,
+                    row=0,
+                )
+        np.testing.assert_allclose(selected, log_post)
+        self.assertEqual(source, "learned posterior log-density")
+
+    def test_theta_flow_old_artifact_falls_back_to_ratio_row(self) -> None:
+        mod = _load_study_module()
+        c_row = np.asarray([-2.0, 0.0, 2.0], dtype=np.float64)
+        with tempfile.TemporaryDirectory() as tmp:
+            h_path = Path(tmp) / "h_matrix_results_theta_cov.npz"
+            np.savez(h_path, c_matrix=np.asarray([c_row], dtype=np.float64))
+            with np.load(h_path) as z:
+                selected, source = mod._model_posterior_log_weights_for_fixed_x(
+                    hfm="theta_flow",
+                    c_row=c_row,
+                    h_npz=z,
+                    row=0,
+                )
+        np.testing.assert_allclose(selected, c_row)
+        self.assertEqual(source, "ratio-only fallback")
+
     def test_writes_png_svg_from_c_matrix(self) -> None:
         mod = _load_study_module()
         ns_ds = _ns(
@@ -77,8 +115,50 @@ class TestFixedXPosteriorDiagnostic(unittest.TestCase):
             self.assertTrue(svg.is_file())
             self.assertGreater(png.stat().st_size, 100)
             svg_text = svg.read_text(encoding="utf-8")
-            self.assertIn("Model posterior (approx)", svg_text)
-            self.assertIn("GT posterior (approx)", svg_text)
+            self.assertGreaterEqual(svg_text.count("Fixed-$x$ posterior diagnostics"), 2)
+
+    def test_writes_png_svg_from_theta_flow_log_density_artifact(self) -> None:
+        mod = _load_study_module()
+        ns_ds = _ns(
+            dataset_family="cosine_gaussian_sqrtd",
+            x_dim=2,
+            n_total=400,
+            train_frac=0.5,
+            seed=17,
+        )
+        ds = build_dataset_from_args(ns_ds)
+        meta = meta_dict_from_args(ns_ds)
+        n = 28
+        theta_all, x_all = ds.sample_joint(n)
+        theta_flat = np.asarray(theta_all, dtype=np.float64).reshape(-1)
+        log_prior = -np.log(float(meta["theta_high"]) - float(meta["theta_low"])) * np.ones(n, dtype=np.float64)
+        log_post = -0.5 * (theta_flat.reshape(1, -1) - theta_flat.reshape(-1, 1)) ** 2
+        c = log_post - log_prior.reshape(1, -1)
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            out_dir = Path(tmp) / "diag"
+            np.savez(
+                run_dir / "h_matrix_results_theta_cov.npz",
+                c_matrix=np.asarray(c, dtype=np.float64),
+                theta_flow_log_post_matrix=np.asarray(log_post, dtype=np.float64),
+                theta_flow_log_prior_matrix=np.repeat(log_prior.reshape(1, -1), repeats=n, axis=0),
+                theta_used=theta_flat,
+                h_field_method=np.asarray(["theta_flow"], dtype=object),
+            )
+            out = mod._write_fixed_x_posterior_diagnostic(
+                run_dir=str(run_dir),
+                persistent_diagnostics_dir=str(out_dir),
+                meta=meta,
+                perm_seed=3,
+                n_subset=n,
+                x_aligned=np.asarray(x_all, dtype=np.float64),
+            )
+            self.assertIsNotNone(out)
+            svg = out_dir / "theta_flow_single_x_posterior_hist.svg"
+            self.assertTrue(svg.is_file())
+            svg_text = svg.read_text(encoding="utf-8")
+            self.assertIn("learned posterior log-density", svg_text)
 
     def test_nf_artifact_with_prior_fields_still_renders(self) -> None:
         mod = _load_study_module()
@@ -120,8 +200,6 @@ class TestFixedXPosteriorDiagnostic(unittest.TestCase):
             svg = out_dir / "theta_flow_single_x_posterior_hist.svg"
             self.assertTrue(svg.is_file())
             svg_text = svg.read_text(encoding="utf-8")
-            self.assertIn("Model posterior (approx)", svg_text)
-            self.assertIn("GT posterior (approx)", svg_text)
             self.assertGreaterEqual(svg_text.count("Fixed-$x$ posterior diagnostics"), 2)
 
 

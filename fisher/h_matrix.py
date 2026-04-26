@@ -50,6 +50,8 @@ class HMatrixResult:
     h_sym_max_asym_abs: float
     flow_scheduler: str | None
     flow_score_mode: str | None
+    theta_flow_log_post_matrix: np.ndarray | None
+    theta_flow_log_prior_matrix: np.ndarray | None
 
 
 def _make_flow_matching_path(scheduler_name: str) -> Any:
@@ -185,6 +187,8 @@ class HMatrixEstimator:
         self._flow_likelihood_solver_post = None
         self._flow_likelihood_solver_prior = None
         self._flow_x_likelihood_solver = None
+        self._theta_flow_log_post_matrix: np.ndarray | None = None
+        self._theta_flow_log_prior_matrix: np.ndarray | None = None
         if self.field_method == "theta_flow":
             self._flow_likelihood_solver_post = _make_flow_ode_solver(self._post_velocity_for_likelihood)
             self._flow_likelihood_solver_prior = _make_flow_ode_solver(self._prior_velocity_for_likelihood)
@@ -358,6 +362,8 @@ class HMatrixEstimator:
         row_block = max(1, int(self.pair_batch_size // n))
         theta_grid_col = np.asarray(theta_grid_col, dtype=np.float32)
         r = np.zeros((n, n), dtype=np.float64)
+        log_post_matrix = np.zeros((n, n), dtype=np.float64)
+        log_prior_matrix = np.zeros((n, n), dtype=np.float64)
         self.model_post.eval()
         if self.model_prior is not None:
             self.model_prior.eval()
@@ -391,7 +397,13 @@ class HMatrixEstimator:
                 exact_divergence=False,
                 enable_grad=False,
             )
-            r[i0:i1, :] = (log_post.reshape(b, n) - log_prior.reshape(b, n)).detach().cpu().numpy().astype(np.float64)
+            log_post_block = log_post.reshape(b, n).detach().cpu().numpy().astype(np.float64)
+            log_prior_block = log_prior.reshape(b, n).detach().cpu().numpy().astype(np.float64)
+            log_post_matrix[i0:i1, :] = log_post_block
+            log_prior_matrix[i0:i1, :] = log_prior_block
+            r[i0:i1, :] = log_post_block - log_prior_block
+        self._theta_flow_log_post_matrix = log_post_matrix
+        self._theta_flow_log_prior_matrix = log_prior_matrix
         return r
 
     def compute_x_conditional_loglik_matrix(self, theta_sorted: np.ndarray, x_sorted: np.ndarray) -> np.ndarray:
@@ -515,18 +527,26 @@ class HMatrixEstimator:
             c_sorted = self.compute_log_ratio_matrix(theta_sorted, x_sorted)
             delta_sorted = self.compute_delta_l(c_sorted)
             g_sorted = np.zeros_like(c_sorted, dtype=np.float64)
+            theta_flow_log_post_sorted = self._theta_flow_log_post_matrix
+            theta_flow_log_prior_sorted = self._theta_flow_log_prior_matrix
         elif self.field_method == "flow_x_likelihood":
             c_sorted = self.compute_x_conditional_loglik_matrix(theta_sorted, x_sorted)
             delta_sorted = self.compute_delta_l(c_sorted)
             g_sorted = np.zeros_like(c_sorted, dtype=np.float64)
+            theta_flow_log_post_sorted = None
+            theta_flow_log_prior_sorted = None
         elif self.field_method == "ctsm_v":
             delta_sorted = self.compute_ctsm_delta_l_matrix(theta_sorted, x_sorted)
             c_sorted = np.asarray(delta_sorted, dtype=np.float64)
             g_sorted = np.zeros_like(c_sorted, dtype=np.float64)
+            theta_flow_log_post_sorted = None
+            theta_flow_log_prior_sorted = None
         else:
             g_sorted = self.compute_g_matrix(theta_sorted, x_sorted)
             c_sorted = self.compute_c_matrix(theta_sorted, g_sorted)
             delta_sorted = self.compute_delta_l(c_sorted)
+            theta_flow_log_post_sorted = None
+            theta_flow_log_prior_sorted = None
         h_dir_sorted = self.compute_h_directed(delta_sorted)
         h_sym_sorted = self.symmetrize(h_dir_sorted)
 
@@ -540,6 +560,16 @@ class HMatrixEstimator:
             delta_used = self._permute_back(delta_sorted, inv_perm)
             h_dir_used = self._permute_back(h_dir_sorted, inv_perm)
             h_sym_used = self._permute_back(h_sym_sorted, inv_perm)
+            theta_flow_log_post_used = (
+                self._permute_back(theta_flow_log_post_sorted, inv_perm)
+                if theta_flow_log_post_sorted is not None
+                else None
+            )
+            theta_flow_log_prior_used = (
+                self._permute_back(theta_flow_log_prior_sorted, inv_perm)
+                if theta_flow_log_prior_sorted is not None
+                else None
+            )
             order_mode = "original"
         else:
             theta_used = theta_sorted.reshape(-1) if theta_sorted.shape[1] == 1 else theta_sorted.copy()
@@ -548,6 +578,8 @@ class HMatrixEstimator:
             delta_used = delta_sorted
             h_dir_used = h_dir_sorted
             h_sym_used = h_sym_sorted
+            theta_flow_log_post_used = theta_flow_log_post_sorted
+            theta_flow_log_prior_used = theta_flow_log_prior_sorted
             order_mode = "sorted"
 
         return HMatrixResult(
@@ -596,4 +628,6 @@ class HMatrixEstimator:
                     )
                 )
             ),
+            theta_flow_log_post_matrix=theta_flow_log_post_used,
+            theta_flow_log_prior_matrix=theta_flow_log_prior_used,
         )

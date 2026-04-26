@@ -324,6 +324,10 @@ def _save_h_matrix_dsm_artifacts(
         h_payload["g_matrix"] = h_result.g_matrix
         h_payload["c_matrix"] = h_result.c_matrix
         h_payload["delta_l_matrix"] = h_result.delta_l_matrix
+        if h_result.theta_flow_log_post_matrix is not None:
+            h_payload["theta_flow_log_post_matrix"] = h_result.theta_flow_log_post_matrix
+        if h_result.theta_flow_log_prior_matrix is not None:
+            h_payload["theta_flow_log_prior_matrix"] = h_result.theta_flow_log_prior_matrix
     np.savez(h_npz_path, **h_payload)
 
     h_summary_path = os.path.join(args.output_dir, f"h_matrix_summary{suffix}.txt")
