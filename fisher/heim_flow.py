@@ -329,6 +329,77 @@ def initialize_h2_euclidean(
     return _sanitize_h2_matrix(out, clip_low=0.0, clip_high=1.0)
 
 
+def initialize_mean_mahalanobis_distance(
+    *,
+    x_all: np.ndarray,
+    bin_all: np.ndarray,
+    n_bins: int,
+    min_bin_count: int,
+) -> np.ndarray:
+    """Unbounded shared-covariance Mahalanobis distance between per-bin observation means.
+
+    For bins i, j with means ``mu_i``, ``mu_j`` and shared Ledoit--Wolf precision on pooled
+    within-bin residuals, returns
+
+        D_ij = sqrt((mu_i - mu_j)^T Sigma^{-1} (mu_i - mu_j))
+
+    on the diagonal 0, with NaN where a bin has too few points or a pair is ill-defined.
+    This matrix is used directly for the first metric MDS fit (not mapped through bounded H^2).
+    """
+    x = np.asarray(x_all, dtype=np.float64)
+    bi = np.asarray(bin_all, dtype=np.int64).reshape(-1)
+    nb = int(n_bins)
+    min_count = int(min_bin_count)
+    if x.ndim != 2:
+        raise ValueError("x_all must be 2D.")
+    if x.shape[0] != bi.shape[0]:
+        raise ValueError("x_all and bin_all rows must match.")
+    if nb < 1:
+        raise ValueError("n_bins must be >= 1.")
+    if min_count < 1:
+        raise ValueError("min_bin_count must be >= 1.")
+
+    means = np.full((nb, x.shape[1]), np.nan, dtype=np.float64)
+    valid = np.zeros(nb, dtype=bool)
+    residuals: list[np.ndarray] = []
+    for b in range(nb):
+        idx = np.flatnonzero(bi == b)
+        if int(idx.size) < min_count:
+            continue
+        xb = np.asarray(x[idx], dtype=np.float64)
+        mu = np.mean(xb, axis=0)
+        means[b, :] = mu
+        valid[b] = True
+        residuals.append(xb - mu)
+
+    out = np.full((nb, nb), np.nan, dtype=np.float64)
+    np.fill_diagonal(out, 0.0)
+    if int(np.sum(valid)) < 2 or not residuals:
+        return out
+    resid = np.vstack(residuals)
+    if resid.shape[0] < 2:
+        return out
+    try:
+        lw = LedoitWolf().fit(resid)
+        precision = np.asarray(lw.precision_, dtype=np.float64)
+    except Exception:
+        return out
+    for i in range(nb):
+        if not valid[i]:
+            continue
+        for j in range(i + 1, nb):
+            if not valid[j]:
+                continue
+            diff = means[i] - means[j]
+            maha2 = float(diff @ precision @ diff)
+            if not np.isfinite(maha2) or maha2 < 0.0:
+                continue
+            dist = float(np.sqrt(max(0.0, maha2)))
+            out[i, j] = dist
+            out[j, i] = dist
+    return out
+
+
 def run_heim_flow(
     *,
     x_all: np.ndarray,
@@ -349,19 +420,34 @@ def run_heim_flow(
     if int(cfg.n_bins) < 1:
         raise ValueError("cfg.n_bins must be >= 1.")
     mode = str(cfg.init_mode).strip().lower()
-    if mode not in ("euclidean", "classifier"):
-        raise ValueError("cfg.init_mode must be one of {'euclidean','classifier'}.")
+    if mode not in ("euclidean", "classifier", "mean_mahalanobis"):
+        raise ValueError("cfg.init_mode must be one of {'euclidean','classifier','mean_mahalanobis'}.")
     distance_transform = str(cfg.distance_transform).strip().lower()
     if distance_transform not in ("hellinger", "bhattacharyya"):
         raise ValueError("cfg.distance_transform must be one of {'hellinger','bhattacharyya'}.")
 
-    if mode == "euclidean":
+    if mode == "mean_mahalanobis":
+        d_k = initialize_mean_mahalanobis_distance(
+            x_all=x_all,
+            bin_all=bin_all,
+            n_bins=int(cfg.n_bins),
+            min_bin_count=int(cfg.min_bin_count),
+        )
+        d_k = np.asarray(d_k, dtype=np.float64)
+        h2_k = np.full_like(d_k, np.nan, dtype=np.float64)
+        fin = np.isfinite(d_k) & (d_k >= 0.0)
+        h2_k[fin] = 1.0 - np.exp(-0.125 * (d_k[fin] ** 2))
+        np.fill_diagonal(h2_k, 0.0)
+        h2_k = _sanitize_h2_matrix(h2_k, clip_low=float(cfg.clip_low), clip_high=float(cfg.clip_high))
+    elif mode == "euclidean":
         h2_k = initialize_h2_euclidean(
             x_all=x_all,
             bin_all=bin_all,
             n_bins=int(cfg.n_bins),
             min_bin_count=int(cfg.min_bin_count),
         )
+        h2_k = _sanitize_h2_matrix(h2_k, clip_low=float(cfg.clip_low), clip_high=float(cfg.clip_high))
+        d_k = _distance_from_h2(h2_k, transform=distance_transform)
     else:
         h2_k = initialize_h2_classifier(
             x_train=x_train,
@@ -372,8 +458,8 @@ def run_heim_flow(
             min_class_count=int(cfg.min_class_count),
             random_state=int(cfg.clf_random_state),
         )
-    h2_k = _sanitize_h2_matrix(h2_k, clip_low=float(cfg.clip_low), clip_high=float(cfg.clip_high))
-    d_k = _distance_from_h2(h2_k, transform=distance_transform)
+        h2_k = _sanitize_h2_matrix(h2_k, clip_low=float(cfg.clip_low), clip_high=float(cfg.clip_high))
+        d_k = _distance_from_h2(h2_k, transform=distance_transform)
 
     history_h2: list[np.ndarray] = [np.asarray(h2_k, dtype=np.float64)]
     history_d: list[np.ndarray] = [np.asarray(d_k, dtype=np.float64)]

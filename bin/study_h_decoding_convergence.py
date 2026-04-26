@@ -470,8 +470,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--heim-flow-init-mode",
         type=str,
         default="euclidean",
-        choices=["euclidean", "classifier"],
-        help="HeIM-Flow D^(0) initializer (default: euclidean).",
+        choices=["euclidean", "classifier", "mean_mahalanobis"],
+        help=(
+            "HeIM-Flow D^(0) initializer (default: euclidean). "
+            "mean_mahalanobis uses unbounded shared-covariance Mahalanobis mean distances for the first MDS."
+        ),
     )
     p.add_argument(
         "--heim-flow-convergence-tol",
@@ -780,6 +783,12 @@ def _validate_cli(args: argparse.Namespace) -> None:
         dist_transform = str(getattr(args, "heim_flow_distance_transform", "hellinger")).strip().lower()
         if dist_transform not in ("hellinger", "bhattacharyya"):
             raise ValueError("--heim-flow-distance-transform must be one of {hellinger, bhattacharyya}.")
+        heim_init = str(getattr(args, "heim_flow_init_mode", "euclidean")).strip().lower()
+        if heim_init not in ("euclidean", "classifier", "mean_mahalanobis"):
+            raise ValueError(
+                "--heim-flow-init-mode must be one of {euclidean, classifier, mean_mahalanobis} "
+                f"(got {getattr(args, 'heim_flow_init_mode', None)!r})."
+            )
         tol = float(getattr(args, "heim_flow_convergence_tol", 0.0))
         if not np.isfinite(tol):
             raise ValueError("--heim-flow-convergence-tol must be finite.")

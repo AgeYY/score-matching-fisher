@@ -13,6 +13,7 @@ from fisher.heim_flow import (
     HeimIterationOutput,
     initialize_h2_classifier,
     initialize_h2_euclidean,
+    initialize_mean_mahalanobis_distance,
     run_heim_flow,
 )
 
@@ -57,6 +58,123 @@ class TestHeimFlow(unittest.TestCase):
             self.assertTrue(np.allclose(np.diag(h2), 0.0))
             finite = np.isfinite(h2)
             self.assertTrue(np.all((h2[finite] >= 0.0) & (h2[finite] <= 1.0)))
+
+    def test_initialize_mean_mahalanobis_distance(self) -> None:
+        """Well-separated bin means => unbounded Mahalanobis distance can exceed 1 off-diagonal."""
+        rng = np.random.default_rng(4)
+        n_bins = 4
+        n_per_bin = 25
+        x_dim = 2
+        centers = np.asarray(
+            [[0.0, 0.0], [3.0, 0.0], [6.0, 0.0], [20.0, 0.0]], dtype=np.float64
+        )
+        x_parts = []
+        b_parts = []
+        for b in range(n_bins):
+            x_b = rng.normal(loc=centers[b], scale=0.1, size=(n_per_bin, x_dim))
+            x_parts.append(x_b)
+            b_parts.append(np.full(n_per_bin, b, dtype=np.int64))
+        x_all = np.vstack(x_parts)
+        bin_all = np.concatenate(b_parts)
+        d = initialize_mean_mahalanobis_distance(
+            x_all=x_all,
+            bin_all=bin_all,
+            n_bins=n_bins,
+            min_bin_count=5,
+        )
+        self.assertEqual(d.shape, (n_bins, n_bins))
+        self.assertTrue(np.allclose(d, d.T, equal_nan=True))
+        self.assertTrue(np.allclose(np.diag(d), 0.0))
+        fin = np.isfinite(d) & (np.arange(n_bins)[:, None] != np.arange(n_bins))
+        self.assertTrue(np.all(d[fin] >= 0.0))
+        self.assertTrue(np.all(np.isfinite(d[fin])))
+        # Furthest means should yield distance > 1
+        self.assertGreater(float(d[0, 3]), 1.0)
+
+    def test_run_heim_flow_mean_mahalanobis_passes_raw_distance_to_metric_mds(self) -> None:
+        """First metric MDS dissimilarity must be the unbounded init matrix, not H^2-derived distance."""
+        rng = np.random.default_rng(31)
+        n_bins = 3
+        n_per_bin = 15
+        x_dim = 2
+        x_parts = []
+        b_parts = []
+        for b in range(n_bins):
+            mu = np.array([4.0 * b, 0.0], dtype=np.float64)
+            x_b = rng.normal(loc=mu, scale=0.1, size=(n_per_bin, x_dim))
+            x_parts.append(x_b)
+            b_parts.append(np.full(n_per_bin, b, dtype=np.int64))
+        x_all = np.vstack(x_parts)
+        bin_all = np.concatenate(b_parts)
+        n_train = int(0.6 * x_all.shape[0])
+        x_train = np.asarray(x_all[:n_train], dtype=np.float64)
+        x_val = np.asarray(x_all[n_train:], dtype=np.float64)
+        bin_train = np.asarray(bin_all[:n_train], dtype=np.int64)
+        bin_val = np.asarray(bin_all[n_train:], dtype=np.int64)
+
+        expected_d = initialize_mean_mahalanobis_distance(
+            x_all=x_all,
+            bin_all=bin_all,
+            n_bins=n_bins,
+            min_bin_count=4,
+        )
+
+        seen_metric: list[np.ndarray] = []
+
+        def _zero_classical_seed(distance: np.ndarray, *, n_components: int) -> np.ndarray:
+            n = int(np.asarray(distance).shape[0])
+            return np.zeros((n, int(n_components)), dtype=np.float64)
+
+        def _fake_metric_mds(
+            distance: np.ndarray, *, n_components: int, init_embedding: np.ndarray | None = None
+        ) -> np.ndarray:
+            seen_metric.append(np.asarray(distance, dtype=np.float64))
+            n = int(np.asarray(distance).shape[0])
+            return np.zeros((n, int(n_components)), dtype=np.float64)
+
+        h2_init = np.asarray(
+            [
+                [0.0, 0.1, 0.2],
+                [0.1, 0.0, 0.15],
+                [0.2, 0.15, 0.0],
+            ],
+            dtype=np.float64,
+        )
+
+        def _fake_estimate(_payload: HeimIterationInput) -> HeimIterationOutput:
+            return HeimIterationOutput(
+                h2_binned=np.asarray(h2_init, dtype=np.float64), delta_l_matrix=None, h_sym_matrix=None, metadata={}
+            )
+
+        cfg = HeimFlowConfig(
+            n_bins=n_bins,
+            n_iters=1,
+            mds_dim=2,
+            init_mode="mean_mahalanobis",
+            distance_transform="hellinger",
+            min_bin_count=4,
+            min_class_count=4,
+            convergence_tol=0.0,
+        )
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(
+            heim_flow_mod, "_mds_embedding_from_distance", side_effect=_zero_classical_seed
+        ), mock.patch.object(heim_flow_mod, "_metric_mds_embedding_from_distance", side_effect=_fake_metric_mds):
+            out = run_heim_flow(
+                x_all=x_all,
+                x_train=x_train,
+                x_validation=x_val,
+                bin_all=bin_all,
+                bin_train=bin_train,
+                bin_validation=bin_val,
+                output_root=td,
+                cfg=cfg,
+                estimate_callback=_fake_estimate,
+            )
+
+        self.assertGreaterEqual(len(seen_metric), 1)
+        np.testing.assert_allclose(seen_metric[0], expected_d, rtol=0.0, atol=1e-10, equal_nan=True)
+        # history_d[0] is the same raw init matrix used for MDS
+        np.testing.assert_allclose(out.history_d[0], expected_d, rtol=0.0, atol=1e-10, equal_nan=True)
 
     def test_run_heim_flow_updates_h2_and_returns_history(self) -> None:
         rng = np.random.default_rng(7)
