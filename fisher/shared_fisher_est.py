@@ -108,6 +108,7 @@ def effective_flow_theta_fourier_omega_prior(args: Any) -> tuple[float, str]:
 from fisher.trainers import (
     geometric_sigma_schedule,
     train_conditional_theta_flow_model,
+    train_conditional_theta_flow_pre_post_model,
     train_conditional_x_flow_model,
     train_local_decoder,
     train_prior_theta_flow_model,
@@ -126,7 +127,15 @@ def require_device(name: str) -> torch.device:
 
 def normalize_theta_field_method(method: str) -> str:
     m = str(method).strip().lower()
-    if m in ("theta_flow", "theta_path_integral", "x_flow", "x_flow_reg", "ctsm_v"):
+    if m in (
+        "theta_flow",
+        "theta_flow_reg",
+        "theta_flow_pre_post",
+        "theta_path_integral",
+        "x_flow",
+        "x_flow_reg",
+        "ctsm_v",
+    ):
         return m
     legacy_names = (
         "flow",
@@ -137,12 +146,14 @@ def normalize_theta_field_method(method: str) -> str:
     if m in legacy_names:
         raise ValueError(
             "Legacy --theta-field-method is removed. Use one of "
-            "{'theta_flow', 'theta_path_integral', 'x_flow', 'x_flow_reg', 'ctsm_v'}. "
+            "{'theta_flow', 'theta_flow_reg', 'theta_flow_pre_post', 'theta_path_integral', "
+            "'x_flow', 'x_flow_reg', 'ctsm_v'}. "
             "theta_flow = theta-space flow ODE log-likelihood Bayes ratios; "
             "theta_path_integral = velocity-to-score plus trapezoid integral along sorted theta."
         )
     raise ValueError(
-        "--theta-field-method must be one of {'theta_flow','theta_path_integral','x_flow','x_flow_reg','ctsm_v'}."
+        "--theta-field-method must be one of {'theta_flow','theta_flow_reg','theta_flow_pre_post',"
+        "'theta_path_integral','x_flow','x_flow_reg','ctsm_v'}."
     )
 
 
@@ -324,6 +335,8 @@ def _save_h_matrix_dsm_artifacts(
         h_payload["g_matrix"] = h_result.g_matrix
         h_payload["c_matrix"] = h_result.c_matrix
         h_payload["delta_l_matrix"] = h_result.delta_l_matrix
+        if h_result.log_p_theta_prior is not None:
+            h_payload["log_p_theta_prior"] = np.asarray(h_result.log_p_theta_prior, dtype=np.float64)
     np.savez(h_npz_path, **h_payload)
 
     h_summary_path = os.path.join(args.output_dir, f"h_matrix_summary{suffix}.txt")
@@ -1077,6 +1090,55 @@ def validate_estimation_args(args: Any) -> None:
         raise ValueError("--flow-endpoint-loss-weight must be non-negative.")
     if int(getattr(args, "flow_endpoint_steps", 20)) < 1:
         raise ValueError("--flow-endpoint-steps must be >= 1.")
+    if _tfm_val in ("theta_flow_reg", "theta_flow_pre_post") and float(getattr(args, "flow_endpoint_loss_weight", 0.0)) > 0.0:
+        raise ValueError(
+            "--flow-endpoint-loss-weight is not supported with --theta-field-method "
+            "theta_flow_reg or theta_flow_pre_post."
+        )
+    if float(getattr(args, "flow_theta_reg_lambda", 0.01)) < 0.0:
+        raise ValueError("--flow-theta-reg-lambda must be non-negative.")
+    if _tfm_val == "theta_flow_pre_post" and float(getattr(args, "flow_theta_reg_lambda", 0.01)) <= 0.0:
+        raise ValueError("--flow-theta-reg-lambda must be positive with --theta-field-method theta_flow_pre_post.")
+    if int(getattr(args, "flow_theta_reg_bin_n_bins", 10)) < 1:
+        raise ValueError("--flow-theta-reg-bin-n-bins must be >= 1.")
+    if float(getattr(args, "flow_theta_reg_variance_floor", 1e-6)) <= 0.0:
+        raise ValueError("--flow-theta-reg-variance-floor must be positive.")
+    _prepost_pre_epochs = getattr(args, "flow_theta_pre_post_pretrain_epochs", None)
+    if _prepost_pre_epochs is None:
+        _prepost_pre_epochs = getattr(args, "flow_epochs", 1)
+    if int(_prepost_pre_epochs) < 1:
+        raise ValueError("--flow-theta-pre-post-pretrain-epochs must be >= 1.")
+    _prepost_ft_epochs = getattr(args, "flow_theta_pre_post_finetune_epochs", 10000)
+    if int(_prepost_ft_epochs) < 1:
+        raise ValueError("--flow-theta-pre-post-finetune-epochs must be >= 1.")
+    _prepost_ft_lr = getattr(args, "flow_theta_pre_post_finetune_lr", None)
+    if _prepost_ft_lr is None:
+        _prepost_ft_lr = getattr(args, "flow_lr", 1e-3)
+    if float(_prepost_ft_lr) <= 0.0:
+        raise ValueError("--flow-theta-pre-post-finetune-lr must be positive.")
+    if _tfm_val in ("theta_flow", "theta_flow_reg", "theta_flow_pre_post", "theta_path_integral"):
+        default_x_reg = {
+            "flow_x_reg_lambda": 0.1,
+            "flow_x_reg_prior_method": "binned",
+            "flow_x_reg_bin_n_bins": 10,
+            "flow_x_reg_knn_k": 64,
+            "flow_x_reg_bandwidth_floor": 1e-6,
+            "flow_x_reg_variance_floor": 1e-6,
+            "flow_x_reg_weighted_var_correction": True,
+        }
+        for key, default in default_x_reg.items():
+            got = getattr(args, key, default)
+            if isinstance(default, str):
+                changed = str(got).strip().lower() != default
+            elif isinstance(default, bool):
+                changed = bool(got) != default
+            elif isinstance(default, int):
+                changed = int(got) != default
+            else:
+                changed = not math.isclose(float(got), float(default), rel_tol=0.0, abs_tol=0.0)
+            if changed:
+                cli_name = "--" + key.replace("_", "-")
+                raise ValueError(f"{cli_name} is only valid with --theta-field-method x_flow_reg.")
     if int(getattr(args, "flow_early_patience", 1)) < 1:
         raise ValueError("--flow-early-patience must be >= 1.")
     if float(getattr(args, "flow_early_min_delta", 0.0)) < 0.0:
@@ -1127,7 +1189,7 @@ def validate_estimation_args(args: Any) -> None:
     if _fx_omega_mode not in ("fixed", "theta_range"):
         raise ValueError("--flow-x-theta-fourier-omega-mode must be one of {'fixed', 'theta_range'}.")
     if _tfm_val in ("x_flow", "x_flow_reg") and _arch == "soft_moe":
-        raise ValueError("--flow-arch soft_moe is supported only for theta_flow/theta_path_integral.")
+        raise ValueError("--flow-arch soft_moe is supported only for theta-flow methods.")
     if _tfm_val in ("x_flow", "x_flow_reg") and _arch == "film_fourier":
         if _fx_omega_mode == "theta_range":
             lo = float(getattr(args, "theta_low", -6.0))
@@ -1157,7 +1219,7 @@ def validate_estimation_args(args: Any) -> None:
     _ft_prior_omega_mode = str(getattr(args, "flow_prior_theta_fourier_omega_mode", "theta_range")).strip().lower()
     _ft_prior_inc_lin = not bool(getattr(args, "flow_prior_theta_fourier_no_linear", False))
     _ft_prior_inc_bias = not bool(getattr(args, "flow_prior_theta_fourier_no_bias", False))
-    if _tfm_val in ("theta_flow", "theta_path_integral") and _arch == "film_fourier":
+    if _tfm_val in ("theta_flow", "theta_flow_reg", "theta_flow_pre_post", "theta_path_integral") and _arch == "film_fourier":
         if _ft_post_k < 0:
             raise ValueError("--flow-theta-fourier-k must be >= 0.")
         if _ft_post_omega_mode not in ("fixed", "theta_range"):
@@ -1180,10 +1242,11 @@ def validate_estimation_args(args: Any) -> None:
         _tf_dim_post = (1 if _ft_post_inc_bias else 0) + (1 if _ft_post_inc_lin else 0) + 2 * _ft_post_k
         if _tf_dim_post < 1:
             raise ValueError(
-                "theta_flow / theta_path_integral film_fourier (posterior): theta feature dim is 0. Use "
+                "theta_flow / theta_flow_reg / theta_flow_pre_post / theta_path_integral "
+                "film_fourier (posterior): theta feature dim is 0. Use "
                 "--flow-theta-fourier-k >= 1 or keep linear/bias features enabled."
             )
-    if _tfm_val in ("theta_flow", "theta_path_integral") and _arch == "film_fourier":
+    if _tfm_val in ("theta_flow", "theta_flow_reg", "theta_flow_pre_post", "theta_path_integral") and _arch == "film_fourier":
         if _ft_prior_k < 0:
             raise ValueError("--flow-prior-theta-fourier-k must be >= 0.")
         if _ft_prior_omega_mode not in ("fixed", "theta_range"):
@@ -1206,7 +1269,8 @@ def validate_estimation_args(args: Any) -> None:
         _tf_dim_prior = (1 if _ft_prior_inc_bias else 0) + (1 if _ft_prior_inc_lin else 0) + 2 * _ft_prior_k
         if _tf_dim_prior < 1:
             raise ValueError(
-                "theta_flow / theta_path_integral film_fourier (prior): theta feature dim is 0. Use "
+                "theta_flow / theta_flow_pre_post / theta_path_integral film_fourier "
+                "(prior): theta feature dim is 0. Use "
                 "--flow-prior-theta-fourier-k >= 1 or keep linear/bias features enabled."
             )
     if (
@@ -1297,6 +1361,22 @@ def _save_dsm_score_prior_training_losses_npz(
     flow_x_reg_weighted_var_correction: bool = False,
     flow_x_reg_prior_losses: np.ndarray | None = None,
     flow_x_reg_fm_losses: np.ndarray | None = None,
+    flow_theta_reg_lambda: float = 0.0,
+    flow_theta_reg_bin_n_bins: int = 0,
+    flow_theta_reg_variance_floor: float = float("nan"),
+    flow_theta_reg_losses: np.ndarray | None = None,
+    flow_theta_reg_fm_losses: np.ndarray | None = None,
+    theta_pre_post_pretrain_train_losses: np.ndarray | None = None,
+    theta_pre_post_pretrain_reg_train_losses: np.ndarray | None = None,
+    theta_pre_post_pretrain_val_losses: np.ndarray | None = None,
+    theta_pre_post_pretrain_reg_val_losses: np.ndarray | None = None,
+    theta_pre_post_pretrain_val_monitor_losses: np.ndarray | None = None,
+    theta_pre_post_finetune_train_losses: np.ndarray | None = None,
+    theta_pre_post_finetune_fm_train_losses: np.ndarray | None = None,
+    theta_pre_post_finetune_val_losses: np.ndarray | None = None,
+    theta_pre_post_finetune_fm_val_losses: np.ndarray | None = None,
+    theta_pre_post_finetune_val_monitor_losses: np.ndarray | None = None,
+    theta_pre_post_readout_trainable_params: int = 0,
     flow_x_init_checkpoint: str = "",
     flow_x_save_checkpoint: str = "",
     flow_x_init_checkpoint_source_lambda: float = float("nan"),
@@ -1358,6 +1438,58 @@ def _save_dsm_score_prior_training_losses_npz(
             [] if flow_x_reg_fm_losses is None else flow_x_reg_fm_losses,
             dtype=np.float64,
         ),
+        flow_theta_reg_lambda=np.float64(flow_theta_reg_lambda),
+        flow_theta_reg_bin_n_bins=np.int64(flow_theta_reg_bin_n_bins),
+        flow_theta_reg_variance_floor=np.float64(flow_theta_reg_variance_floor),
+        flow_theta_reg_losses=np.asarray(
+            [] if flow_theta_reg_losses is None else flow_theta_reg_losses,
+            dtype=np.float64,
+        ),
+        flow_theta_reg_fm_losses=np.asarray(
+            [] if flow_theta_reg_fm_losses is None else flow_theta_reg_fm_losses,
+            dtype=np.float64,
+        ),
+        theta_pre_post_pretrain_train_losses=np.asarray(
+            [] if theta_pre_post_pretrain_train_losses is None else theta_pre_post_pretrain_train_losses,
+            dtype=np.float64,
+        ),
+        theta_pre_post_pretrain_reg_train_losses=np.asarray(
+            [] if theta_pre_post_pretrain_reg_train_losses is None else theta_pre_post_pretrain_reg_train_losses,
+            dtype=np.float64,
+        ),
+        theta_pre_post_pretrain_val_losses=np.asarray(
+            [] if theta_pre_post_pretrain_val_losses is None else theta_pre_post_pretrain_val_losses,
+            dtype=np.float64,
+        ),
+        theta_pre_post_pretrain_reg_val_losses=np.asarray(
+            [] if theta_pre_post_pretrain_reg_val_losses is None else theta_pre_post_pretrain_reg_val_losses,
+            dtype=np.float64,
+        ),
+        theta_pre_post_pretrain_val_monitor_losses=np.asarray(
+            [] if theta_pre_post_pretrain_val_monitor_losses is None else theta_pre_post_pretrain_val_monitor_losses,
+            dtype=np.float64,
+        ),
+        theta_pre_post_finetune_train_losses=np.asarray(
+            [] if theta_pre_post_finetune_train_losses is None else theta_pre_post_finetune_train_losses,
+            dtype=np.float64,
+        ),
+        theta_pre_post_finetune_fm_train_losses=np.asarray(
+            [] if theta_pre_post_finetune_fm_train_losses is None else theta_pre_post_finetune_fm_train_losses,
+            dtype=np.float64,
+        ),
+        theta_pre_post_finetune_val_losses=np.asarray(
+            [] if theta_pre_post_finetune_val_losses is None else theta_pre_post_finetune_val_losses,
+            dtype=np.float64,
+        ),
+        theta_pre_post_finetune_fm_val_losses=np.asarray(
+            [] if theta_pre_post_finetune_fm_val_losses is None else theta_pre_post_finetune_fm_val_losses,
+            dtype=np.float64,
+        ),
+        theta_pre_post_finetune_val_monitor_losses=np.asarray(
+            [] if theta_pre_post_finetune_val_monitor_losses is None else theta_pre_post_finetune_val_monitor_losses,
+            dtype=np.float64,
+        ),
+        theta_pre_post_readout_trainable_params=np.int64(theta_pre_post_readout_trainable_params),
     )
     return path
 
@@ -2397,9 +2529,12 @@ def run_shared_fisher_estimation(
         print(f"[training_losses] saved {tnpz}")
         return
 
-    if theta_field_method in ("theta_flow", "theta_path_integral"):
+    if theta_field_method in ("theta_flow", "theta_flow_reg", "theta_flow_pre_post", "theta_path_integral"):
         if not bool(getattr(args, "prior_enable", True)):
-            raise ValueError("theta_flow and theta_path_integral currently require prior model enabled.")
+            raise ValueError(
+                "theta_flow, theta_flow_reg, theta_flow_pre_post, and theta_path_integral "
+                "currently require prior model enabled."
+            )
         flow_eval_t = float(getattr(args, "flow_eval_t", 0.8))
         if not (0.0 <= flow_eval_t <= 1.0):
             raise ValueError("--flow-eval-t must be in [0, 1].")
@@ -2409,8 +2544,11 @@ def run_shared_fisher_estimation(
         flow_prior_arch = "mlp" if flow_score_arch == "soft_moe" else str(flow_arch).strip().lower()
         theta_onehot_state = bool(getattr(args, "theta_flow_onehot_state", False))
         if theta_onehot_state:
-            if theta_field_method != "theta_flow":
-                raise ValueError("--theta-flow-onehot-state requires theta_field_method=theta_flow.")
+            if theta_field_method not in ("theta_flow", "theta_flow_reg", "theta_flow_pre_post"):
+                raise ValueError(
+                    "--theta-flow-onehot-state requires theta_field_method=theta_flow, "
+                    "theta_flow_reg, or theta_flow_pre_post."
+                )
             if flow_score_arch != "mlp" or flow_prior_arch != "mlp":
                 raise ValueError(
                     "--theta-flow-onehot-state currently supports flow_arch=mlp only "
@@ -2570,32 +2708,75 @@ def run_shared_fisher_estimation(
             ).to(device)
         else:
             raise ValueError("--flow-arch must be one of {'mlp','soft_moe','film','film_fourier'}.")
-        post_train_out = train_conditional_theta_flow_model(
-            model=post_model,
-            theta_train=theta_score_fit,
-            x_train=x_score_fit,
-            epochs=int(getattr(args, "flow_epochs", 10000)),
-            batch_size=int(getattr(args, "flow_batch_size", 256)),
-            lr=float(getattr(args, "flow_lr", 1e-3)),
-            device=device,
-            log_every=max(1, args.log_every),
-            theta_val=theta_score_val,
-            x_val=x_score_val,
-            early_stopping_patience=int(getattr(args, "flow_early_patience", 1000)),
-            early_stopping_min_delta=float(getattr(args, "flow_early_min_delta", 1e-4)),
-            early_stopping_ema_alpha=float(getattr(args, "flow_early_ema_alpha", 0.05)),
-            restore_best=bool(getattr(args, "flow_restore_best", True)),
-            scheduler_name=str(getattr(args, "flow_scheduler", "cosine")),
-            endpoint_loss_weight=(
-                float(getattr(args, "flow_endpoint_loss_weight", 0.0))
-                if theta_field_method == "theta_flow"
-                else 0.0
-            ),
-            endpoint_ode_steps=int(getattr(args, "flow_endpoint_steps", 20)),
-        )
+        if theta_field_method == "theta_flow_pre_post":
+            _prepost_pre_epochs = getattr(args, "flow_theta_pre_post_pretrain_epochs", None)
+            if _prepost_pre_epochs is None:
+                _prepost_pre_epochs = int(getattr(args, "flow_epochs", 10000))
+            _prepost_ft_lr = getattr(args, "flow_theta_pre_post_finetune_lr", None)
+            if _prepost_ft_lr is None:
+                _prepost_ft_lr = float(getattr(args, "flow_lr", 1e-3))
+            post_train_out = train_conditional_theta_flow_pre_post_model(
+                model=post_model,
+                theta_train=theta_score_fit,
+                x_train=x_score_fit,
+                pretrain_epochs=int(_prepost_pre_epochs),
+                finetune_epochs=int(getattr(args, "flow_theta_pre_post_finetune_epochs", 10000)),
+                batch_size=int(getattr(args, "flow_batch_size", 256)),
+                pretrain_lr=float(getattr(args, "flow_lr", 1e-3)),
+                finetune_lr=float(_prepost_ft_lr),
+                device=device,
+                log_every=max(1, args.log_every),
+                theta_val=theta_score_val,
+                x_val=x_score_val,
+                early_stopping_patience=int(getattr(args, "flow_early_patience", 1000)),
+                early_stopping_min_delta=float(getattr(args, "flow_early_min_delta", 1e-4)),
+                early_stopping_ema_alpha=float(getattr(args, "flow_early_ema_alpha", 0.05)),
+                restore_best=bool(getattr(args, "flow_restore_best", True)),
+                scheduler_name=str(getattr(args, "flow_scheduler", "cosine")),
+                theta_prior_regularization_lambda=float(getattr(args, "flow_theta_reg_lambda", 0.01)),
+                theta_prior_regularization_bin_n_bins=int(getattr(args, "flow_theta_reg_bin_n_bins", 10)),
+                theta_prior_regularization_variance_floor=float(
+                    getattr(args, "flow_theta_reg_variance_floor", 1e-6)
+                ),
+            )
+        else:
+            post_train_out = train_conditional_theta_flow_model(
+                model=post_model,
+                theta_train=theta_score_fit,
+                x_train=x_score_fit,
+                epochs=int(getattr(args, "flow_epochs", 10000)),
+                batch_size=int(getattr(args, "flow_batch_size", 256)),
+                lr=float(getattr(args, "flow_lr", 1e-3)),
+                device=device,
+                log_every=max(1, args.log_every),
+                theta_val=theta_score_val,
+                x_val=x_score_val,
+                early_stopping_patience=int(getattr(args, "flow_early_patience", 1000)),
+                early_stopping_min_delta=float(getattr(args, "flow_early_min_delta", 1e-4)),
+                early_stopping_ema_alpha=float(getattr(args, "flow_early_ema_alpha", 0.05)),
+                restore_best=bool(getattr(args, "flow_restore_best", True)),
+                scheduler_name=str(getattr(args, "flow_scheduler", "cosine")),
+                endpoint_loss_weight=(
+                    float(getattr(args, "flow_endpoint_loss_weight", 0.0))
+                    if theta_field_method == "theta_flow"
+                    else 0.0
+                ),
+                endpoint_ode_steps=int(getattr(args, "flow_endpoint_steps", 20)),
+                theta_prior_regularization_lambda=(
+                    float(getattr(args, "flow_theta_reg_lambda", 0.01))
+                    if theta_field_method == "theta_flow_reg"
+                    else 0.0
+                ),
+                theta_prior_regularization_bin_n_bins=int(getattr(args, "flow_theta_reg_bin_n_bins", 10)),
+                theta_prior_regularization_variance_floor=float(
+                    getattr(args, "flow_theta_reg_variance_floor", 1e-6)
+                ),
+            )
         post_train_losses = np.asarray(post_train_out["train_losses"], dtype=np.float64)
         post_val_losses = np.asarray(post_train_out["val_losses"], dtype=np.float64)
         post_val_monitor_losses = np.asarray(post_train_out.get("val_monitor_losses", []), dtype=np.float64)
+        post_train_fm_losses = np.asarray(post_train_out.get("train_fm_losses", []), dtype=np.float64)
+        post_train_reg_losses = np.asarray(post_train_out.get("train_reg_losses", []), dtype=np.float64)
         post_best_epoch = int(post_train_out["best_epoch"])
         post_stopped_epoch = int(post_train_out["stopped_epoch"])
         post_stopped_early = bool(post_train_out["stopped_early"])
@@ -2616,6 +2797,16 @@ def run_shared_fisher_estimation(
                 linestyle="--",
                 label=f"Theta-flow val EMA (α={getattr(args, 'flow_early_ema_alpha', 0.05):g})",
             )
+        if theta_field_method == "theta_flow_pre_post":
+            _n_pre = int(np.asarray(post_train_out.get("theta_pre_post_pretrain_train_losses", [])).size)
+            if 0 < _n_pre < post_train_losses.size:
+                plt.axvline(
+                    _n_pre + 0.5,
+                    color="0.35",
+                    linestyle="-.",
+                    linewidth=1.2,
+                    label="pretrain / fine-tune split",
+                )
         if 1 <= post_best_epoch <= post_train_losses.size:
             plt.axvline(post_best_epoch, color="#2ca02c", linestyle="--", linewidth=1.5, label=f"Best epoch {post_best_epoch}")
         if 1 <= post_stopped_epoch <= post_train_losses.size:
@@ -2790,7 +2981,11 @@ def run_shared_fisher_estimation(
         h_result: HMatrixResult | None = None
         if bool(getattr(args, "compute_h_matrix", False)):
             h_eval = flow_eval_t
-            _h_field = "theta_flow" if theta_field_method == "theta_flow" else "theta_path_integral"
+            _h_field = (
+                "theta_flow"
+                if theta_field_method in ("theta_flow", "theta_flow_reg", "theta_flow_pre_post")
+                else "theta_path_integral"
+            )
             print(
                 "[h_matrix] "
                 f"enabled=True field={_h_field} "
@@ -2819,9 +3014,9 @@ def run_shared_fisher_estimation(
             h_npz_path, h_summary_path, h_fig_path, h_delta_fig_path = _save_h_matrix_dsm_artifacts(
                 args, h_result, suffix
             )
-            if theta_field_method == "theta_flow":
+            if theta_field_method in ("theta_flow", "theta_flow_reg", "theta_flow_pre_post"):
                 print(
-                    "[summary] theta_flow mode completed (H-matrix only path; "
+                    f"[summary] {theta_field_method} mode completed (H-matrix only path; "
                     "ODESolver.compute_likelihood on conditional theta-flow for log p(theta|x) minus prior; "
                     "Bayes-ratio matrix)."
                 )
@@ -2877,12 +3072,69 @@ def run_shared_fisher_estimation(
                 prior_n_total_steps=int(prior_train_out.get("n_total_steps", 0)),
                 prior_lr_last=float(prior_train_out.get("lr_last", float("nan"))),
                 theta_field_method=theta_field_method,
+                flow_theta_reg_lambda=(
+                    float(getattr(args, "flow_theta_reg_lambda", 0.01))
+                    if theta_field_method in ("theta_flow_reg", "theta_flow_pre_post")
+                    else 0.0
+                ),
+                flow_theta_reg_bin_n_bins=(
+                    int(getattr(args, "flow_theta_reg_bin_n_bins", 10))
+                    if theta_field_method in ("theta_flow_reg", "theta_flow_pre_post")
+                    else 0
+                ),
+                flow_theta_reg_variance_floor=float(getattr(args, "flow_theta_reg_variance_floor", 1e-6)),
+                flow_theta_reg_losses=post_train_reg_losses,
+                flow_theta_reg_fm_losses=post_train_fm_losses,
+                theta_pre_post_pretrain_train_losses=np.asarray(
+                    post_train_out.get("theta_pre_post_pretrain_train_losses", []),
+                    dtype=np.float64,
+                ),
+                theta_pre_post_pretrain_reg_train_losses=np.asarray(
+                    post_train_out.get("theta_pre_post_pretrain_reg_train_losses", []),
+                    dtype=np.float64,
+                ),
+                theta_pre_post_pretrain_val_losses=np.asarray(
+                    post_train_out.get("theta_pre_post_pretrain_val_losses", []),
+                    dtype=np.float64,
+                ),
+                theta_pre_post_pretrain_reg_val_losses=np.asarray(
+                    post_train_out.get("theta_pre_post_pretrain_reg_val_losses", []),
+                    dtype=np.float64,
+                ),
+                theta_pre_post_pretrain_val_monitor_losses=np.asarray(
+                    post_train_out.get("theta_pre_post_pretrain_val_monitor_losses", []),
+                    dtype=np.float64,
+                ),
+                theta_pre_post_finetune_train_losses=np.asarray(
+                    post_train_out.get("theta_pre_post_finetune_train_losses", []),
+                    dtype=np.float64,
+                ),
+                theta_pre_post_finetune_fm_train_losses=np.asarray(
+                    post_train_out.get("theta_pre_post_finetune_fm_train_losses", []),
+                    dtype=np.float64,
+                ),
+                theta_pre_post_finetune_val_losses=np.asarray(
+                    post_train_out.get("theta_pre_post_finetune_val_losses", []),
+                    dtype=np.float64,
+                ),
+                theta_pre_post_finetune_fm_val_losses=np.asarray(
+                    post_train_out.get("theta_pre_post_finetune_fm_val_losses", []),
+                    dtype=np.float64,
+                ),
+                theta_pre_post_finetune_val_monitor_losses=np.asarray(
+                    post_train_out.get("theta_pre_post_finetune_val_monitor_losses", []),
+                    dtype=np.float64,
+                ),
+                theta_pre_post_readout_trainable_params=int(
+                    post_train_out.get("theta_pre_post_readout_trainable_params", 0)
+                ),
             )
             print(f"[training_losses] saved {tnpz}")
             return
 
         raise RuntimeError(
-            "theta_flow and theta_path_integral require --compute-h-matrix to produce output artifacts."
+            "theta_flow, theta_flow_reg, theta_flow_pre_post, and theta_path_integral "
+            "require --compute-h-matrix to produce output artifacts."
         )
 
     theta_std = float(np.std(theta_score_fit))

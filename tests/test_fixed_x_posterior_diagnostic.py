@@ -36,6 +36,29 @@ def _ns(**overrides: object) -> argparse.Namespace:
 
 
 class TestFixedXPosteriorDiagnostic(unittest.TestCase):
+    def test_theta_flow_diagnostic_log_weights_use_saved_learned_prior(self) -> None:
+        mod = _load_study_module()
+        c_row = np.asarray([0.0, 0.0, 0.0], dtype=np.float64)
+        theta = np.asarray([-1.0, 0.0, 1.0], dtype=np.float64)
+        learned_prior = np.asarray([-100.0, 0.0, -100.0], dtype=np.float64)
+        logp, source = mod._diagnostic_posterior_log_weights(
+            hfm="theta_flow",
+            c_row=c_row,
+            theta_flat=theta,
+            log_p_theta_prior=learned_prior,
+        )
+        self.assertEqual(source, "learned prior")
+        self.assertTrue(np.allclose(logp, learned_prior))
+
+        fallback_logp, fallback_source = mod._diagnostic_posterior_log_weights(
+            hfm="theta_flow",
+            c_row=c_row,
+            theta_flat=theta,
+            log_p_theta_prior=None,
+        )
+        self.assertEqual(fallback_source, "standard-normal fallback")
+        self.assertFalse(np.allclose(fallback_logp, learned_prior))
+
     def test_writes_png_svg_from_c_matrix(self) -> None:
         mod = _load_study_module()
         ns_ds = _ns(
@@ -51,6 +74,7 @@ class TestFixedXPosteriorDiagnostic(unittest.TestCase):
         rng = np.random.default_rng(0)
         theta_all, x_all = ds.sample_joint(n)
         c = rng.standard_normal((n, n)) * 0.05
+        log_prior = -0.5 * np.asarray(theta_all, dtype=np.float64).reshape(-1) ** 2
         np.fill_diagonal(c, 0.0)
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp) / "run"
@@ -59,6 +83,7 @@ class TestFixedXPosteriorDiagnostic(unittest.TestCase):
             np.savez(
                 run_dir / "h_matrix_results_theta_cov.npz",
                 c_matrix=c,
+                log_p_theta_prior=np.asarray(log_prior, dtype=np.float64),
                 theta_used=np.asarray(theta_all, dtype=np.float64).reshape(-1),
                 h_field_method=np.asarray(["theta_flow"], dtype=object),
             )
@@ -79,6 +104,7 @@ class TestFixedXPosteriorDiagnostic(unittest.TestCase):
             svg_text = svg.read_text(encoding="utf-8")
             self.assertIn("Model posterior (approx)", svg_text)
             self.assertIn("GT posterior (approx)", svg_text)
+            self.assertIn("learned prior", svg_text)
 
     def test_nf_artifact_with_prior_fields_still_renders(self) -> None:
         mod = _load_study_module()

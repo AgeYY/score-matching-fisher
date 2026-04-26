@@ -19,7 +19,11 @@ Regenerate the NPZ if the family does not match.
 
 For each ``n`` in ``--n-list``, the H matrix is computed from trained models for the selected
 field method. Supported methods are ``--theta-field-method theta_flow`` (theta-space flow ODE
-log-likelihood Bayes ratios; prior + posterior theta-flows), ``--theta-field-method theta_path_integral``
+log-likelihood Bayes ratios; prior + posterior theta-flows), ``--theta-field-method theta_flow_reg``
+(same H evaluation as theta_flow, with binned Gaussian synthetic-pair regularization during posterior training),
+``--theta-field-method theta_flow_pre_post`` (same H evaluation as theta_flow, with posterior
+regularization-only pretraining followed by readout-only real-data fine-tuning),
+``--theta-field-method theta_path_integral``
 (same training as theta_flow but H from velocity-to-score plus trapezoid integral along sorted ``theta``),
 ``--theta-field-method x_flow`` (conditional x-space FM likelihood; no prior model),
 ``--theta-field-method x_flow_reg`` (same x-space FM likelihood with KNN Gaussian velocity-prior regularization),
@@ -27,9 +31,11 @@ log-likelihood Bayes ratios; prior + posterior theta-flows), ``--theta-field-met
 ``--theta-field-method nf`` (conditional normalizing flow log p(theta|x) with an NF prior
 for posterior-minus-prior log-ratio construction).
 Flow methods use ``--flow-arch``: ``mlp``, ``film`` (FiLM with raw-theta embeddings), or
-``film_fourier`` for ``theta_flow`` / ``theta_path_integral`` / ``x_flow`` / ``x_flow_reg``.
+``film_fourier`` for ``theta_flow`` / ``theta_flow_reg`` / ``theta_flow_pre_post`` /
+``theta_path_integral`` / ``x_flow`` / ``x_flow_reg``.
 ``film_fourier`` uses FiLM conditioning with Fourier theta features
-(``--flow-theta-fourier-*`` for ``theta_flow`` / ``theta_path_integral`` and ``--flow-x-theta-fourier-*`` for ``x_flow`` / ``x_flow_reg``).
+(``--flow-theta-fourier-*`` for ``theta_flow`` / ``theta_flow_reg`` /
+``theta_flow_pre_post`` / ``theta_path_integral`` and ``--flow-x-theta-fourier-*`` for ``x_flow`` / ``x_flow_reg``).
 The **reference column** (``n_ref``) does **not** run learned H
 training: the
 matrix-panel top row shows **MC generative** ``sqrt(H^2)`` (same as the H correlation
@@ -46,7 +52,8 @@ written (older runs), the script may **backfill**
 hold **square-root** matrices for this study (legacy key name ``hellinger_gt_sq_mc``; values are
 ``sqrt(H^2)``, not ``H^2``). LLR diagnostics (newer runs) add ``gt_mean_llr_one_sided_mc``,
 ``llr_binned_columns``, and ``corr_llr_binned_vs_gt_mc`` (binned model ``\\Delta L`` vs one-sided
-generative mean log-likelihood ratios; see ``fisher/hellinger_gt.py``).
+generative mean log-likelihood ratios; see ``fisher/hellinger_gt.py``). The optional
+``binned_gaussian_h_binned_columns`` row is also stored as ``sqrt(H^2)``.
 """
 
 from __future__ import annotations
@@ -122,6 +129,37 @@ def _sqrt_h_like(mat: np.ndarray) -> np.ndarray:
     out = np.full_like(h, np.nan, dtype=np.float64)
     finite = np.isfinite(h)
     out[finite] = np.sqrt(np.clip(h[finite], 0.0, 1.0))
+    return out
+
+
+def _meta_for_gt_hellinger_mc(meta: dict[str, Any]) -> dict[str, Any]:
+    """Return meta for MC GT Hellinger / one-sided mean LLR.
+
+    For PR-autoencoder-embedded **cosine** families, the NPZ has ambient ``x_dim = h_dim`` (e.g. 100)
+    but the generative toy is still the low-dimensional (pre-embed) process; ``x`` in the archive
+    is a nonlinear lift. MC ground truth should use :func:`fisher.shared_fisher_est.build_dataset_from_meta`
+    with ``x_dim = pr_autoencoder_z_dim`` so ``sample_x`` and ``log_p_x_given_theta`` are consistent
+    with the original space.
+
+    ``randamp_gaussian_sqrtd`` + PR is already handled inside ``build_dataset_from_meta`` (generative
+    ``x_dim`` set from ``pr_autoencoder_z_dim``); this helper only applies to cosine* families.
+    """
+    if not bool(meta.get("pr_autoencoder_embedded", False)):
+        return meta
+    fam = str(meta.get("dataset_family", ""))
+    if fam not in (
+        "cosine_gaussian",
+        "cosine_gaussian_const_noise",
+        "cosine_gaussian_sqrtd",
+        "cosine_gaussian_sqrtd_rand_tune",
+    ):
+        return meta
+    h = int(meta.get("x_dim", 0))
+    z = int(meta.get("pr_autoencoder_z_dim", h))
+    if h <= z:
+        return meta
+    out = dict(meta)
+    out["x_dim"] = z
     return out
 
 
@@ -639,9 +677,10 @@ def _validate_cli(args: argparse.Namespace) -> None:
     if use_onehot:
         tfm = str(getattr(args, "theta_field_method", "theta_flow")).strip().lower()
         arch = str(getattr(args, "flow_arch", "mlp")).strip().lower()
-        if tfm != "theta_flow":
+        if tfm not in ("theta_flow", "theta_flow_reg", "theta_flow_pre_post"):
             raise ValueError(
-                "--theta-flow-onehot-state requires --theta-field-method theta_flow "
+                "--theta-flow-onehot-state requires --theta-field-method theta_flow, "
+                "theta_flow_reg, or theta_flow_pre_post "
                 f"(got {getattr(args, 'theta_field_method', None)!r})."
             )
         if arch != "mlp":
@@ -652,9 +691,10 @@ def _validate_cli(args: argparse.Namespace) -> None:
     if use_fourier:
         tfm = str(getattr(args, "theta_field_method", "theta_flow")).strip().lower()
         arch = str(getattr(args, "flow_arch", "mlp")).strip().lower()
-        if tfm != "theta_flow":
+        if tfm not in ("theta_flow", "theta_flow_reg", "theta_flow_pre_post"):
             raise ValueError(
-                "--theta-flow-fourier-state requires --theta-field-method theta_flow "
+                "--theta-flow-fourier-state requires --theta-field-method theta_flow, "
+                "theta_flow_reg, or theta_flow_pre_post "
                 f"(got {getattr(args, 'theta_field_method', None)!r})."
             )
         if arch != "mlp":
@@ -669,9 +709,10 @@ def _validate_cli(args: argparse.Namespace) -> None:
             raise ValueError("--theta-flow-fourier-period-mult must be a finite positive number.")
     if use_segmented:
         tfm = str(getattr(args, "theta_field_method", "theta_flow")).strip().lower()
-        if tfm != "theta_flow":
+        if tfm not in ("theta_flow", "theta_flow_reg", "theta_flow_pre_post"):
             raise ValueError(
-                "--theta-flow-segmented requires --theta-field-method theta_flow "
+                "--theta-flow-segmented requires --theta-field-method theta_flow, "
+                "theta_flow_reg, or theta_flow_pre_post "
                 f"(got {getattr(args, 'theta_field_method', None)!r})."
             )
     warm_lam = getattr(args, "warm_start_flow_x_reg_source_lambda", None)
@@ -839,6 +880,65 @@ def _metrics_fixed_edges(
         random_state=int(clf_random_state),
     )
     return h_binned, clf_acc
+
+
+def _binned_gaussian_hellinger_sq(
+    subset: SweepSubset,
+    n_bins: int,
+    *,
+    variance_floor: float = 1e-6,
+) -> np.ndarray:
+    r"""Binned-Gaussian ``H^2`` estimate using per-bin means and shared diagonal variance.
+
+    This is the no-flow diagnostic matching the binned Gaussian regularizer: fit
+    ``p(x | bin(theta)=b) = N(mu_b, diag(global_var))`` from the subset full pool,
+    then compute the closed-form shared-covariance Gaussian Hellinger distance.
+    """
+    x_all = np.asarray(subset.bundle.x_all, dtype=np.float64)
+    bin_all = np.asarray(subset.bin_all, dtype=np.int64).reshape(-1)
+    nb = int(n_bins)
+    vf = float(variance_floor)
+    if x_all.ndim != 2:
+        raise ValueError("x_all must be 2D.")
+    if x_all.shape[0] != bin_all.shape[0]:
+        raise ValueError("x_all and bin_all must have the same number of rows.")
+    if nb < 1:
+        raise ValueError("n_bins must be >= 1.")
+    if not np.isfinite(vf) or vf <= 0.0:
+        raise ValueError("variance_floor must be a finite positive number.")
+
+    x_dim = int(x_all.shape[1])
+    means = np.zeros((nb, x_dim), dtype=np.float64)
+    counts = np.bincount(np.clip(bin_all, 0, nb - 1), minlength=nb).astype(np.int64)
+    for b in range(nb):
+        idx = np.flatnonzero(bin_all == b)
+        if idx.size > 0:
+            means[b] = np.mean(x_all[idx], axis=0)
+
+    nonempty = counts > 0
+    nonempty_idx = np.flatnonzero(nonempty)
+    out = np.full((nb, nb), np.nan, dtype=np.float64)
+    np.fill_diagonal(out, 0.0)
+    if nonempty_idx.size == 0:
+        return out
+    for b in np.flatnonzero(~nonempty):
+        nearest = int(nonempty_idx[np.argmin(np.abs(nonempty_idx - int(b)))])
+        means[int(b)] = means[nearest]
+
+    train_means = means[np.clip(bin_all, 0, nb - 1)]
+    global_var = np.maximum(np.mean((x_all - train_means) ** 2, axis=0), vf)
+    inv_var = 1.0 / global_var
+    for i in range(nb):
+        for j in range(i + 1, nb):
+            diff = means[i] - means[j]
+            maha2 = float(np.sum(diff * diff * inv_var))
+            if not np.isfinite(maha2):
+                continue
+            h2_ij = 1.0 - float(np.exp(-0.125 * max(0.0, maha2)))
+            h2_ij = float(np.clip(h2_ij, 0.0, 1.0))
+            out[i, j] = h2_ij
+            out[j, i] = h2_ij
+    return out
 
 
 def _pairwise_clf_from_bundle(
@@ -1249,6 +1349,27 @@ def _stable_softmax_log(logp: np.ndarray) -> np.ndarray:
     return e / s
 
 
+def _diagnostic_posterior_log_weights(
+    *,
+    hfm: str,
+    c_row: np.ndarray,
+    theta_flat: np.ndarray,
+    log_p_theta_prior: np.ndarray | None,
+) -> tuple[np.ndarray, str]:
+    """Return log weights for the fixed-x posterior diagnostic."""
+    method = str(hfm).strip().lower()
+    c = np.asarray(c_row, dtype=np.float64).reshape(-1)
+    th = np.asarray(theta_flat, dtype=np.float64).reshape(-1)
+    if method == "theta_flow":
+        if log_p_theta_prior is not None:
+            lp = np.asarray(log_p_theta_prior, dtype=np.float64).reshape(-1)
+            if lp.size != c.size:
+                raise ValueError(f"log_p_theta_prior length {lp.size} does not match c row length {c.size}.")
+            return c + lp, "learned prior"
+        return c + _log_std_normal_scalar(th), "standard-normal fallback"
+    return c, "direct"
+
+
 def _normalize_density_trapz(theta_grid: np.ndarray, density: np.ndarray) -> np.ndarray:
     t = np.asarray(theta_grid, dtype=np.float64).reshape(-1)
     q = np.asarray(density, dtype=np.float64).reshape(-1)
@@ -1309,6 +1430,14 @@ def _approx_gt_posterior_density(
 ) -> np.ndarray:
     td = np.asarray(theta_dense, dtype=np.float64).reshape(-1)
     x1 = np.asarray(x_fixed, dtype=np.float64).reshape(1, -1)
+    gen_d = int(getattr(dataset, "x_dim", int(x1.shape[1])))
+    if int(x1.shape[1]) > gen_d:
+        # e.g. PR-AE embedded x in R^h_dim while build_dataset_from_meta uses latent z_dim.
+        x1 = x1[:, :gen_d]
+    elif int(x1.shape[1]) < gen_d:
+        raise ValueError(
+            f"x has fewer dims than generative x_dim: got {x1.shape[1]} need {gen_d}."
+        )
     if td.size < 2:
         return np.zeros_like(td, dtype=np.float64)
     x_rep = np.repeat(x1, repeats=td.size, axis=0)
@@ -1344,6 +1473,7 @@ def _plot_fixed_x_column(
     i_fix: int,
     hfm: str,
     c: np.ndarray,
+    log_p_theta_prior: np.ndarray | None,
     th_flat: np.ndarray,
     xa: np.ndarray,
     th_grid: np.ndarray,
@@ -1353,12 +1483,12 @@ def _plot_fixed_x_column(
     hi: float,
 ) -> None:
     c_row = np.asarray(c[int(i_fix), :], dtype=np.float64).reshape(-1)
-    if hfm == "theta_flow":
-        logp = c_row + _log_std_normal_scalar(th_flat)
-    elif hfm == "nf":
-        logp = c_row
-    else:
-        logp = c_row
+    logp, posterior_source = _diagnostic_posterior_log_weights(
+        hfm=hfm,
+        c_row=c_row,
+        theta_flat=th_flat,
+        log_p_theta_prior=log_p_theta_prior,
+    )
     w = _stable_softmax_log(logp)
     order = np.argsort(th_flat, kind="mergesort")
     th_s = th_flat[order]
@@ -1366,6 +1496,9 @@ def _plot_fixed_x_column(
     q_model = _weighted_kde_density(th_s, w_s, th_grid)
 
     x_fixed = np.asarray(xa[int(i_fix)], dtype=np.float64).reshape(-1)
+    _gen_d = int(getattr(dataset, "x_dim", int(x_fixed.size)))
+    if int(x_fixed.size) > _gen_d:
+        x_fixed = x_fixed[:_gen_d]
     x0 = float(x_fixed[0]) if x_fixed.size else float("nan")
     xn = float(np.linalg.norm(x_fixed))
     q_gt = _approx_gt_posterior_density(
@@ -1384,7 +1517,7 @@ def _plot_fixed_x_column(
     ax_top.plot(th_grid, q_gt, color="#d62728", lw=1.5, ls="--", label="GT posterior (approx)")
     ax_top.set_ylabel("density")
     ax_top.set_title(
-        f"Fixed-$x$ posterior diagnostics  (row $i$={int(i_fix)},  method={hfm})",
+        f"Fixed-$x$ posterior diagnostics  (row $i$={int(i_fix)},  method={hfm}, {posterior_source})",
         fontsize=9,
     )
     ax_top.legend(loc="upper right", fontsize=7)
@@ -1443,8 +1576,10 @@ def _write_fixed_x_posterior_diagnostic(
     Uses ``c_matrix`` from ``h_matrix_results*.npz`` (requires ``h_save_intermediates``) and
     a deterministic row index ``i`` derived from ``perm_seed`` and ``n_subset``.
 
-    - ``theta_flow``: ``C[i,j] = log p(θ_j|x_i) - log p(θ_j)`` (std-normal base); we add
-      ``log p(θ_j)`` back for a softmax "posterior mass" on the training θ grid.
+    - ``theta_flow`` / ``theta_flow_reg`` / ``theta_flow_pre_post`` H artifacts store
+      ``C[i,j] = log p(θ_j|x_i) - log p(θ_j)``. If available, add the saved learned
+      ``log p(θ_j)`` back for posterior mass on the training θ grid. Older artifacts
+      without this vector fall back to a standard-normal prior approximation.
     - ``nf``: ``C[i,j] = log p(θ_j|x_i)`` directly.
     - Other H-field methods: soft-max the C row (scale may be method-specific) for a coarse view.
     """
@@ -1498,6 +1633,17 @@ def _write_fixed_x_posterior_diagnostic(
         return out_png
 
     th_flat = np.asarray(theta_u, dtype=np.float64).reshape(-1)
+    log_p_theta_prior: np.ndarray | None = None
+    if "log_p_theta_prior" in z.files:
+        lp = np.asarray(z["log_p_theta_prior"], dtype=np.float64).reshape(-1)
+        if lp.size == n and np.all(np.isfinite(lp)):
+            log_p_theta_prior = lp
+        else:
+            print(
+                "[convergence] fixed-x diagnostic: ignoring bad log_p_theta_prior "
+                f"shape={getattr(lp, 'shape', None)} finite={bool(np.all(np.isfinite(lp)))}",
+                flush=True,
+            )
     xa = np.asarray(x_aligned, dtype=np.float64)
     if int(xa.shape[0]) != n:
         print(
@@ -1530,7 +1676,12 @@ def _write_fixed_x_posterior_diagnostic(
         fig, axes = plt.subplots(1, 2, figsize=(12.0, 3.2), dpi=120, sharey=True, layout="tight")
         for ax, i_fix in zip(np.asarray(axes).reshape(-1), (i_fix_a, i_fix_b)):
             c_row = np.asarray(c[int(i_fix), :], dtype=np.float64).reshape(-1)
-            logp = c_row + _log_std_normal_scalar(th_flat) if hfm == "theta_flow" else c_row
+            logp, posterior_source = _diagnostic_posterior_log_weights(
+                hfm=hfm,
+                c_row=c_row,
+                theta_flat=th_flat,
+                log_p_theta_prior=log_p_theta_prior,
+            )
             w = _stable_softmax_log(logp)
             order = np.argsort(th_flat, kind="mergesort")
             th_s = th_flat[order]
@@ -1545,7 +1696,8 @@ def _write_fixed_x_posterior_diagnostic(
             ax.set_ylabel("mass")
             ax.set_xlabel(r"$\theta$")
             ax.set_title(
-                f"fixed $x$  i={int(i_fix)}  method={hfm}\n(posterior overlay failed: {e!s})",
+                f"fixed $x$  i={int(i_fix)}  method={hfm}, {posterior_source}\n"
+                f"(posterior overlay failed: {e!s})",
                 fontsize=8,
             )
             ax.annotate(
@@ -1571,6 +1723,7 @@ def _write_fixed_x_posterior_diagnostic(
         i_fix=int(i_fix_a),
         hfm=hfm,
         c=c,
+        log_p_theta_prior=log_p_theta_prior,
         th_flat=th_flat,
         xa=xa,
         th_grid=th_grid,
@@ -1585,6 +1738,7 @@ def _write_fixed_x_posterior_diagnostic(
         i_fix=int(i_fix_b),
         hfm=hfm,
         c=c,
+        log_p_theta_prior=log_p_theta_prior,
         th_flat=th_flat,
         xa=xa,
         th_grid=th_grid,
@@ -1673,6 +1827,16 @@ def _load_per_n_training_loss_npz(path: str) -> dict[str, Any]:
         "prior_train_losses": _arr("prior_train_losses"),
         "prior_val_losses": _arr("prior_val_losses"),
         "prior_val_monitor_losses": _arr("prior_val_monitor_losses"),
+        "theta_pre_post_pretrain_train_losses": _arr("theta_pre_post_pretrain_train_losses"),
+        "theta_pre_post_pretrain_reg_train_losses": _arr("theta_pre_post_pretrain_reg_train_losses"),
+        "theta_pre_post_pretrain_val_losses": _arr("theta_pre_post_pretrain_val_losses"),
+        "theta_pre_post_pretrain_reg_val_losses": _arr("theta_pre_post_pretrain_reg_val_losses"),
+        "theta_pre_post_pretrain_val_monitor_losses": _arr("theta_pre_post_pretrain_val_monitor_losses"),
+        "theta_pre_post_finetune_train_losses": _arr("theta_pre_post_finetune_train_losses"),
+        "theta_pre_post_finetune_fm_train_losses": _arr("theta_pre_post_finetune_fm_train_losses"),
+        "theta_pre_post_finetune_val_losses": _arr("theta_pre_post_finetune_val_losses"),
+        "theta_pre_post_finetune_fm_val_losses": _arr("theta_pre_post_finetune_fm_val_losses"),
+        "theta_pre_post_finetune_val_monitor_losses": _arr("theta_pre_post_finetune_val_monitor_losses"),
     }
 
 
@@ -1772,6 +1936,10 @@ def _render_training_losses_panel(
         tfm = str(bundle.get("theta_field_method", "theta_flow")).strip().lower()
         if tfm == "theta_flow":
             post_lab = "theta-flow ODE Bayes-ratio"
+        elif tfm == "theta_flow_reg":
+            post_lab = "theta-flow-reg ODE Bayes-ratio"
+        elif tfm == "theta_flow_pre_post":
+            post_lab = "theta-flow pre/post ODE Bayes-ratio"
         elif tfm == "theta_path_integral":
             post_lab = "theta-path-integral score"
         elif tfm == "x_flow":
@@ -1843,6 +2011,7 @@ def _save_combined_convergence_figure(
     diagnostic_png_path: str | None,
     out_png_path: str,
     dpi: int = 160,
+    binned_gaussian_corr_h: np.ndarray | None = None,
     llr_gt: np.ndarray | None = None,
     llr_est_mats: list[np.ndarray] | None = None,
     corr_llr: np.ndarray | None = None,
@@ -1921,6 +2090,7 @@ def _save_combined_convergence_figure(
         list(ns),
         corr_h,
         corr_clf,
+        binned_gaussian_corr_h=binned_gaussian_corr_h,
         tick_labelsize=13.0,
         axis_labelsize=13.0,
         legend_fontsize=10.0,
@@ -1995,6 +2165,10 @@ def _save_combined_convergence_figure(
         tfm = str(bundle.get("theta_field_method", "theta_flow")).strip().lower()
         if tfm == "theta_flow":
             post_lab = "theta-flow ODE Bayes-ratio"
+        elif tfm == "theta_flow_reg":
+            post_lab = "theta-flow-reg ODE Bayes-ratio"
+        elif tfm == "theta_flow_pre_post":
+            post_lab = "theta-flow pre/post ODE Bayes-ratio"
         elif tfm == "theta_path_integral":
             post_lab = "theta-path-integral score"
         elif tfm == "x_flow":
@@ -2213,6 +2387,7 @@ def _populate_convergence_curve_ax(
     corr_h: np.ndarray,
     corr_clf: np.ndarray,
     *,
+    binned_gaussian_corr_h: np.ndarray | None = None,
     tick_labelsize: float = 11.0,
     axis_labelsize: float = 12.0,
     legend_fontsize: float = 9.0,
@@ -2243,6 +2418,21 @@ def _populate_convergence_curve_ax(
         markersize=5,
         label="decoding acc matrix",
     )
+    if binned_gaussian_corr_h is not None:
+        cbg = np.asarray(binned_gaussian_corr_h, dtype=np.float64).ravel()
+        if int(cbg.size) != len(ns_list):
+            raise ValueError("binned_gaussian_corr_h must have one entry per n in --n-list.")
+        if np.any(np.isfinite(cbg)):
+            ax.plot(
+                ns_list,
+                cbg,
+                color="#2ca02c",
+                linewidth=1.8,
+                linestyle="-.",
+                marker="^",
+                markersize=6,
+                label="binned Gaussian H matrix",
+            )
     ax.axhline(
         1.0,
         color="0.45",
@@ -2364,6 +2554,10 @@ class CachedConvergenceBundle(TypedDict):
     prior_row_label: NotRequired[str]
     prior_row_flow_x_reg_lambda: NotRequired[float]
     prior_row_corr_h_binned_vs_gt_mc: NotRequired[np.ndarray]
+    binned_gaussian_h_binned_columns: NotRequired[np.ndarray]
+    binned_gaussian_corr_h_binned_vs_gt_mc: NotRequired[np.ndarray]
+    binned_gaussian_variance_floor: NotRequired[float]
+    binned_gaussian_label: NotRequired[str]
 
 
 def _load_cached_convergence_results(output_dir: str) -> CachedConvergenceBundle:
@@ -2452,6 +2646,24 @@ def _load_cached_convergence_results(output_dir: str) -> CachedConvergenceBundle
             z["prior_row_corr_h_binned_vs_gt_mc"],
             dtype=np.float64,
         ).ravel()
+    if "binned_gaussian_h_binned_columns" in z.files:
+        base_bundle["binned_gaussian_h_binned_columns"] = np.asarray(
+            z["binned_gaussian_h_binned_columns"],
+            dtype=np.float64,
+        )
+    if "binned_gaussian_corr_h_binned_vs_gt_mc" in z.files:
+        base_bundle["binned_gaussian_corr_h_binned_vs_gt_mc"] = np.asarray(
+            z["binned_gaussian_corr_h_binned_vs_gt_mc"],
+            dtype=np.float64,
+        ).ravel()
+    if "binned_gaussian_variance_floor" in z.files:
+        base_bundle["binned_gaussian_variance_floor"] = float(
+            np.asarray(z["binned_gaussian_variance_floor"]).reshape(-1)[0]
+        )
+    if "binned_gaussian_label" in z.files:
+        raw_label = z["binned_gaussian_label"]
+        if np.asarray(raw_label).size > 0:
+            base_bundle["binned_gaussian_label"] = str(np.asarray(raw_label).reshape(-1)[0])
     return cast(CachedConvergenceBundle, base_bundle)
 
 
@@ -2502,6 +2714,10 @@ def _render_convergence_figures_and_summary(
     visualization_only: bool,
     llr_cols: np.ndarray | None = None,
     corr_llr: np.ndarray | None = None,
+    binned_gaussian_h_cols: np.ndarray | None = None,
+    binned_gaussian_corr_h: np.ndarray | None = None,
+    binned_gaussian_label: str | None = None,
+    binned_gaussian_variance_floor: float | None = None,
     prior_row_h_cols: np.ndarray | None = None,
     prior_row_label: str | None = None,
     prior_row_loss_rows: list[dict[str, str]] | None = None,
@@ -2516,6 +2732,7 @@ def _render_convergence_figures_and_summary(
                 "corr_h_binned_vs_gt_mc",
                 "corr_clf_vs_ref",
                 "corr_llr_binned_vs_gt_mc",
+                "corr_binned_gaussian_h_binned_vs_gt_mc",
                 "wall_seconds",
             ]
         )
@@ -2528,11 +2745,25 @@ def _render_convergence_figures_and_summary(
                 r_llr = float(np.asarray(corr_llr, dtype=np.float64).ravel()[i])
             else:
                 r_llr = ""
-            w.writerow([n, corr_h[i], corr_clf[i], r_llr, wall_s[i]])
+            r_bg: float | str
+            if (
+                binned_gaussian_corr_h is not None
+                and int(np.asarray(binned_gaussian_corr_h, dtype=np.float64).ravel().size) > i
+            ):
+                r_bg = float(np.asarray(binned_gaussian_corr_h, dtype=np.float64).ravel()[i])
+            else:
+                r_bg = ""
+            w.writerow([n, corr_h[i], corr_clf[i], r_llr, r_bg, wall_s[i]])
 
     fig_path = os.path.join(args.output_dir, "h_decoding_convergence.png")
     fig, ax = plt.subplots(1, 1, figsize=_H_DECODING_CURVE_FIGSIZE_IN)
-    _populate_convergence_curve_ax(ax, list(ns), corr_h, corr_clf)
+    _populate_convergence_curve_ax(
+        ax,
+        list(ns),
+        corr_h,
+        corr_clf,
+        binned_gaussian_corr_h=binned_gaussian_corr_h,
+    )
     fig.tight_layout()
     conv_svg = _save_figure_png_svg(fig, fig_path, dpi=160)
     plt.close(fig)
@@ -2540,6 +2771,14 @@ def _render_convergence_figures_and_summary(
     matrix_panel_path = os.path.join(args.output_dir, "h_decoding_matrices_panel.png")
     col_labels = [f"n={n}" for n in ns] + [f"Approx GT, n_ref={int(args.n_ref)}"]
     extra_h_rows: list[tuple[str, list[np.ndarray]]] = []
+    if binned_gaussian_h_cols is not None:
+        bg_label = binned_gaussian_label or r"$\sqrt{H^2}$, binned Gaussian"
+        bg_arr = np.asarray(binned_gaussian_h_cols, dtype=np.float64)
+        if bg_arr.shape != np.asarray(h_cols, dtype=np.float64).shape:
+            raise ValueError(
+                f"binned_gaussian_h_cols shape {bg_arr.shape} must match h_cols shape {np.asarray(h_cols).shape}."
+            )
+        extra_h_rows.append((bg_label, [np.asarray(bg_arr[j], dtype=np.float64) for j in range(bg_arr.shape[0])]))
     if prior_row_h_cols is not None:
         prior_label = prior_row_label or r"$\sqrt{H^2}$, x-flow-reg prior"
         prior_arr = np.asarray(prior_row_h_cols, dtype=np.float64)
@@ -2623,6 +2862,7 @@ def _render_convergence_figures_and_summary(
         ns=list(ns),
         corr_h=corr_h,
         corr_clf=corr_clf,
+        binned_gaussian_corr_h=binned_gaussian_corr_h,
         loss_dir=loss_dir,
         diagnostic_png_path=diagnostic_png_use,
         out_png_path=combined_path,
@@ -2661,6 +2901,10 @@ def _render_convergence_figures_and_summary(
     if prior_row_h_cols is not None:
         paths_out["prior_row_label"] = prior_row_label or ""
         paths_out["prior_row_training_losses_manifest"] = prior_row_manifest_path
+    if binned_gaussian_h_cols is not None:
+        paths_out["binned_gaussian_label"] = binned_gaussian_label or ""
+        if binned_gaussian_variance_floor is not None:
+            paths_out["binned_gaussian_variance_floor"] = str(float(binned_gaussian_variance_floor))
     if visualization_only:
         paths_out["mode"] = "visualization-only (figures/csv/summary regenerated from cached NPZ)"
     if err_msg:
@@ -2698,6 +2942,20 @@ def _render_convergence_figures_and_summary(
             sf.write(
                 "prior_row_h_binned_columns: auxiliary H row columns, last column reuses MC GT sqrt(H^2).\n"
             )
+        if binned_gaussian_h_cols is not None:
+            sf.write("\n# Binned Gaussian row\n")
+            sf.write(f"binned_gaussian_label: {binned_gaussian_label or ''}\n")
+            if binned_gaussian_variance_floor is not None:
+                sf.write(f"binned_gaussian_variance_floor: {float(binned_gaussian_variance_floor)}\n")
+            sf.write(
+                "binned_gaussian_h_binned_columns: no-flow binned Gaussian sqrt(H^2) columns; "
+                "last column reuses MC GT sqrt(H^2).\n"
+            )
+            if binned_gaussian_corr_h is not None:
+                sf.write(
+                    "binned_gaussian_corr_h_binned_vs_gt_mc: Pearson r, off-diagonal no-flow "
+                    "binned Gaussian sqrt(H^2) vs sqrt(generative GT H^2).\n"
+                )
 
     tag = "[convergence] Saved (visualization-only):" if visualization_only else "[convergence] Saved:"
     print(tag)
@@ -2799,6 +3057,10 @@ def main(argv: list[str] | None = None) -> None:
         )
         _llr_c = cached.get("llr_binned_columns")
         _corr_llr_c = cached.get("corr_llr_binned_vs_gt_mc")
+        _bg_h_c = cached.get("binned_gaussian_h_binned_columns")
+        _bg_corr_c = cached.get("binned_gaussian_corr_h_binned_vs_gt_mc")
+        _bg_label_c = cached.get("binned_gaussian_label")
+        _bg_vf_c = cached.get("binned_gaussian_variance_floor")
         _prior_row_h_c = cached.get("prior_row_h_binned_columns")
         _prior_row_label_c = cached.get("prior_row_label")
         _render_convergence_figures_and_summary(
@@ -2824,6 +3086,10 @@ def main(argv: list[str] | None = None) -> None:
             visualization_only=True,
             llr_cols=None if _llr_c is None else np.asarray(_llr_c, dtype=np.float64),
             corr_llr=None if _corr_llr_c is None else np.asarray(_corr_llr_c, dtype=np.float64).ravel(),
+            binned_gaussian_h_cols=None if _bg_h_c is None else np.asarray(_bg_h_c, dtype=np.float64),
+            binned_gaussian_corr_h=None if _bg_corr_c is None else np.asarray(_bg_corr_c, dtype=np.float64).ravel(),
+            binned_gaussian_label=None if _bg_label_c is None else str(_bg_label_c),
+            binned_gaussian_variance_floor=None if _bg_vf_c is None else float(_bg_vf_c),
             prior_row_h_cols=None if _prior_row_h_c is None else np.asarray(_prior_row_h_c, dtype=np.float64),
             prior_row_label=None if _prior_row_label_c is None else str(_prior_row_label_c),
         )
@@ -2877,7 +3143,15 @@ def main(argv: list[str] | None = None) -> None:
 
     clf_rs = base_seed if int(args.clf_random_state) < 0 else int(args.clf_random_state)
 
-    dataset_for_gt = build_dataset_from_meta(meta)
+    meta_gt = _meta_for_gt_hellinger_mc(meta)
+    if meta_gt is not meta:
+        print(
+            "[convergence] GT Hellinger / LLR MC: using generative "
+            f"x_dim={int(meta_gt['x_dim'])} (PR latent z_dim) instead of ambient "
+            f"x_dim={int(meta.get('x_dim', meta_gt['x_dim']))}.",
+            flush=True,
+        )
+    dataset_for_gt = build_dataset_from_meta(meta_gt)
     gt_seed = base_seed if int(args.gt_hellinger_seed) < 0 else int(args.gt_hellinger_seed)
     if hasattr(dataset_for_gt, "rng"):
         dataset_for_gt.rng = np.random.default_rng(gt_seed)
@@ -2912,17 +3186,34 @@ def main(argv: list[str] | None = None) -> None:
     ref_dir = os.path.join(args.output_dir, "reference")
     os.makedirs(ref_dir, exist_ok=True)
     tfm = str(getattr(args, "theta_field_method", "theta_flow")).strip().lower()
-    if tfm == "theta_flow":
+    if tfm in ("theta_flow", "theta_flow_reg", "theta_flow_pre_post"):
         print(
             f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
             f"(flow_arch={getattr(args, 'flow_arch', 'mlp')})",
             flush=True,
         )
         print(
-            "[convergence] theta_flow mode uses ODE log-likelihood on theta-space flows "
+            f"[convergence] {tfm} mode uses ODE log-likelihood on theta-space flows "
             "(log p(theta|x) - log p(theta) via compute_likelihood; no theta-axis score integral).",
             flush=True,
         )
+        if tfm == "theta_flow_reg":
+            print(
+                "[convergence] theta_flow_reg adds binned Gaussian synthetic-pair posterior FM regularization "
+                f"lambda={float(getattr(args, 'flow_theta_reg_lambda', 0.01)):.6g} "
+                f"bins={int(getattr(args, 'flow_theta_reg_bin_n_bins', 10))} "
+                f"var_floor={float(getattr(args, 'flow_theta_reg_variance_floor', 1e-6)):.6g}.",
+                flush=True,
+            )
+        elif tfm == "theta_flow_pre_post":
+            print(
+                "[convergence] theta_flow_pre_post pretrains the posterior theta-flow on binned Gaussian "
+                "synthetic-pair regularization only, then freezes all but the readout for real-data FM "
+                f"fine-tuning (lambda={float(getattr(args, 'flow_theta_reg_lambda', 0.01)):.6g}; "
+                f"bins={int(getattr(args, 'flow_theta_reg_bin_n_bins', 10))}; "
+                f"fine_epochs={int(getattr(args, 'flow_theta_pre_post_finetune_epochs', 10000))}).",
+                flush=True,
+            )
     elif tfm == "theta_path_integral":
         print(
             f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
@@ -2984,7 +3275,7 @@ def main(argv: list[str] | None = None) -> None:
     else:
         raise ValueError(
             f"Unsupported --theta-field-method={tfm!r}; use "
-            "theta_flow, theta_path_integral, x_flow, x_flow_reg, ctsm_v, or nf."
+            "theta_flow, theta_flow_reg, theta_flow_pre_post, theta_path_integral, x_flow, x_flow_reg, ctsm_v, or nf."
         )
     print(
         "[convergence] n_ref reference: no learned H training at n_ref; matrix-panel top row = MC GT sqrt(H^2); "
@@ -3116,6 +3407,30 @@ def main(argv: list[str] | None = None) -> None:
     clf_sweep = primary_sweep.clf_sweep
     llr_sweep = primary_sweep.llr_sweep
     per_n_loss_rows = primary_sweep.per_n_loss_rows
+    binned_gaussian_label = r"$\sqrt{H^2}$, binned Gaussian"
+    binned_gaussian_variance_floor = float(
+        getattr(args, "flow_theta_reg_variance_floor", getattr(args, "flow_x_reg_variance_floor", 1e-6))
+    )
+    binned_gaussian_h_sweep: list[np.ndarray] = []
+    binned_gaussian_corr_h = np.full(len(ns), np.nan, dtype=np.float64)
+    for k, n in enumerate(ns):
+        subset_bg = _subset_bundle(
+            bundle,
+            perm,
+            int(n),
+            meta,
+            bin_idx_all=bin_idx_all,
+            theta_state_all=None,
+        )
+        bg_h2 = _binned_gaussian_hellinger_sq(
+            subset_bg,
+            n_bins,
+            variance_floor=binned_gaussian_variance_floor,
+        )
+        bg_h_sqrt = _sqrt_h_like(bg_h2)
+        binned_gaussian_h_sweep.append(np.asarray(bg_h_sqrt, dtype=np.float64))
+        binned_gaussian_corr_h[k] = vhb.matrix_corr_offdiag_pearson(bg_h_sqrt, h_gt_sqrt)
+    binned_gaussian_h_cols = np.stack(binned_gaussian_h_sweep + [h_ref], axis=0)
 
     prior_row_lambda = getattr(args, "prior_row_flow_x_reg_lambda", None)
     prior_row_sweep: PerNSweepResult | None = None
@@ -3192,6 +3507,10 @@ def main(argv: list[str] | None = None) -> None:
         "llr_binned_columns": llr_cols,
         "corr_llr_binned_vs_gt_mc": corr_llr,
         "theta_field_method": np.asarray([tfm], dtype=object),
+        "binned_gaussian_h_binned_columns": binned_gaussian_h_cols,
+        "binned_gaussian_corr_h_binned_vs_gt_mc": binned_gaussian_corr_h,
+        "binned_gaussian_variance_floor": np.float64(binned_gaussian_variance_floor),
+        "binned_gaussian_label": np.asarray([binned_gaussian_label], dtype=object),
     }
     if warm_source_lambda is not None:
         result_payload.update(
@@ -3247,6 +3566,10 @@ def main(argv: list[str] | None = None) -> None:
         visualization_only=False,
         llr_cols=llr_cols,
         corr_llr=corr_llr,
+        binned_gaussian_h_cols=binned_gaussian_h_cols,
+        binned_gaussian_corr_h=binned_gaussian_corr_h,
+        binned_gaussian_label=binned_gaussian_label,
+        binned_gaussian_variance_floor=binned_gaussian_variance_floor,
         prior_row_h_cols=prior_row_h_cols,
         prior_row_label=prior_row_label,
         prior_row_loss_rows=None if prior_row_sweep is None else prior_row_sweep.per_n_loss_rows,

@@ -46,6 +46,9 @@ from fisher.shared_fisher_est import build_dataset_from_meta, normalize_flow_arc
 # - theta_flow:mlp
 # - theta_flow:film
 # - theta_flow:film_fourier
+# - theta_flow_reg:mlp
+# - theta_flow_reg:film
+# - theta_flow_reg:film_fourier
 # - theta_path_integral:mlp
 # - theta_path_integral:film
 # - theta_path_integral:film_fourier
@@ -57,7 +60,7 @@ from fisher.shared_fisher_est import build_dataset_from_meta, normalize_flow_arc
 # - x_flow_reg:film_fourier
 # - ctsm_v
 # - nf
-_FLOW_BASED_METHODS = {"theta_flow", "theta_path_integral", "x_flow", "x_flow_reg"}
+_FLOW_BASED_METHODS = {"theta_flow", "theta_flow_reg", "theta_path_integral", "x_flow", "x_flow_reg"}
 
 
 def _normalize_theta_field_method_local(method: str) -> str:
@@ -88,7 +91,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Comma-separated theta-field methods to sweep in one run. "
             "Overrides --theta-field-method when non-empty. "
-            "Supported values: theta_flow, theta_path_integral, x_flow, x_flow_reg, ctsm_v, nf."
+            "Supported values: theta_flow, theta_flow_reg, theta_path_integral, x_flow, x_flow_reg, ctsm_v, nf."
         ),
     )
     p.add_argument(
@@ -98,7 +101,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Comma-separated theta-field row specs, highest precedence over --theta-field-methods and "
             "--theta-field-method. Tokens are method or method:arch, e.g. "
-            "theta_flow:mlp,theta_flow:film,x_flow:film_fourier,x_flow_reg:mlp,ctsm_v."
+            "theta_flow:mlp,theta_flow_reg:mlp,theta_flow:film,x_flow:film_fourier,x_flow_reg:mlp,ctsm_v."
         ),
     )
     return p
@@ -159,7 +162,7 @@ def _parse_theta_field_rows(args: argparse.Namespace) -> list[ThetaFieldRowSpec]
             if method not in _FLOW_BASED_METHODS:
                 raise ValueError(
                     f"Invalid --theta-field-rows token {tok!r}; arch suffix is only allowed for "
-                    "flow methods {theta_flow, theta_path_integral, x_flow, x_flow_reg}."
+                    "flow methods {theta_flow, theta_flow_reg, theta_path_integral, x_flow, x_flow_reg}."
                 )
         key = (method, arch)
         if key in seen:

@@ -79,6 +79,8 @@ class TestStudyHDecodingConvergenceVizOnly(unittest.TestCase):
             wall_s = np.array([1.0, 2.0], dtype=np.float64)
             llr_gt = np.full((n_bins, n_bins), 0.12, dtype=np.float64)
             llr_cols = np.full((len(ns_list) + 1, n_bins, n_bins), 0.12, dtype=np.float64)
+            binned_gaussian_h_cols = np.full((len(ns_list) + 1, n_bins, n_bins), 0.25, dtype=np.float64)
+            binned_gaussian_corr = np.array([0.7, 0.72], dtype=np.float64)
             results_npz = out_dir / "h_decoding_convergence_results.npz"
             np.savez_compressed(
                 results_npz,
@@ -104,6 +106,10 @@ class TestStudyHDecodingConvergenceVizOnly(unittest.TestCase):
                 column_n=np.asarray(ns_list + [n_ref], dtype=np.int64),
                 gt_mean_llr_one_sided_mc=llr_gt,
                 llr_binned_columns=llr_cols,
+                binned_gaussian_h_binned_columns=binned_gaussian_h_cols,
+                binned_gaussian_corr_h_binned_vs_gt_mc=binned_gaussian_corr,
+                binned_gaussian_variance_floor=np.float64(1e-6),
+                binned_gaussian_label=np.asarray([r"$\sqrt{H^2}$, binned Gaussian"], dtype=object),
             )
             loss_dir = out_dir / "training_losses"
             loss_dir.mkdir()
@@ -150,6 +156,12 @@ class TestStudyHDecodingConvergenceVizOnly(unittest.TestCase):
             self.assertTrue((out_dir / "h_decoding_convergence_combined.png").is_file())
             self.assertTrue((out_dir / "h_decoding_training_losses_panel.png").is_file())
             self.assertTrue((out_dir / "h_decoding_convergence_summary.txt").is_file())
+            summary = (out_dir / "h_decoding_convergence_summary.txt").read_text(encoding="utf-8")
+            self.assertIn("binned_gaussian_h_binned_columns", summary)
+            self.assertIn("binned_gaussian_corr_h_binned_vs_gt_mc", summary)
+            csv_text = (out_dir / "h_decoding_convergence_results.csv").read_text(encoding="utf-8")
+            self.assertIn("corr_binned_gaussian_h_binned_vs_gt_mc", csv_text.splitlines()[0])
+            self.assertIn("0.7", csv_text)
 
 
 if __name__ == "__main__":

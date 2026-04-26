@@ -111,7 +111,9 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         help=(
             "Likelihood-ratio field method: theta_flow (theta-space flow ODE log-likelihood Bayes ratios "
             "log p(theta|x)-log p(theta)), theta_path_integral (velocity-to-score plus trapezoid integral "
-            "along sorted theta), x_flow (conditional x-space flow ODE log p(x|theta)), "
+            "along sorted theta), theta_flow_reg (theta_flow with binned Gaussian synthetic-pair regularization), "
+            "theta_flow_pre_post (regularization-only pretraining then readout-only data fine-tuning), "
+            "x_flow (conditional x-space flow ODE log p(x|theta)), "
             "x_flow_reg (x_flow with KNN Gaussian velocity-prior regularization), or "
             "ctsm_v (pair-conditioned CTSM-v time-score integration)."
         ),
@@ -275,6 +277,45 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
             "-mean log p(theta|x) likelihood term."
         ),
     )
+    p.add_argument(
+        "--flow-theta-reg-lambda",
+        type=float,
+        default=0.01,
+        help="theta_flow_reg only: weight for binned Gaussian synthetic-pair theta-flow regularization.",
+    )
+    p.add_argument(
+        "--flow-theta-reg-bin-n-bins",
+        type=int,
+        default=10,
+        help="theta_flow_reg only: number of equal-width theta bins for the fitted p(x|theta) Gaussian estimate.",
+    )
+    p.add_argument(
+        "--flow-theta-reg-variance-floor",
+        type=float,
+        default=1e-6,
+        help="theta_flow_reg only: minimum diagonal variance for the fitted binned Gaussian p(x|theta).",
+    )
+    p.add_argument(
+        "--flow-theta-pre-post-pretrain-epochs",
+        type=int,
+        default=None,
+        help=(
+            "theta_flow_pre_post only: posterior pretraining epochs for the regularization-only stage. "
+            "Default: --flow-epochs."
+        ),
+    )
+    p.add_argument(
+        "--flow-theta-pre-post-finetune-epochs",
+        type=int,
+        default=10000,
+        help="theta_flow_pre_post only: readout-only data fine-tuning epochs after regularization pretraining.",
+    )
+    p.add_argument(
+        "--flow-theta-pre-post-finetune-lr",
+        type=float,
+        default=None,
+        help="theta_flow_pre_post only: readout-only fine-tuning learning rate. Default: --flow-lr.",
+    )
     p.add_argument("--flow-hidden-dim", type=int, default=128)
     p.add_argument("--flow-depth", type=int, default=3)
     p.add_argument(
@@ -390,7 +431,8 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         default="mlp",
         choices=["mlp", "soft_moe", "film", "film_fourier"],
         help=(
-            "Flow architecture shared by theta_flow, theta_path_integral, x_flow, and x_flow_reg: "
+            "Flow architecture shared by theta_flow, theta_flow_reg, theta_flow_pre_post, "
+            "theta_path_integral, x_flow, and x_flow_reg: "
             "mlp, soft_moe (dense soft gating over MLP experts), "
             "film (FiLM blocks with embedded raw theta), or "
             "film_fourier (FiLM blocks with Fourier theta features)."
