@@ -44,6 +44,29 @@ class TestSingleNHeimThetaFlowScript(unittest.TestCase):
         expected = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=np.float64)
         np.testing.assert_allclose(out, expected, atol=1e-12, rtol=0.0)
 
+    def test_write_h_sqrt_heim_row_figure_includes_mds2_row(self) -> None:
+        h = np.ones((2, 2), dtype=np.float64) * 0.3
+        hgt = np.ones((2, 2), dtype=np.float64) * 0.4
+        stages: list[tuple[str, np.ndarray, float]] = [("HeIM init", h, 0.1), ("HeIM iter 0", h * 0.9, 0.2)]
+        hist = np.array(
+            [
+                [[0.0, 0.0], [1.0, 0.0]],
+                [[0.1, 0.1], [0.9, 0.1]],
+            ],
+            dtype=np.float64,
+        )
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "h_theta_flow_heim_iter_row.png"
+            p, s = single_theta_heim._write_h_sqrt_heim_row_figure(
+                out_png=str(out),
+                stage_entries=stages,
+                h_gt_sqrt=hgt,
+                history_embedding=hist,
+            )
+            self.assertTrue(Path(p).is_file())
+            self.assertTrue(Path(s).is_file())
+            self.assertTrue(out.with_suffix(".svg").is_file())
+
     def test_bayes_iteration_visualization_writes_csv_and_figures(self) -> None:
         n_bins = 2
         n = 4

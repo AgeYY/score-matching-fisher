@@ -6,6 +6,7 @@ from __future__ import annotations
 import csv
 import os
 import sys
+import time
 from pathlib import Path
 
 _repo_root = Path(__file__).resolve().parent.parent
@@ -15,6 +16,7 @@ if str(_repo_root) not in sys.path:
 if str(_bin_dir) not in sys.path:
     sys.path.insert(0, str(_bin_dir))
 
+import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -119,6 +121,149 @@ def _write_matrix_panel(
     return out_svg
 
 
+def _embedding_2d_for_h_stage(
+    *, stage_index: int, history_embedding: np.ndarray
+) -> np.ndarray | None:
+    """MDS $z$ used to pair with the H-maps per column: `history_embedding[k,:,:]` (bin$\times$mds_dim)."""
+    h = np.asarray(history_embedding, dtype=np.float64)
+    if h.ndim != 3 or h.shape[0] < 1 or h.shape[-1] != 2 or h.size == 0:
+        return None
+    mds_i = 0 if int(stage_index) <= 1 else int(stage_index) - 1
+    if mds_i >= h.shape[0]:
+        return None
+    return np.asarray(h[mds_i], dtype=np.float64).reshape(-1, 2)
+
+
+def _embedding_xy_limits(emb_2d_list: list[np.ndarray | None], *, pad_frac: float = 0.12) -> tuple[float, float, float, float]:
+    pts: list[np.ndarray] = []
+    for e in emb_2d_list:
+        if e is None or e.size < 1:
+            continue
+        a = np.asarray(e, dtype=np.float64).reshape(-1, 2)
+        ok = np.isfinite(a).all(axis=1)
+        if np.any(ok):
+            pts.append(a[ok])
+    if not pts:
+        return -1.0, 1.0, -1.0, 1.0
+    allp = np.concatenate(pts, axis=0)
+    xlo, xhi = float(np.min(allp[:, 0])), float(np.max(allp[:, 0]))
+    ylo, yhi = float(np.min(allp[:, 1])), float(np.max(allp[:, 1]))
+    span = max(xhi - xlo, yhi - ylo, 1e-9)
+    pad = float(pad_frac) * span
+    return xlo - pad, xhi + pad, ylo - pad, yhi + pad
+
+
+def _write_h_sqrt_heim_row_figure(
+    *,
+    out_png: str,
+    stage_entries: list[tuple[str, np.ndarray, float]],
+    h_gt_sqrt: np.ndarray,
+    history_embedding: np.ndarray | None = None,
+) -> tuple[str, str]:
+    """H/GT row (as before); optional second row: 2D MDS per stage when $r=2$ and `history_embedding` is stored."""
+    h_gt = np.asarray(h_gt_sqrt, dtype=np.float64)
+    mats: list[np.ndarray] = [np.asarray(h, dtype=np.float64) for _, h, _ in stage_entries] + [h_gt]
+    vals = np.concatenate([m.ravel() for m in mats if m.size > 0], axis=0) if mats else np.array([0.0], dtype=np.float64)
+    finite = vals[np.isfinite(vals)]
+    vmax = float(np.max(finite)) if finite.size else 0.0
+    if (not np.isfinite(vmax)) or vmax <= 0.0:
+        vmax = 1.0
+    ncols = int(len(stage_entries) + 1)
+    w = 2.65 * ncols
+
+    use_mds2 = bool(
+        history_embedding is not None
+        and np.asarray(history_embedding).size > 0
+        and int(np.asarray(history_embedding).ndim) == 3
+        and int(np.asarray(history_embedding).shape[-1]) == 2
+    )
+    mds2_for_stage: list[np.ndarray | None] = [
+        _embedding_2d_for_h_stage(
+            stage_index=s,
+            history_embedding=np.asarray(history_embedding, dtype=np.float64),  # type: ignore[arg-type]
+        )
+        for s in range(len(stage_entries))
+    ] if use_mds2 else [None] * len(stage_entries)
+    xlo, xhi, ylo, yhi = _embedding_xy_limits(
+        mds2_for_stage if use_mds2 else [],
+    )
+
+    ax_bot: list | None = None
+    if use_mds2:
+        fig, g2 = plt.subplots(2, ncols, figsize=(w, 3.15 + 2.85), constrained_layout=True, height_ratios=[1.0, 0.95])
+        g2m = np.asarray(g2, dtype=object).reshape(2, ncols)
+        ax_list = [g2m[0, j] for j in range(ncols)]
+        ax_bot = [g2m[1, j] for j in range(ncols)]
+    else:
+        fig, axes1 = plt.subplots(1, ncols, figsize=(w, 3.25), constrained_layout=True)
+        a1m = np.atleast_1d(np.asarray(axes1, dtype=object)).reshape(-1)
+        ax_list = [a1m[j] for j in range(ncols)]
+    norm = mcolors.Normalize(vmin=0.0, vmax=vmax, clip=False)
+    mappable_last = None
+    for j, (label, h, r) in enumerate(stage_entries):
+        title = rf"{label}  $r$={float(r):.4f}"
+        axt = ax_list[j]
+        mappable_last = axt.imshow(
+            np.asarray(h, dtype=np.float64), origin="lower", norm=norm, cmap="viridis", interpolation="nearest"
+        )
+        axt.set_title(title, fontsize=10)
+        axt.set_xlabel(r"$\theta$ bin")
+        if j == 0:
+            axt.set_ylabel(r"$\theta$ bin")
+    j_gt = len(stage_entries)
+    mappable_last = ax_list[j_gt].imshow(
+        h_gt, origin="lower", norm=norm, cmap="viridis", interpolation="nearest"
+    )
+    ax_list[j_gt].set_title(r"GT MC $\sqrt{H^2}$", fontsize=10)
+    ax_list[j_gt].set_xlabel(r"$\theta$ bin")
+    if j_gt == 0:
+        ax_list[j_gt].set_ylabel(r"$\theta$ bin")
+    fig.colorbar(
+        mappable_last, ax=ax_list, fraction=0.04, pad=0.04, label=r"$\sqrt{H^2}$"
+    )
+    if use_mds2 and ax_bot is not None:
+        for s in range(len(stage_entries)):
+            bax = ax_bot[s]
+            emb2 = mds2_for_stage[s] if s < len(mds2_for_stage) else None
+            if emb2 is not None and int(emb2.shape[0]) >= 1:
+                bax.scatter(emb2[:, 0], emb2[:, 1], s=14, c="#1f77b4", edgecolors="none", alpha=0.85, zorder=1)
+                for b in range(int(emb2.shape[0])):
+                    bax.annotate(
+                        str(b),
+                        (float(emb2[b, 0]), float(emb2[b, 1])),
+                        textcoords="offset points",
+                        xytext=(3, 3),
+                        fontsize=7,
+                        alpha=0.85,
+                    )
+            else:
+                bax.text(0.5, 0.5, "MDS missing", transform=bax.transAxes, ha="center", va="center", fontsize=9, color="gray")
+            bax.set_xlabel(r"MDS$_1$")
+            if s == 0:
+                bax.set_ylabel(r"MDS$_2$ (bin emb.)")
+            bax.set_xlim(xlo, xhi)
+            bax.set_ylim(ylo, yhi)
+            bax.set_aspect("equal", adjustable="box")
+        bg = ax_bot[j_gt]
+        bg.axis("off")
+        bg.text(
+            0.5,
+            0.5,
+            "GT: no MDS",
+            transform=bg.transAxes,
+            ha="center",
+            va="center",
+            fontsize=10,
+            color="0.3",
+        )
+    out_svg = str(Path(out_png).with_suffix(".svg"))
+    os.makedirs(os.path.dirname(os.path.abspath(out_png)) or ".", exist_ok=True)
+    fig.savefig(out_png, dpi=220)
+    fig.savefig(out_svg)
+    plt.close(fig)
+    return out_png, out_svg
+
+
 def _render_h_iteration_visualizations(
     *,
     output_dir: str,
@@ -128,7 +273,7 @@ def _render_h_iteration_visualizations(
     n_train: int,
     bin_validation: np.ndarray,
     h_gt_sqrt: np.ndarray,
-) -> list[dict[str, str]]:
+) -> tuple[list[dict[str, str]], str, str]:
     heim_npz = os.path.join(output_dir, "heim_flow_iterations.npz")
     if not os.path.isfile(heim_npz):
         raise FileNotFoundError(f"Expected HeIM iteration archive not found: {heim_npz}")
@@ -136,13 +281,19 @@ def _render_h_iteration_visualizations(
     init_h2 = np.asarray(z["init_h2"], dtype=np.float64)
     rel_hist = np.asarray(z["rel_change_history"], dtype=np.float64).reshape(-1)
     iters_done = int(np.asarray(z["heim_iters_completed"]).reshape(-1)[0]) if "heim_iters_completed" in z.files else int(rel_hist.size)
+    if "history_embedding" in z.files and np.asarray(z["history_embedding"]).size > 0:
+        he_hist: np.ndarray | None = np.asarray(z["history_embedding"], dtype=np.float64)
+    else:
+        he_hist = None
 
     viz_dir = os.path.join(output_dir, "heim_flow_iter_viz")
     os.makedirs(viz_dir, exist_ok=True)
     rows: list[dict[str, str]] = []
+    stage_entries: list[tuple[str, np.ndarray, float]] = []
 
     init_sqrt = shc._sqrt_h_like(init_h2)
     corr_init = float(shc.vhb.matrix_corr_offdiag_pearson(init_sqrt, h_gt_sqrt))
+    stage_entries.append(("HeIM init", init_sqrt, corr_init))
     init_stem = _iter_stem(n=n, label="iter_init", kind="h")
     init_png = os.path.join(viz_dir, f"{init_stem}.png")
     init_svg = single_x_heim._write_iteration_matrix_panel(
@@ -174,6 +325,7 @@ def _render_h_iteration_visualizations(
             n_bins=n_bins,
         )
         corr_k = float(shc.vhb.matrix_corr_offdiag_pearson(h_k_sqrt, h_gt_sqrt))
+        stage_entries.append((f"HeIM iter {int(k)}", h_k_sqrt, corr_k))
         stem = _iter_stem(n=n, label=f"iter_{k:03d}", kind="h")
         out_png = os.path.join(viz_dir, f"{stem}.png")
         out_svg = single_x_heim._write_iteration_matrix_panel(
@@ -195,6 +347,14 @@ def _render_h_iteration_visualizations(
             }
         )
 
+    out_row_png = os.path.join(viz_dir, f"h_theta_flow_heim_iter_row_n_{int(n):06d}.png")
+    row_png, row_svg = _write_h_sqrt_heim_row_figure(
+        out_png=out_row_png,
+        stage_entries=stage_entries,
+        h_gt_sqrt=np.asarray(h_gt_sqrt, dtype=np.float64),
+        history_embedding=he_hist,
+    )
+
     csv_path = os.path.join(output_dir, "heim_flow_iteration_metrics.csv")
     with open(csv_path, "w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(
@@ -203,7 +363,7 @@ def _render_h_iteration_visualizations(
         )
         w.writeheader()
         w.writerows(rows)
-    return rows
+    return rows, row_png, row_svg
 
 
 def _render_bayes_iteration_visualizations(
@@ -311,6 +471,16 @@ def main(argv: list[str] | None = None) -> None:
     n_pool = int(bundle.theta_all.shape[0])
     if n < 1 or n > n_pool:
         raise ValueError(f"--n must satisfy 1 <= n <= n_total={n_pool}; got n={n}.")
+    n_ref = int(args.n_ref)
+    if n_pool < n_ref:
+        raise ValueError(
+            f"Dataset has n_total={n_pool} but --n-ref={n_ref} requires n_total >= n_ref "
+            "(generative GT Hellinger MC matches study_h_decoding_convergence.py)."
+        )
+    if n > n_ref:
+        raise ValueError(
+            f"Require n <= --n-ref for nested-subset agreement with the convergence study; got n={n} n_ref={n_ref}."
+        )
 
     n_bins = int(args.num_theta_bins)
     base_seed = int(args.run_seed) if args.run_seed is not None else int(meta["seed"])
@@ -347,11 +517,12 @@ def main(argv: list[str] | None = None) -> None:
     if hasattr(dataset_for_gt, "rng"):
         dataset_for_gt.rng = np.random.default_rng(gt_seed)
     centers = shc.bin_centers_from_edges(edges)
-    gt_n_mc = int(n_validation) // n_bins
+    gt_n_mc = int(n_ref) // n_bins
     if gt_n_mc < 1:
         raise ValueError(
-            f"Need n_validation//num_theta_bins >= 1 for GT MC; got n_validation={n_validation} n_bins={n_bins}."
+            f"Need n_ref//num_theta_bins >= 1 for GT MC; got n_ref={n_ref} n_bins={n_bins} (same as study_h_decoding_convergence.py)."
         )
+    t_gta = time.time()
     h_gt_mc = shc.estimate_hellinger_sq_one_sided_mc(
         dataset_for_gt,
         centers,
@@ -359,6 +530,12 @@ def main(argv: list[str] | None = None) -> None:
         symmetrize=bool(args.gt_hellinger_symmetrize),
     )
     h_gt_sqrt = shc._sqrt_h_like(h_gt_mc)
+    print(
+        f"[single-n-heim-theta-flow] GT Hellinger (MC likelihood) n_bins={n_bins} n_mc={int(gt_n_mc)} "
+        f"(n_ref={int(n_ref)}  n_bins*n_mc={n_bins * int(gt_n_mc)})  wall: {time.time() - t_gta:.1f}s  "
+        f"(learned H still validation-only; correlation vs GT)",
+        flush=True,
+    )
 
     _h2_final, _clf_n, _loaded_final, _x_aligned = shc._run_heim_flow_for_subset(
         args=args,
@@ -391,7 +568,7 @@ def main(argv: list[str] | None = None) -> None:
         h_gt_sqrt=h_gt_sqrt,
         corr_h=corr_final,
     )
-    iter_rows = _render_h_iteration_visualizations(
+    iter_rows, h_iter_row_png, h_iter_row_svg = _render_h_iteration_visualizations(
         output_dir=args.output_dir,
         n=int(n),
         dataset_family=str(args.dataset_family),
@@ -422,7 +599,11 @@ def main(argv: list[str] | None = None) -> None:
         train_frac_used=np.float64(float(FORCED_TRAIN_FRAC)),
         n_train=np.int64(int(n_train)),
         n_validation=np.int64(int(n_validation)),
-        hellinger_eval_pool=np.asarray(["validation_only"], dtype=object),
+        gt_hellinger_n_ref_budget=np.int64(int(n_ref)),
+        hellinger_eval_pool=np.asarray(
+            ["model:validation_binned_h; gt:generative_mc_n_ref"],
+            dtype=object,
+        ),
         log_likelihood_semantics=np.asarray(["log_p_x_given_theta_minus_log_p_x"], dtype=object),
         rel_change_history=np.asarray(z_heim["rel_change_history"], dtype=np.float64),
         heim_iters_requested=np.asarray(z_heim["heim_iters_requested"]).reshape(-1)[0],
@@ -442,12 +623,15 @@ def main(argv: list[str] | None = None) -> None:
         sf.write(f"n_train: {int(n_train)}\n")
         sf.write(f"n_validation: {int(n_validation)}\n")
         sf.write(f"num_theta_bins: {int(n_bins)}\n")
-        sf.write("hellinger_eval_pool: validation_only\n")
+        sf.write(f"n_ref: {int(n_ref)}  # same role as study_h_decoding_convergence --n-ref; GT uses n_mc = n_ref//num_theta_bins\n")
+        sf.write("hellinger_eval_pool: model binned H from validation; GT from generative MC (n_ref budget, like convergence)\n")
         sf.write(f"heim_distance_transform: {heim_distance_transform}\n")
         sf.write("heim_embedding_distance: Bhattacharyya D=-log(1-H^2)\n")
         sf.write("heim_h_diagnostics: H panels remain sqrt(H^2) for GT Hellinger comparison\n")
         sf.write(f"theta_bin_source: {theta_bin_source}\n")
-        sf.write(f"gt_hellinger_n_mc: {int(gt_n_mc)}\n")
+        sf.write(f"gt_hellinger_n_mc: {int(gt_n_mc)}  # per bin row; floor(n_ref/num_theta_bins)\n")
+        sf.write(f"gt_hellinger_n_ref_budget: {int(n_ref)}\n")
+        sf.write(f"gt_hellinger_n_bins_times_n_mc: {int(n_bins) * int(gt_n_mc)}  # may be < n_ref\n")
         sf.write(f"gt_hellinger_seed: {int(gt_seed)}\n")
         sf.write(f"corr_h_vs_gt_offdiag_pearson_final: {float(corr_final):.6g}\n")
         sf.write("log_likelihood_semantics: log p(theta|x) - log p(theta) = log p(x|theta) - log p(x)\n")
@@ -458,12 +642,16 @@ def main(argv: list[str] | None = None) -> None:
         sf.write(f"iteration_metrics_csv: {os.path.join(args.output_dir, 'heim_flow_iteration_metrics.csv')}\n")
         sf.write(f"bayes_iteration_metrics_csv: {os.path.join(args.output_dir, 'heim_flow_bayes_iteration_metrics.csv')}\n")
         sf.write(f"iteration_viz_count: {len(iter_rows)}\n")
+        sf.write(f"h_iter_row_figure_png: {h_iter_row_png}\n")
+        sf.write(f"h_iter_row_figure_svg: {h_iter_row_svg}\n")
         sf.write(f"bayes_iteration_viz_count: {len(bayes_rows)}\n")
 
     print("[single-n-heim-theta-flow] Saved:")
     print(f"  - {fig_png}")
     print(f"  - {fig_svg}")
     print(f"  - {os.path.join(args.output_dir, 'heim_flow_iter_viz')}/")
+    print(f"  - {h_iter_row_png}")
+    print(f"  - {h_iter_row_svg}")
     print(f"  - {os.path.join(args.output_dir, 'heim_flow_iteration_metrics.csv')}")
     print(f"  - {os.path.join(args.output_dir, 'heim_flow_bayes_iteration_metrics.csv')}")
     print(f"  - {out_npz}")

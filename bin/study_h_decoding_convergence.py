@@ -1486,6 +1486,10 @@ def _run_heim_flow_for_subset(
         shutil.copy2(final_loss_npz, os.path.join(output_dir, "score_prior_training_losses.npz"))
 
     heim_npz = os.path.join(output_dir, "heim_flow_iterations.npz")
+    hist_embed = heim_out.history_embedding
+    history_embedding_arr = (
+        np.stack([np.asarray(z, dtype=np.float64) for z in hist_embed], axis=0) if len(hist_embed) else np.zeros((0, int(n_bins), int(mds_eff)), dtype=np.float64)
+    )
     np.savez_compressed(
         heim_npz,
         init_h2=np.asarray(heim_out.init_h2, dtype=np.float64),
@@ -1493,6 +1497,7 @@ def _run_heim_flow_for_subset(
         final_d=np.asarray(heim_out.final_d, dtype=np.float64),
         final_embedding=np.asarray(heim_out.final_embedding, dtype=np.float64),
         final_theta_state_all=np.asarray(heim_out.final_theta_state_all, dtype=np.float64),
+        history_embedding=np.asarray(history_embedding_arr, dtype=np.float64),
         rel_change_history=np.asarray(heim_out.rel_change_history, dtype=np.float64),
         heim_iters_requested=np.int64(iters_req),
         heim_iters_effective_budget=np.int64(cfg.n_iters),
