@@ -2036,13 +2036,15 @@ def run_shared_fisher_estimation(
         theta_h_matrix = np.asarray(theta_all, dtype=np.float64)
         x_h_matrix = np.asarray(x_all, dtype=np.float64)
         h_eval = 1.0
+        _flow_ex_div = bool(getattr(args, "flow_likelihood_exact_divergence", False))
         print(
             "[h_matrix] "
             f"enabled=True field={theta_field_method} "
             f"flow_ode_t_span={h_eval:.6f} "
             f"n_theta_x={int(theta_h_matrix.shape[0])} (train+validation full pool) "
             f"restore_original_order={bool(getattr(args, 'h_restore_original_order', False))} "
-            f"pair_batch_size={int(getattr(args, 'h_batch_size', 65536))}"
+            f"pair_batch_size={int(getattr(args, 'h_batch_size', 65536))} "
+            f"flow_likelihood_exact_divergence={_flow_ex_div}"
         )
         h_estimator = HMatrixEstimator(
             model_post=x_flow_model,
@@ -2052,6 +2054,7 @@ def run_shared_fisher_estimation(
             pair_batch_size=int(getattr(args, "h_batch_size", 65536)),
             field_method="flow_x_likelihood",
             flow_scheduler=str(getattr(args, "flow_scheduler", "cosine")),
+            flow_likelihood_exact_divergence=_flow_ex_div,
         )
         h_result = h_estimator.run(
             theta=theta_h_matrix,
@@ -2628,6 +2631,7 @@ def run_shared_fisher_estimation(
             h_eval = flow_eval_t
             _h_field = "theta_flow" if theta_field_method == "theta_flow" else "theta_path_integral"
             _post_only = bool(getattr(args, "theta_flow_posterior_only_likelihood", False))
+            _flow_ex_div = bool(getattr(args, "flow_likelihood_exact_divergence", False))
             print(
                 "[h_matrix] "
                 f"enabled=True field={_h_field} "
@@ -2636,6 +2640,7 @@ def run_shared_fisher_estimation(
                 f"restore_original_order={bool(getattr(args, 'h_restore_original_order', False))} "
                 f"pair_batch_size={int(getattr(args, 'h_batch_size', 65536))}"
                 f" theta_flow_posterior_only_likelihood={_post_only}"
+                f" flow_likelihood_exact_divergence={_flow_ex_div}"
             )
             h_estimator = HMatrixEstimator(
                 model_post=post_model,
@@ -2646,6 +2651,7 @@ def run_shared_fisher_estimation(
                 field_method=_h_field,
                 flow_scheduler=str(getattr(args, "flow_scheduler", "cosine")),
                 theta_flow_posterior_only_likelihood=_post_only,
+                flow_likelihood_exact_divergence=_flow_ex_div,
             )
             h_result = h_estimator.run(
                 theta=theta_h_matrix,

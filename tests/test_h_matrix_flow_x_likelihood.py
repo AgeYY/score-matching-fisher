@@ -126,6 +126,35 @@ class TestHMatrixFlowXLikelihood(unittest.TestCase):
         args = parser.parse_args(["--theta-field-method", "x_flow", "--flow-arch", "mlp"])
         validate_estimation_args(args)
 
+    def test_validate_estimation_args_accepts_flow_likelihood_exact_divergence_flag(self) -> None:
+        parser = argparse.ArgumentParser()
+        add_estimation_arguments(parser)
+        args = parser.parse_args(
+            ["--theta-field-method", "x_flow", "--flow-arch", "mlp", "--flow-likelihood-exact-divergence"]
+        )
+        validate_estimation_args(args)
+        self.assertTrue(bool(getattr(args, "flow_likelihood_exact_divergence", False)))
+
+    def test_flow_x_exact_divergence_smoke(self) -> None:
+        post = _ThetaInvariantXFlow()
+        est = HMatrixEstimator(
+            model_post=post,
+            model_prior=None,
+            sigma_eval=1.0,
+            device=torch.device("cpu"),
+            pair_batch_size=64,
+            field_method="flow_x_likelihood",
+            flow_scheduler="cosine",
+            flow_ode_steps=12,
+            flow_likelihood_exact_divergence=True,
+        )
+        theta = np.linspace(-0.5, 0.5, 4, dtype=np.float64).reshape(-1, 1)
+        x = np.stack([np.sin(theta.reshape(-1)), np.cos(theta.reshape(-1)), 0.1 * theta.reshape(-1)], axis=1).astype(
+            np.float64
+        )
+        out = est.run(theta=theta, x=x, restore_original_order=False)
+        self.assertTrue(np.isfinite(out.c_matrix).all())
+
     def test_validate_rejects_legacy_flow_score_arch_indep_mlp(self) -> None:
         parser = argparse.ArgumentParser()
         add_estimation_arguments(parser)

@@ -118,6 +118,7 @@ class HMatrixEstimator:
         field_method: str = "dsm",
         flow_scheduler: str = "cosine",
         flow_ode_steps: int = 64,
+        flow_likelihood_exact_divergence: bool = False,
         ctsm_int_n_time: int = 300,
         ctsm_t_eps: float = 1e-5,
         theta_flow_posterior_only_likelihood: bool = False,
@@ -188,6 +189,7 @@ class HMatrixEstimator:
             raise ValueError("ctsm_t_eps must be in [0, 0.5).")
         self.ctsm_int_n_time = int(ctsm_int_n_time)
         self.ctsm_t_eps = float(ctsm_t_eps)
+        self.flow_likelihood_exact_divergence = bool(flow_likelihood_exact_divergence)
         self.flow_likelihood_method = "midpoint"
         self._flow_path = (
             _make_flow_matching_path(self.flow_scheduler)
@@ -402,7 +404,7 @@ class HMatrixEstimator:
                 step_size=None,
                 method=self.flow_likelihood_method,
                 time_grid=time_grid,
-                exact_divergence=False,
+                exact_divergence=self.flow_likelihood_exact_divergence,
                 enable_grad=False,
                 x_cond=x_t,
             )
@@ -419,7 +421,7 @@ class HMatrixEstimator:
                     step_size=None,
                     method=self.flow_likelihood_method,
                     time_grid=time_grid,
-                    exact_divergence=False,
+                    exact_divergence=self.flow_likelihood_exact_divergence,
                     enable_grad=False,
                 )
                 log_prior_block = log_prior.reshape(b, n).detach().cpu().numpy().astype(np.float64)
@@ -458,7 +460,7 @@ class HMatrixEstimator:
                 step_size=None,
                 method=self.flow_likelihood_method,
                 time_grid=time_grid,
-                exact_divergence=False,
+                exact_divergence=self.flow_likelihood_exact_divergence,
                 enable_grad=False,
                 theta_cond=theta_t,
             )

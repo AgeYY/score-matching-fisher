@@ -811,6 +811,65 @@ def _metrics_fixed_edges(
     return h_binned, clf_acc
 
 
+def _binned_gaussian_hellinger_sq(
+    subset: SweepSubset,
+    n_bins: int,
+    *,
+    variance_floor: float = 1e-6,
+) -> np.ndarray:
+    r"""Binned-Gaussian ``H^2`` estimate using per-bin means and shared diagonal variance.
+
+    This no-flow diagnostic fits ``p(x | bin(theta)=b) = N(mu_b, diag(global_var))``
+    from the subset full pool, then computes the closed-form shared-covariance
+    Gaussian Hellinger distance.
+    """
+    x_all = np.asarray(subset.bundle.x_all, dtype=np.float64)
+    bin_all = np.asarray(subset.bin_all, dtype=np.int64).reshape(-1)
+    nb = int(n_bins)
+    vf = float(variance_floor)
+    if x_all.ndim != 2:
+        raise ValueError("x_all must be 2D.")
+    if x_all.shape[0] != bin_all.shape[0]:
+        raise ValueError("x_all and bin_all must have the same number of rows.")
+    if nb < 1:
+        raise ValueError("n_bins must be >= 1.")
+    if not np.isfinite(vf) or vf <= 0.0:
+        raise ValueError("variance_floor must be a finite positive number.")
+
+    x_dim = int(x_all.shape[1])
+    means = np.zeros((nb, x_dim), dtype=np.float64)
+    counts = np.bincount(np.clip(bin_all, 0, nb - 1), minlength=nb).astype(np.int64)
+    for b in range(nb):
+        idx = np.flatnonzero(bin_all == b)
+        if idx.size > 0:
+            means[b] = np.mean(x_all[idx], axis=0)
+
+    nonempty = counts > 0
+    nonempty_idx = np.flatnonzero(nonempty)
+    out = np.full((nb, nb), np.nan, dtype=np.float64)
+    np.fill_diagonal(out, 0.0)
+    if nonempty_idx.size == 0:
+        return out
+    for b in np.flatnonzero(~nonempty):
+        nearest = int(nonempty_idx[np.argmin(np.abs(nonempty_idx - int(b)))])
+        means[int(b)] = means[nearest]
+
+    train_means = means[np.clip(bin_all, 0, nb - 1)]
+    global_var = np.maximum(np.mean((x_all - train_means) ** 2, axis=0), vf)
+    inv_var = 1.0 / global_var
+    for i in range(nb):
+        for j in range(i + 1, nb):
+            diff = means[i] - means[j]
+            maha2 = float(np.sum(diff * diff * inv_var))
+            if not np.isfinite(maha2):
+                continue
+            h2_ij = 1.0 - float(np.exp(-0.125 * max(0.0, maha2)))
+            h2_ij = float(np.clip(h2_ij, 0.0, 1.0))
+            out[i, j] = h2_ij
+            out[j, i] = h2_ij
+    return out
+
+
 def _pairwise_clf_from_bundle(
     *,
     args: argparse.Namespace,
@@ -1785,6 +1844,8 @@ def _save_combined_convergence_figure(
     llr_gt: np.ndarray | None = None,
     llr_est_mats: list[np.ndarray] | None = None,
     corr_llr: np.ndarray | None = None,
+    binned_gaussian_corr_h: np.ndarray | None = None,
+    extra_h_rows: list[tuple[str, list[np.ndarray]]] | None = None,
 ) -> str:
     """Single figure with matrix panel, correlation curves, H and LLR est-vs-GT scatters, losses, and optional diagnostic.
 
@@ -1804,7 +1865,8 @@ def _save_combined_convergence_figure(
     n_loss_cols = len(ns)
     want_ft = _loss_dir_has_any_likelihood_finetune(list(ns), loss_dir)
     n_loss_rows = 4 if want_ft else 2
-    m_w, m_h = 2.8 * n_cols, 5.0
+    n_matrix_rows = 2 + len(extra_h_rows or [])
+    m_w, m_h = 2.8 * n_cols, 2.5 * n_matrix_rows
     l_w, l_h = max(2.6 * n_loss_cols, 6.0), 5.8 * (n_loss_rows / 2.0)
     top_h = float(m_h)
     bot_h = float(l_h)
@@ -1847,11 +1909,11 @@ def _save_combined_convergence_figure(
         width_ratios=[m_w, top_h * (float(crv_w) / float(crv_h))],
         height_ratios=height_rows,
     )
-    gs_left = gs0[0, 0].subgridspec(2, n_cols)
-    axes_m = np.empty((2, n_cols), dtype=object)
-    for c in range(n_cols):
-        axes_m[0, c] = fig.add_subplot(gs_left[0, c])
-        axes_m[1, c] = fig.add_subplot(gs_left[1, c])
+    gs_left = gs0[0, 0].subgridspec(n_matrix_rows, n_cols)
+    axes_m = np.empty((n_matrix_rows, n_cols), dtype=object)
+    for r in range(n_matrix_rows):
+        for c in range(n_cols):
+            axes_m[r, c] = fig.add_subplot(gs_left[r, c])
     _populate_matrix_panel_axes(
         axes_m,
         h_mats=h_mats,
@@ -1859,6 +1921,7 @@ def _save_combined_convergence_figure(
         col_labels=col_labels,
         n_bins=n_bins,
         theta_centers=theta_centers,
+        extra_h_rows=extra_h_rows,
     )
     ax_c = fig.add_subplot(gs0[0, 1])
     _populate_convergence_curve_ax(
@@ -1866,6 +1929,7 @@ def _save_combined_convergence_figure(
         list(ns),
         corr_h,
         corr_clf,
+        binned_gaussian_corr_h=binned_gaussian_corr_h,
         tick_labelsize=13.0,
         axis_labelsize=13.0,
         legend_fontsize=10.0,
@@ -2137,8 +2201,9 @@ def _populate_matrix_panel_axes(
     col_labels: list[str],
     n_bins: int,
     theta_centers: np.ndarray,
+    extra_h_rows: list[tuple[str, list[np.ndarray]]] | None = None,
 ) -> None:
-    """Draw 2 × n_cols heatmaps on existing axes (shared with standalone matrix panel + combined figure)."""
+    """Draw H rows plus pairwise decoding on existing axes."""
     tc = np.asarray(theta_centers, dtype=np.float64).ravel()
     if int(tc.size) != int(n_bins):
         raise ValueError(f"theta_centers length {tc.size} must match n_bins={n_bins}.")
@@ -2152,8 +2217,11 @@ def _populate_matrix_panel_axes(
     n_cols = len(h_mats)
     if n_cols != len(clf_mats) or n_cols != len(col_labels):
         raise ValueError("h_mats, clf_mats, col_labels length mismatch.")
-    if axes.shape != (2, n_cols):
-        raise ValueError(f"axes must be shape (2, {n_cols}); got {axes.shape}.")
+    extra_rows = list(extra_h_rows or [])
+    n_h_rows = 1 + len(extra_rows)
+    expected_shape = (n_h_rows + 1, n_cols)
+    if axes.shape != expected_shape:
+        raise ValueError(f"axes must be shape {expected_shape}; got {axes.shape}.")
 
     vmin_h, vmax_h = 0.0, 1.0
     vmin_c, vmax_c = _finite_min_max(clf_mats)
@@ -2183,7 +2251,35 @@ def _populate_matrix_panel_axes(
         _cb0 = plt.colorbar(im0, ax=ax0, fraction=0.046, pad=0.04)
         _cb0.ax.tick_params(labelsize=_matrix_colorbar_tick_labelsize)
 
-        ax1 = axes[1, c]
+        for r_extra, (row_label, row_mats) in enumerate(extra_rows, start=1):
+            if len(row_mats) != n_cols:
+                raise ValueError(f"extra H row {row_label!r} has {len(row_mats)} mats; expected {n_cols}.")
+            ax_extra = axes[r_extra, c]
+            im_extra = ax_extra.imshow(
+                row_mats[c],
+                vmin=vmin_h,
+                vmax=vmax_h,
+                cmap=cmap,
+                aspect="equal",
+                origin="lower",
+            )
+            ax_extra.set_xticks(tick_pos)
+            ax_extra.set_xticklabels(
+                tick_labs,
+                rotation=x_rot,
+                ha="right" if x_rot else "center",
+                fontsize=_matrix_tick_labelsize,
+            )
+            ax_extra.set_yticks(tick_pos)
+            ax_extra.set_yticklabels(tick_labs, fontsize=_matrix_tick_labelsize)
+            ax_extra.tick_params(axis="both", labelsize=_matrix_tick_labelsize)
+            _matrix_axes_show_top_right_spines(ax_extra)
+            if c == 0:
+                ax_extra.set_ylabel(row_label, fontsize=11)
+            _cb_extra = plt.colorbar(im_extra, ax=ax_extra, fraction=0.046, pad=0.04)
+            _cb_extra.ax.tick_params(labelsize=_matrix_colorbar_tick_labelsize)
+
+        ax1 = axes[n_h_rows, c]
         im1 = ax1.imshow(
             clf_mats[c],
             vmin=vmin_c,
@@ -2211,6 +2307,7 @@ def _populate_convergence_curve_ax(
     corr_h: np.ndarray,
     corr_clf: np.ndarray,
     *,
+    binned_gaussian_corr_h: np.ndarray | None = None,
     tick_labelsize: float = 11.0,
     axis_labelsize: float = 12.0,
     legend_fontsize: float = 9.0,
@@ -2241,6 +2338,21 @@ def _populate_convergence_curve_ax(
         markersize=5,
         label="decoding acc matrix",
     )
+    if binned_gaussian_corr_h is not None:
+        cbg = np.asarray(binned_gaussian_corr_h, dtype=np.float64).ravel()
+        if int(cbg.size) != len(ns_list):
+            raise ValueError("binned_gaussian_corr_h must have one entry per n in --n-list.")
+        if np.any(np.isfinite(cbg)):
+            ax.plot(
+                ns_list,
+                cbg,
+                color="#2ca02c",
+                linewidth=1.8,
+                linestyle="-.",
+                marker="^",
+                markersize=6,
+                label="binned Gaussian H matrix",
+            )
     ax.axhline(
         1.0,
         color="0.45",
@@ -2264,10 +2376,12 @@ def _render_matrix_panel(
     out_path: str,
     n_bins: int,
     theta_centers: np.ndarray,
+    extra_h_rows: list[tuple[str, list[np.ndarray]]] | None = None,
 ) -> None:
-    """Two rows: sqrt(binned H_sym) vs sqrt(GT H^2), pairwise decoding."""
+    """Rows: learned sqrt(H), optional auxiliary H rows, and pairwise decoding."""
     n_cols = len(h_mats)
-    fig, axes = plt.subplots(2, n_cols, figsize=(2.8 * n_cols, 5.0), squeeze=False)
+    n_rows = 2 + len(extra_h_rows or [])
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(2.8 * n_cols, 2.5 * n_rows), squeeze=False)
     _populate_matrix_panel_axes(
         axes,
         h_mats=h_mats,
@@ -2275,6 +2389,7 @@ def _render_matrix_panel(
         col_labels=col_labels,
         n_bins=n_bins,
         theta_centers=theta_centers,
+        extra_h_rows=extra_h_rows,
     )
     fig.tight_layout()
     fig.subplots_adjust(hspace=0.12)
@@ -2355,6 +2470,10 @@ class CachedConvergenceBundle(TypedDict):
     llr_gt_mean_one_sided_mc: NotRequired[np.ndarray]
     llr_binned_columns: NotRequired[np.ndarray]
     corr_llr_binned_vs_gt_mc: NotRequired[np.ndarray]
+    binned_gaussian_h_binned_columns: NotRequired[np.ndarray]
+    binned_gaussian_corr_h_binned_vs_gt_mc: NotRequired[np.ndarray]
+    binned_gaussian_variance_floor: NotRequired[float]
+    binned_gaussian_label: NotRequired[str]
 
 
 def _load_cached_convergence_results(output_dir: str) -> CachedConvergenceBundle:
@@ -2428,6 +2547,26 @@ def _load_cached_convergence_results(output_dir: str) -> CachedConvergenceBundle
         base_bundle["llr_binned_columns"] = np.asarray(z["llr_binned_columns"], dtype=np.float64)
     if "corr_llr_binned_vs_gt_mc" in z.files:
         base_bundle["corr_llr_binned_vs_gt_mc"] = np.asarray(z["corr_llr_binned_vs_gt_mc"], dtype=np.float64).ravel()
+    if "binned_gaussian_h_binned_columns" in z.files:
+        base_bundle["binned_gaussian_h_binned_columns"] = np.asarray(
+            z["binned_gaussian_h_binned_columns"],
+            dtype=np.float64,
+        )
+    if "binned_gaussian_corr_h_binned_vs_gt_mc" in z.files:
+        base_bundle["binned_gaussian_corr_h_binned_vs_gt_mc"] = np.asarray(
+            z["binned_gaussian_corr_h_binned_vs_gt_mc"],
+            dtype=np.float64,
+        ).ravel()
+    if "binned_gaussian_variance_floor" in z.files:
+        base_bundle["binned_gaussian_variance_floor"] = float(
+            np.asarray(z["binned_gaussian_variance_floor"]).reshape(-1)[0]
+        )
+    if "binned_gaussian_label" in z.files:
+        raw_label = z["binned_gaussian_label"]
+        try:
+            base_bundle["binned_gaussian_label"] = str(np.asarray(raw_label).reshape(-1)[0])
+        except Exception:
+            base_bundle["binned_gaussian_label"] = str(raw_label)
     return cast(CachedConvergenceBundle, base_bundle)
 
 
@@ -2478,6 +2617,10 @@ def _render_convergence_figures_and_summary(
     visualization_only: bool,
     llr_cols: np.ndarray | None = None,
     corr_llr: np.ndarray | None = None,
+    binned_gaussian_h_cols: np.ndarray | None = None,
+    binned_gaussian_corr_h: np.ndarray | None = None,
+    binned_gaussian_label: str | None = None,
+    binned_gaussian_variance_floor: float | None = None,
 ) -> None:
     """Write CSV, figures, manifest, training-loss panel, summary, and print artifact paths."""
     csv_path = os.path.join(args.output_dir, "h_decoding_convergence_results.csv")
@@ -2505,13 +2648,28 @@ def _render_convergence_figures_and_summary(
 
     fig_path = os.path.join(args.output_dir, "h_decoding_convergence.png")
     fig, ax = plt.subplots(1, 1, figsize=_H_DECODING_CURVE_FIGSIZE_IN)
-    _populate_convergence_curve_ax(ax, list(ns), corr_h, corr_clf)
+    _populate_convergence_curve_ax(
+        ax,
+        list(ns),
+        corr_h,
+        corr_clf,
+        binned_gaussian_corr_h=binned_gaussian_corr_h,
+    )
     fig.tight_layout()
     conv_svg = _save_figure_png_svg(fig, fig_path, dpi=160)
     plt.close(fig)
 
     matrix_panel_path = os.path.join(args.output_dir, "h_decoding_matrices_panel.png")
     col_labels = [f"n={n}" for n in ns] + [f"Approx GT, n_ref={int(args.n_ref)}"]
+    extra_h_rows: list[tuple[str, list[np.ndarray]]] = []
+    if binned_gaussian_h_cols is not None:
+        bg_label = binned_gaussian_label or r"$\sqrt{H^2}$, binned Gaussian"
+        bg_arr = np.asarray(binned_gaussian_h_cols, dtype=np.float64)
+        if bg_arr.shape != np.asarray(h_cols, dtype=np.float64).shape:
+            raise ValueError(
+                f"binned_gaussian_h_cols shape {bg_arr.shape} must match h_cols shape {np.asarray(h_cols).shape}."
+            )
+        extra_h_rows.append((bg_label, [np.asarray(bg_arr[j], dtype=np.float64) for j in range(bg_arr.shape[0])]))
     _render_matrix_panel(
         h_mats=list(h_cols),
         clf_mats=list(clf_cols),
@@ -2519,6 +2677,7 @@ def _render_convergence_figures_and_summary(
         out_path=matrix_panel_path,
         n_bins=n_bins,
         theta_centers=theta_centers,
+        extra_h_rows=extra_h_rows,
     )
 
     loss_dir = os.path.join(args.output_dir, "training_losses")
@@ -2577,6 +2736,8 @@ def _render_convergence_figures_and_summary(
         llr_gt=llr_gt,
         llr_est_mats=llr_est,
         corr_llr=corr_llr_a,
+        binned_gaussian_corr_h=binned_gaussian_corr_h,
+        extra_h_rows=extra_h_rows,
     )
 
     loss_panel_png = os.path.join(args.output_dir, "h_decoding_training_losses_panel.png")
@@ -2608,6 +2769,10 @@ def _render_convergence_figures_and_summary(
     }
     if visualization_only:
         paths_out["mode"] = "visualization-only (figures/csv/summary regenerated from cached NPZ)"
+    if binned_gaussian_h_cols is not None:
+        paths_out["binned_gaussian_label"] = binned_gaussian_label or ""
+        if binned_gaussian_variance_floor is not None:
+            paths_out["binned_gaussian_variance_floor"] = str(float(binned_gaussian_variance_floor))
     if err_msg:
         paths_out["errors"] = "; ".join(err_msg[:20])
     _write_summary(summary_path, args, meta, perm_seed, n_pool, ref_dir, paths_out, per_n_loss_rows)
@@ -2637,6 +2802,20 @@ def _render_convergence_figures_and_summary(
         )
         sf.write(f"gt_hellinger_seed: {int(gt_seed)}\n")
         sf.write(f"gt_hellinger_symmetrize: {bool(gt_symmetrize_effective)}\n")
+        if binned_gaussian_h_cols is not None:
+            sf.write("\n# Binned Gaussian row\n")
+            sf.write(f"binned_gaussian_label: {binned_gaussian_label or ''}\n")
+            if binned_gaussian_variance_floor is not None:
+                sf.write(f"binned_gaussian_variance_floor: {float(binned_gaussian_variance_floor)}\n")
+            sf.write(
+                "binned_gaussian_h_binned_columns: no-flow binned Gaussian sqrt(H^2) columns; "
+                "last column reuses MC GT sqrt(H^2).\n"
+            )
+            if binned_gaussian_corr_h is not None:
+                sf.write(
+                    "binned_gaussian_corr_h_binned_vs_gt_mc: Pearson r, off-diagonal no-flow "
+                    "binned Gaussian sqrt(H^2) vs sqrt(generative GT H^2).\n"
+                )
 
     tag = "[convergence] Saved (visualization-only):" if visualization_only else "[convergence] Saved:"
     print(tag)
@@ -2738,6 +2917,10 @@ def main(argv: list[str] | None = None) -> None:
         )
         _llr_c = cached.get("llr_binned_columns")
         _corr_llr_c = cached.get("corr_llr_binned_vs_gt_mc")
+        _bg_h_c = cached.get("binned_gaussian_h_binned_columns")
+        _bg_corr_c = cached.get("binned_gaussian_corr_h_binned_vs_gt_mc")
+        _bg_label_c = cached.get("binned_gaussian_label")
+        _bg_vf_c = cached.get("binned_gaussian_variance_floor")
         _render_convergence_figures_and_summary(
             args=args,
             meta=meta,
@@ -2761,6 +2944,10 @@ def main(argv: list[str] | None = None) -> None:
             visualization_only=True,
             llr_cols=None if _llr_c is None else np.asarray(_llr_c, dtype=np.float64),
             corr_llr=None if _corr_llr_c is None else np.asarray(_corr_llr_c, dtype=np.float64).ravel(),
+            binned_gaussian_h_cols=None if _bg_h_c is None else np.asarray(_bg_h_c, dtype=np.float64),
+            binned_gaussian_corr_h=None if _bg_corr_c is None else np.asarray(_bg_corr_c, dtype=np.float64).ravel(),
+            binned_gaussian_label=None if _bg_label_c is None else str(_bg_label_c),
+            binned_gaussian_variance_floor=None if _bg_vf_c is None else float(_bg_vf_c),
         )
         return
 
@@ -3106,6 +3293,30 @@ def main(argv: list[str] | None = None) -> None:
     llr_ref = np.asarray(llr_gt_mc, dtype=np.float64)
     llr_cols = np.stack(llr_sweep + [llr_ref], axis=0)
     column_n = np.asarray(list(ns) + [int(args.n_ref)], dtype=np.int64)
+    binned_gaussian_label = r"$\sqrt{H^2}$, binned Gaussian"
+    binned_gaussian_variance_floor = float(
+        getattr(args, "flow_theta_reg_variance_floor", getattr(args, "flow_x_reg_variance_floor", 1e-6))
+    )
+    binned_gaussian_h_sweep: list[np.ndarray] = []
+    binned_gaussian_corr_h = np.full(len(ns), np.nan, dtype=np.float64)
+    for k, n in enumerate(ns):
+        subset_bg = _subset_bundle(
+            bundle,
+            perm,
+            int(n),
+            meta,
+            bin_idx_all=bin_idx_all,
+            theta_state_all=None,
+        )
+        bg_h2 = _binned_gaussian_hellinger_sq(
+            subset_bg,
+            n_bins,
+            variance_floor=binned_gaussian_variance_floor,
+        )
+        bg_h_sqrt = _sqrt_h_like(bg_h2)
+        binned_gaussian_h_sweep.append(np.asarray(bg_h_sqrt, dtype=np.float64))
+        binned_gaussian_corr_h[k] = vhb.matrix_corr_offdiag_pearson(bg_h_sqrt, h_gt_sqrt)
+    binned_gaussian_h_cols = np.stack(binned_gaussian_h_sweep + [h_ref], axis=0)
 
     out_npz = os.path.join(args.output_dir, "h_decoding_convergence_results.npz")
     np.savez_compressed(
@@ -3133,6 +3344,10 @@ def main(argv: list[str] | None = None) -> None:
         gt_mean_llr_one_sided_mc=np.asarray(llr_gt_mc, dtype=np.float64),
         llr_binned_columns=llr_cols,
         corr_llr_binned_vs_gt_mc=corr_llr,
+        binned_gaussian_h_binned_columns=binned_gaussian_h_cols,
+        binned_gaussian_corr_h_binned_vs_gt_mc=binned_gaussian_corr_h,
+        binned_gaussian_variance_floor=np.float64(binned_gaussian_variance_floor),
+        binned_gaussian_label=np.asarray([binned_gaussian_label], dtype=object),
     )
 
     _render_convergence_figures_and_summary(
@@ -3158,6 +3373,10 @@ def main(argv: list[str] | None = None) -> None:
         visualization_only=False,
         llr_cols=llr_cols,
         corr_llr=corr_llr,
+        binned_gaussian_h_cols=binned_gaussian_h_cols,
+        binned_gaussian_corr_h=binned_gaussian_corr_h,
+        binned_gaussian_label=binned_gaussian_label,
+        binned_gaussian_variance_floor=binned_gaussian_variance_floor,
     )
 
 

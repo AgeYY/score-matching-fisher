@@ -303,6 +303,16 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         dest="flow_likelihood_finetune_exact_divergence",
         help="Disable exact divergence for theta_flow NLL fine-tune (currently unsupported; validation rejects).",
     )
+    p.add_argument(
+        "--flow-likelihood-exact-divergence",
+        action="store_true",
+        default=False,
+        help=(
+            "theta_flow / x_flow H-matrix evaluation: use exact_divergence=True in "
+            "flow_matching ODESolver.compute_likelihood (per-dim Jacobian trace; slower than Hutchinson). "
+            "Default False keeps Hutchinson for ODE log-density blocks."
+        ),
+    )
     p.add_argument("--flow-likelihood-finetune-patience", type=int, default=100)
     p.add_argument("--flow-likelihood-finetune-min-delta", type=float, default=1e-4)
     p.add_argument("--flow-likelihood-finetune-ema-alpha", type=float, default=0.05)
