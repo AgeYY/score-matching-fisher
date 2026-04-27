@@ -93,3 +93,45 @@ def test_validate_rejects_posterior_only_likelihood_for_x_flow() -> None:
     )
     with pytest.raises(ValueError, match="--theta-flow-posterior-only-likelihood requires --theta-field-method theta_flow"):
         validate_estimation_args(args)
+
+
+def test_validate_accepts_theta_flow_zero_fm_epochs_with_nll_finetune() -> None:
+    args = parse_full_args(
+        [
+            "--theta-field-method",
+            "theta_flow",
+            "--flow-epochs",
+            "0",
+            "--flow-likelihood-finetune-epochs",
+            "1",
+        ]
+    )
+    validate_estimation_args(args)
+    assert int(args.flow_epochs) == 0
+    assert int(args.flow_likelihood_finetune_epochs) == 1
+
+
+def test_validate_rejects_theta_flow_zero_fm_epochs_without_nll_finetune() -> None:
+    args = parse_full_args(
+        [
+            "--theta-field-method",
+            "theta_flow",
+            "--flow-epochs",
+            "0",
+        ]
+    )
+    with pytest.raises(ValueError, match="--flow-likelihood-finetune-epochs"):
+        validate_estimation_args(args)
+
+
+def test_validate_rejects_x_flow_zero_fm_epochs_even_with_nll_finetune_disabled() -> None:
+    args = parse_full_args(
+        [
+            "--theta-field-method",
+            "x_flow",
+            "--flow-epochs",
+            "0",
+        ]
+    )
+    with pytest.raises(ValueError, match="--flow-epochs must be >= 1 unless"):
+        validate_estimation_args(args)

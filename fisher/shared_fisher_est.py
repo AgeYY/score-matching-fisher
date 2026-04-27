@@ -1057,8 +1057,8 @@ def validate_estimation_args(args: Any) -> None:
         raise ValueError("--h-batch-size must be >= 1.")
     if float(getattr(args, "h_sigma_eval", -1.0)) == 0.0:
         raise ValueError("--h-sigma-eval must be positive, or <= 0 to auto-select sigma_min.")
-    if int(getattr(args, "flow_epochs", 1)) < 1:
-        raise ValueError("--flow-epochs must be >= 1.")
+    if int(getattr(args, "flow_epochs", 1)) < 0:
+        raise ValueError("--flow-epochs must be >= 0.")
     if bool(getattr(args, "flow_x_two_stage_mean_theta_pretrain", False)):
         if _tfm_val != "x_flow":
             raise ValueError(
@@ -1077,6 +1077,19 @@ def validate_estimation_args(args: Any) -> None:
         raise ValueError("--flow-likelihood-finetune-epochs must be >= 0.")
     if ft_epochs > 2000:
         raise ValueError("--flow-likelihood-finetune-epochs must be <= 2000.")
+    _flow_epochs = int(getattr(args, "flow_epochs", 1))
+    if _flow_epochs == 0:
+        if _tfm_val != "theta_flow":
+            raise ValueError(
+                "--flow-epochs must be >= 1 unless --theta-field-method theta_flow "
+                "(use 0 to skip FM pretraining when --flow-likelihood-finetune-epochs > 0)."
+            )
+        if ft_epochs <= 0:
+            raise ValueError(
+                "--flow-epochs 0 skips FM velocity pretraining on the conditional theta-flow; "
+                "set --flow-likelihood-finetune-epochs > 0 to train by NLL from initialization, "
+                "or use --flow-epochs >= 1."
+            )
     if ft_epochs > 0 and _tfm_val != "theta_flow":
         raise ValueError("--flow-likelihood-finetune-epochs is only supported with --theta-field-method theta_flow.")
     if float(getattr(args, "flow_likelihood_finetune_lr", 1e-4)) <= 0.0:
@@ -2285,11 +2298,18 @@ def run_shared_fisher_estimation(
             ).to(device)
         else:
             raise ValueError("--flow-arch must be one of {'mlp','soft_moe','film','film_fourier'}.")
+        _fm_epochs = int(getattr(args, "flow_epochs", 10000))
+        if _fm_epochs == 0:
+            print(
+                f"[{theta_field_method}] --flow-epochs 0: skipping FM velocity pretraining "
+                "(conditional model starts from initialization; NLL fine-tune may follow).",
+                flush=True,
+            )
         post_train_out = train_conditional_theta_flow_model(
             model=post_model,
             theta_train=theta_score_fit,
             x_train=x_score_fit,
-            epochs=int(getattr(args, "flow_epochs", 10000)),
+            epochs=_fm_epochs,
             batch_size=int(getattr(args, "flow_batch_size", 256)),
             lr=float(getattr(args, "flow_lr", 1e-3)),
             device=device,

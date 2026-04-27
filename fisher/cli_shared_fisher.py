@@ -252,7 +252,15 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--score-proxy-min-mult", type=float, default=0.1)
     p.add_argument("--score-proxy-max-mult", type=float, default=2.0)
     p.add_argument("--score-fixed-sigma", type=float, default=0.02)
-    p.add_argument("--flow-epochs", type=int, default=10000)
+    p.add_argument(
+        "--flow-epochs",
+        type=int,
+        default=10000,
+        help=(
+            "FM velocity pretraining epochs for flow-based fields. "
+            "theta_flow: use 0 to skip pretraining and rely on --flow-likelihood-finetune-epochs (NLL) only."
+        ),
+    )
     p.add_argument("--flow-batch-size", type=int, default=256)
     p.add_argument("--flow-lr", type=float, default=1e-3)
     p.add_argument(
