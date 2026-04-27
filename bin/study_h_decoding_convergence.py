@@ -406,6 +406,20 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--theta-flow-branch-conditioned",
+        action="store_true",
+        help=(
+            "theta_flow only: keep scalar theta as the ODE state, but append a one-hot "
+            "theta branch code to the posterior condition x and train a branch-conditioned prior."
+        ),
+    )
+    p.add_argument(
+        "--theta-flow-branch-bins",
+        type=int,
+        default=4,
+        help="Number of equal-width theta branches for --theta-flow-branch-conditioned (default 4).",
+    )
+    p.add_argument(
         "--clf-min-class-count",
         type=int,
         default=5,
@@ -607,12 +621,15 @@ def _validate_cli(args: argparse.Namespace) -> None:
     use_onehot = bool(getattr(args, "theta_flow_onehot_state", False))
     use_fourier = bool(getattr(args, "theta_flow_fourier_state", False))
     use_segmented = bool(getattr(args, "theta_flow_segmented", False))
+    use_branch = bool(getattr(args, "theta_flow_branch_conditioned", False))
     if use_onehot and use_fourier:
         raise ValueError("Use only one theta-flow state override: one-hot or Fourier, not both.")
     if use_segmented and use_onehot:
         raise ValueError("Use only one theta-flow mode: segmented or one-hot, not both.")
     if use_segmented and use_fourier:
         raise ValueError("Use only one theta-flow mode: segmented or Fourier, not both.")
+    if use_branch and (use_onehot or use_fourier or use_segmented):
+        raise ValueError("Use only one theta-flow mode: branch-conditioned, segmented, one-hot, or Fourier.")
     if use_onehot:
         tfm = str(getattr(args, "theta_field_method", "theta_flow")).strip().lower()
         arch = str(getattr(args, "flow_arch", "mlp")).strip().lower()
@@ -651,6 +668,26 @@ def _validate_cli(args: argparse.Namespace) -> None:
                 "--theta-flow-segmented requires --theta-field-method theta_flow "
                 f"(got {getattr(args, 'theta_field_method', None)!r})."
             )
+    if use_branch:
+        tfm = str(getattr(args, "theta_field_method", "theta_flow")).strip().lower()
+        arch = str(getattr(args, "flow_arch", "mlp")).strip().lower()
+        if tfm != "theta_flow":
+            raise ValueError(
+                "--theta-flow-branch-conditioned requires --theta-field-method theta_flow "
+                f"(got {getattr(args, 'theta_field_method', None)!r})."
+            )
+        if arch != "mlp":
+            raise ValueError(
+                "--theta-flow-branch-conditioned currently supports --flow-arch mlp only "
+                f"(got {getattr(args, 'flow_arch', None)!r})."
+            )
+        if bool(getattr(args, "theta_flow_posterior_only_likelihood", False)):
+            raise ValueError(
+                "--theta-flow-branch-conditioned requires the branch prior flow; "
+                "do not use --theta-flow-posterior-only-likelihood."
+            )
+        if int(getattr(args, "theta_flow_branch_bins", 0)) < 2:
+            raise ValueError("--theta-flow-branch-bins must be >= 2.")
     _parse_n_list(args.n_list)  # syntax check only; pool size checked in main
 
 
@@ -701,6 +738,7 @@ def _subset_bundle(
     *,
     bin_idx_all: np.ndarray,
     theta_state_all: np.ndarray | None = None,
+    x_condition_all: np.ndarray | None = None,
 ) -> SweepSubset:
     """First n indices in perm order (nested subsets). Train/validation split matches make_dataset."""
     n = int(n)
@@ -711,7 +749,8 @@ def _subset_bundle(
         theta_all = theta_all.reshape(-1, 1)
     elif theta_all.ndim != 2:
         raise ValueError("theta_state_all must be 1D or 2D.")
-    x_all = np.asarray(bundle.x_all[sub_perm], dtype=np.float64)
+    x_src_all = bundle.x_all if x_condition_all is None else x_condition_all
+    x_all = np.asarray(x_src_all[sub_perm], dtype=np.float64)
     bin_all = np.asarray(bin_idx_all[sub_perm], dtype=np.int64).reshape(-1)
     if bin_all.shape[0] != n:
         raise ValueError("bin_idx_all subset length mismatch.")
@@ -752,6 +791,10 @@ def _make_full_args(args: argparse.Namespace, meta: dict) -> SimpleNamespace:
     rs = getattr(args, "run_seed", None)
     if rs is not None:
         setattr(full_args, "seed", int(rs))
+    if bool(getattr(args, "theta_flow_branch_conditioned", False)):
+        # Dataset metadata restores the original x_dim; branch conditioning appends b to x
+        # only for this estimation run, so restore the augmented model input width here.
+        setattr(full_args, "x_dim", int(getattr(args, "theta_flow_branch_aug_x_dim")))
     setattr(full_args, "compute_h_matrix", True)
     setattr(full_args, "h_restore_original_order", True)
     setattr(full_args, "skip_shared_fisher_gt_compare", True)
@@ -793,16 +836,22 @@ def _metrics_fixed_edges(
     n_bins: int,
     clf_min_class_count: int,
     clf_random_state: int,
+    clf_x_dim: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     if loaded.h_sym.shape[0] != subset.bin_all.shape[0]:
         raise ValueError(
             f"h_sym rows {loaded.h_sym.shape[0]} do not match subset bins length {subset.bin_all.shape[0]}."
         )
     h_binned, _ = vhb.average_matrix_by_bins(loaded.h_sym, subset.bin_all, n_bins)
+    x_train = np.asarray(subset.bundle.x_train, dtype=np.float64)
+    x_all = np.asarray(subset.bundle.x_all, dtype=np.float64)
+    if clf_x_dim is not None:
+        x_train = x_train[:, : int(clf_x_dim)]
+        x_all = x_all[:, : int(clf_x_dim)]
     clf_acc, _, _, _ = vhb.pairwise_bin_logistic_accuracy_train_val(
-        subset.bundle.x_train,
+        x_train,
         subset.bin_train,
-        subset.bundle.x_all,
+        x_all,
         subset.bin_all,
         n_bins,
         min_class_count=int(clf_min_class_count),
@@ -881,10 +930,16 @@ def _pairwise_clf_from_bundle(
     clf_random_state: int,
 ) -> np.ndarray:
     """Pairwise bin decoding: train on NPZ train rows, accuracy on NPZ full pool."""
+    x_train = np.asarray(subset.bundle.x_train, dtype=np.float64)
+    x_all = np.asarray(subset.bundle.x_all, dtype=np.float64)
+    if bool(getattr(args, "theta_flow_branch_conditioned", False)):
+        base_dim = int(getattr(args, "theta_flow_branch_base_x_dim"))
+        x_train = x_train[:, :base_dim]
+        x_all = x_all[:, :base_dim]
     clf_acc, _, _, _ = vhb.pairwise_bin_logistic_accuracy_train_val(
-        subset.bundle.x_train,
+        x_train,
         subset.bin_train,
-        subset.bundle.x_all,
+        x_all,
         subset.bin_all,
         n_bins,
         min_class_count=int(clf_min_class_count),
@@ -1041,9 +1096,10 @@ def _estimate_one(
             "theta_used from H-matrix npz does not match expected dataset rows for this h_field_method."
         )
     x_aligned = vhb.x_for_h_matrix_alignment(ctx.bundle, ctx.full_args)
-    if x_aligned.shape[0] != loaded.theta_used.shape[0]:
+    h_rows = int(loaded.h_sym.shape[0])
+    if x_aligned.shape[0] != h_rows:
         raise ValueError(
-            f"x/H row mismatch: x_aligned={x_aligned.shape[0]} theta_used={loaded.theta_used.shape[0]}"
+            f"x/H row mismatch: x_aligned={x_aligned.shape[0]} h_rows={h_rows}"
         )
     return loaded, x_aligned, ctx.device
 
@@ -1099,10 +1155,20 @@ def _model_posterior_log_weights_for_fixed_x(
     c = np.asarray(c_row, dtype=np.float64).reshape(-1)
     method = str(hfm).strip().lower()
     if method == "theta_flow":
+        branch_idx = _npz_row_or_vector(h_npz, "theta_flow_branch_index", row=int(row), n=c.size)
+        branch_log_prior = (
+            np.asarray(h_npz["theta_flow_branch_log_prior"], dtype=np.float64).reshape(-1)
+            if h_npz is not None and "theta_flow_branch_log_prior" in getattr(h_npz, "files", ())
+            else None
+        )
+        log_prior = _npz_row_or_vector(h_npz, "theta_flow_log_prior_matrix", row=int(row), n=c.size)
+        if branch_idx is not None and branch_log_prior is not None and log_prior is not None:
+            bi = np.asarray(np.rint(branch_idx), dtype=np.int64).reshape(-1)
+            bi = np.clip(bi, 0, branch_log_prior.size - 1)
+            return c + log_prior + branch_log_prior[bi], "branch-corrected posterior log-density"
         log_post = _npz_row_or_vector(h_npz, "theta_flow_log_post_matrix", row=int(row), n=c.size)
         if log_post is not None:
             return log_post, "learned posterior log-density"
-        log_prior = _npz_row_or_vector(h_npz, "theta_flow_log_prior_matrix", row=int(row), n=c.size)
         if log_prior is not None:
             return c + log_prior, "ratio + learned prior log-density"
         print(
@@ -1324,161 +1390,162 @@ def _write_fixed_x_posterior_diagnostic(
     if not os.path.isfile(h_path):
         print(f"[convergence] fixed-x diagnostic: missing {h_path}", flush=True)
         return None
-    z = np.load(h_path, allow_pickle=True)
-    if "c_matrix" not in z.files:
-        fig, ax = plt.subplots(1, 1, figsize=(6.2, 2.2), dpi=120, layout="tight")
-        ax.text(
-            0.5,
-            0.5,
-            "c_matrix not in H-matrix npz (need h_save_intermediates=True).",
-            ha="center",
-            va="center",
-            transform=ax.transAxes,
-        )
-        ax.set_axis_off()
-        _save_figure_png_svg(fig, out_png, dpi=120)
-        plt.close(fig)
-        return out_png
-
-    c = np.asarray(z["c_matrix"], dtype=np.float64)
-    theta_u = np.asarray(z["theta_used"], dtype=np.float64)
-    if c.ndim != 2 or c.shape[0] != c.shape[1]:
-        print(f"[convergence] fixed-x diagnostic: bad c_matrix shape {getattr(c, 'shape', None)}", flush=True)
-        return None
-    n = int(c.shape[0])
-    if n < 2:
-        return None
-    if theta_u.ndim == 2 and int(theta_u.shape[1]) > 1:
-        fig, ax = plt.subplots(1, 1, figsize=(6.2, 2.2), dpi=120, layout="tight")
-        ax.text(
-            0.5,
-            0.5,
-            "Fixed-x posterior diagnostic: requires scalar theta (N×1) for C-row softmax.",
-            ha="center",
-            va="center",
-            transform=ax.transAxes,
-        )
-        ax.set_axis_off()
-        _save_figure_png_svg(fig, out_png, dpi=120)
-        plt.close(fig)
-        return out_png
-
-    th_flat = np.asarray(theta_u, dtype=np.float64).reshape(-1)
-    xa = np.asarray(x_aligned, dtype=np.float64)
-    if int(xa.shape[0]) != n:
-        print(
-            f"[convergence] fixed-x diagnostic: x length {xa.shape[0]} != c rows {n}",
-            flush=True,
-        )
-        return None
-
-    hfm_raw = "theta_flow"
-    if "h_field_method" in z.files:
-        raw = z["h_field_method"]
-        try:
-            hfm_raw = str(np.asarray(raw).reshape(-1)[0])
-        except (TypeError, ValueError, IndexError):
-            hfm_raw = str(hfm_raw)
-    hfm = str(hfm_raw).strip().lower()
-    i_fix_a, i_fix_b = _select_two_fixed_x_indices(
-        n,
-        perm_seed=int(perm_seed),
-        n_subset=int(n_subset),
-    )
-    try:
-        dataset = build_dataset_from_meta(meta)
-        lo = float(meta["theta_low"])
-        hi = float(meta["theta_high"])
-        th_grid = np.linspace(lo, hi, 400, dtype=np.float64)
-        tcol = th_grid.reshape(-1, 1)
-        mu = np.asarray(dataset.tuning_curve(tcol), dtype=np.float64)
-    except Exception as e:  # noqa: BLE001
-        fig, axes = plt.subplots(1, 2, figsize=(12.0, 3.2), dpi=120, sharey=True, layout="tight")
-        for ax, i_fix in zip(np.asarray(axes).reshape(-1), (i_fix_a, i_fix_b)):
-            c_row = np.asarray(c[int(i_fix), :], dtype=np.float64).reshape(-1)
-            logp, logp_source = _model_posterior_log_weights_for_fixed_x(
-                hfm=hfm,
-                c_row=c_row,
-                h_npz=z,
-                row=int(i_fix),
-            )
-            w = _stable_softmax_log(logp)
-            order = np.argsort(th_flat, kind="mergesort")
-            th_s = th_flat[order]
-            w_s = w[order]
-            x_fixed = np.asarray(xa[int(i_fix)], dtype=np.float64).reshape(-1)
-            x0 = float(x_fixed[0]) if x_fixed.size else float("nan")
-            xn = float(np.linalg.norm(x_fixed))
-            j_map = int(np.argmax(w))
-            theta_map = float(th_flat[j_map])
-            ax.fill_between(th_s, 0.0, w_s, color="#1f77b4", alpha=0.35, step="mid")
-            ax.plot(
-                th_s,
-                w_s,
-                "o-",
-                color="#1f77b4",
-                ms=2,
-                lw=0.8,
-                label=f"softmax weights ({logp_source})",
-            )
-            ax.set_ylabel("mass")
-            ax.set_xlabel(r"$\theta$")
-            ax.set_title(
-                f"fixed $x$  i={int(i_fix)}  method={hfm}\n(posterior overlay failed: {e!s})",
-                fontsize=8,
-            )
-            ax.annotate(
-                f"x[0]={x0:.3g}  ||x||={xn:.3g}  theta_map={theta_map:.3g}",
-                xy=(0.5, 1.02),
-                xycoords="axes fraction",
+    # Close the NPZ promptly so temp run dirs (TemporaryDirectory under output_dir) can be removed.
+    with np.load(h_path, allow_pickle=True) as z:
+        if "c_matrix" not in z.files:
+            fig, ax = plt.subplots(1, 1, figsize=(6.2, 2.2), dpi=120, layout="tight")
+            ax.text(
+                0.5,
+                0.5,
+                "c_matrix not in H-matrix npz (need h_save_intermediates=True).",
                 ha="center",
-                fontsize=7,
+                va="center",
+                transform=ax.transAxes,
             )
+            ax.set_axis_off()
+            _save_figure_png_svg(fig, out_png, dpi=120)
+            plt.close(fig)
+            return out_png
+
+        c = np.asarray(z["c_matrix"], dtype=np.float64)
+        theta_u = np.asarray(z["theta_used"], dtype=np.float64)
+        if c.ndim != 2 or c.shape[0] != c.shape[1]:
+            print(f"[convergence] fixed-x diagnostic: bad c_matrix shape {getattr(c, 'shape', None)}", flush=True)
+            return None
+        n = int(c.shape[0])
+        if n < 2:
+            return None
+        if theta_u.ndim == 2 and int(theta_u.shape[1]) > 1:
+            fig, ax = plt.subplots(1, 1, figsize=(6.2, 2.2), dpi=120, layout="tight")
+            ax.text(
+                0.5,
+                0.5,
+                "Fixed-x posterior diagnostic: requires scalar theta (N×1) for C-row softmax.",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+            )
+            ax.set_axis_off()
+            _save_figure_png_svg(fig, out_png, dpi=120)
+            plt.close(fig)
+            return out_png
+
+        th_flat = np.asarray(theta_u, dtype=np.float64).reshape(-1)
+        xa = np.asarray(x_aligned, dtype=np.float64)
+        if int(xa.shape[0]) != n:
+            print(
+                f"[convergence] fixed-x diagnostic: x length {xa.shape[0]} != c rows {n}",
+                flush=True,
+            )
+            return None
+
+        hfm_raw = "theta_flow"
+        if "h_field_method" in z.files:
+            raw = z["h_field_method"]
+            try:
+                hfm_raw = str(np.asarray(raw).reshape(-1)[0])
+            except (TypeError, ValueError, IndexError):
+                hfm_raw = str(hfm_raw)
+        hfm = str(hfm_raw).strip().lower()
+        i_fix_a, i_fix_b = _select_two_fixed_x_indices(
+            n,
+            perm_seed=int(perm_seed),
+            n_subset=int(n_subset),
+        )
+        try:
+            dataset = build_dataset_from_meta(meta)
+            lo = float(meta["theta_low"])
+            hi = float(meta["theta_high"])
+            th_grid = np.linspace(lo, hi, 400, dtype=np.float64)
+            tcol = th_grid.reshape(-1, 1)
+            mu = np.asarray(dataset.tuning_curve(tcol), dtype=np.float64)
+        except Exception as e:  # noqa: BLE001
+            fig, axes = plt.subplots(1, 2, figsize=(12.0, 3.2), dpi=120, sharey=True, layout="tight")
+            for ax, i_fix in zip(np.asarray(axes).reshape(-1), (i_fix_a, i_fix_b)):
+                c_row = np.asarray(c[int(i_fix), :], dtype=np.float64).reshape(-1)
+                logp, logp_source = _model_posterior_log_weights_for_fixed_x(
+                    hfm=hfm,
+                    c_row=c_row,
+                    h_npz=z,
+                    row=int(i_fix),
+                )
+                w = _stable_softmax_log(logp)
+                order = np.argsort(th_flat, kind="mergesort")
+                th_s = th_flat[order]
+                w_s = w[order]
+                x_fixed = np.asarray(xa[int(i_fix)], dtype=np.float64).reshape(-1)
+                x0 = float(x_fixed[0]) if x_fixed.size else float("nan")
+                xn = float(np.linalg.norm(x_fixed))
+                j_map = int(np.argmax(w))
+                theta_map = float(th_flat[j_map])
+                ax.fill_between(th_s, 0.0, w_s, color="#1f77b4", alpha=0.35, step="mid")
+                ax.plot(
+                    th_s,
+                    w_s,
+                    "o-",
+                    color="#1f77b4",
+                    ms=2,
+                    lw=0.8,
+                    label=f"softmax weights ({logp_source})",
+                )
+                ax.set_ylabel("mass")
+                ax.set_xlabel(r"$\theta$")
+                ax.set_title(
+                    f"fixed $x$  i={int(i_fix)}  method={hfm}\n(posterior overlay failed: {e!s})",
+                    fontsize=8,
+                )
+                ax.annotate(
+                    f"x[0]={x0:.3g}  ||x||={xn:.3g}  theta_map={theta_map:.3g}",
+                    xy=(0.5, 1.02),
+                    xycoords="axes fraction",
+                    ha="center",
+                    fontsize=7,
+                )
+            _save_figure_png_svg(fig, out_png, dpi=120)
+            plt.close(fig)
+            print(f"[convergence] fixed-x diagnostic -> {out_png}", flush=True)
+            return out_png
+
+        fig, axs = plt.subplots(2, 2, figsize=(12.8, 5.0), dpi=120, sharex="col", layout="tight")
+        ax00 = cast(plt.Axes, axs[0, 0])
+        ax01 = cast(plt.Axes, axs[0, 1])
+        ax10 = cast(plt.Axes, axs[1, 0])
+        ax11 = cast(plt.Axes, axs[1, 1])
+        _plot_fixed_x_column(
+            ax_top=ax00,
+            ax_bot=ax10,
+            i_fix=int(i_fix_a),
+            hfm=hfm,
+            c=c,
+            th_flat=th_flat,
+            xa=xa,
+            th_grid=th_grid,
+            mu=mu,
+            dataset=dataset,
+            lo=lo,
+            hi=hi,
+            h_npz=z,
+        )
+        _plot_fixed_x_column(
+            ax_top=ax01,
+            ax_bot=ax11,
+            i_fix=int(i_fix_b),
+            hfm=hfm,
+            c=c,
+            th_flat=th_flat,
+            xa=xa,
+            th_grid=th_grid,
+            mu=mu,
+            dataset=dataset,
+            lo=lo,
+            hi=hi,
+            h_npz=z,
+        )
+
         _save_figure_png_svg(fig, out_png, dpi=120)
         plt.close(fig)
         print(f"[convergence] fixed-x diagnostic -> {out_png}", flush=True)
         return out_png
-
-    fig, axs = plt.subplots(2, 2, figsize=(12.8, 5.0), dpi=120, sharex="col", layout="tight")
-    ax00 = cast(plt.Axes, axs[0, 0])
-    ax01 = cast(plt.Axes, axs[0, 1])
-    ax10 = cast(plt.Axes, axs[1, 0])
-    ax11 = cast(plt.Axes, axs[1, 1])
-    _plot_fixed_x_column(
-        ax_top=ax00,
-        ax_bot=ax10,
-        i_fix=int(i_fix_a),
-        hfm=hfm,
-        c=c,
-        th_flat=th_flat,
-        xa=xa,
-        th_grid=th_grid,
-        mu=mu,
-        dataset=dataset,
-        lo=lo,
-        hi=hi,
-        h_npz=z,
-    )
-    _plot_fixed_x_column(
-        ax_top=ax01,
-        ax_bot=ax11,
-        i_fix=int(i_fix_b),
-        hfm=hfm,
-        c=c,
-        th_flat=th_flat,
-        xa=xa,
-        th_grid=th_grid,
-        mu=mu,
-        dataset=dataset,
-        lo=lo,
-        hi=hi,
-        h_npz=z,
-    )
-
-    _save_figure_png_svg(fig, out_png, dpi=120)
-    plt.close(fig)
-    print(f"[convergence] fixed-x diagnostic -> {out_png}", flush=True)
-    return out_png
 
 
 def _backfill_fixed_x_posterior_diagnostic_if_missing(
@@ -2416,6 +2483,11 @@ def _write_summary(
         f.write(f"num_theta_bins: {args.num_theta_bins}\n")
         f.write(f"theta_flow_onehot_state: {bool(getattr(args, 'theta_flow_onehot_state', False))}\n")
         f.write(f"theta_flow_fourier_state: {bool(getattr(args, 'theta_flow_fourier_state', False))}\n")
+        f.write(f"theta_flow_branch_conditioned: {bool(getattr(args, 'theta_flow_branch_conditioned', False))}\n")
+        if bool(getattr(args, "theta_flow_branch_conditioned", False)):
+            f.write(f"theta_flow_branch_bins: {int(getattr(args, 'theta_flow_branch_bins', 0))}\n")
+            f.write(f"theta_flow_branch_base_x_dim: {int(getattr(args, 'theta_flow_branch_base_x_dim', -1))}\n")
+            f.write(f"theta_flow_branch_aug_x_dim: {int(getattr(args, 'theta_flow_branch_aug_x_dim', -1))}\n")
         if bool(getattr(args, "theta_flow_fourier_state", False)):
             f.write(f"theta_flow_fourier_k: {int(getattr(args, 'theta_flow_fourier_k', 0))}\n")
             f.write(
@@ -2974,6 +3046,7 @@ def main(argv: list[str] | None = None) -> None:
     edges, edge_lo, edge_hi = vhb.theta_bin_edges(theta_ref, n_bins)
     bin_idx_all = vhb.theta_to_bin_index(theta_scalar_all, edges, n_bins)
     theta_state_all: np.ndarray | None = None
+    x_condition_all: np.ndarray | None = None
     if bool(getattr(args, "theta_flow_onehot_state", False)):
         theta_state_all = np.eye(n_bins, dtype=np.float64)[bin_idx_all]
         print(
@@ -2994,6 +3067,24 @@ def main(argv: list[str] | None = None) -> None:
             f"period={theta_fourier_period:.6g} "
             f"(mult={float(args.theta_flow_fourier_period_mult):.3g}, ref_range={theta_fourier_ref_range:.6g}, "
             f"center={theta_fourier_center:.6g}, include_linear={bool(args.theta_flow_fourier_include_linear)})",
+            flush=True,
+        )
+    elif bool(getattr(args, "theta_flow_branch_conditioned", False)):
+        branch_bins = int(getattr(args, "theta_flow_branch_bins", 4))
+        branch_edges, branch_edge_lo, branch_edge_hi = vhb.theta_bin_edges(theta_ref, branch_bins)
+        branch_idx_all = vhb.theta_to_bin_index(theta_scalar_all, branch_edges, branch_bins)
+        branch_onehot_all = np.eye(branch_bins, dtype=np.float64)[branch_idx_all]
+        x_base_all = np.asarray(bundle.x_all, dtype=np.float64)
+        if x_base_all.ndim != 2:
+            raise ValueError("theta-flow branch conditioning expects x_all to be 2D.")
+        x_condition_all = np.concatenate([x_base_all, branch_onehot_all], axis=1)
+        setattr(args, "theta_flow_branch_base_x_dim", int(x_base_all.shape[1]))
+        setattr(args, "theta_flow_branch_aug_x_dim", int(x_condition_all.shape[1]))
+        setattr(args, "theta_flow_branch_edges", np.asarray(branch_edges, dtype=np.float64))
+        print(
+            "[convergence] theta_flow branch-conditioned mode enabled: "
+            f"branches={branch_bins} theta_edges=[{branch_edge_lo:.6g}, {branch_edge_hi:.6g}] "
+            f"x_dim {x_base_all.shape[1]} -> {x_condition_all.shape[1]}",
             flush=True,
         )
 
@@ -3116,6 +3207,7 @@ def main(argv: list[str] | None = None) -> None:
         meta,
         bin_idx_all=bin_idx_all,
         theta_state_all=theta_state_all,
+        x_condition_all=x_condition_all,
     )
     h_ref = np.asarray(h_gt_sqrt, dtype=np.float64)
     clf_ref = _pairwise_clf_from_bundle(
@@ -3192,6 +3284,7 @@ def main(argv: list[str] | None = None) -> None:
                 meta,
                 bin_idx_all=bin_idx_all,
                 theta_state_all=theta_state_all,
+                x_condition_all=x_condition_all,
             )
             loaded_n, x_aligned, _ = _estimate_one(
                 args=args,
@@ -3212,7 +3305,11 @@ def main(argv: list[str] | None = None) -> None:
                 meta=meta,
                 perm_seed=int(perm_seed),
                 n_subset=int(n),
-                x_aligned=x_aligned,
+                x_aligned=(
+                    np.asarray(x_aligned, dtype=np.float64)[:, : int(getattr(args, "theta_flow_branch_base_x_dim"))]
+                    if bool(getattr(args, "theta_flow_branch_conditioned", False))
+                    else x_aligned
+                ),
             )
             h_n, clf_n = _metrics_fixed_edges(
                 loaded_n,
@@ -3220,6 +3317,9 @@ def main(argv: list[str] | None = None) -> None:
                 n_bins,
                 int(args.clf_min_class_count),
                 clf_rs,
+                int(getattr(args, "theta_flow_branch_base_x_dim"))
+                if bool(getattr(args, "theta_flow_branch_conditioned", False))
+                else None,
             )
             h_n_sqrt = _sqrt_h_like(h_n)
             corr_h[k] = vhb.matrix_corr_offdiag_pearson(h_n_sqrt, h_gt_sqrt)
@@ -3273,7 +3373,11 @@ def main(argv: list[str] | None = None) -> None:
             )
         finally:
             if tmp_ctx is not None:
-                tmp_ctx.cleanup()
+                try:
+                    tmp_ctx.cleanup()
+                except OSError:
+                    # NFS / open-file races: best-effort remove the per-n temp run dir.
+                    shutil.rmtree(tmp_ctx.name, ignore_errors=True)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -3331,6 +3435,14 @@ def main(argv: list[str] | None = None) -> None:
         dataset_meta_seed=np.int64(meta["seed"]),
         theta_bin_edges=edges,
         theta_bin_centers=centers,
+        theta_flow_branch_conditioned=np.int32(1 if bool(getattr(args, "theta_flow_branch_conditioned", False)) else 0),
+        theta_flow_branch_bins=np.int64(int(getattr(args, "theta_flow_branch_bins", 0))),
+        theta_flow_branch_edges=np.asarray(
+            getattr(args, "theta_flow_branch_edges", np.asarray([], dtype=np.float64)),
+            dtype=np.float64,
+        ),
+        theta_flow_branch_base_x_dim=np.int64(int(getattr(args, "theta_flow_branch_base_x_dim", -1))),
+        theta_flow_branch_aug_x_dim=np.int64(int(getattr(args, "theta_flow_branch_aug_x_dim", -1))),
         # Legacy key name: sqrt(H^2) from MC; see module docstring.
         hellinger_gt_sq_mc=h_gt_sqrt,
         gt_hellinger_n_mc=np.int64(gt_n_mc),

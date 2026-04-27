@@ -11,6 +11,7 @@ from typing import Any
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from sklearn.linear_model import LogisticRegression
 
 from global_setting import SCORE_VAL_FRACTION
 
@@ -105,6 +106,56 @@ def effective_flow_theta_fourier_omega_post(args: Any) -> tuple[float, str]:
 def effective_flow_theta_fourier_omega_prior(args: Any) -> tuple[float, str]:
     """Prior theta-flow Fourier omega (``--flow-prior-theta-fourier-*``)."""
     return effective_theta_fourier_omega_for_prefix(args, "flow_prior_theta_fourier")
+
+
+def theta_branch_indices_from_edges(theta: np.ndarray, edges: np.ndarray) -> np.ndarray:
+    """Map scalar theta values to fixed equal-width branch indices."""
+    th = np.asarray(theta, dtype=np.float64).reshape(-1)
+    ed = np.asarray(edges, dtype=np.float64).reshape(-1)
+    if ed.size < 3:
+        raise ValueError("theta branch edges must contain at least 3 values.")
+    idx = np.searchsorted(ed[1:-1], th, side="right")
+    return np.clip(idx, 0, ed.size - 2).astype(np.int64, copy=False)
+
+
+def fit_theta_branch_log_probs(
+    *,
+    theta_train: np.ndarray,
+    x_train_aug: np.ndarray,
+    theta_all: np.ndarray,
+    x_all_aug: np.ndarray,
+    branch_edges: np.ndarray,
+    base_x_dim: int,
+    random_state: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Estimate log p(branch|x) on all rows and empirical log p(branch)."""
+    edges = np.asarray(branch_edges, dtype=np.float64).reshape(-1)
+    n_branches = int(edges.size - 1)
+    if n_branches < 2:
+        raise ValueError("theta-flow branch conditioning requires at least 2 branches.")
+    base_dim = int(base_x_dim)
+    x_tr = np.asarray(x_train_aug, dtype=np.float64)
+    x_all = np.asarray(x_all_aug, dtype=np.float64)
+    if x_tr.ndim != 2 or x_all.ndim != 2 or x_tr.shape[1] < base_dim or x_all.shape[1] < base_dim:
+        raise ValueError("branch classifier expects augmented x arrays with at least base_x_dim columns.")
+    y_tr = theta_branch_indices_from_edges(theta_train, edges)
+    y_all = theta_branch_indices_from_edges(theta_all, edges)
+    counts = np.bincount(y_tr, minlength=n_branches).astype(np.float64)
+    branch_prior = (counts + 1.0) / (float(np.sum(counts)) + float(n_branches))
+    probs = np.tile(branch_prior.reshape(1, -1), (x_all.shape[0], 1))
+    present = np.flatnonzero(counts > 0.0)
+    if present.size >= 2:
+        clf = LogisticRegression(solver="lbfgs", random_state=int(random_state), max_iter=1000)
+        clf.fit(x_tr[:, :base_dim], y_tr)
+        pred = clf.predict_proba(x_all[:, :base_dim])
+        probs = np.full((x_all.shape[0], n_branches), 1e-12, dtype=np.float64)
+        for local_col, cls in enumerate(clf.classes_):
+            probs[:, int(cls)] = pred[:, local_col]
+        probs = probs / np.sum(probs, axis=1, keepdims=True)
+    # Keep rows for unobserved all-branches finite; y_all validation catches edge mistakes.
+    if y_all.shape[0] != x_all.shape[0]:
+        raise ValueError("theta_all and x_all length mismatch for branch correction.")
+    return np.log(np.clip(probs, 1e-12, 1.0)), np.log(np.clip(branch_prior, 1e-12, 1.0))
 from fisher.trainers import (
     geometric_sigma_schedule,
     train_conditional_theta_flow_likelihood_finetune,
@@ -330,6 +381,16 @@ def _save_h_matrix_dsm_artifacts(
             h_payload["theta_flow_log_post_matrix"] = h_result.theta_flow_log_post_matrix
         if h_result.theta_flow_log_prior_matrix is not None:
             h_payload["theta_flow_log_prior_matrix"] = h_result.theta_flow_log_prior_matrix
+        if h_result.theta_flow_branch_edges is not None:
+            h_payload["theta_flow_branch_edges"] = h_result.theta_flow_branch_edges
+        if h_result.theta_flow_branch_index is not None:
+            h_payload["theta_flow_branch_index"] = h_result.theta_flow_branch_index.astype(np.int64)
+        if h_result.theta_flow_branch_log_posterior is not None:
+            h_payload["theta_flow_branch_log_posterior"] = h_result.theta_flow_branch_log_posterior
+        if h_result.theta_flow_branch_log_prior is not None:
+            h_payload["theta_flow_branch_log_prior"] = h_result.theta_flow_branch_log_prior
+        if h_result.theta_flow_branch_correction_matrix is not None:
+            h_payload["theta_flow_branch_correction_matrix"] = h_result.theta_flow_branch_correction_matrix
     np.savez(h_npz_path, **h_payload)
 
     h_summary_path = os.path.join(args.output_dir, f"h_matrix_summary{suffix}.txt")
@@ -351,6 +412,7 @@ def _save_h_matrix_dsm_artifacts(
             hf.write(f"flow_scheduler: {h_result.flow_scheduler}\n")
         if h_result.flow_score_mode is not None:
             hf.write(f"flow_score_mode: {h_result.flow_score_mode}\n")
+        hf.write(f"theta_flow_branch_conditioned: {h_result.theta_flow_branch_edges is not None}\n")
         hf.write(f"h_save_intermediates: {bool(getattr(args, 'h_save_intermediates', False))}\n")
 
     h_fig_path = os.path.join(args.output_dir, f"h_matrix_sym_heatmap{suffix}.png")
@@ -1404,6 +1466,14 @@ def _save_theta_flow_model_checkpoint(
         "theta_flow_fourier_k": int(getattr(args, "theta_flow_fourier_k", 0)),
         "theta_flow_fourier_period_mult": float(getattr(args, "theta_flow_fourier_period_mult", 0.0)),
         "theta_flow_fourier_include_linear": bool(getattr(args, "theta_flow_fourier_include_linear", False)),
+        "theta_flow_branch_conditioned": bool(getattr(args, "theta_flow_branch_conditioned", False)),
+        "theta_flow_branch_bins": int(getattr(args, "theta_flow_branch_bins", 0)),
+        "theta_flow_branch_base_x_dim": int(getattr(args, "theta_flow_branch_base_x_dim", -1)),
+        "theta_flow_branch_aug_x_dim": int(getattr(args, "theta_flow_branch_aug_x_dim", -1)),
+        "theta_flow_branch_edges": np.asarray(
+            getattr(args, "theta_flow_branch_edges", np.asarray([], dtype=np.float64)),
+            dtype=np.float64,
+        ),
         "theta_flow_posterior_only_likelihood": bool(getattr(args, "theta_flow_posterior_only_likelihood", False)),
         "flow_likelihood_finetune_epochs": int(getattr(args, "flow_likelihood_finetune_epochs", 0)),
         "flow_likelihood_finetune_lr": float(getattr(args, "flow_likelihood_finetune_lr", 1e-4)),
@@ -2139,6 +2209,7 @@ def run_shared_fisher_estimation(
         flow_score_arch = str(flow_arch).strip().lower()
         flow_prior_arch = "mlp" if flow_score_arch == "soft_moe" else str(flow_arch).strip().lower()
         theta_onehot_state = bool(getattr(args, "theta_flow_onehot_state", False))
+        theta_branch_conditioned = bool(getattr(args, "theta_flow_branch_conditioned", False))
         if theta_onehot_state:
             if theta_field_method != "theta_flow":
                 raise ValueError("--theta-flow-onehot-state requires theta_field_method=theta_flow.")
@@ -2152,7 +2223,44 @@ def run_shared_fisher_estimation(
                     "--theta-flow-onehot-state expects theta dimension >= 2 after preprocessing; "
                     f"got theta_dim={theta_dim_flow}."
                 )
-        theta_repr = f"one_hot[{theta_dim_flow}]" if theta_onehot_state else ("scalar" if theta_dim_flow == 1 else f"vector[{theta_dim_flow}]")
+        branch_edges = np.asarray(getattr(args, "theta_flow_branch_edges", np.asarray([], dtype=np.float64)), dtype=np.float64)
+        branch_bins = int(getattr(args, "theta_flow_branch_bins", 0))
+        branch_base_x_dim = int(getattr(args, "theta_flow_branch_base_x_dim", -1))
+        branch_log_post_all: np.ndarray | None = None
+        branch_log_prior: np.ndarray | None = None
+        if theta_branch_conditioned:
+            if theta_field_method != "theta_flow":
+                raise ValueError("--theta-flow-branch-conditioned requires theta_field_method=theta_flow.")
+            if flow_score_arch != "mlp" or flow_prior_arch != "mlp":
+                raise ValueError("--theta-flow-branch-conditioned currently supports flow_arch=mlp only.")
+            if theta_dim_flow != 1:
+                raise ValueError(
+                    "--theta-flow-branch-conditioned keeps scalar theta as the ODE state; "
+                    f"got theta_dim={theta_dim_flow}."
+                )
+            if branch_edges.size != branch_bins + 1 or branch_bins < 2:
+                raise ValueError("theta-flow branch conditioning requires branch_edges with branch_bins + 1 entries.")
+            if branch_base_x_dim < 1 or int(args.x_dim) != branch_base_x_dim + branch_bins:
+                raise ValueError(
+                    "theta-flow branch conditioning expects x_dim = base_x_dim + branch_bins "
+                    f"(got x_dim={int(args.x_dim)}, base_x_dim={branch_base_x_dim}, branch_bins={branch_bins})."
+                )
+            branch_log_post_all, branch_log_prior = fit_theta_branch_log_probs(
+                theta_train=theta_score_fit,
+                x_train_aug=x_score_fit,
+                theta_all=theta_all,
+                x_all_aug=x_all,
+                branch_edges=branch_edges,
+                base_x_dim=branch_base_x_dim,
+                random_state=int(getattr(args, "seed", 7)),
+            )
+        theta_repr = (
+            f"branch_scalar[{branch_bins}]"
+            if theta_branch_conditioned
+            else f"one_hot[{theta_dim_flow}]"
+            if theta_onehot_state
+            else ("scalar" if theta_dim_flow == 1 else f"vector[{theta_dim_flow}]")
+        )
         print(
             f"[{theta_field_method}] "
             f"fit={theta_score_fit.shape[0]} val={theta_score_val.shape[0]} "
@@ -2416,7 +2524,23 @@ def run_shared_fisher_estimation(
         prior_ckpt_hparams: dict[str, Any]
         prior_train_out: dict[str, Any]
         if not theta_flow_posterior_only:
-            if flow_prior_arch == "mlp":
+            if theta_branch_conditioned:
+                prior_ckpt_hparams = {
+                    "x_dim": int(branch_bins),
+                    "hidden_dim": int(getattr(args, "prior_hidden_dim", 128)),
+                    "depth": int(getattr(args, "prior_depth", 3)),
+                    "use_logit_time": True,
+                    "theta_dim": int(theta_dim_flow),
+                    "branch_conditioned_prior": True,
+                }
+                prior_model_flow = ConditionalThetaFlowVelocity(
+                    x_dim=int(branch_bins),
+                    hidden_dim=int(getattr(args, "prior_hidden_dim", 128)),
+                    depth=int(getattr(args, "prior_depth", 3)),
+                    use_logit_time=True,
+                    theta_dim=theta_dim_flow,
+                ).to(device)
+            elif flow_prior_arch == "mlp":
                 prior_ckpt_hparams = {
                     "hidden_dim": int(getattr(args, "prior_hidden_dim", 128)),
                     "depth": int(getattr(args, "prior_depth", 3)),
@@ -2480,21 +2604,44 @@ def run_shared_fisher_estimation(
                 ).to(device)
             else:
                 raise ValueError("--flow-arch must be one of {'mlp','film','film_fourier'}.")
-            prior_train_out = train_prior_theta_flow_model(
-                model=prior_model_flow,
-                theta_train=theta_score_fit,
-                epochs=int(getattr(args, "prior_epochs", 10000)),
-                batch_size=int(getattr(args, "prior_batch_size", 256)),
-                lr=float(getattr(args, "prior_lr", 1e-3)),
-                device=device,
-                log_every=max(1, args.log_every),
-                theta_val=theta_score_val,
-                early_stopping_patience=int(getattr(args, "prior_early_patience", 1000)),
-                early_stopping_min_delta=float(getattr(args, "prior_early_min_delta", 1e-4)),
-                early_stopping_ema_alpha=float(getattr(args, "prior_early_ema_alpha", 0.05)),
-                restore_best=bool(getattr(args, "prior_restore_best", True)),
-                scheduler_name=str(getattr(args, "flow_scheduler", "cosine")),
-            )
+            if theta_branch_conditioned:
+                branch_train = np.asarray(x_score_fit[:, branch_base_x_dim:], dtype=np.float64)
+                branch_val = np.asarray(x_score_val[:, branch_base_x_dim:], dtype=np.float64)
+                if branch_train.shape[1] != branch_bins or branch_val.shape[1] != branch_bins:
+                    raise ValueError("branch-conditioned prior expected branch one-hot columns at the end of x.")
+                prior_train_out = train_conditional_theta_flow_model(
+                    model=prior_model_flow,
+                    theta_train=theta_score_fit,
+                    x_train=branch_train,
+                    epochs=int(getattr(args, "prior_epochs", 10000)),
+                    batch_size=int(getattr(args, "prior_batch_size", 256)),
+                    lr=float(getattr(args, "prior_lr", 1e-3)),
+                    device=device,
+                    log_every=max(1, args.log_every),
+                    theta_val=theta_score_val,
+                    x_val=branch_val,
+                    early_stopping_patience=int(getattr(args, "prior_early_patience", 1000)),
+                    early_stopping_min_delta=float(getattr(args, "prior_early_min_delta", 1e-4)),
+                    early_stopping_ema_alpha=float(getattr(args, "prior_early_ema_alpha", 0.05)),
+                    restore_best=bool(getattr(args, "prior_restore_best", True)),
+                    scheduler_name=str(getattr(args, "flow_scheduler", "cosine")),
+                )
+            else:
+                prior_train_out = train_prior_theta_flow_model(
+                    model=prior_model_flow,
+                    theta_train=theta_score_fit,
+                    epochs=int(getattr(args, "prior_epochs", 10000)),
+                    batch_size=int(getattr(args, "prior_batch_size", 256)),
+                    lr=float(getattr(args, "prior_lr", 1e-3)),
+                    device=device,
+                    log_every=max(1, args.log_every),
+                    theta_val=theta_score_val,
+                    early_stopping_patience=int(getattr(args, "prior_early_patience", 1000)),
+                    early_stopping_min_delta=float(getattr(args, "prior_early_min_delta", 1e-4)),
+                    early_stopping_ema_alpha=float(getattr(args, "prior_early_ema_alpha", 0.05)),
+                    restore_best=bool(getattr(args, "prior_restore_best", True)),
+                    scheduler_name=str(getattr(args, "flow_scheduler", "cosine")),
+                )
             prior_train_losses = np.asarray(prior_train_out["train_losses"], dtype=np.float64)
             prior_val_losses = np.asarray(prior_train_out["val_losses"], dtype=np.float64)
             prior_val_monitor_losses = np.asarray(prior_train_out.get("val_monitor_losses", []), dtype=np.float64)
@@ -2513,21 +2660,40 @@ def run_shared_fisher_estimation(
                     f"batch={ft_batch} ode_steps={int(getattr(args, 'flow_likelihood_finetune_ode_steps', 64))}",
                     flush=True,
                 )
-                prior_likelihood_ft_out = train_prior_theta_flow_likelihood_finetune(
-                    model=prior_model_flow,
-                    theta_train=theta_score_fit,
-                    epochs=ft_epochs,
-                    batch_size=ft_batch,
-                    lr=float(getattr(args, "flow_likelihood_finetune_lr", 1e-4)),
-                    device=device,
-                    log_every=max(1, args.log_every),
-                    theta_val=theta_score_val,
-                    early_stopping_patience=int(getattr(args, "flow_likelihood_finetune_patience", 100)),
-                    early_stopping_min_delta=float(getattr(args, "flow_likelihood_finetune_min_delta", 1e-4)),
-                    early_stopping_ema_alpha=float(getattr(args, "flow_likelihood_finetune_ema_alpha", 0.05)),
-                    restore_best=bool(getattr(args, "prior_restore_best", True)),
-                    ode_steps=int(getattr(args, "flow_likelihood_finetune_ode_steps", 64)),
-                )
+                if theta_branch_conditioned:
+                    prior_likelihood_ft_out = train_conditional_theta_flow_likelihood_finetune(
+                        model=prior_model_flow,
+                        theta_train=theta_score_fit,
+                        x_train=branch_train,
+                        epochs=ft_epochs,
+                        batch_size=ft_batch,
+                        lr=float(getattr(args, "flow_likelihood_finetune_lr", 1e-4)),
+                        device=device,
+                        log_every=max(1, args.log_every),
+                        theta_val=theta_score_val,
+                        x_val=branch_val,
+                        early_stopping_patience=int(getattr(args, "flow_likelihood_finetune_patience", 100)),
+                        early_stopping_min_delta=float(getattr(args, "flow_likelihood_finetune_min_delta", 1e-4)),
+                        early_stopping_ema_alpha=float(getattr(args, "flow_likelihood_finetune_ema_alpha", 0.05)),
+                        restore_best=bool(getattr(args, "prior_restore_best", True)),
+                        ode_steps=int(getattr(args, "flow_likelihood_finetune_ode_steps", 64)),
+                    )
+                else:
+                    prior_likelihood_ft_out = train_prior_theta_flow_likelihood_finetune(
+                        model=prior_model_flow,
+                        theta_train=theta_score_fit,
+                        epochs=ft_epochs,
+                        batch_size=ft_batch,
+                        lr=float(getattr(args, "flow_likelihood_finetune_lr", 1e-4)),
+                        device=device,
+                        log_every=max(1, args.log_every),
+                        theta_val=theta_score_val,
+                        early_stopping_patience=int(getattr(args, "flow_likelihood_finetune_patience", 100)),
+                        early_stopping_min_delta=float(getattr(args, "flow_likelihood_finetune_min_delta", 1e-4)),
+                        early_stopping_ema_alpha=float(getattr(args, "flow_likelihood_finetune_ema_alpha", 0.05)),
+                        restore_best=bool(getattr(args, "prior_restore_best", True)),
+                        ode_steps=int(getattr(args, "flow_likelihood_finetune_ode_steps", 64)),
+                    )
                 prior_likelihood_ft_train_losses = np.asarray(prior_likelihood_ft_out["train_losses"], dtype=np.float64)
                 prior_likelihood_ft_val_losses = np.asarray(prior_likelihood_ft_out["val_losses"], dtype=np.float64)
                 prior_likelihood_ft_val_monitor_losses = np.asarray(
@@ -2652,6 +2818,10 @@ def run_shared_fisher_estimation(
                 flow_scheduler=str(getattr(args, "flow_scheduler", "cosine")),
                 theta_flow_posterior_only_likelihood=_post_only,
                 flow_likelihood_exact_divergence=_flow_ex_div,
+                theta_flow_branch_edges=branch_edges if theta_branch_conditioned else None,
+                theta_flow_branch_log_posterior=branch_log_post_all,
+                theta_flow_branch_log_prior=branch_log_prior,
+                theta_flow_branch_base_x_dim=branch_base_x_dim if theta_branch_conditioned else None,
             )
             h_result = h_estimator.run(
                 theta=theta_h_matrix,

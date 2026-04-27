@@ -52,6 +52,11 @@ class HMatrixResult:
     flow_score_mode: str | None
     theta_flow_log_post_matrix: np.ndarray | None
     theta_flow_log_prior_matrix: np.ndarray | None
+    theta_flow_branch_edges: np.ndarray | None
+    theta_flow_branch_index: np.ndarray | None
+    theta_flow_branch_log_posterior: np.ndarray | None
+    theta_flow_branch_log_prior: np.ndarray | None
+    theta_flow_branch_correction_matrix: np.ndarray | None
 
 
 def _make_flow_matching_path(scheduler_name: str) -> Any:
@@ -122,6 +127,10 @@ class HMatrixEstimator:
         ctsm_int_n_time: int = 300,
         ctsm_t_eps: float = 1e-5,
         theta_flow_posterior_only_likelihood: bool = False,
+        theta_flow_branch_edges: np.ndarray | None = None,
+        theta_flow_branch_log_posterior: np.ndarray | None = None,
+        theta_flow_branch_log_prior: np.ndarray | None = None,
+        theta_flow_branch_base_x_dim: int | None = None,
     ) -> None:
         if pair_batch_size < 1:
             raise ValueError("pair_batch_size must be >= 1.")
@@ -191,6 +200,35 @@ class HMatrixEstimator:
         self.ctsm_t_eps = float(ctsm_t_eps)
         self.flow_likelihood_exact_divergence = bool(flow_likelihood_exact_divergence)
         self.flow_likelihood_method = "midpoint"
+        self.theta_flow_branch_edges = (
+            None if theta_flow_branch_edges is None else np.asarray(theta_flow_branch_edges, dtype=np.float64).reshape(-1)
+        )
+        self.theta_flow_branch_log_posterior = (
+            None
+            if theta_flow_branch_log_posterior is None
+            else np.asarray(theta_flow_branch_log_posterior, dtype=np.float64)
+        )
+        self.theta_flow_branch_log_prior = (
+            None if theta_flow_branch_log_prior is None else np.asarray(theta_flow_branch_log_prior, dtype=np.float64).reshape(-1)
+        )
+        self.theta_flow_branch_base_x_dim = None if theta_flow_branch_base_x_dim is None else int(theta_flow_branch_base_x_dim)
+        self.theta_flow_branch_conditioned = self.theta_flow_branch_edges is not None
+        if self.theta_flow_branch_conditioned:
+            if self.field_method != "theta_flow":
+                raise ValueError("theta-flow branch conditioning is only valid for field_method='theta_flow'.")
+            if self.theta_flow_posterior_only_likelihood:
+                raise ValueError("theta-flow branch conditioning requires a branch prior model.")
+            if self.theta_flow_branch_edges is None or self.theta_flow_branch_edges.size < 3:
+                raise ValueError("theta_flow_branch_edges must contain at least 3 entries.")
+            n_branches = int(self.theta_flow_branch_edges.size - 1)
+            if self.theta_flow_branch_base_x_dim is None or self.theta_flow_branch_base_x_dim < 1:
+                raise ValueError("theta_flow_branch_base_x_dim must be positive.")
+            if self.theta_flow_branch_log_posterior is None or self.theta_flow_branch_log_posterior.ndim != 2:
+                raise ValueError("theta_flow_branch_log_posterior must be a 2D array.")
+            if self.theta_flow_branch_log_posterior.shape[1] != n_branches:
+                raise ValueError("theta_flow_branch_log_posterior width must match branch count.")
+            if self.theta_flow_branch_log_prior is None or self.theta_flow_branch_log_prior.size != n_branches:
+                raise ValueError("theta_flow_branch_log_prior length must match branch count.")
         self._flow_path = (
             _make_flow_matching_path(self.flow_scheduler)
             if self.field_method in ("theta_path_integral", "theta_flow")
@@ -201,6 +239,9 @@ class HMatrixEstimator:
         self._flow_x_likelihood_solver = None
         self._theta_flow_log_post_matrix: np.ndarray | None = None
         self._theta_flow_log_prior_matrix: np.ndarray | None = None
+        self._theta_flow_branch_index: np.ndarray | None = None
+        self._theta_flow_branch_log_posterior_sorted: np.ndarray | None = None
+        self._theta_flow_branch_correction_matrix: np.ndarray | None = None
         if self.field_method == "theta_flow":
             self._flow_likelihood_solver_post = _make_flow_ode_solver(self._post_velocity_for_likelihood)
             if not self.theta_flow_posterior_only_likelihood:
@@ -256,9 +297,13 @@ class HMatrixEstimator:
         return self.model_post(x, x_cond, self._time_to_batch_column(t, x))
 
     def _prior_velocity_for_likelihood(self, x: torch.Tensor, t: torch.Tensor, **model_extras: Any) -> torch.Tensor:
-        _ = model_extras
         if self.model_prior is None:
             raise RuntimeError("_prior_velocity_for_likelihood called without model_prior.")
+        if self.theta_flow_branch_conditioned:
+            branch_cond = model_extras.get("branch_cond", None)
+            if branch_cond is None:
+                raise ValueError("branch-conditioned theta prior ODE call requires model_extras['branch_cond'].")
+            return self.model_prior(x, branch_cond, self._time_to_batch_column(t, x))
         return self.model_prior(x, self._time_to_batch_column(t, x))
 
     def _x_post_velocity_for_likelihood(self, x: torch.Tensor, t: torch.Tensor, **model_extras: Any) -> torch.Tensor:
@@ -286,6 +331,22 @@ class HMatrixEstimator:
         in_range = bool(np.all(th >= -atol) and np.all(th <= 1.0 + atol))
         near_binary = bool(np.all((np.abs(th) <= atol) | (np.abs(th - 1.0) <= atol)))
         return bool(row_sum_ok and in_range and near_binary)
+
+    @staticmethod
+    def _theta_branch_index(theta_mat: np.ndarray, edges: np.ndarray) -> np.ndarray:
+        theta_flat = HMatrixEstimator._theta_as_matrix(theta_mat).reshape(-1)
+        ed = np.asarray(edges, dtype=np.float64).reshape(-1)
+        if ed.size < 3:
+            raise ValueError("theta branch edges must contain at least 3 values.")
+        idx = np.searchsorted(ed[1:-1], theta_flat, side="right")
+        return np.clip(idx, 0, ed.size - 2).astype(np.int64, copy=False)
+
+    @staticmethod
+    def _onehot_from_index(idx: np.ndarray, n_classes: int) -> np.ndarray:
+        ii = np.asarray(idx, dtype=np.int64).reshape(-1)
+        out = np.zeros((ii.size, int(n_classes)), dtype=np.float32)
+        out[np.arange(ii.size), np.clip(ii, 0, int(n_classes) - 1)] = 1.0
+        return out
 
     @staticmethod
     def sort_by_theta(theta: np.ndarray, x: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -375,6 +436,16 @@ class HMatrixEstimator:
         n = int(theta_grid_col.shape[0])
         if n < 1:
             raise ValueError("Need at least one sample to compute H-matrix.")
+        branch_idx: np.ndarray | None = None
+        branch_onehot: np.ndarray | None = None
+        branch_correction_matrix: np.ndarray | None = None
+        if self.theta_flow_branch_conditioned:
+            assert self.theta_flow_branch_edges is not None
+            assert self.theta_flow_branch_log_prior is not None
+            assert self._theta_flow_branch_log_posterior_sorted is not None
+            branch_idx = self._theta_branch_index(theta_grid_col, self.theta_flow_branch_edges)
+            branch_onehot = self._onehot_from_index(branch_idx, int(self.theta_flow_branch_edges.size - 1))
+            branch_correction_matrix = np.zeros((n, n), dtype=np.float64)
         row_block = max(1, int(self.pair_batch_size // n))
         theta_grid_col = np.asarray(theta_grid_col, dtype=np.float32)
         r = np.zeros((n, n), dtype=np.float64)
@@ -394,7 +465,17 @@ class HMatrixEstimator:
             xb = np.asarray(x_sorted[i0:i1], dtype=np.float32)
             b = int(i1 - i0)
             theta_tile = np.tile(theta_grid_col, (b, 1))
-            x_rep = np.repeat(xb, repeats=n, axis=0)
+            if self.theta_flow_branch_conditioned:
+                if branch_idx is None or branch_onehot is None:
+                    raise RuntimeError("branch metadata missing during theta-flow likelihood.")
+                assert self.theta_flow_branch_base_x_dim is not None
+                x_base = xb[:, : self.theta_flow_branch_base_x_dim]
+                x_rep_base = np.repeat(x_base, repeats=n, axis=0)
+                branch_tile_np = np.tile(branch_onehot, (b, 1))
+                x_rep = np.concatenate([x_rep_base, branch_tile_np], axis=1)
+            else:
+                branch_tile_np = None
+                x_rep = np.repeat(xb, repeats=n, axis=0)
             theta_t = torch.from_numpy(theta_tile).to(self.device)
             x_t = torch.from_numpy(x_rep).to(self.device)
             time_grid = torch.linspace(1.0, 0.0, self.flow_ode_steps + 1, device=theta_t.device, dtype=theta_t.dtype)
@@ -415,6 +496,11 @@ class HMatrixEstimator:
             else:
                 assert self._flow_likelihood_solver_prior is not None
                 assert log_prior_matrix is not None
+                prior_kwargs: dict[str, Any] = {}
+                if self.theta_flow_branch_conditioned:
+                    if branch_tile_np is None:
+                        raise RuntimeError("branch prior conditioning missing during likelihood.")
+                    prior_kwargs["branch_cond"] = torch.from_numpy(branch_tile_np).to(self.device)
                 _, log_prior = self._flow_likelihood_solver_prior.compute_likelihood(
                     x_1=theta_t,
                     log_p0=self._standard_normal_log_prob,
@@ -423,12 +509,26 @@ class HMatrixEstimator:
                     time_grid=time_grid,
                     exact_divergence=self.flow_likelihood_exact_divergence,
                     enable_grad=False,
+                    **prior_kwargs,
                 )
                 log_prior_block = log_prior.reshape(b, n).detach().cpu().numpy().astype(np.float64)
                 log_prior_matrix[i0:i1, :] = log_prior_block
-                r[i0:i1, :] = log_post_block - log_prior_block
+                if self.theta_flow_branch_conditioned:
+                    assert branch_idx is not None
+                    assert self.theta_flow_branch_log_prior is not None
+                    assert self._theta_flow_branch_log_posterior_sorted is not None
+                    correction = (
+                        self._theta_flow_branch_log_posterior_sorted[i0:i1, :][:, branch_idx]
+                        - self.theta_flow_branch_log_prior[branch_idx].reshape(1, -1)
+                    )
+                    branch_correction_matrix[i0:i1, :] = correction
+                    r[i0:i1, :] = log_post_block - log_prior_block + correction
+                else:
+                    r[i0:i1, :] = log_post_block - log_prior_block
         self._theta_flow_log_post_matrix = log_post_matrix
         self._theta_flow_log_prior_matrix = log_prior_matrix
+        self._theta_flow_branch_index = branch_idx
+        self._theta_flow_branch_correction_matrix = branch_correction_matrix
         return r
 
     def compute_x_conditional_loglik_matrix(self, theta_sorted: np.ndarray, x_sorted: np.ndarray) -> np.ndarray:
@@ -547,6 +647,13 @@ class HMatrixEstimator:
         theta_sorted, x_sorted, perm, inv_perm = self.sort_by_theta(theta_col, x)
         if theta_sorted.shape[1] == 1 and np.any(np.diff(theta_sorted[:, 0]) < 0.0):
             raise ValueError("sort_by_theta produced a non-monotone theta sequence.")
+        if self.theta_flow_branch_conditioned:
+            assert self.theta_flow_branch_log_posterior is not None
+            if self.theta_flow_branch_log_posterior.shape[0] != theta_col.shape[0]:
+                raise ValueError("theta_flow_branch_log_posterior row count must match theta rows.")
+            self._theta_flow_branch_log_posterior_sorted = self.theta_flow_branch_log_posterior[perm]
+        else:
+            self._theta_flow_branch_log_posterior_sorted = None
 
         if self.field_method == "theta_flow":
             c_sorted = self.compute_log_ratio_matrix(theta_sorted, x_sorted)
@@ -554,24 +661,32 @@ class HMatrixEstimator:
             g_sorted = np.zeros_like(c_sorted, dtype=np.float64)
             theta_flow_log_post_sorted = self._theta_flow_log_post_matrix
             theta_flow_log_prior_sorted = self._theta_flow_log_prior_matrix
+            theta_flow_branch_correction_sorted = self._theta_flow_branch_correction_matrix
+            theta_flow_branch_index_sorted = self._theta_flow_branch_index
         elif self.field_method == "flow_x_likelihood":
             c_sorted = self.compute_x_conditional_loglik_matrix(theta_sorted, x_sorted)
             delta_sorted = self.compute_delta_l(c_sorted)
             g_sorted = np.zeros_like(c_sorted, dtype=np.float64)
             theta_flow_log_post_sorted = None
             theta_flow_log_prior_sorted = None
+            theta_flow_branch_correction_sorted = None
+            theta_flow_branch_index_sorted = None
         elif self.field_method == "ctsm_v":
             delta_sorted = self.compute_ctsm_delta_l_matrix(theta_sorted, x_sorted)
             c_sorted = np.asarray(delta_sorted, dtype=np.float64)
             g_sorted = np.zeros_like(c_sorted, dtype=np.float64)
             theta_flow_log_post_sorted = None
             theta_flow_log_prior_sorted = None
+            theta_flow_branch_correction_sorted = None
+            theta_flow_branch_index_sorted = None
         else:
             g_sorted = self.compute_g_matrix(theta_sorted, x_sorted)
             c_sorted = self.compute_c_matrix(theta_sorted, g_sorted)
             delta_sorted = self.compute_delta_l(c_sorted)
             theta_flow_log_post_sorted = None
             theta_flow_log_prior_sorted = None
+            theta_flow_branch_correction_sorted = None
+            theta_flow_branch_index_sorted = None
         h_dir_sorted = self.compute_h_directed(delta_sorted)
         h_sym_sorted = self.symmetrize(h_dir_sorted)
 
@@ -595,6 +710,21 @@ class HMatrixEstimator:
                 if theta_flow_log_prior_sorted is not None
                 else None
             )
+            theta_flow_branch_correction_used = (
+                self._permute_back(theta_flow_branch_correction_sorted, inv_perm)
+                if theta_flow_branch_correction_sorted is not None
+                else None
+            )
+            theta_flow_branch_index_used = (
+                theta_flow_branch_index_sorted[inv_perm]
+                if theta_flow_branch_index_sorted is not None
+                else None
+            )
+            theta_flow_branch_log_posterior_used = (
+                self._theta_flow_branch_log_posterior_sorted[inv_perm]
+                if self._theta_flow_branch_log_posterior_sorted is not None
+                else None
+            )
             order_mode = "original"
         else:
             theta_used = theta_sorted.reshape(-1) if theta_sorted.shape[1] == 1 else theta_sorted.copy()
@@ -605,6 +735,9 @@ class HMatrixEstimator:
             h_sym_used = h_sym_sorted
             theta_flow_log_post_used = theta_flow_log_post_sorted
             theta_flow_log_prior_used = theta_flow_log_prior_sorted
+            theta_flow_branch_correction_used = theta_flow_branch_correction_sorted
+            theta_flow_branch_index_used = theta_flow_branch_index_sorted
+            theta_flow_branch_log_posterior_used = self._theta_flow_branch_log_posterior_sorted
             order_mode = "sorted"
 
         return HMatrixResult(
@@ -659,4 +792,9 @@ class HMatrixEstimator:
             ),
             theta_flow_log_post_matrix=theta_flow_log_post_used,
             theta_flow_log_prior_matrix=theta_flow_log_prior_used,
+            theta_flow_branch_edges=self.theta_flow_branch_edges,
+            theta_flow_branch_index=theta_flow_branch_index_used,
+            theta_flow_branch_log_posterior=theta_flow_branch_log_posterior_used,
+            theta_flow_branch_log_prior=self.theta_flow_branch_log_prior,
+            theta_flow_branch_correction_matrix=theta_flow_branch_correction_used,
         )
