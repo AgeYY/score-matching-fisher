@@ -31,6 +31,9 @@ Flow methods use ``--flow-arch``: ``mlp``, ``film`` (FiLM with raw-theta embeddi
 ``film_fourier`` for ``theta_flow`` / ``theta_path_integral`` / ``x_flow``.
 ``film_fourier`` uses FiLM conditioning with Fourier theta features
 (``--flow-theta-fourier-*`` for ``theta_flow`` / ``theta_path_integral`` and ``--flow-x-theta-fourier-*`` for ``x_flow``).
+``--theta-field-method pairwise_bin_theta_flow`` trains a separate binary scalar
+``theta_flow`` for each off-diagonal theta-bin pair after relabeling the two bins as
+``-1`` and ``+1``, then assembles a bin-level H/LLR matrix.
 The **reference column** (``n_ref``) does **not** run learned H
 training: the
 matrix-panel top row shows **MC generative** ``sqrt(H^2)`` (same as the H correlation
@@ -412,6 +415,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Minimum samples per bin class for pairwise classifiers (default 5).",
     )
     p.add_argument(
+        "--pairwise-bin-min-class-count",
+        type=int,
+        default=5,
+        help=(
+            "pairwise_bin_theta_flow only: minimum train/full samples per theta bin required "
+            "before fitting a binary theta-flow for a bin pair (default 5)."
+        ),
+    )
+    p.add_argument(
         "--clf-random-state",
         type=int,
         default=-1,
@@ -589,12 +601,19 @@ def _validate_cli(args: argparse.Namespace) -> None:
             pa = float(_pa)
             if (not np.isfinite(pa)) or pa <= 0.0 or pa > 1.0:
                 raise ValueError("--nf-prior-early-ema-alpha must be in (0, 1].")
+    elif tfm == "pairwise_bin_theta_flow":
+        setattr(args, "theta_field_method", "pairwise_bin_theta_flow")
+        probe = argparse.Namespace(**vars(args).copy())
+        setattr(probe, "theta_field_method", "theta_flow")
+        validate_estimation_args(probe)
     else:
         validate_estimation_args(args)
     if int(args.num_theta_bins) < 1:
         raise ValueError("--num-theta-bins must be >= 1.")
     if int(args.clf_min_class_count) < 1:
         raise ValueError("--clf-min-class-count must be >= 1.")
+    if int(getattr(args, "pairwise_bin_min_class_count", 5)) < 1:
+        raise ValueError("--pairwise-bin-min-class-count must be >= 1.")
     n_ref = int(args.n_ref)
     n_bins_cli = int(args.num_theta_bins)
     if n_ref < 2:
@@ -607,12 +626,18 @@ def _validate_cli(args: argparse.Namespace) -> None:
     use_onehot = bool(getattr(args, "theta_flow_onehot_state", False))
     use_fourier = bool(getattr(args, "theta_flow_fourier_state", False))
     use_segmented = bool(getattr(args, "theta_flow_segmented", False))
+    use_pairwise_bin = tfm == "pairwise_bin_theta_flow"
     if use_onehot and use_fourier:
         raise ValueError("Use only one theta-flow state override: one-hot or Fourier, not both.")
     if use_segmented and use_onehot:
         raise ValueError("Use only one theta-flow mode: segmented or one-hot, not both.")
     if use_segmented and use_fourier:
         raise ValueError("Use only one theta-flow mode: segmented or Fourier, not both.")
+    if use_pairwise_bin and (use_onehot or use_fourier or use_segmented):
+        raise ValueError(
+            "--theta-field-method pairwise_bin_theta_flow uses its own binary theta labels; "
+            "do not combine it with one-hot, Fourier, or segmented theta-flow modes."
+        )
     if use_onehot:
         tfm = str(getattr(args, "theta_field_method", "theta_flow")).strip().lower()
         arch = str(getattr(args, "flow_arch", "mlp")).strip().lower()
@@ -691,6 +716,15 @@ class SweepSubset(NamedTuple):
     bin_all: np.ndarray
     bin_train: np.ndarray
     bin_validation: np.ndarray
+
+
+class PairwiseBinThetaFlowResult(NamedTuple):
+    h_binned: np.ndarray
+    delta_l_binned: np.ndarray
+    pair_valid: np.ndarray
+    pair_support: np.ndarray
+    pair_train_support: np.ndarray
+    out_npz: str
 
 
 def _subset_bundle(
@@ -891,6 +925,226 @@ def _pairwise_clf_from_bundle(
         random_state=int(clf_random_state),
     )
     return clf_acc
+
+
+def _pairwise_binary_bundle(
+    subset: SweepSubset,
+    bin_a: int,
+    bin_b: int,
+) -> tuple[SharedDatasetBundle, np.ndarray]:
+    """Restrict a subset to two bins and relabel them as scalar theta states -1 and +1."""
+    a = int(bin_a)
+    b = int(bin_b)
+    if a == b:
+        raise ValueError("pairwise binary bundle requires two distinct bins.")
+
+    def _select(x: np.ndarray, bins: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        bi = np.asarray(bins, dtype=np.int64).reshape(-1)
+        keep = (bi == a) | (bi == b)
+        idx = np.flatnonzero(keep)
+        labels = np.where(bi[idx] == a, -1.0, 1.0).astype(np.float64).reshape(-1, 1)
+        return np.asarray(x[idx], dtype=np.float64), labels
+
+    x_train, theta_train = _select(subset.bundle.x_train, subset.bin_train)
+    x_val, theta_val = _select(subset.bundle.x_validation, subset.bin_validation)
+    x_all = np.concatenate([x_train, x_val], axis=0)
+    theta_all = np.concatenate([theta_train, theta_val], axis=0)
+    n_train = int(theta_train.shape[0])
+    train_idx = np.arange(n_train, dtype=np.int64)
+    validation_idx = np.arange(n_train, int(theta_all.shape[0]), dtype=np.int64)
+    bin_all = np.where(theta_all.reshape(-1) < 0.0, a, b).astype(np.int64)
+    return (
+        SharedDatasetBundle(
+            meta=subset.bundle.meta,
+            theta_all=theta_all,
+            x_all=x_all,
+            train_idx=train_idx,
+            validation_idx=validation_idx,
+            theta_train=theta_train,
+            x_train=x_train,
+            theta_validation=theta_val,
+            x_validation=x_val,
+        ),
+        bin_all,
+    )
+
+
+def _nanmean_padded_1d(arrays: list[np.ndarray]) -> np.ndarray:
+    vals = [np.asarray(a, dtype=np.float64).reshape(-1) for a in arrays if np.asarray(a).size > 0]
+    if not vals:
+        return np.asarray([], dtype=np.float64)
+    n = max(int(v.size) for v in vals)
+    stack = np.full((len(vals), n), np.nan, dtype=np.float64)
+    for i, v in enumerate(vals):
+        stack[i, : v.size] = v
+    valid = np.isfinite(stack)
+    denom = np.sum(valid, axis=0)
+    out = np.full(n, np.nan, dtype=np.float64)
+    mask = denom > 0
+    out[mask] = np.nansum(stack[:, mask], axis=0) / denom[mask]
+    return out
+
+
+def _write_pairwise_bin_training_losses(run_dir: str, pair_loss_paths: list[str]) -> str:
+    bundles: list[dict[str, Any]] = []
+    for p in pair_loss_paths:
+        if os.path.isfile(p):
+            bundles.append(_load_per_n_training_loss_npz(p))
+
+    def _collect(key: str) -> np.ndarray:
+        return _nanmean_padded_1d([np.asarray(b.get(key, []), dtype=np.float64) for b in bundles])
+
+    prior_enable = any(bool(b.get("prior_enable", True)) for b in bundles)
+    out = os.path.join(run_dir, "score_prior_training_losses.npz")
+    np.savez_compressed(
+        out,
+        theta_field_method=np.asarray(["pairwise_bin_theta_flow"], dtype=object),
+        prior_enable=np.bool_(prior_enable),
+        score_train_losses=_collect("score_train_losses"),
+        score_val_losses=_collect("score_val_losses"),
+        score_val_monitor_losses=_collect("score_val_monitor_losses"),
+        score_likelihood_finetune_train_losses=_collect("score_likelihood_finetune_train_losses"),
+        score_likelihood_finetune_val_losses=_collect("score_likelihood_finetune_val_losses"),
+        score_likelihood_finetune_val_monitor_losses=_collect("score_likelihood_finetune_val_monitor_losses"),
+        prior_train_losses=_collect("prior_train_losses"),
+        prior_val_losses=_collect("prior_val_losses"),
+        prior_val_monitor_losses=_collect("prior_val_monitor_losses"),
+        prior_likelihood_finetune_train_losses=_collect("prior_likelihood_finetune_train_losses"),
+        prior_likelihood_finetune_val_losses=_collect("prior_likelihood_finetune_val_losses"),
+        prior_likelihood_finetune_val_monitor_losses=_collect("prior_likelihood_finetune_val_monitor_losses"),
+        pair_loss_paths=np.asarray(pair_loss_paths, dtype=object),
+        n_pair_runs=np.int64(len(bundles)),
+    )
+    return out
+
+
+def _run_pairwise_bin_theta_flow(
+    *,
+    args: argparse.Namespace,
+    meta: dict,
+    subset: SweepSubset,
+    output_dir: str,
+    n_bins: int,
+    edges: np.ndarray,
+) -> PairwiseBinThetaFlowResult:
+    """Train a binary theta-flow for every bin pair and assemble a bin-level H/LLR matrix."""
+    nb = int(n_bins)
+    min_count = int(getattr(args, "pairwise_bin_min_class_count", 5))
+    os.makedirs(output_dir, exist_ok=True)
+    pair_root = os.path.join(output_dir, "pairwise_bin_theta_flow")
+    os.makedirs(pair_root, exist_ok=True)
+    h_binned = np.full((nb, nb), np.nan, dtype=np.float64)
+    delta_l_binned = np.full((nb, nb), np.nan, dtype=np.float64)
+    pair_valid = np.zeros((nb, nb), dtype=bool)
+    pair_support = np.zeros((nb, nb), dtype=np.int64)
+    pair_train_support = np.zeros((nb, nb), dtype=np.int64)
+    pair_dirs: list[str] = []
+    pair_loss_paths: list[str] = []
+    np.fill_diagonal(h_binned, 0.0)
+    np.fill_diagonal(delta_l_binned, 0.0)
+
+    for a in range(nb):
+        for b in range(a + 1, nb):
+            n_all_a = int(np.sum(subset.bin_all == a))
+            n_all_b = int(np.sum(subset.bin_all == b))
+            n_tr_a = int(np.sum(subset.bin_train == a))
+            n_tr_b = int(np.sum(subset.bin_train == b))
+            pair_support[a, b] = pair_support[b, a] = n_all_a + n_all_b
+            pair_train_support[a, b] = pair_train_support[b, a] = n_tr_a + n_tr_b
+            if min(n_all_a, n_all_b, n_tr_a, n_tr_b) < min_count:
+                print(
+                    "[pairwise_bin_theta_flow] skip "
+                    f"bins=({a},{b}) counts_all=({n_all_a},{n_all_b}) "
+                    f"counts_train=({n_tr_a},{n_tr_b}) min={min_count}",
+                    flush=True,
+                )
+                continue
+
+            pair_bundle, pair_bin_all = _pairwise_binary_bundle(subset, a, b)
+            pair_dir = os.path.join(pair_root, f"bin_{a:02d}_{b:02d}")
+            pair_args = argparse.Namespace(**vars(args).copy())
+            pair_args.theta_field_method = "theta_flow"
+            pair_args.theta_flow_onehot_state = False
+            pair_args.theta_flow_fourier_state = False
+            pair_args.theta_flow_segmented = False
+            pair_args.output_dir = pair_dir
+            pair_args.h_matrix_npz = None
+            pair_args.h_only = False
+            loaded, _, _ = _estimate_one(
+                args=pair_args,
+                meta=meta,
+                bundle=pair_bundle,
+                output_dir=pair_dir,
+                n_bins=2,
+            )
+            pair_labels = np.where(np.asarray(loaded.theta_used, dtype=np.float64).reshape(-1) < 0.0, 0, 1)
+            h2, _ = vhb.average_matrix_by_bins(np.asarray(loaded.h_sym, dtype=np.float64), pair_labels, 2)
+            delta_l = _load_delta_l_from_run_dir(pair_dir, dataset_family=str(meta.get("dataset_family", "")))
+            dl2, _ = vhb.average_matrix_by_bins(delta_l, pair_labels, 2)
+            h_ab = float(h2[0, 1])
+            h_ba = float(h2[1, 0])
+            h_vals = np.asarray([h_ab, h_ba], dtype=np.float64)
+            h_finite = h_vals[np.isfinite(h_vals)]
+            h_binned[a, b] = h_binned[b, a] = (
+                float(np.mean(h_finite)) if h_finite.size > 0 else float("nan")
+            )
+            delta_l_binned[a, b] = float(dl2[0, 1])
+            delta_l_binned[b, a] = float(dl2[1, 0])
+            pair_valid[a, b] = pair_valid[b, a] = True
+            pair_dirs.append(os.path.abspath(pair_dir))
+            loss_path = os.path.join(pair_dir, "score_prior_training_losses.npz")
+            if os.path.isfile(loss_path):
+                pair_loss_paths.append(os.path.abspath(loss_path))
+            print(
+                f"[pairwise_bin_theta_flow] bins=({a},{b}) "
+                f"h={h_binned[a, b]:.6g} delta_ab={delta_l_binned[a, b]:.6g} "
+                f"delta_ba={delta_l_binned[b, a]:.6g}",
+                flush=True,
+            )
+
+    out_npz = os.path.join(output_dir, "pairwise_bin_theta_flow_results.npz")
+    np.savez_compressed(
+        out_npz,
+        h_sym_binned=h_binned,
+        delta_l_binned=delta_l_binned,
+        pair_valid=pair_valid.astype(np.int32),
+        pair_support=pair_support,
+        pair_train_support=pair_train_support,
+        theta_bin_edges=np.asarray(edges, dtype=np.float64),
+        pair_dirs=np.asarray(pair_dirs, dtype=object),
+        min_class_count=np.int64(min_count),
+    )
+
+    fig_path = os.path.join(output_dir, "pairwise_bin_theta_flow_heatmap.png")
+    fig, axes = plt.subplots(1, 2, figsize=(8.5, 3.6), layout="tight")
+    im0 = axes[0].imshow(_sqrt_h_like(h_binned), origin="lower", aspect="auto", vmin=0.0, vmax=1.0)
+    axes[0].set_title(r"Pairwise binary $\sqrt{H^2}$")
+    axes[0].set_xlabel("bin j")
+    axes[0].set_ylabel("bin i")
+    fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+    im1 = axes[1].imshow(delta_l_binned, origin="lower", aspect="auto")
+    axes[1].set_title(r"Pairwise binary $\Delta L$")
+    axes[1].set_xlabel("bin j")
+    axes[1].set_ylabel("bin i")
+    fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+    _save_figure_png_svg(fig, fig_path, dpi=160)
+    plt.close(fig)
+
+    loss_out = _write_pairwise_bin_training_losses(output_dir, pair_loss_paths)
+    print(
+        f"[pairwise_bin_theta_flow] aggregate saved: {out_npz}; "
+        f"valid_pairs={int(np.sum(np.triu(pair_valid, 1)))}/{nb * (nb - 1) // 2}; "
+        f"losses={loss_out}",
+        flush=True,
+    )
+    return PairwiseBinThetaFlowResult(
+        h_binned=h_binned,
+        delta_l_binned=delta_l_binned,
+        pair_valid=pair_valid,
+        pair_support=pair_support,
+        pair_train_support=pair_train_support,
+        out_npz=out_npz,
+    )
 
 
 def _estimate_one(
@@ -1706,6 +1960,8 @@ def _render_training_losses_panel(
             post_lab = "pair-conditioned CTSM-v"
         elif tfm == "nf":
             post_lab = "normalizing-flow posterior"
+        elif tfm == "pairwise_bin_theta_flow":
+            post_lab = "pairwise binary theta-flow"
         else:
             post_lab = tfm
         _plot_loss_triplet(
@@ -2014,6 +2270,8 @@ def _save_combined_convergence_figure(
             post_lab = "pair-conditioned CTSM-v"
         elif tfm == "nf":
             post_lab = "normalizing-flow posterior"
+        elif tfm == "pairwise_bin_theta_flow":
+            post_lab = "pairwise binary theta-flow"
         else:
             post_lab = tfm
         _plot_loss_triplet(
@@ -2414,6 +2672,8 @@ def _write_summary(
         f.write(f"output_dir: {args.output_dir}\n")
         f.write(f"n_ref: {args.n_ref}  n_list: {args.n_list}\n")
         f.write(f"num_theta_bins: {args.num_theta_bins}\n")
+        f.write(f"theta_field_method: {getattr(args, 'theta_field_method', 'theta_flow')}\n")
+        f.write(f"pairwise_bin_min_class_count: {int(getattr(args, 'pairwise_bin_min_class_count', 5))}\n")
         f.write(f"theta_flow_onehot_state: {bool(getattr(args, 'theta_flow_onehot_state', False))}\n")
         f.write(f"theta_flow_fourier_state: {bool(getattr(args, 'theta_flow_fourier_state', False))}\n")
         if bool(getattr(args, "theta_flow_fourier_state", False)):
@@ -3096,10 +3356,21 @@ def main(argv: list[str] | None = None) -> None:
             "forms R=C_post-log p(theta_j), then DeltaL=R-diag(R), and H via 1-sech(DeltaL/2).",
             flush=True,
         )
+    elif tfm == "pairwise_bin_theta_flow":
+        print(
+            f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
+            "(one binary theta-flow per off-diagonal theta-bin pair)",
+            flush=True,
+        )
+        print(
+            "[convergence] pairwise_bin_theta_flow maps each bin pair to labels -1/+1, "
+            "trains the existing scalar theta_flow estimator, then assembles a bin-level H/LLR matrix.",
+            flush=True,
+        )
     else:
         raise ValueError(
             f"Unsupported --theta-field-method={tfm!r}; use "
-            "theta_flow, theta_path_integral, x_flow, ctsm_v, or nf."
+            "theta_flow, theta_path_integral, x_flow, ctsm_v, nf, or pairwise_bin_theta_flow."
         )
     print(
         "[convergence] n_ref reference: no learned H training at n_ref; matrix-panel top row = MC GT sqrt(H^2); "
@@ -3193,42 +3464,63 @@ def main(argv: list[str] | None = None) -> None:
                 bin_idx_all=bin_idx_all,
                 theta_state_all=theta_state_all,
             )
-            loaded_n, x_aligned, _ = _estimate_one(
-                args=args,
-                meta=meta,
-                bundle=subset_n.bundle,
-                output_dir=run_dir,
-                n_bins=n_bins,
-            )
-            per_diag = os.path.join(
-                args.output_dir,
-                "sweep_runs",
-                f"n_{int(n):06d}",
-                "diagnostics",
-            )
-            _write_fixed_x_posterior_diagnostic(
-                run_dir=run_dir,
-                persistent_diagnostics_dir=per_diag,
-                meta=meta,
-                perm_seed=int(perm_seed),
-                n_subset=int(n),
-                x_aligned=x_aligned,
-            )
-            h_n, clf_n = _metrics_fixed_edges(
-                loaded_n,
-                subset_n,
-                n_bins,
-                int(args.clf_min_class_count),
-                clf_rs,
-            )
+            if tfm == "pairwise_bin_theta_flow":
+                pairwise_n = _run_pairwise_bin_theta_flow(
+                    args=args,
+                    meta=meta,
+                    subset=subset_n,
+                    output_dir=run_dir,
+                    n_bins=n_bins,
+                    edges=edges,
+                )
+                h_n = np.asarray(pairwise_n.h_binned, dtype=np.float64)
+                clf_n = _pairwise_clf_from_bundle(
+                    args=args,
+                    meta=meta,
+                    subset=subset_n,
+                    output_dir=run_dir,
+                    n_bins=n_bins,
+                    clf_min_class_count=int(args.clf_min_class_count),
+                    clf_random_state=clf_rs,
+                )
+                llr_n = np.asarray(pairwise_n.delta_l_binned, dtype=np.float64)
+            else:
+                loaded_n, x_aligned, _ = _estimate_one(
+                    args=args,
+                    meta=meta,
+                    bundle=subset_n.bundle,
+                    output_dir=run_dir,
+                    n_bins=n_bins,
+                )
+                per_diag = os.path.join(
+                    args.output_dir,
+                    "sweep_runs",
+                    f"n_{int(n):06d}",
+                    "diagnostics",
+                )
+                _write_fixed_x_posterior_diagnostic(
+                    run_dir=run_dir,
+                    persistent_diagnostics_dir=per_diag,
+                    meta=meta,
+                    perm_seed=int(perm_seed),
+                    n_subset=int(n),
+                    x_aligned=x_aligned,
+                )
+                h_n, clf_n = _metrics_fixed_edges(
+                    loaded_n,
+                    subset_n,
+                    n_bins,
+                    int(args.clf_min_class_count),
+                    clf_rs,
+                )
+                delta_l_in = _load_delta_l_from_run_dir(run_dir, dataset_family=ds_fam)
+                llr_n = _metrics_delta_l_binned(delta_l_in, subset_n, n_bins)
             h_n_sqrt = _sqrt_h_like(h_n)
             corr_h[k] = vhb.matrix_corr_offdiag_pearson(h_n_sqrt, h_gt_sqrt)
             corr_clf[k] = vhb.matrix_corr_offdiag_pearson(clf_n, clf_ref)
             wall_s[k] = time.time() - t1
             h_sweep.append(np.asarray(h_n_sqrt, dtype=np.float64))
             clf_sweep.append(np.asarray(clf_n, dtype=np.float64))
-            delta_l_in = _load_delta_l_from_run_dir(run_dir, dataset_family=ds_fam)
-            llr_n = _metrics_delta_l_binned(delta_l_in, subset_n, n_bins)
             llr_sweep.append(np.asarray(llr_n, dtype=np.float64))
             corr_llr[k] = vhb.matrix_corr_offdiag_pearson(llr_n, np.asarray(llr_gt_mc, dtype=np.float64))
             print(
@@ -3326,6 +3618,8 @@ def main(argv: list[str] | None = None) -> None:
         corr_clf_vs_ref=corr_clf,
         wall_seconds=wall_s,
         n_ref=np.int64(args.n_ref),
+        theta_field_method=np.asarray([str(getattr(args, "theta_field_method", "theta_flow"))], dtype=object),
+        pairwise_bin_min_class_count=np.int64(int(getattr(args, "pairwise_bin_min_class_count", 5))),
         perm_seed=np.int64(perm_seed),
         convergence_base_seed=np.int64(base_seed),
         dataset_meta_seed=np.int64(meta["seed"]),
