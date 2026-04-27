@@ -1429,36 +1429,37 @@ def _backfill_fixed_x_posterior_diagnostic_if_missing(
     perm_seed: int,
     n_pool: int,
 ) -> None:
-    """If ``h_decoding_convergence_combined`` expects a diagnostic PNG but only an H-matrix NPZ exists (e.g. old run), write it."""
-    n_max = int(max(ns))
-    diag_png = os.path.join(
-        output_dir,
-        "sweep_runs",
-        f"n_{n_max:06d}",
-        "diagnostics",
-        "theta_flow_single_x_posterior_hist.png",
-    )
-    if os.path.isfile(diag_png):
-        return
-    run_dir = os.path.join(output_dir, "sweep_runs", f"n_{n_max:06d}")
-    ds_fam = str(meta.get("dataset_family", ""))
-    suffix = "_non_gauss" if ds_fam == "cosine_gmm" else "_theta_cov"
-    h_path = os.path.join(run_dir, f"h_matrix_results{suffix}.npz")
-    if not os.path.isfile(h_path):
-        return
+    """Backfill per-n diagnostic PNGs when old runs have H-matrix NPZs but no diagnostic images."""
     rng = np.random.default_rng(int(perm_seed))
     perm = rng.permutation(int(n_pool))
-    sub = perm[:n_max]
-    x_aligned = np.asarray(bundle.x_all[sub], dtype=np.float64)
-    per_diag = os.path.join(output_dir, "sweep_runs", f"n_{n_max:06d}", "diagnostics")
-    _write_fixed_x_posterior_diagnostic(
-        run_dir=run_dir,
-        persistent_diagnostics_dir=per_diag,
-        meta=meta,
-        perm_seed=int(perm_seed),
-        n_subset=int(n_max),
-        x_aligned=x_aligned,
-    )
+    ds_fam = str(meta.get("dataset_family", ""))
+    suffix = "_non_gauss" if ds_fam == "cosine_gmm" else "_theta_cov"
+    for n_raw in ns:
+        n = int(n_raw)
+        diag_png = os.path.join(
+            output_dir,
+            "sweep_runs",
+            f"n_{n:06d}",
+            "diagnostics",
+            "theta_flow_single_x_posterior_hist.png",
+        )
+        if os.path.isfile(diag_png):
+            continue
+        run_dir = os.path.join(output_dir, "sweep_runs", f"n_{n:06d}")
+        h_path = os.path.join(run_dir, f"h_matrix_results{suffix}.npz")
+        if not os.path.isfile(h_path):
+            continue
+        sub = perm[:n]
+        x_aligned = np.asarray(bundle.x_all[sub], dtype=np.float64)
+        per_diag = os.path.join(output_dir, "sweep_runs", f"n_{n:06d}", "diagnostics")
+        _write_fixed_x_posterior_diagnostic(
+            run_dir=run_dir,
+            persistent_diagnostics_dir=per_diag,
+            meta=meta,
+            perm_seed=int(perm_seed),
+            n_subset=int(n),
+            x_aligned=x_aligned,
+        )
 
 
 def _load_per_n_training_loss_npz(path: str) -> dict[str, Any]:
@@ -1658,7 +1659,7 @@ def _save_combined_convergence_figure(
     corr_h: np.ndarray,
     corr_clf: np.ndarray,
     loss_dir: str,
-    diagnostic_png_path: str | None,
+    diagnostic_png_paths: list[str | None],
     out_png_path: str,
     dpi: int = 160,
     llr_gt: np.ndarray | None = None,
@@ -1695,6 +1696,11 @@ def _save_combined_convergence_figure(
         )
     if int(np.asarray(corr_h, dtype=np.float64).ravel().size) != len(ns):
         raise ValueError("corr_h must have one entry per n in --n-list.")
+    if len(diagnostic_png_paths) != len(ns):
+        raise ValueError(
+            "diagnostic_png_paths must have one entry per n in --n-list; "
+            f"got {len(diagnostic_png_paths)} paths for {len(ns)} n values."
+        )
     h_gt = h_mats[-1]
     use_llr = (
         llr_gt is not None
@@ -1854,38 +1860,40 @@ def _save_combined_convergence_figure(
             axes_loss[1, j].set_axis_off()
 
     diag_row = 4 if use_llr else 3
-    ax_diag = fig.add_subplot(gs0[diag_row, :])
-    if diagnostic_png_path is None or not os.path.isfile(str(diagnostic_png_path)):
-        ax_diag.text(
-            0.5,
-            0.5,
-            "Fixed-x posterior+tuning diagnostic not found.\n"
-            "Expected: sweep_runs/n_<max(n_list)>/diagnostics/theta_flow_single_x_posterior_hist.png",
-            ha="center",
-            va="center",
-            fontsize=10,
-        )
-        ax_diag.set_axis_off()
-    else:
-        try:
-            img = plt.imread(str(diagnostic_png_path))
-            ax_diag.imshow(img)
-            ax_diag.set_title(
-                f"Fixed-x posterior+tuning diagnostic ({os.path.basename(str(diagnostic_png_path))})",
-                fontsize=10,
-            )
-            ax_diag.axis("off")
-        except Exception as e:
+    gs_diag = gs0[diag_row, :].subgridspec(1, max(1, len(ns)))
+    for j, n in enumerate(ns):
+        ax_diag = fig.add_subplot(gs_diag[0, j])
+        diagnostic_png_path = diagnostic_png_paths[j]
+        if diagnostic_png_path is None or not os.path.isfile(str(diagnostic_png_path)):
             ax_diag.text(
                 0.5,
                 0.5,
-                f"Failed to load diagnostic image:\n{e!s}",
+                "Fixed-x posterior+tuning diagnostic not found.\n"
+                f"Expected: sweep_runs/n_{int(n):06d}/diagnostics/theta_flow_single_x_posterior_hist.png",
                 ha="center",
                 va="center",
-                fontsize=9,
-                color="crimson",
+                fontsize=8,
             )
+            ax_diag.set_title(f"n={int(n)}", fontsize=10)
             ax_diag.set_axis_off()
+        else:
+            try:
+                img = plt.imread(str(diagnostic_png_path))
+                ax_diag.imshow(img)
+                ax_diag.set_title(f"Fixed-x posterior+tuning diagnostic, n={int(n)}", fontsize=10)
+                ax_diag.axis("off")
+            except Exception as e:
+                ax_diag.text(
+                    0.5,
+                    0.5,
+                    f"Failed to load diagnostic image:\n{e!s}",
+                    ha="center",
+                    va="center",
+                    fontsize=8,
+                    color="crimson",
+                )
+                ax_diag.set_title(f"n={int(n)}", fontsize=10)
+                ax_diag.set_axis_off()
 
     path_svg = _save_figure_png_svg(fig, out_png_path, dpi=dpi)
     plt.close(fig)
@@ -2339,14 +2347,16 @@ def _render_convergence_figures_and_summary(
             )
 
     combined_path = os.path.join(args.output_dir, "h_decoding_convergence_combined.png")
-    diagnostic_png = os.path.join(
-        args.output_dir,
-        "sweep_runs",
-        f"n_{int(max(ns)):06d}",
-        "diagnostics",
-        "theta_flow_single_x_posterior_hist.png",
-    )
-    diagnostic_png_use = diagnostic_png if os.path.isfile(diagnostic_png) else None
+    diagnostic_png_paths: list[str | None] = []
+    for n in ns:
+        diagnostic_png = os.path.join(
+            args.output_dir,
+            "sweep_runs",
+            f"n_{int(n):06d}",
+            "diagnostics",
+            "theta_flow_single_x_posterior_hist.png",
+        )
+        diagnostic_png_paths.append(diagnostic_png if os.path.isfile(diagnostic_png) else None)
     llr_est: list[np.ndarray] | None = None
     llr_gt: np.ndarray | None = None
     corr_llr_a: np.ndarray | None = None
@@ -2369,7 +2379,7 @@ def _render_convergence_figures_and_summary(
         corr_h=corr_h,
         corr_clf=corr_clf,
         loss_dir=loss_dir,
-        diagnostic_png_path=diagnostic_png_use,
+        diagnostic_png_paths=diagnostic_png_paths,
         out_png_path=combined_path,
         dpi=160,
         llr_gt=llr_gt,
@@ -2395,7 +2405,9 @@ def _render_convergence_figures_and_summary(
         "matrix_panel_svg": str(Path(matrix_panel_path).with_suffix(".svg")),
         "combined_figure": combined_path,
         "combined_figure_svg": combined_svg,
-        "embedded_fixed_x_diagnostic_png": diagnostic_png_use or "",
+        "embedded_fixed_x_diagnostic_pngs": "; ".join(
+            f"n={int(n)}:{p}" for n, p in zip(ns, diagnostic_png_paths) if p is not None
+        ),
         "training_losses_panel": loss_panel_png,
         "training_losses_panel_svg": loss_panel_svg,
         "reference_npz": os.path.join(args.output_dir, "h_decoding_convergence_reference.npz"),

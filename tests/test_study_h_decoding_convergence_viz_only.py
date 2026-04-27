@@ -120,6 +120,22 @@ class TestStudyHDecodingConvergenceVizOnly(unittest.TestCase):
                     prior_val_losses=np.array([0.06], dtype=np.float64),
                     prior_val_monitor_losses=np.array([0.055], dtype=np.float64),
                 )
+            perm = np.random.default_rng(seed).permutation(n_total)
+            for n in ns_list:
+                sub = perm[: int(n)]
+                run_dir = out_dir / "sweep_runs" / f"n_{int(n):06d}"
+                run_dir.mkdir(parents=True)
+                theta_used = np.asarray(theta_all[sub], dtype=np.float64).reshape(-1)
+                c = np.zeros((int(n), int(n)), dtype=np.float64)
+                log_prior = np.zeros(int(n), dtype=np.float64)
+                np.savez(
+                    run_dir / "h_matrix_results_theta_cov.npz",
+                    c_matrix=c,
+                    theta_flow_log_post_matrix=c + log_prior.reshape(1, -1),
+                    theta_flow_log_prior_matrix=np.repeat(log_prior.reshape(1, -1), repeats=int(n), axis=0),
+                    theta_used=theta_used,
+                    h_field_method=np.asarray(["theta_flow"], dtype=object),
+                )
 
             cmd = [
                 sys.executable,
@@ -149,7 +165,20 @@ class TestStudyHDecodingConvergenceVizOnly(unittest.TestCase):
             self.assertTrue((out_dir / "h_decoding_matrices_panel.png").is_file())
             self.assertTrue((out_dir / "h_decoding_convergence_combined.png").is_file())
             self.assertTrue((out_dir / "h_decoding_training_losses_panel.png").is_file())
-            self.assertTrue((out_dir / "h_decoding_convergence_summary.txt").is_file())
+            summary_path = out_dir / "h_decoding_convergence_summary.txt"
+            self.assertTrue(summary_path.is_file())
+            summary_text = summary_path.read_text(encoding="utf-8")
+            self.assertIn("embedded_fixed_x_diagnostic_pngs", summary_text)
+            for n in ns_list:
+                diag_png = (
+                    out_dir
+                    / "sweep_runs"
+                    / f"n_{int(n):06d}"
+                    / "diagnostics"
+                    / "theta_flow_single_x_posterior_hist.png"
+                )
+                self.assertTrue(diag_png.is_file())
+                self.assertIn(f"n={int(n)}:", summary_text)
 
 
 if __name__ == "__main__":
