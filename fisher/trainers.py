@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from typing import Any
 
 import numpy as np
 import torch
@@ -1567,6 +1568,7 @@ def train_conditional_theta_flow_model(
     scheduler_name: str = "cosine",
     endpoint_loss_weight: float = 0.0,
     endpoint_ode_steps: int = 20,
+    source_sampler: Any | None = None,
 ) -> dict[str, float | int | bool | list[float]]:
     path = _make_flow_matching_path(scheduler_name=scheduler_name)
     endpoint_weight = float(endpoint_loss_weight)
@@ -1611,7 +1613,11 @@ def train_conditional_theta_flow_model(
             tb = tb.to(device, non_blocking=True)
             xb = xb.to(device, non_blocking=True)
             t = torch.rand(tb.shape[0], device=tb.device)
-            theta0 = torch.randn_like(tb)
+            theta0 = (
+                source_sampler.sample_matched_torch(tb, xb)
+                if source_sampler is not None
+                else torch.randn_like(tb)
+            )
             path_sample = path.sample(t=t, x_0=theta0, x_1=tb)
             pred = model(path_sample.x_t, xb, path_sample.t)
             fm_loss = torch.mean((pred - path_sample.dx_t) ** 2)
@@ -1651,7 +1657,11 @@ def train_conditional_theta_flow_model(
                     tb = tb.to(device, non_blocking=True)
                     xb = xb.to(device, non_blocking=True)
                     t = torch.rand(tb.shape[0], device=tb.device)
-                    theta0 = torch.randn_like(tb)
+                    theta0 = (
+                        source_sampler.sample_matched_torch(tb, xb)
+                        if source_sampler is not None
+                        else torch.randn_like(tb)
+                    )
                     path_sample = path.sample(t=t, x_0=theta0, x_1=tb)
                     pred = model(path_sample.x_t, xb, path_sample.t)
                     val_fm_loss = torch.mean((pred - path_sample.dx_t) ** 2)

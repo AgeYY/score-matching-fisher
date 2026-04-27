@@ -110,8 +110,9 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         default="theta_flow",
         help=(
             "Likelihood-ratio field method: theta_flow (theta-space flow ODE log-likelihood Bayes ratios "
-            "log p(theta|x)-log p(theta)), theta_path_integral (velocity-to-score plus trapezoid integral "
-            "along sorted theta), x_flow (conditional x-space flow ODE log p(x|theta)), or "
+            "log p(theta|x)-log p(theta)), theta_flow_gaussian_scaffold (theta-flow posterior with "
+            "Gaussian posterior scaffold source/base), theta_path_integral (velocity-to-score plus "
+            "trapezoid integral along sorted theta), x_flow (conditional x-space flow ODE log p(x|theta)), or "
             "ctsm_v (pair-conditioned CTSM-v time-score integration)."
         ),
     )
@@ -355,6 +356,18 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
             "theta_flow_log_prior_matrix is omitted (None)."
         ),
     )
+    p.add_argument("--theta-gaussian-scaffold-bin-n-bins", type=int, default=10)
+    p.add_argument(
+        "--theta-gaussian-scaffold-grid-size",
+        type=int,
+        default=512,
+        help="Deprecated compatibility knob; theta_flow_gaussian_scaffold now fits mixtures on theta bins.",
+    )
+    p.add_argument("--theta-gaussian-scaffold-n-components", type=int, default=3)
+    p.add_argument("--theta-gaussian-scaffold-em-steps", type=int, default=20)
+    p.add_argument("--theta-gaussian-scaffold-variance-floor", type=float, default=1e-6)
+    p.add_argument("--theta-gaussian-scaffold-min-branch-mass", type=float, default=1e-4)
+    p.add_argument("--theta-gaussian-scaffold-source-eps", type=float, default=1e-6)
     p.add_argument("--flow-early-patience", type=int, default=1000)
     p.add_argument("--flow-early-min-delta", type=float, default=1e-4)
     p.add_argument(

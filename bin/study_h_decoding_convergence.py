@@ -1098,7 +1098,7 @@ def _model_posterior_log_weights_for_fixed_x(
 ) -> tuple[np.ndarray, str]:
     c = np.asarray(c_row, dtype=np.float64).reshape(-1)
     method = str(hfm).strip().lower()
-    if method == "theta_flow":
+    if method in ("theta_flow", "theta_flow_gaussian_scaffold"):
         log_post = _npz_row_or_vector(h_npz, "theta_flow_log_post_matrix", row=int(row), n=c.size)
         if log_post is not None:
             return log_post, "learned posterior log-density"
@@ -1106,7 +1106,7 @@ def _model_posterior_log_weights_for_fixed_x(
         if log_prior is not None:
             return c + log_prior, "ratio + learned prior log-density"
         print(
-            "[convergence] fixed-x diagnostic: theta_flow artifact lacks learned posterior/prior "
+            f"[convergence] fixed-x diagnostic: {method} artifact lacks learned posterior/prior "
             "log-density fields; using ratio row as a uniform-prior fallback.",
             flush=True,
         )
@@ -1309,8 +1309,8 @@ def _write_fixed_x_posterior_diagnostic(
     Uses ``c_matrix`` from ``h_matrix_results*.npz`` (requires ``h_save_intermediates``) and
     a deterministic row index ``i`` derived from ``perm_seed`` and ``n_subset``.
 
-    - ``theta_flow``: ``C[i,j] = log p(θ_j|x_i) - log p(θ_j)`` (std-normal base); we add
-      ``log p(θ_j)`` back for a softmax "posterior mass" on the training θ grid.
+    - ``theta_flow`` / ``theta_flow_gaussian_scaffold``: use saved learned
+      ``theta_flow_log_post_matrix`` for posterior mass when available.
     - ``nf``: ``C[i,j] = log p(θ_j|x_i)`` directly.
     - Other H-field methods: soft-max the C row (scale may be method-specific) for a coarse view.
     """
@@ -3052,6 +3052,18 @@ def main(argv: list[str] | None = None) -> None:
                 "(log p(theta|x) - log p(theta) via compute_likelihood; no theta-axis score integral).",
                 flush=True,
             )
+    elif tfm == "theta_flow_gaussian_scaffold":
+        print(
+            f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
+            f"(flow_arch={getattr(args, 'flow_arch', 'mlp')})",
+            flush=True,
+        )
+        print(
+            "[convergence] theta_flow_gaussian_scaffold mode trains the posterior theta-flow from "
+            "a binned Gaussian likelihood plus k-Gaussian posterior-mixture scaffold source and "
+            "evaluates ODE log-likelihood with the same mixture base.",
+            flush=True,
+        )
     elif tfm == "theta_path_integral":
         print(
             f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
@@ -3099,7 +3111,7 @@ def main(argv: list[str] | None = None) -> None:
     else:
         raise ValueError(
             f"Unsupported --theta-field-method={tfm!r}; use "
-            "theta_flow, theta_path_integral, x_flow, ctsm_v, or nf."
+            "theta_flow, theta_flow_gaussian_scaffold, theta_path_integral, x_flow, ctsm_v, or nf."
         )
     print(
         "[convergence] n_ref reference: no learned H training at n_ref; matrix-panel top row = MC GT sqrt(H^2); "

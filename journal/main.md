@@ -16,6 +16,9 @@ Collected markdown notes in `journal/notes/`: long-form chapters (moved from the
 
 ## 2026-04
 
+- [2026-04-27 H-decoding `theta_flow_gaussian_scaffold`: 10D `cosine_gaussian_sqrtd`, `n=200`, k-Gaussian posterior mixture scaffold, reproducible run](notes/2026-04-27-h-decoding-theta-flow-gaussian-scaffold-10d-cosine-sqrtd-n200.md)
+- [2026-04-27 H-decoding `theta_flow_gaussian_scaffold`: 3D `cosine_gaussian_sqrtd`, Gaussian posterior scaffold source, and H / decoding convergence](notes/2026-04-27-h-decoding-theta-flow-gaussian-scaffold-3d-cosine-sqrtd.md)
+
 - [2026-04-26 H-decoding `theta_flow`: 3D cosine $\sqrt{d}$ + 2D/3D `randamp_gaussian`, NFS `--keep-intermediate`, artifacts + fixed-$x$ figure (Markdown + commands)](notes/2026-04-26-h-decoding-theta-flow-lowdim-cosine-randamp-nfs-keep-intermediate.md)
 
 - [2026-04-25 x-flow (`--theta-field-method x_flow`): conditional $x$-space flow matching, ODE $\log p(x\mid\theta)$, and H-decoding / Hellinger matrix pipeline (`flow_x_likelihood`)](notes/2026-04-25-x-flow-conditional-likelihood-hellinger-h-decoding.md)
