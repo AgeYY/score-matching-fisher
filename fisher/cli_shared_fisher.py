@@ -326,6 +326,17 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         default=0.8,
         help="Fixed time t used to evaluate theta-flow velocity field for H-matrix (flow mode).",
     )
+    p.add_argument(
+        "--theta-flow-posterior-only-likelihood",
+        action="store_true",
+        default=False,
+        help=(
+            "theta_flow only (H-matrix): use posterior ODE log-density only for the likelihood matrix "
+            "(c_ij = log p(theta_j|x_i)), instead of subtracting the learned prior flow log p(theta_j). "
+            "Skips prior flow training, NLL fine-tune, checkpoint, and prior ODE likelihood; "
+            "theta_flow_log_prior_matrix is omitted (None)."
+        ),
+    )
     p.add_argument("--flow-early-patience", type=int, default=1000)
     p.add_argument("--flow-early-min-delta", type=float, default=1e-4)
     p.add_argument(

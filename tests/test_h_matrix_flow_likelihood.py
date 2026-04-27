@@ -77,6 +77,63 @@ class TestHMatrixFlowLikelihood(unittest.TestCase):
         self.assertTrue(np.isfinite(out.h_sym).all())
         self.assertEqual(out.flow_score_mode, "direct_ode_likelihood")
 
+    def test_theta_flow_posterior_only_uses_log_post_for_c_matrix(self) -> None:
+        post = _ShiftedPosteriorFlow()
+        prior = _DummyPriorFlow()
+        est_bayes = HMatrixEstimator(
+            model_post=post,
+            model_prior=prior,
+            sigma_eval=1.0,
+            device=torch.device("cpu"),
+            pair_batch_size=64,
+            field_method="theta_flow",
+            flow_scheduler="cosine",
+            flow_ode_steps=16,
+            theta_flow_posterior_only_likelihood=False,
+        )
+        est_postonly = HMatrixEstimator(
+            model_post=post,
+            model_prior=None,
+            sigma_eval=1.0,
+            device=torch.device("cpu"),
+            pair_batch_size=64,
+            field_method="theta_flow",
+            flow_scheduler="cosine",
+            flow_ode_steps=16,
+            theta_flow_posterior_only_likelihood=True,
+        )
+        theta = np.linspace(-1.2, 1.2, 7, dtype=np.float64).reshape(-1, 1)
+        x = np.stack([np.sin(theta.reshape(-1)), np.cos(theta.reshape(-1))], axis=1).astype(np.float64)
+        out_b = est_bayes.run(theta=theta, x=x, restore_original_order=False)
+        out_p = est_postonly.run(theta=theta, x=x, restore_original_order=False)
+        self.assertEqual(out_p.flow_score_mode, "direct_ode_likelihood_posterior_only")
+        assert out_b.theta_flow_log_post_matrix is not None
+        assert out_b.theta_flow_log_prior_matrix is not None
+        assert out_p.theta_flow_log_prior_matrix is None
+        np.testing.assert_allclose(out_p.c_matrix, out_b.theta_flow_log_post_matrix, rtol=0.0, atol=1e-5)
+        np.testing.assert_allclose(
+            out_b.c_matrix,
+            out_b.theta_flow_log_post_matrix - out_b.theta_flow_log_prior_matrix,
+            rtol=0.0,
+            atol=1e-5,
+        )
+
+    def test_theta_flow_posterior_only_rejects_nonnone_prior(self) -> None:
+        post = _ShiftedPosteriorFlow()
+        prior = _DummyPriorFlow()
+        with self.assertRaises(ValueError):
+            HMatrixEstimator(
+                model_post=post,
+                model_prior=prior,
+                sigma_eval=1.0,
+                device=torch.device("cpu"),
+                pair_batch_size=64,
+                field_method="theta_flow",
+                flow_scheduler="cosine",
+                flow_ode_steps=8,
+                theta_flow_posterior_only_likelihood=True,
+            )
+
     def test_validate_estimation_args_accepts_theta_flow(self) -> None:
         parser = argparse.ArgumentParser()
         add_estimation_arguments(parser)

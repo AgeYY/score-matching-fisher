@@ -19,7 +19,9 @@ Regenerate the NPZ if the family does not match.
 
 For each ``n`` in ``--n-list``, the H matrix is computed from trained models for the selected
 field method. Supported methods are ``--theta-field-method theta_flow`` (theta-space flow ODE
-log-likelihood Bayes ratios; prior + posterior theta-flows), ``--theta-field-method theta_path_integral``
+log-likelihood: Bayes ratios train/evaluate prior + posterior flows; with
+``--theta-flow-posterior-only-likelihood``, only the posterior flow is trained/evaluated),
+``--theta-field-method theta_path_integral``
 (same training as theta_flow but H from velocity-to-score plus trapezoid integral along sorted ``theta``),
 ``--theta-field-method x_flow`` (conditional x-space FM likelihood; no prior model),
 ``--theta-field-method ctsm_v`` (pair-conditioned CTSM-v time-score integration; no prior model), and
@@ -2851,11 +2853,18 @@ def main(argv: list[str] | None = None) -> None:
             f"(flow_arch={getattr(args, 'flow_arch', 'mlp')})",
             flush=True,
         )
-        print(
-            "[convergence] theta_flow mode uses ODE log-likelihood on theta-space flows "
-            "(log p(theta|x) - log p(theta) via compute_likelihood; no theta-axis score integral).",
-            flush=True,
-        )
+        if bool(getattr(args, "theta_flow_posterior_only_likelihood", False)):
+            print(
+                "[convergence] theta_flow mode uses ODE log-likelihood on the conditional theta-flow only "
+                "(log p(theta|x) via compute_likelihood; prior flow skipped; no theta-axis score integral).",
+                flush=True,
+            )
+        else:
+            print(
+                "[convergence] theta_flow mode uses ODE log-likelihood on theta-space flows "
+                "(log p(theta|x) - log p(theta) via compute_likelihood; no theta-axis score integral).",
+                flush=True,
+            )
     elif tfm == "theta_path_integral":
         print(
             f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "

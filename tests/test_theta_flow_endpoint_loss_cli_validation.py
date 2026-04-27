@@ -81,3 +81,15 @@ def test_validate_rejects_likelihood_finetune_for_x_flow() -> None:
     )
     with pytest.raises(ValueError, match="only supported with --theta-field-method theta_flow"):
         validate_estimation_args(args)
+
+
+def test_validate_rejects_posterior_only_likelihood_for_x_flow() -> None:
+    args = parse_full_args(
+        [
+            "--theta-field-method",
+            "x_flow",
+            "--theta-flow-posterior-only-likelihood",
+        ]
+    )
+    with pytest.raises(ValueError, match="--theta-flow-posterior-only-likelihood requires --theta-field-method theta_flow"):
+        validate_estimation_args(args)

@@ -120,6 +120,7 @@ class HMatrixEstimator:
         flow_ode_steps: int = 64,
         ctsm_int_n_time: int = 300,
         ctsm_t_eps: float = 1e-5,
+        theta_flow_posterior_only_likelihood: bool = False,
     ) -> None:
         if pair_batch_size < 1:
             raise ValueError("pair_batch_size must be >= 1.")
@@ -134,6 +135,9 @@ class HMatrixEstimator:
                 "field_method must be one of "
                 "{'dsm', 'theta_path_integral', 'theta_flow', 'flow_x_likelihood', 'ctsm_v'}."
             )
+        self.theta_flow_posterior_only_likelihood = bool(theta_flow_posterior_only_likelihood)
+        if self.theta_flow_posterior_only_likelihood and method != "theta_flow":
+            raise ValueError("theta_flow_posterior_only_likelihood is only valid for field_method='theta_flow'.")
         if method == "dsm" and sigma_eval <= 0.0:
             raise ValueError("sigma_eval must be positive for DSM mode.")
         if method in ("theta_path_integral", "theta_flow", "flow_x_likelihood") and not (0.0 <= sigma_eval <= 1.0):
@@ -166,6 +170,12 @@ class HMatrixEstimator:
                 raise ValueError("ctsm_v expects model_prior=None.")
             if not isinstance(model_post, PairConditionedTimeScoreNetBase):
                 raise TypeError("ctsm_v requires model_post to be a PairConditionedTimeScoreNetBase subclass.")
+        elif method == "theta_flow" and self.theta_flow_posterior_only_likelihood:
+            if model_prior is not None:
+                raise ValueError(
+                    "theta_flow_posterior_only_likelihood requires model_prior=None "
+                    "(prior flow ODE likelihood is not computed)."
+                )
         elif model_prior is None:
             raise ValueError(f"field_method={method!r} requires a non-None model_prior.")
         self.field_method = method
@@ -191,7 +201,8 @@ class HMatrixEstimator:
         self._theta_flow_log_prior_matrix: np.ndarray | None = None
         if self.field_method == "theta_flow":
             self._flow_likelihood_solver_post = _make_flow_ode_solver(self._post_velocity_for_likelihood)
-            self._flow_likelihood_solver_prior = _make_flow_ode_solver(self._prior_velocity_for_likelihood)
+            if not self.theta_flow_posterior_only_likelihood:
+                self._flow_likelihood_solver_prior = _make_flow_ode_solver(self._prior_velocity_for_likelihood)
         if self.field_method == "flow_x_likelihood":
             self._flow_x_likelihood_solver = _make_flow_ode_solver(self._x_post_velocity_for_likelihood)
 
@@ -351,9 +362,12 @@ class HMatrixEstimator:
         return g
 
     def compute_log_ratio_matrix(self, theta_sorted: np.ndarray, x_sorted: np.ndarray) -> np.ndarray:
-        """Directly estimate per-pair log-likelihood ratio matrix via flow ODE likelihoods.
+        """Directly estimate per-pair log-density matrix via flow ODE likelihoods.
 
-        r[i,j] = log p(theta_j | x_i) - log p(theta_j).
+        Default (Bayes ratio): ``r[i,j] = log p(theta_j | x_i) - log p(theta_j)``.
+
+        When ``theta_flow_posterior_only_likelihood`` is true: ``r[i,j] = log p(theta_j | x_i)``
+        with ``model_prior=None`` (no prior ODE likelihood); ``theta_flow_log_prior_matrix`` is ``None``.
         """
         theta_grid_col = self._theta_as_matrix(theta_sorted)
         n = int(theta_grid_col.shape[0])
@@ -363,12 +377,16 @@ class HMatrixEstimator:
         theta_grid_col = np.asarray(theta_grid_col, dtype=np.float32)
         r = np.zeros((n, n), dtype=np.float64)
         log_post_matrix = np.zeros((n, n), dtype=np.float64)
-        log_prior_matrix = np.zeros((n, n), dtype=np.float64)
+        log_prior_matrix: np.ndarray | None = (
+            None if self.theta_flow_posterior_only_likelihood else np.zeros((n, n), dtype=np.float64)
+        )
         self.model_post.eval()
         if self.model_prior is not None:
             self.model_prior.eval()
-        if self._flow_likelihood_solver_post is None or self._flow_likelihood_solver_prior is None:
-            raise RuntimeError("theta_flow ODE solvers are not initialized.")
+        if self._flow_likelihood_solver_post is None:
+            raise RuntimeError("theta_flow ODE posterior solver is not initialized.")
+        if not self.theta_flow_posterior_only_likelihood and self._flow_likelihood_solver_prior is None:
+            raise RuntimeError("theta_flow ODE prior solver is not initialized.")
         for i0 in range(0, n, row_block):
             i1 = min(n, i0 + row_block)
             xb = np.asarray(x_sorted[i0:i1], dtype=np.float32)
@@ -388,20 +406,25 @@ class HMatrixEstimator:
                 enable_grad=False,
                 x_cond=x_t,
             )
-            _, log_prior = self._flow_likelihood_solver_prior.compute_likelihood(
-                x_1=theta_t,
-                log_p0=self._standard_normal_log_prob,
-                step_size=None,
-                method=self.flow_likelihood_method,
-                time_grid=time_grid,
-                exact_divergence=False,
-                enable_grad=False,
-            )
             log_post_block = log_post.reshape(b, n).detach().cpu().numpy().astype(np.float64)
-            log_prior_block = log_prior.reshape(b, n).detach().cpu().numpy().astype(np.float64)
             log_post_matrix[i0:i1, :] = log_post_block
-            log_prior_matrix[i0:i1, :] = log_prior_block
-            r[i0:i1, :] = log_post_block - log_prior_block
+            if self.theta_flow_posterior_only_likelihood:
+                r[i0:i1, :] = log_post_block
+            else:
+                assert self._flow_likelihood_solver_prior is not None
+                assert log_prior_matrix is not None
+                _, log_prior = self._flow_likelihood_solver_prior.compute_likelihood(
+                    x_1=theta_t,
+                    log_p0=self._standard_normal_log_prob,
+                    step_size=None,
+                    method=self.flow_likelihood_method,
+                    time_grid=time_grid,
+                    exact_divergence=False,
+                    enable_grad=False,
+                )
+                log_prior_block = log_prior.reshape(b, n).detach().cpu().numpy().astype(np.float64)
+                log_prior_matrix[i0:i1, :] = log_prior_block
+                r[i0:i1, :] = log_post_block - log_prior_block
         self._theta_flow_log_post_matrix = log_post_matrix
         self._theta_flow_log_prior_matrix = log_prior_matrix
         return r
@@ -615,7 +638,11 @@ class HMatrixEstimator:
                 self.flow_score_mode
                 if self.flow_score_mode is not None
                 else (
-                    "direct_ode_likelihood"
+                    (
+                        "direct_ode_likelihood_posterior_only"
+                        if self.field_method == "theta_flow" and self.theta_flow_posterior_only_likelihood
+                        else "direct_ode_likelihood"
+                    )
                     if self.field_method == "theta_flow"
                     else (
                         "direct_ode_x_cond_likelihood"

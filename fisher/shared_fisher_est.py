@@ -1091,6 +1091,8 @@ def validate_estimation_args(args: Any) -> None:
         raise ValueError("--flow-likelihood-finetune-ema-alpha must be in (0, 1].")
     if not bool(getattr(args, "flow_likelihood_finetune_exact_divergence", True)):
         raise ValueError("--flow-likelihood-finetune-exact-divergence is currently required.")
+    if bool(getattr(args, "theta_flow_posterior_only_likelihood", False)) and _tfm_val != "theta_flow":
+        raise ValueError("--theta-flow-posterior-only-likelihood requires --theta-field-method theta_flow.")
     if float(getattr(args, "flow_endpoint_loss_weight", 0.0)) < 0.0:
         raise ValueError("--flow-endpoint-loss-weight must be non-negative.")
     if int(getattr(args, "flow_endpoint_steps", 20)) < 1:
@@ -1389,6 +1391,7 @@ def _save_theta_flow_model_checkpoint(
         "theta_flow_fourier_k": int(getattr(args, "theta_flow_fourier_k", 0)),
         "theta_flow_fourier_period_mult": float(getattr(args, "theta_flow_fourier_period_mult", 0.0)),
         "theta_flow_fourier_include_linear": bool(getattr(args, "theta_flow_fourier_include_linear", False)),
+        "theta_flow_posterior_only_likelihood": bool(getattr(args, "theta_flow_posterior_only_likelihood", False)),
         "flow_likelihood_finetune_epochs": int(getattr(args, "flow_likelihood_finetune_epochs", 0)),
         "flow_likelihood_finetune_lr": float(getattr(args, "flow_likelihood_finetune_lr", 1e-4)),
         "flow_likelihood_finetune_ode_steps": int(getattr(args, "flow_likelihood_finetune_ode_steps", 64)),
@@ -2100,8 +2103,18 @@ def run_shared_fisher_estimation(
         return
 
     if theta_field_method in ("theta_flow", "theta_path_integral"):
+        theta_flow_posterior_only = (
+            theta_field_method == "theta_flow"
+            and bool(getattr(args, "theta_flow_posterior_only_likelihood", False))
+        )
         if not bool(getattr(args, "prior_enable", True)):
-            raise ValueError("theta_flow and theta_path_integral currently require prior model enabled.")
+            if theta_field_method == "theta_path_integral":
+                raise ValueError("theta_path_integral currently requires prior model enabled.")
+            if theta_field_method == "theta_flow" and not theta_flow_posterior_only:
+                raise ValueError(
+                    "theta_flow requires prior model enabled unless --theta-flow-posterior-only-likelihood "
+                    "(which skips the prior flow entirely)."
+                )
         flow_eval_t = float(getattr(args, "flow_eval_t", 0.8))
         if not (0.0 <= flow_eval_t <= 1.0):
             raise ValueError("--flow-eval-t must be in [0, 1].")
@@ -2376,158 +2389,182 @@ def run_shared_fisher_estimation(
         plt.savefig(post_loss_fig, dpi=180)
         plt.close()
 
-        if flow_prior_arch == "mlp":
-            prior_ckpt_hparams = {
-                "hidden_dim": int(getattr(args, "prior_hidden_dim", 128)),
-                "depth": int(getattr(args, "prior_depth", 3)),
-                "use_logit_time": True,
-                "theta_dim": int(theta_dim_flow),
-            }
-            prior_model_flow = PriorThetaFlowVelocity(
-                hidden_dim=int(getattr(args, "prior_hidden_dim", 128)),
-                depth=int(getattr(args, "prior_depth", 3)),
-                use_logit_time=True,
-                theta_dim=theta_dim_flow,
-            ).to(device)
-        elif flow_prior_arch == "film":
-            prior_ckpt_hparams = {
-                "hidden_dim": int(getattr(args, "prior_hidden_dim", 128)),
-                "depth": int(getattr(args, "prior_depth", 3)),
-                "use_logit_time": True,
-                "use_layer_norm": bool(getattr(args, "flow_prior_use_layer_norm", False)),
-                "gated_film": bool(getattr(args, "flow_prior_gated_film", False)),
-                "zero_out_init": bool(getattr(args, "flow_prior_zero_out_init", False)),
-                "cond_embed_dim": int(getattr(args, "flow_prior_cond_embed_dim", 16)),
-                "cond_embed_depth": int(getattr(args, "flow_prior_cond_embed_depth", 1)),
-                "cond_embed_act": str(getattr(args, "flow_prior_cond_embed_act", "silu")),
-            }
-            prior_model_flow = PriorThetaFlowVelocityFiLMPerLayer(
-                hidden_dim=int(getattr(args, "prior_hidden_dim", 128)),
-                depth=int(getattr(args, "prior_depth", 3)),
-                use_logit_time=True,
-                use_layer_norm=bool(getattr(args, "flow_prior_use_layer_norm", False)),
-                gated_film=bool(getattr(args, "flow_prior_gated_film", False)),
-                zero_out_init=bool(getattr(args, "flow_prior_zero_out_init", False)),
-                cond_embed_dim=int(getattr(args, "flow_prior_cond_embed_dim", 16)),
-                cond_embed_depth=int(getattr(args, "flow_prior_cond_embed_depth", 1)),
-                cond_embed_act=str(getattr(args, "flow_prior_cond_embed_act", "silu")),
-            ).to(device)
-        elif flow_prior_arch == "film_fourier":
-            _om_eff_p, _ = effective_flow_theta_fourier_omega_prior(args)
-            prior_ckpt_hparams = {
-                "hidden_dim": int(getattr(args, "prior_hidden_dim", 128)),
-                "depth": int(getattr(args, "prior_depth", 3)),
-                "use_logit_time": True,
-                "use_layer_norm": bool(getattr(args, "flow_prior_use_layer_norm", False)),
-                "gated_film": bool(getattr(args, "flow_prior_gated_film", False)),
-                "zero_out_init": bool(getattr(args, "flow_prior_zero_out_init", False)),
-                "theta_fourier_k": int(getattr(args, "flow_prior_theta_fourier_k", 4)),
-                "theta_fourier_omega": float(_om_eff_p),
-                "theta_fourier_include_linear": not bool(getattr(args, "flow_prior_theta_fourier_no_linear", False)),
-                "theta_fourier_include_bias": not bool(getattr(args, "flow_prior_theta_fourier_no_bias", False)),
-            }
-            prior_model_flow = PriorThetaFlowVelocityThetaFourierFiLMPerLayer(
-                hidden_dim=int(getattr(args, "prior_hidden_dim", 128)),
-                depth=int(getattr(args, "prior_depth", 3)),
-                use_logit_time=True,
-                use_layer_norm=bool(getattr(args, "flow_prior_use_layer_norm", False)),
-                gated_film=bool(getattr(args, "flow_prior_gated_film", False)),
-                zero_out_init=bool(getattr(args, "flow_prior_zero_out_init", False)),
-                theta_fourier_k=int(getattr(args, "flow_prior_theta_fourier_k", 4)),
-                theta_fourier_omega=float(_om_eff_p),
-                theta_fourier_include_linear=not bool(getattr(args, "flow_prior_theta_fourier_no_linear", False)),
-                theta_fourier_include_bias=not bool(getattr(args, "flow_prior_theta_fourier_no_bias", False)),
-            ).to(device)
-        else:
-            raise ValueError("--flow-arch must be one of {'mlp','film','film_fourier'}.")
-        prior_train_out = train_prior_theta_flow_model(
-            model=prior_model_flow,
-            theta_train=theta_score_fit,
-            epochs=int(getattr(args, "prior_epochs", 10000)),
-            batch_size=int(getattr(args, "prior_batch_size", 256)),
-            lr=float(getattr(args, "prior_lr", 1e-3)),
-            device=device,
-            log_every=max(1, args.log_every),
-            theta_val=theta_score_val,
-            early_stopping_patience=int(getattr(args, "prior_early_patience", 1000)),
-            early_stopping_min_delta=float(getattr(args, "prior_early_min_delta", 1e-4)),
-            early_stopping_ema_alpha=float(getattr(args, "prior_early_ema_alpha", 0.05)),
-            restore_best=bool(getattr(args, "prior_restore_best", True)),
-            scheduler_name=str(getattr(args, "flow_scheduler", "cosine")),
-        )
-        prior_train_losses = np.asarray(prior_train_out["train_losses"], dtype=np.float64)
-        prior_val_losses = np.asarray(prior_train_out["val_losses"], dtype=np.float64)
-        prior_val_monitor_losses = np.asarray(prior_train_out.get("val_monitor_losses", []), dtype=np.float64)
-        prior_best_epoch = int(prior_train_out["best_epoch"])
-        prior_stopped_epoch = int(prior_train_out["stopped_epoch"])
-        prior_stopped_early = bool(prior_train_out["stopped_early"])
-        prior_best_val_loss = float(prior_train_out["best_val_loss"])
-        prior_likelihood_ft_train_losses = np.asarray([], dtype=np.float64)
-        prior_likelihood_ft_val_losses = np.asarray([], dtype=np.float64)
-        prior_likelihood_ft_val_monitor_losses = np.asarray([], dtype=np.float64)
-        prior_likelihood_ft_out: dict[str, Any] = {}
-        if theta_field_method == "theta_flow" and ft_epochs > 0:
-            print(
-                "[theta_flow_nll_ft] prior fine-tune enabled: "
-                f"epochs={ft_epochs} lr={float(getattr(args, 'flow_likelihood_finetune_lr', 1e-4)):.6g} "
-                f"batch={ft_batch} ode_steps={int(getattr(args, 'flow_likelihood_finetune_ode_steps', 64))}",
-                flush=True,
-            )
-            prior_likelihood_ft_out = train_prior_theta_flow_likelihood_finetune(
+        prior_model_flow: Any
+        prior_ckpt_hparams: dict[str, Any]
+        prior_train_out: dict[str, Any]
+        if not theta_flow_posterior_only:
+            if flow_prior_arch == "mlp":
+                prior_ckpt_hparams = {
+                    "hidden_dim": int(getattr(args, "prior_hidden_dim", 128)),
+                    "depth": int(getattr(args, "prior_depth", 3)),
+                    "use_logit_time": True,
+                    "theta_dim": int(theta_dim_flow),
+                }
+                prior_model_flow = PriorThetaFlowVelocity(
+                    hidden_dim=int(getattr(args, "prior_hidden_dim", 128)),
+                    depth=int(getattr(args, "prior_depth", 3)),
+                    use_logit_time=True,
+                    theta_dim=theta_dim_flow,
+                ).to(device)
+            elif flow_prior_arch == "film":
+                prior_ckpt_hparams = {
+                    "hidden_dim": int(getattr(args, "prior_hidden_dim", 128)),
+                    "depth": int(getattr(args, "prior_depth", 3)),
+                    "use_logit_time": True,
+                    "use_layer_norm": bool(getattr(args, "flow_prior_use_layer_norm", False)),
+                    "gated_film": bool(getattr(args, "flow_prior_gated_film", False)),
+                    "zero_out_init": bool(getattr(args, "flow_prior_zero_out_init", False)),
+                    "cond_embed_dim": int(getattr(args, "flow_prior_cond_embed_dim", 16)),
+                    "cond_embed_depth": int(getattr(args, "flow_prior_cond_embed_depth", 1)),
+                    "cond_embed_act": str(getattr(args, "flow_prior_cond_embed_act", "silu")),
+                }
+                prior_model_flow = PriorThetaFlowVelocityFiLMPerLayer(
+                    hidden_dim=int(getattr(args, "prior_hidden_dim", 128)),
+                    depth=int(getattr(args, "prior_depth", 3)),
+                    use_logit_time=True,
+                    use_layer_norm=bool(getattr(args, "flow_prior_use_layer_norm", False)),
+                    gated_film=bool(getattr(args, "flow_prior_gated_film", False)),
+                    zero_out_init=bool(getattr(args, "flow_prior_zero_out_init", False)),
+                    cond_embed_dim=int(getattr(args, "flow_prior_cond_embed_dim", 16)),
+                    cond_embed_depth=int(getattr(args, "flow_prior_cond_embed_depth", 1)),
+                    cond_embed_act=str(getattr(args, "flow_prior_cond_embed_act", "silu")),
+                ).to(device)
+            elif flow_prior_arch == "film_fourier":
+                _om_eff_p, _ = effective_flow_theta_fourier_omega_prior(args)
+                prior_ckpt_hparams = {
+                    "hidden_dim": int(getattr(args, "prior_hidden_dim", 128)),
+                    "depth": int(getattr(args, "prior_depth", 3)),
+                    "use_logit_time": True,
+                    "use_layer_norm": bool(getattr(args, "flow_prior_use_layer_norm", False)),
+                    "gated_film": bool(getattr(args, "flow_prior_gated_film", False)),
+                    "zero_out_init": bool(getattr(args, "flow_prior_zero_out_init", False)),
+                    "theta_fourier_k": int(getattr(args, "flow_prior_theta_fourier_k", 4)),
+                    "theta_fourier_omega": float(_om_eff_p),
+                    "theta_fourier_include_linear": not bool(getattr(args, "flow_prior_theta_fourier_no_linear", False)),
+                    "theta_fourier_include_bias": not bool(getattr(args, "flow_prior_theta_fourier_no_bias", False)),
+                }
+                prior_model_flow = PriorThetaFlowVelocityThetaFourierFiLMPerLayer(
+                    hidden_dim=int(getattr(args, "prior_hidden_dim", 128)),
+                    depth=int(getattr(args, "prior_depth", 3)),
+                    use_logit_time=True,
+                    use_layer_norm=bool(getattr(args, "flow_prior_use_layer_norm", False)),
+                    gated_film=bool(getattr(args, "flow_prior_gated_film", False)),
+                    zero_out_init=bool(getattr(args, "flow_prior_zero_out_init", False)),
+                    theta_fourier_k=int(getattr(args, "flow_prior_theta_fourier_k", 4)),
+                    theta_fourier_omega=float(_om_eff_p),
+                    theta_fourier_include_linear=not bool(getattr(args, "flow_prior_theta_fourier_no_linear", False)),
+                    theta_fourier_include_bias=not bool(getattr(args, "flow_prior_theta_fourier_no_bias", False)),
+                ).to(device)
+            else:
+                raise ValueError("--flow-arch must be one of {'mlp','film','film_fourier'}.")
+            prior_train_out = train_prior_theta_flow_model(
                 model=prior_model_flow,
                 theta_train=theta_score_fit,
-                epochs=ft_epochs,
-                batch_size=ft_batch,
-                lr=float(getattr(args, "flow_likelihood_finetune_lr", 1e-4)),
+                epochs=int(getattr(args, "prior_epochs", 10000)),
+                batch_size=int(getattr(args, "prior_batch_size", 256)),
+                lr=float(getattr(args, "prior_lr", 1e-3)),
                 device=device,
                 log_every=max(1, args.log_every),
                 theta_val=theta_score_val,
-                early_stopping_patience=int(getattr(args, "flow_likelihood_finetune_patience", 100)),
-                early_stopping_min_delta=float(getattr(args, "flow_likelihood_finetune_min_delta", 1e-4)),
-                early_stopping_ema_alpha=float(getattr(args, "flow_likelihood_finetune_ema_alpha", 0.05)),
+                early_stopping_patience=int(getattr(args, "prior_early_patience", 1000)),
+                early_stopping_min_delta=float(getattr(args, "prior_early_min_delta", 1e-4)),
+                early_stopping_ema_alpha=float(getattr(args, "prior_early_ema_alpha", 0.05)),
                 restore_best=bool(getattr(args, "prior_restore_best", True)),
-                ode_steps=int(getattr(args, "flow_likelihood_finetune_ode_steps", 64)),
+                scheduler_name=str(getattr(args, "flow_scheduler", "cosine")),
             )
-            prior_likelihood_ft_train_losses = np.asarray(prior_likelihood_ft_out["train_losses"], dtype=np.float64)
-            prior_likelihood_ft_val_losses = np.asarray(prior_likelihood_ft_out["val_losses"], dtype=np.float64)
-            prior_likelihood_ft_val_monitor_losses = np.asarray(
-                prior_likelihood_ft_out.get("val_monitor_losses", []),
-                dtype=np.float64,
-            )
+            prior_train_losses = np.asarray(prior_train_out["train_losses"], dtype=np.float64)
+            prior_val_losses = np.asarray(prior_train_out["val_losses"], dtype=np.float64)
+            prior_val_monitor_losses = np.asarray(prior_train_out.get("val_monitor_losses", []), dtype=np.float64)
+            prior_best_epoch = int(prior_train_out["best_epoch"])
+            prior_stopped_epoch = int(prior_train_out["stopped_epoch"])
+            prior_stopped_early = bool(prior_train_out["stopped_early"])
+            prior_best_val_loss = float(prior_train_out["best_val_loss"])
+            prior_likelihood_ft_train_losses = np.asarray([], dtype=np.float64)
+            prior_likelihood_ft_val_losses = np.asarray([], dtype=np.float64)
+            prior_likelihood_ft_val_monitor_losses = np.asarray([], dtype=np.float64)
+            prior_likelihood_ft_out: dict[str, Any] = {}
+            if theta_field_method == "theta_flow" and ft_epochs > 0:
+                print(
+                    "[theta_flow_nll_ft] prior fine-tune enabled: "
+                    f"epochs={ft_epochs} lr={float(getattr(args, 'flow_likelihood_finetune_lr', 1e-4)):.6g} "
+                    f"batch={ft_batch} ode_steps={int(getattr(args, 'flow_likelihood_finetune_ode_steps', 64))}",
+                    flush=True,
+                )
+                prior_likelihood_ft_out = train_prior_theta_flow_likelihood_finetune(
+                    model=prior_model_flow,
+                    theta_train=theta_score_fit,
+                    epochs=ft_epochs,
+                    batch_size=ft_batch,
+                    lr=float(getattr(args, "flow_likelihood_finetune_lr", 1e-4)),
+                    device=device,
+                    log_every=max(1, args.log_every),
+                    theta_val=theta_score_val,
+                    early_stopping_patience=int(getattr(args, "flow_likelihood_finetune_patience", 100)),
+                    early_stopping_min_delta=float(getattr(args, "flow_likelihood_finetune_min_delta", 1e-4)),
+                    early_stopping_ema_alpha=float(getattr(args, "flow_likelihood_finetune_ema_alpha", 0.05)),
+                    restore_best=bool(getattr(args, "prior_restore_best", True)),
+                    ode_steps=int(getattr(args, "flow_likelihood_finetune_ode_steps", 64)),
+                )
+                prior_likelihood_ft_train_losses = np.asarray(prior_likelihood_ft_out["train_losses"], dtype=np.float64)
+                prior_likelihood_ft_val_losses = np.asarray(prior_likelihood_ft_out["val_losses"], dtype=np.float64)
+                prior_likelihood_ft_val_monitor_losses = np.asarray(
+                    prior_likelihood_ft_out.get("val_monitor_losses", []),
+                    dtype=np.float64,
+                )
 
-        prior_loss_fig = os.path.join(args.output_dir, "prior_score_loss_vs_epoch.png")
-        epochs_prior = np.arange(1, prior_train_losses.size + 1)
-        plt.figure(figsize=(8.8, 5.0))
-        plt.plot(epochs_prior, prior_train_losses, color="#1f77b4", linewidth=2.0, label="Prior theta-flow train loss")
-        if prior_val_losses.size == prior_train_losses.size and np.any(np.isfinite(prior_val_losses)):
-            plt.plot(epochs_prior, prior_val_losses, color="#d62728", linewidth=2.0, label="Prior theta-flow val loss")
-        if prior_val_monitor_losses.size == prior_train_losses.size and np.any(np.isfinite(prior_val_monitor_losses)):
-            plt.plot(
-                epochs_prior,
-                prior_val_monitor_losses,
-                color="#ff7f0e",
-                linewidth=2.0,
-                linestyle="--",
-                label=f"Prior val EMA (α={getattr(args, 'prior_early_ema_alpha', 0.05):g})",
+            prior_loss_fig = os.path.join(args.output_dir, "prior_score_loss_vs_epoch.png")
+            epochs_prior = np.arange(1, prior_train_losses.size + 1)
+            plt.figure(figsize=(8.8, 5.0))
+            plt.plot(epochs_prior, prior_train_losses, color="#1f77b4", linewidth=2.0, label="Prior theta-flow train loss")
+            if prior_val_losses.size == prior_train_losses.size and np.any(np.isfinite(prior_val_losses)):
+                plt.plot(epochs_prior, prior_val_losses, color="#d62728", linewidth=2.0, label="Prior theta-flow val loss")
+            if prior_val_monitor_losses.size == prior_train_losses.size and np.any(np.isfinite(prior_val_monitor_losses)):
+                plt.plot(
+                    epochs_prior,
+                    prior_val_monitor_losses,
+                    color="#ff7f0e",
+                    linewidth=2.0,
+                    linestyle="--",
+                    label=f"Prior val EMA (α={getattr(args, 'prior_early_ema_alpha', 0.05):g})",
+                )
+            if 1 <= prior_best_epoch <= prior_train_losses.size:
+                plt.axvline(prior_best_epoch, color="#2ca02c", linestyle="--", linewidth=1.5, label=f"Best epoch {prior_best_epoch}")
+            if 1 <= prior_stopped_epoch <= prior_train_losses.size:
+                plt.axvline(
+                    prior_stopped_epoch,
+                    color="#9467bd",
+                    linestyle=":",
+                    linewidth=1.6,
+                    label=f"Stop epoch {prior_stopped_epoch}",
+                )
+            plt.xlabel("Epoch")
+            plt.ylabel("Loss")
+            plt.title("Prior theta-flow training")
+            plt.grid(alpha=0.25, linestyle="--", linewidth=0.8)
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(prior_loss_fig, dpi=180)
+            plt.close()
+        else:
+            print(
+                "[theta_flow] posterior-only likelihood: skipping prior flow construction, training, "
+                "NLL fine-tune, loss figure, and checkpoint.",
+                flush=True,
             )
-        if 1 <= prior_best_epoch <= prior_train_losses.size:
-            plt.axvline(prior_best_epoch, color="#2ca02c", linestyle="--", linewidth=1.5, label=f"Best epoch {prior_best_epoch}")
-        if 1 <= prior_stopped_epoch <= prior_train_losses.size:
-            plt.axvline(
-                prior_stopped_epoch,
-                color="#9467bd",
-                linestyle=":",
-                linewidth=1.6,
-                label=f"Stop epoch {prior_stopped_epoch}",
-            )
-        plt.xlabel("Epoch")
-        plt.ylabel("Loss")
-        plt.title("Prior theta-flow training")
-        plt.grid(alpha=0.25, linestyle="--", linewidth=0.8)
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(prior_loss_fig, dpi=180)
-        plt.close()
+            prior_model_flow = None
+            prior_ckpt_hparams = {}
+            prior_train_out = {}
+            prior_train_losses = np.asarray([], dtype=np.float64)
+            prior_val_losses = np.asarray([], dtype=np.float64)
+            prior_val_monitor_losses = np.asarray([], dtype=np.float64)
+            prior_best_epoch = 0
+            prior_stopped_epoch = 0
+            prior_stopped_early = False
+            prior_best_val_loss = float("nan")
+            prior_likelihood_ft_train_losses = np.asarray([], dtype=np.float64)
+            prior_likelihood_ft_val_losses = np.asarray([], dtype=np.float64)
+            prior_likelihood_ft_val_monitor_losses = np.asarray([], dtype=np.float64)
+            prior_loss_fig = ""
 
         post_ckpt_path = _save_theta_flow_model_checkpoint(
             output_dir=args.output_dir,
@@ -2541,20 +2578,26 @@ def run_shared_fisher_estimation(
             model_hparams=post_ckpt_hparams,
             args=args,
         )
-        prior_ckpt_path = _save_theta_flow_model_checkpoint(
-            output_dir=args.output_dir,
-            filename="theta_flow_prior_checkpoint.pt",
-            model=prior_model_flow,
-            model_role="prior",
-            theta_field_method=theta_field_method,
-            flow_arch=flow_prior_arch,
-            flow_scheduler=str(getattr(args, "flow_scheduler", "cosine")),
-            theta_dim_flow=theta_dim_flow,
-            model_hparams=prior_ckpt_hparams,
-            args=args,
-        )
+        if not theta_flow_posterior_only:
+            prior_ckpt_path = _save_theta_flow_model_checkpoint(
+                output_dir=args.output_dir,
+                filename="theta_flow_prior_checkpoint.pt",
+                model=prior_model_flow,
+                model_role="prior",
+                theta_field_method=theta_field_method,
+                flow_arch=flow_prior_arch,
+                flow_scheduler=str(getattr(args, "flow_scheduler", "cosine")),
+                theta_dim_flow=theta_dim_flow,
+                model_hparams=prior_ckpt_hparams,
+                args=args,
+            )
+        else:
+            prior_ckpt_path = ""
         print(f"[theta_flow_ckpt] saved posterior checkpoint: {post_ckpt_path}")
-        print(f"[theta_flow_ckpt] saved prior checkpoint: {prior_ckpt_path}")
+        if prior_ckpt_path:
+            print(f"[theta_flow_ckpt] saved prior checkpoint: {prior_ckpt_path}")
+        else:
+            print("[theta_flow_ckpt] prior checkpoint skipped (posterior-only likelihood mode).")
 
         # H matrix: full per-run pool (train ∪ validation); fitting stays on train split with val early stop.
         theta_h_matrix = np.asarray(theta_all, dtype=np.float64)
@@ -2564,6 +2607,7 @@ def run_shared_fisher_estimation(
         if bool(getattr(args, "compute_h_matrix", False)):
             h_eval = flow_eval_t
             _h_field = "theta_flow" if theta_field_method == "theta_flow" else "theta_path_integral"
+            _post_only = bool(getattr(args, "theta_flow_posterior_only_likelihood", False))
             print(
                 "[h_matrix] "
                 f"enabled=True field={_h_field} "
@@ -2571,6 +2615,7 @@ def run_shared_fisher_estimation(
                 f"n_theta_x={int(theta_h_matrix.shape[0])} (train+validation full pool) "
                 f"restore_original_order={bool(getattr(args, 'h_restore_original_order', False))} "
                 f"pair_batch_size={int(getattr(args, 'h_batch_size', 65536))}"
+                f" theta_flow_posterior_only_likelihood={_post_only}"
             )
             h_estimator = HMatrixEstimator(
                 model_post=post_model,
@@ -2580,6 +2625,7 @@ def run_shared_fisher_estimation(
                 pair_batch_size=int(getattr(args, "h_batch_size", 65536)),
                 field_method=_h_field,
                 flow_scheduler=str(getattr(args, "flow_scheduler", "cosine")),
+                theta_flow_posterior_only_likelihood=_post_only,
             )
             h_result = h_estimator.run(
                 theta=theta_h_matrix,
@@ -2593,11 +2639,18 @@ def run_shared_fisher_estimation(
                 args, h_result, suffix
             )
             if theta_field_method == "theta_flow":
-                print(
-                    "[summary] theta_flow mode completed (H-matrix only path; "
-                    "ODESolver.compute_likelihood on conditional theta-flow for log p(theta|x) minus prior; "
-                    "Bayes-ratio matrix)."
-                )
+                if bool(getattr(args, "theta_flow_posterior_only_likelihood", False)):
+                    print(
+                        "[summary] theta_flow mode completed (H-matrix only path; "
+                        "ODESolver.compute_likelihood on conditional theta-flow for log p(theta|x) only "
+                        "(posterior-only likelihood matrix; prior flow not trained or evaluated)."
+                    )
+                else:
+                    print(
+                        "[summary] theta_flow mode completed (H-matrix only path; "
+                        "ODESolver.compute_likelihood on conditional theta-flow for log p(theta|x) minus prior; "
+                        "Bayes-ratio matrix)."
+                    )
             else:
                 print(
                     "[summary] theta_path_integral mode completed (H-matrix only path; "
@@ -2606,9 +2659,11 @@ def run_shared_fisher_estimation(
                 )
             print("Saved artifacts:")
             print(f"  - {post_loss_fig}")
-            print(f"  - {prior_loss_fig}")
+            if prior_loss_fig:
+                print(f"  - {prior_loss_fig}")
             print(f"  - {post_ckpt_path}")
-            print(f"  - {prior_ckpt_path}")
+            if prior_ckpt_path:
+                print(f"  - {prior_ckpt_path}")
             print(f"  - {h_npz_path}")
             print(f"  - {h_summary_path}")
             print(f"  - {h_fig_path}")
@@ -2627,7 +2682,7 @@ def run_shared_fisher_estimation(
                 score_stopped_epoch=post_stopped_epoch,
                 score_stopped_early=post_stopped_early,
                 score_best_val_loss=post_best_val_loss,
-                prior_enable=True,
+                prior_enable=not theta_flow_posterior_only,
                 prior_train_losses=prior_train_losses,
                 prior_val_losses=prior_val_losses,
                 prior_val_monitor_losses=prior_val_monitor_losses,
