@@ -789,10 +789,13 @@ def build_dataset_from_meta(
             seed=seed,
         )
     if family == "cosine_gaussian_sqrtd":
+        gen_x_dim = int(meta["x_dim"])
+        if bool(meta.get("pr_autoencoder_embedded", False)):
+            gen_x_dim = int(meta.get("pr_autoencoder_z_dim", gen_x_dim))
         return ToyConditionalGaussianSqrtdDataset(
             theta_low=float(meta["theta_low"]),
             theta_high=float(meta["theta_high"]),
-            x_dim=int(meta["x_dim"]),
+            x_dim=gen_x_dim,
             tuning_curve_family=str(meta.get("tuning_curve_family", "cosine")),
             vm_mu_amp=float(meta.get("vm_mu_amp", 1.0)),
             vm_kappa=float(meta.get("vm_kappa", 1.0)),
@@ -822,10 +825,13 @@ def build_dataset_from_meta(
             cta = np.asarray(cta_raw, dtype=np.float64).reshape(-1)
         else:
             cta = None
+        gen_x_dim = int(meta["x_dim"])
+        if bool(meta.get("pr_autoencoder_embedded", False)):
+            gen_x_dim = int(meta.get("pr_autoencoder_z_dim", gen_x_dim))
         return ToyConditionalGaussianCosineRandampSqrtdDataset(
             theta_low=float(meta["theta_low"]),
             theta_high=float(meta["theta_high"]),
-            x_dim=int(meta["x_dim"]),
+            x_dim=gen_x_dim,
             tuning_curve_family=str(meta.get("tuning_curve_family", "cosine")),
             vm_mu_amp=float(meta.get("vm_mu_amp", 1.0)),
             vm_kappa=float(meta.get("vm_kappa", 1.0)),

@@ -22,6 +22,8 @@ The dataset family token `randamp_gaussian_sqrtd_pr_autoencoder` is **removed** 
      --device cuda
    ```
 
+   For **`cosine_gaussian_sqrtd`** (or other non-`randamp_gaussian_sqrtd` families), pass **`--allow-non-randamp-sqrtd`** in addition to the same flags.
+
 By default the projection script **always trains** a PR-autoencoder (no checkpoint reuse). Pass **`--use-cache`** to load a matching cached model from `--cache-dir` when available.
 
-The embedded NPZ keeps `dataset_family: randamp_gaussian_sqrtd`, sets `meta["x_dim"]` to `--h-dim`, and sets `pr_autoencoder_embedded: true` with `pr_autoencoder_z_dim` equal to the source latent dimension. `build_dataset_from_meta` uses the latent dimension for the generative toy class when `pr_autoencoder_embedded` is true.
+The embedded NPZ keeps the input `dataset_family` (e.g. `randamp_gaussian_sqrtd` or `cosine_gaussian_sqrtd`), sets `meta["x_dim"]` to `--h-dim`, and sets `pr_autoencoder_embedded: true` with `pr_autoencoder_z_dim` equal to the source latent dimension. `build_dataset_from_meta` uses the latent dimension for the generative toy class when `pr_autoencoder_embedded` is true (for `randamp_gaussian_sqrtd`, `cosine_gaussian_sqrtd`, and `cosine_gaussian_sqrtd_rand_tune`).

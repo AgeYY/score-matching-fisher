@@ -1240,6 +1240,11 @@ def _approx_gt_posterior_density(
 ) -> np.ndarray:
     td = np.asarray(theta_dense, dtype=np.float64).reshape(-1)
     x1 = np.asarray(x_fixed, dtype=np.float64).reshape(1, -1)
+    d_obs = int(x1.shape[1])
+    d_gen = int(getattr(dataset, "x_dim", d_obs))
+    if d_obs != d_gen:
+        # e.g. PR-autoencoder embedded x (ambient dim != generative z_dim): no exact p(x|theta) here.
+        return np.full_like(td, np.nan, dtype=np.float64)
     if td.size < 2:
         return np.zeros_like(td, dtype=np.float64)
     x_rep = np.repeat(x1, repeats=td.size, axis=0)
@@ -1313,7 +1318,8 @@ def _plot_fixed_x_column(
     ax_top.fill_between(th_s, 0.0, w_s, color="#1f77b4", alpha=0.22, step="mid")
     ax_top.plot(th_s, w_s, "o", color="#1f77b4", ms=2, alpha=0.55, label="Posterior mass on θ samples")
     ax_top.plot(th_grid, q_model, color="#1f77b4", lw=1.6, label=f"Model posterior (approx; {logp_source})")
-    ax_top.plot(th_grid, q_gt, color="#d62728", lw=1.5, ls="--", label="GT posterior (approx)")
+    if np.any(np.isfinite(q_gt)):
+        ax_top.plot(th_grid, q_gt, color="#d62728", lw=1.5, ls="--", label="GT posterior (approx)")
     ax_top.set_ylabel("density")
     ax_top.set_title(
         f"Fixed-$x$ posterior diagnostics  (row $i$={int(i_fix)},  method={hfm})",
@@ -3272,7 +3278,9 @@ def main(argv: list[str] | None = None) -> None:
             run_dir = os.path.join(sweep_root, f"n_{n:06d}")
             os.makedirs(run_dir, exist_ok=True)
         else:
-            tmp_ctx = tempfile.TemporaryDirectory(prefix=f"h_conv_n{n}_", dir=args.output_dir)
+            tmp_ctx = tempfile.TemporaryDirectory(
+                prefix=f"h_conv_n{n}_", dir=args.output_dir, ignore_cleanup_errors=True
+            )
             run_dir = tmp_ctx.name
 
         try:

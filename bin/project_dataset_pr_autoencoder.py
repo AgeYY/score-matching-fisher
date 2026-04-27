@@ -4,12 +4,14 @@
 Typical workflow:
 
 1. ``python bin/make_dataset.py --dataset-family randamp_gaussian_sqrtd --x-dim 2 ...``
+   (or e.g. ``cosine_gaussian_sqrtd`` at low ``--x-dim``).
 2. ``python bin/project_dataset_pr_autoencoder.py --input-npz <low.npz> --output-npz <high.npz> --h-dim 10``
+   For families other than ``randamp_gaussian_sqrtd``, add ``--allow-non-randamp-sqrtd``.
 
-The output archive keeps ``dataset_family='randamp_gaussian_sqrtd'`` (generative recipe), sets
-``meta['x_dim']`` to the embedded dimension ``h_dim``, and sets ``pr_autoencoder_embedded=True``
-with ``pr_autoencoder_z_dim`` equal to the source latent dimension. Ground-truth helpers that need
-the low-dimensional generative model use :func:`fisher.shared_fisher_est.build_dataset_from_meta`.
+The output archive keeps the input ``dataset_family`` (generative recipe), sets ``meta['x_dim']``
+to the embedded dimension ``h_dim``, and sets ``pr_autoencoder_embedded=True`` with
+``pr_autoencoder_z_dim`` equal to the source latent dimension. Ground-truth helpers that need the
+low-dimensional generative model use :func:`fisher.shared_fisher_est.build_dataset_from_meta`.
 
 Unless ``--skip-viz``, writes ``pr_projection_summary.{png,svg}`` next to ``--output-npz``:
 left panel = PCA of embedded ``x``; right panel = PR-autoencoder training loss vs epoch.
