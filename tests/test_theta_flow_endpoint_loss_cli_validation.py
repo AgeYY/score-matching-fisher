@@ -36,3 +36,48 @@ def test_validate_rejects_non_positive_theta_flow_endpoint_steps() -> None:
     args = parse_full_args(["--flow-endpoint-steps", "0"])
     with pytest.raises(ValueError, match="--flow-endpoint-steps must be >= 1."):
         validate_estimation_args(args)
+
+
+def test_validate_accepts_theta_flow_likelihood_finetune_flags() -> None:
+    args = parse_full_args(
+        [
+            "--theta-field-method",
+            "theta_flow",
+            "--flow-likelihood-finetune-epochs",
+            "2",
+            "--flow-likelihood-finetune-lr",
+            "1e-4",
+            "--flow-likelihood-finetune-ode-steps",
+            "4",
+        ]
+    )
+    validate_estimation_args(args)
+    assert int(args.flow_likelihood_finetune_epochs) == 2
+
+
+@pytest.mark.parametrize(
+    ("flag", "value", "match"),
+    [
+        ("--flow-likelihood-finetune-epochs", "-1", "--flow-likelihood-finetune-epochs must be >= 0."),
+        ("--flow-likelihood-finetune-epochs", "2001", "--flow-likelihood-finetune-epochs must be <= 2000."),
+        ("--flow-likelihood-finetune-lr", "0", "--flow-likelihood-finetune-lr must be positive."),
+        ("--flow-likelihood-finetune-ode-steps", "0", "--flow-likelihood-finetune-ode-steps must be >= 1."),
+    ],
+)
+def test_validate_rejects_invalid_theta_flow_likelihood_finetune_flags(flag: str, value: str, match: str) -> None:
+    args = parse_full_args([flag, value])
+    with pytest.raises(ValueError, match=match):
+        validate_estimation_args(args)
+
+
+def test_validate_rejects_likelihood_finetune_for_x_flow() -> None:
+    args = parse_full_args(
+        [
+            "--theta-field-method",
+            "x_flow",
+            "--flow-likelihood-finetune-epochs",
+            "1",
+        ]
+    )
+    with pytest.raises(ValueError, match="only supported with --theta-field-method theta_flow"):
+        validate_estimation_args(args)

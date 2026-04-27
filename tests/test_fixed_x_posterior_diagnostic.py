@@ -36,6 +36,31 @@ def _ns(**overrides: object) -> argparse.Namespace:
 
 
 class TestFixedXPosteriorDiagnostic(unittest.TestCase):
+    def test_training_loss_loader_reads_likelihood_finetune_arrays(self) -> None:
+        mod = _load_study_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "losses.npz"
+            np.savez_compressed(
+                p,
+                theta_field_method=np.asarray(["theta_flow"], dtype=object),
+                prior_enable=np.bool_(True),
+                score_train_losses=np.asarray([1.0], dtype=np.float64),
+                score_val_losses=np.asarray([1.1], dtype=np.float64),
+                score_val_monitor_losses=np.asarray([1.05], dtype=np.float64),
+                score_likelihood_finetune_train_losses=np.asarray([0.9, 0.8], dtype=np.float64),
+                score_likelihood_finetune_val_losses=np.asarray([0.95, 0.85], dtype=np.float64),
+                score_likelihood_finetune_val_monitor_losses=np.asarray([0.95, 0.9], dtype=np.float64),
+                prior_train_losses=np.asarray([0.7], dtype=np.float64),
+                prior_val_losses=np.asarray([0.8], dtype=np.float64),
+                prior_val_monitor_losses=np.asarray([0.75], dtype=np.float64),
+                prior_likelihood_finetune_train_losses=np.asarray([0.6], dtype=np.float64),
+                prior_likelihood_finetune_val_losses=np.asarray([0.65], dtype=np.float64),
+                prior_likelihood_finetune_val_monitor_losses=np.asarray([0.65], dtype=np.float64),
+            )
+            loaded = mod._load_per_n_training_loss_npz(str(p))
+        np.testing.assert_allclose(loaded["score_likelihood_finetune_train_losses"], [0.9, 0.8])
+        np.testing.assert_allclose(loaded["prior_likelihood_finetune_train_losses"], [0.6])
+
     def test_theta_flow_log_weight_selection_prefers_saved_posterior(self) -> None:
         mod = _load_study_module()
         c_row = np.asarray([-2.0, 0.0, 2.0], dtype=np.float64)

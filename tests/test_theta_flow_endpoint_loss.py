@@ -3,10 +3,12 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from fisher.models import ConditionalThetaFlowVelocity
+from fisher.models import ConditionalThetaFlowVelocity, PriorThetaFlowVelocity
 from fisher.trainers import (
     _theta_flow_conditional_nll_aux_loss,
+    train_conditional_theta_flow_likelihood_finetune,
     train_conditional_theta_flow_model,
+    train_prior_theta_flow_likelihood_finetune,
 )
 
 
@@ -93,3 +95,53 @@ def test_train_theta_flow_endpoint_loss_enabled_tracks_component_losses() -> Non
     assert len(out["val_endpoint_losses"]) == 2
     assert np.all(np.isfinite(np.asarray(out["val_losses"], dtype=np.float64)))
     assert np.all(np.isfinite(np.asarray(out["val_endpoint_losses"], dtype=np.float64)))
+
+
+def test_train_theta_flow_likelihood_finetune_tracks_nll_losses() -> None:
+    torch.manual_seed(0)
+    theta, x = _make_toy_dataset(n=18)
+    theta_tr, x_tr = theta[:12], x[:12]
+    theta_va, x_va = theta[12:], x[12:]
+    model = ConditionalThetaFlowVelocity(x_dim=2, hidden_dim=12, depth=1).to(torch.device("cpu"))
+    out = train_conditional_theta_flow_likelihood_finetune(
+        model=model,
+        theta_train=theta_tr,
+        x_train=x_tr,
+        epochs=2,
+        batch_size=6,
+        lr=1e-4,
+        device=torch.device("cpu"),
+        log_every=10,
+        theta_val=theta_va,
+        x_val=x_va,
+        ode_steps=3,
+    )
+    assert len(out["train_losses"]) == 2
+    assert len(out["val_losses"]) == 2
+    assert len(out["val_monitor_losses"]) == 2
+    assert np.all(np.isfinite(np.asarray(out["train_losses"], dtype=np.float64)))
+    assert np.all(np.isfinite(np.asarray(out["val_losses"], dtype=np.float64)))
+
+
+def test_train_prior_theta_flow_likelihood_finetune_tracks_nll_losses() -> None:
+    torch.manual_seed(0)
+    theta, _ = _make_toy_dataset(n=18)
+    theta_tr = theta[:12]
+    theta_va = theta[12:]
+    model = PriorThetaFlowVelocity(hidden_dim=12, depth=1, theta_dim=1).to(torch.device("cpu"))
+    out = train_prior_theta_flow_likelihood_finetune(
+        model=model,
+        theta_train=theta_tr,
+        epochs=2,
+        batch_size=6,
+        lr=1e-4,
+        device=torch.device("cpu"),
+        log_every=10,
+        theta_val=theta_va,
+        ode_steps=3,
+    )
+    assert len(out["train_losses"]) == 2
+    assert len(out["val_losses"]) == 2
+    assert len(out["val_monitor_losses"]) == 2
+    assert np.all(np.isfinite(np.asarray(out["train_losses"], dtype=np.float64)))
+    assert np.all(np.isfinite(np.asarray(out["val_losses"], dtype=np.float64)))

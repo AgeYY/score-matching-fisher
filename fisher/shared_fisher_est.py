@@ -107,9 +107,11 @@ def effective_flow_theta_fourier_omega_prior(args: Any) -> tuple[float, str]:
     return effective_theta_fourier_omega_for_prefix(args, "flow_prior_theta_fourier")
 from fisher.trainers import (
     geometric_sigma_schedule,
+    train_conditional_theta_flow_likelihood_finetune,
     train_conditional_theta_flow_model,
     train_conditional_x_flow_model,
     train_local_decoder,
+    train_prior_theta_flow_likelihood_finetune,
     train_prior_theta_flow_model,
     train_prior_score_model,
     train_prior_score_model_ncsm_continuous,
@@ -1070,6 +1072,25 @@ def validate_estimation_args(args: Any) -> None:
         raise ValueError("--flow-batch-size must be >= 1.")
     if float(getattr(args, "flow_lr", 0.0)) <= 0.0:
         raise ValueError("--flow-lr must be positive.")
+    ft_epochs = int(getattr(args, "flow_likelihood_finetune_epochs", 0))
+    if ft_epochs < 0:
+        raise ValueError("--flow-likelihood-finetune-epochs must be >= 0.")
+    if ft_epochs > 2000:
+        raise ValueError("--flow-likelihood-finetune-epochs must be <= 2000.")
+    if ft_epochs > 0 and _tfm_val != "theta_flow":
+        raise ValueError("--flow-likelihood-finetune-epochs is only supported with --theta-field-method theta_flow.")
+    if float(getattr(args, "flow_likelihood_finetune_lr", 1e-4)) <= 0.0:
+        raise ValueError("--flow-likelihood-finetune-lr must be positive.")
+    if int(getattr(args, "flow_likelihood_finetune_ode_steps", 64)) < 1:
+        raise ValueError("--flow-likelihood-finetune-ode-steps must be >= 1.")
+    if int(getattr(args, "flow_likelihood_finetune_patience", 100)) < 1:
+        raise ValueError("--flow-likelihood-finetune-patience must be >= 1.")
+    if float(getattr(args, "flow_likelihood_finetune_min_delta", 1e-4)) < 0.0:
+        raise ValueError("--flow-likelihood-finetune-min-delta must be non-negative.")
+    if not (0.0 < float(getattr(args, "flow_likelihood_finetune_ema_alpha", 0.05)) <= 1.0):
+        raise ValueError("--flow-likelihood-finetune-ema-alpha must be in (0, 1].")
+    if not bool(getattr(args, "flow_likelihood_finetune_exact_divergence", True)):
+        raise ValueError("--flow-likelihood-finetune-exact-divergence is currently required.")
     if float(getattr(args, "flow_endpoint_loss_weight", 0.0)) < 0.0:
         raise ValueError("--flow-endpoint-loss-weight must be non-negative.")
     if int(getattr(args, "flow_endpoint_steps", 20)) < 1:
@@ -1258,6 +1279,9 @@ def _save_dsm_score_prior_training_losses_npz(
     score_n_clipped_steps: int = 0,
     score_n_total_steps: int = 0,
     score_lr_last: float = float("nan"),
+    score_likelihood_finetune_train_losses: np.ndarray | None = None,
+    score_likelihood_finetune_val_losses: np.ndarray | None = None,
+    score_likelihood_finetune_val_monitor_losses: np.ndarray | None = None,
     prior_has_nonfinite: bool = False,
     prior_grad_norm_mean: float = float("nan"),
     prior_grad_norm_max: float = float("nan"),
@@ -1265,6 +1289,9 @@ def _save_dsm_score_prior_training_losses_npz(
     prior_n_clipped_steps: int = 0,
     prior_n_total_steps: int = 0,
     prior_lr_last: float = float("nan"),
+    prior_likelihood_finetune_train_losses: np.ndarray | None = None,
+    prior_likelihood_finetune_val_losses: np.ndarray | None = None,
+    prior_likelihood_finetune_val_monitor_losses: np.ndarray | None = None,
     theta_field_method: str = "theta_flow",
 ) -> str:
     """Write per-run training curves for posterior and optional prior (DSM score or theta-flow)."""
@@ -1291,6 +1318,18 @@ def _save_dsm_score_prior_training_losses_npz(
         score_n_clipped_steps=np.int64(score_n_clipped_steps),
         score_n_total_steps=np.int64(score_n_total_steps),
         score_lr_last=np.float64(score_lr_last),
+        score_likelihood_finetune_train_losses=np.asarray(
+            [] if score_likelihood_finetune_train_losses is None else score_likelihood_finetune_train_losses,
+            dtype=np.float64,
+        ),
+        score_likelihood_finetune_val_losses=np.asarray(
+            [] if score_likelihood_finetune_val_losses is None else score_likelihood_finetune_val_losses,
+            dtype=np.float64,
+        ),
+        score_likelihood_finetune_val_monitor_losses=np.asarray(
+            [] if score_likelihood_finetune_val_monitor_losses is None else score_likelihood_finetune_val_monitor_losses,
+            dtype=np.float64,
+        ),
         prior_enable=np.bool_(prior_enable),
         prior_train_losses=np.asarray(prior_train_losses, dtype=np.float64),
         prior_val_losses=np.asarray(prior_val_losses, dtype=np.float64),
@@ -1306,6 +1345,18 @@ def _save_dsm_score_prior_training_losses_npz(
         prior_n_clipped_steps=np.int64(prior_n_clipped_steps),
         prior_n_total_steps=np.int64(prior_n_total_steps),
         prior_lr_last=np.float64(prior_lr_last),
+        prior_likelihood_finetune_train_losses=np.asarray(
+            [] if prior_likelihood_finetune_train_losses is None else prior_likelihood_finetune_train_losses,
+            dtype=np.float64,
+        ),
+        prior_likelihood_finetune_val_losses=np.asarray(
+            [] if prior_likelihood_finetune_val_losses is None else prior_likelihood_finetune_val_losses,
+            dtype=np.float64,
+        ),
+        prior_likelihood_finetune_val_monitor_losses=np.asarray(
+            [] if prior_likelihood_finetune_val_monitor_losses is None else prior_likelihood_finetune_val_monitor_losses,
+            dtype=np.float64,
+        ),
     )
     return path
 
@@ -1338,6 +1389,9 @@ def _save_theta_flow_model_checkpoint(
         "theta_flow_fourier_k": int(getattr(args, "theta_flow_fourier_k", 0)),
         "theta_flow_fourier_period_mult": float(getattr(args, "theta_flow_fourier_period_mult", 0.0)),
         "theta_flow_fourier_include_linear": bool(getattr(args, "theta_flow_fourier_include_linear", False)),
+        "flow_likelihood_finetune_epochs": int(getattr(args, "flow_likelihood_finetune_epochs", 0)),
+        "flow_likelihood_finetune_lr": float(getattr(args, "flow_likelihood_finetune_lr", 1e-4)),
+        "flow_likelihood_finetune_ode_steps": int(getattr(args, "flow_likelihood_finetune_ode_steps", 64)),
         "model_hparams": dict(model_hparams),
         "state_dict": model.state_dict(),
     }
@@ -2249,6 +2303,45 @@ def run_shared_fisher_estimation(
         post_stopped_early = bool(post_train_out["stopped_early"])
         post_best_val_loss = float(post_train_out["best_val_loss"])
 
+        ft_epochs = int(getattr(args, "flow_likelihood_finetune_epochs", 0))
+        ft_batch = int(getattr(args, "flow_likelihood_finetune_batch_size", 0))
+        if ft_batch <= 0:
+            ft_batch = int(getattr(args, "flow_batch_size", 256))
+        post_likelihood_ft_train_losses = np.asarray([], dtype=np.float64)
+        post_likelihood_ft_val_losses = np.asarray([], dtype=np.float64)
+        post_likelihood_ft_val_monitor_losses = np.asarray([], dtype=np.float64)
+        post_likelihood_ft_out: dict[str, Any] = {}
+        if theta_field_method == "theta_flow" and ft_epochs > 0:
+            print(
+                "[theta_flow_nll_ft] posterior fine-tune enabled: "
+                f"epochs={ft_epochs} lr={float(getattr(args, 'flow_likelihood_finetune_lr', 1e-4)):.6g} "
+                f"batch={ft_batch} ode_steps={int(getattr(args, 'flow_likelihood_finetune_ode_steps', 64))}",
+                flush=True,
+            )
+            post_likelihood_ft_out = train_conditional_theta_flow_likelihood_finetune(
+                model=post_model,
+                theta_train=theta_score_fit,
+                x_train=x_score_fit,
+                epochs=ft_epochs,
+                batch_size=ft_batch,
+                lr=float(getattr(args, "flow_likelihood_finetune_lr", 1e-4)),
+                device=device,
+                log_every=max(1, args.log_every),
+                theta_val=theta_score_val,
+                x_val=x_score_val,
+                early_stopping_patience=int(getattr(args, "flow_likelihood_finetune_patience", 100)),
+                early_stopping_min_delta=float(getattr(args, "flow_likelihood_finetune_min_delta", 1e-4)),
+                early_stopping_ema_alpha=float(getattr(args, "flow_likelihood_finetune_ema_alpha", 0.05)),
+                restore_best=bool(getattr(args, "flow_restore_best", True)),
+                ode_steps=int(getattr(args, "flow_likelihood_finetune_ode_steps", 64)),
+            )
+            post_likelihood_ft_train_losses = np.asarray(post_likelihood_ft_out["train_losses"], dtype=np.float64)
+            post_likelihood_ft_val_losses = np.asarray(post_likelihood_ft_out["val_losses"], dtype=np.float64)
+            post_likelihood_ft_val_monitor_losses = np.asarray(
+                post_likelihood_ft_out.get("val_monitor_losses", []),
+                dtype=np.float64,
+            )
+
         post_loss_fig = os.path.join(args.output_dir, "score_loss_vs_epoch.png")
         epochs_arr = np.arange(1, post_train_losses.size + 1)
         plt.figure(figsize=(8.8, 5.0))
@@ -2369,6 +2462,38 @@ def run_shared_fisher_estimation(
         prior_stopped_epoch = int(prior_train_out["stopped_epoch"])
         prior_stopped_early = bool(prior_train_out["stopped_early"])
         prior_best_val_loss = float(prior_train_out["best_val_loss"])
+        prior_likelihood_ft_train_losses = np.asarray([], dtype=np.float64)
+        prior_likelihood_ft_val_losses = np.asarray([], dtype=np.float64)
+        prior_likelihood_ft_val_monitor_losses = np.asarray([], dtype=np.float64)
+        prior_likelihood_ft_out: dict[str, Any] = {}
+        if theta_field_method == "theta_flow" and ft_epochs > 0:
+            print(
+                "[theta_flow_nll_ft] prior fine-tune enabled: "
+                f"epochs={ft_epochs} lr={float(getattr(args, 'flow_likelihood_finetune_lr', 1e-4)):.6g} "
+                f"batch={ft_batch} ode_steps={int(getattr(args, 'flow_likelihood_finetune_ode_steps', 64))}",
+                flush=True,
+            )
+            prior_likelihood_ft_out = train_prior_theta_flow_likelihood_finetune(
+                model=prior_model_flow,
+                theta_train=theta_score_fit,
+                epochs=ft_epochs,
+                batch_size=ft_batch,
+                lr=float(getattr(args, "flow_likelihood_finetune_lr", 1e-4)),
+                device=device,
+                log_every=max(1, args.log_every),
+                theta_val=theta_score_val,
+                early_stopping_patience=int(getattr(args, "flow_likelihood_finetune_patience", 100)),
+                early_stopping_min_delta=float(getattr(args, "flow_likelihood_finetune_min_delta", 1e-4)),
+                early_stopping_ema_alpha=float(getattr(args, "flow_likelihood_finetune_ema_alpha", 0.05)),
+                restore_best=bool(getattr(args, "prior_restore_best", True)),
+                ode_steps=int(getattr(args, "flow_likelihood_finetune_ode_steps", 64)),
+            )
+            prior_likelihood_ft_train_losses = np.asarray(prior_likelihood_ft_out["train_losses"], dtype=np.float64)
+            prior_likelihood_ft_val_losses = np.asarray(prior_likelihood_ft_out["val_losses"], dtype=np.float64)
+            prior_likelihood_ft_val_monitor_losses = np.asarray(
+                prior_likelihood_ft_out.get("val_monitor_losses", []),
+                dtype=np.float64,
+            )
 
         prior_loss_fig = os.path.join(args.output_dir, "prior_score_loss_vs_epoch.png")
         epochs_prior = np.arange(1, prior_train_losses.size + 1)
@@ -2517,6 +2642,9 @@ def run_shared_fisher_estimation(
                 score_n_clipped_steps=int(post_train_out.get("n_clipped_steps", 0)),
                 score_n_total_steps=int(post_train_out.get("n_total_steps", 0)),
                 score_lr_last=float(post_train_out.get("lr_last", float("nan"))),
+                score_likelihood_finetune_train_losses=post_likelihood_ft_train_losses,
+                score_likelihood_finetune_val_losses=post_likelihood_ft_val_losses,
+                score_likelihood_finetune_val_monitor_losses=post_likelihood_ft_val_monitor_losses,
                 prior_has_nonfinite=bool(prior_train_out.get("has_nonfinite", False)),
                 prior_grad_norm_mean=float(prior_train_out.get("grad_norm_mean", float("nan"))),
                 prior_grad_norm_max=float(prior_train_out.get("grad_norm_max", float("nan"))),
@@ -2524,6 +2652,9 @@ def run_shared_fisher_estimation(
                 prior_n_clipped_steps=int(prior_train_out.get("n_clipped_steps", 0)),
                 prior_n_total_steps=int(prior_train_out.get("n_total_steps", 0)),
                 prior_lr_last=float(prior_train_out.get("lr_last", float("nan"))),
+                prior_likelihood_finetune_train_losses=prior_likelihood_ft_train_losses,
+                prior_likelihood_finetune_val_losses=prior_likelihood_ft_val_losses,
+                prior_likelihood_finetune_val_monitor_losses=prior_likelihood_ft_val_monitor_losses,
                 theta_field_method=theta_field_method,
             )
             print(f"[training_losses] saved {tnpz}")

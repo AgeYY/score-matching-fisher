@@ -1491,10 +1491,49 @@ def _load_per_n_training_loss_npz(path: str) -> dict[str, Any]:
         "score_train_losses": _arr("score_train_losses"),
         "score_val_losses": _arr("score_val_losses"),
         "score_val_monitor_losses": _arr("score_val_monitor_losses"),
+        "score_likelihood_finetune_train_losses": _arr("score_likelihood_finetune_train_losses"),
+        "score_likelihood_finetune_val_losses": _arr("score_likelihood_finetune_val_losses"),
+        "score_likelihood_finetune_val_monitor_losses": _arr("score_likelihood_finetune_val_monitor_losses"),
         "prior_train_losses": _arr("prior_train_losses"),
         "prior_val_losses": _arr("prior_val_losses"),
         "prior_val_monitor_losses": _arr("prior_val_monitor_losses"),
+        "prior_likelihood_finetune_train_losses": _arr("prior_likelihood_finetune_train_losses"),
+        "prior_likelihood_finetune_val_losses": _arr("prior_likelihood_finetune_val_losses"),
+        "prior_likelihood_finetune_val_monitor_losses": _arr("prior_likelihood_finetune_val_monitor_losses"),
     }
+
+
+def _bundle_has_any_likelihood_finetune(bundle: dict[str, Any]) -> bool:
+    """True if any likelihood fine-tune loss array in ``bundle`` is non-empty."""
+    keys = (
+        "score_likelihood_finetune_train_losses",
+        "score_likelihood_finetune_val_losses",
+        "score_likelihood_finetune_val_monitor_losses",
+        "prior_likelihood_finetune_train_losses",
+        "prior_likelihood_finetune_val_losses",
+        "prior_likelihood_finetune_val_monitor_losses",
+    )
+    for k in keys:
+        a = bundle.get(k)
+        if a is None:
+            continue
+        if np.asarray(a, dtype=np.float64).size > 0:
+            return True
+    return False
+
+
+def _loss_dir_has_any_likelihood_finetune(ns: list[int], loss_dir: str) -> bool:
+    for n in ns:
+        path = os.path.join(loss_dir, f"n_{int(n):06d}.npz")
+        if not os.path.isfile(path):
+            continue
+        try:
+            bundle = _load_per_n_training_loss_npz(path)
+        except Exception:
+            continue
+        if _bundle_has_any_likelihood_finetune(bundle):
+            return True
+    return False
 
 
 def _plot_loss_triplet(
@@ -1508,7 +1547,7 @@ def _plot_loss_triplet(
     show_legend: bool,
     score_like: bool,
 ) -> None:
-    """Plot train / val / EMA monitor curves on one axis."""
+    """Plot train / val / EMA monitor curves on one axis (single training phase)."""
     train = np.asarray(train, dtype=np.float64).ravel()
     val = np.asarray(val, dtype=np.float64).ravel()
     ema = np.asarray(ema, dtype=np.float64).ravel()
@@ -1545,21 +1584,26 @@ def _render_training_losses_panel(
     out_png_path: str,
     dpi: int = 160,
 ) -> str:
-    """Two rows (score, prior), one column per ``n``; save PNG + SVG."""
+    """Two or four rows (FM pretrain; optional NLL fine-tune), one column per ``n``; save PNG + SVG."""
     n_cols = len(ns)
     if n_cols < 1:
         raise ValueError("n-list must be non-empty for training loss panel.")
+    want_ft = _loss_dir_has_any_likelihood_finetune(ns, loss_dir)
+    n_loss_rows = 4 if want_ft else 2
     w = max(2.6 * n_cols, 6.0)
-    h = 5.8
-    fig, axes = plt.subplots(2, n_cols, figsize=(w, h), squeeze=False, sharex="col")
+    h = 5.8 * (n_loss_rows / 2.0)
+    sharex_kw: dict[str, Any] = {"sharex": "col"} if n_loss_rows == 2 else {"sharex": False}
+    fig, axes = plt.subplots(n_loss_rows, n_cols, figsize=(w, h), squeeze=False, **sharex_kw)
 
-    row0_ylabel = "score / posterior loss"
-    row1_ylabel = "prior loss"
+    row0_ylabel = "score / posterior loss" if not want_ft else "posterior FM loss"
+    row1_ylabel = "prior loss" if not want_ft else "prior FM loss"
+    row2_ylabel = "posterior NLL fine-tune"
+    row3_ylabel = "prior NLL fine-tune"
 
     for j, n in enumerate(ns):
         path = os.path.join(loss_dir, f"n_{int(n):06d}.npz")
         if not os.path.isfile(path):
-            for r in (0, 1):
+            for r in range(n_loss_rows):
                 axes[r, j].text(
                     0.5,
                     0.5,
@@ -1576,7 +1620,7 @@ def _render_training_losses_panel(
         try:
             bundle = _load_per_n_training_loss_npz(path)
         except Exception as e:
-            for r in (0, 1):
+            for r in range(n_loss_rows):
                 axes[r, j].text(
                     0.5,
                     0.5,
@@ -1637,11 +1681,85 @@ def _render_training_losses_panel(
             )
             axes[1, j].set_axis_off()
 
-    fig.suptitle(
-        "Training loss vs epoch (top: posterior; bottom: prior). Columns: nested subset sizes n.",
-        fontsize=11,
-        y=1.02,
-    )
+        if want_ft:
+            if _bundle_has_any_likelihood_finetune(bundle):
+                _plot_loss_triplet(
+                    axes[2, j],
+                    bundle["score_likelihood_finetune_train_losses"],
+                    bundle["score_likelihood_finetune_val_losses"],
+                    bundle["score_likelihood_finetune_val_monitor_losses"],
+                    ylabel=row2_ylabel if j == 0 else "",
+                    title=None,
+                    show_legend=(j == 0),
+                    score_like=True,
+                )
+            else:
+                axes[2, j].text(
+                    0.5,
+                    0.5,
+                    "no NLL fine-tune\nin this run",
+                    ha="center",
+                    va="center",
+                    transform=axes[2, j].transAxes,
+                    fontsize=9,
+                    color="#555555",
+                )
+                axes[2, j].set_axis_off()
+
+            if bundle["prior_enable"]:
+                if (
+                    np.asarray(bundle["prior_likelihood_finetune_train_losses"], dtype=np.float64).size > 0
+                    or np.asarray(bundle["prior_likelihood_finetune_val_losses"], dtype=np.float64).size > 0
+                    or np.asarray(bundle["prior_likelihood_finetune_val_monitor_losses"], dtype=np.float64).size
+                    > 0
+                ):
+                    _plot_loss_triplet(
+                        axes[3, j],
+                        bundle["prior_likelihood_finetune_train_losses"],
+                        bundle["prior_likelihood_finetune_val_losses"],
+                        bundle["prior_likelihood_finetune_val_monitor_losses"],
+                        ylabel=row3_ylabel if j == 0 else "",
+                        title=None,
+                        show_legend=(j == 0),
+                        score_like=False,
+                    )
+                else:
+                    axes[3, j].text(
+                        0.5,
+                        0.5,
+                        "no prior NLL\nfine-tune data",
+                        ha="center",
+                        va="center",
+                        transform=axes[3, j].transAxes,
+                        fontsize=9,
+                        color="#555555",
+                    )
+                    axes[3, j].set_axis_off()
+            else:
+                axes[3, j].text(
+                    0.5,
+                    0.5,
+                    "prior disabled",
+                    ha="center",
+                    va="center",
+                    transform=axes[3, j].transAxes,
+                    fontsize=10,
+                )
+                axes[3, j].set_axis_off()
+
+    if want_ft:
+        fig.suptitle(
+            "Training loss vs epoch (top two rows: FM pretrain; bottom two rows: NLL fine-tune). "
+            "Columns: nested subset sizes n.",
+            fontsize=11,
+            y=1.01,
+        )
+    else:
+        fig.suptitle(
+            "Training loss vs epoch (top: posterior; bottom: prior). Columns: nested subset sizes n.",
+            fontsize=11,
+            y=1.02,
+        )
     fig.tight_layout()
     svg = _save_figure_png_svg(fig, out_png_path, dpi=dpi)
     plt.close(fig)
@@ -1674,14 +1792,18 @@ def _save_combined_convergence_figure(
     With LLR data: top row = matrix + curves; then H scatter row; then LLR scatter row (binned
     model ``ΔL`` vs generative one-sided mean LLR); then training losses; then diagnostic.
     If ``llr_gt``/``llr_est_mats``/``corr_llr`` are omitted, the LLR row is skipped (older runs).
+    The training-loss strip uses two subplot rows by default, or four rows when any per-n
+    ``training_losses`` NPZ contains non-empty likelihood fine-tune curves (separate y-scales).
     """
     crv_w, crv_h = _H_DECODING_CURVE_FIGSIZE_IN
     if crv_h <= 0:
         raise ValueError("_H_DECODING_CURVE_FIGSIZE_IN height must be > 0.")
     n_cols = len(h_mats)
     n_loss_cols = len(ns)
+    want_ft = _loss_dir_has_any_likelihood_finetune(list(ns), loss_dir)
+    n_loss_rows = 4 if want_ft else 2
     m_w, m_h = 2.8 * n_cols, 5.0
-    l_w, l_h = max(2.6 * n_loss_cols, 6.0), 5.8
+    l_w, l_h = max(2.6 * n_loss_cols, 6.0), 5.8 * (n_loss_rows / 2.0)
     top_h = float(m_h)
     bot_h = float(l_h)
     fig_w = max(m_w + (top_h * (float(crv_w) / float(crv_h))), l_w)
@@ -1775,16 +1897,18 @@ def _save_combined_convergence_figure(
                 r_offdiag=float(corr_llr[j]),
             )
 
-    gs_loss = gs0[loss_row, :].subgridspec(2, n_loss_cols)
-    axes_loss = np.empty((2, n_loss_cols), dtype=object)
-    row0_ylabel = "score / posterior loss"
-    row1_ylabel = "prior loss"
+    gs_loss = gs0[loss_row, :].subgridspec(n_loss_rows, n_loss_cols)
+    axes_loss = np.empty((n_loss_rows, n_loss_cols), dtype=object)
+    row0_ylabel = "score / posterior loss" if not want_ft else "posterior FM loss"
+    row1_ylabel = "prior loss" if not want_ft else "prior FM loss"
+    row2_ylabel = "posterior NLL fine-tune"
+    row3_ylabel = "prior NLL fine-tune"
     for j, n in enumerate(ns):
         path = os.path.join(loss_dir, f"n_{int(n):06d}.npz")
-        axes_loss[0, j] = fig.add_subplot(gs_loss[0, j])
-        axes_loss[1, j] = fig.add_subplot(gs_loss[1, j])
+        for r in range(n_loss_rows):
+            axes_loss[r, j] = fig.add_subplot(gs_loss[r, j])
         if not os.path.isfile(path):
-            for r in (0, 1):
+            for r in range(n_loss_rows):
                 axes_loss[r, j].text(
                     0.5,
                     0.5,
@@ -1800,7 +1924,7 @@ def _save_combined_convergence_figure(
         try:
             bundle = _load_per_n_training_loss_npz(path)
         except Exception as e:
-            for r in (0, 1):
+            for r in range(n_loss_rows):
                 axes_loss[r, j].text(
                     0.5,
                     0.5,
@@ -1858,6 +1982,72 @@ def _save_combined_convergence_figure(
                 fontsize=10,
             )
             axes_loss[1, j].set_axis_off()
+
+        if want_ft:
+            if _bundle_has_any_likelihood_finetune(bundle):
+                _plot_loss_triplet(
+                    axes_loss[2, j],
+                    bundle["score_likelihood_finetune_train_losses"],
+                    bundle["score_likelihood_finetune_val_losses"],
+                    bundle["score_likelihood_finetune_val_monitor_losses"],
+                    ylabel=row2_ylabel if j == 0 else "",
+                    title=None,
+                    show_legend=(j == 0),
+                    score_like=True,
+                )
+            else:
+                axes_loss[2, j].text(
+                    0.5,
+                    0.5,
+                    "no NLL fine-tune\nin this run",
+                    ha="center",
+                    va="center",
+                    transform=axes_loss[2, j].transAxes,
+                    fontsize=8,
+                    color="#555555",
+                )
+                axes_loss[2, j].set_axis_off()
+
+            if bundle["prior_enable"]:
+                if (
+                    np.asarray(bundle["prior_likelihood_finetune_train_losses"], dtype=np.float64).size > 0
+                    or np.asarray(bundle["prior_likelihood_finetune_val_losses"], dtype=np.float64).size > 0
+                    or np.asarray(bundle["prior_likelihood_finetune_val_monitor_losses"], dtype=np.float64).size
+                    > 0
+                ):
+                    _plot_loss_triplet(
+                        axes_loss[3, j],
+                        bundle["prior_likelihood_finetune_train_losses"],
+                        bundle["prior_likelihood_finetune_val_losses"],
+                        bundle["prior_likelihood_finetune_val_monitor_losses"],
+                        ylabel=row3_ylabel if j == 0 else "",
+                        title=None,
+                        show_legend=(j == 0),
+                        score_like=False,
+                    )
+                else:
+                    axes_loss[3, j].text(
+                        0.5,
+                        0.5,
+                        "no prior NLL\nfine-tune data",
+                        ha="center",
+                        va="center",
+                        transform=axes_loss[3, j].transAxes,
+                        fontsize=8,
+                        color="#555555",
+                    )
+                    axes_loss[3, j].set_axis_off()
+            else:
+                axes_loss[3, j].text(
+                    0.5,
+                    0.5,
+                    "prior disabled",
+                    ha="center",
+                    va="center",
+                    transform=axes_loss[3, j].transAxes,
+                    fontsize=10,
+                )
+                axes_loss[3, j].set_axis_off()
 
     diag_row = 4 if use_llr else 3
     gs_diag = gs0[diag_row, :].subgridspec(1, max(1, len(ns)))

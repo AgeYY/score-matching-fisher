@@ -256,6 +256,49 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--flow-batch-size", type=int, default=256)
     p.add_argument("--flow-lr", type=float, default=1e-3)
     p.add_argument(
+        "--flow-likelihood-finetune-epochs",
+        type=int,
+        default=0,
+        help=(
+            "theta_flow only: optional second-stage fine-tune epochs that minimize ODE "
+            "negative log likelihood after flow-matching pretraining. Default 0 disables. "
+            "Maximum allowed value is 2000."
+        ),
+    )
+    p.add_argument(
+        "--flow-likelihood-finetune-lr",
+        type=float,
+        default=1e-4,
+        help="theta_flow NLL fine-tune learning rate.",
+    )
+    p.add_argument(
+        "--flow-likelihood-finetune-batch-size",
+        type=int,
+        default=0,
+        help="theta_flow NLL fine-tune batch size; <=0 inherits --flow-batch-size.",
+    )
+    p.add_argument(
+        "--flow-likelihood-finetune-ode-steps",
+        type=int,
+        default=64,
+        help="theta_flow NLL fine-tune midpoint ODE steps for likelihood integration.",
+    )
+    p.add_argument(
+        "--flow-likelihood-finetune-exact-divergence",
+        action="store_true",
+        default=True,
+        help="theta_flow NLL fine-tune uses exact divergence (currently required and enabled by default).",
+    )
+    p.add_argument(
+        "--no-flow-likelihood-finetune-exact-divergence",
+        action="store_false",
+        dest="flow_likelihood_finetune_exact_divergence",
+        help="Disable exact divergence for theta_flow NLL fine-tune (currently unsupported; validation rejects).",
+    )
+    p.add_argument("--flow-likelihood-finetune-patience", type=int, default=100)
+    p.add_argument("--flow-likelihood-finetune-min-delta", type=float, default=1e-4)
+    p.add_argument("--flow-likelihood-finetune-ema-alpha", type=float, default=0.05)
+    p.add_argument(
         "--flow-endpoint-loss-weight",
         type=float,
         default=0.0,
