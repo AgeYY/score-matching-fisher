@@ -118,7 +118,7 @@ from fisher.trainers import (
     train_score_model,
     train_score_model_ncsm_continuous,
 )
-from fisher.theta_gaussian_scaffold import ThetaGaussianScaffold
+from fisher.theta_gaussian_scaffold import ThetaDiscreteScaffold, ThetaGaussianScaffold
 
 
 def require_device(name: str) -> torch.device:
@@ -129,7 +129,14 @@ def require_device(name: str) -> torch.device:
 
 def normalize_theta_field_method(method: str) -> str:
     m = str(method).strip().lower()
-    if m in ("theta_flow", "theta_flow_gaussian_scaffold", "theta_path_integral", "x_flow", "ctsm_v"):
+    if m in (
+        "theta_flow",
+        "theta_flow_gaussian_scaffold",
+        "theta_flow_discrete_scaffold",
+        "theta_path_integral",
+        "x_flow",
+        "ctsm_v",
+    ):
         return m
     legacy_names = (
         "flow",
@@ -140,12 +147,14 @@ def normalize_theta_field_method(method: str) -> str:
     if m in legacy_names:
         raise ValueError(
             "Legacy --theta-field-method is removed. Use one of "
-            "{'theta_flow', 'theta_flow_gaussian_scaffold', 'theta_path_integral', 'x_flow', 'ctsm_v'}. "
+            "{'theta_flow', 'theta_flow_gaussian_scaffold', 'theta_flow_discrete_scaffold', "
+            "'theta_path_integral', 'x_flow', 'ctsm_v'}. "
             "theta_flow = theta-space flow ODE log-likelihood Bayes ratios; "
             "theta_path_integral = velocity-to-score plus trapezoid integral along sorted theta."
         )
     raise ValueError(
-        "--theta-field-method must be one of {'theta_flow','theta_flow_gaussian_scaffold','theta_path_integral','x_flow','ctsm_v'}."
+        "--theta-field-method must be one of {'theta_flow','theta_flow_gaussian_scaffold',"
+        "'theta_flow_discrete_scaffold','theta_path_integral','x_flow','ctsm_v'}."
     )
 
 
@@ -1109,29 +1118,32 @@ def validate_estimation_args(args: Any) -> None:
         raise ValueError("--flow-likelihood-finetune-exact-divergence is currently required.")
     if bool(getattr(args, "theta_flow_posterior_only_likelihood", False)) and _tfm_val != "theta_flow":
         raise ValueError("--theta-flow-posterior-only-likelihood requires --theta-field-method theta_flow.")
-    if _tfm_val == "theta_flow_gaussian_scaffold":
+    if _tfm_val in ("theta_flow_gaussian_scaffold", "theta_flow_discrete_scaffold"):
         _scaffold_bins = int(getattr(args, "theta_gaussian_scaffold_bin_n_bins", 10))
         _scaffold_components = int(getattr(args, "theta_gaussian_scaffold_n_components", 3))
         if _scaffold_bins < 1:
             raise ValueError("--theta-gaussian-scaffold-bin-n-bins must be >= 1.")
-        if int(getattr(args, "theta_gaussian_scaffold_grid_size", 512)) < 8:
+        if _tfm_val == "theta_flow_gaussian_scaffold" and int(getattr(args, "theta_gaussian_scaffold_grid_size", 512)) < 8:
             raise ValueError("--theta-gaussian-scaffold-grid-size must be >= 8.")
-        if _scaffold_components < 1:
+        if _tfm_val == "theta_flow_gaussian_scaffold" and _scaffold_components < 1:
             raise ValueError("--theta-gaussian-scaffold-n-components must be >= 1.")
-        if _scaffold_components > _scaffold_bins:
+        if _tfm_val == "theta_flow_gaussian_scaffold" and _scaffold_components > _scaffold_bins:
             raise ValueError("--theta-gaussian-scaffold-n-components must be <= --theta-gaussian-scaffold-bin-n-bins.")
-        if int(getattr(args, "theta_gaussian_scaffold_em_steps", 20)) < 1:
+        if _tfm_val == "theta_flow_gaussian_scaffold" and int(getattr(args, "theta_gaussian_scaffold_em_steps", 20)) < 1:
             raise ValueError("--theta-gaussian-scaffold-em-steps must be >= 1.")
         if float(getattr(args, "theta_gaussian_scaffold_variance_floor", 1e-6)) <= 0.0:
             raise ValueError("--theta-gaussian-scaffold-variance-floor must be positive.")
-        if float(getattr(args, "theta_gaussian_scaffold_min_branch_mass", 1e-4)) < 0.0:
+        if _tfm_val == "theta_flow_gaussian_scaffold" and float(getattr(args, "theta_gaussian_scaffold_min_branch_mass", 1e-4)) < 0.0:
             raise ValueError("--theta-gaussian-scaffold-min-branch-mass must be >= 0.")
         if float(getattr(args, "theta_gaussian_scaffold_source_eps", 1e-6)) < 0.0:
             raise ValueError("--theta-gaussian-scaffold-source-eps must be >= 0.")
     if float(getattr(args, "flow_endpoint_loss_weight", 0.0)) < 0.0:
         raise ValueError("--flow-endpoint-loss-weight must be non-negative.")
-    if _tfm_val == "theta_flow_gaussian_scaffold" and float(getattr(args, "flow_endpoint_loss_weight", 0.0)) > 0.0:
-        raise ValueError("--flow-endpoint-loss-weight is not supported with theta_flow_gaussian_scaffold.")
+    if _tfm_val in ("theta_flow_gaussian_scaffold", "theta_flow_discrete_scaffold") and float(getattr(args, "flow_endpoint_loss_weight", 0.0)) > 0.0:
+        raise ValueError(
+            "--flow-endpoint-loss-weight is not supported with theta_flow_gaussian_scaffold "
+            "or theta_flow_discrete_scaffold."
+        )
     if int(getattr(args, "flow_endpoint_steps", 20)) < 1:
         raise ValueError("--flow-endpoint-steps must be >= 1.")
     if int(getattr(args, "flow_early_patience", 1)) < 1:
@@ -1195,7 +1207,7 @@ def validate_estimation_args(args: Any) -> None:
     _ft_prior_omega_mode = str(getattr(args, "flow_prior_theta_fourier_omega_mode", "theta_range")).strip().lower()
     _ft_prior_inc_lin = not bool(getattr(args, "flow_prior_theta_fourier_no_linear", False))
     _ft_prior_inc_bias = not bool(getattr(args, "flow_prior_theta_fourier_no_bias", False))
-    if _tfm_val in ("theta_flow", "theta_flow_gaussian_scaffold", "theta_path_integral") and _arch == "film_fourier":
+    if _tfm_val in ("theta_flow", "theta_flow_gaussian_scaffold", "theta_flow_discrete_scaffold", "theta_path_integral") and _arch == "film_fourier":
         if _ft_post_k < 0:
             raise ValueError("--flow-theta-fourier-k must be >= 0.")
         if _ft_post_omega_mode not in ("fixed", "theta_range"):
@@ -1218,10 +1230,10 @@ def validate_estimation_args(args: Any) -> None:
         _tf_dim_post = (1 if _ft_post_inc_bias else 0) + (1 if _ft_post_inc_lin else 0) + 2 * _ft_post_k
         if _tf_dim_post < 1:
             raise ValueError(
-                "theta_flow / theta_flow_gaussian_scaffold / theta_path_integral film_fourier (posterior): theta feature dim is 0. Use "
+                "theta_flow / theta_flow_gaussian_scaffold / theta_flow_discrete_scaffold / theta_path_integral film_fourier (posterior): theta feature dim is 0. Use "
                 "--flow-theta-fourier-k >= 1 or keep linear/bias features enabled."
             )
-    if _tfm_val in ("theta_flow", "theta_flow_gaussian_scaffold", "theta_path_integral") and _arch == "film_fourier":
+    if _tfm_val in ("theta_flow", "theta_flow_gaussian_scaffold", "theta_flow_discrete_scaffold", "theta_path_integral") and _arch == "film_fourier":
         if _ft_prior_k < 0:
             raise ValueError("--flow-prior-theta-fourier-k must be >= 0.")
         if _ft_prior_omega_mode not in ("fixed", "theta_range"):
@@ -1244,19 +1256,19 @@ def validate_estimation_args(args: Any) -> None:
         _tf_dim_prior = (1 if _ft_prior_inc_bias else 0) + (1 if _ft_prior_inc_lin else 0) + 2 * _ft_prior_k
         if _tf_dim_prior < 1:
             raise ValueError(
-                "theta_flow / theta_flow_gaussian_scaffold / theta_path_integral film_fourier (prior): theta feature dim is 0. Use "
+                "theta_flow / theta_flow_gaussian_scaffold / theta_flow_discrete_scaffold / theta_path_integral film_fourier (prior): theta feature dim is 0. Use "
                 "--flow-prior-theta-fourier-k >= 1 or keep linear/bias features enabled."
             )
     if (
         bool(getattr(args, "compute_h_matrix", False))
         and not bool(getattr(args, "prior_enable", True))
-        and _tfm_val != "x_flow"
+        and _tfm_val not in ("x_flow", "theta_flow_discrete_scaffold")
     ):
         raise ValueError("--compute-h-matrix requires prior score; do not use --no-prior-score.")
     if bool(getattr(args, "skip_shared_fisher_gt_compare", False)):
         if not bool(getattr(args, "compute_h_matrix", False)):
             raise ValueError("--skip-shared-fisher-gt-compare requires --compute-h-matrix.")
-        if not bool(getattr(args, "prior_enable", True)) and _tfm_val != "x_flow":
+        if not bool(getattr(args, "prior_enable", True)) and _tfm_val not in ("x_flow", "theta_flow_discrete_scaffold"):
             raise ValueError("--skip-shared-fisher-gt-compare requires prior score; do not use --no-prior-score.")
     if int(getattr(args, "ctsm_epochs", 1)) < 1:
         raise ValueError("--ctsm-epochs must be >= 1.")
@@ -2156,11 +2168,13 @@ def run_shared_fisher_estimation(
         print(f"[training_losses] saved {tnpz}")
         return
 
-    if theta_field_method in ("theta_flow", "theta_flow_gaussian_scaffold", "theta_path_integral"):
+    if theta_field_method in ("theta_flow", "theta_flow_gaussian_scaffold", "theta_flow_discrete_scaffold", "theta_path_integral"):
         theta_flow_posterior_only = (
             theta_field_method == "theta_flow"
             and bool(getattr(args, "theta_flow_posterior_only_likelihood", False))
         )
+        theta_flow_uniform_prior = theta_field_method == "theta_flow_discrete_scaffold"
+        theta_flow_skip_prior = theta_flow_posterior_only or theta_flow_uniform_prior
         if not bool(getattr(args, "prior_enable", True)):
             if theta_field_method == "theta_path_integral":
                 raise ValueError("theta_path_integral currently requires prior model enabled.")
@@ -2192,8 +2206,8 @@ def run_shared_fisher_estimation(
                     "--theta-flow-onehot-state expects theta dimension >= 2 after preprocessing; "
                     f"got theta_dim={theta_dim_flow}."
                 )
-        if theta_field_method == "theta_flow_gaussian_scaffold" and theta_dim_flow != 1:
-            raise ValueError("theta_flow_gaussian_scaffold v1 requires scalar theta.")
+        if theta_field_method in ("theta_flow_gaussian_scaffold", "theta_flow_discrete_scaffold") and theta_dim_flow != 1:
+            raise ValueError(f"{theta_field_method} v1 requires scalar theta.")
         theta_repr = f"one_hot[{theta_dim_flow}]" if theta_onehot_state else ("scalar" if theta_dim_flow == 1 else f"vector[{theta_dim_flow}]")
         print(
             f"[{theta_field_method}] "
@@ -2252,6 +2266,9 @@ def run_shared_fisher_estimation(
             f"{_xf_post}{_xf_prior}"
         )
         theta_gaussian_scaffold: ThetaGaussianScaffold | None = None
+        theta_discrete_scaffold: ThetaDiscreteScaffold | None = None
+        theta_flow_fit = theta_score_fit
+        theta_flow_val = theta_score_val
         if theta_field_method == "theta_flow_gaussian_scaffold":
             theta_gaussian_scaffold = ThetaGaussianScaffold.fit(
                 theta_train=theta_score_fit,
@@ -2274,6 +2291,27 @@ def run_shared_fisher_estimation(
                 f"components={int(getattr(args, 'theta_gaussian_scaffold_n_components', 3))} "
                 f"em_steps={int(getattr(args, 'theta_gaussian_scaffold_em_steps', 20))} "
                 f"var_floor={float(getattr(args, 'theta_gaussian_scaffold_variance_floor', 1e-6)):.6g}",
+                flush=True,
+            )
+        elif theta_field_method == "theta_flow_discrete_scaffold":
+            theta_discrete_scaffold = ThetaDiscreteScaffold.fit(
+                theta_train=theta_score_fit,
+                x_train=x_score_fit,
+                n_bins=int(getattr(args, "theta_gaussian_scaffold_bin_n_bins", 10)),
+                variance_floor=float(getattr(args, "theta_gaussian_scaffold_variance_floor", 1e-6)),
+                source_eps=float(getattr(args, "theta_gaussian_scaffold_source_eps", 0.0)),
+                theta_low=float(getattr(args, "theta_low", np.min(theta_score_fit))),
+                theta_high=float(getattr(args, "theta_high", np.max(theta_score_fit))),
+            )
+            theta_flow_fit = theta_discrete_scaffold.discretize_theta_np(theta_score_fit)
+            theta_flow_val = theta_discrete_scaffold.discretize_theta_np(theta_score_val)
+            scaffold_path = os.path.join(args.output_dir, "theta_discrete_scaffold.npz")
+            np.savez_compressed(scaffold_path, **theta_discrete_scaffold.to_npz_payload())
+            print(
+                "[theta_discrete_scaffold] "
+                f"saved={scaffold_path} bins={int(getattr(args, 'theta_gaussian_scaffold_bin_n_bins', 10))} "
+                f"var_floor={float(getattr(args, 'theta_gaussian_scaffold_variance_floor', 1e-6)):.6g} "
+                "source=q0_bin_centers prior=uniform_constant",
                 flush=True,
             )
 
@@ -2377,14 +2415,14 @@ def run_shared_fisher_estimation(
             )
         post_train_out = train_conditional_theta_flow_model(
             model=post_model,
-            theta_train=theta_score_fit,
+            theta_train=theta_flow_fit,
             x_train=x_score_fit,
             epochs=_fm_epochs,
             batch_size=int(getattr(args, "flow_batch_size", 256)),
             lr=float(getattr(args, "flow_lr", 1e-3)),
             device=device,
             log_every=max(1, args.log_every),
-            theta_val=theta_score_val,
+            theta_val=theta_flow_val,
             x_val=x_score_val,
             early_stopping_patience=int(getattr(args, "flow_early_patience", 1000)),
             early_stopping_min_delta=float(getattr(args, "flow_early_min_delta", 1e-4)),
@@ -2397,7 +2435,7 @@ def run_shared_fisher_estimation(
                 else 0.0
             ),
             endpoint_ode_steps=int(getattr(args, "flow_endpoint_steps", 20)),
-            source_sampler=theta_gaussian_scaffold,
+            source_sampler=theta_discrete_scaffold if theta_discrete_scaffold is not None else theta_gaussian_scaffold,
         )
         post_train_losses = np.asarray(post_train_out["train_losses"], dtype=np.float64)
         post_val_losses = np.asarray(post_train_out["val_losses"], dtype=np.float64)
@@ -2483,7 +2521,7 @@ def run_shared_fisher_estimation(
         prior_model_flow: Any
         prior_ckpt_hparams: dict[str, Any]
         prior_train_out: dict[str, Any]
-        if not theta_flow_posterior_only:
+        if not theta_flow_skip_prior:
             if flow_prior_arch == "mlp":
                 prior_ckpt_hparams = {
                     "hidden_dim": int(getattr(args, "prior_hidden_dim", 128)),
@@ -2637,11 +2675,18 @@ def run_shared_fisher_estimation(
             plt.savefig(prior_loss_fig, dpi=180)
             plt.close()
         else:
-            print(
-                "[theta_flow] posterior-only likelihood: skipping prior flow construction, training, "
-                "NLL fine-tune, loss figure, and checkpoint.",
-                flush=True,
-            )
+            if theta_flow_uniform_prior:
+                print(
+                    "[theta_flow_discrete_scaffold] uniform prior constant: skipping prior flow construction, "
+                    "training, NLL fine-tune, loss figure, checkpoint, and prior ODE likelihood.",
+                    flush=True,
+                )
+            else:
+                print(
+                    "[theta_flow] posterior-only likelihood: skipping prior flow construction, training, "
+                    "NLL fine-tune, loss figure, and checkpoint.",
+                    flush=True,
+                )
             prior_model_flow = None
             prior_ckpt_hparams = {}
             prior_train_out = {}
@@ -2669,7 +2714,7 @@ def run_shared_fisher_estimation(
             model_hparams=post_ckpt_hparams,
             args=args,
         )
-        if not theta_flow_posterior_only:
+        if not theta_flow_skip_prior:
             prior_ckpt_path = _save_theta_flow_model_checkpoint(
                 output_dir=args.output_dir,
                 filename="theta_flow_prior_checkpoint.pt",
@@ -2688,18 +2733,23 @@ def run_shared_fisher_estimation(
         if prior_ckpt_path:
             print(f"[theta_flow_ckpt] saved prior checkpoint: {prior_ckpt_path}")
         else:
-            print("[theta_flow_ckpt] prior checkpoint skipped (posterior-only likelihood mode).")
+            skip_reason = "uniform prior constant" if theta_flow_uniform_prior else "posterior-only likelihood mode"
+            print(f"[theta_flow_ckpt] prior checkpoint skipped ({skip_reason}).")
 
         # H matrix: full per-run pool (train ∪ validation); fitting stays on train split with val early stop.
-        theta_h_matrix = np.asarray(theta_all, dtype=np.float64)
+        theta_h_matrix = (
+            theta_discrete_scaffold.discretize_theta_np(theta_all)
+            if theta_discrete_scaffold is not None
+            else np.asarray(theta_all, dtype=np.float64)
+        )
         x_h_matrix = np.asarray(x_all, dtype=np.float64)
 
         h_result: HMatrixResult | None = None
         if bool(getattr(args, "compute_h_matrix", False)):
             h_eval = flow_eval_t
             _h_field = (
-                "theta_flow_gaussian_scaffold"
-                if theta_field_method == "theta_flow_gaussian_scaffold"
+                theta_field_method
+                if theta_field_method in ("theta_flow_gaussian_scaffold", "theta_flow_discrete_scaffold")
                 else ("theta_flow" if theta_field_method == "theta_flow" else "theta_path_integral")
             )
             _post_only = bool(getattr(args, "theta_flow_posterior_only_likelihood", False))
@@ -2724,7 +2774,7 @@ def run_shared_fisher_estimation(
                 flow_scheduler=str(getattr(args, "flow_scheduler", "cosine")),
                 theta_flow_posterior_only_likelihood=_post_only,
                 flow_likelihood_exact_divergence=_flow_ex_div,
-                theta_gaussian_scaffold=theta_gaussian_scaffold,
+                theta_gaussian_scaffold=theta_discrete_scaffold if theta_discrete_scaffold is not None else theta_gaussian_scaffold,
             )
             h_result = h_estimator.run(
                 theta=theta_h_matrix,
@@ -2756,6 +2806,12 @@ def run_shared_fisher_estimation(
                     "conditional theta-flow posterior ODE likelihood uses k-Gaussian posterior-mixture scaffold base, "
                     "then subtracts learned prior flow log p(theta))."
                 )
+            elif theta_field_method == "theta_flow_discrete_scaffold":
+                print(
+                    "[summary] theta_flow_discrete_scaffold mode completed (H-matrix only path; "
+                    "conditional theta-flow posterior ODE likelihood uses discrete q0 bin scaffold base, "
+                    "and the prior is treated as a uniform constant)."
+                )
             else:
                 print(
                     "[summary] theta_path_integral mode completed (H-matrix only path; "
@@ -2777,8 +2833,8 @@ def run_shared_fisher_estimation(
             tnpz = _save_dsm_score_prior_training_losses_npz(
                 args.output_dir,
                 theta_all=theta_all,
-                theta_score_fit=theta_score_fit,
-                theta_score_val=theta_score_val,
+                theta_score_fit=theta_flow_fit,
+                theta_score_val=theta_flow_val,
                 score_split="dataset_train_validation",
                 score_train_losses=post_train_losses,
                 score_val_losses=post_val_losses,
@@ -2787,7 +2843,7 @@ def run_shared_fisher_estimation(
                 score_stopped_epoch=post_stopped_epoch,
                 score_stopped_early=post_stopped_early,
                 score_best_val_loss=post_best_val_loss,
-                prior_enable=not theta_flow_posterior_only,
+                prior_enable=not theta_flow_skip_prior,
                 prior_train_losses=prior_train_losses,
                 prior_val_losses=prior_val_losses,
                 prior_val_monitor_losses=prior_val_monitor_losses,
@@ -2818,7 +2874,7 @@ def run_shared_fisher_estimation(
                 theta_field_method=theta_field_method,
                 theta_gaussian_scaffold_bin_n_bins=(
                     int(getattr(args, "theta_gaussian_scaffold_bin_n_bins", 10))
-                    if theta_field_method == "theta_flow_gaussian_scaffold"
+                    if theta_field_method in ("theta_flow_gaussian_scaffold", "theta_flow_discrete_scaffold")
                     else 0
                 ),
                 theta_gaussian_scaffold_grid_size=(
@@ -2838,7 +2894,7 @@ def run_shared_fisher_estimation(
                 ),
                 theta_gaussian_scaffold_variance_floor=(
                     float(getattr(args, "theta_gaussian_scaffold_variance_floor", 1e-6))
-                    if theta_field_method == "theta_flow_gaussian_scaffold"
+                    if theta_field_method in ("theta_flow_gaussian_scaffold", "theta_flow_discrete_scaffold")
                     else float("nan")
                 ),
                 theta_gaussian_scaffold_min_branch_mass=(
@@ -2848,7 +2904,7 @@ def run_shared_fisher_estimation(
                 ),
                 theta_gaussian_scaffold_source_eps=(
                     float(getattr(args, "theta_gaussian_scaffold_source_eps", 1e-6))
-                    if theta_field_method == "theta_flow_gaussian_scaffold"
+                    if theta_field_method in ("theta_flow_gaussian_scaffold", "theta_flow_discrete_scaffold")
                     else float("nan")
                 ),
             )
@@ -2856,7 +2912,8 @@ def run_shared_fisher_estimation(
             return
 
         raise RuntimeError(
-            "theta_flow, theta_flow_gaussian_scaffold, and theta_path_integral require --compute-h-matrix to produce output artifacts."
+            "theta_flow, theta_flow_gaussian_scaffold, theta_flow_discrete_scaffold, "
+            "and theta_path_integral require --compute-h-matrix to produce output artifacts."
         )
 
     theta_std = float(np.std(theta_score_fit))

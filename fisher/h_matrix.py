@@ -29,7 +29,7 @@ from fisher.models import (
     PriorThetaFlowVelocityFiLMPerLayer,
     PriorThetaFlowVelocityThetaFourierMLP,
 )
-from fisher.theta_gaussian_scaffold import ThetaGaussianScaffold
+from fisher.theta_gaussian_scaffold import ThetaDiscreteScaffold, ThetaGaussianScaffold
 
 
 @dataclass
@@ -124,7 +124,7 @@ class HMatrixEstimator:
         ctsm_int_n_time: int = 300,
         ctsm_t_eps: float = 1e-5,
         theta_flow_posterior_only_likelihood: bool = False,
-        theta_gaussian_scaffold: ThetaGaussianScaffold | None = None,
+        theta_gaussian_scaffold: ThetaGaussianScaffold | ThetaDiscreteScaffold | None = None,
     ) -> None:
         if pair_batch_size < 1:
             raise ValueError("pair_batch_size must be >= 1.")
@@ -134,17 +134,32 @@ class HMatrixEstimator:
         self.device = device
         self.pair_batch_size = int(pair_batch_size)
         method = str(field_method).strip().lower()
-        if method not in ("dsm", "theta_path_integral", "theta_flow", "theta_flow_gaussian_scaffold", "flow_x_likelihood", "ctsm_v"):
+        if method not in (
+            "dsm",
+            "theta_path_integral",
+            "theta_flow",
+            "theta_flow_gaussian_scaffold",
+            "theta_flow_discrete_scaffold",
+            "flow_x_likelihood",
+            "ctsm_v",
+        ):
             raise ValueError(
                 "field_method must be one of "
-                "{'dsm', 'theta_path_integral', 'theta_flow', 'theta_flow_gaussian_scaffold', 'flow_x_likelihood', 'ctsm_v'}."
+                "{'dsm', 'theta_path_integral', 'theta_flow', 'theta_flow_gaussian_scaffold', "
+                "'theta_flow_discrete_scaffold', 'flow_x_likelihood', 'ctsm_v'}."
             )
         self.theta_flow_posterior_only_likelihood = bool(theta_flow_posterior_only_likelihood)
         if self.theta_flow_posterior_only_likelihood and method != "theta_flow":
             raise ValueError("theta_flow_posterior_only_likelihood is only valid for field_method='theta_flow'.")
         if method == "dsm" and sigma_eval <= 0.0:
             raise ValueError("sigma_eval must be positive for DSM mode.")
-        if method in ("theta_path_integral", "theta_flow", "theta_flow_gaussian_scaffold", "flow_x_likelihood") and not (0.0 <= sigma_eval <= 1.0):
+        if method in (
+            "theta_path_integral",
+            "theta_flow",
+            "theta_flow_gaussian_scaffold",
+            "theta_flow_discrete_scaffold",
+            "flow_x_likelihood",
+        ) and not (0.0 <= sigma_eval <= 1.0):
             raise ValueError("For flow-based methods, t_eval (passed via sigma_eval) must be in [0, 1].")
         if int(flow_ode_steps) < 2:
             raise ValueError("flow_ode_steps must be >= 2.")
@@ -182,7 +197,9 @@ class HMatrixEstimator:
                 )
         elif method == "theta_flow_gaussian_scaffold" and theta_gaussian_scaffold is None:
             raise ValueError("theta_flow_gaussian_scaffold requires theta_gaussian_scaffold.")
-        elif model_prior is None:
+        elif method == "theta_flow_discrete_scaffold" and theta_gaussian_scaffold is None:
+            raise ValueError("theta_flow_discrete_scaffold requires theta_gaussian_scaffold.")
+        elif model_prior is None and method != "theta_flow_discrete_scaffold":
             raise ValueError(f"field_method={method!r} requires a non-None model_prior.")
         self.field_method = method
         self.theta_gaussian_scaffold = theta_gaussian_scaffold
@@ -199,7 +216,12 @@ class HMatrixEstimator:
         self.flow_likelihood_method = "midpoint"
         self._flow_path = (
             _make_flow_matching_path(self.flow_scheduler)
-            if self.field_method in ("theta_path_integral", "theta_flow", "theta_flow_gaussian_scaffold")
+            if self.field_method in (
+                "theta_path_integral",
+                "theta_flow",
+                "theta_flow_gaussian_scaffold",
+                "theta_flow_discrete_scaffold",
+            )
             else None
         )
         self._flow_likelihood_solver_post = None
@@ -208,9 +230,9 @@ class HMatrixEstimator:
         self._theta_flow_log_post_matrix: np.ndarray | None = None
         self._theta_flow_log_prior_matrix: np.ndarray | None = None
         self._theta_flow_log_base_matrix: np.ndarray | None = None
-        if self.field_method in ("theta_flow", "theta_flow_gaussian_scaffold"):
+        if self.field_method in ("theta_flow", "theta_flow_gaussian_scaffold", "theta_flow_discrete_scaffold"):
             self._flow_likelihood_solver_post = _make_flow_ode_solver(self._post_velocity_for_likelihood)
-            if not self.theta_flow_posterior_only_likelihood:
+            if not self.theta_flow_posterior_only_likelihood and self.field_method != "theta_flow_discrete_scaffold":
                 self._flow_likelihood_solver_prior = _make_flow_ode_solver(self._prior_velocity_for_likelihood)
         if self.field_method == "flow_x_likelihood":
             self._flow_x_likelihood_solver = _make_flow_ode_solver(self._x_post_velocity_for_likelihood)
@@ -445,9 +467,9 @@ class HMatrixEstimator:
         x_cond: torch.Tensor,
     ) -> tuple[np.ndarray, np.ndarray]:
         if self.theta_gaussian_scaffold is None:
-            raise RuntimeError("theta_flow_gaussian_scaffold requires a fitted scaffold.")
+            raise RuntimeError(f"{self.field_method} requires a fitted scaffold.")
         if theta_target.ndim != 2 or int(theta_target.shape[1]) != 1:
-            raise ValueError("theta_flow_gaussian_scaffold likelihood requires scalar theta.")
+            raise ValueError(f"{self.field_method} likelihood requires scalar theta.")
         steps = int(self.flow_ode_steps)
         step_dt = -1.0 / float(steps)
         theta_t = theta_target.detach()
@@ -465,7 +487,7 @@ class HMatrixEstimator:
                 velocity = self.model_post(theta_req, x_cond, t_col)
                 v_flat = velocity.reshape(velocity.shape[0], -1)
                 if int(v_flat.shape[1]) != 1:
-                    raise ValueError("theta_flow_gaussian_scaffold likelihood requires scalar theta velocity.")
+                    raise ValueError(f"{self.field_method} likelihood requires scalar theta velocity.")
                 grad = torch.autograd.grad(
                     v_flat[:, 0].sum(),
                     theta_req,
@@ -530,6 +552,36 @@ class HMatrixEstimator:
         self._theta_flow_log_prior_matrix = log_prior_matrix
         self._theta_flow_log_base_matrix = log_base_matrix
         return r
+
+    def compute_log_ratio_matrix_discrete_scaffold(self, theta_sorted: np.ndarray, x_sorted: np.ndarray) -> np.ndarray:
+        """Estimate log p_phi(theta_j|x_i) with a discrete q0 base and a constant uniform prior."""
+        theta_grid_col = self._theta_as_matrix(theta_sorted)
+        if theta_grid_col.shape[1] != 1:
+            raise ValueError("theta_flow_discrete_scaffold requires scalar theta.")
+        n = int(theta_grid_col.shape[0])
+        if n < 1:
+            raise ValueError("Need at least one sample to compute H-matrix.")
+        row_block = max(1, int(self.pair_batch_size // n))
+        theta_grid_col = np.asarray(theta_grid_col, dtype=np.float32)
+        log_post_matrix = np.zeros((n, n), dtype=np.float64)
+        log_prior_matrix = np.zeros((n, n), dtype=np.float64)
+        log_base_matrix = np.zeros((n, n), dtype=np.float64)
+        self.model_post.eval()
+        for i0 in range(0, n, row_block):
+            i1 = min(n, i0 + row_block)
+            xb = np.asarray(x_sorted[i0:i1], dtype=np.float32)
+            b = int(i1 - i0)
+            theta_tile = np.tile(theta_grid_col, (b, 1))
+            x_rep = np.repeat(xb, repeats=n, axis=0)
+            theta_t = torch.from_numpy(theta_tile).to(self.device)
+            x_t = torch.from_numpy(x_rep).to(self.device)
+            log_post_np, log_base_np = self._conditional_theta_flow_log_density_scaffold(theta_t, x_t)
+            log_post_matrix[i0:i1, :] = log_post_np.reshape(b, n)
+            log_base_matrix[i0:i1, :] = log_base_np.reshape(b, n)
+        self._theta_flow_log_post_matrix = log_post_matrix
+        self._theta_flow_log_prior_matrix = log_prior_matrix
+        self._theta_flow_log_base_matrix = log_base_matrix
+        return log_post_matrix - log_prior_matrix
 
     def compute_x_conditional_loglik_matrix(self, theta_sorted: np.ndarray, x_sorted: np.ndarray) -> np.ndarray:
         """Estimate C_ij = log p(x_i | theta_j) via conditional x-flow ODE likelihood (one solver call per block)."""
@@ -662,6 +714,13 @@ class HMatrixEstimator:
             theta_flow_log_post_sorted = self._theta_flow_log_post_matrix
             theta_flow_log_prior_sorted = self._theta_flow_log_prior_matrix
             theta_flow_log_base_sorted = self._theta_flow_log_base_matrix
+        elif self.field_method == "theta_flow_discrete_scaffold":
+            c_sorted = self.compute_log_ratio_matrix_discrete_scaffold(theta_sorted, x_sorted)
+            delta_sorted = self.compute_delta_l(c_sorted)
+            g_sorted = np.zeros_like(c_sorted, dtype=np.float64)
+            theta_flow_log_post_sorted = self._theta_flow_log_post_matrix
+            theta_flow_log_prior_sorted = self._theta_flow_log_prior_matrix
+            theta_flow_log_base_sorted = self._theta_flow_log_base_matrix
         elif self.field_method == "flow_x_likelihood":
             c_sorted = self.compute_x_conditional_loglik_matrix(theta_sorted, x_sorted)
             delta_sorted = self.compute_delta_l(c_sorted)
@@ -741,7 +800,12 @@ class HMatrixEstimator:
                 if self.field_method == "theta_path_integral"
                 else (
                     "flow_ode_t_span"
-                    if self.field_method in ("theta_flow", "theta_flow_gaussian_scaffold", "flow_x_likelihood")
+                    if self.field_method in (
+                        "theta_flow",
+                        "theta_flow_gaussian_scaffold",
+                        "theta_flow_discrete_scaffold",
+                        "flow_x_likelihood",
+                    )
                     else ("ctsm_t_eps" if self.field_method == "ctsm_v" else "sigma_eval")
                 )
             ),
@@ -750,7 +814,13 @@ class HMatrixEstimator:
             h_sym_max_asym_abs=h_sym_max_asym_abs,
             flow_scheduler=(
                 self.flow_scheduler
-                if self.field_method in ("theta_path_integral", "theta_flow", "theta_flow_gaussian_scaffold", "flow_x_likelihood")
+                if self.field_method in (
+                    "theta_path_integral",
+                    "theta_flow",
+                    "theta_flow_gaussian_scaffold",
+                    "theta_flow_discrete_scaffold",
+                    "flow_x_likelihood",
+                )
                 else None
             ),
             flow_score_mode=(
@@ -762,7 +832,11 @@ class HMatrixEstimator:
                         if self.field_method == "theta_flow" and self.theta_flow_posterior_only_likelihood
                         else "direct_ode_likelihood"
                     )
-                    if self.field_method in ("theta_flow", "theta_flow_gaussian_scaffold")
+                    if self.field_method in (
+                        "theta_flow",
+                        "theta_flow_gaussian_scaffold",
+                        "theta_flow_discrete_scaffold",
+                    )
                     else (
                         "direct_ode_x_cond_likelihood"
                         if self.field_method == "flow_x_likelihood"

@@ -344,10 +344,29 @@ def hellinger_figure_labels(h_field_method: str) -> tuple[str, str, str]:
 def theta_for_h_matrix_alignment(bundle: SharedDatasetBundle, full_args: SimpleNamespace) -> np.ndarray:
     mode = str(getattr(full_args, "score_fisher_eval_data", "full"))
     if mode == "full":
-        return np.asarray(bundle.theta_all, dtype=np.float64).reshape(-1)
-    if mode == "score_eval":
-        return np.asarray(bundle.theta_eval, dtype=np.float64).reshape(-1)
-    raise ValueError(f"Unknown score_fisher_eval_data: {mode}")
+        th = np.asarray(bundle.theta_all, dtype=np.float64)
+    elif mode == "score_eval":
+        th = np.asarray(bundle.theta_eval, dtype=np.float64)
+    else:
+        raise ValueError(f"Unknown score_fisher_eval_data: {mode}")
+
+    tfm = str(getattr(full_args, "theta_field_method", "")).strip().lower()
+    if tfm == "theta_flow_discrete_scaffold":
+        from fisher.theta_gaussian_scaffold import ThetaDiscreteScaffold
+
+        out_dir = str(getattr(full_args, "output_dir", "") or "").strip()
+        if not out_dir:
+            raise ValueError(
+                "theta_flow_discrete_scaffold requires full_args.output_dir for theta_discrete_scaffold.npz"
+            )
+        scaffold_path = os.path.join(out_dir, "theta_discrete_scaffold.npz")
+        if not os.path.isfile(scaffold_path):
+            raise ValueError(f"Missing discrete scaffold artifact: {scaffold_path}")
+        sc = ThetaDiscreteScaffold.from_npz(scaffold_path)
+        out = sc.discretize_theta_np(th)
+        return np.asarray(out, dtype=np.float64).reshape(-1)
+
+    return np.asarray(th, dtype=np.float64).reshape(-1)
 
 
 def x_for_h_matrix_alignment(bundle: SharedDatasetBundle, full_args: SimpleNamespace) -> np.ndarray:

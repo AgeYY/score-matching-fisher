@@ -11,7 +11,7 @@ from fisher.cli_shared_fisher import add_estimation_arguments
 from fisher.models import ConditionalThetaFlowVelocity, PriorThetaFlowVelocity
 from fisher.h_matrix import HMatrixEstimator
 from fisher.shared_fisher_est import run_shared_fisher_estimation, validate_estimation_args
-from fisher.theta_gaussian_scaffold import ThetaGaussianScaffold
+from fisher.theta_gaussian_scaffold import ThetaDiscreteScaffold, ThetaGaussianScaffold
 from fisher.trainers import train_conditional_theta_flow_model
 
 
@@ -50,6 +50,82 @@ def test_scaffold_fit_q0_and_matched_sampling_are_finite() -> None:
     lp = scaffold.log_prob_np(samples, x[:5])
     assert lp.shape == (5,)
     assert np.isfinite(lp).all()
+
+
+def test_scaffold_likelihood_uses_global_residual_variance() -> None:
+    theta = np.asarray([-0.9, -0.7, 0.7, 0.9], dtype=np.float64).reshape(-1, 1)
+    x = np.asarray(
+        [
+            [0.0, 0.0],
+            [2.0, 4.0],
+            [10.0, 20.0],
+            [14.0, 24.0],
+        ],
+        dtype=np.float64,
+    )
+    scaffold = ThetaGaussianScaffold.fit(
+        theta_train=theta,
+        x_train=x,
+        n_bins=2,
+        grid_size=32,
+        n_components=1,
+        em_steps=2,
+        variance_floor=1e-6,
+        theta_low=-1.0,
+        theta_high=1.0,
+    )
+
+    expected_means = np.asarray([[1.0, 2.0], [12.0, 22.0]], dtype=np.float64)
+    residuals = np.asarray(
+        [
+            [-1.0, -2.0],
+            [1.0, 2.0],
+            [-2.0, -2.0],
+            [2.0, 2.0],
+        ],
+        dtype=np.float64,
+    )
+    expected_var = np.mean(residuals**2, axis=0)
+    np.testing.assert_allclose(scaffold.bin_means, expected_means)
+    np.testing.assert_allclose(scaffold.bin_vars, np.tile(expected_var, (2, 1)))
+
+
+def test_discrete_scaffold_samples_bin_centers_and_uses_piecewise_density() -> None:
+    theta = np.asarray([-0.9, -0.7, 0.7, 0.9], dtype=np.float64).reshape(-1, 1)
+    x = np.asarray(
+        [
+            [0.0, 0.0],
+            [2.0, 4.0],
+            [10.0, 20.0],
+            [14.0, 24.0],
+        ],
+        dtype=np.float64,
+    )
+    scaffold = ThetaDiscreteScaffold.fit(
+        theta_train=theta,
+        x_train=x,
+        n_bins=2,
+        variance_floor=1e-6,
+        theta_low=-1.0,
+        theta_high=1.0,
+    )
+
+    q, _ = scaffold.q0_bins(x[:2])
+    np.testing.assert_allclose(np.sum(q, axis=1), np.ones(2), rtol=1e-8, atol=1e-8)
+    samples, branch_ids = scaffold.sample_matched_np(theta[:4], x[:4], np.random.default_rng(0))
+    assert samples.shape == (4, 1)
+    assert branch_ids.shape == (4,)
+    assert set(np.unique(samples.reshape(-1))).issubset(set(scaffold.bin_centers.tolist()))
+    np.testing.assert_allclose(
+        scaffold.discretize_theta_np(np.asarray([-0.9, 0.9]).reshape(-1, 1)).reshape(-1),
+        scaffold.bin_centers,
+    )
+
+    probe_theta = np.asarray([-0.9, 0.9], dtype=np.float64).reshape(-1, 1)
+    probe_x = np.repeat(x[:1], repeats=2, axis=0)
+    q_probe, _ = scaffold.q0_bins(probe_x)
+    expected = np.log(q_probe[np.arange(2), [0, 1]]) - np.log(scaffold.bin_widths[[0, 1]])
+    np.testing.assert_allclose(scaffold.log_prob_np(probe_theta, probe_x), expected)
 
 
 def test_train_conditional_theta_flow_uses_scaffold_source_sampler() -> None:
@@ -120,6 +196,39 @@ def test_h_matrix_gaussian_scaffold_uses_base_log_prob() -> None:
     assert np.isfinite(out.h_sym).all()
 
 
+def test_h_matrix_discrete_scaffold_uses_constant_prior() -> None:
+    theta = np.linspace(-1.0, 1.0, 6, dtype=np.float64).reshape(-1, 1)
+    x = np.concatenate([np.cos(theta), np.sin(theta)], axis=1).astype(np.float64)
+    scaffold = ThetaDiscreteScaffold.fit(
+        theta_train=theta,
+        x_train=x,
+        n_bins=3,
+        theta_low=-1.0,
+        theta_high=1.0,
+    )
+    theta_disc = scaffold.discretize_theta_np(theta)
+    post = ConditionalThetaFlowVelocity(x_dim=2, hidden_dim=8, depth=1)
+    est = HMatrixEstimator(
+        model_post=post,
+        model_prior=None,
+        sigma_eval=1.0,
+        device=torch.device("cpu"),
+        pair_batch_size=64,
+        field_method="theta_flow_discrete_scaffold",
+        flow_scheduler="vp",
+        flow_ode_steps=4,
+        theta_gaussian_scaffold=scaffold,
+    )
+    out = est.run(theta=theta_disc, x=x, restore_original_order=False)
+    assert out.field_method == "theta_flow_discrete_scaffold"
+    assert out.theta_flow_log_post_matrix is not None
+    assert out.theta_flow_log_prior_matrix is not None
+    assert out.theta_flow_log_base_matrix is not None
+    np.testing.assert_allclose(out.theta_flow_log_prior_matrix, np.zeros_like(out.c_matrix))
+    assert np.isfinite(out.c_matrix).all()
+    assert np.isfinite(out.h_sym).all()
+
+
 def test_shared_estimation_theta_flow_gaussian_scaffold_smoke() -> None:
     parser = argparse.ArgumentParser()
     add_estimation_arguments(parser)
@@ -185,3 +294,64 @@ def test_shared_estimation_theta_flow_gaussian_scaffold_smoke() -> None:
         assert int(z["theta_gaussian_scaffold_grid_size"]) == 64
         assert int(z["theta_gaussian_scaffold_n_components"]) == 3
         assert int(z["theta_gaussian_scaffold_em_steps"]) == 4
+
+
+def test_shared_estimation_theta_flow_discrete_scaffold_smoke() -> None:
+    parser = argparse.ArgumentParser()
+    add_estimation_arguments(parser)
+    args = parser.parse_args([])
+    args.theta_field_method = "theta_flow_discrete_scaffold"
+    args.compute_h_matrix = True
+    args.prior_enable = False
+    args.device = "cpu"
+    args.x_dim = 2
+    args.dataset_family = "cosine_gaussian"
+    args.h_restore_original_order = True
+    args.h_batch_size = 128
+    args.h_save_intermediates = True
+    args.seed = 5
+    args.log_every = 99
+    args.flow_epochs = 2
+    args.flow_batch_size = 8
+    args.flow_hidden_dim = 12
+    args.flow_depth = 1
+    args.flow_early_patience = 100
+    args.flow_scheduler = "vp"
+    args.theta_gaussian_scaffold_bin_n_bins = 5
+    validate_estimation_args(args)
+
+    n = 20
+    theta_all = np.linspace(-1.0, 1.0, n, dtype=np.float64).reshape(-1, 1)
+    x_all = np.concatenate([np.cos(theta_all), np.sin(theta_all)], axis=1).astype(np.float64)
+    split = n // 2
+    with tempfile.TemporaryDirectory() as td:
+        args.output_dir = str(Path(td))
+        run_shared_fisher_estimation(
+            args,
+            dataset=object(),
+            theta_all=theta_all,
+            x_all=x_all,
+            theta_train=theta_all[:split],
+            x_train=x_all[:split],
+            theta_validation=theta_all[split:],
+            x_validation=x_all[split:],
+            rng=np.random.default_rng(0),
+        )
+        out_dir = Path(td)
+        assert (out_dir / "theta_discrete_scaffold.npz").is_file()
+        assert (out_dir / "theta_flow_posterior_checkpoint.pt").is_file()
+        assert not (out_dir / "theta_flow_prior_checkpoint.pt").exists()
+        h_path = out_dir / "h_matrix_results_theta_cov.npz"
+        loss_path = out_dir / "score_prior_training_losses.npz"
+        assert h_path.is_file()
+        assert loss_path.is_file()
+        h_z = np.load(h_path, allow_pickle=True)
+        assert str(h_z["h_field_method"].reshape(-1)[0]) == "theta_flow_discrete_scaffold"
+        assert "theta_flow_log_base_matrix" in h_z.files
+        assert "theta_flow_log_prior_matrix" in h_z.files
+        np.testing.assert_allclose(h_z["theta_flow_log_prior_matrix"], np.zeros_like(h_z["c_matrix"]))
+        assert np.isfinite(h_z["theta_flow_log_post_matrix"]).all()
+        z = np.load(loss_path, allow_pickle=True)
+        assert str(z["theta_field_method"].reshape(-1)[0]) == "theta_flow_discrete_scaffold"
+        assert not bool(z["prior_enable"])
+        assert int(z["theta_gaussian_scaffold_bin_n_bins"]) == 5
