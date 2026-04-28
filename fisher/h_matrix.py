@@ -143,6 +143,7 @@ class HMatrixEstimator:
             "theta_flow",
             "theta_flow_gaussian_scaffold",
             "theta_flow_discrete_scaffold",
+            "theta_flow_discrete_scaffold_nll",
             "theta_flow_discrete_scaffold_q0",
             "flow_x_likelihood",
             "ctsm_v",
@@ -150,7 +151,8 @@ class HMatrixEstimator:
             raise ValueError(
                 "field_method must be one of "
                 "{'dsm', 'theta_path_integral', 'theta_flow', 'theta_flow_gaussian_scaffold', "
-                "'theta_flow_discrete_scaffold', 'theta_flow_discrete_scaffold_q0', 'flow_x_likelihood', 'ctsm_v'}."
+                "'theta_flow_discrete_scaffold', 'theta_flow_discrete_scaffold_nll', "
+                "'theta_flow_discrete_scaffold_q0', 'flow_x_likelihood', 'ctsm_v'}."
             )
         self.theta_flow_posterior_only_likelihood = bool(theta_flow_posterior_only_likelihood)
         if self.theta_flow_posterior_only_likelihood and method != "theta_flow":
@@ -162,6 +164,7 @@ class HMatrixEstimator:
             "theta_flow",
             "theta_flow_gaussian_scaffold",
             "theta_flow_discrete_scaffold",
+            "theta_flow_discrete_scaffold_nll",
             "theta_flow_discrete_scaffold_q0",
             "flow_x_likelihood",
         ) and not (0.0 <= sigma_eval <= 1.0):
@@ -202,8 +205,12 @@ class HMatrixEstimator:
                 )
         elif method == "theta_flow_gaussian_scaffold" and theta_gaussian_scaffold is None:
             raise ValueError("theta_flow_gaussian_scaffold requires theta_gaussian_scaffold.")
-        elif method == "theta_flow_discrete_scaffold" and theta_gaussian_scaffold is None:
-            raise ValueError("theta_flow_discrete_scaffold requires theta_gaussian_scaffold.")
+        elif method in ("theta_flow_discrete_scaffold", "theta_flow_discrete_scaffold_nll") and theta_gaussian_scaffold is None:
+            raise ValueError(f"{method} requires theta_gaussian_scaffold.")
+        elif method in ("theta_flow_discrete_scaffold", "theta_flow_discrete_scaffold_nll") and not isinstance(
+            theta_gaussian_scaffold, ThetaDiscreteScaffold
+        ):
+            raise TypeError(f"{method} requires a fitted ThetaDiscreteScaffold.")
         elif method == "theta_flow_discrete_scaffold_q0":
             if theta_gaussian_scaffold is None:
                 raise ValueError("theta_flow_discrete_scaffold_q0 requires theta_gaussian_scaffold.")
@@ -211,7 +218,11 @@ class HMatrixEstimator:
                 raise TypeError("theta_flow_discrete_scaffold_q0 requires a fitted ThetaDiscreteScaffold.")
             if model_post is not None:
                 raise ValueError("theta_flow_discrete_scaffold_q0 expects model_post=None (no FM velocity model).")
-        elif model_prior is None and method not in ("theta_flow_discrete_scaffold", "theta_flow_discrete_scaffold_q0"):
+        elif model_prior is None and method not in (
+            "theta_flow_discrete_scaffold",
+            "theta_flow_discrete_scaffold_nll",
+            "theta_flow_discrete_scaffold_q0",
+        ):
             raise ValueError(f"field_method={method!r} requires a non-None model_prior.")
         self.field_method = method
         self.theta_gaussian_scaffold = theta_gaussian_scaffold
@@ -233,6 +244,7 @@ class HMatrixEstimator:
                 "theta_flow",
                 "theta_flow_gaussian_scaffold",
                 "theta_flow_discrete_scaffold",
+                "theta_flow_discrete_scaffold_nll",
             )
             else None
         )
@@ -242,9 +254,17 @@ class HMatrixEstimator:
         self._theta_flow_log_post_matrix: np.ndarray | None = None
         self._theta_flow_log_prior_matrix: np.ndarray | None = None
         self._theta_flow_log_base_matrix: np.ndarray | None = None
-        if self.field_method in ("theta_flow", "theta_flow_gaussian_scaffold", "theta_flow_discrete_scaffold"):
+        if self.field_method in (
+            "theta_flow",
+            "theta_flow_gaussian_scaffold",
+            "theta_flow_discrete_scaffold",
+            "theta_flow_discrete_scaffold_nll",
+        ):
             self._flow_likelihood_solver_post = _make_flow_ode_solver(self._post_velocity_for_likelihood)
-            if not self.theta_flow_posterior_only_likelihood and self.field_method != "theta_flow_discrete_scaffold":
+            if not self.theta_flow_posterior_only_likelihood and self.field_method not in (
+                "theta_flow_discrete_scaffold",
+                "theta_flow_discrete_scaffold_nll",
+            ):
                 self._flow_likelihood_solver_prior = _make_flow_ode_solver(self._prior_velocity_for_likelihood)
         if self.field_method == "flow_x_likelihood":
             self._flow_x_likelihood_solver = _make_flow_ode_solver(self._x_post_velocity_for_likelihood)
@@ -760,7 +780,7 @@ class HMatrixEstimator:
             theta_flow_log_post_sorted = self._theta_flow_log_post_matrix
             theta_flow_log_prior_sorted = self._theta_flow_log_prior_matrix
             theta_flow_log_base_sorted = self._theta_flow_log_base_matrix
-        elif self.field_method == "theta_flow_discrete_scaffold":
+        elif self.field_method in ("theta_flow_discrete_scaffold", "theta_flow_discrete_scaffold_nll"):
             c_sorted = self.compute_log_ratio_matrix_discrete_scaffold(theta_sorted, x_sorted)
             delta_sorted = self.compute_delta_l(c_sorted)
             g_sorted = np.zeros_like(c_sorted, dtype=np.float64)
@@ -857,6 +877,7 @@ class HMatrixEstimator:
                         "theta_flow",
                         "theta_flow_gaussian_scaffold",
                         "theta_flow_discrete_scaffold",
+                        "theta_flow_discrete_scaffold_nll",
                         "theta_flow_discrete_scaffold_q0",
                         "flow_x_likelihood",
                     )
@@ -873,6 +894,7 @@ class HMatrixEstimator:
                     "theta_flow",
                     "theta_flow_gaussian_scaffold",
                     "theta_flow_discrete_scaffold",
+                    "theta_flow_discrete_scaffold_nll",
                     "theta_flow_discrete_scaffold_q0",
                     "flow_x_likelihood",
                 )
@@ -895,6 +917,7 @@ class HMatrixEstimator:
                         "theta_flow",
                         "theta_flow_gaussian_scaffold",
                         "theta_flow_discrete_scaffold",
+                        "theta_flow_discrete_scaffold_nll",
                         "theta_flow_discrete_scaffold_q0",
                     )
                     else (

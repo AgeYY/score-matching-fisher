@@ -24,6 +24,8 @@ log-likelihood: Bayes ratios train/evaluate prior + posterior flows; with
 ``--theta-field-method theta_flow_discrete_scaffold`` (discretize theta into bins, use the
 binned posterior ``q0`` directly as the posterior flow source/base, and treat the prior as a
 uniform constant),
+``--theta-field-method theta_flow_discrete_scaffold_nll`` (same discrete q0 scaffold/base and
+uniform prior, but ``--flow-epochs 0`` and train the posterior flow directly by scaffold NLL),
 ``--theta-field-method theta_flow_discrete_scaffold_q0`` (same discrete scaffold fit as above but
 ``--flow-epochs 0``: skip FM training; H uses ``q_0(\theta|x)`` log-probability only, no posterior ODE),
 ``--theta-field-method theta_path_integral``
@@ -451,19 +453,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--nf-epochs", type=int, default=2000, help="NF method only: training epochs.")
     p.add_argument("--nf-batch-size", type=int, default=256, help="NF method only: training batch size.")
     p.add_argument("--nf-lr", type=float, default=1e-3, help="NF method only: learning rate.")
-    p.add_argument("--nf-hidden-dim", type=int, default=128, help="NF method only: hidden size for MLP encoder AND NSF spline nets.")
-    p.add_argument("--nf-context-dim", type=int, default=32, help="NF method only: NSF context dimension (ignored when --nf-x-encoder linear).")
+    p.add_argument("--nf-hidden-dim", type=int, default=128, help="NF method only: encoder hidden size.")
+    p.add_argument("--nf-context-dim", type=int, default=32, help="NF method only: context size.")
     p.add_argument("--nf-transforms", type=int, default=5, help="NF method only: spline transform count.")
-    p.add_argument(
-        "--nf-x-encoder",
-        type=str,
-        default="mlp",
-        choices=["mlp", "linear"],
-        help=(
-            "NF method only: encode x into NSF context — mlp (SiLU MLP x→context_dim) or "
-            "linear (single Linear layer x→scalar; forces context_dim=1)."
-        ),
-    )
     p.add_argument(
         "--nf-pair-batch-size",
         type=int,
@@ -578,11 +570,6 @@ def _validate_cli(args: argparse.Namespace) -> None:
         alpha = float(getattr(args, "nf_early_ema_alpha", 0.0))
         if not np.isfinite(alpha) or alpha <= 0.0 or alpha > 1.0:
             raise ValueError("--nf-early-ema-alpha must be in (0, 1].")
-        xenc = str(getattr(args, "nf_x_encoder", "mlp")).strip().lower()
-        if xenc not in ("mlp", "linear"):
-            raise ValueError("--nf-x-encoder must be one of {'mlp','linear'}.")
-        if xenc == "linear":
-            setattr(args, "nf_context_dim", 1)
         _pe = getattr(args, "nf_prior_epochs", None)
         if _pe is not None and int(_pe) < 1:
             raise ValueError("--nf-prior-epochs must be >= 1.")
@@ -941,9 +928,6 @@ def _estimate_one(
         nf_lr = float(getattr(args, "nf_lr", 1e-3))
         nf_hidden_dim = int(getattr(args, "nf_hidden_dim", 128))
         nf_context_dim = int(getattr(args, "nf_context_dim", 32))
-        nf_x_encoder = str(getattr(args, "nf_x_encoder", "mlp")).strip().lower()
-        if nf_x_encoder == "linear":
-            nf_context_dim = 1
         nf_transforms = int(getattr(args, "nf_transforms", 5))
         nf_early_patience = int(getattr(args, "nf_early_patience", 300))
         nf_early_min_delta = float(getattr(args, "nf_early_min_delta", 1e-4))
@@ -966,7 +950,6 @@ def _estimate_one(
             context_dim=nf_context_dim,
             hidden_dim=nf_hidden_dim,
             transforms=nf_transforms,
-            x_encoder=nf_x_encoder,
         ).to(dev)
         train_out = train_conditional_nf(
             model=model,
@@ -1122,7 +1105,13 @@ def _model_posterior_log_weights_for_fixed_x(
 ) -> tuple[np.ndarray, str]:
     c = np.asarray(c_row, dtype=np.float64).reshape(-1)
     method = str(hfm).strip().lower()
-    if method in ("theta_flow", "theta_flow_gaussian_scaffold", "theta_flow_discrete_scaffold", "theta_flow_discrete_scaffold_q0"):
+    if method in (
+        "theta_flow",
+        "theta_flow_gaussian_scaffold",
+        "theta_flow_discrete_scaffold",
+        "theta_flow_discrete_scaffold_nll",
+        "theta_flow_discrete_scaffold_q0",
+    ):
         log_post = _npz_row_or_vector(h_npz, "theta_flow_log_post_matrix", row=int(row), n=c.size)
         if log_post is not None:
             return log_post, "learned posterior log-density"
@@ -1338,7 +1327,7 @@ def _write_fixed_x_posterior_diagnostic(
     Uses ``c_matrix`` from ``h_matrix_results*.npz`` (requires ``h_save_intermediates``) and
     a deterministic row index ``i`` derived from ``perm_seed`` and ``n_subset``.
 
-    - ``theta_flow`` / ``theta_flow_gaussian_scaffold`` / ``theta_flow_discrete_scaffold`` / ``theta_flow_discrete_scaffold_q0``: use saved learned
+    - ``theta_flow`` / ``theta_flow_gaussian_scaffold`` / ``theta_flow_discrete_scaffold`` / ``theta_flow_discrete_scaffold_nll`` / ``theta_flow_discrete_scaffold_q0``: use saved learned
       ``theta_flow_log_post_matrix`` for posterior mass when available.
     - ``nf``: ``C[i,j] = log p(θ_j|x_i)`` directly.
     - Other H-field methods: soft-max the C row (scale may be method-specific) for a coarse view.
@@ -3105,6 +3094,18 @@ def main(argv: list[str] | None = None) -> None:
             "with piecewise-constant q0 base density, and treats the prior as a uniform constant.",
             flush=True,
         )
+    elif tfm == "theta_flow_discrete_scaffold_nll":
+        print(
+            f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
+            f"(flow_arch={getattr(args, 'flow_arch', 'mlp')}; --flow-epochs 0; NLL-only)",
+            flush=True,
+        )
+        print(
+            "[convergence] theta_flow_discrete_scaffold_nll mode fits the discrete q0 scaffold, "
+            "skips FM, trains the posterior flow by scaffold NLL, evaluates ODE log-likelihood "
+            "with piecewise-constant q0 base density, and treats the prior as a uniform constant.",
+            flush=True,
+        )
     elif tfm == "theta_flow_discrete_scaffold_q0":
         print(
             f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
@@ -3156,11 +3157,6 @@ def main(argv: list[str] | None = None) -> None:
             flush=True,
         )
         print(
-            f"[convergence] nf x-encoder={getattr(args, 'nf_x_encoder', 'mlp')} "
-            f"context_dim={(1 if str(getattr(args, 'nf_x_encoder', 'mlp')).strip().lower() == 'linear' else int(getattr(args, 'nf_context_dim', 32)))}",
-            flush=True,
-        )
-        print(
             "[convergence] nf mode builds C_post[i,j]=log p(theta_j|x_i), learns log p(theta_j), "
             "forms R=C_post-log p(theta_j), then DeltaL=R-diag(R), and H via 1-sech(DeltaL/2).",
             flush=True,
@@ -3169,7 +3165,7 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError(
             f"Unsupported --theta-field-method={tfm!r}; use "
             "theta_flow, theta_flow_gaussian_scaffold, theta_flow_discrete_scaffold, "
-            "theta_flow_discrete_scaffold_q0, "
+            "theta_flow_discrete_scaffold_nll, theta_flow_discrete_scaffold_q0, "
             "theta_path_integral, x_flow, ctsm_v, or nf."
         )
     print(

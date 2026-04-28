@@ -113,6 +113,8 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
             "log p(theta|x)-log p(theta)), theta_flow_gaussian_scaffold (theta-flow posterior with "
             "Gaussian posterior scaffold source/base), theta_flow_discrete_scaffold (theta-flow posterior "
             "with discrete q0 bin source/base and uniform-prior constant), "
+            "theta_flow_discrete_scaffold_nll (same discrete scaffold likelihood; --flow-epochs 0; "
+            "posterior trained by NLL only), "
             "theta_flow_discrete_scaffold_q0 (same discrete scaffold fit but --flow-epochs 0; H from q0 log-prob only, no FM ODE), "
             "theta_path_integral "
             "(velocity-to-score plus trapezoid integral along sorted theta), x_flow (conditional x-space flow ODE log p(x|theta)), or "
@@ -262,7 +264,8 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         default=10000,
         help=(
             "FM velocity pretraining epochs for flow-based fields. "
-            "theta_flow: use 0 to skip pretraining and rely on --flow-likelihood-finetune-epochs (NLL) only."
+            "theta_flow: use 0 to skip pretraining and rely on --flow-likelihood-finetune-epochs (NLL) only. "
+            "theta_flow_discrete_scaffold_nll requires 0 and trains by scaffold NLL only."
         ),
     )
     p.add_argument("--flow-batch-size", type=int, default=256)

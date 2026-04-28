@@ -52,6 +52,9 @@ from fisher.shared_fisher_est import build_dataset_from_meta, normalize_flow_arc
 # - theta_flow_discrete_scaffold:mlp
 # - theta_flow_discrete_scaffold:film
 # - theta_flow_discrete_scaffold:film_fourier
+# - theta_flow_discrete_scaffold_nll:mlp
+# - theta_flow_discrete_scaffold_nll:film
+# - theta_flow_discrete_scaffold_nll:film_fourier
 # - theta_path_integral:mlp
 # - theta_path_integral:film
 # - theta_path_integral:film_fourier
@@ -64,6 +67,7 @@ _FLOW_BASED_METHODS = {
     "theta_flow",
     "theta_flow_gaussian_scaffold",
     "theta_flow_discrete_scaffold",
+    "theta_flow_discrete_scaffold_nll",
     "theta_path_integral",
     "x_flow",
 }
@@ -98,7 +102,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Comma-separated theta-field methods to sweep in one run. "
             "Overrides --theta-field-method when non-empty. "
             "Supported values: theta_flow, theta_flow_gaussian_scaffold, theta_flow_discrete_scaffold, "
-            "theta_path_integral, x_flow, ctsm_v, nf."
+            "theta_flow_discrete_scaffold_nll, theta_path_integral, x_flow, ctsm_v, nf."
         ),
     )
     p.add_argument(

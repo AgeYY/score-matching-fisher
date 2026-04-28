@@ -219,6 +219,38 @@ class ThetaDiscreteScaffold:
         mass = np.maximum(q[np.arange(th.size), idx], 1e-300)
         return np.log(mass) - np.log(widths)
 
+    def log_prob_torch(self, theta: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """Torch version of :meth:`log_prob_np` for scaffold-NLL theta-flow training."""
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        if theta.ndim != 2 or int(theta.shape[1]) != 1:
+            raise ValueError("ThetaDiscreteScaffold.log_prob_torch requires scalar theta with shape (N,) or (N,1).")
+        if x.ndim == 1:
+            x = x.unsqueeze(0)
+        if x.ndim != 2 or int(x.shape[0]) != int(theta.shape[0]):
+            raise ValueError("x must be 2D with the same number of rows as theta.")
+
+        device = theta.device
+        dtype = theta.dtype
+        means = torch.as_tensor(self.bin_means, device=device, dtype=dtype)
+        vars_ = torch.clamp(
+            torch.as_tensor(self.bin_vars, device=device, dtype=dtype),
+            min=float(self.variance_floor),
+        )
+        edges = torch.as_tensor(self.bin_edges, device=device, dtype=dtype)
+        widths_all = torch.clamp(edges[1:] - edges[:-1], min=torch.finfo(dtype).tiny)
+
+        diff = x[:, None, :] - means[None, :, :]
+        log_det = torch.sum(torch.log(2.0 * math.pi * vars_), dim=1)
+        maha = torch.sum(diff * diff / vars_[None, :, :], dim=2)
+        logw = -0.5 * (maha + log_det.reshape(1, -1))
+        logq = logw - torch.logsumexp(logw, dim=1, keepdim=True)
+
+        idx = torch.bucketize(theta.reshape(-1), edges, right=True) - 1
+        idx = torch.clamp(idx, 0, int(means.shape[0]) - 1)
+        rows = torch.arange(theta.shape[0], device=device)
+        return logq[rows, idx] - torch.log(widths_all[idx])
+
     def to_npz_payload(self) -> dict[str, Any]:
         return {
             "bin_edges": np.asarray(self.bin_edges, dtype=np.float64),

@@ -355,3 +355,67 @@ def test_shared_estimation_theta_flow_discrete_scaffold_smoke() -> None:
         assert str(z["theta_field_method"].reshape(-1)[0]) == "theta_flow_discrete_scaffold"
         assert not bool(z["prior_enable"])
         assert int(z["theta_gaussian_scaffold_bin_n_bins"]) == 5
+
+
+def test_shared_estimation_theta_flow_discrete_scaffold_nll_smoke() -> None:
+    parser = argparse.ArgumentParser()
+    add_estimation_arguments(parser)
+    args = parser.parse_args([])
+    args.theta_field_method = "theta_flow_discrete_scaffold_nll"
+    args.compute_h_matrix = True
+    args.prior_enable = False
+    args.device = "cpu"
+    args.x_dim = 2
+    args.dataset_family = "cosine_gaussian"
+    args.h_restore_original_order = True
+    args.h_batch_size = 128
+    args.h_save_intermediates = True
+    args.seed = 5
+    args.log_every = 99
+    args.flow_epochs = 0
+    args.flow_likelihood_finetune_epochs = 1
+    args.flow_likelihood_finetune_ode_steps = 2
+    args.flow_likelihood_finetune_batch_size = 8
+    args.flow_hidden_dim = 12
+    args.flow_depth = 1
+    args.flow_early_patience = 100
+    args.flow_scheduler = "vp"
+    args.theta_gaussian_scaffold_bin_n_bins = 5
+    validate_estimation_args(args)
+
+    n = 20
+    theta_all = np.linspace(-1.0, 1.0, n, dtype=np.float64).reshape(-1, 1)
+    x_all = np.concatenate([np.cos(theta_all), np.sin(theta_all)], axis=1).astype(np.float64)
+    split = n // 2
+    with tempfile.TemporaryDirectory() as td:
+        args.output_dir = str(Path(td))
+        run_shared_fisher_estimation(
+            args,
+            dataset=object(),
+            theta_all=theta_all,
+            x_all=x_all,
+            theta_train=theta_all[:split],
+            x_train=x_all[:split],
+            theta_validation=theta_all[split:],
+            x_validation=x_all[split:],
+            rng=np.random.default_rng(0),
+        )
+        out_dir = Path(td)
+        assert (out_dir / "theta_discrete_scaffold.npz").is_file()
+        assert (out_dir / "theta_flow_posterior_checkpoint.pt").is_file()
+        assert not (out_dir / "theta_flow_prior_checkpoint.pt").exists()
+        h_path = out_dir / "h_matrix_results_theta_cov.npz"
+        loss_path = out_dir / "score_prior_training_losses.npz"
+        assert h_path.is_file()
+        assert loss_path.is_file()
+        h_z = np.load(h_path, allow_pickle=True)
+        assert str(h_z["h_field_method"].reshape(-1)[0]) == "theta_flow_discrete_scaffold_nll"
+        assert "theta_flow_log_base_matrix" in h_z.files
+        assert "theta_flow_log_prior_matrix" in h_z.files
+        np.testing.assert_allclose(h_z["theta_flow_log_prior_matrix"], np.zeros_like(h_z["c_matrix"]))
+        assert np.isfinite(h_z["theta_flow_log_post_matrix"]).all()
+        z = np.load(loss_path, allow_pickle=True)
+        assert str(z["theta_field_method"].reshape(-1)[0]) == "theta_flow_discrete_scaffold_nll"
+        assert not bool(z["prior_enable"])
+        assert int(z["theta_gaussian_scaffold_bin_n_bins"]) == 5
+        assert np.asarray(z["score_train_losses"], dtype=np.float64).size >= 1

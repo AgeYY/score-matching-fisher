@@ -124,6 +124,50 @@ def test_validate_rejects_theta_flow_zero_fm_epochs_without_nll_finetune() -> No
         validate_estimation_args(args)
 
 
+def test_validate_accepts_discrete_scaffold_nll_only_flags() -> None:
+    args = parse_full_args(
+        [
+            "--theta-field-method",
+            "theta_flow_discrete_scaffold_nll",
+            "--flow-epochs",
+            "0",
+            "--flow-likelihood-finetune-epochs",
+            "1",
+        ]
+    )
+    validate_estimation_args(args)
+    assert int(args.flow_epochs) == 0
+    assert int(args.flow_likelihood_finetune_epochs) == 1
+
+
+def test_validate_rejects_discrete_scaffold_nll_with_fm_epochs() -> None:
+    args = parse_full_args(
+        [
+            "--theta-field-method",
+            "theta_flow_discrete_scaffold_nll",
+            "--flow-epochs",
+            "1",
+            "--flow-likelihood-finetune-epochs",
+            "1",
+        ]
+    )
+    with pytest.raises(ValueError, match="theta_flow_discrete_scaffold_nll requires --flow-epochs 0"):
+        validate_estimation_args(args)
+
+
+def test_validate_rejects_discrete_scaffold_nll_without_nll_epochs() -> None:
+    args = parse_full_args(
+        [
+            "--theta-field-method",
+            "theta_flow_discrete_scaffold_nll",
+            "--flow-epochs",
+            "0",
+        ]
+    )
+    with pytest.raises(ValueError, match="theta_flow_discrete_scaffold_nll requires --flow-likelihood-finetune-epochs > 0"):
+        validate_estimation_args(args)
+
+
 def test_validate_rejects_x_flow_zero_fm_epochs_even_with_nll_finetune_disabled() -> None:
     args = parse_full_args(
         [

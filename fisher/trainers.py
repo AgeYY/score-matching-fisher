@@ -32,6 +32,7 @@ from fisher.models import (
     UnconditionalXFlowVelocityFiLMPerLayer,
     UnconditionalXScore,
 )
+from fisher.theta_gaussian_scaffold import ThetaDiscreteScaffold
 
 
 def to_score_loader(theta: np.ndarray, x: np.ndarray, batch_size: int, shuffle: bool = True) -> DataLoader:
@@ -990,6 +991,50 @@ def _theta_flow_conditional_nll_aux_loss(
     return nll
 
 
+def _theta_flow_conditional_discrete_scaffold_nll_loss(
+    *,
+    model: ConditionalThetaFlowVelocity
+    | ConditionalThetaFlowVelocityLinearXEmbed
+    | ConditionalThetaFlowVelocityFiLMPerLayer
+    | ConditionalThetaFlowVelocityThetaFourierMLP,
+    theta_target: torch.Tensor,
+    x_cond: torch.Tensor,
+    scaffold: ThetaDiscreteScaffold,
+    n_steps: int,
+    enable_grad: bool,
+) -> torch.Tensor:
+    steps = int(n_steps)
+    if steps < 1:
+        raise ValueError("endpoint ODE steps must be >= 1.")
+    step_dt = -1.0 / float(steps)  # integrate from t=1 -> 0
+    theta_t = theta_target
+    log_det = torch.zeros(theta_target.shape[0], device=theta_target.device, dtype=theta_target.dtype)
+    create_graph = bool(enable_grad)
+    for k in range(steps):
+        t_mid = 1.0 + (float(k) + 0.5) * step_dt
+        t_col = torch.full(
+            (theta_target.shape[0], 1),
+            t_mid,
+            device=theta_target.device,
+            dtype=theta_target.dtype,
+        )
+        with torch.set_grad_enabled(True):
+            theta_req = theta_t.requires_grad_(True)
+            velocity = model(theta_req, x_cond, t_col)
+            div = _theta_flow_exact_divergence(
+                velocity=velocity,
+                theta_t=theta_req,
+                create_graph=create_graph,
+            )
+        theta_t = theta_t + step_dt * velocity
+        log_det = log_det + step_dt * div
+        if not enable_grad:
+            theta_t = theta_t.detach()
+            log_det = log_det.detach()
+    log_post = scaffold.log_prob_torch(theta_t, x_cond) + log_det
+    return -torch.mean(log_post)
+
+
 def _theta_flow_prior_nll_aux_loss(
     *,
     model: PriorThetaFlowVelocity
@@ -1414,6 +1459,145 @@ def train_conditional_theta_flow_likelihood_finetune(
     if has_val and restore_best and best_state is not None:
         model.load_state_dict(best_state)
         print(f"[theta_flow_nll_ft restore-best] restored epoch={best_epoch} val_smooth={best_val_loss:.6f}")
+
+    return {
+        "train_losses": train_losses,
+        "val_losses": val_losses,
+        "val_monitor_losses": val_monitor_losses,
+        "best_val_loss": float(best_val_loss),
+        "best_epoch": int(best_epoch),
+        "stopped_epoch": int(stopped_epoch),
+        "stopped_early": bool(stopped_early),
+        "lr_last": float(optimizer.param_groups[0]["lr"]),
+    }
+
+
+def train_conditional_theta_flow_discrete_scaffold_nll(
+    model: ConditionalThetaFlowVelocity
+    | ConditionalThetaFlowVelocityLinearXEmbed
+    | ConditionalThetaFlowVelocityFiLMPerLayer
+    | ConditionalThetaFlowVelocityThetaFourierMLP,
+    *,
+    scaffold: ThetaDiscreteScaffold,
+    theta_train: np.ndarray,
+    x_train: np.ndarray,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    device: torch.device,
+    log_every: int,
+    theta_val: np.ndarray | None = None,
+    x_val: np.ndarray | None = None,
+    early_stopping_patience: int = 100,
+    early_stopping_min_delta: float = 1e-4,
+    early_stopping_ema_alpha: float = 0.05,
+    restore_best: bool = True,
+    ode_steps: int = 64,
+) -> dict[str, float | int | bool | list[float]]:
+    if int(epochs) < 1:
+        raise ValueError("epochs must be >= 1.")
+    if int(batch_size) < 1:
+        raise ValueError("batch_size must be >= 1.")
+    if float(lr) <= 0.0:
+        raise ValueError("lr must be positive.")
+    if int(ode_steps) < 1:
+        raise ValueError("ode_steps must be >= 1.")
+    alpha = float(early_stopping_ema_alpha)
+    if not (0.0 < alpha <= 1.0):
+        raise ValueError("early_stopping_ema_alpha must be in (0, 1].")
+
+    loader = to_score_loader(theta_train, x_train, batch_size=batch_size, shuffle=True)
+    has_val = theta_val is not None and x_val is not None and len(theta_val) > 0
+    val_loader = to_score_loader(theta_val, x_val, batch_size=batch_size, shuffle=False) if has_val else None
+    optimizer = torch.optim.Adam(model.parameters(), lr=float(lr))
+    train_losses: list[float] = []
+    val_losses: list[float] = []
+    val_monitor_losses: list[float] = []
+    best_val_loss = float("inf")
+    best_epoch = 0
+    best_state: dict[str, torch.Tensor] | None = None
+    patience_counter = 0
+    stopped_early = False
+    stopped_epoch = int(epochs)
+    val_ema: float | None = None
+
+    for epoch in range(1, int(epochs) + 1):
+        model.train()
+        epoch_losses: list[float] = []
+        for tb, xb in loader:
+            tb = tb.to(device, non_blocking=True)
+            xb = xb.to(device, non_blocking=True)
+            loss = _theta_flow_conditional_discrete_scaffold_nll_loss(
+                model=model,
+                theta_target=tb,
+                x_cond=xb,
+                scaffold=scaffold,
+                n_steps=int(ode_steps),
+                enable_grad=True,
+            )
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+            epoch_losses.append(float(loss.item()))
+        mean_train_loss = float(np.mean(epoch_losses))
+        train_losses.append(mean_train_loss)
+
+        mean_val_loss = float("nan")
+        if has_val and val_loader is not None:
+            model.eval()
+            val_epoch_losses: list[float] = []
+            for tb, xb in val_loader:
+                tb = tb.to(device, non_blocking=True)
+                xb = xb.to(device, non_blocking=True)
+                val_loss = _theta_flow_conditional_discrete_scaffold_nll_loss(
+                    model=model,
+                    theta_target=tb,
+                    x_cond=xb,
+                    scaffold=scaffold,
+                    n_steps=int(ode_steps),
+                    enable_grad=False,
+                )
+                val_epoch_losses.append(float(val_loss.item()))
+            mean_val_loss = float(np.mean(val_epoch_losses))
+            val_ema = _ema_update_val_monitor(val_ema, mean_val_loss, alpha)
+            smooth_val_loss = val_ema
+            if smooth_val_loss < (best_val_loss - float(early_stopping_min_delta)):
+                best_val_loss = smooth_val_loss
+                best_epoch = epoch
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                patience_counter = 0
+            else:
+                patience_counter += 1
+            val_monitor_losses.append(smooth_val_loss)
+        else:
+            val_monitor_losses.append(float("nan"))
+        val_losses.append(mean_val_loss)
+
+        if epoch == 1 or epoch % max(1, int(log_every)) == 0 or epoch == int(epochs):
+            if has_val:
+                print(
+                    f"[theta_flow_discrete_scaffold_nll {epoch:4d}/{int(epochs)}] train_nll={mean_train_loss:.6f} "
+                    f"val_nll={mean_val_loss:.6f} val_smooth={val_monitor_losses[-1]:.6f} "
+                    f"best_smooth={best_val_loss:.6f} best_epoch={best_epoch}"
+                )
+            else:
+                print(f"[theta_flow_discrete_scaffold_nll {epoch:4d}/{int(epochs)}] train_nll={mean_train_loss:.6f}")
+
+        if has_val and patience_counter >= int(early_stopping_patience):
+            stopped_early = True
+            stopped_epoch = epoch
+            print(
+                f"[theta_flow_discrete_scaffold_nll early-stop] epoch={epoch} best_epoch={best_epoch} "
+                f"best_smooth={best_val_loss:.6f} patience={int(early_stopping_patience)}"
+            )
+            break
+
+    if has_val and restore_best and best_state is not None:
+        model.load_state_dict(best_state)
+        print(
+            f"[theta_flow_discrete_scaffold_nll restore-best] restored epoch={best_epoch} "
+            f"val_smooth={best_val_loss:.6f}"
+        )
 
     return {
         "train_losses": train_losses,
