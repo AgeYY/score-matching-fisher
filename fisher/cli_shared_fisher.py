@@ -112,7 +112,9 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
             "Likelihood-ratio field method: theta_flow (theta-space flow ODE log-likelihood Bayes ratios "
             "log p(theta|x)-log p(theta)), theta_flow_gaussian_scaffold (theta-flow posterior with "
             "Gaussian posterior scaffold source/base), theta_flow_discrete_scaffold (theta-flow posterior "
-            "with discrete q0 bin source/base and uniform-prior constant), theta_path_integral "
+            "with discrete q0 bin source/base and uniform-prior constant), "
+            "theta_flow_discrete_scaffold_q0 (same discrete scaffold fit but --flow-epochs 0; H from q0 log-prob only, no FM ODE), "
+            "theta_path_integral "
             "(velocity-to-score plus trapezoid integral along sorted theta), x_flow (conditional x-space flow ODE log p(x|theta)), or "
             "ctsm_v (pair-conditioned CTSM-v time-score integration)."
         ),

@@ -133,6 +133,7 @@ def normalize_theta_field_method(method: str) -> str:
         "theta_flow",
         "theta_flow_gaussian_scaffold",
         "theta_flow_discrete_scaffold",
+        "theta_flow_discrete_scaffold_q0",
         "theta_path_integral",
         "x_flow",
         "ctsm_v",
@@ -148,13 +149,14 @@ def normalize_theta_field_method(method: str) -> str:
         raise ValueError(
             "Legacy --theta-field-method is removed. Use one of "
             "{'theta_flow', 'theta_flow_gaussian_scaffold', 'theta_flow_discrete_scaffold', "
+            "'theta_flow_discrete_scaffold_q0', "
             "'theta_path_integral', 'x_flow', 'ctsm_v'}. "
             "theta_flow = theta-space flow ODE log-likelihood Bayes ratios; "
             "theta_path_integral = velocity-to-score plus trapezoid integral along sorted theta."
         )
     raise ValueError(
         "--theta-field-method must be one of {'theta_flow','theta_flow_gaussian_scaffold',"
-        "'theta_flow_discrete_scaffold','theta_path_integral','x_flow','ctsm_v'}."
+        "'theta_flow_discrete_scaffold','theta_flow_discrete_scaffold_q0','theta_path_integral','x_flow','ctsm_v'}."
     )
 
 
@@ -1090,11 +1092,17 @@ def validate_estimation_args(args: Any) -> None:
     if ft_epochs > 2000:
         raise ValueError("--flow-likelihood-finetune-epochs must be <= 2000.")
     _flow_epochs = int(getattr(args, "flow_epochs", 1))
-    if _flow_epochs == 0:
+    if str(_tfm_val).strip().lower() == "theta_flow_discrete_scaffold_q0":
+        if _flow_epochs != 0:
+            raise ValueError(
+                "theta_flow_discrete_scaffold_q0 requires --flow-epochs 0 (no FM velocity training; H uses q0 only)."
+            )
+    elif _flow_epochs == 0:
         if _tfm_val != "theta_flow":
             raise ValueError(
                 "--flow-epochs must be >= 1 unless --theta-field-method theta_flow "
-                "(use 0 to skip FM pretraining when --flow-likelihood-finetune-epochs > 0)."
+                "(use 0 to skip FM pretraining when --flow-likelihood-finetune-epochs > 0) "
+                "or theta_flow_discrete_scaffold_q0 (q0-only H; use --flow-epochs 0)."
             )
         if ft_epochs <= 0:
             raise ValueError(
@@ -1118,7 +1126,7 @@ def validate_estimation_args(args: Any) -> None:
         raise ValueError("--flow-likelihood-finetune-exact-divergence is currently required.")
     if bool(getattr(args, "theta_flow_posterior_only_likelihood", False)) and _tfm_val != "theta_flow":
         raise ValueError("--theta-flow-posterior-only-likelihood requires --theta-field-method theta_flow.")
-    if _tfm_val in ("theta_flow_gaussian_scaffold", "theta_flow_discrete_scaffold"):
+    if _tfm_val in ("theta_flow_gaussian_scaffold", "theta_flow_discrete_scaffold", "theta_flow_discrete_scaffold_q0"):
         _scaffold_bins = int(getattr(args, "theta_gaussian_scaffold_bin_n_bins", 10))
         _scaffold_components = int(getattr(args, "theta_gaussian_scaffold_n_components", 3))
         if _scaffold_bins < 1:
@@ -1139,7 +1147,9 @@ def validate_estimation_args(args: Any) -> None:
             raise ValueError("--theta-gaussian-scaffold-source-eps must be >= 0.")
     if float(getattr(args, "flow_endpoint_loss_weight", 0.0)) < 0.0:
         raise ValueError("--flow-endpoint-loss-weight must be non-negative.")
-    if _tfm_val in ("theta_flow_gaussian_scaffold", "theta_flow_discrete_scaffold") and float(getattr(args, "flow_endpoint_loss_weight", 0.0)) > 0.0:
+    if _tfm_val in ("theta_flow_gaussian_scaffold", "theta_flow_discrete_scaffold", "theta_flow_discrete_scaffold_q0") and float(
+        getattr(args, "flow_endpoint_loss_weight", 0.0)
+    ) > 0.0:
         raise ValueError(
             "--flow-endpoint-loss-weight is not supported with theta_flow_gaussian_scaffold "
             "or theta_flow_discrete_scaffold."
@@ -1207,7 +1217,13 @@ def validate_estimation_args(args: Any) -> None:
     _ft_prior_omega_mode = str(getattr(args, "flow_prior_theta_fourier_omega_mode", "theta_range")).strip().lower()
     _ft_prior_inc_lin = not bool(getattr(args, "flow_prior_theta_fourier_no_linear", False))
     _ft_prior_inc_bias = not bool(getattr(args, "flow_prior_theta_fourier_no_bias", False))
-    if _tfm_val in ("theta_flow", "theta_flow_gaussian_scaffold", "theta_flow_discrete_scaffold", "theta_path_integral") and _arch == "film_fourier":
+    if _tfm_val in (
+        "theta_flow",
+        "theta_flow_gaussian_scaffold",
+        "theta_flow_discrete_scaffold",
+        "theta_flow_discrete_scaffold_q0",
+        "theta_path_integral",
+    ) and _arch == "film_fourier":
         if _ft_post_k < 0:
             raise ValueError("--flow-theta-fourier-k must be >= 0.")
         if _ft_post_omega_mode not in ("fixed", "theta_range"):
@@ -1233,7 +1249,13 @@ def validate_estimation_args(args: Any) -> None:
                 "theta_flow / theta_flow_gaussian_scaffold / theta_flow_discrete_scaffold / theta_path_integral film_fourier (posterior): theta feature dim is 0. Use "
                 "--flow-theta-fourier-k >= 1 or keep linear/bias features enabled."
             )
-    if _tfm_val in ("theta_flow", "theta_flow_gaussian_scaffold", "theta_flow_discrete_scaffold", "theta_path_integral") and _arch == "film_fourier":
+    if _tfm_val in (
+        "theta_flow",
+        "theta_flow_gaussian_scaffold",
+        "theta_flow_discrete_scaffold",
+        "theta_flow_discrete_scaffold_q0",
+        "theta_path_integral",
+    ) and _arch == "film_fourier":
         if _ft_prior_k < 0:
             raise ValueError("--flow-prior-theta-fourier-k must be >= 0.")
         if _ft_prior_omega_mode not in ("fixed", "theta_range"):
@@ -1262,13 +1284,13 @@ def validate_estimation_args(args: Any) -> None:
     if (
         bool(getattr(args, "compute_h_matrix", False))
         and not bool(getattr(args, "prior_enable", True))
-        and _tfm_val not in ("x_flow", "theta_flow_discrete_scaffold")
+        and _tfm_val not in ("x_flow", "theta_flow_discrete_scaffold", "theta_flow_discrete_scaffold_q0")
     ):
         raise ValueError("--compute-h-matrix requires prior score; do not use --no-prior-score.")
     if bool(getattr(args, "skip_shared_fisher_gt_compare", False)):
         if not bool(getattr(args, "compute_h_matrix", False)):
             raise ValueError("--skip-shared-fisher-gt-compare requires --compute-h-matrix.")
-        if not bool(getattr(args, "prior_enable", True)) and _tfm_val not in ("x_flow", "theta_flow_discrete_scaffold"):
+        if not bool(getattr(args, "prior_enable", True)) and _tfm_val not in ("x_flow", "theta_flow_discrete_scaffold", "theta_flow_discrete_scaffold_q0"):
             raise ValueError("--skip-shared-fisher-gt-compare requires prior score; do not use --no-prior-score.")
     if int(getattr(args, "ctsm_epochs", 1)) < 1:
         raise ValueError("--ctsm-epochs must be >= 1.")
@@ -2168,12 +2190,19 @@ def run_shared_fisher_estimation(
         print(f"[training_losses] saved {tnpz}")
         return
 
-    if theta_field_method in ("theta_flow", "theta_flow_gaussian_scaffold", "theta_flow_discrete_scaffold", "theta_path_integral"):
+    if theta_field_method in (
+        "theta_flow",
+        "theta_flow_gaussian_scaffold",
+        "theta_flow_discrete_scaffold",
+        "theta_flow_discrete_scaffold_q0",
+        "theta_path_integral",
+    ):
         theta_flow_posterior_only = (
             theta_field_method == "theta_flow"
             and bool(getattr(args, "theta_flow_posterior_only_likelihood", False))
         )
-        theta_flow_uniform_prior = theta_field_method == "theta_flow_discrete_scaffold"
+        theta_flow_uniform_prior = theta_field_method in ("theta_flow_discrete_scaffold", "theta_flow_discrete_scaffold_q0")
+        fm_enabled = theta_field_method != "theta_flow_discrete_scaffold_q0"
         theta_flow_skip_prior = theta_flow_posterior_only or theta_flow_uniform_prior
         if not bool(getattr(args, "prior_enable", True)):
             if theta_field_method == "theta_path_integral":
@@ -2206,7 +2235,7 @@ def run_shared_fisher_estimation(
                     "--theta-flow-onehot-state expects theta dimension >= 2 after preprocessing; "
                     f"got theta_dim={theta_dim_flow}."
                 )
-        if theta_field_method in ("theta_flow_gaussian_scaffold", "theta_flow_discrete_scaffold") and theta_dim_flow != 1:
+        if theta_field_method in ("theta_flow_gaussian_scaffold", "theta_flow_discrete_scaffold", "theta_flow_discrete_scaffold_q0") and theta_dim_flow != 1:
             raise ValueError(f"{theta_field_method} v1 requires scalar theta.")
         theta_repr = f"one_hot[{theta_dim_flow}]" if theta_onehot_state else ("scalar" if theta_dim_flow == 1 else f"vector[{theta_dim_flow}]")
         print(
@@ -2293,7 +2322,7 @@ def run_shared_fisher_estimation(
                 f"var_floor={float(getattr(args, 'theta_gaussian_scaffold_variance_floor', 1e-6)):.6g}",
                 flush=True,
             )
-        elif theta_field_method == "theta_flow_discrete_scaffold":
+        elif theta_field_method in ("theta_flow_discrete_scaffold", "theta_flow_discrete_scaffold_q0"):
             theta_discrete_scaffold = ThetaDiscreteScaffold.fit(
                 theta_train=theta_score_fit,
                 x_train=x_score_fit,
@@ -2311,139 +2340,177 @@ def run_shared_fisher_estimation(
                 "[theta_discrete_scaffold] "
                 f"saved={scaffold_path} bins={int(getattr(args, 'theta_gaussian_scaffold_bin_n_bins', 10))} "
                 f"var_floor={float(getattr(args, 'theta_gaussian_scaffold_variance_floor', 1e-6)):.6g} "
-                "source=q0_bin_centers prior=uniform_constant",
+                "source=q0_bin_centers prior=uniform_constant"
+                + (
+                    " mode=q0_only_h_no_fm"
+                    if theta_field_method == "theta_flow_discrete_scaffold_q0"
+                    else ""
+                ),
                 flush=True,
             )
 
-        if flow_score_arch == "mlp":
-            post_ckpt_hparams = {
-                "x_dim": int(args.x_dim),
-                "hidden_dim": int(getattr(args, "flow_hidden_dim", 128)),
-                "depth": int(getattr(args, "flow_depth", 3)),
-                "use_logit_time": True,
-                "theta_dim": int(theta_dim_flow),
-            }
-            post_model = ConditionalThetaFlowVelocity(
-                x_dim=args.x_dim,
-                hidden_dim=int(getattr(args, "flow_hidden_dim", 128)),
-                depth=int(getattr(args, "flow_depth", 3)),
-                use_logit_time=True,
-                theta_dim=theta_dim_flow,
-            ).to(device)
-        elif flow_score_arch == "soft_moe":
-            post_ckpt_hparams = {
-                "x_dim": int(args.x_dim),
-                "hidden_dim": int(getattr(args, "flow_hidden_dim", 128)),
-                "depth": int(getattr(args, "flow_depth", 3)),
-                "use_logit_time": True,
-                "theta_dim": int(theta_dim_flow),
-                "num_experts": int(getattr(args, "flow_moe_num_experts", 4)),
-                "router_temperature": float(getattr(args, "flow_moe_router_temperature", 1.0)),
-                "moe_shared_backbone": True,
-                "moe_linear_expert_heads": True,
-            }
-            post_model = ConditionalThetaFlowVelocitySoftMoE(
-                x_dim=args.x_dim,
-                hidden_dim=int(getattr(args, "flow_hidden_dim", 128)),
-                depth=int(getattr(args, "flow_depth", 3)),
-                use_logit_time=True,
-                theta_dim=theta_dim_flow,
-                num_experts=int(getattr(args, "flow_moe_num_experts", 4)),
-                router_temperature=float(getattr(args, "flow_moe_router_temperature", 1.0)),
-            ).to(device)
-        elif flow_score_arch == "film":
-            post_ckpt_hparams = {
-                "x_dim": int(args.x_dim),
-                "hidden_dim": int(getattr(args, "flow_hidden_dim", 128)),
-                "depth": int(getattr(args, "flow_depth", 3)),
-                "use_logit_time": True,
-                "use_layer_norm": bool(getattr(args, "flow_use_layer_norm", False)),
-                "gated_film": bool(getattr(args, "flow_gated_film", False)),
-                "zero_out_init": bool(getattr(args, "flow_zero_out_init", False)),
-                "cond_embed_dim": int(getattr(args, "flow_cond_embed_dim", 16)),
-                "cond_embed_depth": int(getattr(args, "flow_cond_embed_depth", 1)),
-                "cond_embed_act": str(getattr(args, "flow_cond_embed_act", "silu")),
-            }
-            post_model = ConditionalThetaFlowVelocityFiLMPerLayer(
-                x_dim=int(args.x_dim),
-                hidden_dim=int(getattr(args, "flow_hidden_dim", 128)),
-                depth=int(getattr(args, "flow_depth", 3)),
-                use_logit_time=True,
-                use_layer_norm=bool(getattr(args, "flow_use_layer_norm", False)),
-                gated_film=bool(getattr(args, "flow_gated_film", False)),
-                zero_out_init=bool(getattr(args, "flow_zero_out_init", False)),
-                cond_embed_dim=int(getattr(args, "flow_cond_embed_dim", 16)),
-                cond_embed_depth=int(getattr(args, "flow_cond_embed_depth", 1)),
-                cond_embed_act=str(getattr(args, "flow_cond_embed_act", "silu")),
-            ).to(device)
-        elif flow_score_arch == "film_fourier":
-            _om_eff, _ = effective_flow_theta_fourier_omega_post(args)
-            post_ckpt_hparams = {
-                "x_dim": int(args.x_dim),
-                "hidden_dim": int(getattr(args, "flow_hidden_dim", 128)),
-                "depth": int(getattr(args, "flow_depth", 3)),
-                "use_logit_time": True,
-                "use_layer_norm": bool(getattr(args, "flow_use_layer_norm", False)),
-                "gated_film": bool(getattr(args, "flow_gated_film", False)),
-                "zero_out_init": bool(getattr(args, "flow_zero_out_init", False)),
-                "theta_fourier_k": int(getattr(args, "flow_theta_fourier_k", 4)),
-                "theta_fourier_omega": float(_om_eff),
-                "theta_fourier_include_linear": not bool(getattr(args, "flow_theta_fourier_no_linear", False)),
-                "theta_fourier_include_bias": not bool(getattr(args, "flow_theta_fourier_no_bias", False)),
-            }
-            post_model = ConditionalThetaFlowVelocityThetaFourierFiLMPerLayer(
-                x_dim=int(args.x_dim),
-                hidden_dim=int(getattr(args, "flow_hidden_dim", 128)),
-                depth=int(getattr(args, "flow_depth", 3)),
-                use_logit_time=True,
-                use_layer_norm=bool(getattr(args, "flow_use_layer_norm", False)),
-                gated_film=bool(getattr(args, "flow_gated_film", False)),
-                zero_out_init=bool(getattr(args, "flow_zero_out_init", False)),
-                theta_fourier_k=int(getattr(args, "flow_theta_fourier_k", 4)),
-                theta_fourier_omega=float(_om_eff),
-                theta_fourier_include_linear=not bool(getattr(args, "flow_theta_fourier_no_linear", False)),
-                theta_fourier_include_bias=not bool(getattr(args, "flow_theta_fourier_no_bias", False)),
-            ).to(device)
+        if fm_enabled:
+            if flow_score_arch == "mlp":
+                post_ckpt_hparams = {
+                    "x_dim": int(args.x_dim),
+                    "hidden_dim": int(getattr(args, "flow_hidden_dim", 128)),
+                    "depth": int(getattr(args, "flow_depth", 3)),
+                    "use_logit_time": True,
+                    "theta_dim": int(theta_dim_flow),
+                }
+                post_model = ConditionalThetaFlowVelocity(
+                    x_dim=args.x_dim,
+                    hidden_dim=int(getattr(args, "flow_hidden_dim", 128)),
+                    depth=int(getattr(args, "flow_depth", 3)),
+                    use_logit_time=True,
+                    theta_dim=theta_dim_flow,
+                ).to(device)
+            elif flow_score_arch == "soft_moe":
+                post_ckpt_hparams = {
+                    "x_dim": int(args.x_dim),
+                    "hidden_dim": int(getattr(args, "flow_hidden_dim", 128)),
+                    "depth": int(getattr(args, "flow_depth", 3)),
+                    "use_logit_time": True,
+                    "theta_dim": int(theta_dim_flow),
+                    "num_experts": int(getattr(args, "flow_moe_num_experts", 4)),
+                    "router_temperature": float(getattr(args, "flow_moe_router_temperature", 1.0)),
+                    "moe_shared_backbone": True,
+                    "moe_linear_expert_heads": True,
+                }
+                post_model = ConditionalThetaFlowVelocitySoftMoE(
+                    x_dim=args.x_dim,
+                    hidden_dim=int(getattr(args, "flow_hidden_dim", 128)),
+                    depth=int(getattr(args, "flow_depth", 3)),
+                    use_logit_time=True,
+                    theta_dim=theta_dim_flow,
+                    num_experts=int(getattr(args, "flow_moe_num_experts", 4)),
+                    router_temperature=float(getattr(args, "flow_moe_router_temperature", 1.0)),
+                ).to(device)
+            elif flow_score_arch == "film":
+                post_ckpt_hparams = {
+                    "x_dim": int(args.x_dim),
+                    "hidden_dim": int(getattr(args, "flow_hidden_dim", 128)),
+                    "depth": int(getattr(args, "flow_depth", 3)),
+                    "use_logit_time": True,
+                    "use_layer_norm": bool(getattr(args, "flow_use_layer_norm", False)),
+                    "gated_film": bool(getattr(args, "flow_gated_film", False)),
+                    "zero_out_init": bool(getattr(args, "flow_zero_out_init", False)),
+                    "cond_embed_dim": int(getattr(args, "flow_cond_embed_dim", 16)),
+                    "cond_embed_depth": int(getattr(args, "flow_cond_embed_depth", 1)),
+                    "cond_embed_act": str(getattr(args, "flow_cond_embed_act", "silu")),
+                }
+                post_model = ConditionalThetaFlowVelocityFiLMPerLayer(
+                    x_dim=int(args.x_dim),
+                    hidden_dim=int(getattr(args, "flow_hidden_dim", 128)),
+                    depth=int(getattr(args, "flow_depth", 3)),
+                    use_logit_time=True,
+                    use_layer_norm=bool(getattr(args, "flow_use_layer_norm", False)),
+                    gated_film=bool(getattr(args, "flow_gated_film", False)),
+                    zero_out_init=bool(getattr(args, "flow_zero_out_init", False)),
+                    cond_embed_dim=int(getattr(args, "flow_cond_embed_dim", 16)),
+                    cond_embed_depth=int(getattr(args, "flow_cond_embed_depth", 1)),
+                    cond_embed_act=str(getattr(args, "flow_cond_embed_act", "silu")),
+                ).to(device)
+            elif flow_score_arch == "film_fourier":
+                _om_eff, _ = effective_flow_theta_fourier_omega_post(args)
+                post_ckpt_hparams = {
+                    "x_dim": int(args.x_dim),
+                    "hidden_dim": int(getattr(args, "flow_hidden_dim", 128)),
+                    "depth": int(getattr(args, "flow_depth", 3)),
+                    "use_logit_time": True,
+                    "use_layer_norm": bool(getattr(args, "flow_use_layer_norm", False)),
+                    "gated_film": bool(getattr(args, "flow_gated_film", False)),
+                    "zero_out_init": bool(getattr(args, "flow_zero_out_init", False)),
+                    "theta_fourier_k": int(getattr(args, "flow_theta_fourier_k", 4)),
+                    "theta_fourier_omega": float(_om_eff),
+                    "theta_fourier_include_linear": not bool(getattr(args, "flow_theta_fourier_no_linear", False)),
+                    "theta_fourier_include_bias": not bool(getattr(args, "flow_theta_fourier_no_bias", False)),
+                }
+                post_model = ConditionalThetaFlowVelocityThetaFourierFiLMPerLayer(
+                    x_dim=int(args.x_dim),
+                    hidden_dim=int(getattr(args, "flow_hidden_dim", 128)),
+                    depth=int(getattr(args, "flow_depth", 3)),
+                    use_logit_time=True,
+                    use_layer_norm=bool(getattr(args, "flow_use_layer_norm", False)),
+                    gated_film=bool(getattr(args, "flow_gated_film", False)),
+                    zero_out_init=bool(getattr(args, "flow_zero_out_init", False)),
+                    theta_fourier_k=int(getattr(args, "flow_theta_fourier_k", 4)),
+                    theta_fourier_omega=float(_om_eff),
+                    theta_fourier_include_linear=not bool(getattr(args, "flow_theta_fourier_no_linear", False)),
+                    theta_fourier_include_bias=not bool(getattr(args, "flow_theta_fourier_no_bias", False)),
+                ).to(device)
+            else:
+                raise ValueError("--flow-arch must be one of {'mlp','soft_moe','film','film_fourier'}.")
         else:
-            raise ValueError("--flow-arch must be one of {'mlp','soft_moe','film','film_fourier'}.")
-        _fm_epochs = int(getattr(args, "flow_epochs", 10000))
-        if _fm_epochs == 0:
+            post_model = None
+            post_ckpt_hparams = {}
             print(
-                f"[{theta_field_method}] --flow-epochs 0: skipping FM velocity pretraining "
-                "(conditional model starts from initialization; NLL fine-tune may follow).",
+                "[theta_flow_discrete_scaffold_q0] skipping FM posterior velocity network (--flow-epochs 0; H uses q0 only).",
                 flush=True,
             )
-        post_train_out = train_conditional_theta_flow_model(
-            model=post_model,
-            theta_train=theta_flow_fit,
-            x_train=x_score_fit,
-            epochs=_fm_epochs,
-            batch_size=int(getattr(args, "flow_batch_size", 256)),
-            lr=float(getattr(args, "flow_lr", 1e-3)),
-            device=device,
-            log_every=max(1, args.log_every),
-            theta_val=theta_flow_val,
-            x_val=x_score_val,
-            early_stopping_patience=int(getattr(args, "flow_early_patience", 1000)),
-            early_stopping_min_delta=float(getattr(args, "flow_early_min_delta", 1e-4)),
-            early_stopping_ema_alpha=float(getattr(args, "flow_early_ema_alpha", 0.05)),
-            restore_best=bool(getattr(args, "flow_restore_best", True)),
-            scheduler_name=str(getattr(args, "flow_scheduler", "cosine")),
-            endpoint_loss_weight=(
-                float(getattr(args, "flow_endpoint_loss_weight", 0.0))
-                if theta_field_method == "theta_flow"
-                else 0.0
-            ),
-            endpoint_ode_steps=int(getattr(args, "flow_endpoint_steps", 20)),
-            source_sampler=theta_discrete_scaffold if theta_discrete_scaffold is not None else theta_gaussian_scaffold,
-        )
-        post_train_losses = np.asarray(post_train_out["train_losses"], dtype=np.float64)
-        post_val_losses = np.asarray(post_train_out["val_losses"], dtype=np.float64)
-        post_val_monitor_losses = np.asarray(post_train_out.get("val_monitor_losses", []), dtype=np.float64)
-        post_best_epoch = int(post_train_out["best_epoch"])
-        post_stopped_epoch = int(post_train_out["stopped_epoch"])
-        post_stopped_early = bool(post_train_out["stopped_early"])
-        post_best_val_loss = float(post_train_out["best_val_loss"])
+        if fm_enabled:
+            _fm_epochs = int(getattr(args, "flow_epochs", 10000))
+            if _fm_epochs == 0:
+                print(
+                    f"[{theta_field_method}] --flow-epochs 0: skipping FM velocity pretraining "
+                    "(conditional model starts from initialization; NLL fine-tune may follow).",
+                    flush=True,
+                )
+            post_train_out = train_conditional_theta_flow_model(
+                model=post_model,
+                theta_train=theta_flow_fit,
+                x_train=x_score_fit,
+                epochs=_fm_epochs,
+                batch_size=int(getattr(args, "flow_batch_size", 256)),
+                lr=float(getattr(args, "flow_lr", 1e-3)),
+                device=device,
+                log_every=max(1, args.log_every),
+                theta_val=theta_flow_val,
+                x_val=x_score_val,
+                early_stopping_patience=int(getattr(args, "flow_early_patience", 1000)),
+                early_stopping_min_delta=float(getattr(args, "flow_early_min_delta", 1e-4)),
+                early_stopping_ema_alpha=float(getattr(args, "flow_early_ema_alpha", 0.05)),
+                restore_best=bool(getattr(args, "flow_restore_best", True)),
+                scheduler_name=str(getattr(args, "flow_scheduler", "cosine")),
+                endpoint_loss_weight=(
+                    float(getattr(args, "flow_endpoint_loss_weight", 0.0))
+                    if theta_field_method == "theta_flow"
+                    else 0.0
+                ),
+                endpoint_ode_steps=int(getattr(args, "flow_endpoint_steps", 20)),
+                source_sampler=theta_discrete_scaffold if theta_discrete_scaffold is not None else theta_gaussian_scaffold,
+            )
+            post_train_losses = np.asarray(post_train_out["train_losses"], dtype=np.float64)
+            post_val_losses = np.asarray(post_train_out["val_losses"], dtype=np.float64)
+            post_val_monitor_losses = np.asarray(post_train_out.get("val_monitor_losses", []), dtype=np.float64)
+            post_best_epoch = int(post_train_out["best_epoch"])
+            post_stopped_epoch = int(post_train_out["stopped_epoch"])
+            post_stopped_early = bool(post_train_out["stopped_early"])
+            post_best_val_loss = float(post_train_out["best_val_loss"])
+        else:
+            post_train_out = {
+                "train_losses": [],
+                "val_losses": [],
+                "val_monitor_losses": [],
+                "best_val_loss": float("nan"),
+                "best_epoch": 0,
+                "stopped_epoch": 0,
+                "stopped_early": False,
+                "has_nonfinite": False,
+                "grad_norm_mean": float("nan"),
+                "grad_norm_max": float("nan"),
+                "param_norm_final": float("nan"),
+                "n_clipped_steps": 0,
+                "n_total_steps": 0,
+                "lr_last": float("nan"),
+            }
+            post_train_losses = np.asarray([], dtype=np.float64)
+            post_val_losses = np.asarray([], dtype=np.float64)
+            post_val_monitor_losses = np.asarray([], dtype=np.float64)
+            post_best_epoch = 0
+            post_stopped_epoch = 0
+            post_stopped_early = False
+            post_best_val_loss = float("nan")
 
         ft_epochs = int(getattr(args, "flow_likelihood_finetune_epochs", 0))
         ft_batch = int(getattr(args, "flow_likelihood_finetune_batch_size", 0))
@@ -2484,39 +2551,41 @@ def run_shared_fisher_estimation(
                 dtype=np.float64,
             )
 
-        post_loss_fig = os.path.join(args.output_dir, "score_loss_vs_epoch.png")
-        epochs_arr = np.arange(1, post_train_losses.size + 1)
-        plt.figure(figsize=(8.8, 5.0))
-        plt.plot(epochs_arr, post_train_losses, color="#1f77b4", linewidth=2.0, label="Theta-flow train loss")
-        if post_val_losses.size == post_train_losses.size and np.any(np.isfinite(post_val_losses)):
-            plt.plot(epochs_arr, post_val_losses, color="#d62728", linewidth=2.0, label="Theta-flow val loss")
-        if post_val_monitor_losses.size == post_train_losses.size and np.any(np.isfinite(post_val_monitor_losses)):
-            plt.plot(
-                epochs_arr,
-                post_val_monitor_losses,
-                color="#ff7f0e",
-                linewidth=2.0,
-                linestyle="--",
-                label=f"Theta-flow val EMA (α={getattr(args, 'flow_early_ema_alpha', 0.05):g})",
-            )
-        if 1 <= post_best_epoch <= post_train_losses.size:
-            plt.axvline(post_best_epoch, color="#2ca02c", linestyle="--", linewidth=1.5, label=f"Best epoch {post_best_epoch}")
-        if 1 <= post_stopped_epoch <= post_train_losses.size:
-            plt.axvline(
-                post_stopped_epoch,
-                color="#9467bd",
-                linestyle=":",
-                linewidth=1.6,
-                label=f"Stop epoch {post_stopped_epoch}",
-            )
-        plt.xlabel("Epoch")
-        plt.ylabel("Loss")
-        plt.title("Conditional theta-flow training")
-        plt.grid(alpha=0.25, linestyle="--", linewidth=0.8)
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(post_loss_fig, dpi=180)
-        plt.close()
+        post_loss_fig = ""
+        if fm_enabled:
+            post_loss_fig = os.path.join(args.output_dir, "score_loss_vs_epoch.png")
+            epochs_arr = np.arange(1, post_train_losses.size + 1)
+            plt.figure(figsize=(8.8, 5.0))
+            plt.plot(epochs_arr, post_train_losses, color="#1f77b4", linewidth=2.0, label="Theta-flow train loss")
+            if post_val_losses.size == post_train_losses.size and np.any(np.isfinite(post_val_losses)):
+                plt.plot(epochs_arr, post_val_losses, color="#d62728", linewidth=2.0, label="Theta-flow val loss")
+            if post_val_monitor_losses.size == post_train_losses.size and np.any(np.isfinite(post_val_monitor_losses)):
+                plt.plot(
+                    epochs_arr,
+                    post_val_monitor_losses,
+                    color="#ff7f0e",
+                    linewidth=2.0,
+                    linestyle="--",
+                    label=f"Theta-flow val EMA (α={getattr(args, 'flow_early_ema_alpha', 0.05):g})",
+                )
+            if 1 <= post_best_epoch <= post_train_losses.size:
+                plt.axvline(post_best_epoch, color="#2ca02c", linestyle="--", linewidth=1.5, label=f"Best epoch {post_best_epoch}")
+            if 1 <= post_stopped_epoch <= post_train_losses.size:
+                plt.axvline(
+                    post_stopped_epoch,
+                    color="#9467bd",
+                    linestyle=":",
+                    linewidth=1.6,
+                    label=f"Stop epoch {post_stopped_epoch}",
+                )
+            plt.xlabel("Epoch")
+            plt.ylabel("Loss")
+            plt.title("Conditional theta-flow training")
+            plt.grid(alpha=0.25, linestyle="--", linewidth=0.8)
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(post_loss_fig, dpi=180)
+            plt.close()
 
         prior_model_flow: Any
         prior_ckpt_hparams: dict[str, Any]
@@ -2676,8 +2745,13 @@ def run_shared_fisher_estimation(
             plt.close()
         else:
             if theta_flow_uniform_prior:
+                _m = (
+                    "[theta_flow_discrete_scaffold]"
+                    if theta_field_method == "theta_flow_discrete_scaffold"
+                    else "[theta_flow_discrete_scaffold_q0]"
+                )
                 print(
-                    "[theta_flow_discrete_scaffold] uniform prior constant: skipping prior flow construction, "
+                    f"{_m} uniform prior constant: skipping prior flow construction, "
                     "training, NLL fine-tune, loss figure, checkpoint, and prior ODE likelihood.",
                     flush=True,
                 )
@@ -2702,18 +2776,25 @@ def run_shared_fisher_estimation(
             prior_likelihood_ft_val_monitor_losses = np.asarray([], dtype=np.float64)
             prior_loss_fig = ""
 
-        post_ckpt_path = _save_theta_flow_model_checkpoint(
-            output_dir=args.output_dir,
-            filename="theta_flow_posterior_checkpoint.pt",
-            model=post_model,
-            model_role="posterior",
-            theta_field_method=theta_field_method,
-            flow_arch=flow_score_arch,
-            flow_scheduler=str(getattr(args, "flow_scheduler", "cosine")),
-            theta_dim_flow=theta_dim_flow,
-            model_hparams=post_ckpt_hparams,
-            args=args,
-        )
+        if fm_enabled:
+            post_ckpt_path = _save_theta_flow_model_checkpoint(
+                output_dir=args.output_dir,
+                filename="theta_flow_posterior_checkpoint.pt",
+                model=post_model,
+                model_role="posterior",
+                theta_field_method=theta_field_method,
+                flow_arch=flow_score_arch,
+                flow_scheduler=str(getattr(args, "flow_scheduler", "cosine")),
+                theta_dim_flow=theta_dim_flow,
+                model_hparams=post_ckpt_hparams,
+                args=args,
+            )
+        else:
+            post_ckpt_path = ""
+            print(
+                "[theta_flow_ckpt] posterior checkpoint skipped (theta_flow_discrete_scaffold_q0: no FM model).",
+                flush=True,
+            )
         if not theta_flow_skip_prior:
             prior_ckpt_path = _save_theta_flow_model_checkpoint(
                 output_dir=args.output_dir,
@@ -2729,7 +2810,8 @@ def run_shared_fisher_estimation(
             )
         else:
             prior_ckpt_path = ""
-        print(f"[theta_flow_ckpt] saved posterior checkpoint: {post_ckpt_path}")
+        if post_ckpt_path:
+            print(f"[theta_flow_ckpt] saved posterior checkpoint: {post_ckpt_path}")
         if prior_ckpt_path:
             print(f"[theta_flow_ckpt] saved prior checkpoint: {prior_ckpt_path}")
         else:
@@ -2749,7 +2831,11 @@ def run_shared_fisher_estimation(
             h_eval = flow_eval_t
             _h_field = (
                 theta_field_method
-                if theta_field_method in ("theta_flow_gaussian_scaffold", "theta_flow_discrete_scaffold")
+                if theta_field_method in (
+                    "theta_flow_gaussian_scaffold",
+                    "theta_flow_discrete_scaffold",
+                    "theta_flow_discrete_scaffold_q0",
+                )
                 else ("theta_flow" if theta_field_method == "theta_flow" else "theta_path_integral")
             )
             _post_only = bool(getattr(args, "theta_flow_posterior_only_likelihood", False))
@@ -2812,6 +2898,12 @@ def run_shared_fisher_estimation(
                     "conditional theta-flow posterior ODE likelihood uses discrete q0 bin scaffold base, "
                     "and the prior is treated as a uniform constant)."
                 )
+            elif theta_field_method == "theta_flow_discrete_scaffold_q0":
+                print(
+                    "[summary] theta_flow_discrete_scaffold_q0 mode completed (H-matrix only path; "
+                    "no FM training; H uses discrete q0(theta|x) log-prob directly (no posterior ODE); "
+                    "prior is a uniform constant)."
+                )
             else:
                 print(
                     "[summary] theta_path_integral mode completed (H-matrix only path; "
@@ -2819,10 +2911,12 @@ def run_shared_fisher_estimation(
                     "trapezoid integral along sorted theta)."
                 )
             print("Saved artifacts:")
-            print(f"  - {post_loss_fig}")
+            if post_loss_fig:
+                print(f"  - {post_loss_fig}")
             if prior_loss_fig:
                 print(f"  - {prior_loss_fig}")
-            print(f"  - {post_ckpt_path}")
+            if post_ckpt_path:
+                print(f"  - {post_ckpt_path}")
             if prior_ckpt_path:
                 print(f"  - {prior_ckpt_path}")
             print(f"  - {h_npz_path}")
@@ -2874,7 +2968,7 @@ def run_shared_fisher_estimation(
                 theta_field_method=theta_field_method,
                 theta_gaussian_scaffold_bin_n_bins=(
                     int(getattr(args, "theta_gaussian_scaffold_bin_n_bins", 10))
-                    if theta_field_method in ("theta_flow_gaussian_scaffold", "theta_flow_discrete_scaffold")
+                    if theta_field_method in ("theta_flow_gaussian_scaffold", "theta_flow_discrete_scaffold", "theta_flow_discrete_scaffold_q0")
                     else 0
                 ),
                 theta_gaussian_scaffold_grid_size=(
@@ -2894,7 +2988,7 @@ def run_shared_fisher_estimation(
                 ),
                 theta_gaussian_scaffold_variance_floor=(
                     float(getattr(args, "theta_gaussian_scaffold_variance_floor", 1e-6))
-                    if theta_field_method in ("theta_flow_gaussian_scaffold", "theta_flow_discrete_scaffold")
+                    if theta_field_method in ("theta_flow_gaussian_scaffold", "theta_flow_discrete_scaffold", "theta_flow_discrete_scaffold_q0")
                     else float("nan")
                 ),
                 theta_gaussian_scaffold_min_branch_mass=(
@@ -2904,7 +2998,7 @@ def run_shared_fisher_estimation(
                 ),
                 theta_gaussian_scaffold_source_eps=(
                     float(getattr(args, "theta_gaussian_scaffold_source_eps", 1e-6))
-                    if theta_field_method in ("theta_flow_gaussian_scaffold", "theta_flow_discrete_scaffold")
+                    if theta_field_method in ("theta_flow_gaussian_scaffold", "theta_flow_discrete_scaffold", "theta_flow_discrete_scaffold_q0")
                     else float("nan")
                 ),
             )
@@ -2913,6 +3007,7 @@ def run_shared_fisher_estimation(
 
         raise RuntimeError(
             "theta_flow, theta_flow_gaussian_scaffold, theta_flow_discrete_scaffold, "
+            "theta_flow_discrete_scaffold_q0, "
             "and theta_path_integral require --compute-h-matrix to produce output artifacts."
         )
 

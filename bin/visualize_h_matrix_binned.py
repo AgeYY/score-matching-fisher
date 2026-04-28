@@ -351,13 +351,13 @@ def theta_for_h_matrix_alignment(bundle: SharedDatasetBundle, full_args: SimpleN
         raise ValueError(f"Unknown score_fisher_eval_data: {mode}")
 
     tfm = str(getattr(full_args, "theta_field_method", "")).strip().lower()
-    if tfm == "theta_flow_discrete_scaffold":
+    if tfm in ("theta_flow_discrete_scaffold", "theta_flow_discrete_scaffold_q0"):
         from fisher.theta_gaussian_scaffold import ThetaDiscreteScaffold
 
         out_dir = str(getattr(full_args, "output_dir", "") or "").strip()
         if not out_dir:
             raise ValueError(
-                "theta_flow_discrete_scaffold requires full_args.output_dir for theta_discrete_scaffold.npz"
+                "theta_flow_discrete_scaffold or theta_flow_discrete_scaffold_q0 requires full_args.output_dir for theta_discrete_scaffold.npz"
             )
         scaffold_path = os.path.join(out_dir, "theta_discrete_scaffold.npz")
         if not os.path.isfile(scaffold_path):

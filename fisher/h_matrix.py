@@ -107,7 +107,8 @@ class HMatrixEstimator:
         | ConditionalXFlowVelocityIndependentThetaFourierMLP
         | ConditionalXFlowVelocityThetaFourierFiLMPerLayer
         | ConditionalXFlowVelocityThetaFourierMLP
-        | PairConditionedTimeScoreNetBase,
+        | PairConditionedTimeScoreNetBase
+        | None,
         model_prior: PriorScore1D
         | PriorScore1DFiLMPerLayer
         | PriorThetaFlowVelocity
@@ -140,13 +141,14 @@ class HMatrixEstimator:
             "theta_flow",
             "theta_flow_gaussian_scaffold",
             "theta_flow_discrete_scaffold",
+            "theta_flow_discrete_scaffold_q0",
             "flow_x_likelihood",
             "ctsm_v",
         ):
             raise ValueError(
                 "field_method must be one of "
                 "{'dsm', 'theta_path_integral', 'theta_flow', 'theta_flow_gaussian_scaffold', "
-                "'theta_flow_discrete_scaffold', 'flow_x_likelihood', 'ctsm_v'}."
+                "'theta_flow_discrete_scaffold', 'theta_flow_discrete_scaffold_q0', 'flow_x_likelihood', 'ctsm_v'}."
             )
         self.theta_flow_posterior_only_likelihood = bool(theta_flow_posterior_only_likelihood)
         if self.theta_flow_posterior_only_likelihood and method != "theta_flow":
@@ -158,6 +160,7 @@ class HMatrixEstimator:
             "theta_flow",
             "theta_flow_gaussian_scaffold",
             "theta_flow_discrete_scaffold",
+            "theta_flow_discrete_scaffold_q0",
             "flow_x_likelihood",
         ) and not (0.0 <= sigma_eval <= 1.0):
             raise ValueError("For flow-based methods, t_eval (passed via sigma_eval) must be in [0, 1].")
@@ -199,7 +202,14 @@ class HMatrixEstimator:
             raise ValueError("theta_flow_gaussian_scaffold requires theta_gaussian_scaffold.")
         elif method == "theta_flow_discrete_scaffold" and theta_gaussian_scaffold is None:
             raise ValueError("theta_flow_discrete_scaffold requires theta_gaussian_scaffold.")
-        elif model_prior is None and method != "theta_flow_discrete_scaffold":
+        elif method == "theta_flow_discrete_scaffold_q0":
+            if theta_gaussian_scaffold is None:
+                raise ValueError("theta_flow_discrete_scaffold_q0 requires theta_gaussian_scaffold.")
+            if not isinstance(theta_gaussian_scaffold, ThetaDiscreteScaffold):
+                raise TypeError("theta_flow_discrete_scaffold_q0 requires a fitted ThetaDiscreteScaffold.")
+            if model_post is not None:
+                raise ValueError("theta_flow_discrete_scaffold_q0 expects model_post=None (no FM velocity model).")
+        elif model_prior is None and method not in ("theta_flow_discrete_scaffold", "theta_flow_discrete_scaffold_q0"):
             raise ValueError(f"field_method={method!r} requires a non-None model_prior.")
         self.field_method = method
         self.theta_gaussian_scaffold = theta_gaussian_scaffold
@@ -583,6 +593,40 @@ class HMatrixEstimator:
         self._theta_flow_log_base_matrix = log_base_matrix
         return log_post_matrix - log_prior_matrix
 
+    def compute_log_ratio_matrix_discrete_scaffold_q0_only(
+        self, theta_sorted: np.ndarray, x_sorted: np.ndarray
+    ) -> np.ndarray:
+        """Likelihood ratios using only discrete scaffold q0(theta|x); no conditional FM ODE."""
+        theta_grid_col = self._theta_as_matrix(theta_sorted)
+        if theta_grid_col.shape[1] != 1:
+            raise ValueError("theta_flow_discrete_scaffold_q0 requires scalar theta.")
+        n = int(theta_grid_col.shape[0])
+        if n < 1:
+            raise ValueError("Need at least one sample to compute H-matrix.")
+        sc = self.theta_gaussian_scaffold
+        if sc is None or not isinstance(sc, ThetaDiscreteScaffold):
+            raise RuntimeError("theta_flow_discrete_scaffold_q0 requires ThetaDiscreteScaffold.")
+        row_block = max(1, int(self.pair_batch_size // n))
+        theta_grid_col = np.asarray(theta_grid_col, dtype=np.float64)
+        log_post_matrix = np.zeros((n, n), dtype=np.float64)
+        log_prior_matrix = np.zeros((n, n), dtype=np.float64)
+        log_base_matrix = np.zeros((n, n), dtype=np.float64)
+        for i0 in range(0, n, row_block):
+            i1 = min(n, i0 + row_block)
+            xb = np.asarray(x_sorted[i0:i1], dtype=np.float64)
+            b = int(i1 - i0)
+            theta_tile = np.tile(theta_grid_col, (b, 1))
+            x_rep = np.repeat(xb, repeats=n, axis=0)
+            th_flat = theta_tile.reshape(-1)
+            lp = sc.log_prob_np(th_flat, x_rep)
+            log_post_block = np.asarray(lp, dtype=np.float64).reshape(b, n)
+            log_post_matrix[i0:i1, :] = log_post_block
+            log_base_matrix[i0:i1, :] = log_post_block
+        self._theta_flow_log_post_matrix = log_post_matrix
+        self._theta_flow_log_prior_matrix = log_prior_matrix
+        self._theta_flow_log_base_matrix = log_base_matrix
+        return log_post_matrix - log_prior_matrix
+
     def compute_x_conditional_loglik_matrix(self, theta_sorted: np.ndarray, x_sorted: np.ndarray) -> np.ndarray:
         """Estimate C_ij = log p(x_i | theta_j) via conditional x-flow ODE likelihood (one solver call per block)."""
         theta_grid_col = self._theta_as_matrix(theta_sorted)
@@ -721,6 +765,13 @@ class HMatrixEstimator:
             theta_flow_log_post_sorted = self._theta_flow_log_post_matrix
             theta_flow_log_prior_sorted = self._theta_flow_log_prior_matrix
             theta_flow_log_base_sorted = self._theta_flow_log_base_matrix
+        elif self.field_method == "theta_flow_discrete_scaffold_q0":
+            c_sorted = self.compute_log_ratio_matrix_discrete_scaffold_q0_only(theta_sorted, x_sorted)
+            delta_sorted = self.compute_delta_l(c_sorted)
+            g_sorted = np.zeros_like(c_sorted, dtype=np.float64)
+            theta_flow_log_post_sorted = self._theta_flow_log_post_matrix
+            theta_flow_log_prior_sorted = self._theta_flow_log_prior_matrix
+            theta_flow_log_base_sorted = self._theta_flow_log_base_matrix
         elif self.field_method == "flow_x_likelihood":
             c_sorted = self.compute_x_conditional_loglik_matrix(theta_sorted, x_sorted)
             delta_sorted = self.compute_delta_l(c_sorted)
@@ -804,6 +855,7 @@ class HMatrixEstimator:
                         "theta_flow",
                         "theta_flow_gaussian_scaffold",
                         "theta_flow_discrete_scaffold",
+                        "theta_flow_discrete_scaffold_q0",
                         "flow_x_likelihood",
                     )
                     else ("ctsm_t_eps" if self.field_method == "ctsm_v" else "sigma_eval")
@@ -819,6 +871,7 @@ class HMatrixEstimator:
                     "theta_flow",
                     "theta_flow_gaussian_scaffold",
                     "theta_flow_discrete_scaffold",
+                    "theta_flow_discrete_scaffold_q0",
                     "flow_x_likelihood",
                 )
                 else None
@@ -830,12 +883,17 @@ class HMatrixEstimator:
                     (
                         "direct_ode_likelihood_posterior_only"
                         if self.field_method == "theta_flow" and self.theta_flow_posterior_only_likelihood
-                        else "direct_ode_likelihood"
+                        else (
+                            "discrete_q0_log_prob_np"
+                            if self.field_method == "theta_flow_discrete_scaffold_q0"
+                            else "direct_ode_likelihood"
+                        )
                     )
                     if self.field_method in (
                         "theta_flow",
                         "theta_flow_gaussian_scaffold",
                         "theta_flow_discrete_scaffold",
+                        "theta_flow_discrete_scaffold_q0",
                     )
                     else (
                         "direct_ode_x_cond_likelihood"

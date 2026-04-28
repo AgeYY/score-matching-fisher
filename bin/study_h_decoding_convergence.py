@@ -24,6 +24,8 @@ log-likelihood: Bayes ratios train/evaluate prior + posterior flows; with
 ``--theta-field-method theta_flow_discrete_scaffold`` (discretize theta into bins, use the
 binned posterior ``q0`` directly as the posterior flow source/base, and treat the prior as a
 uniform constant),
+``--theta-field-method theta_flow_discrete_scaffold_q0`` (same discrete scaffold fit as above but
+``--flow-epochs 0``: skip FM training; H uses ``q_0(\theta|x)`` log-probability only, no posterior ODE),
 ``--theta-field-method theta_path_integral``
 (same training as theta_flow but H from velocity-to-score plus trapezoid integral along sorted ``theta``),
 ``--theta-field-method x_flow`` (conditional x-space FM likelihood; no prior model),
@@ -1101,7 +1103,7 @@ def _model_posterior_log_weights_for_fixed_x(
 ) -> tuple[np.ndarray, str]:
     c = np.asarray(c_row, dtype=np.float64).reshape(-1)
     method = str(hfm).strip().lower()
-    if method in ("theta_flow", "theta_flow_gaussian_scaffold", "theta_flow_discrete_scaffold"):
+    if method in ("theta_flow", "theta_flow_gaussian_scaffold", "theta_flow_discrete_scaffold", "theta_flow_discrete_scaffold_q0"):
         log_post = _npz_row_or_vector(h_npz, "theta_flow_log_post_matrix", row=int(row), n=c.size)
         if log_post is not None:
             return log_post, "learned posterior log-density"
@@ -1312,7 +1314,7 @@ def _write_fixed_x_posterior_diagnostic(
     Uses ``c_matrix`` from ``h_matrix_results*.npz`` (requires ``h_save_intermediates``) and
     a deterministic row index ``i`` derived from ``perm_seed`` and ``n_subset``.
 
-    - ``theta_flow`` / ``theta_flow_gaussian_scaffold`` / ``theta_flow_discrete_scaffold``: use saved learned
+    - ``theta_flow`` / ``theta_flow_gaussian_scaffold`` / ``theta_flow_discrete_scaffold`` / ``theta_flow_discrete_scaffold_q0``: use saved learned
       ``theta_flow_log_post_matrix`` for posterior mass when available.
     - ``nf``: ``C[i,j] = log p(θ_j|x_i)`` directly.
     - Other H-field methods: soft-max the C row (scale may be method-specific) for a coarse view.
@@ -3079,6 +3081,17 @@ def main(argv: list[str] | None = None) -> None:
             "with piecewise-constant q0 base density, and treats the prior as a uniform constant.",
             flush=True,
         )
+    elif tfm == "theta_flow_discrete_scaffold_q0":
+        print(
+            f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
+            f"(flow_arch={getattr(args, 'flow_arch', 'mlp')}; --flow-epochs 0 required)",
+            flush=True,
+        )
+        print(
+            "[convergence] theta_flow_discrete_scaffold_q0 mode fits the discrete q0 scaffold on train data, "
+            "skips FM, and builds H from q0(theta|x) log-probability only (no posterior ODE; uniform prior).",
+            flush=True,
+        )
     elif tfm == "theta_path_integral":
         print(
             f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
@@ -3127,6 +3140,7 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError(
             f"Unsupported --theta-field-method={tfm!r}; use "
             "theta_flow, theta_flow_gaussian_scaffold, theta_flow_discrete_scaffold, "
+            "theta_flow_discrete_scaffold_q0, "
             "theta_path_integral, x_flow, ctsm_v, or nf."
         )
     print(
