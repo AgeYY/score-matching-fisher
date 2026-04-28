@@ -15,6 +15,7 @@ from fisher.models import (
     ConditionalScore1D,
     ConditionalScore1DFiLMPerLayer,
     ConditionalThetaFlowVelocity,
+    ConditionalThetaFlowVelocityLinearXEmbed,
     ConditionalThetaFlowVelocityFiLMPerLayer,
     ConditionalThetaFlowVelocityThetaFourierMLP,
     ConditionalXFlowVelocity,
@@ -99,6 +100,7 @@ class HMatrixEstimator:
         model_post: ConditionalScore1D
         | ConditionalScore1DFiLMPerLayer
         | ConditionalThetaFlowVelocity
+        | ConditionalThetaFlowVelocityLinearXEmbed
         | ConditionalThetaFlowVelocityFiLMPerLayer
         | ConditionalThetaFlowVelocityThetaFourierMLP
         | ConditionalXFlowVelocity

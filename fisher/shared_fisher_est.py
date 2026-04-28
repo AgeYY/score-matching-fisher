@@ -30,6 +30,7 @@ from fisher.models import (
     ConditionalScore1D,
     ConditionalScore1DFiLMPerLayer,
     ConditionalThetaFlowVelocity,
+    ConditionalThetaFlowVelocityLinearXEmbed,
     ConditionalThetaFlowVelocityFiLMPerLayer,
     ConditionalThetaFlowVelocitySoftMoE,
     ConditionalThetaFlowVelocityThetaFourierFiLMPerLayer,
@@ -162,9 +163,9 @@ def normalize_theta_field_method(method: str) -> str:
 
 def normalize_flow_arch(args: Any) -> str:
     arch = str(getattr(args, "flow_arch", "mlp")).strip().lower()
-    if arch in ("mlp", "soft_moe", "film", "film_fourier"):
+    if arch in ("mlp", "mlp_lin_x", "soft_moe", "film", "film_fourier"):
         return arch
-    raise ValueError("--flow-arch must be one of {'mlp','soft_moe','film','film_fourier'}.")
+    raise ValueError("--flow-arch must be one of {'mlp','mlp_lin_x','soft_moe','film','film_fourier'}.")
 
 
 def build_posterior_score_model(
@@ -741,10 +742,13 @@ def build_dataset_from_meta(
             seed=seed,
         )
     if family == "cosine_gaussian_sqrtd":
+        gen_x_dim = int(meta["x_dim"])
+        if bool(meta.get("pr_autoencoder_embedded", False)):
+            gen_x_dim = int(meta.get("pr_autoencoder_z_dim", gen_x_dim))
         return ToyConditionalGaussianSqrtdDataset(
             theta_low=float(meta["theta_low"]),
             theta_high=float(meta["theta_high"]),
-            x_dim=int(meta["x_dim"]),
+            x_dim=gen_x_dim,
             tuning_curve_family=str(meta.get("tuning_curve_family", "cosine")),
             vm_mu_amp=float(meta.get("vm_mu_amp", 1.0)),
             vm_kappa=float(meta.get("vm_kappa", 1.0)),
@@ -774,10 +778,13 @@ def build_dataset_from_meta(
             cta = np.asarray(cta_raw, dtype=np.float64).reshape(-1)
         else:
             cta = None
+        gen_x_dim = int(meta["x_dim"])
+        if bool(meta.get("pr_autoencoder_embedded", False)):
+            gen_x_dim = int(meta.get("pr_autoencoder_z_dim", gen_x_dim))
         return ToyConditionalGaussianCosineRandampSqrtdDataset(
             theta_low=float(meta["theta_low"]),
             theta_high=float(meta["theta_high"]),
-            x_dim=int(meta["x_dim"]),
+            x_dim=gen_x_dim,
             tuning_curve_family=str(meta.get("tuning_curve_family", "cosine")),
             vm_mu_amp=float(meta.get("vm_mu_amp", 1.0)),
             vm_kappa=float(meta.get("vm_kappa", 1.0)),
@@ -1172,8 +1179,8 @@ def validate_estimation_args(args: Any) -> None:
         raise ValueError("--flow-prior-cond-embed-dim must be >= 1.")
     if int(getattr(args, "flow_prior_cond_embed_depth", 1)) < 1:
         raise ValueError("--flow-prior-cond-embed-depth must be >= 1.")
-    if _arch not in ("mlp", "soft_moe", "film", "film_fourier"):
-        raise ValueError("--flow-arch must be one of {'mlp','soft_moe','film','film_fourier'}.")
+    if _arch not in ("mlp", "mlp_lin_x", "soft_moe", "film", "film_fourier"):
+        raise ValueError("--flow-arch must be one of {'mlp','mlp_lin_x','soft_moe','film','film_fourier'}.")
     if int(getattr(args, "flow_moe_num_experts", 4)) < 1:
         raise ValueError("--flow-moe-num-experts must be >= 1.")
     if float(getattr(args, "flow_moe_router_temperature", 1.0)) <= 0.0:
@@ -1188,6 +1195,8 @@ def validate_estimation_args(args: Any) -> None:
         raise ValueError("--flow-x-theta-fourier-omega-mode must be one of {'fixed', 'theta_range'}.")
     if _tfm_val == "x_flow" and _arch == "soft_moe":
         raise ValueError("--flow-arch soft_moe is supported only for theta_flow/theta_path_integral.")
+    if _tfm_val == "x_flow" and _arch == "mlp_lin_x":
+        raise ValueError("--flow-arch mlp_lin_x is supported only for theta_flow/theta_path_integral.")
     if _tfm_val == "x_flow" and _arch == "film_fourier":
         if _fx_omega_mode == "theta_range":
             lo = float(getattr(args, "theta_low", -6.0))
@@ -2220,14 +2229,18 @@ def run_shared_fisher_estimation(
         theta_std = float(np.std(theta_score_fit))
         theta_dim_flow = int(theta_score_fit.shape[1]) if theta_score_fit.ndim >= 2 else 1
         flow_score_arch = str(flow_arch).strip().lower()
-        flow_prior_arch = "mlp" if flow_score_arch == "soft_moe" else str(flow_arch).strip().lower()
+        flow_prior_arch = (
+            "mlp"
+            if flow_score_arch in ("soft_moe", "mlp_lin_x")
+            else str(flow_arch).strip().lower()
+        )
         theta_onehot_state = bool(getattr(args, "theta_flow_onehot_state", False))
         if theta_onehot_state:
             if theta_field_method != "theta_flow":
                 raise ValueError("--theta-flow-onehot-state requires theta_field_method=theta_flow.")
-            if flow_score_arch != "mlp" or flow_prior_arch != "mlp":
+            if flow_score_arch not in ("mlp", "mlp_lin_x") or flow_prior_arch != "mlp":
                 raise ValueError(
-                    "--theta-flow-onehot-state currently supports flow_arch=mlp only "
+                    "--theta-flow-onehot-state currently supports flow_arch=mlp or mlp_lin_x "
                     f"(got posterior={flow_score_arch!r}, prior={flow_prior_arch!r})."
                 )
             if theta_dim_flow < 2:
@@ -2365,6 +2378,22 @@ def run_shared_fisher_estimation(
                     use_logit_time=True,
                     theta_dim=theta_dim_flow,
                 ).to(device)
+            elif flow_score_arch == "mlp_lin_x":
+                post_ckpt_hparams = {
+                    "x_dim": int(args.x_dim),
+                    "hidden_dim": int(getattr(args, "flow_hidden_dim", 128)),
+                    "depth": int(getattr(args, "flow_depth", 3)),
+                    "use_logit_time": True,
+                    "theta_dim": int(theta_dim_flow),
+                    "variant": "linear_x_embed",
+                }
+                post_model = ConditionalThetaFlowVelocityLinearXEmbed(
+                    x_dim=args.x_dim,
+                    hidden_dim=int(getattr(args, "flow_hidden_dim", 128)),
+                    depth=int(getattr(args, "flow_depth", 3)),
+                    use_logit_time=True,
+                    theta_dim=theta_dim_flow,
+                ).to(device)
             elif flow_score_arch == "soft_moe":
                 post_ckpt_hparams = {
                     "x_dim": int(args.x_dim),
@@ -2440,7 +2469,7 @@ def run_shared_fisher_estimation(
                     theta_fourier_include_bias=not bool(getattr(args, "flow_theta_fourier_no_bias", False)),
                 ).to(device)
             else:
-                raise ValueError("--flow-arch must be one of {'mlp','soft_moe','film','film_fourier'}.")
+                raise ValueError("--flow-arch must be one of {'mlp','mlp_lin_x','soft_moe','film','film_fourier'}.")
         else:
             post_model = None
             post_ckpt_hparams = {}

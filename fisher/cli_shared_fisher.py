@@ -395,11 +395,13 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         "--flow-arch",
         type=str,
         default="mlp",
-        choices=["mlp", "soft_moe", "film", "film_fourier"],
+        choices=["mlp", "mlp_lin_x", "soft_moe", "film", "film_fourier"],
         help=(
             "Flow architecture shared by theta_flow, theta_path_integral, and x_flow: "
-            "mlp, soft_moe (dense soft gating over MLP experts), "
-            "film (FiLM blocks with embedded raw theta), or "
+            "mlp (concatenate theta_t, full x, t); "
+            "mlp_lin_x (concatenate theta_t, e(x)=Linear(x)->scalar, t); "
+            "soft_moe (dense soft gating over MLP experts); "
+            "film (FiLM blocks with embedded raw theta); or "
             "film_fourier (FiLM blocks with Fourier theta features)."
         ),
     )

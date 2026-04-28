@@ -212,6 +212,65 @@ class ConditionalThetaFlowVelocity(nn.Module):
         return self.forward(theta, x, t)
 
 
+class ConditionalThetaFlowVelocityLinearXEmbed(nn.Module):
+    """Conditional theta-velocity v(theta_t, x, t) with MLP on [theta_t, e(x), t].
+
+    ``e(x)`` is a single linear map ``x -> scalar`` (``nn.Linear(x_dim, 1)``); the trunk MLP matches
+    :class:`ConditionalThetaFlowVelocity` except raw ``x`` is replaced by ``e(x)``.
+    """
+
+    def __init__(
+        self,
+        x_dim: int = 2,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        use_logit_time: bool = True,
+        *,
+        theta_dim: int = 1,
+    ) -> None:
+        super().__init__()
+        if x_dim < 2:
+            raise ValueError("x_dim must be >= 2.")
+        if int(theta_dim) < 1:
+            raise ValueError("theta_dim must be >= 1.")
+        self.x_dim = int(x_dim)
+        self.theta_dim = int(theta_dim)
+        self.use_logit_time = bool(use_logit_time)
+        self.x_embed = nn.Linear(int(x_dim), 1)
+        in_dim = self.theta_dim + 1 + 1  # theta_t, e(x), t_feat
+        layers: list[nn.Module] = []
+        for _ in range(depth):
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            layers.append(nn.SiLU())
+            in_dim = hidden_dim
+        layers.append(nn.Linear(hidden_dim, self.theta_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, theta_t: torch.Tensor, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        if theta_t.ndim == 1:
+            theta_t = theta_t.unsqueeze(-1)
+        if theta_t.shape[-1] != self.theta_dim:
+            raise ValueError(f"theta_t last dim {theta_t.shape[-1]} != theta_dim={self.theta_dim}")
+        if x.shape[-1] != self.x_dim:
+            raise ValueError(f"x last dim {x.shape[-1]} != x_dim={self.x_dim}")
+        if t.ndim == 1:
+            t = t.unsqueeze(-1)
+        if self.use_logit_time:
+            t_clip = torch.clamp(t, min=1e-4, max=1.0 - 1e-4)
+            t_feat = torch.log(t_clip) - torch.log1p(-t_clip)
+        else:
+            t_feat = t
+        e_x = self.x_embed(x)
+        feats = torch.cat([theta_t, e_x, t_feat], dim=-1)
+        return self.net(feats)
+
+    @torch.no_grad()
+    def predict_velocity(self, theta: torch.Tensor, x: torch.Tensor, t_eval: float) -> torch.Tensor:
+        self.eval()
+        t = torch.full((theta.shape[0], 1), float(t_eval), device=theta.device)
+        return self.forward(theta, x, t)
+
+
 class ConditionalThetaFlowVelocitySoftMoE(nn.Module):
     """Conditional theta-velocity model with dense soft-MoE and a shared backbone.
 

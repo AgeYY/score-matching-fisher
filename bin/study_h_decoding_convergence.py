@@ -451,9 +451,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--nf-epochs", type=int, default=2000, help="NF method only: training epochs.")
     p.add_argument("--nf-batch-size", type=int, default=256, help="NF method only: training batch size.")
     p.add_argument("--nf-lr", type=float, default=1e-3, help="NF method only: learning rate.")
-    p.add_argument("--nf-hidden-dim", type=int, default=128, help="NF method only: encoder hidden size.")
-    p.add_argument("--nf-context-dim", type=int, default=32, help="NF method only: context size.")
+    p.add_argument("--nf-hidden-dim", type=int, default=128, help="NF method only: hidden size for MLP encoder AND NSF spline nets.")
+    p.add_argument("--nf-context-dim", type=int, default=32, help="NF method only: NSF context dimension (ignored when --nf-x-encoder linear).")
     p.add_argument("--nf-transforms", type=int, default=5, help="NF method only: spline transform count.")
+    p.add_argument(
+        "--nf-x-encoder",
+        type=str,
+        default="mlp",
+        choices=["mlp", "linear"],
+        help=(
+            "NF method only: encode x into NSF context — mlp (SiLU MLP x→context_dim) or "
+            "linear (single Linear layer x→scalar; forces context_dim=1)."
+        ),
+    )
     p.add_argument(
         "--nf-pair-batch-size",
         type=int,
@@ -568,6 +578,11 @@ def _validate_cli(args: argparse.Namespace) -> None:
         alpha = float(getattr(args, "nf_early_ema_alpha", 0.0))
         if not np.isfinite(alpha) or alpha <= 0.0 or alpha > 1.0:
             raise ValueError("--nf-early-ema-alpha must be in (0, 1].")
+        xenc = str(getattr(args, "nf_x_encoder", "mlp")).strip().lower()
+        if xenc not in ("mlp", "linear"):
+            raise ValueError("--nf-x-encoder must be one of {'mlp','linear'}.")
+        if xenc == "linear":
+            setattr(args, "nf_context_dim", 1)
         _pe = getattr(args, "nf_prior_epochs", None)
         if _pe is not None and int(_pe) < 1:
             raise ValueError("--nf-prior-epochs must be >= 1.")
@@ -926,6 +941,9 @@ def _estimate_one(
         nf_lr = float(getattr(args, "nf_lr", 1e-3))
         nf_hidden_dim = int(getattr(args, "nf_hidden_dim", 128))
         nf_context_dim = int(getattr(args, "nf_context_dim", 32))
+        nf_x_encoder = str(getattr(args, "nf_x_encoder", "mlp")).strip().lower()
+        if nf_x_encoder == "linear":
+            nf_context_dim = 1
         nf_transforms = int(getattr(args, "nf_transforms", 5))
         nf_early_patience = int(getattr(args, "nf_early_patience", 300))
         nf_early_min_delta = float(getattr(args, "nf_early_min_delta", 1e-4))
@@ -948,6 +966,7 @@ def _estimate_one(
             context_dim=nf_context_dim,
             hidden_dim=nf_hidden_dim,
             transforms=nf_transforms,
+            x_encoder=nf_x_encoder,
         ).to(dev)
         train_out = train_conditional_nf(
             model=model,
@@ -1179,6 +1198,10 @@ def _approx_gt_posterior_density(
 ) -> np.ndarray:
     td = np.asarray(theta_dense, dtype=np.float64).reshape(-1)
     x1 = np.asarray(x_fixed, dtype=np.float64).reshape(1, -1)
+    gen_dim = int(getattr(dataset, "x_dim", int(x1.shape[1])))
+    if int(x1.shape[1]) != gen_dim:
+        # Embedded high-dim x (e.g. PR autoencoder): native toy likelihood expects z_dim rows.
+        return np.full(td.shape[0], np.nan, dtype=np.float64)
     if td.size < 2:
         return np.zeros_like(td, dtype=np.float64)
     x_rep = np.repeat(x1, repeats=td.size, axis=0)
@@ -1252,7 +1275,8 @@ def _plot_fixed_x_column(
     ax_top.fill_between(th_s, 0.0, w_s, color="#1f77b4", alpha=0.22, step="mid")
     ax_top.plot(th_s, w_s, "o", color="#1f77b4", ms=2, alpha=0.55, label="Posterior mass on θ samples")
     ax_top.plot(th_grid, q_model, color="#1f77b4", lw=1.6, label=f"Model posterior (approx; {logp_source})")
-    ax_top.plot(th_grid, q_gt, color="#d62728", lw=1.5, ls="--", label="GT posterior (approx)")
+    if np.any(np.isfinite(q_gt)):
+        ax_top.plot(th_grid, q_gt, color="#d62728", lw=1.5, ls="--", label="GT posterior (approx)")
     ax_top.set_ylabel("density")
     ax_top.set_title(
         f"Fixed-$x$ posterior diagnostics  (row $i$={int(i_fix)},  method={hfm})",
@@ -3129,6 +3153,11 @@ def main(argv: list[str] | None = None) -> None:
         print(
             f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
             "(conditional normalizing flow posterior + learned prior)",
+            flush=True,
+        )
+        print(
+            f"[convergence] nf x-encoder={getattr(args, 'nf_x_encoder', 'mlp')} "
+            f"context_dim={(1 if str(getattr(args, 'nf_x_encoder', 'mlp')).strip().lower() == 'linear' else int(getattr(args, 'nf_context_dim', 32)))}",
             flush=True,
         )
         print(

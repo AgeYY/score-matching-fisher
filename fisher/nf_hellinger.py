@@ -33,19 +33,33 @@ class ConditionalThetaNF(nn.Module):
         context_dim: int,
         hidden_dim: int,
         transforms: int,
+        x_encoder: str = "mlp",
     ) -> None:
         super().__init__()
         require_zuko_for_nf()
-        self.encoder = nn.Sequential(
-            nn.Linear(int(x_dim), int(hidden_dim)),
-            nn.SiLU(),
-            nn.Linear(int(hidden_dim), int(hidden_dim)),
-            nn.SiLU(),
-            nn.Linear(int(hidden_dim), int(context_dim)),
-        )
+        enc = str(x_encoder).strip().lower()
+        if enc == "linear":
+            if int(context_dim) != 1:
+                raise ValueError(
+                    "ConditionalThetaNF x_encoder='linear' requires context_dim=1 (NSF context is the scalar e(x))."
+                )
+            self.encoder: nn.Module = nn.Linear(int(x_dim), 1)
+            ctx = 1
+        elif enc == "mlp":
+            ctx = int(context_dim)
+            self.encoder = nn.Sequential(
+                nn.Linear(int(x_dim), int(hidden_dim)),
+                nn.SiLU(),
+                nn.Linear(int(hidden_dim), int(hidden_dim)),
+                nn.SiLU(),
+                nn.Linear(int(hidden_dim), ctx),
+            )
+        else:
+            raise ValueError("x_encoder must be one of {'mlp','linear'}.")
+        self.x_encoder_kind = enc
         self.flow = zuko.flows.NSF(  # type: ignore[union-attr]
             features=1,
-            context=int(context_dim),
+            context=int(ctx),
             transforms=int(transforms),
             hidden_features=[int(hidden_dim), int(hidden_dim)],
         )

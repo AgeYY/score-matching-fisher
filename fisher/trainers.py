@@ -12,6 +12,7 @@ from fisher.models import (
     ConditionalScore1D,
     ConditionalScore1DFiLMPerLayer,
     ConditionalThetaFlowVelocity,
+    ConditionalThetaFlowVelocityLinearXEmbed,
     ConditionalThetaFlowVelocityFiLMPerLayer,
     ConditionalThetaFlowVelocityThetaFourierMLP,
     ConditionalXFlowVelocity,
@@ -948,6 +949,7 @@ def _theta_flow_exact_divergence(
 def _theta_flow_conditional_nll_aux_loss(
     *,
     model: ConditionalThetaFlowVelocity
+    | ConditionalThetaFlowVelocityLinearXEmbed
     | ConditionalThetaFlowVelocityFiLMPerLayer
     | ConditionalThetaFlowVelocityThetaFourierMLP,
     theta_target: torch.Tensor,
@@ -1296,6 +1298,7 @@ def _train_conditional_x_flow_phase(
 
 def train_conditional_theta_flow_likelihood_finetune(
     model: ConditionalThetaFlowVelocity
+    | ConditionalThetaFlowVelocityLinearXEmbed
     | ConditionalThetaFlowVelocityFiLMPerLayer
     | ConditionalThetaFlowVelocityThetaFourierMLP,
     theta_train: np.ndarray,
@@ -1550,6 +1553,7 @@ def train_prior_theta_flow_likelihood_finetune(
 
 def train_conditional_theta_flow_model(
     model: ConditionalThetaFlowVelocity
+    | ConditionalThetaFlowVelocityLinearXEmbed
     | ConditionalThetaFlowVelocityFiLMPerLayer
     | ConditionalThetaFlowVelocityThetaFourierMLP,
     theta_train: np.ndarray,
