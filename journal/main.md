@@ -16,6 +16,8 @@ Collected markdown notes in `journal/notes/`: long-form chapters (moved from the
 
 ## 2026-04
 
+- [2026-04-29 H-decoding: B-spline diagonal-$\theta$ linear X-flow (`linear_x_flow_diagonal_theta_spline`) on 10D `cosine_gaussian_sqrtd` — method, poor `corr_h` vs MLP baseline, repro + figure](notes/2026-04-29-h-decoding-lxf-diagonal-theta-spline-xdim10.md)
+
 - [2026-04-26 H-decoding `theta_flow`: 3D cosine $\sqrt{d}$ + 2D/3D `randamp_gaussian`, NFS `--keep-intermediate`, artifacts + fixed-$x$ figure (Markdown + commands)](notes/2026-04-26-h-decoding-theta-flow-lowdim-cosine-randamp-nfs-keep-intermediate.md)
 
 - [2026-04-25 x-flow (`--theta-field-method x_flow`): conditional $x$-space flow matching, ODE $\log p(x\mid\theta)$, and H-decoding / Hellinger matrix pipeline (`flow_x_likelihood`)](notes/2026-04-25-x-flow-conditional-likelihood-hellinger-h-decoding.md)

@@ -14,6 +14,9 @@ The variant :class:`ConditionalThetaDiagonalLinearXFlowMLP` uses
 ``v(x,theta)=diag(a_phi(theta)) x + b_phi(theta)``; the endpoint is a
 diagonal Gaussian with
 ``Sigma_ii=exp(2 a_i)`` and ``mu_i=((e^{a_i}-1)/a_i) b_i`` (elementwise).
+
+:class:`ConditionalThetaDiagonalSplineLinearXFlowMLP` is the same diagonal flow, but ``a`` and ``b``
+are linear maps of fixed scalar-theta B-spline features (see ``spline_basis_features_normalized``).
 """
 
 from __future__ import annotations
@@ -46,6 +49,116 @@ def _phi_expm1_div_a(a: torch.Tensor) -> torch.Tensor:
     safe_a = torch.where(mask, torch.ones_like(a), a)
     ref = torch.expm1(a) / safe_a
     return torch.where(mask, taylor, ref)
+
+
+def open_uniform_clamped_knot_vector(
+    num_basis: int,
+    degree: int = 3,
+    *,
+    dtype: torch.dtype = torch.float32,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    """Open-uniform clamped B-spline knot vector for ``num_basis`` functions at given ``degree``.
+
+    Returns ``U`` of length ``num_basis + degree + 1`` (Cox--de Boor indexing).
+    """
+    n = int(num_basis)
+    p = int(degree)
+    if n < 1:
+        raise ValueError("num_basis must be >= 1.")
+    if p < 1:
+        raise ValueError("degree must be >= 1.")
+    if n < p + 1:
+        raise ValueError(f"num_basis must be >= degree+1 (need {p + 1}); got {n}.")
+    m = n + p  # last knot index; total knots = m + 1
+    u = torch.zeros(m + 1, dtype=dtype, device=device)
+    u[: p + 1] = 0.0
+    u[m - p :] = 1.0
+    if n - p - 1 > 0:
+        for j in range(1, n - p):
+            u[p + j] = float(j) / float(n - p)
+    return u
+
+
+def bspline_basis_phi_batch(
+    u01: torch.Tensor,
+    knots: torch.Tensor,
+    degree: int,
+) -> torch.Tensor:
+    """Evaluate clamped B-spline basis ``N_{i,p}(u)`` for all ``i=0..n-1``.
+
+    ``u01`` has shape ``[B]`` with values in ``[0, 1]``. ``knots`` has length ``n+p+1``.
+    Returns ``phi`` of shape ``[B, n]`` where ``n = len(knots) - degree - 1``.
+    """
+    if u01.ndim != 1:
+        raise ValueError("u01 must be 1D [B].")
+    p = int(degree)
+    dtype = u01.dtype
+    device = u01.device
+    u = u01.clamp(1e-6, 1.0 - 1e-6)
+    u_mat = knots.to(dtype=dtype, device=device)
+    m = int(u_mat.shape[0]) - 1
+    n = m - p
+    if n < 1:
+        raise ValueError("Invalid knots/degree: inferred num_basis < 1.")
+    bsz = int(u.shape[0])
+    ui = u[:, None]
+    u_left = u_mat[:-1].unsqueeze(0)
+    u_right = u_mat[1:].unsqueeze(0)
+    span_len = u_right - u_left
+    zero_len = span_len.abs() < 1e-15
+    interior = (ui >= u_left) & (ui < u_right)
+    n0 = interior & ~zero_len
+    n_curr = n0.to(dtype=dtype)
+    eps_d = torch.tensor(1e-15, dtype=dtype, device=device)
+
+    for _r in range(1, p + 1):
+        m_new = m - _r
+        n_next = torch.zeros(bsz, m_new, dtype=dtype, device=device)
+        for i in range(m_new):
+            u_i = u_mat[i]
+            u_ir = u_mat[i + _r]
+            denom1 = u_ir - u_i
+            t1 = torch.where(
+                denom1.abs() > eps_d,
+                (u - u_i) / denom1 * n_curr[:, i],
+                torch.zeros(bsz, dtype=dtype, device=device),
+            )
+            u_i1 = u_mat[i + 1]
+            u_ir1 = u_mat[i + _r + 1]
+            denom2 = u_ir1 - u_i1
+            t2 = torch.where(
+                denom2.abs() > eps_d,
+                (u_ir1 - u) / denom2 * n_curr[:, i + 1],
+                torch.zeros(bsz, dtype=dtype, device=device),
+            )
+            n_next[:, i] = t1 + t2
+        n_curr = n_next
+    if int(n_curr.shape[1]) != n:
+        raise RuntimeError(f"B-spline basis width mismatch: got {n_curr.shape[1]}, expected {n}.")
+    return n_curr
+
+
+def spline_basis_features_normalized(
+    theta: torch.Tensor,
+    *,
+    theta_min: torch.Tensor,
+    theta_max: torch.Tensor,
+    num_basis: int,
+    knots: torch.Tensor,
+    degree: int = 3,
+) -> torch.Tensor:
+    """Map scalar ``theta`` to ``[0,1]`` and return B-spline features ``phi`` of shape ``[B, K]``."""
+    if theta.ndim == 1:
+        theta = theta.unsqueeze(-1)
+    if int(theta.shape[1]) != 1:
+        raise ValueError("spline_basis_features_normalized expects theta with last dim 1 (scalar theta).")
+    t0 = theta_min.to(dtype=theta.dtype, device=theta.device).reshape(1, 1)
+    t1 = theta_max.to(dtype=theta.dtype, device=theta.device).reshape(1, 1)
+    den = (t1 - t0).clamp_min(1e-12)
+    u01 = ((theta - t0) / den).clamp(0.0, 1.0)
+    u_flat = u01.reshape(-1).clamp(1e-6, 1.0 - 1e-6)
+    return bspline_basis_phi_batch(u_flat, knots, int(degree))
 
 
 def _as_2d_float64(a: np.ndarray, *, name: str) -> np.ndarray:
@@ -290,6 +403,134 @@ class ConditionalThetaDiagonalLinearXFlowMLP(nn.Module):
         a_theta, b_theta = self.a_b(theta)
         phi = _phi_expm1_div_a(a_theta)
         mu = phi * b_theta
+        sigma_diag = torch.exp(2.0 * a_theta) + float(solve_jitter)
+        return mu, sigma_diag
+
+    def log_prob_normalized(
+        self,
+        x_norm: torch.Tensor,
+        theta: torch.Tensor,
+        *,
+        solve_jitter: float = 1e-6,
+    ) -> torch.Tensor:
+        if x_norm.ndim == 1:
+            x_norm = x_norm.unsqueeze(0)
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        if x_norm.shape[0] != theta.shape[0]:
+            raise ValueError("x and theta batch sizes must match.")
+        mu, sigma_diag = self.endpoint_mean_covariance_diag(theta, solve_jitter=solve_jitter)
+        d = int(x_norm.shape[1])
+        quad = torch.sum((x_norm - mu) ** 2 / sigma_diag, dim=1)
+        log_det = torch.sum(torch.log(sigma_diag), dim=1)
+        return -0.5 * (quad + log_det + float(d) * math.log(2.0 * math.pi))
+
+    def log_prob_observed(
+        self,
+        x_raw: torch.Tensor,
+        theta: torch.Tensor,
+        *,
+        x_mean: torch.Tensor,
+        x_std: torch.Tensor,
+        solve_jitter: float = 1e-6,
+    ) -> torch.Tensor:
+        z = (x_raw - x_mean) / x_std
+        logjac = -torch.sum(torch.log(x_std))
+        return self.log_prob_normalized(z, theta, solve_jitter=solve_jitter) + logjac
+
+
+class ConditionalThetaDiagonalSplineLinearXFlowMLP(nn.Module):
+    """Diagonal drift ``a(theta)`` and offset ``b(theta)`` from fixed B-spline features of scalar ``theta``.
+
+    Velocity ``v(x,theta)=a(theta) \\odot x + b(theta)`` with the same diagonal-Gaussian endpoint as
+    :class:`ConditionalThetaDiagonalLinearXFlowMLP` (``\\Sigma_{ii}=exp(2 a_i)``,
+    ``\\mu_i = ((e^{a_i}-1)/a_i) b_i``).
+
+    ``theta`` is normalized to ``[0,1]`` using fixed ``theta_min``, ``theta_max`` (typically from the
+    training set). Only ``theta_dim=1`` is supported.
+    """
+
+    def __init__(
+        self,
+        *,
+        theta_dim: int,
+        x_dim: int,
+        theta_min: float,
+        theta_max: float,
+        num_basis: int = 5,
+        spline_degree: int = 3,
+    ) -> None:
+        super().__init__()
+        if int(theta_dim) != 1:
+            raise ValueError(
+                "ConditionalThetaDiagonalSplineLinearXFlowMLP requires scalar theta (theta_dim=1)."
+            )
+        if int(x_dim) < 1:
+            raise ValueError("x_dim must be >= 1.")
+        self.theta_dim = 1
+        self.x_dim = int(x_dim)
+        self.num_basis = int(num_basis)
+        self.spline_degree = int(spline_degree)
+        if self.num_basis < self.spline_degree + 1:
+            raise ValueError(
+                f"num_basis must be >= spline_degree+1 (need {self.spline_degree + 1}); got {self.num_basis}."
+            )
+        knots = open_uniform_clamped_knot_vector(
+            self.num_basis,
+            degree=self.spline_degree,
+            dtype=torch.float32,
+        )
+        self.register_buffer("knots", knots)
+        tmn = float(theta_min)
+        tmx = float(theta_max)
+        if (not np.isfinite(tmn)) or (not np.isfinite(tmx)):
+            raise ValueError("theta_min and theta_max must be finite.")
+        if tmx <= tmn:
+            tmx = tmn + 1e-6
+        self.register_buffer("theta_min_buf", torch.tensor([tmn], dtype=torch.float32))
+        self.register_buffer("theta_max_buf", torch.tensor([tmx], dtype=torch.float32))
+        self.Wa = nn.Parameter(torch.zeros(self.x_dim, self.num_basis))
+        self.ca = nn.Parameter(torch.full((self.x_dim,), 1e-3))
+        self.Wb = nn.Parameter(torch.zeros(self.x_dim, self.num_basis))
+        self.cb = nn.Parameter(torch.zeros(self.x_dim))
+        nn.init.normal_(self.Wa, mean=0.0, std=0.02)
+        nn.init.normal_(self.Wb, mean=0.0, std=0.02)
+
+    def spline_phi(self, theta: torch.Tensor) -> torch.Tensor:
+        return spline_basis_features_normalized(
+            theta,
+            theta_min=self.theta_min_buf,
+            theta_max=self.theta_max_buf,
+            num_basis=self.num_basis,
+            knots=self.knots,
+            degree=self.spline_degree,
+        )
+
+    def a_b(self, theta: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        phi = self.spline_phi(theta)
+        a_theta = phi @ self.Wa.T + self.ca
+        b_theta = phi @ self.Wb.T + self.cb
+        return a_theta, b_theta
+
+    def forward(self, x: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
+        a_theta, b_theta = self.a_b(theta)
+        return a_theta * x + b_theta
+
+    def regularization_loss(self) -> torch.Tensor | None:
+        return None
+
+    def endpoint_mean_covariance_diag(
+        self,
+        theta: torch.Tensor,
+        *,
+        solve_jitter: float = 1e-6,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Returns ``mu`` [B, D] and diagonal variance ``sigma_diag`` [B, D] in normalized space."""
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        a_theta, b_theta = self.a_b(theta)
+        phi_scale = _phi_expm1_div_a(a_theta)
+        mu = phi_scale * b_theta
         sigma_diag = torch.exp(2.0 * a_theta) + float(solve_jitter)
         return mu, sigma_diag
 

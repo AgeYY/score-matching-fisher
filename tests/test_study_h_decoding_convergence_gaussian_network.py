@@ -541,6 +541,7 @@ class TestStudyHDecodingConvergenceGaussianNetwork(unittest.TestCase):
             ("linear-x-flow-scalar", "linear_x_flow_scalar"),
             ("linear-x-flow-diagonal", "linear_x_flow_diagonal"),
             ("linear-x-flow-diagonal-theta", "linear_x_flow_diagonal_theta"),
+            ("linear-x-flow-diagonal-theta-spline", "linear_x_flow_diagonal_theta_spline"),
             ("linear-x-flow-low-rank", "linear_x_flow_low_rank"),
             ("linear-x-flow-low-rank-randb", "linear_x_flow_low_rank_randb"),
         ):
@@ -583,6 +584,8 @@ class TestStudyHDecodingConvergenceGaussianNetwork(unittest.TestCase):
                     "16",
                     "--lxf-depth",
                     "1",
+                    "--lxf-spline-k",
+                    "5",
                     "--lxf-low-rank-dim",
                     "1",
                     "--lxf-early-patience",

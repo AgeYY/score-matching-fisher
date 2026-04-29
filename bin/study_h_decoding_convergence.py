@@ -46,6 +46,8 @@ uses the same objective with a diagonal covariance / Cholesky (see ``fisher/gaus
 induced Gaussian with theta-dependent mean and shared covariance.
 ``--theta-field-method linear-x-flow-diagonal-theta`` trains ``v(x,theta)=diag(a_phi(theta)) x+b_phi(theta)``
 and evaluates a diagonal Gaussian with theta-dependent mean and diagonal covariance.
+``--theta-field-method linear-x-flow-diagonal-theta-spline`` is the same diagonal flow, but ``a`` and ``b``
+are linear maps of fixed scalar-theta B-spline features (default ``K=5``).
 ``--theta-field-method linear-x-flow-schedule`` uses the same time-independent velocity network
 and likelihood, but trains on a scheduled affine probability path such as cosine.
 ``--theta-field-method nf-reduction`` learns an invertible x-space flow to ``(z, epsilon)`` and
@@ -136,6 +138,7 @@ from fisher.linear_x_flow import (
     ConditionalRandomBasisLowRankLinearXFlowMLP,
     ConditionalScalarLinearXFlowMLP,
     ConditionalThetaDiagonalLinearXFlowMLP,
+    ConditionalThetaDiagonalSplineLinearXFlowMLP,
     compute_linear_x_flow_c_matrix,
     train_linear_x_flow,
     train_linear_x_flow_schedule,
@@ -860,6 +863,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lxf-lr", type=float, default=1e-4, help="linear-x-flow only: learning rate.")
     p.add_argument("--lxf-hidden-dim", type=int, default=128, help="linear-x-flow only: b_phi MLP hidden width.")
     p.add_argument("--lxf-depth", type=int, default=3, help="linear-x-flow only: b_phi MLP depth.")
+    p.add_argument(
+        "--lxf-spline-k",
+        type=int,
+        default=5,
+        help="linear-x-flow-diagonal-theta-spline only: number of B-spline basis functions K (cubic, clamped).",
+    )
     p.add_argument("--lxf-low-rank-dim", type=int, default=4, help="linear-x-flow-low-rank only: rank r.")
     p.add_argument("--lxf-randb-lambda-a", type=float, default=1e-4, help="linear-x-flow-low-rank-randb only: L2 penalty on diagonal a.")
     p.add_argument("--lxf-randb-lambda-s", type=float, default=1e-4, help="linear-x-flow-low-rank-randb only: L2 penalty on symmetric S.")
@@ -1250,6 +1259,8 @@ def _normalize_linear_x_flow_method(tfm: str) -> str | None:
         "linear_x_flow_diagonal": "linear_x_flow_diagonal",
         "linear-x-flow-diagonal-theta": "linear_x_flow_diagonal_theta",
         "linear_x_flow_diagonal_theta": "linear_x_flow_diagonal_theta",
+        "linear-x-flow-diagonal-theta-spline": "linear_x_flow_diagonal_theta_spline",
+        "linear_x_flow_diagonal_theta_spline": "linear_x_flow_diagonal_theta_spline",
         "linear-x-flow-low-rank": "linear_x_flow_low_rank",
         "linear_x_flow_low_rank": "linear_x_flow_low_rank",
         "linear-x-flow-low-rank-randb": "linear_x_flow_low_rank_randb",
@@ -1450,6 +1461,12 @@ def _validate_lxf_cli(args: argparse.Namespace) -> None:
             raise ValueError("--lxf-randb-lambda-a must be >= 0.")
         if float(getattr(args, "lxf_randb_lambda_s", 0.0)) < 0.0:
             raise ValueError("--lxf-randb-lambda-s must be >= 0.")
+    if method == "linear_x_flow_diagonal_theta_spline":
+        sk = int(getattr(args, "lxf_spline_k", 5))
+        if sk < 4:
+            raise ValueError("--lxf-spline-k must be >= 4 for cubic B-splines (degree 3).")
+        if sk > 64:
+            raise ValueError("--lxf-spline-k must be <= 64.")
     if float(getattr(args, f"{prefix}_weight_decay", 0.0)) < 0.0:
         raise ValueError(f"{label}-weight-decay must be >= 0.")
     te = float(getattr(args, f"{prefix}_t_eps", 1e-3))
@@ -1868,6 +1885,7 @@ def _validate_cli(args: argparse.Namespace) -> None:
         "linear_x_flow_scalar",
         "linear_x_flow_diagonal",
         "linear_x_flow_diagonal_theta",
+        "linear_x_flow_diagonal_theta_spline",
         "linear_x_flow_low_rank",
         "linear_x_flow_low_rank_randb",
         "linear_x_flow_schedule",
@@ -3328,6 +3346,24 @@ def _estimate_one(
                 hidden_dim=int(getattr(args, f"{lxf_prefix}_hidden_dim", 128)),
                 depth=int(getattr(args, f"{lxf_prefix}_depth", 3)),
             ).to(dev)
+        elif method_name == "linear_x_flow_diagonal_theta_spline":
+            if int(theta_all.shape[1]) != 1:
+                raise ValueError(
+                    f"{method_name} requires scalar theta (theta.shape[1]==1); got theta_dim={int(theta_all.shape[1])}."
+                )
+            drift_type = "diagonal_theta_spline"
+            tcol = np.asarray(theta_train[:, 0], dtype=np.float64).reshape(-1)
+            theta_min = float(np.min(tcol))
+            theta_max = float(np.max(tcol))
+            spline_k = int(getattr(args, "lxf_spline_k", 5))
+            model = ConditionalThetaDiagonalSplineLinearXFlowMLP(
+                theta_dim=1,
+                x_dim=x_dim_lxf,
+                theta_min=theta_min,
+                theta_max=theta_max,
+                num_basis=spline_k,
+                spline_degree=3,
+            ).to(dev)
         elif method_name == "linear_x_flow_low_rank":
             if lxf_rank > x_dim_lxf:
                 raise ValueError(f"--lxf-low-rank-dim must be <= x_dim={x_dim_lxf}; got {lxf_rank}.")
@@ -3421,6 +3457,7 @@ def _estimate_one(
             lxf_low_rank_dim=np.int64(lxf_rank if method_name in ("linear_x_flow_low_rank", "linear_x_flow_low_rank_randb") else 0),
             lxf_randb_lambda_a=np.float64(float(getattr(args, "lxf_randb_lambda_a", 1e-4)) if method_name == "linear_x_flow_low_rank_randb" else 0.0),
             lxf_randb_lambda_s=np.float64(float(getattr(args, "lxf_randb_lambda_s", 1e-4)) if method_name == "linear_x_flow_low_rank_randb" else 0.0),
+            lxf_spline_k=np.int64(int(getattr(args, "lxf_spline_k", 5)) if method_name == "linear_x_flow_diagonal_theta_spline" else 0),
             lxf_weight_ema_decay=np.float64(train_out.get("weight_ema_decay", float(getattr(args, f"{lxf_prefix}_weight_ema_decay", 0.9)))),
             lxf_weight_ema_enabled=np.bool_(train_out.get("weight_ema_enabled", False)),
             lxf_final_eval_weights=np.asarray([str(train_out.get("final_eval_weights", "raw"))], dtype=object),
@@ -3469,6 +3506,7 @@ def _estimate_one(
             lxf_low_rank_dim=np.int64(lxf_rank if method_name in ("linear_x_flow_low_rank", "linear_x_flow_low_rank_randb") else 0),
             lxf_randb_lambda_a=np.float64(float(getattr(args, "lxf_randb_lambda_a", 1e-4)) if method_name == "linear_x_flow_low_rank_randb" else 0.0),
             lxf_randb_lambda_s=np.float64(float(getattr(args, "lxf_randb_lambda_s", 1e-4)) if method_name == "linear_x_flow_low_rank_randb" else 0.0),
+            lxf_spline_k=np.int64(int(getattr(args, "lxf_spline_k", 5)) if method_name == "linear_x_flow_diagonal_theta_spline" else 0),
             lxf_weight_ema_decay=np.float64(train_out.get("weight_ema_decay", float(getattr(args, f"{lxf_prefix}_weight_ema_decay", 0.9)))),
             lxf_weight_ema_enabled=np.bool_(train_out.get("weight_ema_enabled", False)),
             lxf_final_eval_weights=np.asarray([str(train_out.get("final_eval_weights", "raw"))], dtype=object),
@@ -4679,6 +4717,8 @@ def _model_posterior_log_weights_for_fixed_x(
         return c, r"Linear X-flow diagonal $A$ log $p(x|\theta)$"
     if method == "linear_x_flow_diagonal_theta":
         return c, r"Linear X-flow diagonal $A(\theta)$ log $p(x|\theta)$"
+    if method == "linear_x_flow_diagonal_theta_spline":
+        return c, r"Linear X-flow diagonal $A(\theta)$ spline log $p(x|\theta)$"
     if method == "linear_x_flow_low_rank":
         return c, r"Linear X-flow low-rank $A$ log $p(x|\theta)$"
     if method == "linear_x_flow_low_rank_randb":
@@ -5365,6 +5405,8 @@ def _render_training_losses_panel(
             post_lab = "linear-x-flow diagonal FM likelihood"
         elif tfm == "linear_x_flow_diagonal_theta":
             post_lab = "linear-x-flow diagonal-theta FM likelihood"
+        elif tfm == "linear_x_flow_diagonal_theta_spline":
+            post_lab = "linear-x-flow diagonal-theta-spline FM likelihood"
         elif tfm == "linear_x_flow_low_rank":
             post_lab = "linear-x-flow low-rank FM likelihood"
         elif tfm == "linear_x_flow_low_rank_randb":
@@ -5804,6 +5846,8 @@ def _save_combined_convergence_figure(
             post_lab = "linear-x-flow diagonal FM likelihood"
         elif tfm == "linear_x_flow_diagonal_theta":
             post_lab = "linear-x-flow diagonal-theta FM likelihood"
+        elif tfm == "linear_x_flow_diagonal_theta_spline":
+            post_lab = "linear-x-flow diagonal-theta-spline FM likelihood"
         elif tfm == "linear_x_flow_low_rank":
             post_lab = "linear-x-flow low-rank FM likelihood"
         elif tfm == "linear_x_flow_low_rank_randb":
@@ -6265,6 +6309,7 @@ def _write_summary(
             "linear_x_flow_scalar",
             "linear_x_flow_diagonal",
             "linear_x_flow_diagonal_theta",
+            "linear_x_flow_diagonal_theta_spline",
             "linear_x_flow_low_rank",
             "linear_x_flow_low_rank_randb",
         ):
@@ -6282,6 +6327,7 @@ def _write_summary(
             f.write(f"lxf_weight_ema_decay: {float(getattr(args, 'lxf_weight_ema_decay', 0.0))}\n")
             f.write(f"lxf_early_patience: {int(getattr(args, 'lxf_early_patience', 0))}\n")
             f.write(f"lxf_pair_batch_size: {int(getattr(args, 'lxf_pair_batch_size', 0))}\n")
+            f.write(f"lxf_spline_k: {int(getattr(args, 'lxf_spline_k', 0))}\n")
         if _tfm_sum == "linear_x_flow_schedule":
             f.write(f"lxfs_path_schedule: {getattr(args, 'lxfs_path_schedule', '')}\n")
             f.write(f"lxfs_epochs: {int(getattr(args, 'lxfs_epochs', 0))}\n")
@@ -7266,6 +7312,19 @@ def main(argv: list[str] | None = None) -> None:
             "theta-dependent mean for C[i,j]=log p(x_i|theta_j), DeltaL=C-diag(C), and H via 1-sech(DeltaL/2).",
             flush=True,
         )
+    elif tfm == "linear_x_flow_diagonal_theta_spline":
+        print(
+            f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
+            f"(K={int(getattr(args, 'lxf_spline_k', 5))}; cubic B-spline features of scalar theta; straight-bridge FM)",
+            flush=True,
+        )
+        print(
+            "[convergence] linear_x_flow_diagonal_theta_spline mode trains "
+            "v(x,theta)=diag(a(theta)) x + b(theta) with a,b linear in fixed B-spline(phi(theta)), "
+            "then uses diagonal Gaussian p(x|theta) with Sigma_ii=exp(2 a_i(theta)) and "
+            "theta-dependent mean for C[i,j]=log p(x_i|theta_j), DeltaL=C-diag(C), and H via 1-sech(DeltaL/2).",
+            flush=True,
+        )
     elif tfm in (
         "linear_x_flow",
         "linear_x_flow_scalar",
@@ -7373,6 +7432,7 @@ def main(argv: list[str] | None = None) -> None:
             "theta_flow, theta-flow-autoencoder, theta_path_integral, x_flow, x-flow-autoencoder, x-flow-pca, "
             "ctsm_v, nf, contrastive, nf-reduction, gaussian-x-flow, gaussian-x-flow-diagonal, "
             "linear-x-flow, linear-x-flow-scalar, linear-x-flow-diagonal, linear-x-flow-diagonal-theta, "
+            "linear-x-flow-diagonal-theta-spline, "
             "linear-x-flow-low-rank, linear-x-flow-low-rank-randb, linear-x-flow-schedule, linear-theta-flow, gaussian-network, "
             "gaussian-network-diagonal, gaussian-network-diagonal-binned-pca, gaussian-network-low-rank, gaussian-network-autoencoder, "
             "or gaussian-network-diagonal-autoencoder."
