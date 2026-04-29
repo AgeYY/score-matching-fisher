@@ -1,0 +1,365 @@
+[convergence] GT Hellinger (MC likelihood) n_bins=10 n_mc=500 (n_bins*n_mc=5000 <= n_ref=5000) wall time: 0.2s (H track uses sqrt(H^2) vs sqrt(binned h_sym))
+[convergence] GT one-sided mean LLR (MC likelihood) n_bins=10 n_mc=500 wall time: 0.2s (LLR track: E_x[log p(x|θ_j)-log p(x|θ_i)] vs binned ΔL).
+[convergence] sweep n in --n-list: --theta-field-method=linear_x_flow (full symmetric A; shared linear A x plus theta-MLP offset FM)
+[convergence] linear_x_flow mode trains v(x,theta)=A x + b_phi(theta), then uses the induced Gaussian with theta-dependent mean and shared covariance for C[i,j]=log p(x_i|theta_j), DeltaL=C-diag(C), and H via 1-sech(DeltaL/2).
+[convergence] n_ref reference: no learned H training at n_ref; matrix-panel top row = MC GT sqrt(H^2); pairwise decoding from n_ref subset only.
+[convergence] reference dir (decoding-only artifacts) n=5000 -> /nfshome/zeyuan/score-matching-fisher/h_decoding_conv_cosine_gaussian_sqrtd_xdim50_linear_x_flow_20260429-115835/reference
+[convergence] n_list=[80, 200, 400, 600]
+[convergence] reference (GT + decoding) wall time: 0.2s
+[convergence] per-n training sweep is enabled; collecting training_losses from each run artifact.
+[linear_x_flow    1/2000] train_fm=2.107025 val_fm=1.980651 val_smooth=1.980651 best_smooth=1.980651 best_epoch=1
+[linear_x_flow    5/2000] train_fm=1.983784 val_fm=2.207870 val_smooth=2.008083 best_smooth=1.980651 best_epoch=1
+[linear_x_flow   10/2000] train_fm=1.958729 val_fm=2.093691 val_smooth=2.030320 best_smooth=1.980651 best_epoch=1
+[linear_x_flow   15/2000] train_fm=1.995136 val_fm=2.110369 val_smooth=2.037675 best_smooth=1.980651 best_epoch=1
+[linear_x_flow   20/2000] train_fm=2.040077 val_fm=1.949690 val_smooth=2.043833 best_smooth=1.980651 best_epoch=1
+[linear_x_flow   25/2000] train_fm=1.971210 val_fm=2.117765 val_smooth=2.060676 best_smooth=1.980651 best_epoch=1
+[linear_x_flow   30/2000] train_fm=2.049236 val_fm=2.124542 val_smooth=2.065327 best_smooth=1.980651 best_epoch=1
+[linear_x_flow   35/2000] train_fm=1.983516 val_fm=2.073355 val_smooth=2.065881 best_smooth=1.980651 best_epoch=1
+[linear_x_flow   40/2000] train_fm=1.929125 val_fm=2.199600 val_smooth=2.074429 best_smooth=1.980651 best_epoch=1
+[linear_x_flow   45/2000] train_fm=2.075639 val_fm=2.045911 val_smooth=2.065212 best_smooth=1.980651 best_epoch=1
+[linear_x_flow   50/2000] train_fm=2.027639 val_fm=2.111609 val_smooth=2.063539 best_smooth=1.980651 best_epoch=1
+[linear_x_flow   55/2000] train_fm=1.992840 val_fm=2.097422 val_smooth=2.069870 best_smooth=1.980651 best_epoch=1
+[linear_x_flow   60/2000] train_fm=1.996795 val_fm=2.014125 val_smooth=2.063823 best_smooth=1.980651 best_epoch=1
+[linear_x_flow   65/2000] train_fm=1.900565 val_fm=1.949340 val_smooth=2.054653 best_smooth=1.980651 best_epoch=1
+[linear_x_flow   70/2000] train_fm=1.910850 val_fm=2.117598 val_smooth=2.054086 best_smooth=1.980651 best_epoch=1
+[linear_x_flow   75/2000] train_fm=1.934756 val_fm=2.032578 val_smooth=2.050167 best_smooth=1.980651 best_epoch=1
+[linear_x_flow   80/2000] train_fm=1.905004 val_fm=2.117217 val_smooth=2.046894 best_smooth=1.980651 best_epoch=1
+[linear_x_flow   85/2000] train_fm=2.003207 val_fm=2.081183 val_smooth=2.046713 best_smooth=1.980651 best_epoch=1
+[linear_x_flow   90/2000] train_fm=1.992491 val_fm=2.105482 val_smooth=2.064147 best_smooth=1.980651 best_epoch=1
+[linear_x_flow   95/2000] train_fm=1.950336 val_fm=2.136693 val_smooth=2.063580 best_smooth=1.980651 best_epoch=1
+[linear_x_flow  100/2000] train_fm=1.824261 val_fm=2.196247 val_smooth=2.072957 best_smooth=1.980651 best_epoch=1
+[linear_x_flow  105/2000] train_fm=1.941582 val_fm=2.064996 val_smooth=2.073543 best_smooth=1.980651 best_epoch=1
+[linear_x_flow  110/2000] train_fm=1.974110 val_fm=2.112437 val_smooth=2.063691 best_smooth=1.980651 best_epoch=1
+[linear_x_flow  115/2000] train_fm=1.917776 val_fm=2.080523 val_smooth=2.062277 best_smooth=1.980651 best_epoch=1
+[linear_x_flow  120/2000] train_fm=1.970176 val_fm=2.105191 val_smooth=2.068774 best_smooth=1.980651 best_epoch=1
+[linear_x_flow  125/2000] train_fm=1.900754 val_fm=2.098306 val_smooth=2.076828 best_smooth=1.980651 best_epoch=1
+[linear_x_flow  130/2000] train_fm=1.920820 val_fm=2.054542 val_smooth=2.069757 best_smooth=1.980651 best_epoch=1
+[linear_x_flow  135/2000] train_fm=1.911351 val_fm=2.110768 val_smooth=2.078056 best_smooth=1.980651 best_epoch=1
+[linear_x_flow  140/2000] train_fm=1.925108 val_fm=2.039310 val_smooth=2.067209 best_smooth=1.980651 best_epoch=1
+[linear_x_flow  145/2000] train_fm=1.946208 val_fm=2.011508 val_smooth=2.061049 best_smooth=1.980651 best_epoch=1
+[linear_x_flow  150/2000] train_fm=1.933970 val_fm=2.094112 val_smooth=2.057024 best_smooth=1.980651 best_epoch=1
+[linear_x_flow  155/2000] train_fm=1.962012 val_fm=2.114041 val_smooth=2.072446 best_smooth=1.980651 best_epoch=1
+[linear_x_flow  160/2000] train_fm=1.863214 val_fm=2.077246 val_smooth=2.082429 best_smooth=1.980651 best_epoch=1
+[linear_x_flow  165/2000] train_fm=1.841776 val_fm=2.092475 val_smooth=2.088760 best_smooth=1.980651 best_epoch=1
+[linear_x_flow  170/2000] train_fm=1.952912 val_fm=2.124523 val_smooth=2.087979 best_smooth=1.980651 best_epoch=1
+[linear_x_flow  175/2000] train_fm=1.920169 val_fm=2.101151 val_smooth=2.089615 best_smooth=1.980651 best_epoch=1
+[linear_x_flow  180/2000] train_fm=1.889324 val_fm=2.191229 val_smooth=2.094476 best_smooth=1.980651 best_epoch=1
+[linear_x_flow  185/2000] train_fm=1.923942 val_fm=2.086627 val_smooth=2.093382 best_smooth=1.980651 best_epoch=1
+[linear_x_flow  190/2000] train_fm=1.904791 val_fm=1.991616 val_smooth=2.098422 best_smooth=1.980651 best_epoch=1
+[linear_x_flow  195/2000] train_fm=1.926424 val_fm=2.163635 val_smooth=2.094074 best_smooth=1.980651 best_epoch=1
+[linear_x_flow  200/2000] train_fm=1.825187 val_fm=2.107511 val_smooth=2.093763 best_smooth=1.980651 best_epoch=1
+[linear_x_flow  205/2000] train_fm=1.898087 val_fm=2.057146 val_smooth=2.093370 best_smooth=1.980651 best_epoch=1
+[linear_x_flow  210/2000] train_fm=1.840980 val_fm=2.068294 val_smooth=2.097469 best_smooth=1.980651 best_epoch=1
+[linear_x_flow  215/2000] train_fm=2.011392 val_fm=2.144987 val_smooth=2.095156 best_smooth=1.980651 best_epoch=1
+[linear_x_flow  220/2000] train_fm=1.967758 val_fm=2.146061 val_smooth=2.094162 best_smooth=1.980651 best_epoch=1
+[linear_x_flow  225/2000] train_fm=1.858652 val_fm=2.036095 val_smooth=2.093862 best_smooth=1.980651 best_epoch=1
+[linear_x_flow  230/2000] train_fm=1.866479 val_fm=2.114906 val_smooth=2.089696 best_smooth=1.980651 best_epoch=1
+[linear_x_flow  235/2000] train_fm=1.923898 val_fm=2.159253 val_smooth=2.102023 best_smooth=1.980651 best_epoch=1
+[linear_x_flow  240/2000] train_fm=1.821675 val_fm=2.143903 val_smooth=2.096453 best_smooth=1.980651 best_epoch=1
+[linear_x_flow  245/2000] train_fm=1.842375 val_fm=2.091135 val_smooth=2.096287 best_smooth=1.980651 best_epoch=1
+[linear_x_flow  250/2000] train_fm=1.944855 val_fm=2.134985 val_smooth=2.099822 best_smooth=1.980651 best_epoch=1
+[linear_x_flow  255/2000] train_fm=1.900032 val_fm=2.147384 val_smooth=2.106866 best_smooth=1.980651 best_epoch=1
+[linear_x_flow  260/2000] train_fm=1.889532 val_fm=2.104098 val_smooth=2.111077 best_smooth=1.980651 best_epoch=1
+[linear_x_flow  265/2000] train_fm=1.836448 val_fm=2.166265 val_smooth=2.115757 best_smooth=1.980651 best_epoch=1
+[linear_x_flow  270/2000] train_fm=1.916460 val_fm=2.021624 val_smooth=2.111362 best_smooth=1.980651 best_epoch=1
+[linear_x_flow  275/2000] train_fm=1.832889 val_fm=2.196888 val_smooth=2.107696 best_smooth=1.980651 best_epoch=1
+[linear_x_flow  280/2000] train_fm=1.929566 val_fm=1.992440 val_smooth=2.102452 best_smooth=1.980651 best_epoch=1
+[linear_x_flow  285/2000] train_fm=1.898387 val_fm=2.098222 val_smooth=2.108464 best_smooth=1.980651 best_epoch=1
+[linear_x_flow  290/2000] train_fm=1.853298 val_fm=2.057701 val_smooth=2.102908 best_smooth=1.980651 best_epoch=1
+[linear_x_flow  295/2000] train_fm=1.936464 val_fm=2.075859 val_smooth=2.105745 best_smooth=1.980651 best_epoch=1
+[linear_x_flow  300/2000] train_fm=1.806711 val_fm=2.131721 val_smooth=2.104787 best_smooth=1.980651 best_epoch=1
+[linear_x_flow early-stop] epoch=301 best_epoch=1 best_smooth=1.980651 patience=300
+[linear_x_flow restore-best] restored epoch=1 val_smooth=1.980651
+[convergence] fixed-x diagnostic -> /nfshome/zeyuan/score-matching-fisher/h_decoding_conv_cosine_gaussian_sqrtd_xdim50_linear_x_flow_20260429-115835/sweep_runs/n_000080/diagnostics/theta_flow_single_x_posterior_hist.png
+[convergence] n=80  corr_h=-0.1397  corr_clf=0.3630  corr_llr=-0.0160  wall=4.0s
+[convergence] n=80 training_loss copied -> /nfshome/zeyuan/score-matching-fisher/h_decoding_conv_cosine_gaussian_sqrtd_xdim50_linear_x_flow_20260429-115835/training_losses/n_000080.npz
+[linear_x_flow    1/2000] train_fm=2.005530 val_fm=2.092320 val_smooth=2.092320 best_smooth=2.092320 best_epoch=1
+[linear_x_flow    5/2000] train_fm=1.920974 val_fm=2.107580 val_smooth=2.095318 best_smooth=2.092320 best_epoch=1
+[linear_x_flow   10/2000] train_fm=2.026973 val_fm=2.121703 val_smooth=2.102286 best_smooth=2.092320 best_epoch=1
+[linear_x_flow   15/2000] train_fm=1.978016 val_fm=2.154342 val_smooth=2.110022 best_smooth=2.092320 best_epoch=1
+[linear_x_flow   20/2000] train_fm=2.013322 val_fm=2.115849 val_smooth=2.108411 best_smooth=2.092320 best_epoch=1
+[linear_x_flow   25/2000] train_fm=1.962338 val_fm=2.156712 val_smooth=2.111210 best_smooth=2.092320 best_epoch=1
+[linear_x_flow   30/2000] train_fm=1.999354 val_fm=2.084209 val_smooth=2.107624 best_smooth=2.092320 best_epoch=1
+[linear_x_flow   35/2000] train_fm=1.960702 val_fm=2.117538 val_smooth=2.118550 best_smooth=2.092320 best_epoch=1
+[linear_x_flow   40/2000] train_fm=2.042596 val_fm=2.064374 val_smooth=2.114075 best_smooth=2.092320 best_epoch=1
+[linear_x_flow   45/2000] train_fm=1.984877 val_fm=2.177080 val_smooth=2.120326 best_smooth=2.092320 best_epoch=1
+[linear_x_flow   50/2000] train_fm=2.002080 val_fm=2.041797 val_smooth=2.119116 best_smooth=2.092320 best_epoch=1
+[linear_x_flow   55/2000] train_fm=2.020871 val_fm=2.263897 val_smooth=2.132530 best_smooth=2.092320 best_epoch=1
+[linear_x_flow   60/2000] train_fm=1.948951 val_fm=2.098459 val_smooth=2.130139 best_smooth=2.092320 best_epoch=1
+[linear_x_flow   65/2000] train_fm=2.003080 val_fm=2.095155 val_smooth=2.131132 best_smooth=2.092320 best_epoch=1
+[linear_x_flow   70/2000] train_fm=1.993178 val_fm=2.071850 val_smooth=2.126797 best_smooth=2.092320 best_epoch=1
+[linear_x_flow   75/2000] train_fm=1.945500 val_fm=2.092153 val_smooth=2.120897 best_smooth=2.092320 best_epoch=1
+[linear_x_flow   80/2000] train_fm=1.975661 val_fm=2.168143 val_smooth=2.123002 best_smooth=2.092320 best_epoch=1
+[linear_x_flow   85/2000] train_fm=1.930614 val_fm=2.085473 val_smooth=2.118872 best_smooth=2.092320 best_epoch=1
+[linear_x_flow   90/2000] train_fm=2.000938 val_fm=2.106115 val_smooth=2.114410 best_smooth=2.092320 best_epoch=1
+[linear_x_flow   95/2000] train_fm=1.936512 val_fm=2.109130 val_smooth=2.113122 best_smooth=2.092320 best_epoch=1
+[linear_x_flow  100/2000] train_fm=1.978592 val_fm=2.120745 val_smooth=2.119947 best_smooth=2.092320 best_epoch=1
+[linear_x_flow  105/2000] train_fm=1.986924 val_fm=2.141131 val_smooth=2.118560 best_smooth=2.092320 best_epoch=1
+[linear_x_flow  110/2000] train_fm=1.989016 val_fm=2.118742 val_smooth=2.122899 best_smooth=2.092320 best_epoch=1
+[linear_x_flow  115/2000] train_fm=1.974849 val_fm=2.157497 val_smooth=2.120885 best_smooth=2.092320 best_epoch=1
+[linear_x_flow  120/2000] train_fm=2.003761 val_fm=2.122344 val_smooth=2.126610 best_smooth=2.092320 best_epoch=1
+[linear_x_flow  125/2000] train_fm=2.008022 val_fm=2.126940 val_smooth=2.123830 best_smooth=2.092320 best_epoch=1
+[linear_x_flow  130/2000] train_fm=1.993754 val_fm=2.166625 val_smooth=2.129561 best_smooth=2.092320 best_epoch=1
+[linear_x_flow  135/2000] train_fm=1.957992 val_fm=2.158416 val_smooth=2.127184 best_smooth=2.092320 best_epoch=1
+[linear_x_flow  140/2000] train_fm=1.954711 val_fm=2.126648 val_smooth=2.119715 best_smooth=2.092320 best_epoch=1
+[linear_x_flow  145/2000] train_fm=1.972125 val_fm=2.040070 val_smooth=2.113051 best_smooth=2.092320 best_epoch=1
+[linear_x_flow  150/2000] train_fm=1.992320 val_fm=2.146562 val_smooth=2.109340 best_smooth=2.092320 best_epoch=1
+[linear_x_flow  155/2000] train_fm=1.910486 val_fm=2.152005 val_smooth=2.109472 best_smooth=2.092320 best_epoch=1
+[linear_x_flow  160/2000] train_fm=1.949316 val_fm=2.128844 val_smooth=2.113712 best_smooth=2.092320 best_epoch=1
+[linear_x_flow  165/2000] train_fm=1.942557 val_fm=2.144417 val_smooth=2.107117 best_smooth=2.092320 best_epoch=1
+[linear_x_flow  170/2000] train_fm=1.976627 val_fm=2.105088 val_smooth=2.105740 best_smooth=2.092320 best_epoch=1
+[linear_x_flow  175/2000] train_fm=1.960101 val_fm=2.111444 val_smooth=2.103963 best_smooth=2.092320 best_epoch=1
+[linear_x_flow  180/2000] train_fm=1.977770 val_fm=2.147371 val_smooth=2.112680 best_smooth=2.092320 best_epoch=1
+[linear_x_flow  185/2000] train_fm=1.980037 val_fm=2.122814 val_smooth=2.125859 best_smooth=2.092320 best_epoch=1
+[linear_x_flow  190/2000] train_fm=1.919093 val_fm=2.241563 val_smooth=2.127527 best_smooth=2.092320 best_epoch=1
+[linear_x_flow  195/2000] train_fm=1.942985 val_fm=2.178804 val_smooth=2.122414 best_smooth=2.092320 best_epoch=1
+[linear_x_flow  200/2000] train_fm=1.936949 val_fm=2.056170 val_smooth=2.121236 best_smooth=2.092320 best_epoch=1
+[linear_x_flow  205/2000] train_fm=1.920682 val_fm=2.129712 val_smooth=2.121801 best_smooth=2.092320 best_epoch=1
+[linear_x_flow  210/2000] train_fm=1.892384 val_fm=2.088239 val_smooth=2.120047 best_smooth=2.092320 best_epoch=1
+[linear_x_flow  215/2000] train_fm=1.961997 val_fm=2.163944 val_smooth=2.123066 best_smooth=2.092320 best_epoch=1
+[linear_x_flow  220/2000] train_fm=1.907187 val_fm=2.180583 val_smooth=2.125291 best_smooth=2.092320 best_epoch=1
+[linear_x_flow  225/2000] train_fm=1.939549 val_fm=2.136352 val_smooth=2.132390 best_smooth=2.092320 best_epoch=1
+[linear_x_flow  230/2000] train_fm=1.996939 val_fm=2.108594 val_smooth=2.124021 best_smooth=2.092320 best_epoch=1
+[linear_x_flow  235/2000] train_fm=1.906364 val_fm=2.167814 val_smooth=2.118975 best_smooth=2.092320 best_epoch=1
+[linear_x_flow  240/2000] train_fm=1.920711 val_fm=2.130630 val_smooth=2.114688 best_smooth=2.092320 best_epoch=1
+[linear_x_flow  245/2000] train_fm=1.931646 val_fm=2.128196 val_smooth=2.110868 best_smooth=2.092320 best_epoch=1
+[linear_x_flow  250/2000] train_fm=1.921191 val_fm=2.117526 val_smooth=2.111307 best_smooth=2.092320 best_epoch=1
+[linear_x_flow  255/2000] train_fm=1.946293 val_fm=2.103605 val_smooth=2.113980 best_smooth=2.092320 best_epoch=1
+[linear_x_flow  260/2000] train_fm=1.890093 val_fm=2.157524 val_smooth=2.115409 best_smooth=2.092320 best_epoch=1
+[linear_x_flow  265/2000] train_fm=1.925873 val_fm=2.075650 val_smooth=2.114289 best_smooth=2.092320 best_epoch=1
+[linear_x_flow  270/2000] train_fm=1.931110 val_fm=2.099301 val_smooth=2.111983 best_smooth=2.092320 best_epoch=1
+[linear_x_flow  275/2000] train_fm=1.926881 val_fm=2.087304 val_smooth=2.108106 best_smooth=2.092320 best_epoch=1
+[linear_x_flow  280/2000] train_fm=1.954016 val_fm=2.101238 val_smooth=2.105351 best_smooth=2.092320 best_epoch=1
+[linear_x_flow  285/2000] train_fm=1.946238 val_fm=2.183489 val_smooth=2.121817 best_smooth=2.092320 best_epoch=1
+[linear_x_flow  290/2000] train_fm=1.890082 val_fm=2.073082 val_smooth=2.118660 best_smooth=2.092320 best_epoch=1
+[linear_x_flow  295/2000] train_fm=1.918895 val_fm=2.086920 val_smooth=2.123084 best_smooth=2.092320 best_epoch=1
+[linear_x_flow  300/2000] train_fm=1.892393 val_fm=2.170408 val_smooth=2.119889 best_smooth=2.092320 best_epoch=1
+[linear_x_flow early-stop] epoch=301 best_epoch=1 best_smooth=2.092320 patience=300
+[linear_x_flow restore-best] restored epoch=1 val_smooth=2.092320
+[convergence] fixed-x diagnostic -> /nfshome/zeyuan/score-matching-fisher/h_decoding_conv_cosine_gaussian_sqrtd_xdim50_linear_x_flow_20260429-115835/sweep_runs/n_000200/diagnostics/theta_flow_single_x_posterior_hist.png
+[convergence] n=200  corr_h=-0.1333  corr_clf=0.4409  corr_llr=0.0050  wall=2.2s
+[convergence] n=200 training_loss copied -> /nfshome/zeyuan/score-matching-fisher/h_decoding_conv_cosine_gaussian_sqrtd_xdim50_linear_x_flow_20260429-115835/training_losses/n_000200.npz
+[linear_x_flow    1/2000] train_fm=2.029110 val_fm=2.071461 val_smooth=2.071461 best_smooth=2.071461 best_epoch=1
+[linear_x_flow    5/2000] train_fm=2.030839 val_fm=2.070959 val_smooth=2.065154 best_smooth=2.064848 best_epoch=4
+[linear_x_flow   10/2000] train_fm=1.959484 val_fm=2.093640 val_smooth=2.058666 best_smooth=2.056826 best_epoch=9
+[linear_x_flow   15/2000] train_fm=2.018304 val_fm=2.009328 val_smooth=2.046423 best_smooth=2.046423 best_epoch=15
+[linear_x_flow   20/2000] train_fm=1.991764 val_fm=2.023117 val_smooth=2.041337 best_smooth=2.041337 best_epoch=20
+[linear_x_flow   25/2000] train_fm=1.973207 val_fm=2.020626 val_smooth=2.035039 best_smooth=2.035039 best_epoch=25
+[linear_x_flow   30/2000] train_fm=2.010463 val_fm=2.028770 val_smooth=2.032712 best_smooth=2.032055 best_epoch=28
+[linear_x_flow   35/2000] train_fm=1.984719 val_fm=2.012044 val_smooth=2.023373 best_smooth=2.023373 best_epoch=35
+[linear_x_flow   40/2000] train_fm=2.026416 val_fm=1.996369 val_smooth=2.024166 best_smooth=2.023373 best_epoch=35
+[linear_x_flow   45/2000] train_fm=1.995232 val_fm=2.026245 val_smooth=2.020871 best_smooth=2.020588 best_epoch=44
+[linear_x_flow   50/2000] train_fm=2.008582 val_fm=1.980215 val_smooth=2.015144 best_smooth=2.015144 best_epoch=50
+[linear_x_flow   55/2000] train_fm=1.962239 val_fm=1.998609 val_smooth=2.012589 best_smooth=2.012589 best_epoch=55
+[linear_x_flow   60/2000] train_fm=1.968442 val_fm=2.073125 val_smooth=2.015054 best_smooth=2.010237 best_epoch=58
+[linear_x_flow   65/2000] train_fm=1.967075 val_fm=2.010221 val_smooth=2.016644 best_smooth=2.010237 best_epoch=58
+[linear_x_flow   70/2000] train_fm=1.983093 val_fm=1.973458 val_smooth=2.015147 best_smooth=2.010237 best_epoch=58
+[linear_x_flow   75/2000] train_fm=2.007612 val_fm=1.953825 val_smooth=2.012603 best_smooth=2.010237 best_epoch=58
+[linear_x_flow   80/2000] train_fm=2.046110 val_fm=2.026963 val_smooth=2.016122 best_smooth=2.010237 best_epoch=58
+[linear_x_flow   85/2000] train_fm=1.964036 val_fm=2.013398 val_smooth=2.012976 best_smooth=2.010237 best_epoch=58
+[linear_x_flow   90/2000] train_fm=1.942896 val_fm=1.981533 val_smooth=2.005603 best_smooth=2.005603 best_epoch=90
+[linear_x_flow   95/2000] train_fm=1.990322 val_fm=2.023948 val_smooth=2.007742 best_smooth=2.005603 best_epoch=90
+[linear_x_flow  100/2000] train_fm=1.974134 val_fm=1.996185 val_smooth=2.010890 best_smooth=2.005603 best_epoch=90
+[linear_x_flow  105/2000] train_fm=1.971836 val_fm=1.978555 val_smooth=2.007134 best_smooth=2.005603 best_epoch=90
+[linear_x_flow  110/2000] train_fm=1.988505 val_fm=2.037123 val_smooth=2.017643 best_smooth=2.005603 best_epoch=90
+[linear_x_flow  115/2000] train_fm=1.957413 val_fm=2.003447 val_smooth=2.016304 best_smooth=2.005603 best_epoch=90
+[linear_x_flow  120/2000] train_fm=1.949898 val_fm=2.057497 val_smooth=2.018108 best_smooth=2.005603 best_epoch=90
+[linear_x_flow  125/2000] train_fm=1.945044 val_fm=2.037200 val_smooth=2.013925 best_smooth=2.005603 best_epoch=90
+[linear_x_flow  130/2000] train_fm=1.959805 val_fm=1.956245 val_smooth=2.009123 best_smooth=2.005603 best_epoch=90
+[linear_x_flow  135/2000] train_fm=1.980255 val_fm=2.002757 val_smooth=2.008288 best_smooth=2.005603 best_epoch=90
+[linear_x_flow  140/2000] train_fm=1.966979 val_fm=2.048122 val_smooth=2.012412 best_smooth=2.005603 best_epoch=90
+[linear_x_flow  145/2000] train_fm=1.996112 val_fm=1.964276 val_smooth=2.010311 best_smooth=2.005603 best_epoch=90
+[linear_x_flow  150/2000] train_fm=1.963069 val_fm=2.035604 val_smooth=2.008453 best_smooth=2.005603 best_epoch=90
+[linear_x_flow  155/2000] train_fm=1.944433 val_fm=1.972401 val_smooth=2.003895 best_smooth=2.003895 best_epoch=155
+[linear_x_flow  160/2000] train_fm=1.993890 val_fm=2.014299 val_smooth=2.003356 best_smooth=2.002780 best_epoch=159
+[linear_x_flow  165/2000] train_fm=1.960861 val_fm=2.006196 val_smooth=2.007219 best_smooth=2.002780 best_epoch=159
+[linear_x_flow  170/2000] train_fm=2.018704 val_fm=1.979022 val_smooth=2.012610 best_smooth=2.002780 best_epoch=159
+[linear_x_flow  175/2000] train_fm=1.964996 val_fm=2.025370 val_smooth=2.016917 best_smooth=2.002780 best_epoch=159
+[linear_x_flow  180/2000] train_fm=1.970065 val_fm=2.030236 val_smooth=2.014831 best_smooth=2.002780 best_epoch=159
+[linear_x_flow  185/2000] train_fm=1.975662 val_fm=2.049923 val_smooth=2.010226 best_smooth=2.002780 best_epoch=159
+[linear_x_flow  190/2000] train_fm=1.955326 val_fm=2.040142 val_smooth=2.008081 best_smooth=2.002780 best_epoch=159
+[linear_x_flow  195/2000] train_fm=1.955205 val_fm=2.020284 val_smooth=2.008611 best_smooth=2.002780 best_epoch=159
+[linear_x_flow  200/2000] train_fm=1.940294 val_fm=2.039253 val_smooth=2.007221 best_smooth=2.002780 best_epoch=159
+[linear_x_flow  205/2000] train_fm=1.941873 val_fm=2.028367 val_smooth=2.009565 best_smooth=2.002780 best_epoch=159
+[linear_x_flow  210/2000] train_fm=1.980032 val_fm=2.012401 val_smooth=2.010828 best_smooth=2.002780 best_epoch=159
+[linear_x_flow  215/2000] train_fm=1.963106 val_fm=2.035249 val_smooth=2.008683 best_smooth=2.002780 best_epoch=159
+[linear_x_flow  220/2000] train_fm=1.915488 val_fm=2.006090 val_smooth=2.008648 best_smooth=2.002780 best_epoch=159
+[linear_x_flow  225/2000] train_fm=1.932507 val_fm=1.983589 val_smooth=2.002268 best_smooth=2.002268 best_epoch=225
+[linear_x_flow  230/2000] train_fm=1.954082 val_fm=1.924845 val_smooth=2.000362 best_smooth=2.000362 best_epoch=230
+[linear_x_flow  235/2000] train_fm=1.926792 val_fm=2.005473 val_smooth=2.001084 best_smooth=1.999928 best_epoch=232
+[linear_x_flow  240/2000] train_fm=1.969323 val_fm=1.991898 val_smooth=1.994872 best_smooth=1.994872 best_epoch=240
+[linear_x_flow  245/2000] train_fm=1.977622 val_fm=2.007304 val_smooth=1.994210 best_smooth=1.993521 best_epoch=244
+[linear_x_flow  250/2000] train_fm=1.960831 val_fm=2.030580 val_smooth=2.000950 best_smooth=1.993521 best_epoch=244
+[linear_x_flow  255/2000] train_fm=1.940516 val_fm=1.933789 val_smooth=1.995830 best_smooth=1.993521 best_epoch=244
+[linear_x_flow  260/2000] train_fm=1.956055 val_fm=1.983151 val_smooth=1.997626 best_smooth=1.993521 best_epoch=244
+[linear_x_flow  265/2000] train_fm=1.923674 val_fm=2.033297 val_smooth=2.003018 best_smooth=1.993521 best_epoch=244
+[linear_x_flow  270/2000] train_fm=1.946256 val_fm=1.951434 val_smooth=1.996503 best_smooth=1.993521 best_epoch=244
+[linear_x_flow  275/2000] train_fm=1.954615 val_fm=2.044851 val_smooth=2.001627 best_smooth=1.993521 best_epoch=244
+[linear_x_flow  280/2000] train_fm=1.954054 val_fm=2.066878 val_smooth=2.004625 best_smooth=1.993521 best_epoch=244
+[linear_x_flow  285/2000] train_fm=1.971940 val_fm=2.000867 val_smooth=2.006977 best_smooth=1.993521 best_epoch=244
+[linear_x_flow  290/2000] train_fm=1.949455 val_fm=2.004999 val_smooth=2.009604 best_smooth=1.993521 best_epoch=244
+[linear_x_flow  295/2000] train_fm=1.919484 val_fm=1.975723 val_smooth=2.009647 best_smooth=1.993521 best_epoch=244
+[linear_x_flow  300/2000] train_fm=1.941723 val_fm=2.028409 val_smooth=2.009283 best_smooth=1.993521 best_epoch=244
+[linear_x_flow  305/2000] train_fm=1.928814 val_fm=2.012219 val_smooth=2.011379 best_smooth=1.993521 best_epoch=244
+[linear_x_flow  310/2000] train_fm=1.948339 val_fm=2.000118 val_smooth=2.006936 best_smooth=1.993521 best_epoch=244
+[linear_x_flow  315/2000] train_fm=1.939857 val_fm=1.984001 val_smooth=2.005366 best_smooth=1.993521 best_epoch=244
+[linear_x_flow  320/2000] train_fm=1.910032 val_fm=1.987171 val_smooth=2.004705 best_smooth=1.993521 best_epoch=244
+[linear_x_flow  325/2000] train_fm=1.918067 val_fm=1.987494 val_smooth=2.001471 best_smooth=1.993521 best_epoch=244
+[linear_x_flow  330/2000] train_fm=1.974935 val_fm=1.958216 val_smooth=1.997379 best_smooth=1.993521 best_epoch=244
+[linear_x_flow  335/2000] train_fm=1.961035 val_fm=1.977037 val_smooth=1.995375 best_smooth=1.993521 best_epoch=244
+[linear_x_flow  340/2000] train_fm=1.880694 val_fm=1.902163 val_smooth=1.987186 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  345/2000] train_fm=1.925585 val_fm=1.976526 val_smooth=1.991135 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  350/2000] train_fm=1.911295 val_fm=1.984302 val_smooth=1.992490 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  355/2000] train_fm=1.900612 val_fm=2.004992 val_smooth=1.994843 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  360/2000] train_fm=1.980052 val_fm=1.980916 val_smooth=1.996606 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  365/2000] train_fm=1.937046 val_fm=1.989656 val_smooth=1.997810 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  370/2000] train_fm=1.907743 val_fm=2.012840 val_smooth=1.999064 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  375/2000] train_fm=1.942586 val_fm=2.021255 val_smooth=2.001916 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  380/2000] train_fm=1.899004 val_fm=1.954951 val_smooth=1.997825 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  385/2000] train_fm=1.930043 val_fm=2.045375 val_smooth=1.998777 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  390/2000] train_fm=1.909664 val_fm=2.000231 val_smooth=1.996000 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  395/2000] train_fm=1.956751 val_fm=2.055431 val_smooth=1.998897 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  400/2000] train_fm=1.917046 val_fm=2.020281 val_smooth=1.999032 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  405/2000] train_fm=1.919540 val_fm=2.033405 val_smooth=1.999228 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  410/2000] train_fm=1.937091 val_fm=1.959500 val_smooth=2.000037 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  415/2000] train_fm=1.937716 val_fm=2.030181 val_smooth=2.002778 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  420/2000] train_fm=1.902444 val_fm=2.029384 val_smooth=2.000185 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  425/2000] train_fm=1.908107 val_fm=2.029440 val_smooth=2.004327 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  430/2000] train_fm=1.913008 val_fm=2.005836 val_smooth=2.007520 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  435/2000] train_fm=1.926018 val_fm=2.009321 val_smooth=2.011269 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  440/2000] train_fm=1.910446 val_fm=1.986491 val_smooth=2.010344 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  445/2000] train_fm=1.922989 val_fm=2.021659 val_smooth=2.008357 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  450/2000] train_fm=1.925209 val_fm=2.023985 val_smooth=2.011152 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  455/2000] train_fm=1.935569 val_fm=1.992744 val_smooth=2.015612 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  460/2000] train_fm=1.918982 val_fm=1.945004 val_smooth=2.012569 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  465/2000] train_fm=1.957996 val_fm=2.018689 val_smooth=2.010243 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  470/2000] train_fm=1.914773 val_fm=2.016534 val_smooth=2.014499 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  475/2000] train_fm=1.936854 val_fm=2.079840 val_smooth=2.016063 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  480/2000] train_fm=1.921773 val_fm=1.976868 val_smooth=2.012552 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  485/2000] train_fm=1.945368 val_fm=2.060640 val_smooth=2.014374 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  490/2000] train_fm=1.870042 val_fm=2.065449 val_smooth=2.011336 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  495/2000] train_fm=1.924682 val_fm=2.043059 val_smooth=2.009330 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  500/2000] train_fm=1.901813 val_fm=1.953025 val_smooth=2.006086 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  505/2000] train_fm=1.890247 val_fm=1.984841 val_smooth=2.010288 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  510/2000] train_fm=1.955301 val_fm=1.992467 val_smooth=2.007132 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  515/2000] train_fm=1.918372 val_fm=2.005862 val_smooth=2.005045 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  520/2000] train_fm=1.935856 val_fm=1.959300 val_smooth=2.003163 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  525/2000] train_fm=1.904604 val_fm=1.951120 val_smooth=2.003770 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  530/2000] train_fm=1.900224 val_fm=2.027538 val_smooth=2.005282 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  535/2000] train_fm=1.921599 val_fm=1.993812 val_smooth=2.007877 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  540/2000] train_fm=1.910854 val_fm=2.016653 val_smooth=2.010288 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  545/2000] train_fm=1.918600 val_fm=2.022018 val_smooth=2.009138 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  550/2000] train_fm=1.912707 val_fm=2.039294 val_smooth=2.008989 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  555/2000] train_fm=1.934863 val_fm=2.022596 val_smooth=2.008160 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  560/2000] train_fm=1.917332 val_fm=2.027682 val_smooth=2.013533 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  565/2000] train_fm=1.902202 val_fm=2.042237 val_smooth=2.016577 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  570/2000] train_fm=1.924438 val_fm=1.992488 val_smooth=2.011479 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  575/2000] train_fm=1.917343 val_fm=1.984501 val_smooth=2.015017 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  580/2000] train_fm=1.905545 val_fm=2.019336 val_smooth=2.013701 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  585/2000] train_fm=1.911155 val_fm=2.025100 val_smooth=2.013942 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  590/2000] train_fm=1.896348 val_fm=2.037707 val_smooth=2.012969 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  595/2000] train_fm=1.932131 val_fm=1.968959 val_smooth=2.010644 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  600/2000] train_fm=1.937138 val_fm=1.970401 val_smooth=2.011614 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  605/2000] train_fm=1.888620 val_fm=1.940140 val_smooth=2.007696 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  610/2000] train_fm=1.890211 val_fm=1.968461 val_smooth=2.004494 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  615/2000] train_fm=1.914798 val_fm=2.032684 val_smooth=2.001791 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  620/2000] train_fm=1.902378 val_fm=2.006034 val_smooth=2.000008 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  625/2000] train_fm=1.868280 val_fm=1.949230 val_smooth=1.999585 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  630/2000] train_fm=1.933032 val_fm=1.976686 val_smooth=2.000841 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  635/2000] train_fm=1.892371 val_fm=2.079515 val_smooth=2.008099 best_smooth=1.987186 best_epoch=340
+[linear_x_flow  640/2000] train_fm=1.904125 val_fm=2.012786 val_smooth=2.012654 best_smooth=1.987186 best_epoch=340
+[linear_x_flow early-stop] epoch=640 best_epoch=340 best_smooth=1.987186 patience=300
+[linear_x_flow restore-best] restored epoch=340 val_smooth=1.987186
+[convergence] fixed-x diagnostic -> /nfshome/zeyuan/score-matching-fisher/h_decoding_conv_cosine_gaussian_sqrtd_xdim50_linear_x_flow_20260429-115835/sweep_runs/n_000400/diagnostics/theta_flow_single_x_posterior_hist.png
+[convergence] n=400  corr_h=0.4097  corr_clf=0.4304  corr_llr=0.5789  wall=4.0s
+[convergence] n=400 training_loss copied -> /nfshome/zeyuan/score-matching-fisher/h_decoding_conv_cosine_gaussian_sqrtd_xdim50_linear_x_flow_20260429-115835/training_losses/n_000400.npz
+[linear_x_flow    1/2000] train_fm=2.008238 val_fm=1.991969 val_smooth=1.991969 best_smooth=1.991969 best_epoch=1
+[linear_x_flow    5/2000] train_fm=2.035026 val_fm=2.040931 val_smooth=1.998759 best_smooth=1.991969 best_epoch=1
+[linear_x_flow   10/2000] train_fm=1.990464 val_fm=2.030900 val_smooth=2.005936 best_smooth=1.991969 best_epoch=1
+[linear_x_flow   15/2000] train_fm=1.991996 val_fm=2.031422 val_smooth=2.014953 best_smooth=1.991969 best_epoch=1
+[linear_x_flow   20/2000] train_fm=1.980356 val_fm=2.053077 val_smooth=2.016265 best_smooth=1.991969 best_epoch=1
+[linear_x_flow   25/2000] train_fm=1.963457 val_fm=2.057992 val_smooth=2.021115 best_smooth=1.991969 best_epoch=1
+[linear_x_flow   30/2000] train_fm=1.991357 val_fm=2.041107 val_smooth=2.023608 best_smooth=1.991969 best_epoch=1
+[linear_x_flow   35/2000] train_fm=1.979199 val_fm=2.040282 val_smooth=2.023599 best_smooth=1.991969 best_epoch=1
+[linear_x_flow   40/2000] train_fm=2.003880 val_fm=2.024720 val_smooth=2.021892 best_smooth=1.991969 best_epoch=1
+[linear_x_flow   45/2000] train_fm=1.970077 val_fm=2.058750 val_smooth=2.026983 best_smooth=1.991969 best_epoch=1
+[linear_x_flow   50/2000] train_fm=1.980250 val_fm=2.063271 val_smooth=2.026000 best_smooth=1.991969 best_epoch=1
+[linear_x_flow   55/2000] train_fm=2.006516 val_fm=1.988229 val_smooth=2.025029 best_smooth=1.991969 best_epoch=1
+[linear_x_flow   60/2000] train_fm=1.990888 val_fm=2.032080 val_smooth=2.025419 best_smooth=1.991969 best_epoch=1
+[linear_x_flow   65/2000] train_fm=1.980593 val_fm=2.007759 val_smooth=2.023096 best_smooth=1.991969 best_epoch=1
+[linear_x_flow   70/2000] train_fm=1.978443 val_fm=1.983180 val_smooth=2.021610 best_smooth=1.991969 best_epoch=1
+[linear_x_flow   75/2000] train_fm=1.974616 val_fm=2.005883 val_smooth=2.018698 best_smooth=1.991969 best_epoch=1
+[linear_x_flow   80/2000] train_fm=2.006277 val_fm=2.070325 val_smooth=2.024163 best_smooth=1.991969 best_epoch=1
+[linear_x_flow   85/2000] train_fm=1.994040 val_fm=2.056032 val_smooth=2.024692 best_smooth=1.991969 best_epoch=1
+[linear_x_flow   90/2000] train_fm=1.973022 val_fm=2.017337 val_smooth=2.024012 best_smooth=1.991969 best_epoch=1
+[linear_x_flow   95/2000] train_fm=1.987300 val_fm=2.007783 val_smooth=2.024006 best_smooth=1.991969 best_epoch=1
+[linear_x_flow  100/2000] train_fm=1.958018 val_fm=2.014879 val_smooth=2.025596 best_smooth=1.991969 best_epoch=1
+[linear_x_flow  105/2000] train_fm=1.973398 val_fm=1.993401 val_smooth=2.021932 best_smooth=1.991969 best_epoch=1
+[linear_x_flow  110/2000] train_fm=1.968982 val_fm=2.032656 val_smooth=2.022208 best_smooth=1.991969 best_epoch=1
+[linear_x_flow  115/2000] train_fm=1.966149 val_fm=2.026695 val_smooth=2.023247 best_smooth=1.991969 best_epoch=1
+[linear_x_flow  120/2000] train_fm=1.974943 val_fm=2.039676 val_smooth=2.027418 best_smooth=1.991969 best_epoch=1
+[linear_x_flow  125/2000] train_fm=1.965147 val_fm=1.988197 val_smooth=2.025041 best_smooth=1.991969 best_epoch=1
+[linear_x_flow  130/2000] train_fm=2.007523 val_fm=2.051567 val_smooth=2.026389 best_smooth=1.991969 best_epoch=1
+[linear_x_flow  135/2000] train_fm=1.982214 val_fm=1.980412 val_smooth=2.023621 best_smooth=1.991969 best_epoch=1
+[linear_x_flow  140/2000] train_fm=1.945787 val_fm=2.078589 val_smooth=2.030043 best_smooth=1.991969 best_epoch=1
+[linear_x_flow  145/2000] train_fm=1.957088 val_fm=2.069983 val_smooth=2.032431 best_smooth=1.991969 best_epoch=1
+[linear_x_flow  150/2000] train_fm=1.961869 val_fm=2.019749 val_smooth=2.028290 best_smooth=1.991969 best_epoch=1
+[linear_x_flow  155/2000] train_fm=1.960643 val_fm=2.011868 val_smooth=2.028097 best_smooth=1.991969 best_epoch=1
+[linear_x_flow  160/2000] train_fm=1.953973 val_fm=1.980357 val_smooth=2.026249 best_smooth=1.991969 best_epoch=1
+[linear_x_flow  165/2000] train_fm=1.955564 val_fm=2.016882 val_smooth=2.025470 best_smooth=1.991969 best_epoch=1
+[linear_x_flow  170/2000] train_fm=1.969297 val_fm=2.049233 val_smooth=2.030910 best_smooth=1.991969 best_epoch=1
+[linear_x_flow  175/2000] train_fm=1.950160 val_fm=2.006837 val_smooth=2.028679 best_smooth=1.991969 best_epoch=1
+[linear_x_flow  180/2000] train_fm=1.968307 val_fm=2.005796 val_smooth=2.025376 best_smooth=1.991969 best_epoch=1
+[linear_x_flow  185/2000] train_fm=1.974860 val_fm=2.048812 val_smooth=2.026886 best_smooth=1.991969 best_epoch=1
+[linear_x_flow  190/2000] train_fm=1.966840 val_fm=1.998842 val_smooth=2.022355 best_smooth=1.991969 best_epoch=1
+[linear_x_flow  195/2000] train_fm=1.962312 val_fm=2.025862 val_smooth=2.018558 best_smooth=1.991969 best_epoch=1
+[linear_x_flow  200/2000] train_fm=1.988283 val_fm=2.036357 val_smooth=2.019584 best_smooth=1.991969 best_epoch=1
+[linear_x_flow  205/2000] train_fm=1.940481 val_fm=2.011964 val_smooth=2.021406 best_smooth=1.991969 best_epoch=1
+[linear_x_flow  210/2000] train_fm=1.979176 val_fm=2.027870 val_smooth=2.020566 best_smooth=1.991969 best_epoch=1
+[linear_x_flow  215/2000] train_fm=1.945181 val_fm=2.013179 val_smooth=2.019103 best_smooth=1.991969 best_epoch=1
+[linear_x_flow  220/2000] train_fm=1.952604 val_fm=2.033236 val_smooth=2.022028 best_smooth=1.991969 best_epoch=1
+[linear_x_flow  225/2000] train_fm=1.984403 val_fm=2.031943 val_smooth=2.022995 best_smooth=1.991969 best_epoch=1
+[linear_x_flow  230/2000] train_fm=1.962552 val_fm=1.984116 val_smooth=2.020315 best_smooth=1.991969 best_epoch=1
+[linear_x_flow  235/2000] train_fm=1.975150 val_fm=2.061179 val_smooth=2.021715 best_smooth=1.991969 best_epoch=1
+[linear_x_flow  240/2000] train_fm=1.934144 val_fm=2.032716 val_smooth=2.017867 best_smooth=1.991969 best_epoch=1
+[linear_x_flow  245/2000] train_fm=1.928765 val_fm=1.985522 val_smooth=2.018899 best_smooth=1.991969 best_epoch=1
+[linear_x_flow  250/2000] train_fm=1.945852 val_fm=1.991564 val_smooth=2.020001 best_smooth=1.991969 best_epoch=1
+[linear_x_flow  255/2000] train_fm=1.955458 val_fm=2.013147 val_smooth=2.020779 best_smooth=1.991969 best_epoch=1
+[linear_x_flow  260/2000] train_fm=1.914570 val_fm=1.990022 val_smooth=2.019114 best_smooth=1.991969 best_epoch=1
+[linear_x_flow  265/2000] train_fm=1.939164 val_fm=2.041023 val_smooth=2.019113 best_smooth=1.991969 best_epoch=1
+[linear_x_flow  270/2000] train_fm=1.964970 val_fm=2.011609 val_smooth=2.016759 best_smooth=1.991969 best_epoch=1
+[linear_x_flow  275/2000] train_fm=1.968629 val_fm=2.007889 val_smooth=2.015485 best_smooth=1.991969 best_epoch=1
+[linear_x_flow  280/2000] train_fm=1.967973 val_fm=2.021720 val_smooth=2.017151 best_smooth=1.991969 best_epoch=1
+[linear_x_flow  285/2000] train_fm=1.956956 val_fm=2.023437 val_smooth=2.018747 best_smooth=1.991969 best_epoch=1
+[linear_x_flow  290/2000] train_fm=1.956879 val_fm=2.007548 val_smooth=2.019939 best_smooth=1.991969 best_epoch=1
+[linear_x_flow  295/2000] train_fm=1.964482 val_fm=2.031138 val_smooth=2.019677 best_smooth=1.991969 best_epoch=1
+[linear_x_flow  300/2000] train_fm=1.948894 val_fm=1.971685 val_smooth=2.015632 best_smooth=1.991969 best_epoch=1
+[linear_x_flow early-stop] epoch=301 best_epoch=1 best_smooth=1.991969 patience=300
+[linear_x_flow restore-best] restored epoch=1 val_smooth=1.991969
+[convergence] fixed-x diagnostic -> /nfshome/zeyuan/score-matching-fisher/h_decoding_conv_cosine_gaussian_sqrtd_xdim50_linear_x_flow_20260429-115835/sweep_runs/n_000600/diagnostics/theta_flow_single_x_posterior_hist.png
+[convergence] n=600  corr_h=-0.1088  corr_clf=0.6095  corr_llr=-0.0067  wall=3.3s
+[convergence] n=600 training_loss copied -> /nfshome/zeyuan/score-matching-fisher/h_decoding_conv_cosine_gaussian_sqrtd_xdim50_linear_x_flow_20260429-115835/training_losses/n_000600.npz
+[convergence] Saved:
+  - /nfshome/zeyuan/score-matching-fisher/h_decoding_conv_cosine_gaussian_sqrtd_xdim50_linear_x_flow_20260429-115835/h_decoding_convergence_results.npz
+  - /nfshome/zeyuan/score-matching-fisher/h_decoding_conv_cosine_gaussian_sqrtd_xdim50_linear_x_flow_20260429-115835/h_decoding_convergence_results.csv
+  - /nfshome/zeyuan/score-matching-fisher/h_decoding_conv_cosine_gaussian_sqrtd_xdim50_linear_x_flow_20260429-115835/h_decoding_convergence.png
+  - /nfshome/zeyuan/score-matching-fisher/h_decoding_conv_cosine_gaussian_sqrtd_xdim50_linear_x_flow_20260429-115835/h_decoding_convergence.svg
+  - /nfshome/zeyuan/score-matching-fisher/h_decoding_conv_cosine_gaussian_sqrtd_xdim50_linear_x_flow_20260429-115835/h_decoding_matrices_panel.png
+  - /nfshome/zeyuan/score-matching-fisher/h_decoding_conv_cosine_gaussian_sqrtd_xdim50_linear_x_flow_20260429-115835/h_decoding_matrices_panel.svg
+  - /nfshome/zeyuan/score-matching-fisher/h_decoding_conv_cosine_gaussian_sqrtd_xdim50_linear_x_flow_20260429-115835/h_decoding_convergence_combined.png
+  - /nfshome/zeyuan/score-matching-fisher/h_decoding_conv_cosine_gaussian_sqrtd_xdim50_linear_x_flow_20260429-115835/h_decoding_convergence_combined.svg
+  - /nfshome/zeyuan/score-matching-fisher/h_decoding_conv_cosine_gaussian_sqrtd_xdim50_linear_x_flow_20260429-115835/h_decoding_training_losses_panel.png
+  - /nfshome/zeyuan/score-matching-fisher/h_decoding_conv_cosine_gaussian_sqrtd_xdim50_linear_x_flow_20260429-115835/h_decoding_training_losses_panel.svg
+  - /nfshome/zeyuan/score-matching-fisher/h_decoding_conv_cosine_gaussian_sqrtd_xdim50_linear_x_flow_20260429-115835/training_losses/ (per-n training loss .npz + manifest.txt)
+  - /nfshome/zeyuan/score-matching-fisher/h_decoding_conv_cosine_gaussian_sqrtd_xdim50_linear_x_flow_20260429-115835/h_decoding_convergence_summary.txt
+
+/data/zeyuan/miniforge3/envs/geo_diffusion/lib/python3.13/site-packages/sklearn/linear_model/_logistic.py:406: ConvergenceWarning: lbfgs failed to converge after 100 iteration(s) (status=1):
+STOP: TOTAL NO. OF ITERATIONS REACHED LIMIT
+
+Increase the number of iterations to improve the convergence (max_iter=100).
+You might also want to scale the data as shown in:
+    https://scikit-learn.org/stable/modules/preprocessing.html
+Please also refer to the documentation for alternative solver options:
+    https://scikit-learn.org/stable/modules/linear_model.html#logistic-regression
+  n_iter_i = _check_optimize_result(
+

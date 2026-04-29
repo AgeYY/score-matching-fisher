@@ -236,7 +236,7 @@ def train_linear_x_flow(
     batch_size: int,
     lr: float,
     weight_decay: float = 0.0,
-    t_eps: float = 1e-3,
+    t_eps: float = 0.05,
     patience: int = 300,
     min_delta: float = 1e-4,
     ema_alpha: float = 0.05,
@@ -257,8 +257,8 @@ def train_linear_x_flow(
     if not (0.0 < float(ema_alpha) <= 1.0):
         raise ValueError("ema_alpha must be in (0, 1].")
     te = float(t_eps)
-    if not (0.0 <= te < 1.0):
-        raise ValueError("t_eps must be in [0, 1).")
+    if not (0.0 < te < 0.5):
+        raise ValueError("t_eps must be in (0, 0.5) so bridge times lie in (t_eps, 1-t_eps).")
 
     th_tr = _as_2d_float64(theta_train, name="theta_train")
     x_tr = _as_2d_float64(x_train, name="x_train")
@@ -304,7 +304,7 @@ def train_linear_x_flow(
             tb = tb.to(device)
             x1b = x1b.to(device)
             bs = int(x1b.shape[0])
-            t = te + (1.0 - te) * torch.rand(bs, 1, device=device, dtype=x1b.dtype)
+            t = te + (1.0 - 2.0 * te) * torch.rand(bs, 1, device=device, dtype=x1b.dtype)
             x0b = torch.randn_like(x1b)
             xt = (1.0 - t) * x0b + t * x1b
             ut = x1b - x0b
@@ -330,7 +330,7 @@ def train_linear_x_flow(
                 tb = tb.to(device)
                 x1b = x1b.to(device)
                 bs = int(x1b.shape[0])
-                t = te + (1.0 - te) * torch.rand(bs, 1, device=device, dtype=x1b.dtype)
+                t = te + (1.0 - 2.0 * te) * torch.rand(bs, 1, device=device, dtype=x1b.dtype)
                 x0b = torch.randn_like(x1b)
                 xt = (1.0 - t) * x0b + t * x1b
                 ut = x1b - x0b
@@ -397,7 +397,7 @@ def train_linear_x_flow_schedule(
     batch_size: int,
     lr: float,
     weight_decay: float = 0.0,
-    t_eps: float = 1e-3,
+    t_eps: float = 0.05,
     patience: int = 300,
     min_delta: float = 1e-4,
     ema_alpha: float = 0.05,

@@ -136,6 +136,11 @@ from fisher.linear_x_flow import (
     train_linear_x_flow,
     train_linear_x_flow_schedule,
 )
+from fisher.linear_theta_flow import (
+    ConditionalLinearThetaFlowMixtureMLP,
+    compute_linear_theta_flow_c_matrix,
+    train_linear_theta_flow,
+)
 from fisher.contrastive_llr import (
     ContrastiveAdditiveIndependentScorer,
     ContrastiveGaussianNetworkScorer,
@@ -779,7 +784,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--gxf-epochs", type=int, default=2000, help="gaussian-x-flow only: training epochs.")
     p.add_argument("--gxf-batch-size", type=int, default=256, help="gaussian-x-flow only: training batch size.")
-    p.add_argument("--gxf-lr", type=float, default=1e-3, help="gaussian-x-flow only: learning rate.")
+    p.add_argument("--gxf-lr", type=float, default=1e-4, help="gaussian-x-flow only: learning rate.")
     p.add_argument("--gxf-hidden-dim", type=int, default=128, help="gaussian-x-flow only: MLP hidden width.")
     p.add_argument("--gxf-depth", type=int, default=3, help="gaussian-x-flow only: MLP depth.")
     p.add_argument(
@@ -800,7 +805,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--gxf-t-eps",
         type=float,
-        default=1e-3,
+        default=0.05,
         help="gaussian-x-flow only: bridge time is sampled in [t_eps, 1-t_eps] (open interval).",
     )
     p.add_argument(
@@ -842,7 +847,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--lxf-epochs", type=int, default=2000, help="linear-x-flow only: training epochs.")
     p.add_argument("--lxf-batch-size", type=int, default=1024, help="linear-x-flow only: training batch size.")
-    p.add_argument("--lxf-lr", type=float, default=1e-3, help="linear-x-flow only: learning rate.")
+    p.add_argument("--lxf-lr", type=float, default=1e-4, help="linear-x-flow only: learning rate.")
     p.add_argument("--lxf-hidden-dim", type=int, default=128, help="linear-x-flow only: b_phi MLP hidden width.")
     p.add_argument("--lxf-depth", type=int, default=3, help="linear-x-flow only: b_phi MLP depth.")
     p.add_argument("--lxf-low-rank-dim", type=int, default=4, help="linear-x-flow-low-rank only: rank r.")
@@ -851,7 +856,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--lxf-t-eps",
         type=float,
         default=0.05,
-        help="linear-x-flow only: bridge time is sampled in [t_eps, 1].",
+        help="linear-x-flow only: bridge time is sampled uniformly in [t_eps, 1-t_eps].",
     )
     p.add_argument(
         "--lxf-solve-jitter",
@@ -898,14 +903,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--lxfs-epochs", type=int, default=2000, help="linear-x-flow-schedule only: training epochs.")
     p.add_argument("--lxfs-batch-size", type=int, default=1024, help="linear-x-flow-schedule only: training batch size.")
-    p.add_argument("--lxfs-lr", type=float, default=1e-3, help="linear-x-flow-schedule only: learning rate.")
+    p.add_argument("--lxfs-lr", type=float, default=1e-4, help="linear-x-flow-schedule only: learning rate.")
     p.add_argument("--lxfs-hidden-dim", type=int, default=128, help="linear-x-flow-schedule only: b_phi MLP hidden width.")
     p.add_argument("--lxfs-depth", type=int, default=3, help="linear-x-flow-schedule only: b_phi MLP depth.")
     p.add_argument("--lxfs-weight-decay", type=float, default=0.0, help="linear-x-flow-schedule only: AdamW weight decay.")
     p.add_argument(
         "--lxfs-t-eps",
         type=float,
-        default=1e-3,
+        default=0.05,
         help="linear-x-flow-schedule only: bridge time is sampled in [t_eps, 1-t_eps].",
     )
     p.add_argument(
@@ -943,6 +948,55 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=65536,
         help="linear-x-flow-schedule only: approximate pair budget per C-matrix block (rows*cols).",
+    )
+    p.add_argument("--ltf-num-components", type=int, default=3, help="linear-theta-flow only: Gaussian mixture components.")
+    p.add_argument("--ltf-epochs", type=int, default=2000, help="linear-theta-flow only: training epochs.")
+    p.add_argument("--ltf-batch-size", type=int, default=1024, help="linear-theta-flow only: training batch size.")
+    p.add_argument("--ltf-lr", type=float, default=1e-4, help="linear-theta-flow only: learning rate.")
+    p.add_argument("--ltf-hidden-dim", type=int, default=128, help="linear-theta-flow only: MLP hidden width.")
+    p.add_argument("--ltf-depth", type=int, default=3, help="linear-theta-flow only: MLP depth.")
+    p.add_argument("--ltf-weight-decay", type=float, default=0.0, help="linear-theta-flow only: AdamW weight decay.")
+    p.add_argument(
+        "--ltf-t-eps",
+        type=float,
+        default=0.05,
+        help="linear-theta-flow only: bridge time is sampled uniformly in [t_eps, 1-t_eps].",
+    )
+    p.add_argument(
+        "--ltf-solve-jitter",
+        type=float,
+        default=1e-6,
+        help="linear-theta-flow only: jitter for solving A mu=(exp(A)-I)b.",
+    )
+    p.add_argument(
+        "--ltf-early-patience",
+        type=int,
+        default=300,
+        help="linear-theta-flow only: early-stop patience; 0 disables early stopping.",
+    )
+    p.add_argument(
+        "--ltf-early-min-delta",
+        type=float,
+        default=1e-4,
+        help="linear-theta-flow only: early-stop min delta on smoothed validation FM loss.",
+    )
+    p.add_argument(
+        "--ltf-early-ema-alpha",
+        type=float,
+        default=0.05,
+        help="linear-theta-flow only: EMA alpha for validation FM loss monitor.",
+    )
+    p.add_argument(
+        "--ltf-max-grad-norm",
+        type=float,
+        default=10.0,
+        help="linear-theta-flow only: gradient clipping max norm; <=0 disables clipping.",
+    )
+    p.add_argument(
+        "--ltf-pair-batch-size",
+        type=int,
+        default=65536,
+        help="linear-theta-flow only: approximate pair budget per C-matrix block (rows*cols).",
     )
     p.add_argument("--contrastive-epochs", type=int, default=2000, help="contrastive method only: training epochs.")
     p.add_argument(
@@ -1172,6 +1226,15 @@ def _normalize_linear_x_flow_method(tfm: str) -> str | None:
     return aliases.get(key)
 
 
+def _normalize_linear_theta_flow_method(tfm: str) -> str | None:
+    key = str(tfm).strip().lower()
+    aliases = {
+        "linear-theta-flow": "linear_theta_flow",
+        "linear_theta_flow": "linear_theta_flow",
+    }
+    return aliases.get(key)
+
+
 def _normalize_nf_reduction_method(tfm: str) -> str | None:
     key = str(tfm).strip().lower()
     aliases = {
@@ -1310,7 +1373,7 @@ def _validate_gxf_cli(args: argparse.Namespace) -> None:
         raise ValueError("--gxf-diag-floor must be > 0.")
     if float(getattr(args, "gxf_cov_jitter", 0.0)) <= 0.0:
         raise ValueError("--gxf-cov-jitter must be > 0.")
-    te = float(getattr(args, "gxf_t_eps", 1e-3))
+    te = float(getattr(args, "gxf_t_eps", 0.05))
     if not (0.0 < te < 0.5):
         raise ValueError("--gxf-t-eps must be in (0, 0.5).")
     if int(getattr(args, "gxf_early_patience", -1)) < 0:
@@ -1352,8 +1415,8 @@ def _validate_lxf_cli(args: argparse.Namespace) -> None:
         if not (0.0 < te < 0.5):
             raise ValueError("--lxfs-t-eps must be in (0, 0.5).")
         path_schedule_from_name(str(getattr(args, "lxfs_path_schedule", "cosine")))
-    elif not (0.0 <= te < 1.0):
-        raise ValueError("--lxf-t-eps must be in [0, 1).")
+    elif not (0.0 < te < 0.5):
+        raise ValueError("--lxf-t-eps must be in (0, 0.5).")
     sj = float(getattr(args, f"{prefix}_solve_jitter", 1e-6))
     if not np.isfinite(sj) or sj <= 0.0:
         raise ValueError(f"{label}-solve-jitter must be finite and > 0.")
@@ -1369,6 +1432,41 @@ def _validate_lxf_cli(args: argparse.Namespace) -> None:
     max_grad = float(getattr(args, f"{prefix}_max_grad_norm", 10.0))
     if not np.isfinite(max_grad):
         raise ValueError(f"{label}-max-grad-norm must be finite.")
+
+
+def _validate_ltf_cli(args: argparse.Namespace) -> None:
+    if int(getattr(args, "ltf_num_components", 0)) < 1:
+        raise ValueError("--ltf-num-components must be >= 1.")
+    if int(getattr(args, "ltf_epochs", 0)) < 1:
+        raise ValueError("--ltf-epochs must be >= 1.")
+    if int(getattr(args, "ltf_batch_size", 0)) < 1:
+        raise ValueError("--ltf-batch-size must be >= 1.")
+    if float(getattr(args, "ltf_lr", 0.0)) <= 0.0:
+        raise ValueError("--ltf-lr must be > 0.")
+    if int(getattr(args, "ltf_hidden_dim", 0)) < 1:
+        raise ValueError("--ltf-hidden-dim must be >= 1.")
+    if int(getattr(args, "ltf_depth", 0)) < 1:
+        raise ValueError("--ltf-depth must be >= 1.")
+    if float(getattr(args, "ltf_weight_decay", 0.0)) < 0.0:
+        raise ValueError("--ltf-weight-decay must be >= 0.")
+    te = float(getattr(args, "ltf_t_eps", 0.05))
+    if not (0.0 < te < 0.5):
+        raise ValueError("--ltf-t-eps must be in (0, 0.5).")
+    sj = float(getattr(args, "ltf_solve_jitter", 1e-6))
+    if not np.isfinite(sj) or sj <= 0.0:
+        raise ValueError("--ltf-solve-jitter must be finite and > 0.")
+    if int(getattr(args, "ltf_early_patience", -1)) < 0:
+        raise ValueError("--ltf-early-patience must be >= 0.")
+    if float(getattr(args, "ltf_early_min_delta", 0.0)) < 0.0:
+        raise ValueError("--ltf-early-min-delta must be >= 0.")
+    alpha = float(getattr(args, "ltf_early_ema_alpha", 0.0))
+    if not np.isfinite(alpha) or alpha <= 0.0 or alpha > 1.0:
+        raise ValueError("--ltf-early-ema-alpha must be in (0, 1].")
+    if int(getattr(args, "ltf_pair_batch_size", 0)) < 1:
+        raise ValueError("--ltf-pair-batch-size must be >= 1.")
+    max_grad = float(getattr(args, "ltf_max_grad_norm", 10.0))
+    if not np.isfinite(max_grad):
+        raise ValueError("--ltf-max-grad-norm must be finite.")
 
 
 def _validate_nfr_cli(args: argparse.Namespace) -> None:
@@ -1568,10 +1666,12 @@ def _validate_cli(args: argparse.Namespace) -> None:
     pinf_norm = _normalize_pi_nf_method(tfm)
     gxf_norm = _normalize_gaussian_x_flow_method(tfm)
     lxf_norm = _normalize_linear_x_flow_method(tfm)
+    ltf_norm = _normalize_linear_theta_flow_method(tfm)
     contrastive_norm = _normalize_contrastive_method(tfm)
     gn_norm = None if (
         gxf_norm is not None
         or lxf_norm is not None
+        or ltf_norm is not None
         or nfr_norm is not None
         or gzd_norm is not None
         or pinf_norm is not None
@@ -1603,6 +1703,10 @@ def _validate_cli(args: argparse.Namespace) -> None:
         setattr(args, "theta_field_method", lxf_norm)
         _validate_lxf_cli(args)
         tfm = lxf_norm
+    elif ltf_norm is not None:
+        setattr(args, "theta_field_method", ltf_norm)
+        _validate_ltf_cli(args)
+        tfm = ltf_norm
     elif gn_norm is not None:
         gn_method = gn_norm
         setattr(args, "theta_field_method", gn_method)
@@ -1717,6 +1821,7 @@ def _validate_cli(args: argparse.Namespace) -> None:
         "linear_x_flow_diagonal",
         "linear_x_flow_low_rank",
         "linear_x_flow_schedule",
+        "linear_theta_flow",
         "nf_reduction",
         "gmm_z_decode",
         "pi_nf",
@@ -3285,6 +3390,142 @@ def _estimate_one(
         )
         return loaded_lxf, np.asarray(x_all, dtype=np.float64), dev
 
+    ltf_norm = _normalize_linear_theta_flow_method(tfm)
+    if ltf_norm is not None:
+        method_name = ltf_norm
+        dev = require_device(str(getattr(args, "device", "cuda")))
+        os.makedirs(output_dir, exist_ok=True)
+        theta_train = np.asarray(bundle.theta_train, dtype=np.float64)
+        theta_val = np.asarray(bundle.theta_validation, dtype=np.float64)
+        theta_all = np.asarray(bundle.theta_all, dtype=np.float64)
+        x_train = np.asarray(bundle.x_train, dtype=np.float64)
+        x_val = np.asarray(bundle.x_validation, dtype=np.float64)
+        x_all = np.asarray(bundle.x_all, dtype=np.float64)
+        if theta_train.ndim == 1:
+            theta_train = theta_train.reshape(-1, 1)
+        if theta_val.ndim == 1:
+            theta_val = theta_val.reshape(-1, 1)
+        if theta_all.ndim == 1:
+            theta_all = theta_all.reshape(-1, 1)
+        if theta_train.ndim != 2 or theta_val.ndim != 2 or theta_all.ndim != 2:
+            raise ValueError(f"{method_name} expects theta arrays to be 1D or 2D.")
+        if x_train.ndim != 2 or x_val.ndim != 2 or x_all.ndim != 2:
+            raise ValueError(f"{method_name} expects x arrays to be 2D.")
+        if theta_train.shape[0] < 1 or theta_val.shape[0] < 1:
+            raise ValueError(f"{method_name} requires non-empty train and validation splits.")
+        if theta_train.shape[1] != theta_all.shape[1]:
+            raise ValueError(f"{method_name} theta dimension mismatch.")
+
+        model = ConditionalLinearThetaFlowMixtureMLP(
+            theta_dim=int(theta_all.shape[1]),
+            x_dim=int(x_all.shape[1]),
+            num_components=int(getattr(args, "ltf_num_components", 3)),
+            hidden_dim=int(getattr(args, "ltf_hidden_dim", 128)),
+            depth=int(getattr(args, "ltf_depth", 3)),
+        ).to(dev)
+        train_out = train_linear_theta_flow(
+            model=model,
+            theta_train=theta_train,
+            x_train=x_train,
+            theta_val=theta_val,
+            x_val=x_val,
+            device=dev,
+            epochs=int(getattr(args, "ltf_epochs", 2000)),
+            batch_size=int(getattr(args, "ltf_batch_size", 1024)),
+            lr=float(getattr(args, "ltf_lr", 1e-3)),
+            weight_decay=float(getattr(args, "ltf_weight_decay", 0.0)),
+            t_eps=float(getattr(args, "ltf_t_eps", 0.05)),
+            patience=int(getattr(args, "ltf_early_patience", 300)),
+            min_delta=float(getattr(args, "ltf_early_min_delta", 1e-4)),
+            ema_alpha=float(getattr(args, "ltf_early_ema_alpha", 0.05)),
+            max_grad_norm=float(getattr(args, "ltf_max_grad_norm", 10.0)),
+            log_every=max(1, int(getattr(args, "log_every", 50))),
+            restore_best=True,
+        )
+        theta_mean = np.asarray(train_out["theta_mean"], dtype=np.float64)
+        theta_std = np.asarray(train_out["theta_std"], dtype=np.float64)
+        x_mean = np.asarray(train_out["x_mean"], dtype=np.float64)
+        x_std = np.asarray(train_out["x_std"], dtype=np.float64)
+        c_matrix = compute_linear_theta_flow_c_matrix(
+            model=model,
+            theta_all=theta_all,
+            x_all=x_all,
+            device=dev,
+            theta_mean=theta_mean,
+            theta_std=theta_std,
+            x_mean=x_mean,
+            x_std=x_std,
+            solve_jitter=float(getattr(args, "ltf_solve_jitter", 1e-6)),
+            pair_batch_size=int(getattr(args, "ltf_pair_batch_size", 65536)),
+        )
+        delta_l = compute_delta_l_nf(c_matrix)
+        h_sym = symmetrize_nf(compute_h_directed_nf(delta_l))
+        theta_used = theta_all.reshape(-1) if int(theta_all.shape[1]) == 1 else theta_all.copy()
+
+        np.savez_compressed(
+            os.path.join(output_dir, "h_matrix_results_theta_cov.npz"),
+            theta_used=np.asarray(theta_used, dtype=np.float64),
+            h_sym=np.asarray(h_sym, dtype=np.float64),
+            c_matrix=np.asarray(c_matrix, dtype=np.float64),
+            theta_flow_log_post_matrix=np.asarray(c_matrix, dtype=np.float64),
+            delta_l_matrix=np.asarray(delta_l, dtype=np.float64),
+            h_field_method=np.asarray([method_name], dtype=object),
+            h_eval_scalar_name=np.asarray([f"{method_name}_log_p_theta_given_x"], dtype=object),
+            sigma_eval=np.asarray([np.nan], dtype=np.float64),
+            theta_field_method=np.asarray([method_name], dtype=object),
+            ltf_num_components=np.int64(int(getattr(args, "ltf_num_components", 3))),
+            ltf_t_eps=np.float64(float(getattr(args, "ltf_t_eps", 0.05))),
+            ltf_solve_jitter=np.float64(float(getattr(args, "ltf_solve_jitter", 1e-6))),
+            ltf_hidden_dim=np.int64(int(getattr(args, "ltf_hidden_dim", 128))),
+            ltf_depth=np.int64(int(getattr(args, "ltf_depth", 3))),
+            ltf_theta_mean=np.asarray(theta_mean, dtype=np.float64),
+            ltf_theta_std=np.asarray(theta_std, dtype=np.float64),
+            ltf_x_mean=np.asarray(x_mean, dtype=np.float64),
+            ltf_x_std=np.asarray(x_std, dtype=np.float64),
+        )
+        empty = np.asarray([], dtype=np.float64)
+        np.savez_compressed(
+            os.path.join(output_dir, "score_prior_training_losses.npz"),
+            theta_field_method=np.asarray([method_name], dtype=object),
+            prior_enable=np.bool_(False),
+            score_train_losses=np.asarray(train_out["train_losses"], dtype=np.float64),
+            score_val_losses=np.asarray(train_out["val_losses"], dtype=np.float64),
+            score_val_monitor_losses=np.asarray(train_out["val_monitor_losses"], dtype=np.float64),
+            score_best_epoch=np.int64(train_out["best_epoch"]),
+            score_stopped_epoch=np.int64(train_out["stopped_epoch"]),
+            score_stopped_early=np.bool_(train_out["stopped_early"]),
+            score_best_val_smooth=np.float64(train_out["best_val_loss"]),
+            score_grad_norm_mean=np.float64(float("nan")),
+            score_grad_norm_max=np.float64(float("nan")),
+            score_param_norm_final=np.float64(float("nan")),
+            score_n_clipped_steps=np.int64(train_out.get("n_clipped_steps", 0)),
+            score_n_total_steps=np.int64(train_out.get("n_total_steps", 0)),
+            score_lr_last=np.float64(train_out.get("lr_last", float("nan"))),
+            ae_train_losses=empty,
+            ae_val_losses=empty,
+            ae_val_monitor_losses=empty,
+            ae_best_epoch=np.int64(0),
+            ae_stopped_epoch=np.int64(0),
+            ae_stopped_early=np.bool_(False),
+            ae_latent_dim=np.int64(0),
+            score_likelihood_finetune_train_losses=empty,
+            score_likelihood_finetune_val_losses=empty,
+            score_likelihood_finetune_val_monitor_losses=empty,
+            prior_train_losses=empty,
+            prior_val_losses=empty,
+            prior_val_monitor_losses=empty,
+            prior_likelihood_finetune_train_losses=empty,
+            prior_likelihood_finetune_val_losses=empty,
+            prior_likelihood_finetune_val_monitor_losses=empty,
+            ltf_fm_train=np.bool_(True),
+            ltf_num_components=np.int64(int(getattr(args, "ltf_num_components", 3))),
+        )
+        loaded_ltf = SimpleNamespace(
+            h_sym=np.asarray(h_sym, dtype=np.float64),
+            theta_used=np.asarray(theta_used, dtype=np.float64),
+        )
+        return loaded_ltf, np.asarray(x_all, dtype=np.float64), dev
+
     gn_norm = _normalize_gaussian_network_method(tfm)
     if gn_norm is not None:
         gn_method = gn_norm
@@ -4341,6 +4582,8 @@ def _model_posterior_log_weights_for_fixed_x(
         return c, r"Linear X-flow low-rank $A$ log $p(x|\theta)$"
     if method == "linear_x_flow_schedule":
         return c, r"Linear X-flow schedule log $p(x|\theta)$"
+    if method == "linear_theta_flow":
+        return c, r"Linear theta-flow GMM log $p(\theta|x)$"
     return c, "matrix row"
 
 
@@ -5021,6 +5264,8 @@ def _render_training_losses_panel(
             post_lab = "linear-x-flow low-rank FM likelihood"
         elif tfm == "linear_x_flow_schedule":
             post_lab = "linear-x-flow schedule FM likelihood"
+        elif tfm == "linear_theta_flow":
+            post_lab = "linear-theta-flow mixture FM likelihood"
         else:
             post_lab = tfm
         _plot_loss_triplet(
@@ -5454,6 +5699,8 @@ def _save_combined_convergence_figure(
             post_lab = "linear-x-flow low-rank FM likelihood"
         elif tfm == "linear_x_flow_schedule":
             post_lab = "linear-x-flow schedule FM likelihood"
+        elif tfm == "linear_theta_flow":
+            post_lab = "linear-theta-flow mixture FM likelihood"
         else:
             post_lab = tfm
         _plot_loss_triplet(
@@ -5923,6 +6170,18 @@ def _write_summary(
             f.write(f"lxfs_weight_decay: {float(getattr(args, 'lxfs_weight_decay', 0.0))}\n")
             f.write(f"lxfs_t_eps: {float(getattr(args, 'lxfs_t_eps', 0.0))}\n")
             f.write(f"lxfs_solve_jitter: {float(getattr(args, 'lxfs_solve_jitter', 0.0))}\n")
+        if _tfm_sum == "linear_theta_flow":
+            f.write(f"ltf_num_components: {int(getattr(args, 'ltf_num_components', 0))}\n")
+            f.write(f"ltf_epochs: {int(getattr(args, 'ltf_epochs', 0))}\n")
+            f.write(f"ltf_batch_size: {int(getattr(args, 'ltf_batch_size', 0))}\n")
+            f.write(f"ltf_lr: {float(getattr(args, 'ltf_lr', 0.0))}\n")
+            f.write(f"ltf_hidden_dim: {int(getattr(args, 'ltf_hidden_dim', 0))}\n")
+            f.write(f"ltf_depth: {int(getattr(args, 'ltf_depth', 0))}\n")
+            f.write(f"ltf_weight_decay: {float(getattr(args, 'ltf_weight_decay', 0.0))}\n")
+            f.write(f"ltf_t_eps: {float(getattr(args, 'ltf_t_eps', 0.0))}\n")
+            f.write(f"ltf_solve_jitter: {float(getattr(args, 'ltf_solve_jitter', 0.0))}\n")
+            f.write(f"ltf_early_patience: {int(getattr(args, 'ltf_early_patience', 0))}\n")
+            f.write(f"ltf_pair_batch_size: {int(getattr(args, 'ltf_pair_batch_size', 0))}\n")
             f.write(f"lxfs_early_patience: {int(getattr(args, 'lxfs_early_patience', 0))}\n")
             f.write(f"lxfs_pair_batch_size: {int(getattr(args, 'lxfs_pair_batch_size', 0))}\n")
         if _tfm_sum == "x_flow_pca":
@@ -6680,6 +6939,17 @@ def main(argv: list[str] | None = None) -> None:
             "uses ODE likelihood log p(z|theta), then DeltaL=C-diag(C), and H via 1-sech(DeltaL/2).",
             flush=True,
         )
+    elif tfm == "linear_theta_flow":
+        print(
+            f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
+            f"(K={int(getattr(args, 'ltf_num_components', 3))}; time-independent mixture velocity)",
+            flush=True,
+        )
+        print(
+            "[convergence] linear_theta_flow mode trains pure FM on v_k(theta,x)=A_k theta+b_k(x), "
+            "uses analytic Gaussian-mixture log p(theta|x), then DeltaL=C-diag(C), and H via 1-sech(DeltaL/2).",
+            flush=True,
+        )
     elif tfm == "ctsm_v":
         print(
             f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
@@ -6893,6 +7163,17 @@ def main(argv: list[str] | None = None) -> None:
             "DeltaL=C-diag(C), and H via 1-sech(DeltaL/2).",
             flush=True,
         )
+    elif tfm == "linear_theta_flow":
+        print(
+            f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
+            f"(K={int(getattr(args, 'ltf_num_components', 3))}; time-independent mixture velocity)",
+            flush=True,
+        )
+        print(
+            "[convergence] linear_theta_flow mode trains pure FM on v_k(theta,x)=A_k theta+b_k(x), "
+            "uses analytic Gaussian-mixture log p(theta|x), then DeltaL=C-diag(C), and H via 1-sech(DeltaL/2).",
+            flush=True,
+        )
     elif tfm in (
         "gaussian_network",
         "gaussian_network_diagonal",
@@ -6943,7 +7224,7 @@ def main(argv: list[str] | None = None) -> None:
             "theta_flow, theta-flow-autoencoder, theta_path_integral, x_flow, x-flow-autoencoder, x-flow-pca, "
             "ctsm_v, nf, contrastive, nf-reduction, gaussian-x-flow, gaussian-x-flow-diagonal, "
             "linear-x-flow, linear-x-flow-scalar, linear-x-flow-diagonal, "
-            "linear-x-flow-low-rank, linear-x-flow-schedule, gaussian-network, "
+            "linear-x-flow-low-rank, linear-x-flow-schedule, linear-theta-flow, gaussian-network, "
             "gaussian-network-diagonal, gaussian-network-diagonal-binned-pca, gaussian-network-low-rank, gaussian-network-autoencoder, "
             "or gaussian-network-diagonal-autoencoder."
         )

@@ -300,7 +300,7 @@ def train_gaussian_x_flow(
     batch_size: int,
     lr: float,
     weight_decay: float = 0.0,
-    t_eps: float = 1e-3,
+    t_eps: float = 0.05,
     cov_jitter: float = 1e-4,
     patience: int = 300,
     min_delta: float = 1e-4,

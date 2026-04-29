@@ -262,7 +262,16 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         ),
     )
     p.add_argument("--flow-batch-size", type=int, default=256)
-    p.add_argument("--flow-lr", type=float, default=1e-3)
+    p.add_argument("--flow-lr", type=float, default=1e-4)
+    p.add_argument(
+        "--flow-fm-t-eps",
+        type=float,
+        default=0.05,
+        help=(
+            "theta_flow / theta_path_integral / x_flow: flow-matching bridge time t is sampled uniformly in "
+            "[t_eps, 1-t_eps]. Must lie in (0, 0.5)."
+        ),
+    )
     p.add_argument(
         "--flow-likelihood-finetune-epochs",
         type=int,

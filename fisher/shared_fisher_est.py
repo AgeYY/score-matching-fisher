@@ -1166,6 +1166,10 @@ def validate_estimation_args(args: Any) -> None:
         raise ValueError("--flow-early-min-delta must be non-negative.")
     if not (0.0 < float(getattr(args, "flow_early_ema_alpha", 0.05)) <= 1.0):
         raise ValueError("--flow-early-ema-alpha must be in (0, 1].")
+    _fm_te = float(getattr(args, "flow_fm_t_eps", 0.05))
+    if _tfm_val in ("theta_flow", "theta_path_integral", "x_flow"):
+        if not (0.0 < _fm_te < 0.5):
+            raise ValueError("--flow-fm-t-eps must be in (0, 0.5) for theta_flow / theta_path_integral / x_flow.")
     if not (0.0 <= float(getattr(args, "flow_eval_t", 0.8)) <= 1.0):
         raise ValueError("--flow-eval-t must be in [0, 1].")
     if int(getattr(args, "flow_cond_embed_dim", 16)) < 1:
@@ -2159,6 +2163,7 @@ def run_shared_fisher_estimation(
             restore_best=bool(getattr(args, "flow_restore_best", True)),
             scheduler_name=str(getattr(args, "flow_scheduler", "cosine")),
             two_stage_mean_theta_pretrain=_xf_twostage,
+            fm_t_eps=float(getattr(args, "flow_fm_t_eps", 0.05)),
         )
         if theta_field_method == "x_flow" and post_train_out.get("flow_x_two_stage"):
             print(
@@ -2519,6 +2524,7 @@ def run_shared_fisher_estimation(
                 else 0.0
             ),
             endpoint_ode_steps=int(getattr(args, "flow_endpoint_steps", 20)),
+            fm_t_eps=float(getattr(args, "flow_fm_t_eps", 0.05)),
         )
         post_train_losses = np.asarray(post_train_out["train_losses"], dtype=np.float64)
         post_val_losses = np.asarray(post_train_out["val_losses"], dtype=np.float64)
@@ -2683,6 +2689,7 @@ def run_shared_fisher_estimation(
                 early_stopping_ema_alpha=float(getattr(args, "prior_early_ema_alpha", 0.05)),
                 restore_best=bool(getattr(args, "prior_restore_best", True)),
                 scheduler_name=str(getattr(args, "flow_scheduler", "cosine")),
+                fm_t_eps=float(getattr(args, "flow_fm_t_eps", 0.05)),
             )
             prior_train_losses = np.asarray(prior_train_out["train_losses"], dtype=np.float64)
             prior_val_losses = np.asarray(prior_train_out["val_losses"], dtype=np.float64)

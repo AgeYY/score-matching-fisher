@@ -58,6 +58,21 @@ def to_prior_loader(theta: np.ndarray, batch_size: int, shuffle: bool = True) ->
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, drop_last=False)
 
 
+def _sample_fm_bridge_times(
+    batch_size: int,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    t_eps: float,
+) -> torch.Tensor:
+    """Uniform bridge times in [t_eps, 1 - t_eps] (closed interval via rand in [0,1])."""
+    te = float(t_eps)
+    if not (0.0 < te < 0.5):
+        raise ValueError(f"FM bridge t_eps must lie in (0, 0.5); got {te}.")
+    u = torch.rand((batch_size,), device=device, dtype=dtype)
+    return te + (1.0 - 2.0 * te) * u
+
+
 def _ema_update_val_monitor(prev_ema: float | None, mean_val_loss: float, ema_alpha: float) -> float:
     """Exponential moving average of per-epoch validation loss for early-stopping monitor."""
     if prev_ema is None:
@@ -1051,6 +1066,7 @@ def train_conditional_x_flow_model(
     scheduler_name: str = "cosine",
     *,
     two_stage_mean_theta_pretrain: bool = False,
+    fm_t_eps: float = 0.05,
 ) -> dict[str, float | int | bool | list[float] | list[int]]:
     """Train conditional x-flow velocity. Optional two-stage: mean-theta pretrain then conditional finetune.
 
@@ -1088,6 +1104,7 @@ def train_conditional_x_flow_model(
             phase_label="stage1_mean_theta",
             epoch_base=0,
             total_epochs_label=int(epochs),
+            fm_t_eps=float(fm_t_eps),
         )
         actual_e1 = len(out1["train_losses"])
         out2 = _train_conditional_x_flow_phase(
@@ -1110,6 +1127,7 @@ def train_conditional_x_flow_model(
             phase_label="stage2_conditional",
             epoch_base=actual_e1,
             total_epochs_label=int(epochs),
+            fm_t_eps=float(fm_t_eps),
         )
         tr = list(out1["train_losses"]) + list(out2["train_losses"])
         va = list(out1["val_losses"]) + list(out2["val_losses"])
@@ -1152,6 +1170,7 @@ def train_conditional_x_flow_model(
         phase_label="",
         epoch_base=0,
         total_epochs_label=int(epochs),
+        fm_t_eps=float(fm_t_eps),
     )
 
 
@@ -1181,6 +1200,7 @@ def _train_conditional_x_flow_phase(
     phase_label: str,
     epoch_base: int,
     total_epochs_label: int,
+    fm_t_eps: float = 0.05,
 ) -> dict[str, float | int | bool | list[float] | list[int]]:
     path = _make_flow_matching_path(scheduler_name=scheduler_name)
     loader = to_score_loader(theta_train, x_train, batch_size=batch_size, shuffle=True)
@@ -1216,7 +1236,9 @@ def _train_conditional_x_flow_phase(
             if fixed_theta is not None:
                 tb = torch.full_like(tb, float(fixed_theta))
             x0 = torch.randn_like(xb)
-            t = torch.rand(xb.shape[0], device=xb.device)
+            t = _sample_fm_bridge_times(
+                int(xb.shape[0]), device=xb.device, dtype=xb.dtype, t_eps=fm_t_eps
+            )
             path_sample = path.sample(t=t, x_0=x0, x_1=xb)
             pred = model(path_sample.x_t, tb, path_sample.t)
             loss = torch.mean((pred - path_sample.dx_t) ** 2)
@@ -1238,7 +1260,9 @@ def _train_conditional_x_flow_phase(
                     if fixed_theta is not None:
                         tb = torch.full_like(tb, float(fixed_theta))
                     x0 = torch.randn_like(xb)
-                    t = torch.rand(xb.shape[0], device=xb.device)
+                    t = _sample_fm_bridge_times(
+                        int(xb.shape[0]), device=xb.device, dtype=xb.dtype, t_eps=fm_t_eps
+                    )
                     path_sample = path.sample(t=t, x_0=x0, x_1=xb)
                     pred = model(path_sample.x_t, tb, path_sample.t)
                     val_loss = torch.mean((pred - path_sample.dx_t) ** 2)
@@ -1567,6 +1591,7 @@ def train_conditional_theta_flow_model(
     scheduler_name: str = "cosine",
     endpoint_loss_weight: float = 0.0,
     endpoint_ode_steps: int = 20,
+    fm_t_eps: float = 0.05,
 ) -> dict[str, float | int | bool | list[float]]:
     path = _make_flow_matching_path(scheduler_name=scheduler_name)
     endpoint_weight = float(endpoint_loss_weight)
@@ -1610,7 +1635,9 @@ def train_conditional_theta_flow_model(
         for tb, xb in loader:
             tb = tb.to(device, non_blocking=True)
             xb = xb.to(device, non_blocking=True)
-            t = torch.rand(tb.shape[0], device=tb.device)
+            t = _sample_fm_bridge_times(
+                int(tb.shape[0]), device=tb.device, dtype=tb.dtype, t_eps=fm_t_eps
+            )
             theta0 = torch.randn_like(tb)
             path_sample = path.sample(t=t, x_0=theta0, x_1=tb)
             pred = model(path_sample.x_t, xb, path_sample.t)
@@ -1650,7 +1677,9 @@ def train_conditional_theta_flow_model(
                 for tb, xb in val_loader:
                     tb = tb.to(device, non_blocking=True)
                     xb = xb.to(device, non_blocking=True)
-                    t = torch.rand(tb.shape[0], device=tb.device)
+                    t = _sample_fm_bridge_times(
+                        int(tb.shape[0]), device=tb.device, dtype=tb.dtype, t_eps=fm_t_eps
+                    )
                     theta0 = torch.randn_like(tb)
                     path_sample = path.sample(t=t, x_0=theta0, x_1=tb)
                     pred = model(path_sample.x_t, xb, path_sample.t)
@@ -1757,6 +1786,7 @@ def train_prior_theta_flow_model(
     early_stopping_ema_alpha: float = 0.05,
     restore_best: bool = True,
     scheduler_name: str = "cosine",
+    fm_t_eps: float = 0.05,
 ) -> dict[str, float | int | bool | list[float]]:
     path = _make_flow_matching_path(scheduler_name=scheduler_name)
     loader = to_prior_loader(theta_train, batch_size=batch_size, shuffle=True)
@@ -1782,7 +1812,9 @@ def train_prior_theta_flow_model(
         model.train()
         for (tb,) in loader:
             tb = tb.to(device, non_blocking=True)
-            t = torch.rand(tb.shape[0], device=tb.device)
+            t = _sample_fm_bridge_times(
+                int(tb.shape[0]), device=tb.device, dtype=tb.dtype, t_eps=fm_t_eps
+            )
             theta0 = torch.randn_like(tb)
             path_sample = path.sample(t=t, x_0=theta0, x_1=tb)
             pred = model(path_sample.x_t, path_sample.t)
@@ -1801,7 +1833,9 @@ def train_prior_theta_flow_model(
             with torch.no_grad():
                 for (tb,) in val_loader:
                     tb = tb.to(device, non_blocking=True)
-                    t = torch.rand(tb.shape[0], device=tb.device)
+                    t = _sample_fm_bridge_times(
+                        int(tb.shape[0]), device=tb.device, dtype=tb.dtype, t_eps=fm_t_eps
+                    )
                     theta0 = torch.randn_like(tb)
                     path_sample = path.sample(t=t, x_0=theta0, x_1=tb)
                     pred = model(path_sample.x_t, path_sample.t)
@@ -1870,6 +1904,7 @@ def train_unconditional_x_flow_model(
     early_stopping_ema_alpha: float = 0.05,
     restore_best: bool = True,
     scheduler_name: str = "cosine",
+    fm_t_eps: float = 0.05,
 ) -> dict[str, float | int | bool | list[float]]:
     """Flow matching on x only: learn v(x_t, t) with no theta in the network."""
     path = _make_flow_matching_path(scheduler_name=scheduler_name)
@@ -1897,7 +1932,9 @@ def train_unconditional_x_flow_model(
         for (xb,) in loader:
             xb = xb.to(device, non_blocking=True)
             x0 = torch.randn_like(xb)
-            t = torch.rand(xb.shape[0], device=xb.device)
+            t = _sample_fm_bridge_times(
+                int(xb.shape[0]), device=xb.device, dtype=xb.dtype, t_eps=fm_t_eps
+            )
             path_sample = path.sample(t=t, x_0=x0, x_1=xb)
             pred = model(path_sample.x_t, path_sample.t)
             loss = torch.mean((pred - path_sample.dx_t) ** 2)
@@ -1916,7 +1953,9 @@ def train_unconditional_x_flow_model(
                 for (xb,) in val_loader:
                     xb = xb.to(device, non_blocking=True)
                     x0 = torch.randn_like(xb)
-                    t = torch.rand(xb.shape[0], device=xb.device)
+                    t = _sample_fm_bridge_times(
+                        int(xb.shape[0]), device=xb.device, dtype=xb.dtype, t_eps=fm_t_eps
+                    )
                     path_sample = path.sample(t=t, x_0=x0, x_1=xb)
                     pred = model(path_sample.x_t, path_sample.t)
                     val_loss = torch.mean((pred - path_sample.dx_t) ** 2)
