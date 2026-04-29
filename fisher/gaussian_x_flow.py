@@ -10,12 +10,22 @@ from __future__ import annotations
 
 import math
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from typing import Any, Union
 
 import numpy as np
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
+
+from fisher.model_weight_ema import (
+    clone_model_weight_ema,
+    evaluate_with_weight_ema,
+    init_model_weight_ema,
+    load_model_weights_from_ema_state,
+    scalar_val_ema_update,
+    update_model_weight_ema,
+)
 
 
 def _as_2d_float64(a: np.ndarray, *, name: str) -> np.ndarray:
@@ -305,6 +315,7 @@ def train_gaussian_x_flow(
     patience: int = 300,
     min_delta: float = 1e-4,
     ema_alpha: float = 0.05,
+    weight_ema_decay: float = 0.9,
     max_grad_norm: float = 10.0,
     log_every: int = 50,
     restore_best: bool = True,
@@ -321,6 +332,8 @@ def train_gaussian_x_flow(
         raise ValueError("min_delta must be >= 0.")
     if not (0.0 < float(ema_alpha) <= 1.0):
         raise ValueError("ema_alpha must be in (0, 1].")
+    if not np.isfinite(float(weight_ema_decay)) or float(weight_ema_decay) >= 1.0:
+        raise ValueError("weight_ema_decay must be finite and < 1.")
     te = float(t_eps)
     if not (0.0 < te < 0.5):
         raise ValueError("t_eps must be in (0, 0.5).")
@@ -357,11 +370,14 @@ def train_gaussian_x_flow(
     val_monitor_losses: list[float] = []
     best_val = float("inf")
     best_epoch = 0
-    best_state: dict[str, torch.Tensor] | None = None
-    val_ema: float | None = None
+    best_eval_state_cpu: dict[str, torch.Tensor] | None = None
+    weight_ema_enabled = float(weight_ema_decay) > 0.0
+    weight_ema_state = init_model_weight_ema(model) if weight_ema_enabled else None
     patience_counter = 0
     stopped_early = False
     stopped_epoch = int(epochs)
+    val_ema: float | None = None
+    alpha = float(ema_alpha)
 
     for epoch in range(1, int(epochs) + 1):
         model.train()
@@ -391,6 +407,8 @@ def train_gaussian_x_flow(
             if float(max_grad_norm) > 0.0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), float(max_grad_norm))
             opt.step()
+            if weight_ema_state is not None:
+                update_model_weight_ema(weight_ema_state, model, decay=float(weight_ema_decay))
             ep_losses.append(float(loss.detach().cpu()))
 
         train_loss = float(np.mean(ep_losses))
@@ -398,43 +416,54 @@ def train_gaussian_x_flow(
 
         model.eval()
         val_ep: list[float] = []
-        with torch.no_grad():
-            for tb, x1b in val_loader:
-                tb = tb.to(device)
-                x1b = x1b.to(device)
-                bs = int(x1b.shape[0])
-                t_raw = torch.rand(bs, 1, device=device, dtype=x1b.dtype)
-                t = float(te) + (1.0 - 2.0 * float(te)) * t_raw
-                x0b = torch.randn_like(x1b)
-                a, bcoef, ad, bd = schedule.ab_ad_bd(t)
-                xt = a * x0b + bcoef * x1b
-                ut = ad * x0b + bd * x1b
-                mu, l_cov = model(tb)
-                v = analytic_gaussian_fm_velocity(
-                    xt=xt,
-                    t=t,
-                    mu=mu,
-                    l_cov=l_cov,
-                    schedule=schedule,
-                    cov_jitter=float(cov_jitter),
-                )
-                loss_b = torch.mean(torch.sum((v - ut) ** 2, dim=1))
-                val_ep.append(float(loss_b.detach().cpu()))
-        val_loss = float(np.mean(val_ep))
-        val_losses.append(val_loss)
-        val_ema = val_loss if val_ema is None else float(ema_alpha) * val_loss + (1.0 - float(ema_alpha)) * val_ema
-        val_monitor_losses.append(float(val_ema))
-        if val_ema < best_val - float(min_delta):
-            best_val = float(val_ema)
+        ema_ctx = (
+            evaluate_with_weight_ema(model, weight_ema_state)
+            if weight_ema_state is not None
+            else nullcontext()
+        )
+        with ema_ctx:
+            with torch.no_grad():
+                for tb, x1b in val_loader:
+                    tb = tb.to(device)
+                    x1b = x1b.to(device)
+                    bs = int(x1b.shape[0])
+                    t_raw = torch.rand(bs, 1, device=device, dtype=x1b.dtype)
+                    t = float(te) + (1.0 - 2.0 * float(te)) * t_raw
+                    x0b = torch.randn_like(x1b)
+                    a, bcoef, ad, bd = schedule.ab_ad_bd(t)
+                    xt = a * x0b + bcoef * x1b
+                    ut = ad * x0b + bd * x1b
+                    mu, l_cov = model(tb)
+                    v = analytic_gaussian_fm_velocity(
+                        xt=xt,
+                        t=t,
+                        mu=mu,
+                        l_cov=l_cov,
+                        schedule=schedule,
+                        cov_jitter=float(cov_jitter),
+                    )
+                    loss_b = torch.mean(torch.sum((v - ut) ** 2, dim=1))
+                    val_ep.append(float(loss_b.detach().cpu()))
+        val_raw = float(np.mean(val_ep))
+        val_losses.append(val_raw)
+        val_ema = scalar_val_ema_update(val_ema, val_raw, alpha)
+        val_smooth = float(val_ema)
+        val_monitor_losses.append(val_smooth)
+        if val_smooth < best_val - float(min_delta):
+            best_val = float(val_smooth)
             best_epoch = int(epoch)
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            best_eval_state_cpu = (
+                clone_model_weight_ema(weight_ema_state)
+                if weight_ema_state is not None
+                else {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            )
             patience_counter = 0
         else:
             patience_counter += 1
         if epoch == 1 or epoch % max(1, int(log_every)) == 0 or epoch == int(epochs):
             print(
                 f"[gaussian_x_flow {epoch:4d}/{int(epochs)}] train_fm={train_loss:.6f} "
-                f"val_fm={val_loss:.6f} val_smooth={val_ema:.6f} best_smooth={best_val:.6f} "
+                f"val_fm={val_raw:.6f} val_smooth={val_smooth:.6f} best_monitor={best_val:.6f} "
                 f"best_epoch={best_epoch}",
                 flush=True,
             )
@@ -443,14 +472,29 @@ def train_gaussian_x_flow(
             stopped_epoch = int(epoch)
             print(
                 f"[gaussian_x_flow early-stop] epoch={epoch} best_epoch={best_epoch} "
-                f"best_smooth={best_val:.6f} patience={int(patience)}",
+                f"best_monitor={best_val:.6f} patience={int(patience)}",
                 flush=True,
             )
             break
 
-    if restore_best and best_state is not None:
-        model.load_state_dict(best_state)
-        print(f"[gaussian_x_flow restore-best] restored epoch={best_epoch} val_smooth={best_val:.6f}", flush=True)
+    final_eval_weights = "raw"
+    if restore_best and best_eval_state_cpu is not None:
+        if weight_ema_enabled:
+            load_model_weights_from_ema_state(model, best_eval_state_cpu)
+            final_eval_weights = "ema"
+            print(
+                f"[gaussian_x_flow restore-best] restored EMA eval weights epoch={best_epoch} "
+                f"best_monitor={best_val:.6f}",
+                flush=True,
+            )
+        else:
+            model.load_state_dict(best_eval_state_cpu)
+            final_eval_weights = "raw"
+            print(
+                f"[gaussian_x_flow restore-best] restored raw eval weights epoch={best_epoch} "
+                f"best_monitor={best_val:.6f}",
+                flush=True,
+            )
 
     return {
         "train_losses": train_losses,
@@ -461,6 +505,9 @@ def train_gaussian_x_flow(
         "stopped_epoch": int(stopped_epoch),
         "stopped_early": bool(stopped_early),
         "lr_last": float(opt.param_groups[0]["lr"]),
+        "weight_ema_enabled": bool(weight_ema_enabled),
+        "weight_ema_decay": float(weight_ema_decay),
+        "final_eval_weights": final_eval_weights,
         "x_mean": x_mean.astype(np.float64),
         "x_std": x_std.astype(np.float64),
     }

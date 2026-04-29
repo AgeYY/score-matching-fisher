@@ -540,7 +540,9 @@ class TestStudyHDecodingConvergenceGaussianNetwork(unittest.TestCase):
         for method_cli, method_stored in (
             ("linear-x-flow-scalar", "linear_x_flow_scalar"),
             ("linear-x-flow-diagonal", "linear_x_flow_diagonal"),
+            ("linear-x-flow-diagonal-theta", "linear_x_flow_diagonal_theta"),
             ("linear-x-flow-low-rank", "linear_x_flow_low_rank"),
+            ("linear-x-flow-low-rank-randb", "linear_x_flow_low_rank_randb"),
         ):
             with self.subTest(method=method_cli), tempfile.TemporaryDirectory() as tmp:
                 tmp_path = Path(tmp)

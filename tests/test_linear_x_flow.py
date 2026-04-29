@@ -11,14 +11,64 @@ from fisher.linear_x_flow import (
     ConditionalDiagonalLinearXFlowMLP,
     ConditionalLinearXFlowMLP,
     ConditionalLowRankLinearXFlowMLP,
+    ConditionalRandomBasisLowRankLinearXFlowMLP,
     ConditionalScalarLinearXFlowMLP,
+    ConditionalThetaDiagonalLinearXFlowMLP,
+    _phi_expm1_div_a,
     compute_linear_x_flow_c_matrix,
     train_linear_x_flow_schedule,
 )
 from fisher.gaussian_x_flow import path_schedule_from_name
+from fisher.model_weight_ema import (
+    evaluate_with_weight_ema,
+    init_model_weight_ema,
+    load_model_weights_from_ema_state,
+    update_model_weight_ema,
+)
 
 
 class TestLinearXFlow(unittest.TestCase):
+    def test_load_model_weights_from_ema_state_applies_ema(self) -> None:
+        m = torch.nn.Linear(2, 2, bias=True)
+        with torch.no_grad():
+            m.weight.fill_(1.0)
+        ema = init_model_weight_ema(m)
+        with torch.no_grad():
+            m.weight.fill_(3.0)
+        update_model_weight_ema(ema, m, decay=0.5)
+        load_model_weights_from_ema_state(m, ema)
+        self.assertTrue(torch.allclose(m.weight, ema["weight"].to(m.weight.device, dtype=m.weight.dtype)))
+
+    def test_model_weight_ema_updates_float_tensors_and_copies_integer_buffers(self) -> None:
+        bn = torch.nn.BatchNorm1d(2)
+        with torch.no_grad():
+            bn.weight.fill_(1.0)
+            bn.running_mean.fill_(2.0)
+            bn.num_batches_tracked.fill_(3)
+        ema = init_model_weight_ema(bn)
+        with torch.no_grad():
+            bn.weight.fill_(3.0)
+            bn.running_mean.fill_(4.0)
+            bn.num_batches_tracked.fill_(7)
+        update_model_weight_ema(ema, bn, decay=0.5)
+        self.assertTrue(torch.allclose(ema["weight"], torch.full_like(ema["weight"], 2.0)))
+        self.assertTrue(torch.allclose(ema["running_mean"], torch.full_like(ema["running_mean"], 3.0)))
+        self.assertEqual(int(ema["num_batches_tracked"].item()), 7)
+
+    def test_evaluate_with_weight_ema_restores_raw_weights(self) -> None:
+        m = torch.nn.Linear(2, 2, bias=True)
+        with torch.no_grad():
+            m.weight.fill_(1.0)
+            m.bias.zero_()
+        ema = init_model_weight_ema(m)
+        with torch.no_grad():
+            m.weight.fill_(5.0)
+        update_model_weight_ema(ema, m, decay=0.5)
+        raw_w = m.weight.detach().clone()
+        with evaluate_with_weight_ema(m, ema):
+            self.assertFalse(torch.allclose(m.weight, raw_w))
+        self.assertTrue(torch.allclose(m.weight, raw_w))
+
     def test_model_shapes_and_velocity_finite(self) -> None:
         torch.manual_seed(0)
         m = ConditionalLinearXFlowMLP(theta_dim=2, x_dim=3, hidden_dim=16, depth=2)
@@ -52,6 +102,63 @@ class TestLinearXFlow(unittest.TestCase):
             m.a.copy_(torch.tensor([0.1, 0.2, 0.3]))
         self.assertTrue(torch.allclose(m.A, torch.diag(torch.tensor([0.1, 0.2, 0.3]))))
 
+    def test_phi_expm1_div_a_at_zero(self) -> None:
+        a = torch.zeros(4)
+        phi = _phi_expm1_div_a(a)
+        self.assertTrue(torch.allclose(phi, torch.ones_like(phi)))
+
+    def test_theta_diagonal_forward_and_likelihood_finite(self) -> None:
+        torch.manual_seed(0)
+        m = ConditionalThetaDiagonalLinearXFlowMLP(theta_dim=2, x_dim=3, hidden_dim=16, depth=2)
+        th = torch.randn(5, 2)
+        x = torch.randn(5, 3)
+        v = m(x, th)
+        self.assertEqual(tuple(v.shape), (5, 3))
+        self.assertTrue(torch.all(torch.isfinite(v)))
+        lp = m.log_prob_normalized(x, th, solve_jitter=1e-6)
+        self.assertEqual(tuple(lp.shape), (5,))
+        self.assertTrue(torch.all(torch.isfinite(lp)))
+
+    def test_theta_diagonal_endpoint_matches_elementwise_formula(self) -> None:
+        m = ConditionalThetaDiagonalLinearXFlowMLP(theta_dim=1, x_dim=2, hidden_dim=4, depth=1)
+        with torch.no_grad():
+            for p in m.trunk.parameters():
+                p.zero_()
+            m.a_head.weight.zero_()
+            m.b_head.weight.zero_()
+            m.a_head.bias.copy_(torch.tensor([0.5, -0.2]))
+            m.b_head.bias.copy_(torch.tensor([1.0, 2.0]))
+        th = torch.zeros(3, 1)
+        mu, sig = m.endpoint_mean_covariance_diag(th, solve_jitter=1e-8)
+        a = torch.tensor([0.5, -0.2])
+        b = torch.tensor([1.0, 2.0])
+        phi = _phi_expm1_div_a(a)
+        mu_exp = phi * b
+        sig_exp = torch.exp(2.0 * a)
+        self.assertTrue(torch.allclose(mu[0], mu_exp))
+        self.assertTrue(torch.allclose(sig[0], sig_exp + 1e-8))
+
+    def test_theta_diagonal_compute_c_matrix_finite(self) -> None:
+        torch.manual_seed(3)
+        n = 5
+        d = 2
+        theta_all = np.random.randn(n, 1).astype(np.float64)
+        x_all = np.random.randn(n, d).astype(np.float64)
+        dev = torch.device("cpu")
+        m = ConditionalThetaDiagonalLinearXFlowMLP(theta_dim=1, x_dim=d, hidden_dim=16, depth=1)
+        c = compute_linear_x_flow_c_matrix(
+            model=m,
+            theta_all=theta_all,
+            x_all=x_all,
+            device=dev,
+            x_mean=np.zeros(d, dtype=np.float64),
+            x_std=np.ones(d, dtype=np.float64),
+            solve_jitter=1e-6,
+            pair_batch_size=256,
+        )
+        self.assertEqual(c.shape, (n, n))
+        self.assertTrue(np.all(np.isfinite(c)))
+
     def test_low_rank_drift_matrix(self) -> None:
         m = ConditionalLowRankLinearXFlowMLP(theta_dim=1, x_dim=3, rank=2, hidden_dim=8, depth=1)
         with torch.no_grad():
@@ -61,6 +168,28 @@ class TestLinearXFlow(unittest.TestCase):
         expected = torch.diag(m.a) + (m.U * m.s.unsqueeze(0)) @ m.U.T
         self.assertTrue(torch.allclose(m.A, expected))
         self.assertTrue(torch.allclose(m.A, m.A.T))
+
+    def test_random_basis_low_rank_drift_matrix(self) -> None:
+        torch.manual_seed(5)
+        m = ConditionalRandomBasisLowRankLinearXFlowMLP(
+            theta_dim=1,
+            x_dim=4,
+            rank=2,
+            hidden_dim=8,
+            depth=1,
+            lambda_a=1e-4,
+            lambda_s=1e-4,
+        )
+        self.assertTrue(torch.allclose(m.Q.T @ m.Q, torch.eye(2), atol=1e-5))
+        with torch.no_grad():
+            m.a.copy_(torch.tensor([0.1, 0.2, 0.3, 0.4]))
+            m.S_raw.copy_(torch.tensor([[1.0, 3.0], [-1.0, 2.0]]))
+        expected_s = torch.tensor([[1.0, 1.0], [1.0, 2.0]])
+        expected_a = torch.diag(m.a) + m.Q @ expected_s @ m.Q.T
+        self.assertTrue(torch.allclose(m.S, expected_s))
+        self.assertTrue(torch.allclose(m.A, expected_a))
+        self.assertTrue(torch.allclose(m.A, m.A.T, atol=1e-6))
+        self.assertGreaterEqual(float(m.regularization_loss().detach()), 0.0)
 
     def test_endpoint_mean_covariance_shapes(self) -> None:
         torch.manual_seed(1)
@@ -131,8 +260,36 @@ class TestLinearXFlow(unittest.TestCase):
         )
         self.assertEqual(len(out["train_losses"]), 1)
         self.assertEqual(len(out["val_losses"]), 1)
+        self.assertTrue(bool(out["weight_ema_enabled"]))
+        self.assertAlmostEqual(float(out["weight_ema_decay"]), 0.9)
+        self.assertEqual(out["final_eval_weights"], "ema")
         self.assertTrue(np.isfinite(out["train_losses"][0]))
         self.assertTrue(np.isfinite(out["val_losses"][0]))
+
+    def test_train_schedule_weight_ema_off_final_eval_is_raw(self) -> None:
+        torch.manual_seed(4)
+        rng = np.random.default_rng(4)
+        theta = rng.normal(size=(24, 1)).astype(np.float64)
+        x = np.concatenate([theta, -theta], axis=1) + 0.1 * rng.normal(size=(24, 2))
+        m = ConditionalLinearXFlowMLP(theta_dim=1, x_dim=2, hidden_dim=8, depth=1)
+        out = train_linear_x_flow_schedule(
+            model=m,
+            theta_train=theta[:16],
+            x_train=x[:16],
+            theta_val=theta[16:],
+            x_val=x[16:],
+            device=torch.device("cpu"),
+            schedule=path_schedule_from_name("cosine"),
+            epochs=1,
+            batch_size=8,
+            lr=1e-3,
+            t_eps=1e-3,
+            patience=0,
+            log_every=1,
+            weight_ema_decay=0.0,
+        )
+        self.assertFalse(bool(out["weight_ema_enabled"]))
+        self.assertEqual(out["final_eval_weights"], "raw")
 
 
 if __name__ == "__main__":

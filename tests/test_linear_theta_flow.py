@@ -80,8 +80,11 @@ class TestLinearThetaFlow(unittest.TestCase):
         )
         self.assertEqual(len(out["train_losses"]), 1)
         self.assertEqual(len(out["val_losses"]), 1)
+        self.assertTrue(bool(out["weight_ema_enabled"]))
+        self.assertAlmostEqual(float(out["weight_ema_decay"]), 0.9)
         self.assertTrue(np.isfinite(out["train_losses"][0]))
         self.assertTrue(np.isfinite(out["val_losses"][0]))
+        self.assertEqual(out["final_eval_weights"], "ema")
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ from fisher.gaussian_x_flow import (
     analytic_gaussian_fm_velocity,
     compute_gaussian_x_flow_c_matrix,
     path_schedule_from_name,
+    train_gaussian_x_flow,
 )
 
 
@@ -136,6 +137,33 @@ class TestGaussianXFlowDiagonal(unittest.TestCase):
         )
         lp = m.log_prob_normalized(x, th)
         self.assertTrue(torch.allclose(lp, manual, atol=1e-5, rtol=1e-4))
+
+
+class TestGaussianXFlowTrain(unittest.TestCase):
+    def test_train_one_epoch_final_eval_ema_when_weight_ema_on(self) -> None:
+        torch.manual_seed(20)
+        rng = np.random.default_rng(20)
+        th = rng.normal(size=(32, 1)).astype(np.float64)
+        x = rng.normal(size=(32, 3)).astype(np.float64)
+        m = ConditionalGaussianCovarianceFMMLP(theta_dim=1, x_dim=3, hidden_dim=16, depth=1, diag_floor=1e-4)
+        out = train_gaussian_x_flow(
+            model=m,
+            theta_train=th[:20],
+            x_train=x[:20],
+            theta_val=th[20:],
+            x_val=x[20:],
+            device=torch.device("cpu"),
+            schedule=path_schedule_from_name("linear"),
+            epochs=1,
+            batch_size=8,
+            lr=1e-3,
+            t_eps=0.05,
+            cov_jitter=1e-3,
+            patience=0,
+            log_every=1,
+        )
+        self.assertTrue(bool(out["weight_ema_enabled"]))
+        self.assertEqual(out["final_eval_weights"], "ema")
 
 
 if __name__ == "__main__":
