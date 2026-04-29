@@ -250,6 +250,34 @@ class TestGaussianTuningCurve(unittest.TestCase):
         self.assertIsInstance(ds, ToyConditionalGaussianRandampSqrtdDataset)
         self.assertEqual(int(ds.x_dim), 2)
 
+    def test_meta_roundtrip_cosine_gaussian_sqrtd_pr_embedded_uses_zdim(self) -> None:
+        ns_low = _ns(
+            dataset_family="cosine_gaussian_sqrtd",
+            x_dim=2,
+            n_total=10,
+            train_frac=1.0,
+            seed=11,
+        )
+        validate_dataset_sample_args(ns_low)
+        ds0 = build_dataset_from_args(ns_low)
+        ns_meta = _ns(
+            dataset_family="cosine_gaussian_sqrtd",
+            x_dim=50,
+            n_total=10,
+            train_frac=1.0,
+            seed=11,
+        )
+        validate_dataset_sample_args(ns_meta)
+        meta = meta_dict_from_args(ns_meta)
+        meta["pr_autoencoder_enabled"] = True
+        meta["pr_autoencoder_embedded"] = True
+        meta["pr_autoencoder_z_dim"] = 2
+        ds = build_dataset_from_meta(meta)
+        self.assertIsInstance(ds, ToyConditionalGaussianSqrtdDataset)
+        self.assertEqual(int(ds.x_dim), 2)
+        t0 = np.array([[0.1]])
+        np.testing.assert_allclose(ds.tuning_curve(t0), ds0.tuning_curve(t0), rtol=0, atol=1e-15)
+
     def test_removed_pr_autoencoder_dataset_family_meta_raises(self) -> None:
         ns = _ns(dataset_family="randamp_gaussian_sqrtd", x_dim=2, n_total=10, train_frac=1.0, seed=0)
         meta = meta_dict_from_args(ns)

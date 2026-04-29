@@ -227,6 +227,51 @@ class TestFixedXPosteriorDiagnostic(unittest.TestCase):
             svg_text = svg.read_text(encoding="utf-8")
             self.assertGreaterEqual(svg_text.count("Fixed-$x$ posterior diagnostics"), 2)
 
+    def test_pr_embedded_obs_dim_writes_png_without_gt_posterior_crash(self) -> None:
+        """Embedded observation rows (h_dim) vs generative z_dim must not call GT likelihood with wrong shape."""
+        mod = _load_study_module()
+        ns_ds = _ns(
+            dataset_family="cosine_gaussian_sqrtd",
+            x_dim=50,
+            n_total=400,
+            train_frac=0.5,
+            seed=21,
+        )
+        meta = meta_dict_from_args(ns_ds)
+        meta["pr_autoencoder_embedded"] = True
+        meta["pr_autoencoder_z_dim"] = 3
+        n = 20
+        rng = np.random.default_rng(4)
+        theta_all = rng.uniform(float(meta["theta_low"]), float(meta["theta_high"]), size=(n, 1)).astype(
+            np.float64
+        )
+        x_all = rng.standard_normal((n, 50))
+        c = rng.standard_normal((n, n)) * 0.05
+        np.fill_diagonal(c, 0.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run_pr"
+            run_dir.mkdir()
+            out_dir = Path(tmp) / "diag_pr"
+            np.savez(
+                run_dir / "h_matrix_results_theta_cov.npz",
+                c_matrix=c,
+                theta_used=np.asarray(theta_all, dtype=np.float64).reshape(-1),
+                h_field_method=np.asarray(["theta_flow"], dtype=object),
+            )
+            out = mod._write_fixed_x_posterior_diagnostic(
+                run_dir=str(run_dir),
+                persistent_diagnostics_dir=str(out_dir),
+                meta=meta,
+                perm_seed=9,
+                n_subset=n,
+                x_aligned=np.asarray(x_all, dtype=np.float64),
+            )
+            self.assertIsNotNone(out)
+            png = out_dir / "theta_flow_single_x_posterior_hist.png"
+            self.assertTrue(png.is_file())
+            svg_text = (out_dir / "theta_flow_single_x_posterior_hist.svg").read_text(encoding="utf-8")
+            self.assertIn("GT posterior n/a: embedded obs. dim", svg_text)
+
 
 if __name__ == "__main__":
     unittest.main()

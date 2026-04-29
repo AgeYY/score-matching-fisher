@@ -24,9 +24,22 @@ log-likelihood: Bayes ratios train/evaluate prior + posterior flows; with
 ``--theta-field-method theta_path_integral``
 (same training as theta_flow but H from velocity-to-score plus trapezoid integral along sorted ``theta``),
 ``--theta-field-method x_flow`` (conditional x-space FM likelihood; no prior model),
-``--theta-field-method ctsm_v`` (pair-conditioned CTSM-v time-score integration; no prior model), and
+``--theta-field-method theta-flow-autoencoder`` and ``--theta-field-method x-flow-autoencoder``
+(plain autoencoder preprocessing followed by the corresponding flow method in encoded latent space),
+``--theta-field-method ctsm_v`` (pair-conditioned CTSM-v time-score integration; no prior model),
 ``--theta-field-method nf`` (conditional normalizing flow log p(theta|x) with an NF prior
-for posterior-minus-prior log-ratio construction).
+for posterior-minus-prior log-ratio construction), ``--theta-field-method gaussian-network``
+(MLP conditional Gaussian log p(x|theta), with mean and precision Cholesky outputs), and
+``--theta-field-method gaussian-network-diagonal`` (same but diagonal precision Cholesky), and
+``--theta-field-method gaussian-network-low-rank`` (latent covariance Cholesky mapped through
+learned low-rank projection plus diagonal residual covariance). The staged autoencoder variants
+``gaussian-network-autoencoder`` and ``gaussian-network-diagonal-autoencoder`` first encode
+observations with a plain reconstruction autoencoder, then fit the corresponding Gaussian
+likelihood in latent space. ``--theta-field-method gaussian-x-flow`` trains a full covariance
+Cholesky Gaussian via analytic flow-matching velocity on an affine noise bridge; ``gaussian-x-flow-diagonal``
+uses the same objective with a diagonal covariance / Cholesky (see ``fisher/gaussian_x_flow.py``).
+``--theta-field-method nf-reduction`` learns an invertible x-space flow to ``(z, epsilon)`` and
+computes H from a conditional flow likelihood ``log p(z|theta)``.
 Flow methods use ``--flow-arch``: ``mlp``, ``film`` (FiLM with raw-theta embeddings), or
 ``film_fourier`` for ``theta_flow`` / ``theta_path_integral`` / ``x_flow``.
 ``film_fourier`` uses FiLM conditioning with Fourier theta features
@@ -89,6 +102,42 @@ from fisher.hellinger_gt import (
     estimate_hellinger_sq_one_sided_mc,
     estimate_mean_llr_one_sided_mc,
 )
+from fisher.gaussian_network import (
+    ConditionalDiagonalGaussianPrecisionMLP,
+    ConditionalGaussianPrecisionMLP,
+    ConditionalLowRankGaussianCovarianceMLP,
+    ObservationAutoencoder,
+    compute_gaussian_network_c_matrix,
+    encode_observations,
+    train_gaussian_network,
+    train_observation_autoencoder,
+)
+from fisher.gaussian_x_flow import (
+    ConditionalDiagonalGaussianCovarianceFMMLP,
+    ConditionalGaussianCovarianceFMMLP,
+    compute_gaussian_x_flow_c_matrix,
+    path_schedule_from_name,
+    train_gaussian_x_flow,
+)
+from fisher.contrastive_llr import (
+    ContrastiveAdditiveIndependentScorer,
+    ContrastiveGaussianNetworkScorer,
+    ContrastiveIndependentDotProductScorer,
+    ContrastiveIndependentGaussianScorer,
+    ContrastiveLLRMLP,
+    ContrastiveNormalizedDotBiasScorer,
+    ContrastiveNormalizedDotScorer,
+    compute_contrastive_c_matrix,
+    compute_contrastive_soft_c_matrix,
+    contrastive_soft_metadata_without_training,
+    h_directed_from_delta_l as compute_h_directed_contrastive,
+    normalize_theta_encoding as normalize_contrastive_theta_encoding,
+    theta_dim_for_encoding as contrastive_theta_dim_for_encoding,
+    train_bidir_contrastive_soft_llr,
+    train_contrastive_llr,
+    train_contrastive_soft_llr,
+)
+from fisher.gmm_z_decode import GMMZDecodeModel, compute_gmm_z_decode_c_matrix, train_gmm_z_decode
 from fisher.nf_hellinger import (
     ConditionalThetaNF,
     PriorThetaNF,
@@ -102,6 +151,12 @@ from fisher.nf_hellinger import (
     train_conditional_nf,
     train_prior_nf,
 )
+from fisher.nf_reduction import (
+    NFReductionModel,
+    compute_nf_reduction_c_matrix,
+    train_nf_reduction,
+)
+from fisher.pi_nf import PiNFModel, compute_pi_nf_c_matrix, pi_nf_diagnostics, train_pi_nf
 from fisher.evaluation import log_p_x_given_theta
 from fisher.shared_dataset_io import SharedDatasetBundle, load_shared_dataset_npz
 from fisher.shared_fisher_est import (
@@ -109,6 +164,7 @@ from fisher.shared_fisher_est import (
     merge_meta_into_args,
     require_device,
     validate_estimation_args,
+    validate_gmm_z_decode_args,
 )
 
 
@@ -279,7 +335,8 @@ def build_parser() -> argparse.ArgumentParser:
             "The n_ref matrix-panel column uses MC GT sqrt(H^2) for the top row (no n_ref model training). "
             "Also writes h_decoding_convergence_combined.{png,svg} (matrix panel + correlation curves + "
             "off-diagonal est-vs-GT H scatter + training-loss panel in one figure) and h_decoding_training_losses_panel.{png,svg} "
-            "(standalone training-loss panel, one column per n)."
+            "(standalone training-loss panel, one column per n). Runs that save Gaussian-network pretrain curves "
+            "(e.g. contrastive-soft-gaussian-net) also write h_decoding_gn_pretrain_losses_panel.{png,svg}."
         )
     )
     p.add_argument(
@@ -511,6 +568,396 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="NF method only: optional prior-NF EMA alpha override (default: --nf-early-ema-alpha).",
     )
+    p.add_argument(
+        "--nfr-latent-dim",
+        type=int,
+        default=2,
+        help="nf-reduction only: z dimension r; must satisfy 1 <= r < x_dim.",
+    )
+    p.add_argument("--nfr-epochs", type=int, default=2000, help="nf-reduction only: training epochs.")
+    p.add_argument("--nfr-batch-size", type=int, default=256, help="nf-reduction only: training batch size.")
+    p.add_argument("--nfr-lr", type=float, default=1e-3, help="nf-reduction only: learning rate.")
+    p.add_argument("--nfr-hidden-dim", type=int, default=128, help="nf-reduction only: NSF hidden width.")
+    p.add_argument("--nfr-context-dim", type=int, default=32, help="nf-reduction only: theta context size for z-flow.")
+    p.add_argument(
+        "--nfr-transforms",
+        type=int,
+        default=5,
+        help="nf-reduction only: NSF transform count for representation and conditional z flows.",
+    )
+    p.add_argument(
+        "--nfr-pair-batch-size",
+        type=int,
+        default=65536,
+        help="nf-reduction only: approximate pair budget per C-matrix block (rows*cols).",
+    )
+    p.add_argument(
+        "--nfr-early-patience",
+        type=int,
+        default=300,
+        help="nf-reduction only: early-stop patience; 0 disables early stopping.",
+    )
+    p.add_argument(
+        "--nfr-early-min-delta",
+        type=float,
+        default=1e-4,
+        help="nf-reduction only: early-stop min delta.",
+    )
+    p.add_argument(
+        "--nfr-early-ema-alpha",
+        type=float,
+        default=0.05,
+        help="nf-reduction only: EMA alpha for validation NLL monitor.",
+    )
+    p.add_argument("--pinf-latent-dim", type=int, default=2, help="pi-nf only: z dimension r; must satisfy 1 <= r < x_dim.")
+    p.add_argument("--pinf-epochs", type=int, default=2000, help="pi-nf only: training epochs.")
+    p.add_argument("--pinf-batch-size", type=int, default=256, help="pi-nf only: training batch size.")
+    p.add_argument("--pinf-lr", type=float, default=1e-3, help="pi-nf only: learning rate.")
+    p.add_argument("--pinf-hidden-dim", type=int, default=128, help="pi-nf only: NSF and Gaussian-prior MLP hidden width.")
+    p.add_argument("--pinf-transforms", type=int, default=5, help="pi-nf only: representation NSF transform count.")
+    p.add_argument("--pinf-min-std", type=float, default=1e-3, help="pi-nf only: softplus floor on diagonal z std.")
+    p.add_argument("--pinf-weight-decay", type=float, default=0.0, help="pi-nf only: AdamW weight decay.")
+    p.add_argument("--pinf-recon-weight", type=float, default=1.0, help="pi-nf only: sampled-residual reconstruction MSE weight.")
+    p.add_argument("--pinf-pair-batch-size", type=int, default=65536, help="pi-nf only: approximate pair budget per C-matrix block.")
+    p.add_argument("--pinf-early-patience", type=int, default=300, help="pi-nf only: early-stop patience; 0 disables.")
+    p.add_argument("--pinf-early-min-delta", type=float, default=1e-4, help="pi-nf only: early-stop min delta.")
+    p.add_argument("--pinf-early-ema-alpha", type=float, default=0.05, help="pi-nf only: EMA alpha for validation NLL monitor.")
+    p.add_argument("--gn-epochs", type=int, default=4000, help="gaussian-network method only: training epochs.")
+    p.add_argument("--gn-batch-size", type=int, default=256, help="gaussian-network method only: training batch size.")
+    p.add_argument("--gn-lr", type=float, default=1e-3, help="gaussian-network method only: learning rate.")
+    p.add_argument("--gn-hidden-dim", type=int, default=128, help="gaussian-network method only: MLP hidden width.")
+    p.add_argument("--gn-depth", type=int, default=3, help="gaussian-network method only: MLP depth.")
+    p.add_argument("--gn-weight-decay", type=float, default=0.0, help="gaussian-network method only: AdamW weight decay.")
+    p.add_argument(
+        "--gn-diag-floor",
+        type=float,
+        default=1e-4,
+        help="gaussian-network method only: positive floor added to Cholesky precision diagonal.",
+    )
+    p.add_argument(
+        "--gn-early-patience",
+        type=int,
+        default=300,
+        help="gaussian-network method only: early-stop patience; 0 disables early stopping.",
+    )
+    p.add_argument(
+        "--gn-early-min-delta",
+        type=float,
+        default=1e-4,
+        help="gaussian-network method only: early-stop min delta.",
+    )
+    p.add_argument(
+        "--gn-early-ema-alpha",
+        type=float,
+        default=0.05,
+        help="gaussian-network method only: EMA alpha for validation monitor.",
+    )
+    p.add_argument(
+        "--gn-max-grad-norm",
+        type=float,
+        default=10.0,
+        help="gaussian-network method only: gradient clipping max norm; <=0 disables clipping.",
+    )
+    p.add_argument(
+        "--gn-pair-batch-size",
+        type=int,
+        default=65536,
+        help="gaussian-network method only: approximate pair budget per C-matrix block (rows*cols).",
+    )
+    p.add_argument(
+        "--gn-low-rank-dim",
+        type=int,
+        default=4,
+        help="gaussian-network-low-rank only: latent covariance rank r.",
+    )
+    p.add_argument(
+        "--gn-psi-floor",
+        type=float,
+        default=1e-6,
+        help="gaussian-network-low-rank only: positive floor added to learned residual variances Psi.",
+    )
+    p.add_argument(
+        "--gn-ae-latent-dim",
+        type=int,
+        default=None,
+        help="gaussian-network-autoencoder only: encoded observation dimension (default: min(8, x_dim)).",
+    )
+    p.add_argument(
+        "--gn-ae-epochs",
+        type=int,
+        default=1000,
+        help="gaussian-network-autoencoder only: autoencoder training epochs.",
+    )
+    p.add_argument(
+        "--gn-ae-batch-size",
+        type=int,
+        default=256,
+        help="gaussian-network-autoencoder only: autoencoder training batch size.",
+    )
+    p.add_argument(
+        "--gn-ae-lr",
+        type=float,
+        default=1e-3,
+        help="gaussian-network-autoencoder only: autoencoder learning rate.",
+    )
+    p.add_argument(
+        "--gn-ae-hidden-dim",
+        type=int,
+        default=128,
+        help="gaussian-network-autoencoder only: autoencoder hidden width.",
+    )
+    p.add_argument(
+        "--gn-ae-depth",
+        type=int,
+        default=2,
+        help="gaussian-network-autoencoder only: autoencoder encoder/decoder depth.",
+    )
+    p.add_argument(
+        "--gn-ae-weight-decay",
+        type=float,
+        default=0.0,
+        help="gaussian-network-autoencoder only: autoencoder AdamW weight decay.",
+    )
+    p.add_argument(
+        "--gn-ae-early-patience",
+        type=int,
+        default=200,
+        help="gaussian-network-autoencoder only: autoencoder early-stop patience; 0 disables early stopping.",
+    )
+    p.add_argument(
+        "--gn-ae-early-min-delta",
+        type=float,
+        default=1e-4,
+        help="gaussian-network-autoencoder only: autoencoder early-stop min delta.",
+    )
+    p.add_argument(
+        "--gn-ae-early-ema-alpha",
+        type=float,
+        default=0.05,
+        help="gaussian-network-autoencoder only: EMA alpha for autoencoder validation monitor.",
+    )
+    p.add_argument("--gxf-epochs", type=int, default=2000, help="gaussian-x-flow only: training epochs.")
+    p.add_argument("--gxf-batch-size", type=int, default=256, help="gaussian-x-flow only: training batch size.")
+    p.add_argument("--gxf-lr", type=float, default=1e-3, help="gaussian-x-flow only: learning rate.")
+    p.add_argument("--gxf-hidden-dim", type=int, default=128, help="gaussian-x-flow only: MLP hidden width.")
+    p.add_argument("--gxf-depth", type=int, default=3, help="gaussian-x-flow only: MLP depth.")
+    p.add_argument(
+        "--gxf-weight-decay", type=float, default=0.0, help="gaussian-x-flow only: AdamW weight decay."
+    )
+    p.add_argument(
+        "--gxf-diag-floor",
+        type=float,
+        default=1e-4,
+        help="gaussian-x-flow only: softplus floor on covariance Cholesky diagonal entries.",
+    )
+    p.add_argument(
+        "--gxf-cov-jitter",
+        type=float,
+        default=1e-4,
+        help="gaussian-x-flow only: diagonal jitter added to C_t in the analytic velocity (Cholesky).",
+    )
+    p.add_argument(
+        "--gxf-t-eps",
+        type=float,
+        default=1e-3,
+        help="gaussian-x-flow only: bridge time is sampled in [t_eps, 1-t_eps] (open interval).",
+    )
+    p.add_argument(
+        "--gxf-path-schedule",
+        type=str,
+        default="linear",
+        choices=["linear", "cosine", "cos", "straight"],
+        help="gaussian-x-flow only: affine path a(t), b(t) for the noise bridge (linear or cosine).",
+    )
+    p.add_argument(
+        "--gxf-early-patience",
+        type=int,
+        default=300,
+        help="gaussian-x-flow only: early-stop patience; 0 disables early stopping.",
+    )
+    p.add_argument(
+        "--gxf-early-min-delta",
+        type=float,
+        default=1e-4,
+        help="gaussian-x-flow only: early-stop min delta on smoothed validation FM loss.",
+    )
+    p.add_argument(
+        "--gxf-early-ema-alpha",
+        type=float,
+        default=0.05,
+        help="gaussian-x-flow only: EMA alpha for validation FM loss monitor.",
+    )
+    p.add_argument(
+        "--gxf-max-grad-norm",
+        type=float,
+        default=10.0,
+        help="gaussian-x-flow only: gradient clipping max norm; <=0 disables clipping.",
+    )
+    p.add_argument(
+        "--gxf-pair-batch-size",
+        type=int,
+        default=65536,
+        help="gaussian-x-flow only: approximate pair budget per C-matrix block (rows*cols).",
+    )
+    p.add_argument("--contrastive-epochs", type=int, default=2000, help="contrastive method only: training epochs.")
+    p.add_argument(
+        "--contrastive-batch-size",
+        type=int,
+        default=256,
+        help="contrastive method only: minibatch size for row-wise shuffled-theta cross entropy.",
+    )
+    p.add_argument("--contrastive-lr", type=float, default=1e-3, help="contrastive method only: learning rate.")
+    p.add_argument(
+        "--contrastive-hidden-dim",
+        type=int,
+        default=128,
+        help="contrastive method only: MLP hidden width.",
+    )
+    p.add_argument("--contrastive-depth", type=int, default=3, help="contrastive method only: MLP depth.")
+    p.add_argument(
+        "--contrastive-weight-decay",
+        type=float,
+        default=0.0,
+        help="contrastive method only: AdamW weight decay.",
+    )
+    p.add_argument(
+        "--contrastive-early-patience",
+        type=int,
+        default=300,
+        help="contrastive method only: early-stop patience; 0 disables early stopping.",
+    )
+    p.add_argument(
+        "--contrastive-early-min-delta",
+        type=float,
+        default=1e-4,
+        help="contrastive method only: early-stop min delta.",
+    )
+    p.add_argument(
+        "--contrastive-early-ema-alpha",
+        type=float,
+        default=0.05,
+        help="contrastive method only: EMA alpha for validation monitor.",
+    )
+    p.add_argument(
+        "--contrastive-max-grad-norm",
+        type=float,
+        default=10.0,
+        help="contrastive method only: gradient clipping max norm; <=0 disables clipping.",
+    )
+    p.add_argument(
+        "--contrastive-pair-batch-size",
+        type=int,
+        default=65536,
+        help="contrastive method only: approximate pair budget per C-matrix block (rows*cols).",
+    )
+    p.add_argument(
+        "--contrastive-theta-encoding",
+        type=str,
+        default="one_hot_bin",
+        choices=["one_hot_bin", "integer_bin"],
+        help=(
+            "contrastive method only: theta-bin code passed to scalar S(x, theta_code). "
+            "one_hot_bin uses K-dimensional one-hot bins; integer_bin uses one normalized scalar in [-1,1]."
+        ),
+    )
+    p.add_argument(
+        "--contrastive-soft-bandwidth",
+        type=float,
+        default=1.0,
+        help=(
+            "contrastive-soft only: Gaussian theta-kernel bandwidth in raw theta units "
+            "(default 1.0); <=0 uses auto kth-neighbor bandwidth (--contrastive-soft-bandwidth-k)."
+        ),
+    )
+    p.add_argument(
+        "--contrastive-soft-score-arch",
+        type=str,
+        default="normalized_dot",
+        choices=[
+            "normalized_dot",
+            "norm_dot",
+            "dot",
+            "additive_independent",
+            "additive",
+            "additive_independent_feature",
+            "independent",
+            "independent_gaussian",
+            "gaussian",
+            "independent_dot_product",
+            "independent_dot",
+            "dot_independent",
+            "mlp",
+        ],
+        help=(
+            "contrastive-soft only: scalar score architecture. normalized_dot uses "
+            "S(x,theta)=alpha normalize(g(x))^T normalize(a(theta)); additive_independent uses "
+            "D^{-1} sum_d h_d(x_d)^T a(theta); independent_gaussian uses a diagonal Gaussian "
+            "score; independent_dot_product uses alpha/sqrt(D) sum_d h(x_d,e_d)^T a(theta); "
+            "mlp uses the old joint MLP scorer."
+        ),
+    )
+    p.add_argument(
+        "--contrastive-soft-dot-dim",
+        type=int,
+        default=16,
+        help=(
+            "contrastive-soft normalized_dot/additive_independent only: shared feature dimension "
+            "for dot-product features."
+        ),
+    )
+    p.add_argument(
+        "--contrastive-soft-coordinate-embed-dim",
+        type=int,
+        default=16,
+        help="contrastive-soft independent_dot_product only: learned coordinate embedding dimension.",
+    )
+    p.add_argument(
+        "--contrastive-soft-gaussian-logvar-min",
+        type=float,
+        default=-8.0,
+        help="contrastive-soft independent_gaussian only: minimum clipped log variance.",
+    )
+    p.add_argument(
+        "--contrastive-soft-gaussian-logvar-max",
+        type=float,
+        default=5.0,
+        help="contrastive-soft independent_gaussian only: maximum clipped log variance.",
+    )
+    p.add_argument(
+        "--contrastive-soft-bandwidth-start",
+        type=float,
+        default=0.0,
+        help=(
+            "contrastive-soft only: start bandwidth in raw theta units for linear annealing; "
+            "set both start and end > 0 to enable."
+        ),
+    )
+    p.add_argument(
+        "--contrastive-soft-bandwidth-end",
+        type=float,
+        default=0.0,
+        help=(
+            "contrastive-soft only: final bandwidth in raw theta units for linear annealing; "
+            "set both start and end > 0 to enable."
+        ),
+    )
+    p.add_argument(
+        "--contrastive-soft-bandwidth-k",
+        type=int,
+        default=5,
+        help="contrastive-soft only: kth nearest theta neighbor used for auto bandwidth.",
+    )
+    p.add_argument(
+        "--contrastive-soft-periodic",
+        action="store_true",
+        help="contrastive-soft only: use circular theta distance in the soft target kernel.",
+    )
+    p.add_argument(
+        "--contrastive-soft-period",
+        type=float,
+        default=2.0 * np.pi,
+        help="contrastive-soft only: period for circular theta distance when --contrastive-soft-periodic is set.",
+    )
     add_estimation_arguments(p)
     p.set_defaults(
         output_dir=str(Path(DATA_DIR) / "h_decoding_convergence"),
@@ -531,6 +978,354 @@ def _parse_n_list(s: str) -> list[int]:
     return [int(x) for x in parts]
 
 
+def _normalize_gaussian_network_method(tfm: str) -> str | None:
+    key = str(tfm).strip().lower()
+    aliases = {
+        "gaussian-network": "gaussian_network",
+        "gaussian_network": "gaussian_network",
+        "gaussian-network-diagonal": "gaussian_network_diagonal",
+        "gaussian_network_diagonal": "gaussian_network_diagonal",
+        "gaussian-network-low-rank": "gaussian_network_low_rank",
+        "gaussian_network_low_rank": "gaussian_network_low_rank",
+        "gaussian-network-autoencoder": "gaussian_network_autoencoder",
+        "gaussian_network_autoencoder": "gaussian_network_autoencoder",
+        "gaussian-network-diagonal-autoencoder": "gaussian_network_diagonal_autoencoder",
+        "gaussian_network_diagonal_autoencoder": "gaussian_network_diagonal_autoencoder",
+        "gaussian-network-diagonal-antoencoder": "gaussian_network_diagonal_autoencoder",
+        "gaussian_network_diagonal_antoencoder": "gaussian_network_diagonal_autoencoder",
+    }
+    return aliases.get(key)
+
+
+def _normalize_gaussian_x_flow_method(tfm: str) -> str | None:
+    key = str(tfm).strip().lower()
+    aliases = {
+        "gaussian-x-flow": "gaussian_x_flow",
+        "gaussian_x_flow": "gaussian_x_flow",
+        "gaussian-x-flow-diagonal": "gaussian_x_flow_diagonal",
+        "gaussian_x_flow_diagonal": "gaussian_x_flow_diagonal",
+    }
+    return aliases.get(key)
+
+
+def _normalize_nf_reduction_method(tfm: str) -> str | None:
+    key = str(tfm).strip().lower()
+    aliases = {
+        "nf-reduction": "nf_reduction",
+        "nf_reduction": "nf_reduction",
+    }
+    return aliases.get(key)
+
+
+def _normalize_gmm_z_decode_method(tfm: str) -> str | None:
+    key = str(tfm).strip().lower()
+    aliases = {
+        "gmm-z-decode": "gmm_z_decode",
+        "gmm_z_decode": "gmm_z_decode",
+    }
+    return aliases.get(key)
+
+
+def _normalize_pi_nf_method(tfm: str) -> str | None:
+    key = str(tfm).strip().lower()
+    aliases = {
+        "pi-nf": "pi_nf",
+        "pi_nf": "pi_nf",
+    }
+    return aliases.get(key)
+
+
+def _normalize_contrastive_method(tfm: str) -> str | None:
+    key = str(tfm).strip().lower()
+    aliases = {
+        "contrastive": "contrastive",
+        "contrasive": "contrastive",
+        "shuffled-contrastive": "contrastive",
+        "shuffled_contrastive": "contrastive",
+        "contrastive-soft": "contrastive_soft",
+        "contrastive_soft": "contrastive_soft",
+        "contrasive-soft": "contrastive_soft",
+        "contrasive_soft": "contrastive_soft",
+        "bidir-contrastive-soft": "bidir_contrastive_soft",
+        "bidir_contrastive_soft": "bidir_contrastive_soft",
+        "bidirectional-contrastive-soft": "bidir_contrastive_soft",
+        "bidirectional_contrastive_soft": "bidir_contrastive_soft",
+        "bidir-contrasive-soft": "bidir_contrastive_soft",
+        "bidir_contrasive_soft": "bidir_contrastive_soft",
+        "contrastive-soft-gaussian-net": "contrastive_soft_gaussian_net",
+        "contrastive_soft_gaussian_net": "contrastive_soft_gaussian_net",
+        "contrasive-soft-gaussian-net": "contrastive_soft_gaussian_net",
+        "contrasive_soft_gaussian_net": "contrastive_soft_gaussian_net",
+        "contrastive-soft-gaussian-net-no-finetune": "contrastive_soft_gaussian_net_no_finetune",
+        "contrastive_soft_gaussian_net_no_finetune": "contrastive_soft_gaussian_net_no_finetune",
+        "contrasive-soft-gaussian-net-no-finetune": "contrastive_soft_gaussian_net_no_finetune",
+        "contrasive_soft_gaussian_net_no_finetune": "contrastive_soft_gaussian_net_no_finetune",
+    }
+    return aliases.get(key)
+
+
+def _normalize_flow_autoencoder_method(tfm: str) -> str | None:
+    key = str(tfm).strip().lower()
+    aliases = {
+        "theta-flow-autoencoder": "theta_flow_autoencoder",
+        "theta_flow_autoencoder": "theta_flow_autoencoder",
+        "x-flow-autoencoder": "x_flow_autoencoder",
+        "x_flow_autoencoder": "x_flow_autoencoder",
+    }
+    return aliases.get(key)
+
+
+def _base_flow_method_for_autoencoder(tfm: str) -> str:
+    method = str(tfm).strip().lower()
+    if method == "theta_flow_autoencoder":
+        return "theta_flow"
+    if method == "x_flow_autoencoder":
+        return "x_flow"
+    raise ValueError(f"Unsupported flow autoencoder method: {tfm!r}.")
+
+
+def _validate_autoencoder_cli(args: argparse.Namespace) -> None:
+    ae_latent_dim = getattr(args, "gn_ae_latent_dim", None)
+    if ae_latent_dim is not None and int(ae_latent_dim) < 1:
+        raise ValueError("--gn-ae-latent-dim must be >= 1.")
+    if int(getattr(args, "gn_ae_epochs", 0)) < 1:
+        raise ValueError("--gn-ae-epochs must be >= 1.")
+    if int(getattr(args, "gn_ae_batch_size", 0)) < 1:
+        raise ValueError("--gn-ae-batch-size must be >= 1.")
+    if float(getattr(args, "gn_ae_lr", 0.0)) <= 0.0:
+        raise ValueError("--gn-ae-lr must be > 0.")
+    if int(getattr(args, "gn_ae_hidden_dim", 0)) < 1:
+        raise ValueError("--gn-ae-hidden-dim must be >= 1.")
+    if int(getattr(args, "gn_ae_depth", 0)) < 1:
+        raise ValueError("--gn-ae-depth must be >= 1.")
+    if float(getattr(args, "gn_ae_weight_decay", 0.0)) < 0.0:
+        raise ValueError("--gn-ae-weight-decay must be >= 0.")
+    if int(getattr(args, "gn_ae_early_patience", -1)) < 0:
+        raise ValueError("--gn-ae-early-patience must be >= 0.")
+    if float(getattr(args, "gn_ae_early_min_delta", 0.0)) < 0.0:
+        raise ValueError("--gn-ae-early-min-delta must be >= 0.")
+    ae_alpha = float(getattr(args, "gn_ae_early_ema_alpha", 0.0))
+    if not np.isfinite(ae_alpha) or ae_alpha <= 0.0 or ae_alpha > 1.0:
+        raise ValueError("--gn-ae-early-ema-alpha must be in (0, 1].")
+
+
+def _validate_gxf_cli(args: argparse.Namespace) -> None:
+    if int(getattr(args, "gxf_epochs", 0)) < 1:
+        raise ValueError("--gxf-epochs must be >= 1.")
+    if int(getattr(args, "gxf_batch_size", 0)) < 1:
+        raise ValueError("--gxf-batch-size must be >= 1.")
+    if float(getattr(args, "gxf_lr", 0.0)) <= 0.0:
+        raise ValueError("--gxf-lr must be > 0.")
+    if int(getattr(args, "gxf_hidden_dim", 0)) < 1:
+        raise ValueError("--gxf-hidden-dim must be >= 1.")
+    if int(getattr(args, "gxf_depth", 0)) < 1:
+        raise ValueError("--gxf-depth must be >= 1.")
+    if float(getattr(args, "gxf_weight_decay", 0.0)) < 0.0:
+        raise ValueError("--gxf-weight-decay must be >= 0.")
+    if float(getattr(args, "gxf_diag_floor", 0.0)) <= 0.0:
+        raise ValueError("--gxf-diag-floor must be > 0.")
+    if float(getattr(args, "gxf_cov_jitter", 0.0)) <= 0.0:
+        raise ValueError("--gxf-cov-jitter must be > 0.")
+    te = float(getattr(args, "gxf_t_eps", 1e-3))
+    if not (0.0 < te < 0.5):
+        raise ValueError("--gxf-t-eps must be in (0, 0.5).")
+    if int(getattr(args, "gxf_early_patience", -1)) < 0:
+        raise ValueError("--gxf-early-patience must be >= 0.")
+    if float(getattr(args, "gxf_early_min_delta", 0.0)) < 0.0:
+        raise ValueError("--gxf-early-min-delta must be >= 0.")
+    gxfa = float(getattr(args, "gxf_early_ema_alpha", 0.0))
+    if not np.isfinite(gxfa) or gxfa <= 0.0 or gxfa > 1.0:
+        raise ValueError("--gxf-early-ema-alpha must be in (0, 1].")
+    if int(getattr(args, "gxf_pair_batch_size", 0)) < 1:
+        raise ValueError("--gxf-pair-batch-size must be >= 1.")
+    _mg = float(getattr(args, "gxf_max_grad_norm", 10.0))
+    if not np.isfinite(_mg):
+        raise ValueError("--gxf-max-grad-norm must be finite.")
+    path_schedule_from_name(str(getattr(args, "gxf_path_schedule", "linear")))
+
+
+def _validate_nfr_cli(args: argparse.Namespace) -> None:
+    require_zuko_for_nf()
+    if int(getattr(args, "nfr_latent_dim", 0)) < 1:
+        raise ValueError("--nfr-latent-dim must be >= 1.")
+    if int(getattr(args, "nfr_epochs", 0)) < 1:
+        raise ValueError("--nfr-epochs must be >= 1.")
+    if int(getattr(args, "nfr_batch_size", 0)) < 1:
+        raise ValueError("--nfr-batch-size must be >= 1.")
+    if float(getattr(args, "nfr_lr", 0.0)) <= 0.0:
+        raise ValueError("--nfr-lr must be > 0.")
+    if int(getattr(args, "nfr_hidden_dim", 0)) < 1:
+        raise ValueError("--nfr-hidden-dim must be >= 1.")
+    if int(getattr(args, "nfr_context_dim", 0)) < 1:
+        raise ValueError("--nfr-context-dim must be >= 1.")
+    if int(getattr(args, "nfr_transforms", 0)) < 1:
+        raise ValueError("--nfr-transforms must be >= 1.")
+    if int(getattr(args, "nfr_pair_batch_size", 0)) < 1:
+        raise ValueError("--nfr-pair-batch-size must be >= 1.")
+    if int(getattr(args, "nfr_early_patience", -1)) < 0:
+        raise ValueError("--nfr-early-patience must be >= 0.")
+    if float(getattr(args, "nfr_early_min_delta", 0.0)) < 0.0:
+        raise ValueError("--nfr-early-min-delta must be >= 0.")
+    alpha = float(getattr(args, "nfr_early_ema_alpha", 0.0))
+    if not np.isfinite(alpha) or alpha <= 0.0 or alpha > 1.0:
+        raise ValueError("--nfr-early-ema-alpha must be in (0, 1].")
+
+
+def _validate_pinf_cli(args: argparse.Namespace) -> None:
+    require_zuko_for_nf()
+    if int(getattr(args, "pinf_latent_dim", 0)) < 1:
+        raise ValueError("--pinf-latent-dim must be >= 1.")
+    if int(getattr(args, "pinf_epochs", 0)) < 1:
+        raise ValueError("--pinf-epochs must be >= 1.")
+    if int(getattr(args, "pinf_batch_size", 0)) < 1:
+        raise ValueError("--pinf-batch-size must be >= 1.")
+    if float(getattr(args, "pinf_lr", 0.0)) <= 0.0:
+        raise ValueError("--pinf-lr must be > 0.")
+    if int(getattr(args, "pinf_hidden_dim", 0)) < 1:
+        raise ValueError("--pinf-hidden-dim must be >= 1.")
+    if int(getattr(args, "pinf_transforms", 0)) < 1:
+        raise ValueError("--pinf-transforms must be >= 1.")
+    if float(getattr(args, "pinf_min_std", 0.0)) <= 0.0:
+        raise ValueError("--pinf-min-std must be > 0.")
+    if float(getattr(args, "pinf_weight_decay", 0.0)) < 0.0:
+        raise ValueError("--pinf-weight-decay must be >= 0.")
+    rw = float(getattr(args, "pinf_recon_weight", 1.0))
+    if not np.isfinite(rw) or rw < 0.0:
+        raise ValueError("--pinf-recon-weight must be finite and >= 0.")
+    if int(getattr(args, "pinf_pair_batch_size", 0)) < 1:
+        raise ValueError("--pinf-pair-batch-size must be >= 1.")
+    if int(getattr(args, "pinf_early_patience", -1)) < 0:
+        raise ValueError("--pinf-early-patience must be >= 0.")
+    if float(getattr(args, "pinf_early_min_delta", 0.0)) < 0.0:
+        raise ValueError("--pinf-early-min-delta must be >= 0.")
+    alpha = float(getattr(args, "pinf_early_ema_alpha", 0.0))
+    if not np.isfinite(alpha) or alpha <= 0.0 or alpha > 1.0:
+        raise ValueError("--pinf-early-ema-alpha must be in (0, 1].")
+
+
+def _validate_contrastive_soft_gaussian_net_no_finetune_cli(args: argparse.Namespace) -> None:
+    """GN MLE pretrain only; same bandwidth metadata checks as soft contrastive (no Adam fine-tuning)."""
+    if int(getattr(args, "gn_epochs", 0)) < 1:
+        raise ValueError("--gn-epochs must be >= 1.")
+    if int(getattr(args, "gn_batch_size", 0)) < 1:
+        raise ValueError("--gn-batch-size must be >= 1.")
+    if float(getattr(args, "gn_lr", 0.0)) <= 0.0:
+        raise ValueError("--gn-lr must be > 0.")
+    if int(getattr(args, "gn_hidden_dim", 0)) < 1:
+        raise ValueError("--gn-hidden-dim must be >= 1.")
+    if int(getattr(args, "gn_depth", 0)) < 1:
+        raise ValueError("--gn-depth must be >= 1.")
+    if float(getattr(args, "gn_weight_decay", 0.0)) < 0.0:
+        raise ValueError("--gn-weight-decay must be >= 0.")
+    if float(getattr(args, "gn_diag_floor", 0.0)) <= 0.0:
+        raise ValueError("--gn-diag-floor must be > 0.")
+    if int(getattr(args, "gn_early_patience", -1)) < 0:
+        raise ValueError("--gn-early-patience must be >= 0.")
+    if float(getattr(args, "gn_early_min_delta", 0.0)) < 0.0:
+        raise ValueError("--gn-early-min-delta must be >= 0.")
+    alpha = float(getattr(args, "gn_early_ema_alpha", 0.0))
+    if not np.isfinite(alpha) or alpha <= 0.0 or alpha > 1.0:
+        raise ValueError("--gn-early-ema-alpha must be in (0, 1].")
+    if int(getattr(args, "gn_pair_batch_size", 0)) < 1:
+        raise ValueError("--gn-pair-batch-size must be >= 1.")
+    if int(getattr(args, "contrastive_pair_batch_size", 0)) < 1:
+        raise ValueError("--contrastive-pair-batch-size must be >= 1.")
+    bw = float(getattr(args, "contrastive_soft_bandwidth", 1.0))
+    if not np.isfinite(bw):
+        raise ValueError("--contrastive-soft-bandwidth must be finite.")
+    bw_start = float(getattr(args, "contrastive_soft_bandwidth_start", 0.0))
+    bw_end = float(getattr(args, "contrastive_soft_bandwidth_end", 0.0))
+    if not np.isfinite(bw_start) or not np.isfinite(bw_end):
+        raise ValueError("--contrastive-soft-bandwidth-start/end must be finite.")
+    if (bw_start > 0.0) != (bw_end > 0.0):
+        raise ValueError(
+            "--contrastive-soft-bandwidth-start and --contrastive-soft-bandwidth-end must both be > 0 "
+            "to enable annealing."
+        )
+    if int(getattr(args, "contrastive_soft_bandwidth_k", 0)) < 1:
+        raise ValueError("--contrastive-soft-bandwidth-k must be >= 1.")
+    period = float(getattr(args, "contrastive_soft_period", 2.0 * np.pi))
+    if not np.isfinite(period) or period <= 0.0:
+        raise ValueError("--contrastive-soft-period must be finite and > 0.")
+
+
+def _validate_contrastive_cli(args: argparse.Namespace) -> None:
+    tfm = str(getattr(args, "theta_field_method", "")).strip().lower()
+    if tfm == "contrastive_soft_gaussian_net_no_finetune":
+        _validate_contrastive_soft_gaussian_net_no_finetune_cli(args)
+        return
+    if int(getattr(args, "contrastive_epochs", 0)) < 1:
+        raise ValueError("--contrastive-epochs must be >= 1.")
+    if int(getattr(args, "contrastive_batch_size", 0)) < 2:
+        raise ValueError("--contrastive-batch-size must be >= 2.")
+    if float(getattr(args, "contrastive_lr", 0.0)) <= 0.0:
+        raise ValueError("--contrastive-lr must be > 0.")
+    if int(getattr(args, "contrastive_hidden_dim", 0)) < 1:
+        raise ValueError("--contrastive-hidden-dim must be >= 1.")
+    if int(getattr(args, "contrastive_depth", 0)) < 1:
+        raise ValueError("--contrastive-depth must be >= 1.")
+    if float(getattr(args, "contrastive_weight_decay", 0.0)) < 0.0:
+        raise ValueError("--contrastive-weight-decay must be >= 0.")
+    if int(getattr(args, "contrastive_early_patience", -1)) < 0:
+        raise ValueError("--contrastive-early-patience must be >= 0.")
+    if float(getattr(args, "contrastive_early_min_delta", 0.0)) < 0.0:
+        raise ValueError("--contrastive-early-min-delta must be >= 0.")
+    alpha = float(getattr(args, "contrastive_early_ema_alpha", 0.0))
+    if not np.isfinite(alpha) or alpha <= 0.0 or alpha > 1.0:
+        raise ValueError("--contrastive-early-ema-alpha must be in (0, 1].")
+    max_grad = float(getattr(args, "contrastive_max_grad_norm", 10.0))
+    if not np.isfinite(max_grad) or max_grad < 0.0:
+        raise ValueError("--contrastive-max-grad-norm must be finite and >= 0.")
+    if int(getattr(args, "contrastive_pair_batch_size", 0)) < 1:
+        raise ValueError("--contrastive-pair-batch-size must be >= 1.")
+    enc = normalize_contrastive_theta_encoding(str(getattr(args, "contrastive_theta_encoding", "one_hot_bin")))
+    setattr(args, "contrastive_theta_encoding", enc)
+    soft_arch = str(getattr(args, "contrastive_soft_score_arch", "normalized_dot")).strip().lower().replace("-", "_")
+    soft_arch_aliases = {
+        "normalized_dot": "normalized_dot",
+        "norm_dot": "normalized_dot",
+        "dot": "normalized_dot",
+        "additive": "additive_independent",
+        "additive_independent": "additive_independent",
+        "additive_independent_feature": "additive_independent",
+        "independent": "additive_independent",
+        "gaussian": "independent_gaussian",
+        "independent_gaussian": "independent_gaussian",
+        "independent_dot": "independent_dot_product",
+        "independent_dot_product": "independent_dot_product",
+        "dot_independent": "independent_dot_product",
+        "mlp": "mlp",
+    }
+    if soft_arch not in soft_arch_aliases:
+        raise ValueError(
+            "--contrastive-soft-score-arch must be one of "
+            "{'normalized_dot','additive_independent','independent_gaussian','independent_dot_product','mlp'}."
+        )
+    setattr(args, "contrastive_soft_score_arch", soft_arch_aliases[soft_arch])
+    if int(getattr(args, "contrastive_soft_dot_dim", 0)) < 1:
+        raise ValueError("--contrastive-soft-dot-dim must be >= 1.")
+    if int(getattr(args, "contrastive_soft_coordinate_embed_dim", 0)) < 1:
+        raise ValueError("--contrastive-soft-coordinate-embed-dim must be >= 1.")
+    logvar_min = float(getattr(args, "contrastive_soft_gaussian_logvar_min", -8.0))
+    logvar_max = float(getattr(args, "contrastive_soft_gaussian_logvar_max", 5.0))
+    if not np.isfinite(logvar_min) or not np.isfinite(logvar_max) or logvar_min >= logvar_max:
+        raise ValueError("--contrastive-soft-gaussian-logvar-min/max must be finite with min < max.")
+    bw = float(getattr(args, "contrastive_soft_bandwidth", 1.0))
+    if not np.isfinite(bw):
+        raise ValueError("--contrastive-soft-bandwidth must be finite.")
+    bw_start = float(getattr(args, "contrastive_soft_bandwidth_start", 0.0))
+    bw_end = float(getattr(args, "contrastive_soft_bandwidth_end", 0.0))
+    if not np.isfinite(bw_start) or not np.isfinite(bw_end):
+        raise ValueError("--contrastive-soft-bandwidth-start/end must be finite.")
+    if (bw_start > 0.0) != (bw_end > 0.0):
+        raise ValueError("--contrastive-soft-bandwidth-start and --contrastive-soft-bandwidth-end must both be > 0 to enable annealing.")
+    if int(getattr(args, "contrastive_soft_bandwidth_k", 0)) < 1:
+        raise ValueError("--contrastive-soft-bandwidth-k must be >= 1.")
+    period = float(getattr(args, "contrastive_soft_period", 2.0 * np.pi))
+    if not np.isfinite(period) or period <= 0.0:
+        raise ValueError("--contrastive-soft-period must be finite and > 0.")
+
+
 def theta_segment_ids_equal_width(
     theta: np.ndarray,
     n_segments: int,
@@ -541,6 +1336,79 @@ def theta_segment_ids_equal_width(
 
 def _validate_cli(args: argparse.Namespace) -> None:
     tfm = str(getattr(args, "theta_field_method", "theta_flow")).strip().lower()
+    nfr_norm = _normalize_nf_reduction_method(tfm)
+    gzd_norm = _normalize_gmm_z_decode_method(tfm)
+    pinf_norm = _normalize_pi_nf_method(tfm)
+    gxf_norm = _normalize_gaussian_x_flow_method(tfm)
+    contrastive_norm = _normalize_contrastive_method(tfm)
+    gn_norm = None if (
+        gxf_norm is not None
+        or nfr_norm is not None
+        or gzd_norm is not None
+        or pinf_norm is not None
+        or contrastive_norm is not None
+    ) else _normalize_gaussian_network_method(tfm)
+    flow_ae_norm = _normalize_flow_autoencoder_method(tfm)
+    if contrastive_norm is not None:
+        setattr(args, "theta_field_method", contrastive_norm)
+        _validate_contrastive_cli(args)
+        tfm = contrastive_norm
+    elif pinf_norm is not None:
+        setattr(args, "theta_field_method", pinf_norm)
+        _validate_pinf_cli(args)
+        tfm = pinf_norm
+    elif gzd_norm is not None:
+        setattr(args, "theta_field_method", gzd_norm)
+        validate_gmm_z_decode_args(args)
+        tfm = gzd_norm
+    elif nfr_norm is not None:
+        setattr(args, "theta_field_method", nfr_norm)
+        _validate_nfr_cli(args)
+        tfm = nfr_norm
+    elif gxf_norm is not None:
+        setattr(args, "theta_field_method", gxf_norm)
+        _validate_gxf_cli(args)
+        tfm = gxf_norm
+    elif gn_norm is not None:
+        gn_method = gn_norm
+        setattr(args, "theta_field_method", gn_method)
+        if int(getattr(args, "gn_epochs", 0)) < 1:
+            raise ValueError("--gn-epochs must be >= 1.")
+        if int(getattr(args, "gn_batch_size", 0)) < 1:
+            raise ValueError("--gn-batch-size must be >= 1.")
+        if float(getattr(args, "gn_lr", 0.0)) <= 0.0:
+            raise ValueError("--gn-lr must be > 0.")
+        if int(getattr(args, "gn_hidden_dim", 0)) < 1:
+            raise ValueError("--gn-hidden-dim must be >= 1.")
+        if int(getattr(args, "gn_depth", 0)) < 1:
+            raise ValueError("--gn-depth must be >= 1.")
+        if float(getattr(args, "gn_weight_decay", 0.0)) < 0.0:
+            raise ValueError("--gn-weight-decay must be >= 0.")
+        if float(getattr(args, "gn_diag_floor", 0.0)) <= 0.0:
+            raise ValueError("--gn-diag-floor must be > 0.")
+        if int(getattr(args, "gn_early_patience", -1)) < 0:
+            raise ValueError("--gn-early-patience must be >= 0.")
+        if float(getattr(args, "gn_early_min_delta", 0.0)) < 0.0:
+            raise ValueError("--gn-early-min-delta must be >= 0.")
+        alpha = float(getattr(args, "gn_early_ema_alpha", 0.0))
+        if not np.isfinite(alpha) or alpha <= 0.0 or alpha > 1.0:
+            raise ValueError("--gn-early-ema-alpha must be in (0, 1].")
+        if int(getattr(args, "gn_pair_batch_size", 0)) < 1:
+            raise ValueError("--gn-pair-batch-size must be >= 1.")
+        if int(getattr(args, "gn_low_rank_dim", 0)) < 1:
+            raise ValueError("--gn-low-rank-dim must be >= 1.")
+        if float(getattr(args, "gn_psi_floor", 0.0)) <= 0.0:
+            raise ValueError("--gn-psi-floor must be > 0.")
+        if gn_method in ("gaussian_network_autoencoder", "gaussian_network_diagonal_autoencoder"):
+            _validate_autoencoder_cli(args)
+        tfm = gn_method
+    elif flow_ae_norm is not None:
+        setattr(args, "theta_field_method", flow_ae_norm)
+        _validate_autoencoder_cli(args)
+        base_args = argparse.Namespace(**vars(args).copy())
+        setattr(base_args, "theta_field_method", _base_flow_method_for_autoencoder(flow_ae_norm))
+        validate_estimation_args(base_args)
+        tfm = flow_ae_norm
     if tfm == "nf":
         setattr(args, "theta_field_method", "nf")
         require_zuko_for_nf()
@@ -589,7 +1457,25 @@ def _validate_cli(args: argparse.Namespace) -> None:
             pa = float(_pa)
             if (not np.isfinite(pa)) or pa <= 0.0 or pa > 1.0:
                 raise ValueError("--nf-prior-early-ema-alpha must be in (0, 1].")
-    else:
+    elif tfm not in (
+        "gaussian_network",
+        "gaussian_network_diagonal",
+        "gaussian_network_low_rank",
+        "gaussian_network_autoencoder",
+        "gaussian_network_diagonal_autoencoder",
+        "theta_flow_autoencoder",
+        "x_flow_autoencoder",
+        "gaussian_x_flow",
+        "gaussian_x_flow_diagonal",
+        "nf_reduction",
+        "gmm_z_decode",
+        "pi_nf",
+        "contrastive",
+        "contrastive_soft",
+        "bidir_contrastive_soft",
+        "contrastive_soft_gaussian_net",
+        "contrastive_soft_gaussian_net_no_finetune",
+    ):
         validate_estimation_args(args)
     if int(args.num_theta_bins) < 1:
         raise ValueError("--num-theta-bins must be >= 1.")
@@ -616,9 +1502,9 @@ def _validate_cli(args: argparse.Namespace) -> None:
     if use_onehot:
         tfm = str(getattr(args, "theta_field_method", "theta_flow")).strip().lower()
         arch = str(getattr(args, "flow_arch", "mlp")).strip().lower()
-        if tfm != "theta_flow":
+        if tfm not in ("theta_flow", "theta_flow_autoencoder"):
             raise ValueError(
-                "--theta-flow-onehot-state requires --theta-field-method theta_flow "
+                "--theta-flow-onehot-state requires --theta-field-method theta_flow or theta-flow-autoencoder "
                 f"(got {getattr(args, 'theta_field_method', None)!r})."
             )
         if arch != "mlp":
@@ -629,9 +1515,9 @@ def _validate_cli(args: argparse.Namespace) -> None:
     if use_fourier:
         tfm = str(getattr(args, "theta_field_method", "theta_flow")).strip().lower()
         arch = str(getattr(args, "flow_arch", "mlp")).strip().lower()
-        if tfm != "theta_flow":
+        if tfm not in ("theta_flow", "theta_flow_autoencoder"):
             raise ValueError(
-                "--theta-flow-fourier-state requires --theta-field-method theta_flow "
+                "--theta-flow-fourier-state requires --theta-field-method theta_flow or theta-flow-autoencoder "
                 f"(got {getattr(args, 'theta_field_method', None)!r})."
             )
         if arch != "mlp":
@@ -646,9 +1532,9 @@ def _validate_cli(args: argparse.Namespace) -> None:
             raise ValueError("--theta-flow-fourier-period-mult must be a finite positive number.")
     if use_segmented:
         tfm = str(getattr(args, "theta_field_method", "theta_flow")).strip().lower()
-        if tfm != "theta_flow":
+        if tfm not in ("theta_flow", "theta_flow_autoencoder"):
             raise ValueError(
-                "--theta-flow-segmented requires --theta-field-method theta_flow "
+                "--theta-flow-segmented requires --theta-field-method theta_flow or theta-flow-autoencoder "
                 f"(got {getattr(args, 'theta_field_method', None)!r})."
             )
     _parse_n_list(args.n_list)  # syntax check only; pool size checked in main
@@ -787,6 +1673,83 @@ def _run_ctx_for_bundle(
     )
 
 
+def _rewrite_npz_fields(path: str, **updates: Any) -> None:
+    if not os.path.exists(path):
+        return
+    with np.load(path, allow_pickle=True) as z:
+        payload = {name: z[name] for name in z.files}
+    payload.update(updates)
+    np.savez_compressed(path, **payload)
+
+
+def _train_autoencoder_and_encode_bundle(
+    *,
+    args: argparse.Namespace,
+    bundle: SharedDatasetBundle,
+    device: torch.device,
+) -> tuple[SharedDatasetBundle, dict[str, Any], int]:
+    x_train = np.asarray(bundle.x_train, dtype=np.float64)
+    x_val = np.asarray(bundle.x_validation, dtype=np.float64)
+    x_all = np.asarray(bundle.x_all, dtype=np.float64)
+    if x_train.ndim != 2 or x_val.ndim != 2 or x_all.ndim != 2:
+        raise ValueError("Autoencoder preprocessing expects x arrays to be 2D.")
+    default_latent_dim = min(8, int(x_all.shape[1]))
+    ae_latent_dim = int(getattr(args, "gn_ae_latent_dim", default_latent_dim) or default_latent_dim)
+    if ae_latent_dim > int(x_all.shape[1]):
+        raise ValueError(f"--gn-ae-latent-dim must be <= x_dim={int(x_all.shape[1])}; got {ae_latent_dim}.")
+    ae_model = ObservationAutoencoder(
+        x_dim=int(x_all.shape[1]),
+        latent_dim=ae_latent_dim,
+        hidden_dim=int(getattr(args, "gn_ae_hidden_dim", 128)),
+        depth=int(getattr(args, "gn_ae_depth", 2)),
+    ).to(device)
+    ae_train_out = train_observation_autoencoder(
+        model=ae_model,
+        x_train=x_train,
+        x_val=x_val,
+        device=device,
+        epochs=int(getattr(args, "gn_ae_epochs", 1000)),
+        batch_size=int(getattr(args, "gn_ae_batch_size", 256)),
+        lr=float(getattr(args, "gn_ae_lr", 1e-3)),
+        weight_decay=float(getattr(args, "gn_ae_weight_decay", 0.0)),
+        patience=int(getattr(args, "gn_ae_early_patience", 200)),
+        min_delta=float(getattr(args, "gn_ae_early_min_delta", 1e-4)),
+        ema_alpha=float(getattr(args, "gn_ae_early_ema_alpha", 0.05)),
+        log_every=max(1, int(getattr(args, "log_every", 50))),
+        restore_best=True,
+    )
+    z_train = encode_observations(
+        model=ae_model,
+        x=x_train,
+        device=device,
+        batch_size=int(getattr(args, "gn_ae_batch_size", 256)),
+    )
+    z_val = encode_observations(
+        model=ae_model,
+        x=x_val,
+        device=device,
+        batch_size=int(getattr(args, "gn_ae_batch_size", 256)),
+    )
+    z_all = encode_observations(
+        model=ae_model,
+        x=x_all,
+        device=device,
+        batch_size=int(getattr(args, "gn_ae_batch_size", 256)),
+    )
+    encoded_bundle = SharedDatasetBundle(
+        meta=bundle.meta,
+        theta_all=bundle.theta_all,
+        x_all=z_all,
+        train_idx=bundle.train_idx,
+        validation_idx=bundle.validation_idx,
+        theta_train=bundle.theta_train,
+        x_train=z_train,
+        theta_validation=bundle.theta_validation,
+        x_validation=z_val,
+    )
+    return encoded_bundle, ae_train_out, ae_latent_dim
+
+
 def _metrics_fixed_edges(
     loaded: vhb.LoadedHMatrix,
     subset: SweepSubset,
@@ -900,9 +1863,1518 @@ def _estimate_one(
     bundle: SharedDatasetBundle,
     output_dir: str,
     n_bins: int,
+    bin_train: np.ndarray | None = None,
+    bin_validation: np.ndarray | None = None,
+    bin_all: np.ndarray | None = None,
 ) -> tuple[vhb.LoadedHMatrix, np.ndarray, torch.device]:
     """Train (unless h-only), load H, return loaded H, x_aligned, and device."""
     tfm = str(getattr(args, "theta_field_method", "theta_flow")).strip().lower()
+    contrastive_norm = _normalize_contrastive_method(tfm)
+    if contrastive_norm in ("contrastive_soft_gaussian_net", "contrastive_soft_gaussian_net_no_finetune"):
+        method_name = contrastive_norm
+        dev = require_device(str(getattr(args, "device", "cuda")))
+        os.makedirs(output_dir, exist_ok=True)
+        theta_train = np.asarray(bundle.theta_train, dtype=np.float64)
+        theta_val = np.asarray(bundle.theta_validation, dtype=np.float64)
+        theta_all = np.asarray(bundle.theta_all, dtype=np.float64)
+        x_train = np.asarray(bundle.x_train, dtype=np.float64)
+        x_val = np.asarray(bundle.x_validation, dtype=np.float64)
+        x_all = np.asarray(bundle.x_all, dtype=np.float64)
+        if theta_train.ndim == 1:
+            theta_train = theta_train.reshape(-1, 1)
+        if theta_val.ndim == 1:
+            theta_val = theta_val.reshape(-1, 1)
+        if theta_all.ndim == 1:
+            theta_all = theta_all.reshape(-1, 1)
+        if theta_train.ndim != 2 or theta_val.ndim != 2 or theta_all.ndim != 2:
+            raise ValueError("contrastive-soft-gaussian-net expects theta arrays to be 1D or 2D.")
+        if int(theta_train.shape[1]) != 1 or int(theta_all.shape[1]) != 1:
+            raise ValueError("contrastive-soft-gaussian-net v1 requires scalar theta.")
+        if x_train.ndim != 2 or x_val.ndim != 2 or x_all.ndim != 2:
+            raise ValueError("contrastive-soft-gaussian-net expects x arrays to be 2D.")
+        if theta_train.shape[0] < 2 or theta_val.shape[0] < 2:
+            raise ValueError("contrastive-soft-gaussian-net requires at least two train and two validation rows.")
+
+        x_mean_pre = np.mean(x_train, axis=0, dtype=np.float64)
+        x_std_pre = np.maximum(np.std(x_train, axis=0, dtype=np.float64), 1e-6)
+        theta_mean_pre = np.mean(theta_train, axis=0, dtype=np.float64)
+        theta_std_pre = np.maximum(np.std(theta_train, axis=0, dtype=np.float64), 1e-6)
+        x_train_n = (x_train - x_mean_pre) / x_std_pre
+        x_val_n = (x_val - x_mean_pre) / x_std_pre
+        theta_train_n = (theta_train - theta_mean_pre) / theta_std_pre
+        theta_val_n = (theta_val - theta_mean_pre) / theta_std_pre
+
+        gaussian_model = ConditionalDiagonalGaussianPrecisionMLP(
+            theta_dim=1,
+            x_dim=int(x_all.shape[1]),
+            hidden_dim=int(getattr(args, "gn_hidden_dim", 128)),
+            depth=int(getattr(args, "gn_depth", 3)),
+            diag_floor=float(getattr(args, "gn_diag_floor", 1e-4)),
+        ).to(dev)
+        gn_train_out = train_gaussian_network(
+            model=gaussian_model,
+            theta_train=theta_train_n,
+            x_train=x_train_n,
+            theta_val=theta_val_n,
+            x_val=x_val_n,
+            device=dev,
+            epochs=int(getattr(args, "gn_epochs", 4000)),
+            batch_size=int(getattr(args, "gn_batch_size", 256)),
+            lr=float(getattr(args, "gn_lr", 1e-3)),
+            weight_decay=float(getattr(args, "gn_weight_decay", 0.0)),
+            patience=int(getattr(args, "gn_early_patience", 300)),
+            min_delta=float(getattr(args, "gn_early_min_delta", 1e-4)),
+            ema_alpha=float(getattr(args, "gn_early_ema_alpha", 0.05)),
+            max_grad_norm=float(getattr(args, "gn_max_grad_norm", 10.0)),
+            log_every=max(1, int(getattr(args, "log_every", 50))),
+            restore_best=True,
+        )
+        model = ContrastiveGaussianNetworkScorer(gaussian_model).to(dev)
+        bw_arg = float(getattr(args, "contrastive_soft_bandwidth", 1.0))
+        bw_start = float(getattr(args, "contrastive_soft_bandwidth_start", 0.0))
+        bw_end = float(getattr(args, "contrastive_soft_bandwidth_end", 0.0))
+        bw_k = int(getattr(args, "contrastive_soft_bandwidth_k", 5))
+        periodic = bool(getattr(args, "contrastive_soft_periodic", False))
+        period = float(getattr(args, "contrastive_soft_period", 2.0 * np.pi))
+        if contrastive_norm == "contrastive_soft_gaussian_net_no_finetune":
+            train_out = contrastive_soft_metadata_without_training(
+                theta_train=theta_train,
+                x_train=x_train,
+                bandwidth=bw_arg,
+                bandwidth_start=bw_start,
+                bandwidth_end=bw_end,
+                bandwidth_k=bw_k,
+                periodic=periodic,
+                period=period,
+            )
+        else:
+            train_out = train_contrastive_soft_llr(
+                model=model,
+                theta_train=theta_train,
+                x_train=x_train,
+                theta_val=theta_val,
+                x_val=x_val,
+                device=dev,
+                epochs=int(getattr(args, "contrastive_epochs", 2000)),
+                batch_size=int(getattr(args, "contrastive_batch_size", 256)),
+                lr=float(getattr(args, "contrastive_lr", 1e-3)),
+                bandwidth=bw_arg,
+                bandwidth_start=bw_start,
+                bandwidth_end=bw_end,
+                bandwidth_k=bw_k,
+                periodic=periodic,
+                period=period,
+                weight_decay=float(getattr(args, "contrastive_weight_decay", 0.0)),
+                patience=int(getattr(args, "contrastive_early_patience", 300)),
+                min_delta=float(getattr(args, "contrastive_early_min_delta", 1e-4)),
+                ema_alpha=float(getattr(args, "contrastive_early_ema_alpha", 0.05)),
+                max_grad_norm=float(getattr(args, "contrastive_max_grad_norm", 10.0)),
+                log_every=max(1, int(getattr(args, "log_every", 50))),
+                restore_best=True,
+            )
+        x_mean = np.asarray(train_out["x_mean"], dtype=np.float64)
+        x_std = np.asarray(train_out["x_std"], dtype=np.float64)
+        theta_mean = np.asarray(train_out["theta_mean"], dtype=np.float64)
+        theta_std = np.asarray(train_out["theta_std"], dtype=np.float64)
+        c_matrix = compute_contrastive_soft_c_matrix(
+            model=model,
+            theta_all=theta_all,
+            x_all=x_all,
+            device=dev,
+            x_mean=x_mean,
+            x_std=x_std,
+            theta_mean=theta_mean,
+            theta_std=theta_std,
+            pair_batch_size=int(getattr(args, "contrastive_pair_batch_size", 65536)),
+        )
+        delta_l = compute_delta_l_nf(c_matrix)
+        h_sym = symmetrize_nf(compute_h_directed_contrastive(delta_l))
+        theta_used = theta_all.reshape(-1)
+
+        h_eval_name = (
+            "contrastive_soft_gaussian_net_no_finetune_log_p_x_given_theta"
+            if contrastive_norm == "contrastive_soft_gaussian_net_no_finetune"
+            else "contrastive_soft_gaussian_net_log_p_x_given_theta"
+        )
+        np.savez_compressed(
+            os.path.join(output_dir, "h_matrix_results_theta_cov.npz"),
+            theta_used=np.asarray(theta_used, dtype=np.float64),
+            h_sym=np.asarray(h_sym, dtype=np.float64),
+            c_matrix=np.asarray(c_matrix, dtype=np.float64),
+            delta_l_matrix=np.asarray(delta_l, dtype=np.float64),
+            h_field_method=np.asarray([method_name], dtype=object),
+            h_eval_scalar_name=np.asarray([h_eval_name], dtype=object),
+            sigma_eval=np.asarray([np.nan], dtype=np.float64),
+            theta_field_method=np.asarray([method_name], dtype=object),
+            gn_hidden_dim=np.int64(getattr(args, "gn_hidden_dim", 128)),
+            gn_depth=np.int64(getattr(args, "gn_depth", 3)),
+            gn_diag_floor=np.float64(getattr(args, "gn_diag_floor", 1e-4)),
+            contrastive_effective_batch_size=np.int64(train_out.get("effective_batch_size", 0)),
+            contrastive_soft_bandwidth=np.float64(train_out["bandwidth_raw"]),
+            contrastive_soft_bandwidth_normalized=np.float64(train_out["bandwidth_normalized"]),
+            contrastive_soft_bandwidth_auto=np.bool_(train_out["bandwidth_auto"]),
+            contrastive_soft_bandwidth_anneal_enabled=np.bool_(train_out["bandwidth_anneal_enabled"]),
+            contrastive_soft_bandwidth_start=np.float64(train_out["bandwidth_start_raw"]),
+            contrastive_soft_bandwidth_end=np.float64(train_out["bandwidth_end_raw"]),
+            contrastive_soft_bandwidth_start_normalized=np.float64(train_out["bandwidth_start_normalized"]),
+            contrastive_soft_bandwidth_end_normalized=np.float64(train_out["bandwidth_end_normalized"]),
+            contrastive_soft_bandwidth_schedule=np.asarray(train_out["bandwidth_raw_schedule"], dtype=np.float64),
+            contrastive_soft_bandwidth_schedule_normalized=np.asarray(
+                train_out["bandwidth_normalized_schedule"],
+                dtype=np.float64,
+            ),
+            contrastive_soft_bandwidth_k=np.int64(bw_k),
+            contrastive_soft_periodic=np.bool_(periodic),
+            contrastive_soft_period=np.float64(period),
+            contrastive_x_mean=x_mean,
+            contrastive_x_std=x_std,
+            contrastive_theta_mean=theta_mean,
+            contrastive_theta_std=theta_std,
+        )
+        empty = np.asarray([], dtype=np.float64)
+        np.savez_compressed(
+            os.path.join(output_dir, "score_prior_training_losses.npz"),
+            theta_field_method=np.asarray([method_name], dtype=object),
+            prior_enable=np.bool_(False),
+            score_train_losses=np.asarray(train_out["train_losses"], dtype=np.float64),
+            score_val_losses=np.asarray(train_out["val_losses"], dtype=np.float64),
+            score_val_monitor_losses=np.asarray(train_out["val_monitor_losses"], dtype=np.float64),
+            score_best_epoch=np.int64(train_out["best_epoch"]),
+            score_stopped_epoch=np.int64(train_out["stopped_epoch"]),
+            score_stopped_early=np.bool_(train_out["stopped_early"]),
+            score_best_val_smooth=np.float64(train_out["best_val_loss"]),
+            score_n_clipped_steps=np.int64(train_out.get("n_clipped_steps", 0)),
+            score_n_total_steps=np.int64(train_out.get("n_total_steps", 0)),
+            score_lr_last=np.float64(train_out.get("lr_last", float("nan"))),
+            gn_pretrain_train_losses=np.asarray(gn_train_out["train_losses"], dtype=np.float64),
+            gn_pretrain_val_losses=np.asarray(gn_train_out["val_losses"], dtype=np.float64),
+            gn_pretrain_val_monitor_losses=np.asarray(gn_train_out["val_monitor_losses"], dtype=np.float64),
+            gn_pretrain_best_epoch=np.int64(gn_train_out["best_epoch"]),
+            gn_pretrain_stopped_epoch=np.int64(gn_train_out["stopped_epoch"]),
+            gn_pretrain_stopped_early=np.bool_(gn_train_out["stopped_early"]),
+            gn_pretrain_best_val_smooth=np.float64(gn_train_out["best_val_loss"]),
+            gn_pretrain_grad_norm_mean=np.float64(gn_train_out.get("grad_norm_mean", float("nan"))),
+            gn_pretrain_grad_norm_max=np.float64(gn_train_out.get("grad_norm_max", float("nan"))),
+            gn_pretrain_param_norm_final=np.float64(gn_train_out.get("param_norm_final", float("nan"))),
+            contrastive_batch_size=np.int64(int(getattr(args, "contrastive_batch_size", 256))),
+            contrastive_effective_batch_size=np.int64(train_out.get("effective_batch_size", 0)),
+            contrastive_soft_bandwidth=np.float64(train_out["bandwidth_raw"]),
+            contrastive_soft_bandwidth_auto=np.bool_(train_out["bandwidth_auto"]),
+            contrastive_soft_bandwidth_anneal_enabled=np.bool_(train_out["bandwidth_anneal_enabled"]),
+            contrastive_soft_bandwidth_start=np.float64(train_out["bandwidth_start_raw"]),
+            contrastive_soft_bandwidth_end=np.float64(train_out["bandwidth_end_raw"]),
+            contrastive_soft_bandwidth_schedule=np.asarray(train_out["bandwidth_raw_schedule"], dtype=np.float64),
+            contrastive_soft_bandwidth_schedule_normalized=np.asarray(
+                train_out["bandwidth_normalized_schedule"],
+                dtype=np.float64,
+            ),
+            score_likelihood_finetune_train_losses=empty,
+            score_likelihood_finetune_val_losses=empty,
+            score_likelihood_finetune_val_monitor_losses=empty,
+            prior_train_losses=empty,
+            prior_val_losses=empty,
+            prior_val_monitor_losses=empty,
+            prior_likelihood_finetune_train_losses=empty,
+            prior_likelihood_finetune_val_losses=empty,
+            prior_likelihood_finetune_val_monitor_losses=empty,
+        )
+        loaded = SimpleNamespace(h_sym=np.asarray(h_sym, dtype=np.float64), theta_used=np.asarray(theta_used, dtype=np.float64))
+        return loaded, np.asarray(x_all, dtype=np.float64), dev
+
+    if contrastive_norm == "bidir_contrastive_soft":
+        method_name = contrastive_norm
+        dev = require_device(str(getattr(args, "device", "cuda")))
+        os.makedirs(output_dir, exist_ok=True)
+        theta_train = np.asarray(bundle.theta_train, dtype=np.float64)
+        theta_val = np.asarray(bundle.theta_validation, dtype=np.float64)
+        theta_all = np.asarray(bundle.theta_all, dtype=np.float64)
+        x_train = np.asarray(bundle.x_train, dtype=np.float64)
+        x_val = np.asarray(bundle.x_validation, dtype=np.float64)
+        x_all = np.asarray(bundle.x_all, dtype=np.float64)
+        if theta_train.ndim == 1:
+            theta_train = theta_train.reshape(-1, 1)
+        if theta_val.ndim == 1:
+            theta_val = theta_val.reshape(-1, 1)
+        if theta_all.ndim == 1:
+            theta_all = theta_all.reshape(-1, 1)
+        if theta_train.ndim != 2 or theta_val.ndim != 2 or theta_all.ndim != 2:
+            raise ValueError("bidir-contrastive-soft expects theta arrays to be 1D or 2D.")
+        if int(theta_train.shape[1]) != 1 or int(theta_all.shape[1]) != 1:
+            raise ValueError("bidir-contrastive-soft v1 requires scalar theta.")
+        if x_train.ndim != 2 or x_val.ndim != 2 or x_all.ndim != 2:
+            raise ValueError("bidir-contrastive-soft expects x arrays to be 2D.")
+        if theta_train.shape[0] < 2 or theta_val.shape[0] < 2:
+            raise ValueError("bidir-contrastive-soft requires at least two train and two validation rows.")
+
+        hidden_dim = int(getattr(args, "contrastive_hidden_dim", 128))
+        depth = int(getattr(args, "contrastive_depth", 3))
+        dot_dim = int(getattr(args, "contrastive_soft_dot_dim", 64))
+        soft_arch = str(getattr(args, "contrastive_soft_score_arch", "normalized_dot")).strip().lower().replace("-", "_")
+        if soft_arch == "mlp":
+            model = ContrastiveLLRMLP(
+                x_dim=int(x_all.shape[1]),
+                theta_dim=1,
+                hidden_dim=hidden_dim,
+                depth=depth,
+            ).to(dev)
+        else:
+            model = ContrastiveNormalizedDotBiasScorer(
+                x_dim=int(x_all.shape[1]),
+                theta_dim=1,
+                feature_dim=dot_dim,
+                hidden_dim=hidden_dim,
+                depth=depth,
+            ).to(dev)
+        bw_arg = float(getattr(args, "contrastive_soft_bandwidth", 1.0))
+        bw_start = float(getattr(args, "contrastive_soft_bandwidth_start", 0.0))
+        bw_end = float(getattr(args, "contrastive_soft_bandwidth_end", 0.0))
+        bw_k = int(getattr(args, "contrastive_soft_bandwidth_k", 5))
+        periodic = bool(getattr(args, "contrastive_soft_periodic", False))
+        period = float(getattr(args, "contrastive_soft_period", 2.0 * np.pi))
+        train_out = train_bidir_contrastive_soft_llr(
+            model=model,
+            theta_train=theta_train,
+            x_train=x_train,
+            theta_val=theta_val,
+            x_val=x_val,
+            device=dev,
+            epochs=int(getattr(args, "contrastive_epochs", 2000)),
+            batch_size=int(getattr(args, "contrastive_batch_size", 256)),
+            lr=float(getattr(args, "contrastive_lr", 1e-3)),
+            bandwidth=bw_arg,
+            bandwidth_start=bw_start,
+            bandwidth_end=bw_end,
+            bandwidth_k=bw_k,
+            periodic=periodic,
+            period=period,
+            weight_decay=float(getattr(args, "contrastive_weight_decay", 0.0)),
+            patience=int(getattr(args, "contrastive_early_patience", 300)),
+            min_delta=float(getattr(args, "contrastive_early_min_delta", 1e-4)),
+            ema_alpha=float(getattr(args, "contrastive_early_ema_alpha", 0.05)),
+            max_grad_norm=float(getattr(args, "contrastive_max_grad_norm", 10.0)),
+            log_every=max(1, int(getattr(args, "log_every", 50))),
+            restore_best=True,
+        )
+        x_mean = np.asarray(train_out["x_mean"], dtype=np.float64)
+        x_std = np.asarray(train_out["x_std"], dtype=np.float64)
+        theta_mean = np.asarray(train_out["theta_mean"], dtype=np.float64)
+        theta_std = np.asarray(train_out["theta_std"], dtype=np.float64)
+        if hasattr(model, "rho") and hasattr(model, "alpha"):
+            contrastive_soft_logit_rho = float(model.rho.detach().cpu().item())
+            contrastive_soft_logit_alpha = float(model.alpha.detach().cpu().item())
+        else:
+            contrastive_soft_logit_rho = float("nan")
+            contrastive_soft_logit_alpha = float("nan")
+        bidir_score_tag = "mlp" if soft_arch == "mlp" else "normalized_dot_bias"
+        c_matrix = compute_contrastive_soft_c_matrix(
+            model=model,
+            theta_all=theta_all,
+            x_all=x_all,
+            device=dev,
+            x_mean=x_mean,
+            x_std=x_std,
+            theta_mean=theta_mean,
+            theta_std=theta_std,
+            pair_batch_size=int(getattr(args, "contrastive_pair_batch_size", 65536)),
+        )
+        delta_l = compute_delta_l_nf(c_matrix)
+        h_sym = symmetrize_nf(compute_h_directed_contrastive(delta_l))
+        theta_used = theta_all.reshape(-1)
+
+        np.savez_compressed(
+            os.path.join(output_dir, "h_matrix_results_theta_cov.npz"),
+            theta_used=np.asarray(theta_used, dtype=np.float64),
+            h_sym=np.asarray(h_sym, dtype=np.float64),
+            c_matrix=np.asarray(c_matrix, dtype=np.float64),
+            delta_l_matrix=np.asarray(delta_l, dtype=np.float64),
+            h_field_method=np.asarray([method_name], dtype=object),
+            h_eval_scalar_name=np.asarray(["bidir_contrastive_soft_llr_score"], dtype=object),
+            sigma_eval=np.asarray([np.nan], dtype=np.float64),
+            theta_field_method=np.asarray([method_name], dtype=object),
+            contrastive_hidden_dim=np.int64(hidden_dim),
+            contrastive_depth=np.int64(depth),
+            contrastive_effective_batch_size=np.int64(train_out.get("effective_batch_size", 0)),
+            contrastive_soft_score_arch=np.asarray([bidir_score_tag], dtype=object),
+            contrastive_soft_dot_dim=np.int64(dot_dim),
+            contrastive_soft_logit_rho=np.float64(contrastive_soft_logit_rho),
+            contrastive_soft_logit_alpha=np.float64(contrastive_soft_logit_alpha),
+            contrastive_soft_bandwidth=np.float64(train_out["bandwidth_raw"]),
+            contrastive_soft_bandwidth_normalized=np.float64(train_out["bandwidth_normalized"]),
+            contrastive_soft_bandwidth_auto=np.bool_(train_out["bandwidth_auto"]),
+            contrastive_soft_bandwidth_anneal_enabled=np.bool_(train_out["bandwidth_anneal_enabled"]),
+            contrastive_soft_bandwidth_start=np.float64(train_out["bandwidth_start_raw"]),
+            contrastive_soft_bandwidth_end=np.float64(train_out["bandwidth_end_raw"]),
+            contrastive_soft_bandwidth_start_normalized=np.float64(train_out["bandwidth_start_normalized"]),
+            contrastive_soft_bandwidth_end_normalized=np.float64(train_out["bandwidth_end_normalized"]),
+            contrastive_soft_bandwidth_schedule=np.asarray(train_out["bandwidth_raw_schedule"], dtype=np.float64),
+            contrastive_soft_bandwidth_schedule_normalized=np.asarray(
+                train_out["bandwidth_normalized_schedule"],
+                dtype=np.float64,
+            ),
+            contrastive_soft_bandwidth_k=np.int64(bw_k),
+            contrastive_soft_periodic=np.bool_(periodic),
+            contrastive_soft_period=np.float64(period),
+            contrastive_x_mean=x_mean,
+            contrastive_x_std=x_std,
+            contrastive_theta_mean=theta_mean,
+            contrastive_theta_std=theta_std,
+        )
+        empty = np.asarray([], dtype=np.float64)
+        np.savez_compressed(
+            os.path.join(output_dir, "score_prior_training_losses.npz"),
+            theta_field_method=np.asarray([method_name], dtype=object),
+            prior_enable=np.bool_(False),
+            score_train_losses=np.asarray(train_out["train_losses"], dtype=np.float64),
+            score_train_row_losses=np.asarray(train_out["train_row_losses"], dtype=np.float64),
+            score_train_col_losses=np.asarray(train_out["train_col_losses"], dtype=np.float64),
+            score_val_losses=np.asarray(train_out["val_losses"], dtype=np.float64),
+            score_val_row_losses=np.asarray(train_out["val_row_losses"], dtype=np.float64),
+            score_val_col_losses=np.asarray(train_out["val_col_losses"], dtype=np.float64),
+            score_val_monitor_losses=np.asarray(train_out["val_monitor_losses"], dtype=np.float64),
+            score_best_epoch=np.int64(train_out["best_epoch"]),
+            score_stopped_epoch=np.int64(train_out["stopped_epoch"]),
+            score_stopped_early=np.bool_(train_out["stopped_early"]),
+            score_best_val_smooth=np.float64(train_out["best_val_loss"]),
+            score_grad_norm_mean=np.float64(float("nan")),
+            score_grad_norm_max=np.float64(float("nan")),
+            score_param_norm_final=np.float64(float("nan")),
+            score_n_clipped_steps=np.int64(train_out.get("n_clipped_steps", 0)),
+            score_n_total_steps=np.int64(train_out.get("n_total_steps", 0)),
+            score_lr_last=np.float64(train_out.get("lr_last", float("nan"))),
+            contrastive_batch_size=np.int64(int(getattr(args, "contrastive_batch_size", 256))),
+            contrastive_effective_batch_size=np.int64(train_out.get("effective_batch_size", 0)),
+            contrastive_soft_score_arch=np.asarray([bidir_score_tag], dtype=object),
+            contrastive_soft_dot_dim=np.int64(dot_dim),
+            contrastive_soft_logit_rho=np.float64(contrastive_soft_logit_rho),
+            contrastive_soft_logit_alpha=np.float64(contrastive_soft_logit_alpha),
+            contrastive_soft_bandwidth=np.float64(train_out["bandwidth_raw"]),
+            contrastive_soft_bandwidth_auto=np.bool_(train_out["bandwidth_auto"]),
+            contrastive_soft_bandwidth_anneal_enabled=np.bool_(train_out["bandwidth_anneal_enabled"]),
+            contrastive_soft_bandwidth_start=np.float64(train_out["bandwidth_start_raw"]),
+            contrastive_soft_bandwidth_end=np.float64(train_out["bandwidth_end_raw"]),
+            contrastive_soft_bandwidth_schedule=np.asarray(train_out["bandwidth_raw_schedule"], dtype=np.float64),
+            contrastive_soft_bandwidth_schedule_normalized=np.asarray(
+                train_out["bandwidth_normalized_schedule"],
+                dtype=np.float64,
+            ),
+            score_likelihood_finetune_train_losses=empty,
+            score_likelihood_finetune_val_losses=empty,
+            score_likelihood_finetune_val_monitor_losses=empty,
+            prior_train_losses=empty,
+            prior_val_losses=empty,
+            prior_val_monitor_losses=empty,
+            prior_likelihood_finetune_train_losses=empty,
+            prior_likelihood_finetune_val_losses=empty,
+            prior_likelihood_finetune_val_monitor_losses=empty,
+        )
+        loaded_bidir = SimpleNamespace(
+            h_sym=np.asarray(h_sym, dtype=np.float64),
+            theta_used=np.asarray(theta_used, dtype=np.float64),
+        )
+        return loaded_bidir, np.asarray(x_all, dtype=np.float64), dev
+
+    if contrastive_norm == "contrastive_soft":
+        method_name = contrastive_norm
+        dev = require_device(str(getattr(args, "device", "cuda")))
+        os.makedirs(output_dir, exist_ok=True)
+        theta_train = np.asarray(bundle.theta_train, dtype=np.float64)
+        theta_val = np.asarray(bundle.theta_validation, dtype=np.float64)
+        theta_all = np.asarray(bundle.theta_all, dtype=np.float64)
+        x_train = np.asarray(bundle.x_train, dtype=np.float64)
+        x_val = np.asarray(bundle.x_validation, dtype=np.float64)
+        x_all = np.asarray(bundle.x_all, dtype=np.float64)
+        if theta_train.ndim == 1:
+            theta_train = theta_train.reshape(-1, 1)
+        if theta_val.ndim == 1:
+            theta_val = theta_val.reshape(-1, 1)
+        if theta_all.ndim == 1:
+            theta_all = theta_all.reshape(-1, 1)
+        if theta_train.ndim != 2 or theta_val.ndim != 2 or theta_all.ndim != 2:
+            raise ValueError("contrastive-soft expects theta arrays to be 1D or 2D.")
+        if int(theta_train.shape[1]) != 1 or int(theta_all.shape[1]) != 1:
+            raise ValueError("contrastive-soft v1 requires scalar theta.")
+        if x_train.ndim != 2 or x_val.ndim != 2 or x_all.ndim != 2:
+            raise ValueError("contrastive-soft expects x arrays to be 2D.")
+        if theta_train.shape[0] < 2 or theta_val.shape[0] < 2:
+            raise ValueError("contrastive-soft requires at least two train and two validation rows.")
+
+        hidden_dim = int(getattr(args, "contrastive_hidden_dim", 128))
+        depth = int(getattr(args, "contrastive_depth", 3))
+        soft_arch = str(getattr(args, "contrastive_soft_score_arch", "normalized_dot")).strip().lower().replace("-", "_")
+        dot_dim = int(getattr(args, "contrastive_soft_dot_dim", 64))
+        coord_embed_dim = int(getattr(args, "contrastive_soft_coordinate_embed_dim", 16))
+        gaussian_logvar_min = float(getattr(args, "contrastive_soft_gaussian_logvar_min", -8.0))
+        gaussian_logvar_max = float(getattr(args, "contrastive_soft_gaussian_logvar_max", 5.0))
+        if soft_arch == "normalized_dot":
+            model = ContrastiveNormalizedDotScorer(
+                x_dim=int(x_all.shape[1]),
+                theta_dim=1,
+                feature_dim=dot_dim,
+                hidden_dim=hidden_dim,
+                depth=depth,
+            ).to(dev)
+        elif soft_arch == "additive_independent":
+            model = ContrastiveAdditiveIndependentScorer(
+                x_dim=int(x_all.shape[1]),
+                theta_dim=1,
+                feature_dim=dot_dim,
+                hidden_dim=hidden_dim,
+                depth=depth,
+            ).to(dev)
+        elif soft_arch == "independent_gaussian":
+            model = ContrastiveIndependentGaussianScorer(
+                x_dim=int(x_all.shape[1]),
+                theta_dim=1,
+                hidden_dim=hidden_dim,
+                depth=depth,
+                logvar_min=gaussian_logvar_min,
+                logvar_max=gaussian_logvar_max,
+            ).to(dev)
+        elif soft_arch == "independent_dot_product":
+            model = ContrastiveIndependentDotProductScorer(
+                x_dim=int(x_all.shape[1]),
+                theta_dim=1,
+                feature_dim=dot_dim,
+                coord_embed_dim=coord_embed_dim,
+                hidden_dim=hidden_dim,
+                depth=depth,
+            ).to(dev)
+        elif soft_arch == "mlp":
+            model = ContrastiveLLRMLP(
+                x_dim=int(x_all.shape[1]),
+                theta_dim=1,
+                hidden_dim=hidden_dim,
+                depth=depth,
+            ).to(dev)
+        else:
+            raise ValueError(
+                "--contrastive-soft-score-arch must be one of "
+                "{'normalized_dot','additive_independent','independent_gaussian','independent_dot_product','mlp'}."
+            )
+        bw_arg = float(getattr(args, "contrastive_soft_bandwidth", 1.0))
+        bw_start = float(getattr(args, "contrastive_soft_bandwidth_start", 0.0))
+        bw_end = float(getattr(args, "contrastive_soft_bandwidth_end", 0.0))
+        bw_k = int(getattr(args, "contrastive_soft_bandwidth_k", 5))
+        periodic = bool(getattr(args, "contrastive_soft_periodic", False))
+        period = float(getattr(args, "contrastive_soft_period", 2.0 * np.pi))
+        train_out = train_contrastive_soft_llr(
+            model=model,
+            theta_train=theta_train,
+            x_train=x_train,
+            theta_val=theta_val,
+            x_val=x_val,
+            device=dev,
+            epochs=int(getattr(args, "contrastive_epochs", 2000)),
+            batch_size=int(getattr(args, "contrastive_batch_size", 256)),
+            lr=float(getattr(args, "contrastive_lr", 1e-3)),
+            bandwidth=bw_arg,
+            bandwidth_start=bw_start,
+            bandwidth_end=bw_end,
+            bandwidth_k=bw_k,
+            periodic=periodic,
+            period=period,
+            weight_decay=float(getattr(args, "contrastive_weight_decay", 0.0)),
+            patience=int(getattr(args, "contrastive_early_patience", 300)),
+            min_delta=float(getattr(args, "contrastive_early_min_delta", 1e-4)),
+            ema_alpha=float(getattr(args, "contrastive_early_ema_alpha", 0.05)),
+            max_grad_norm=float(getattr(args, "contrastive_max_grad_norm", 10.0)),
+            log_every=max(1, int(getattr(args, "log_every", 50))),
+            restore_best=True,
+        )
+        x_mean = np.asarray(train_out["x_mean"], dtype=np.float64)
+        x_std = np.asarray(train_out["x_std"], dtype=np.float64)
+        theta_mean = np.asarray(train_out["theta_mean"], dtype=np.float64)
+        theta_std = np.asarray(train_out["theta_std"], dtype=np.float64)
+        if hasattr(model, "rho") and hasattr(model, "alpha"):
+            contrastive_soft_logit_rho = float(model.rho.detach().cpu().item())
+            contrastive_soft_logit_alpha = float(model.alpha.detach().cpu().item())
+        else:
+            contrastive_soft_logit_rho = float("nan")
+            contrastive_soft_logit_alpha = float("nan")
+        c_matrix = compute_contrastive_soft_c_matrix(
+            model=model,
+            theta_all=theta_all,
+            x_all=x_all,
+            device=dev,
+            x_mean=x_mean,
+            x_std=x_std,
+            theta_mean=theta_mean,
+            theta_std=theta_std,
+            pair_batch_size=int(getattr(args, "contrastive_pair_batch_size", 65536)),
+        )
+        delta_l = compute_delta_l_nf(c_matrix)
+        h_sym = symmetrize_nf(compute_h_directed_contrastive(delta_l))
+        theta_used = theta_all.reshape(-1)
+
+        np.savez_compressed(
+            os.path.join(output_dir, "h_matrix_results_theta_cov.npz"),
+            theta_used=np.asarray(theta_used, dtype=np.float64),
+            h_sym=np.asarray(h_sym, dtype=np.float64),
+            c_matrix=np.asarray(c_matrix, dtype=np.float64),
+            delta_l_matrix=np.asarray(delta_l, dtype=np.float64),
+            h_field_method=np.asarray([method_name], dtype=object),
+            h_eval_scalar_name=np.asarray(["contrastive_soft_llr_score"], dtype=object),
+            sigma_eval=np.asarray([np.nan], dtype=np.float64),
+            theta_field_method=np.asarray([method_name], dtype=object),
+            contrastive_hidden_dim=np.int64(hidden_dim),
+            contrastive_depth=np.int64(depth),
+            contrastive_effective_batch_size=np.int64(train_out.get("effective_batch_size", 0)),
+            contrastive_soft_score_arch=np.asarray([soft_arch], dtype=object),
+            contrastive_soft_dot_dim=np.int64(dot_dim),
+            contrastive_soft_coordinate_embed_dim=np.int64(coord_embed_dim),
+            contrastive_soft_gaussian_logvar_min=np.float64(gaussian_logvar_min),
+            contrastive_soft_gaussian_logvar_max=np.float64(gaussian_logvar_max),
+            contrastive_soft_logit_rho=np.float64(contrastive_soft_logit_rho),
+            contrastive_soft_logit_alpha=np.float64(contrastive_soft_logit_alpha),
+            contrastive_soft_bandwidth=np.float64(train_out["bandwidth_raw"]),
+            contrastive_soft_bandwidth_normalized=np.float64(train_out["bandwidth_normalized"]),
+            contrastive_soft_bandwidth_auto=np.bool_(train_out["bandwidth_auto"]),
+            contrastive_soft_bandwidth_anneal_enabled=np.bool_(train_out["bandwidth_anneal_enabled"]),
+            contrastive_soft_bandwidth_start=np.float64(train_out["bandwidth_start_raw"]),
+            contrastive_soft_bandwidth_end=np.float64(train_out["bandwidth_end_raw"]),
+            contrastive_soft_bandwidth_start_normalized=np.float64(train_out["bandwidth_start_normalized"]),
+            contrastive_soft_bandwidth_end_normalized=np.float64(train_out["bandwidth_end_normalized"]),
+            contrastive_soft_bandwidth_schedule=np.asarray(train_out["bandwidth_raw_schedule"], dtype=np.float64),
+            contrastive_soft_bandwidth_schedule_normalized=np.asarray(
+                train_out["bandwidth_normalized_schedule"],
+                dtype=np.float64,
+            ),
+            contrastive_soft_bandwidth_k=np.int64(bw_k),
+            contrastive_soft_periodic=np.bool_(periodic),
+            contrastive_soft_period=np.float64(period),
+            contrastive_x_mean=x_mean,
+            contrastive_x_std=x_std,
+            contrastive_theta_mean=theta_mean,
+            contrastive_theta_std=theta_std,
+        )
+        empty = np.asarray([], dtype=np.float64)
+        np.savez_compressed(
+            os.path.join(output_dir, "score_prior_training_losses.npz"),
+            theta_field_method=np.asarray([method_name], dtype=object),
+            prior_enable=np.bool_(False),
+            score_train_losses=np.asarray(train_out["train_losses"], dtype=np.float64),
+            score_val_losses=np.asarray(train_out["val_losses"], dtype=np.float64),
+            score_val_monitor_losses=np.asarray(train_out["val_monitor_losses"], dtype=np.float64),
+            score_best_epoch=np.int64(train_out["best_epoch"]),
+            score_stopped_epoch=np.int64(train_out["stopped_epoch"]),
+            score_stopped_early=np.bool_(train_out["stopped_early"]),
+            score_best_val_smooth=np.float64(train_out["best_val_loss"]),
+            score_grad_norm_mean=np.float64(float("nan")),
+            score_grad_norm_max=np.float64(float("nan")),
+            score_param_norm_final=np.float64(float("nan")),
+            score_n_clipped_steps=np.int64(train_out.get("n_clipped_steps", 0)),
+            score_n_total_steps=np.int64(train_out.get("n_total_steps", 0)),
+            score_lr_last=np.float64(train_out.get("lr_last", float("nan"))),
+            contrastive_batch_size=np.int64(int(getattr(args, "contrastive_batch_size", 256))),
+            contrastive_effective_batch_size=np.int64(train_out.get("effective_batch_size", 0)),
+            contrastive_soft_score_arch=np.asarray([soft_arch], dtype=object),
+            contrastive_soft_dot_dim=np.int64(dot_dim),
+            contrastive_soft_coordinate_embed_dim=np.int64(coord_embed_dim),
+            contrastive_soft_gaussian_logvar_min=np.float64(gaussian_logvar_min),
+            contrastive_soft_gaussian_logvar_max=np.float64(gaussian_logvar_max),
+            contrastive_soft_logit_rho=np.float64(contrastive_soft_logit_rho),
+            contrastive_soft_logit_alpha=np.float64(contrastive_soft_logit_alpha),
+            contrastive_soft_bandwidth=np.float64(train_out["bandwidth_raw"]),
+            contrastive_soft_bandwidth_auto=np.bool_(train_out["bandwidth_auto"]),
+            contrastive_soft_bandwidth_anneal_enabled=np.bool_(train_out["bandwidth_anneal_enabled"]),
+            contrastive_soft_bandwidth_start=np.float64(train_out["bandwidth_start_raw"]),
+            contrastive_soft_bandwidth_end=np.float64(train_out["bandwidth_end_raw"]),
+            contrastive_soft_bandwidth_schedule=np.asarray(train_out["bandwidth_raw_schedule"], dtype=np.float64),
+            contrastive_soft_bandwidth_schedule_normalized=np.asarray(
+                train_out["bandwidth_normalized_schedule"],
+                dtype=np.float64,
+            ),
+            score_likelihood_finetune_train_losses=empty,
+            score_likelihood_finetune_val_losses=empty,
+            score_likelihood_finetune_val_monitor_losses=empty,
+            prior_train_losses=empty,
+            prior_val_losses=empty,
+            prior_val_monitor_losses=empty,
+            prior_likelihood_finetune_train_losses=empty,
+            prior_likelihood_finetune_val_losses=empty,
+            prior_likelihood_finetune_val_monitor_losses=empty,
+        )
+        loaded_contrastive_soft = SimpleNamespace(
+            h_sym=np.asarray(h_sym, dtype=np.float64),
+            theta_used=np.asarray(theta_used, dtype=np.float64),
+        )
+        return loaded_contrastive_soft, np.asarray(x_all, dtype=np.float64), dev
+
+    if contrastive_norm is not None:
+        method_name = contrastive_norm
+        dev = require_device(str(getattr(args, "device", "cuda")))
+        os.makedirs(output_dir, exist_ok=True)
+        theta_train = np.asarray(bundle.theta_train, dtype=np.float64)
+        theta_val = np.asarray(bundle.theta_validation, dtype=np.float64)
+        theta_all = np.asarray(bundle.theta_all, dtype=np.float64)
+        x_train = np.asarray(bundle.x_train, dtype=np.float64)
+        x_val = np.asarray(bundle.x_validation, dtype=np.float64)
+        x_all = np.asarray(bundle.x_all, dtype=np.float64)
+        if theta_train.ndim == 1:
+            theta_train = theta_train.reshape(-1, 1)
+        if theta_val.ndim == 1:
+            theta_val = theta_val.reshape(-1, 1)
+        if theta_all.ndim == 1:
+            theta_all = theta_all.reshape(-1, 1)
+        if theta_train.ndim != 2 or theta_val.ndim != 2 or theta_all.ndim != 2:
+            raise ValueError("contrastive expects theta arrays to be 1D or 2D.")
+        if x_train.ndim != 2 or x_val.ndim != 2 or x_all.ndim != 2:
+            raise ValueError("contrastive expects x arrays to be 2D.")
+        if theta_train.shape[0] < 2 or theta_val.shape[0] < 2:
+            raise ValueError("contrastive requires at least two train and two validation rows.")
+        if theta_train.shape[1] != theta_all.shape[1]:
+            raise ValueError("contrastive theta dimension mismatch.")
+        if bin_train is None or bin_validation is None or bin_all is None:
+            raise ValueError("contrastive requires theta bin labels from the convergence subset.")
+
+        hidden_dim = int(getattr(args, "contrastive_hidden_dim", 128))
+        depth = int(getattr(args, "contrastive_depth", 3))
+        theta_encoding = normalize_contrastive_theta_encoding(
+            str(getattr(args, "contrastive_theta_encoding", "one_hot_bin"))
+        )
+        model = ContrastiveLLRMLP(
+            x_dim=int(x_all.shape[1]),
+            theta_dim=contrastive_theta_dim_for_encoding(int(n_bins), theta_encoding),
+            hidden_dim=hidden_dim,
+            depth=depth,
+        ).to(dev)
+        train_out = train_contrastive_llr(
+            model=model,
+            theta_train=theta_train,
+            x_train=x_train,
+            theta_val=theta_val,
+            x_val=x_val,
+            bin_train=np.asarray(bin_train, dtype=np.int64),
+            bin_val=np.asarray(bin_validation, dtype=np.int64),
+            n_bins=int(n_bins),
+            theta_encoding=theta_encoding,
+            device=dev,
+            epochs=int(getattr(args, "contrastive_epochs", 2000)),
+            batch_size=int(getattr(args, "contrastive_batch_size", 256)),
+            lr=float(getattr(args, "contrastive_lr", 1e-3)),
+            weight_decay=float(getattr(args, "contrastive_weight_decay", 0.0)),
+            patience=int(getattr(args, "contrastive_early_patience", 300)),
+            min_delta=float(getattr(args, "contrastive_early_min_delta", 1e-4)),
+            ema_alpha=float(getattr(args, "contrastive_early_ema_alpha", 0.05)),
+            max_grad_norm=float(getattr(args, "contrastive_max_grad_norm", 10.0)),
+            log_every=max(1, int(getattr(args, "log_every", 50))),
+            restore_best=True,
+        )
+        x_mean = np.asarray(train_out["x_mean"], dtype=np.float64)
+        x_std = np.asarray(train_out["x_std"], dtype=np.float64)
+        theta_mean = np.asarray(train_out["theta_mean"], dtype=np.float64)
+        theta_std = np.asarray(train_out["theta_std"], dtype=np.float64)
+        c_matrix = compute_contrastive_c_matrix(
+            model=model,
+            theta_all=theta_all,
+            x_all=x_all,
+            bin_all=np.asarray(bin_all, dtype=np.int64),
+            n_bins=int(n_bins),
+            theta_encoding=theta_encoding,
+            device=dev,
+            x_mean=x_mean,
+            x_std=x_std,
+            pair_batch_size=int(getattr(args, "contrastive_pair_batch_size", 65536)),
+        )
+        delta_l = compute_delta_l_nf(c_matrix)
+        h_sym = symmetrize_nf(compute_h_directed_contrastive(delta_l))
+        theta_used = theta_all.reshape(-1) if int(theta_all.shape[1]) == 1 else theta_all.copy()
+
+        np.savez_compressed(
+            os.path.join(output_dir, "h_matrix_results_theta_cov.npz"),
+            theta_used=np.asarray(theta_used, dtype=np.float64),
+            h_sym=np.asarray(h_sym, dtype=np.float64),
+            c_matrix=np.asarray(c_matrix, dtype=np.float64),
+            delta_l_matrix=np.asarray(delta_l, dtype=np.float64),
+            h_field_method=np.asarray([method_name], dtype=object),
+            h_eval_scalar_name=np.asarray(["contrastive_llr_score"], dtype=object),
+            sigma_eval=np.asarray([np.nan], dtype=np.float64),
+            theta_field_method=np.asarray([method_name], dtype=object),
+            contrastive_hidden_dim=np.int64(hidden_dim),
+            contrastive_depth=np.int64(depth),
+            contrastive_num_theta_bins=np.int64(int(n_bins)),
+            contrastive_theta_encoding=np.asarray([theta_encoding], dtype=object),
+            contrastive_unique_bin_batches=np.bool_(True),
+            contrastive_x_mean=x_mean,
+            contrastive_x_std=x_std,
+            contrastive_theta_mean=theta_mean,
+            contrastive_theta_std=theta_std,
+        )
+        empty = np.asarray([], dtype=np.float64)
+        np.savez_compressed(
+            os.path.join(output_dir, "score_prior_training_losses.npz"),
+            theta_field_method=np.asarray([method_name], dtype=object),
+            prior_enable=np.bool_(False),
+            score_train_losses=np.asarray(train_out["train_losses"], dtype=np.float64),
+            score_val_losses=np.asarray(train_out["val_losses"], dtype=np.float64),
+            score_val_monitor_losses=np.asarray(train_out["val_monitor_losses"], dtype=np.float64),
+            score_best_epoch=np.int64(train_out["best_epoch"]),
+            score_stopped_epoch=np.int64(train_out["stopped_epoch"]),
+            score_stopped_early=np.bool_(train_out["stopped_early"]),
+            score_best_val_smooth=np.float64(train_out["best_val_loss"]),
+            score_grad_norm_mean=np.float64(float("nan")),
+            score_grad_norm_max=np.float64(float("nan")),
+            score_param_norm_final=np.float64(float("nan")),
+            score_n_clipped_steps=np.int64(train_out.get("n_clipped_steps", 0)),
+            score_n_total_steps=np.int64(train_out.get("n_total_steps", 0)),
+            score_lr_last=np.float64(train_out.get("lr_last", float("nan"))),
+            contrastive_batch_size=np.int64(int(getattr(args, "contrastive_batch_size", 256))),
+            score_likelihood_finetune_train_losses=empty,
+            score_likelihood_finetune_val_losses=empty,
+            score_likelihood_finetune_val_monitor_losses=empty,
+            prior_train_losses=empty,
+            prior_val_losses=empty,
+            prior_val_monitor_losses=empty,
+            prior_likelihood_finetune_train_losses=empty,
+            prior_likelihood_finetune_val_losses=empty,
+            prior_likelihood_finetune_val_monitor_losses=empty,
+        )
+        loaded_contrastive = SimpleNamespace(
+            h_sym=np.asarray(h_sym, dtype=np.float64),
+            theta_used=np.asarray(theta_used, dtype=np.float64),
+        )
+        return loaded_contrastive, np.asarray(x_all, dtype=np.float64), dev
+
+    gxf_norm = _normalize_gaussian_x_flow_method(tfm)
+    if gxf_norm is not None:
+        method_name = gxf_norm
+        dev = require_device(str(getattr(args, "device", "cuda")))
+        os.makedirs(output_dir, exist_ok=True)
+        theta_train = np.asarray(bundle.theta_train, dtype=np.float64)
+        theta_val = np.asarray(bundle.theta_validation, dtype=np.float64)
+        theta_all = np.asarray(bundle.theta_all, dtype=np.float64)
+        x_train = np.asarray(bundle.x_train, dtype=np.float64)
+        x_val = np.asarray(bundle.x_validation, dtype=np.float64)
+        x_all = np.asarray(bundle.x_all, dtype=np.float64)
+        if theta_train.ndim == 1:
+            theta_train = theta_train.reshape(-1, 1)
+        if theta_val.ndim == 1:
+            theta_val = theta_val.reshape(-1, 1)
+        if theta_all.ndim == 1:
+            theta_all = theta_all.reshape(-1, 1)
+        if theta_train.ndim != 2 or theta_val.ndim != 2 or theta_all.ndim != 2:
+            raise ValueError(f"{method_name} expects theta arrays to be 1D or 2D.")
+        if x_train.ndim != 2 or x_val.ndim != 2 or x_all.ndim != 2:
+            raise ValueError(f"{method_name} expects x arrays to be 2D.")
+        if theta_train.shape[0] < 1 or theta_val.shape[0] < 1:
+            raise ValueError(f"{method_name} requires non-empty train and validation splits.")
+        if theta_train.shape[1] != theta_all.shape[1]:
+            raise ValueError(f"{method_name} theta dimension mismatch.")
+
+        sched_name = str(getattr(args, "gxf_path_schedule", "linear")).strip().lower()
+        schedule = path_schedule_from_name(sched_name)
+        gxf_diag_cov = method_name == "gaussian_x_flow_diagonal"
+        if gxf_diag_cov:
+            model = ConditionalDiagonalGaussianCovarianceFMMLP(
+                theta_dim=int(theta_all.shape[1]),
+                x_dim=int(x_all.shape[1]),
+                hidden_dim=int(getattr(args, "gxf_hidden_dim", 128)),
+                depth=int(getattr(args, "gxf_depth", 3)),
+                diag_floor=float(getattr(args, "gxf_diag_floor", 1e-4)),
+            ).to(dev)
+        else:
+            model = ConditionalGaussianCovarianceFMMLP(
+                theta_dim=int(theta_all.shape[1]),
+                x_dim=int(x_all.shape[1]),
+                hidden_dim=int(getattr(args, "gxf_hidden_dim", 128)),
+                depth=int(getattr(args, "gxf_depth", 3)),
+                diag_floor=float(getattr(args, "gxf_diag_floor", 1e-4)),
+            ).to(dev)
+        h_eval_name = (
+            "gaussian_x_flow_diagonal_log_p_x_given_theta"
+            if gxf_diag_cov
+            else "gaussian_x_flow_log_p_x_given_theta"
+        )
+        train_out = train_gaussian_x_flow(
+            model=model,
+            theta_train=theta_train,
+            x_train=x_train,
+            theta_val=theta_val,
+            x_val=x_val,
+            device=dev,
+            schedule=schedule,
+            epochs=int(getattr(args, "gxf_epochs", 2000)),
+            batch_size=int(getattr(args, "gxf_batch_size", 256)),
+            lr=float(getattr(args, "gxf_lr", 1e-3)),
+            weight_decay=float(getattr(args, "gxf_weight_decay", 0.0)),
+            t_eps=float(getattr(args, "gxf_t_eps", 1e-3)),
+            cov_jitter=float(getattr(args, "gxf_cov_jitter", 1e-4)),
+            patience=int(getattr(args, "gxf_early_patience", 300)),
+            min_delta=float(getattr(args, "gxf_early_min_delta", 1e-4)),
+            ema_alpha=float(getattr(args, "gxf_early_ema_alpha", 0.05)),
+            max_grad_norm=float(getattr(args, "gxf_max_grad_norm", 10.0)),
+            log_every=max(1, int(getattr(args, "log_every", 50))),
+            restore_best=True,
+        )
+        x_mean = np.asarray(train_out["x_mean"], dtype=np.float64)
+        x_std = np.asarray(train_out["x_std"], dtype=np.float64)
+        c_matrix = compute_gaussian_x_flow_c_matrix(
+            model=model,
+            theta_all=theta_all,
+            x_all=x_all,
+            device=dev,
+            x_mean=x_mean,
+            x_std=x_std,
+            pair_batch_size=int(getattr(args, "gxf_pair_batch_size", 65536)),
+        )
+        delta_l = compute_delta_l_nf(c_matrix)
+        h_sym = symmetrize_nf(compute_h_directed_nf(delta_l))
+        theta_used = theta_all.reshape(-1) if int(theta_all.shape[1]) == 1 else theta_all.copy()
+
+        np.savez_compressed(
+            os.path.join(output_dir, "h_matrix_results_theta_cov.npz"),
+            theta_used=np.asarray(theta_used, dtype=np.float64),
+            h_sym=np.asarray(h_sym, dtype=np.float64),
+            c_matrix=np.asarray(c_matrix, dtype=np.float64),
+            delta_l_matrix=np.asarray(delta_l, dtype=np.float64),
+            h_field_method=np.asarray([method_name], dtype=object),
+            h_eval_scalar_name=np.asarray([h_eval_name], dtype=object),
+            sigma_eval=np.asarray([np.nan], dtype=np.float64),
+            theta_field_method=np.asarray([method_name], dtype=object),
+            gxf_path_schedule=np.asarray([sched_name], dtype=object),
+            gxf_t_eps=np.float64(float(getattr(args, "gxf_t_eps", 1e-3))),
+            gxf_cov_jitter=np.float64(float(getattr(args, "gxf_cov_jitter", 1e-4))),
+            gxf_hidden_dim=np.int64(int(getattr(args, "gxf_hidden_dim", 128))),
+            gxf_depth=np.int64(int(getattr(args, "gxf_depth", 3))),
+            gxf_diag_floor=np.float64(float(getattr(args, "gxf_diag_floor", 1e-4))),
+            gxf_diagonal_covariance=np.bool_(gxf_diag_cov),
+            gxf_x_mean=np.asarray(x_mean, dtype=np.float64),
+            gxf_x_std=np.asarray(x_std, dtype=np.float64),
+        )
+        empty = np.asarray([], dtype=np.float64)
+        np.savez_compressed(
+            os.path.join(output_dir, "score_prior_training_losses.npz"),
+            theta_field_method=np.asarray([method_name], dtype=object),
+            prior_enable=np.bool_(False),
+            score_train_losses=np.asarray(train_out["train_losses"], dtype=np.float64),
+            score_val_losses=np.asarray(train_out["val_losses"], dtype=np.float64),
+            score_val_monitor_losses=np.asarray(train_out["val_monitor_losses"], dtype=np.float64),
+            score_best_epoch=np.int64(train_out["best_epoch"]),
+            score_stopped_epoch=np.int64(train_out["stopped_epoch"]),
+            score_stopped_early=np.bool_(train_out["stopped_early"]),
+            score_best_val_smooth=np.float64(train_out["best_val_loss"]),
+            score_grad_norm_mean=np.float64(float("nan")),
+            score_grad_norm_max=np.float64(float("nan")),
+            score_param_norm_final=np.float64(float("nan")),
+            score_n_clipped_steps=np.int64(0),
+            score_n_total_steps=np.int64(0),
+            score_lr_last=np.float64(train_out.get("lr_last", float("nan"))),
+            ae_train_losses=empty,
+            ae_val_losses=empty,
+            ae_val_monitor_losses=empty,
+            ae_best_epoch=np.int64(0),
+            ae_stopped_epoch=np.int64(0),
+            ae_stopped_early=np.bool_(False),
+            ae_latent_dim=np.int64(0),
+            score_likelihood_finetune_train_losses=empty,
+            score_likelihood_finetune_val_losses=empty,
+            score_likelihood_finetune_val_monitor_losses=empty,
+            prior_train_losses=empty,
+            prior_val_losses=empty,
+            prior_val_monitor_losses=empty,
+            prior_likelihood_finetune_train_losses=empty,
+            prior_likelihood_finetune_val_losses=empty,
+            prior_likelihood_finetune_val_monitor_losses=empty,
+            gxf_path_schedule=np.asarray([sched_name], dtype=object),
+            gxf_fm_train=np.bool_(True),
+            gxf_diagonal_covariance=np.bool_(gxf_diag_cov),
+        )
+        loaded_gxf = SimpleNamespace(
+            h_sym=np.asarray(h_sym, dtype=np.float64),
+            theta_used=np.asarray(theta_used, dtype=np.float64),
+        )
+        return loaded_gxf, np.asarray(x_all, dtype=np.float64), dev
+
+    gn_norm = _normalize_gaussian_network_method(tfm)
+    if gn_norm is not None:
+        gn_method = gn_norm
+        dev = require_device(str(getattr(args, "device", "cuda")))
+        os.makedirs(output_dir, exist_ok=True)
+        theta_train = np.asarray(bundle.theta_train, dtype=np.float64)
+        theta_val = np.asarray(bundle.theta_validation, dtype=np.float64)
+        theta_all = np.asarray(bundle.theta_all, dtype=np.float64)
+        x_train = np.asarray(bundle.x_train, dtype=np.float64)
+        x_val = np.asarray(bundle.x_validation, dtype=np.float64)
+        x_all = np.asarray(bundle.x_all, dtype=np.float64)
+        if theta_train.ndim == 1:
+            theta_train = theta_train.reshape(-1, 1)
+        if theta_val.ndim == 1:
+            theta_val = theta_val.reshape(-1, 1)
+        if theta_all.ndim == 1:
+            theta_all = theta_all.reshape(-1, 1)
+        if theta_train.ndim != 2 or theta_val.ndim != 2 or theta_all.ndim != 2:
+            raise ValueError(f"{gn_method} expects theta arrays to be 1D or 2D.")
+        if x_train.ndim != 2 or x_val.ndim != 2 or x_all.ndim != 2:
+            raise ValueError(f"{gn_method} expects x arrays to be 2D.")
+        if theta_train.shape[0] < 1 or theta_val.shape[0] < 1:
+            raise ValueError(f"{gn_method} requires non-empty train and validation splits.")
+        if theta_train.shape[1] != theta_all.shape[1]:
+            raise ValueError(f"{gn_method} theta dimension mismatch.")
+
+        ae_train_out: dict[str, Any] | None = None
+        ae_latent_dim = 0
+        gn_x_train = x_train
+        gn_x_val = x_val
+        gn_x_all = x_all
+        h_eval_scalar_name = f"{gn_method}_log_p_x_given_theta"
+        if gn_method in ("gaussian_network_autoencoder", "gaussian_network_diagonal_autoencoder"):
+            default_latent_dim = min(8, int(x_all.shape[1]))
+            ae_latent_dim = int(getattr(args, "gn_ae_latent_dim", default_latent_dim) or default_latent_dim)
+            if ae_latent_dim > int(x_all.shape[1]):
+                raise ValueError(f"--gn-ae-latent-dim must be <= x_dim={int(x_all.shape[1])}; got {ae_latent_dim}.")
+            ae_model = ObservationAutoencoder(
+                x_dim=int(x_all.shape[1]),
+                latent_dim=ae_latent_dim,
+                hidden_dim=int(getattr(args, "gn_ae_hidden_dim", 128)),
+                depth=int(getattr(args, "gn_ae_depth", 2)),
+            ).to(dev)
+            ae_train_out = train_observation_autoencoder(
+                model=ae_model,
+                x_train=x_train,
+                x_val=x_val,
+                device=dev,
+                epochs=int(getattr(args, "gn_ae_epochs", 1000)),
+                batch_size=int(getattr(args, "gn_ae_batch_size", 256)),
+                lr=float(getattr(args, "gn_ae_lr", 1e-3)),
+                weight_decay=float(getattr(args, "gn_ae_weight_decay", 0.0)),
+                patience=int(getattr(args, "gn_ae_early_patience", 200)),
+                min_delta=float(getattr(args, "gn_ae_early_min_delta", 1e-4)),
+                ema_alpha=float(getattr(args, "gn_ae_early_ema_alpha", 0.05)),
+                log_every=max(1, int(getattr(args, "log_every", 50))),
+                restore_best=True,
+            )
+            gn_x_train = encode_observations(
+                model=ae_model,
+                x=x_train,
+                device=dev,
+                batch_size=int(getattr(args, "gn_ae_batch_size", 256)),
+            )
+            gn_x_val = encode_observations(
+                model=ae_model,
+                x=x_val,
+                device=dev,
+                batch_size=int(getattr(args, "gn_ae_batch_size", 256)),
+            )
+            gn_x_all = encode_observations(
+                model=ae_model,
+                x=x_all,
+                device=dev,
+                batch_size=int(getattr(args, "gn_ae_batch_size", 256)),
+            )
+            h_eval_scalar_name = f"{gn_method}_log_p_z_given_theta"
+
+        if gn_method == "gaussian_network_low_rank":
+            rank = int(getattr(args, "gn_low_rank_dim", 4))
+            if rank > int(gn_x_all.shape[1]):
+                raise ValueError(f"--gn-low-rank-dim must be <= x_dim={int(gn_x_all.shape[1])}; got {rank}.")
+            model = ConditionalLowRankGaussianCovarianceMLP(
+                theta_dim=int(theta_all.shape[1]),
+                x_dim=int(gn_x_all.shape[1]),
+                rank=rank,
+                hidden_dim=int(getattr(args, "gn_hidden_dim", 128)),
+                depth=int(getattr(args, "gn_depth", 3)),
+                diag_floor=float(getattr(args, "gn_diag_floor", 1e-4)),
+                psi_floor=float(getattr(args, "gn_psi_floor", 1e-6)),
+            ).to(dev)
+        else:
+            model_cls = (
+                ConditionalDiagonalGaussianPrecisionMLP
+                if gn_method in ("gaussian_network_diagonal", "gaussian_network_diagonal_autoencoder")
+                else ConditionalGaussianPrecisionMLP
+            )
+            model = model_cls(
+                theta_dim=int(theta_all.shape[1]),
+                x_dim=int(gn_x_all.shape[1]),
+                hidden_dim=int(getattr(args, "gn_hidden_dim", 128)),
+                depth=int(getattr(args, "gn_depth", 3)),
+                diag_floor=float(getattr(args, "gn_diag_floor", 1e-4)),
+            ).to(dev)
+        train_out = train_gaussian_network(
+            model=model,
+            theta_train=theta_train,
+            x_train=gn_x_train,
+            theta_val=theta_val,
+            x_val=gn_x_val,
+            device=dev,
+            epochs=int(getattr(args, "gn_epochs", 4000)),
+            batch_size=int(getattr(args, "gn_batch_size", 256)),
+            lr=float(getattr(args, "gn_lr", 1e-3)),
+            weight_decay=float(getattr(args, "gn_weight_decay", 0.0)),
+            patience=int(getattr(args, "gn_early_patience", 300)),
+            min_delta=float(getattr(args, "gn_early_min_delta", 1e-4)),
+            ema_alpha=float(getattr(args, "gn_early_ema_alpha", 0.05)),
+            max_grad_norm=float(getattr(args, "gn_max_grad_norm", 10.0)),
+            log_every=max(1, int(getattr(args, "log_every", 50))),
+            restore_best=True,
+        )
+        c_matrix = compute_gaussian_network_c_matrix(
+            model=model,
+            theta_all=theta_all,
+            x_all=gn_x_all,
+            device=dev,
+            pair_batch_size=int(getattr(args, "gn_pair_batch_size", 65536)),
+        )
+        delta_l = compute_delta_l_nf(c_matrix)
+        h_sym = symmetrize_nf(compute_h_directed_nf(delta_l))
+        theta_used = theta_all.reshape(-1) if int(theta_all.shape[1]) == 1 else theta_all.copy()
+
+        np.savez_compressed(
+            os.path.join(output_dir, "h_matrix_results_theta_cov.npz"),
+            theta_used=np.asarray(theta_used, dtype=np.float64),
+            h_sym=np.asarray(h_sym, dtype=np.float64),
+            c_matrix=np.asarray(c_matrix, dtype=np.float64),
+            delta_l_matrix=np.asarray(delta_l, dtype=np.float64),
+            h_field_method=np.asarray([gn_method], dtype=object),
+            h_eval_scalar_name=np.asarray([h_eval_scalar_name], dtype=object),
+            sigma_eval=np.asarray([np.nan], dtype=np.float64),
+            gn_hidden_dim=np.int64(getattr(args, "gn_hidden_dim", 128)),
+            gn_depth=np.int64(getattr(args, "gn_depth", 3)),
+            gn_diag_floor=np.float64(getattr(args, "gn_diag_floor", 1e-4)),
+            gn_low_rank_dim=np.int64(getattr(args, "gn_low_rank_dim", 0)),
+            gn_psi_floor=np.float64(getattr(args, "gn_psi_floor", np.nan)),
+            gn_autoencoder_enabled=np.bool_(ae_train_out is not None),
+            gn_ae_latent_dim=np.int64(ae_latent_dim),
+            gn_ae_reconstruction_val_loss=np.float64(
+                ae_train_out["best_val_loss"] if ae_train_out is not None else np.nan
+            ),
+        )
+        empty = np.asarray([], dtype=np.float64)
+        np.savez_compressed(
+            os.path.join(output_dir, "score_prior_training_losses.npz"),
+            theta_field_method=np.asarray([gn_method], dtype=object),
+            prior_enable=np.bool_(False),
+            score_train_losses=np.asarray(train_out["train_losses"], dtype=np.float64),
+            score_val_losses=np.asarray(train_out["val_losses"], dtype=np.float64),
+            score_val_monitor_losses=np.asarray(train_out["val_monitor_losses"], dtype=np.float64),
+            score_best_epoch=np.int64(train_out["best_epoch"]),
+            score_stopped_epoch=np.int64(train_out["stopped_epoch"]),
+            score_stopped_early=np.bool_(train_out["stopped_early"]),
+            score_best_val_smooth=np.float64(train_out["best_val_loss"]),
+            score_grad_norm_mean=np.float64(train_out.get("grad_norm_mean", float("nan"))),
+            score_grad_norm_max=np.float64(train_out.get("grad_norm_max", float("nan"))),
+            score_param_norm_final=np.float64(train_out.get("param_norm_final", float("nan"))),
+            score_n_clipped_steps=np.int64(train_out.get("n_clipped_steps", 0)),
+            score_n_total_steps=np.int64(train_out.get("n_total_steps", 0)),
+            score_lr_last=np.float64(train_out.get("lr_last", float("nan"))),
+            ae_train_losses=np.asarray(
+                ae_train_out["train_losses"] if ae_train_out is not None else [],
+                dtype=np.float64,
+            ),
+            ae_val_losses=np.asarray(
+                ae_train_out["val_losses"] if ae_train_out is not None else [],
+                dtype=np.float64,
+            ),
+            ae_val_monitor_losses=np.asarray(
+                ae_train_out["val_monitor_losses"] if ae_train_out is not None else [],
+                dtype=np.float64,
+            ),
+            ae_best_epoch=np.int64(ae_train_out["best_epoch"] if ae_train_out is not None else 0),
+            ae_stopped_epoch=np.int64(ae_train_out["stopped_epoch"] if ae_train_out is not None else 0),
+            ae_stopped_early=np.bool_(ae_train_out["stopped_early"] if ae_train_out is not None else False),
+            ae_latent_dim=np.int64(ae_latent_dim),
+            score_likelihood_finetune_train_losses=empty,
+            score_likelihood_finetune_val_losses=empty,
+            score_likelihood_finetune_val_monitor_losses=empty,
+            prior_train_losses=empty,
+            prior_val_losses=empty,
+            prior_val_monitor_losses=empty,
+            prior_likelihood_finetune_train_losses=empty,
+            prior_likelihood_finetune_val_losses=empty,
+            prior_likelihood_finetune_val_monitor_losses=empty,
+        )
+        loaded_gn = SimpleNamespace(
+            h_sym=np.asarray(h_sym, dtype=np.float64),
+            theta_used=np.asarray(theta_used, dtype=np.float64),
+        )
+        return loaded_gn, np.asarray(x_all, dtype=np.float64), dev
+
+    if tfm == "gmm_z_decode":
+        dev = require_device(str(getattr(args, "device", "cuda")))
+        os.makedirs(output_dir, exist_ok=True)
+        theta_train = np.asarray(bundle.theta_train, dtype=np.float64)
+        theta_val = np.asarray(bundle.theta_validation, dtype=np.float64)
+        theta_all = np.asarray(bundle.theta_all, dtype=np.float64)
+        x_train = np.asarray(bundle.x_train, dtype=np.float64)
+        x_val = np.asarray(bundle.x_validation, dtype=np.float64)
+        x_all = np.asarray(bundle.x_all, dtype=np.float64)
+        if theta_train.ndim == 1:
+            theta_train = theta_train.reshape(-1, 1)
+        if theta_val.ndim == 1:
+            theta_val = theta_val.reshape(-1, 1)
+        if theta_all.ndim == 1:
+            theta_all = theta_all.reshape(-1, 1)
+        if theta_train.ndim != 2 or theta_val.ndim != 2 or theta_all.ndim != 2:
+            raise ValueError("gmm-z-decode expects theta arrays to be 1D or 2D.")
+        if int(theta_all.shape[1]) != 1:
+            raise ValueError("gmm-z-decode v1 requires scalar theta.")
+        if x_train.ndim != 2 or x_val.ndim != 2 or x_all.ndim != 2:
+            raise ValueError("gmm-z-decode expects x arrays to be 2D.")
+        if theta_train.shape[0] < 1 or theta_val.shape[0] < 1:
+            raise ValueError("gmm-z-decode requires non-empty train and validation splits.")
+
+        latent_dim = int(getattr(args, "gzd_latent_dim", 2))
+        components = int(getattr(args, "gzd_components", 5))
+        hidden_dim = int(getattr(args, "gzd_hidden_dim", 128))
+        depth = int(getattr(args, "gzd_depth", 2))
+        model = GMMZDecodeModel(
+            x_dim=int(x_all.shape[1]),
+            latent_dim=latent_dim,
+            components=components,
+            hidden_dim=hidden_dim,
+            depth=depth,
+            min_std=float(getattr(args, "gzd_min_std", 1e-3)),
+        ).to(dev)
+        train_out = train_gmm_z_decode(
+            model=model,
+            theta_train=theta_train,
+            x_train=x_train,
+            theta_val=theta_val,
+            x_val=x_val,
+            device=dev,
+            epochs=int(getattr(args, "gzd_epochs", 2000)),
+            batch_size=int(getattr(args, "gzd_batch_size", 256)),
+            lr=float(getattr(args, "gzd_lr", 1e-3)),
+            weight_decay=float(getattr(args, "gzd_weight_decay", 0.0)),
+            patience=int(getattr(args, "gzd_early_patience", 300)),
+            min_delta=float(getattr(args, "gzd_early_min_delta", 1e-4)),
+            ema_alpha=float(getattr(args, "gzd_early_ema_alpha", 0.05)),
+            max_grad_norm=float(getattr(args, "gzd_max_grad_norm", 10.0)),
+            log_every=max(1, int(getattr(args, "log_every", 50))),
+            restore_best=True,
+        )
+        c_matrix, z_all = compute_gmm_z_decode_c_matrix(
+            model=model,
+            theta_all=theta_all,
+            x_all=x_all,
+            device=dev,
+            x_mean=np.asarray(train_out["x_mean"], dtype=np.float64),
+            x_std=np.asarray(train_out["x_std"], dtype=np.float64),
+            theta_mean=np.asarray(train_out["theta_mean"], dtype=np.float64),
+            theta_std=np.asarray(train_out["theta_std"], dtype=np.float64),
+            pair_batch_size=int(getattr(args, "gzd_pair_batch_size", 65536)),
+        )
+        delta_l = compute_delta_l_nf(c_matrix)
+        h_sym = symmetrize_nf(compute_h_directed_nf(delta_l))
+        theta_used = theta_all.reshape(-1)
+
+        np.savez_compressed(
+            os.path.join(output_dir, "h_matrix_results_theta_cov.npz"),
+            theta_used=np.asarray(theta_used, dtype=np.float64),
+            h_sym=np.asarray(h_sym, dtype=np.float64),
+            c_matrix=np.asarray(c_matrix, dtype=np.float64),
+            delta_l_matrix=np.asarray(delta_l, dtype=np.float64),
+            h_field_method=np.asarray(["gmm_z_decode"], dtype=object),
+            h_eval_scalar_name=np.asarray(["gmm_z_decode_log_q_theta_given_z_uniform_prior"], dtype=object),
+            sigma_eval=np.asarray([np.nan], dtype=np.float64),
+            theta_field_method=np.asarray(["gmm_z_decode"], dtype=object),
+            gzd_latent_dim=np.int64(latent_dim),
+            gzd_components=np.int64(components),
+            gzd_hidden_dim=np.int64(hidden_dim),
+            gzd_depth=np.int64(depth),
+            gzd_x_mean=np.asarray(train_out["x_mean"], dtype=np.float64),
+            gzd_x_std=np.asarray(train_out["x_std"], dtype=np.float64),
+            gzd_theta_mean=np.asarray(train_out["theta_mean"], dtype=np.float64),
+            gzd_theta_std=np.asarray(train_out["theta_std"], dtype=np.float64),
+            gzd_z_all=np.asarray(z_all, dtype=np.float64),
+        )
+        empty = np.asarray([], dtype=np.float64)
+        np.savez_compressed(
+            os.path.join(output_dir, "score_prior_training_losses.npz"),
+            theta_field_method=np.asarray(["gmm_z_decode"], dtype=object),
+            prior_enable=np.bool_(False),
+            score_train_losses=np.asarray(train_out["train_losses"], dtype=np.float64),
+            score_val_losses=np.asarray(train_out["val_losses"], dtype=np.float64),
+            score_val_monitor_losses=np.asarray(train_out["val_ema_losses"], dtype=np.float64),
+            score_best_epoch=np.int64(train_out["best_epoch"]),
+            score_stopped_epoch=np.int64(train_out["stopped_epoch"]),
+            score_stopped_early=np.bool_(train_out["stopped_early"]),
+            score_best_val_smooth=np.float64(train_out["best_val_ema"]),
+            score_lr_last=np.float64(train_out.get("lr_last", float("nan"))),
+            score_n_clipped_steps=np.int64(train_out.get("n_clipped_steps", 0)),
+            score_n_total_steps=np.int64(train_out.get("n_total_steps", 0)),
+            gzd_latent_dim=np.int64(latent_dim),
+            gzd_components=np.int64(components),
+            score_likelihood_finetune_train_losses=empty,
+            score_likelihood_finetune_val_losses=empty,
+            score_likelihood_finetune_val_monitor_losses=empty,
+            prior_train_losses=empty,
+            prior_val_losses=empty,
+            prior_val_monitor_losses=empty,
+            prior_likelihood_finetune_train_losses=empty,
+            prior_likelihood_finetune_val_losses=empty,
+            prior_likelihood_finetune_val_monitor_losses=empty,
+        )
+        loaded = SimpleNamespace(
+            h_sym=np.asarray(h_sym, dtype=np.float64),
+            theta_used=np.asarray(theta_used, dtype=np.float64),
+        )
+        return loaded, np.asarray(x_all, dtype=np.float64), dev
+
+    if tfm == "pi_nf":
+        dev = require_device(str(getattr(args, "device", "cuda")))
+        os.makedirs(output_dir, exist_ok=True)
+        theta_train = np.asarray(bundle.theta_train, dtype=np.float64)
+        theta_val = np.asarray(bundle.theta_validation, dtype=np.float64)
+        theta_all = np.asarray(bundle.theta_all, dtype=np.float64)
+        x_train = np.asarray(bundle.x_train, dtype=np.float64)
+        x_val = np.asarray(bundle.x_validation, dtype=np.float64)
+        x_all = np.asarray(bundle.x_all, dtype=np.float64)
+        if theta_train.ndim == 1:
+            theta_train = theta_train.reshape(-1, 1)
+        if theta_val.ndim == 1:
+            theta_val = theta_val.reshape(-1, 1)
+        if theta_all.ndim == 1:
+            theta_all = theta_all.reshape(-1, 1)
+        if theta_train.ndim != 2 or theta_val.ndim != 2 or theta_all.ndim != 2:
+            raise ValueError("pi-nf expects theta arrays to be 1D or 2D.")
+        if x_train.ndim != 2 or x_val.ndim != 2 or x_all.ndim != 2:
+            raise ValueError("pi-nf expects x arrays to be 2D.")
+        if theta_train.shape[0] < 1 or theta_val.shape[0] < 1:
+            raise ValueError("pi-nf requires non-empty train and validation splits.")
+        if theta_train.shape[1] != theta_all.shape[1]:
+            raise ValueError("pi-nf theta dimension mismatch.")
+        latent_dim = int(getattr(args, "pinf_latent_dim", 2))
+        if latent_dim >= int(x_all.shape[1]):
+            raise ValueError(f"--pinf-latent-dim must be < x_dim={int(x_all.shape[1])}; got {latent_dim}.")
+
+        pinf_hidden_dim = int(getattr(args, "pinf_hidden_dim", 128))
+        pinf_transforms = int(getattr(args, "pinf_transforms", 5))
+        model = PiNFModel(
+            theta_dim=int(theta_all.shape[1]),
+            x_dim=int(x_all.shape[1]),
+            latent_dim=latent_dim,
+            hidden_dim=pinf_hidden_dim,
+            transforms=pinf_transforms,
+            min_std=float(getattr(args, "pinf_min_std", 1e-3)),
+        ).to(dev)
+        train_out = train_pi_nf(
+            model=model,
+            theta_train=theta_train,
+            x_train=x_train,
+            theta_val=theta_val,
+            x_val=x_val,
+            device=dev,
+            epochs=int(getattr(args, "pinf_epochs", 2000)),
+            batch_size=int(getattr(args, "pinf_batch_size", 256)),
+            lr=float(getattr(args, "pinf_lr", 1e-3)),
+            weight_decay=float(getattr(args, "pinf_weight_decay", 0.0)),
+            recon_weight=float(getattr(args, "pinf_recon_weight", 1.0)),
+            patience=int(getattr(args, "pinf_early_patience", 300)),
+            min_delta=float(getattr(args, "pinf_early_min_delta", 1e-4)),
+            ema_alpha=float(getattr(args, "pinf_early_ema_alpha", 0.05)),
+            log_every=max(1, int(getattr(args, "log_every", 50))),
+            restore_best=True,
+        )
+        x_mean = np.asarray(train_out["x_mean"], dtype=np.float64)
+        x_std = np.asarray(train_out["x_std"], dtype=np.float64)
+        theta_mean = np.asarray(train_out["theta_mean"], dtype=np.float64)
+        theta_std = np.asarray(train_out["theta_std"], dtype=np.float64)
+        c_matrix, z_all, r_all = compute_pi_nf_c_matrix(
+            model=model,
+            theta_all=theta_all,
+            x_all=x_all,
+            device=dev,
+            x_mean=x_mean,
+            x_std=x_std,
+            theta_mean=theta_mean,
+            theta_std=theta_std,
+            pair_batch_size=int(getattr(args, "pinf_pair_batch_size", 65536)),
+        )
+        delta_l = compute_delta_l_nf(c_matrix)
+        h_sym = symmetrize_nf(compute_h_directed_nf(delta_l))
+        theta_used = theta_all.reshape(-1) if int(theta_all.shape[1]) == 1 else theta_all.copy()
+        diag = pi_nf_diagnostics(z_all=z_all, r_all=r_all, theta_all=theta_all)
+
+        np.savez_compressed(
+            os.path.join(output_dir, "h_matrix_results_theta_cov.npz"),
+            theta_used=np.asarray(theta_used, dtype=np.float64),
+            h_sym=np.asarray(h_sym, dtype=np.float64),
+            c_matrix=np.asarray(c_matrix, dtype=np.float64),
+            delta_l_matrix=np.asarray(delta_l, dtype=np.float64),
+            h_field_method=np.asarray(["pi_nf"], dtype=object),
+            h_eval_scalar_name=np.asarray(["pi_nf_log_p_z_given_theta"], dtype=object),
+            sigma_eval=np.asarray([np.nan], dtype=np.float64),
+            theta_field_method=np.asarray(["pi_nf"], dtype=object),
+            pinf_latent_dim=np.int64(latent_dim),
+            pinf_residual_dim=np.int64(int(x_all.shape[1]) - latent_dim),
+            pinf_hidden_dim=np.int64(pinf_hidden_dim),
+            pinf_transforms=np.int64(pinf_transforms),
+            pinf_recon_weight=np.float64(float(getattr(args, "pinf_recon_weight", 1.0))),
+            pinf_x_mean=np.asarray(x_mean, dtype=np.float64),
+            pinf_x_std=np.asarray(x_std, dtype=np.float64),
+            pinf_theta_mean=np.asarray(theta_mean, dtype=np.float64),
+            pinf_theta_std=np.asarray(theta_std, dtype=np.float64),
+            pinf_z_all=np.asarray(z_all, dtype=np.float64),
+            pinf_r_all=np.asarray(r_all, dtype=np.float64),
+            pinf_z_to_theta_r2=np.float64(diag["pinf_z_to_theta_r2"]),
+            pinf_r_to_theta_r2=np.float64(diag["pinf_r_to_theta_r2"]),
+        )
+        empty = np.asarray([], dtype=np.float64)
+        np.savez_compressed(
+            os.path.join(output_dir, "score_prior_training_losses.npz"),
+            theta_field_method=np.asarray(["pi_nf"], dtype=object),
+            prior_enable=np.bool_(False),
+            score_train_losses=np.asarray(train_out["train_losses"], dtype=np.float64),
+            score_val_losses=np.asarray(train_out["val_losses"], dtype=np.float64),
+            score_val_monitor_losses=np.asarray(train_out["val_ema_losses"], dtype=np.float64),
+            score_nll_train_losses=np.asarray(train_out["train_nll_losses"], dtype=np.float64),
+            score_recon_train_losses=np.asarray(train_out["train_recon_losses"], dtype=np.float64),
+            score_total_train_losses=np.asarray(train_out["train_total_losses"], dtype=np.float64),
+            score_nll_val_losses=np.asarray(train_out["val_nll_losses"], dtype=np.float64),
+            score_recon_val_losses=np.asarray(train_out["val_recon_losses"], dtype=np.float64),
+            score_total_val_losses=np.asarray(train_out["val_total_losses"], dtype=np.float64),
+            score_best_epoch=np.int64(train_out["best_epoch"]),
+            score_stopped_epoch=np.int64(train_out["stopped_epoch"]),
+            score_stopped_early=np.bool_(train_out["stopped_early"]),
+            score_best_val_smooth=np.float64(train_out["best_val_ema"]),
+            score_lr_last=np.float64(train_out.get("lr_last", float("nan"))),
+            pinf_latent_dim=np.int64(latent_dim),
+            pinf_residual_dim=np.int64(int(x_all.shape[1]) - latent_dim),
+            pinf_recon_weight=np.float64(float(getattr(args, "pinf_recon_weight", 1.0))),
+            pinf_z_to_theta_r2=np.float64(diag["pinf_z_to_theta_r2"]),
+            pinf_r_to_theta_r2=np.float64(diag["pinf_r_to_theta_r2"]),
+            score_likelihood_finetune_train_losses=empty,
+            score_likelihood_finetune_val_losses=empty,
+            score_likelihood_finetune_val_monitor_losses=empty,
+            prior_train_losses=empty,
+            prior_val_losses=empty,
+            prior_val_monitor_losses=empty,
+            prior_likelihood_finetune_train_losses=empty,
+            prior_likelihood_finetune_val_losses=empty,
+            prior_likelihood_finetune_val_monitor_losses=empty,
+        )
+        loaded_pinf = SimpleNamespace(
+            h_sym=np.asarray(h_sym, dtype=np.float64),
+            theta_used=np.asarray(theta_used, dtype=np.float64),
+        )
+        return loaded_pinf, np.asarray(x_all, dtype=np.float64), dev
+
+    if tfm == "nf_reduction":
+        dev = require_device(str(getattr(args, "device", "cuda")))
+        os.makedirs(output_dir, exist_ok=True)
+        theta_train = np.asarray(bundle.theta_train, dtype=np.float64)
+        theta_val = np.asarray(bundle.theta_validation, dtype=np.float64)
+        theta_all = np.asarray(bundle.theta_all, dtype=np.float64)
+        x_train = np.asarray(bundle.x_train, dtype=np.float64)
+        x_val = np.asarray(bundle.x_validation, dtype=np.float64)
+        x_all = np.asarray(bundle.x_all, dtype=np.float64)
+        if theta_train.ndim == 1:
+            theta_train = theta_train.reshape(-1, 1)
+        if theta_val.ndim == 1:
+            theta_val = theta_val.reshape(-1, 1)
+        if theta_all.ndim == 1:
+            theta_all = theta_all.reshape(-1, 1)
+        if theta_train.ndim != 2 or theta_val.ndim != 2 or theta_all.ndim != 2:
+            raise ValueError("nf-reduction expects theta arrays to be 1D or 2D.")
+        if x_train.ndim != 2 or x_val.ndim != 2 or x_all.ndim != 2:
+            raise ValueError("nf-reduction expects x arrays to be 2D.")
+        if theta_train.shape[0] < 1 or theta_val.shape[0] < 1:
+            raise ValueError("nf-reduction requires non-empty train and validation splits.")
+        if theta_train.shape[1] != theta_all.shape[1]:
+            raise ValueError("nf-reduction theta dimension mismatch.")
+        latent_dim = int(getattr(args, "nfr_latent_dim", 2))
+        if latent_dim >= int(x_all.shape[1]):
+            raise ValueError(f"--nfr-latent-dim must be < x_dim={int(x_all.shape[1])}; got {latent_dim}.")
+
+        nfr_epochs = int(getattr(args, "nfr_epochs", 2000))
+        nfr_batch_size = int(getattr(args, "nfr_batch_size", 256))
+        nfr_lr = float(getattr(args, "nfr_lr", 1e-3))
+        nfr_hidden_dim = int(getattr(args, "nfr_hidden_dim", 128))
+        nfr_context_dim = int(getattr(args, "nfr_context_dim", 32))
+        nfr_transforms = int(getattr(args, "nfr_transforms", 5))
+        nfr_early_patience = int(getattr(args, "nfr_early_patience", 300))
+        nfr_early_min_delta = float(getattr(args, "nfr_early_min_delta", 1e-4))
+        nfr_early_ema_alpha = float(getattr(args, "nfr_early_ema_alpha", 0.05))
+
+        model = NFReductionModel(
+            theta_dim=int(theta_all.shape[1]),
+            x_dim=int(x_all.shape[1]),
+            latent_dim=latent_dim,
+            hidden_dim=nfr_hidden_dim,
+            transforms=nfr_transforms,
+            context_dim=nfr_context_dim,
+        ).to(dev)
+        train_out = train_nf_reduction(
+            model=model,
+            theta_train=theta_train,
+            x_train=x_train,
+            theta_val=theta_val,
+            x_val=x_val,
+            device=dev,
+            epochs=nfr_epochs,
+            batch_size=nfr_batch_size,
+            lr=nfr_lr,
+            patience=nfr_early_patience,
+            min_delta=nfr_early_min_delta,
+            ema_alpha=nfr_early_ema_alpha,
+            log_every=max(1, int(getattr(args, "log_every", 50))),
+            restore_best=True,
+        )
+        x_mean = np.asarray(train_out["x_mean"], dtype=np.float64)
+        x_std = np.asarray(train_out["x_std"], dtype=np.float64)
+        c_matrix, z_all = compute_nf_reduction_c_matrix(
+            model=model,
+            theta_all=theta_all,
+            x_all=x_all,
+            device=dev,
+            x_mean=x_mean,
+            x_std=x_std,
+            pair_batch_size=int(getattr(args, "nfr_pair_batch_size", 65536)),
+        )
+        delta_l = compute_delta_l_nf(c_matrix)
+        h_sym = symmetrize_nf(compute_h_directed_nf(delta_l))
+        theta_used = theta_all.reshape(-1) if int(theta_all.shape[1]) == 1 else theta_all.copy()
+
+        np.savez_compressed(
+            os.path.join(output_dir, "h_matrix_results_theta_cov.npz"),
+            theta_used=np.asarray(theta_used, dtype=np.float64),
+            h_sym=np.asarray(h_sym, dtype=np.float64),
+            c_matrix=np.asarray(c_matrix, dtype=np.float64),
+            delta_l_matrix=np.asarray(delta_l, dtype=np.float64),
+            h_field_method=np.asarray(["nf_reduction"], dtype=object),
+            h_eval_scalar_name=np.asarray(["nf_reduction_log_p_z_given_theta"], dtype=object),
+            sigma_eval=np.asarray([np.nan], dtype=np.float64),
+            theta_field_method=np.asarray(["nf_reduction"], dtype=object),
+            nfr_latent_dim=np.int64(latent_dim),
+            nfr_residual_dim=np.int64(int(x_all.shape[1]) - latent_dim),
+            nfr_hidden_dim=np.int64(nfr_hidden_dim),
+            nfr_context_dim=np.int64(nfr_context_dim),
+            nfr_transforms=np.int64(nfr_transforms),
+            nfr_x_mean=np.asarray(x_mean, dtype=np.float64),
+            nfr_x_std=np.asarray(x_std, dtype=np.float64),
+            nfr_z_all=np.asarray(z_all, dtype=np.float64),
+        )
+        empty = np.asarray([], dtype=np.float64)
+        np.savez_compressed(
+            os.path.join(output_dir, "score_prior_training_losses.npz"),
+            theta_field_method=np.asarray(["nf_reduction"], dtype=object),
+            prior_enable=np.bool_(False),
+            score_train_losses=np.asarray(train_out["train_losses"], dtype=np.float64),
+            score_val_losses=np.asarray(train_out["val_losses"], dtype=np.float64),
+            score_val_monitor_losses=np.asarray(train_out["val_ema_losses"], dtype=np.float64),
+            score_best_epoch=np.int64(train_out["best_epoch"]),
+            score_stopped_epoch=np.int64(train_out["stopped_epoch"]),
+            score_stopped_early=np.bool_(train_out["stopped_early"]),
+            score_best_val_smooth=np.float64(train_out["best_val_ema"]),
+            score_lr_last=np.float64(train_out.get("lr_last", float("nan"))),
+            nfr_latent_dim=np.int64(latent_dim),
+            nfr_residual_dim=np.int64(int(x_all.shape[1]) - latent_dim),
+            score_likelihood_finetune_train_losses=empty,
+            score_likelihood_finetune_val_losses=empty,
+            score_likelihood_finetune_val_monitor_losses=empty,
+            prior_train_losses=empty,
+            prior_val_losses=empty,
+            prior_val_monitor_losses=empty,
+            prior_likelihood_finetune_train_losses=empty,
+            prior_likelihood_finetune_val_losses=empty,
+            prior_likelihood_finetune_val_monitor_losses=empty,
+        )
+        loaded_nfr = SimpleNamespace(
+            h_sym=np.asarray(h_sym, dtype=np.float64),
+            theta_used=np.asarray(theta_used, dtype=np.float64),
+        )
+        return loaded_nfr, np.asarray(x_all, dtype=np.float64), dev
+
     if tfm == "nf":
         dev = require_device(str(getattr(args, "device", "cuda")))
         os.makedirs(output_dir, exist_ok=True)
@@ -1022,6 +3494,69 @@ def _estimate_one(
         )
         return loaded_nf, np.asarray(x_all, dtype=np.float64), dev
 
+    flow_ae_norm = _normalize_flow_autoencoder_method(tfm)
+    if flow_ae_norm is not None:
+        base_method = _base_flow_method_for_autoencoder(flow_ae_norm)
+        dev = require_device(str(getattr(args, "device", "cuda")))
+        os.makedirs(output_dir, exist_ok=True)
+        encoded_bundle, ae_train_out, ae_latent_dim = _train_autoencoder_and_encode_bundle(
+            args=args,
+            bundle=bundle,
+            device=dev,
+        )
+        if flow_ae_norm == "theta_flow_autoencoder" and ae_latent_dim < 2:
+            raise ValueError("theta-flow-autoencoder requires --gn-ae-latent-dim >= 2 for theta-flow conditioning.")
+        d = vars(args).copy()
+        d.setdefault("h_matrix_npz", None)
+        d.setdefault("h_only", False)
+        args2 = argparse.Namespace(**d)
+        args2.theta_field_method = base_method
+        args2.output_dir = output_dir
+        full_args = _make_full_args(args2, meta)
+        setattr(full_args, "theta_field_method", base_method)
+        setattr(full_args, "x_dim", int(ae_latent_dim))
+        ctx = _run_ctx_for_bundle(args2, meta, encoded_bundle, full_args, n_bins)
+        vhb.run_h_estimation_if_needed(ctx)
+
+        h_path = os.path.join(output_dir, _h_matrix_results_npz_basename(dataset_family=str(meta.get("dataset_family", ""))))
+        if not os.path.exists(h_path):
+            h_path = os.path.join(output_dir, "h_matrix_results_theta_cov.npz")
+        if base_method == "theta_flow":
+            eval_name = "theta_flow_autoencoder_log_ratio_theta_given_z"
+        else:
+            eval_name = "x_flow_autoencoder_log_p_z_given_theta"
+        _rewrite_npz_fields(
+            h_path,
+            h_field_method=np.asarray([flow_ae_norm], dtype=object),
+            h_eval_scalar_name=np.asarray([eval_name], dtype=object),
+            autoencoder_enabled=np.bool_(True),
+            ae_latent_dim=np.int64(ae_latent_dim),
+            ae_reconstruction_val_loss=np.float64(ae_train_out["best_val_loss"]),
+        )
+        loss_path = os.path.join(output_dir, "score_prior_training_losses.npz")
+        _rewrite_npz_fields(
+            loss_path,
+            theta_field_method=np.asarray([flow_ae_norm], dtype=object),
+            ae_train_losses=np.asarray(ae_train_out["train_losses"], dtype=np.float64),
+            ae_val_losses=np.asarray(ae_train_out["val_losses"], dtype=np.float64),
+            ae_val_monitor_losses=np.asarray(ae_train_out["val_monitor_losses"], dtype=np.float64),
+            ae_best_epoch=np.int64(ae_train_out["best_epoch"]),
+            ae_stopped_epoch=np.int64(ae_train_out["stopped_epoch"]),
+            ae_stopped_early=np.bool_(ae_train_out["stopped_early"]),
+            ae_latent_dim=np.int64(ae_latent_dim),
+        )
+        loaded = vhb.load_h_matrix(ctx)
+        theta_chk = vhb.theta_for_h_matrix_alignment(ctx.bundle, ctx.full_args)
+        if theta_chk.shape[0] != loaded.theta_used.shape[0]:
+            raise ValueError(
+                f"theta/H row mismatch: theta_chk={theta_chk.shape[0]} theta_used={loaded.theta_used.shape[0]}"
+            )
+        if not np.allclose(theta_chk, loaded.theta_used, rtol=0.0, atol=1e-5):
+            raise ValueError(
+                "theta_used from H-matrix npz does not match expected dataset rows for this h_field_method."
+            )
+        return loaded, np.asarray(bundle.x_all, dtype=np.float64), dev
+
     d = vars(args).copy()
     d.setdefault("h_matrix_npz", None)
     d.setdefault("h_only", False)
@@ -1098,20 +3633,44 @@ def _model_posterior_log_weights_for_fixed_x(
 ) -> tuple[np.ndarray, str]:
     c = np.asarray(c_row, dtype=np.float64).reshape(-1)
     method = str(hfm).strip().lower()
-    if method == "theta_flow":
+    if method in ("theta_flow", "theta_flow_autoencoder"):
         log_post = _npz_row_or_vector(h_npz, "theta_flow_log_post_matrix", row=int(row), n=c.size)
         if log_post is not None:
-            return log_post, "learned posterior log-density"
+            suffix = " over encoded z" if method == "theta_flow_autoencoder" else ""
+            return log_post, f"learned posterior log-density{suffix}"
         log_prior = _npz_row_or_vector(h_npz, "theta_flow_log_prior_matrix", row=int(row), n=c.size)
         if log_prior is not None:
-            return c + log_prior, "ratio + learned prior log-density"
+            suffix = " over encoded z" if method == "theta_flow_autoencoder" else ""
+            return c + log_prior, f"ratio + learned prior log-density{suffix}"
         print(
             "[convergence] fixed-x diagnostic: theta_flow artifact lacks learned posterior/prior "
             "log-density fields; using ratio row as a uniform-prior fallback.",
             flush=True,
         )
         return c, "ratio-only fallback"
-    return c, "posterior log-density" if method == "nf" else "matrix row"
+    if method == "nf":
+        return c, "posterior log-density"
+    if method == "nf_reduction":
+        return c, r"NF-reduction log $p(z|\theta)$"
+    if method == "gmm_z_decode":
+        return c, r"GMM-z-decode log $q(\theta|z)$"
+    if method == "pi_nf":
+        return c, r"pi-NF log $p(z|\theta)$"
+    if method == "gaussian_network":
+        return c, r"Gaussian-network log $p(x|\theta)$"
+    if method == "gaussian_network_diagonal":
+        return c, r"Gaussian-network diagonal log $p(x|\theta)$"
+    if method == "gaussian_network_low_rank":
+        return c, r"Gaussian-network low-rank log $p(x|\theta)$"
+    if method == "gaussian_network_autoencoder":
+        return c, r"Gaussian-network AE log $p(z|\theta)$"
+    if method == "gaussian_network_diagonal_autoencoder":
+        return c, r"Gaussian-network diagonal AE log $p(z|\theta)$"
+    if method == "gaussian_x_flow":
+        return c, r"Gaussian X-flow log $p(x|\theta)$"
+    if method == "gaussian_x_flow_diagonal":
+        return c, r"Gaussian X-flow (diagonal cov.) log $p(x|\theta)$"
+    return c, "matrix row"
 
 
 def _normalize_density_trapz(theta_grid: np.ndarray, density: np.ndarray) -> np.ndarray:
@@ -1164,6 +3723,18 @@ def _weighted_kde_density(
     return _normalize_density_trapz(td, q)
 
 
+def _obs_dim_matches_generative_likelihood(x_fixed: np.ndarray, dataset: Any) -> bool:
+    """True iff ``x_fixed`` can be evaluated under ``dataset.log_p_x_given_theta``.
+
+    PR-embedded NPZs store observations in ``h_dim`` while :func:`build_dataset_from_meta`
+    builds the toy likelihood in ``generative_x_dim_from_meta`` (e.g. z-space). Fixed-$x$
+    GT posterior curves require the same dimension as that likelihood.
+    """
+    obs = int(np.asarray(x_fixed, dtype=np.float64).reshape(-1).size)
+    gen = int(getattr(dataset, "x_dim", obs))
+    return obs == gen
+
+
 def _approx_gt_posterior_density(
     *,
     dataset: Any,
@@ -1171,8 +3742,10 @@ def _approx_gt_posterior_density(
     theta_dense: np.ndarray,
     theta_low: float,
     theta_high: float,
-) -> np.ndarray:
+) -> np.ndarray | None:
     td = np.asarray(theta_dense, dtype=np.float64).reshape(-1)
+    if not _obs_dim_matches_generative_likelihood(x_fixed, dataset):
+        return None
     x1 = np.asarray(x_fixed, dtype=np.float64).reshape(1, -1)
     if td.size < 2:
         return np.zeros_like(td, dtype=np.float64)
@@ -1247,21 +3820,26 @@ def _plot_fixed_x_column(
     ax_top.fill_between(th_s, 0.0, w_s, color="#1f77b4", alpha=0.22, step="mid")
     ax_top.plot(th_s, w_s, "o", color="#1f77b4", ms=2, alpha=0.55, label="Posterior mass on θ samples")
     ax_top.plot(th_grid, q_model, color="#1f77b4", lw=1.6, label=f"Model posterior (approx; {logp_source})")
-    ax_top.plot(th_grid, q_gt, color="#d62728", lw=1.5, ls="--", label="GT posterior (approx)")
+    if q_gt is not None:
+        ax_top.plot(th_grid, q_gt, color="#d62728", lw=1.5, ls="--", label="GT posterior (approx)")
     ax_top.set_ylabel("density")
     ax_top.set_title(
         f"Fixed-$x$ posterior diagnostics  (row $i$={int(i_fix)},  method={hfm})",
         fontsize=9,
     )
     ax_top.legend(loc="upper right", fontsize=7)
+    ann = f"x[0]={x0:.3g}  ||x||={xn:.3g}  theta_map={theta_map:.3g}"
+    if q_gt is None:
+        ann += "  (GT posterior n/a: embedded obs. dim ≠ generative likelihood dim)"
     ax_top.annotate(
-        f"x[0]={x0:.3g}  ||x||={xn:.3g}  theta_map={theta_map:.3g}",
+        ann,
         xy=(0.5, 1.12),
         xycoords="axes fraction",
         ha="center",
         fontsize=7,
     )
 
+    gen_match = _obs_dim_matches_generative_likelihood(x_fixed, dataset)
     d_dim = int(mu.shape[1]) if mu.ndim == 2 else 1
     d_plot = int(min(3, max(d_dim, 1)))
     for dd in range(d_plot):
@@ -1274,7 +3852,7 @@ def _plot_fixed_x_column(
             lw=1.0,
             label=fr"GT $\mu_{{{dd}}}(\theta)$" if d_plot > 1 else r"GT $\mu_0(\theta)$ (1st dim)",
         )
-        if dd < int(x_fixed.size):
+        if gen_match and dd < int(x_fixed.size):
             x_dd = float(x_fixed[dd])
             ax_bot.axhline(
                 x_dd,
@@ -1561,6 +4139,9 @@ def _load_per_n_training_loss_npz(path: str) -> dict[str, Any]:
         "prior_likelihood_finetune_train_losses": _arr("prior_likelihood_finetune_train_losses"),
         "prior_likelihood_finetune_val_losses": _arr("prior_likelihood_finetune_val_losses"),
         "prior_likelihood_finetune_val_monitor_losses": _arr("prior_likelihood_finetune_val_monitor_losses"),
+        "gn_pretrain_train_losses": _arr("gn_pretrain_train_losses"),
+        "gn_pretrain_val_losses": _arr("gn_pretrain_val_losses"),
+        "gn_pretrain_val_monitor_losses": _arr("gn_pretrain_val_monitor_losses"),
     }
 
 
@@ -1593,6 +4174,31 @@ def _loss_dir_has_any_likelihood_finetune(ns: list[int], loss_dir: str) -> bool:
         except Exception:
             continue
         if _bundle_has_any_likelihood_finetune(bundle):
+            return True
+    return False
+
+
+def _bundle_has_gn_pretrain(bundle: dict[str, Any]) -> bool:
+    """True if Gaussian-network MLE pretrain curves were saved (contrastive-soft-GN family)."""
+    for k in ("gn_pretrain_train_losses", "gn_pretrain_val_losses", "gn_pretrain_val_monitor_losses"):
+        a = bundle.get(k)
+        if a is None:
+            continue
+        if np.asarray(a, dtype=np.float64).size > 0:
+            return True
+    return False
+
+
+def _loss_dir_has_gn_pretrain(ns: list[int], loss_dir: str) -> bool:
+    for n in ns:
+        path = os.path.join(loss_dir, f"n_{int(n):06d}.npz")
+        if not os.path.isfile(path):
+            continue
+        try:
+            bundle = _load_per_n_training_loss_npz(path)
+        except Exception:
+            continue
+        if _bundle_has_gn_pretrain(bundle):
             return True
     return False
 
@@ -1698,14 +4304,38 @@ def _render_training_losses_panel(
         tfm = str(bundle.get("theta_field_method", "theta_flow")).strip().lower()
         if tfm == "theta_flow":
             post_lab = "theta-flow ODE Bayes-ratio"
+        elif tfm == "theta_flow_autoencoder":
+            post_lab = "theta-flow AE Bayes-ratio"
         elif tfm == "theta_path_integral":
             post_lab = "theta-path-integral score"
         elif tfm == "x_flow":
             post_lab = "x-flow direct likelihood"
+        elif tfm == "x_flow_autoencoder":
+            post_lab = "x-flow AE likelihood"
         elif tfm == "ctsm_v":
             post_lab = "pair-conditioned CTSM-v"
         elif tfm == "nf":
             post_lab = "normalizing-flow posterior"
+        elif tfm == "nf_reduction":
+            post_lab = "NF-reduction z likelihood"
+        elif tfm == "gmm_z_decode":
+            post_lab = "GMM-z-decode posterior NLL"
+        elif tfm == "pi_nf":
+            post_lab = "pi-NF exact NLL"
+        elif tfm == "gaussian_network":
+            post_lab = "gaussian-network likelihood"
+        elif tfm == "gaussian_network_diagonal":
+            post_lab = "gaussian-network diagonal likelihood"
+        elif tfm == "gaussian_network_low_rank":
+            post_lab = "gaussian-network low-rank likelihood"
+        elif tfm == "gaussian_network_autoencoder":
+            post_lab = "gaussian-network AE likelihood"
+        elif tfm == "gaussian_network_diagonal_autoencoder":
+            post_lab = "gaussian-network diagonal AE likelihood"
+        elif tfm == "gaussian_x_flow":
+            post_lab = "gaussian-x-flow FM likelihood"
+        elif tfm == "gaussian_x_flow_diagonal":
+            post_lab = "gaussian-x-flow-diagonal FM likelihood"
         else:
             post_lab = tfm
         _plot_loss_triplet(
@@ -1821,6 +4451,93 @@ def _render_training_losses_panel(
             fontsize=11,
             y=1.02,
         )
+    fig.tight_layout()
+    svg = _save_figure_png_svg(fig, out_png_path, dpi=dpi)
+    plt.close(fig)
+    return svg
+
+
+def _render_gn_pretrain_losses_panel(
+    *,
+    ns: list[int],
+    loss_dir: str,
+    out_png_path: str,
+    dpi: int = 160,
+) -> str:
+    """Gaussian-network MLE pretrain NLL vs epoch (separate from main training-loss panel)."""
+    n_cols = len(ns)
+    if n_cols < 1:
+        raise ValueError("n-list must be non-empty for GN pretrain loss panel.")
+    w = max(2.6 * n_cols, 6.0)
+    h = 3.4
+    fig, axes = plt.subplots(1, n_cols, figsize=(w, h), squeeze=False)
+
+    for j, n in enumerate(ns):
+        path = os.path.join(loss_dir, f"n_{int(n):06d}.npz")
+        ax = axes[0, j]
+        if not os.path.isfile(path):
+            ax.text(
+                0.5,
+                0.5,
+                f"missing\n{path}",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+                fontsize=8,
+                color="crimson",
+            )
+            ax.set_axis_off()
+            continue
+        try:
+            bundle = _load_per_n_training_loss_npz(path)
+        except Exception as e:
+            ax.text(
+                0.5,
+                0.5,
+                f"load error:\n{e!s}"[:200],
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+                fontsize=7,
+                color="crimson",
+            )
+            ax.set_axis_off()
+            continue
+
+        tr = np.asarray(bundle.get("gn_pretrain_train_losses", []), dtype=np.float64).ravel()
+        va = np.asarray(bundle.get("gn_pretrain_val_losses", []), dtype=np.float64).ravel()
+        ema = np.asarray(bundle.get("gn_pretrain_val_monitor_losses", []), dtype=np.float64).ravel()
+        if tr.size == 0 and va.size == 0 and ema.size == 0:
+            ax.text(
+                0.5,
+                0.5,
+                "no gn_pretrain\nloss arrays",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+                fontsize=9,
+                color="#555555",
+            )
+            ax.set_axis_off()
+            continue
+
+        _plot_loss_triplet(
+            ax,
+            tr,
+            va,
+            ema,
+            ylabel="NLL" if j == 0 else "",
+            title=f"n={n} (GN MLE pretrain)",
+            show_legend=(j == 0),
+            score_like=True,
+        )
+
+    fig.suptitle(
+        "Gaussian-network pretraining loss vs epoch (train/val/val EMA). "
+        "Columns: nested subset sizes n.",
+        fontsize=11,
+        y=1.02,
+    )
     fig.tight_layout()
     svg = _save_figure_png_svg(fig, out_png_path, dpi=dpi)
     plt.close(fig)
@@ -2006,14 +4723,38 @@ def _save_combined_convergence_figure(
         tfm = str(bundle.get("theta_field_method", "theta_flow")).strip().lower()
         if tfm == "theta_flow":
             post_lab = "theta-flow ODE Bayes-ratio"
+        elif tfm == "theta_flow_autoencoder":
+            post_lab = "theta-flow AE Bayes-ratio"
         elif tfm == "theta_path_integral":
             post_lab = "theta-path-integral score"
         elif tfm == "x_flow":
             post_lab = "x-flow direct likelihood"
+        elif tfm == "x_flow_autoencoder":
+            post_lab = "x-flow AE likelihood"
         elif tfm == "ctsm_v":
             post_lab = "pair-conditioned CTSM-v"
         elif tfm == "nf":
             post_lab = "normalizing-flow posterior"
+        elif tfm == "nf_reduction":
+            post_lab = "NF-reduction z likelihood"
+        elif tfm == "gmm_z_decode":
+            post_lab = "GMM-z-decode posterior NLL"
+        elif tfm == "pi_nf":
+            post_lab = "pi-NF exact NLL"
+        elif tfm == "gaussian_network":
+            post_lab = "gaussian-network likelihood"
+        elif tfm == "gaussian_network_diagonal":
+            post_lab = "gaussian-network diagonal likelihood"
+        elif tfm == "gaussian_network_low_rank":
+            post_lab = "gaussian-network low-rank likelihood"
+        elif tfm == "gaussian_network_autoencoder":
+            post_lab = "gaussian-network AE likelihood"
+        elif tfm == "gaussian_network_diagonal_autoencoder":
+            post_lab = "gaussian-network diagonal AE likelihood"
+        elif tfm == "gaussian_x_flow":
+            post_lab = "gaussian-x-flow FM likelihood"
+        elif tfm == "gaussian_x_flow_diagonal":
+            post_lab = "gaussian-x-flow-diagonal FM likelihood"
         else:
             post_lab = tfm
         _plot_loss_triplet(
@@ -2416,6 +5157,90 @@ def _write_summary(
         f.write(f"num_theta_bins: {args.num_theta_bins}\n")
         f.write(f"theta_flow_onehot_state: {bool(getattr(args, 'theta_flow_onehot_state', False))}\n")
         f.write(f"theta_flow_fourier_state: {bool(getattr(args, 'theta_flow_fourier_state', False))}\n")
+        if str(getattr(args, "theta_field_method", "")).strip().lower() in (
+            "gaussian_network",
+            "gaussian_network_diagonal",
+            "gaussian_network_low_rank",
+            "gaussian_network_autoencoder",
+            "gaussian_network_diagonal_autoencoder",
+        ):
+            f.write(f"gn_epochs: {int(getattr(args, 'gn_epochs', 0))}\n")
+            f.write(f"gn_batch_size: {int(getattr(args, 'gn_batch_size', 0))}\n")
+            f.write(f"gn_lr: {float(getattr(args, 'gn_lr', 0.0))}\n")
+            f.write(f"gn_hidden_dim: {int(getattr(args, 'gn_hidden_dim', 0))}\n")
+            f.write(f"gn_depth: {int(getattr(args, 'gn_depth', 0))}\n")
+            f.write(f"gn_diag_floor: {float(getattr(args, 'gn_diag_floor', 0.0))}\n")
+            f.write(f"gn_low_rank_dim: {int(getattr(args, 'gn_low_rank_dim', 0))}\n")
+            f.write(f"gn_psi_floor: {float(getattr(args, 'gn_psi_floor', 0.0))}\n")
+            f.write(f"gn_early_patience: {int(getattr(args, 'gn_early_patience', 0))}\n")
+            if str(getattr(args, "theta_field_method", "")).strip().lower() in (
+                "gaussian_network_autoencoder",
+                "gaussian_network_diagonal_autoencoder",
+            ):
+                f.write(f"gn_ae_latent_dim: {getattr(args, 'gn_ae_latent_dim', None)}\n")
+                f.write(f"gn_ae_epochs: {int(getattr(args, 'gn_ae_epochs', 0))}\n")
+                f.write(f"gn_ae_batch_size: {int(getattr(args, 'gn_ae_batch_size', 0))}\n")
+                f.write(f"gn_ae_lr: {float(getattr(args, 'gn_ae_lr', 0.0))}\n")
+                f.write(f"gn_ae_hidden_dim: {int(getattr(args, 'gn_ae_hidden_dim', 0))}\n")
+                f.write(f"gn_ae_depth: {int(getattr(args, 'gn_ae_depth', 0))}\n")
+                f.write(f"gn_ae_early_patience: {int(getattr(args, 'gn_ae_early_patience', 0))}\n")
+        _tfm_sum = str(getattr(args, "theta_field_method", "")).strip().lower()
+        if _tfm_sum in ("gaussian_x_flow", "gaussian_x_flow_diagonal"):
+            f.write(f"gxf_epochs: {int(getattr(args, 'gxf_epochs', 0))}\n")
+            f.write(f"gxf_batch_size: {int(getattr(args, 'gxf_batch_size', 0))}\n")
+            f.write(f"gxf_lr: {float(getattr(args, 'gxf_lr', 0.0))}\n")
+            f.write(f"gxf_hidden_dim: {int(getattr(args, 'gxf_hidden_dim', 0))}\n")
+            f.write(f"gxf_depth: {int(getattr(args, 'gxf_depth', 0))}\n")
+            f.write(f"gxf_weight_decay: {float(getattr(args, 'gxf_weight_decay', 0.0))}\n")
+            f.write(f"gxf_diag_floor: {float(getattr(args, 'gxf_diag_floor', 0.0))}\n")
+            f.write(f"gxf_cov_jitter: {float(getattr(args, 'gxf_cov_jitter', 0.0))}\n")
+            f.write(f"gxf_t_eps: {float(getattr(args, 'gxf_t_eps', 0.0))}\n")
+            f.write(f"gxf_path_schedule: {getattr(args, 'gxf_path_schedule', '')}\n")
+            f.write(f"gxf_early_patience: {int(getattr(args, 'gxf_early_patience', 0))}\n")
+            f.write(f"gxf_pair_batch_size: {int(getattr(args, 'gxf_pair_batch_size', 0))}\n")
+            f.write(f"gxf_diagonal_covariance: {_tfm_sum == 'gaussian_x_flow_diagonal'}\n")
+        if _tfm_sum == "nf_reduction":
+            f.write(f"nfr_latent_dim: {int(getattr(args, 'nfr_latent_dim', 0))}\n")
+            f.write(f"nfr_epochs: {int(getattr(args, 'nfr_epochs', 0))}\n")
+            f.write(f"nfr_batch_size: {int(getattr(args, 'nfr_batch_size', 0))}\n")
+            f.write(f"nfr_lr: {float(getattr(args, 'nfr_lr', 0.0))}\n")
+            f.write(f"nfr_hidden_dim: {int(getattr(args, 'nfr_hidden_dim', 0))}\n")
+            f.write(f"nfr_context_dim: {int(getattr(args, 'nfr_context_dim', 0))}\n")
+            f.write(f"nfr_transforms: {int(getattr(args, 'nfr_transforms', 0))}\n")
+            f.write(f"nfr_early_patience: {int(getattr(args, 'nfr_early_patience', 0))}\n")
+            f.write(f"nfr_pair_batch_size: {int(getattr(args, 'nfr_pair_batch_size', 0))}\n")
+        if _tfm_sum == "gmm_z_decode":
+            f.write(f"gzd_latent_dim: {int(getattr(args, 'gzd_latent_dim', 0))}\n")
+            f.write(f"gzd_components: {int(getattr(args, 'gzd_components', 0))}\n")
+            f.write(f"gzd_epochs: {int(getattr(args, 'gzd_epochs', 0))}\n")
+            f.write(f"gzd_batch_size: {int(getattr(args, 'gzd_batch_size', 0))}\n")
+            f.write(f"gzd_lr: {float(getattr(args, 'gzd_lr', 0.0))}\n")
+            f.write(f"gzd_hidden_dim: {int(getattr(args, 'gzd_hidden_dim', 0))}\n")
+            f.write(f"gzd_depth: {int(getattr(args, 'gzd_depth', 0))}\n")
+            f.write(f"gzd_early_patience: {int(getattr(args, 'gzd_early_patience', 0))}\n")
+            f.write(f"gzd_pair_batch_size: {int(getattr(args, 'gzd_pair_batch_size', 0))}\n")
+        if _tfm_sum == "pi_nf":
+            f.write(f"pinf_latent_dim: {int(getattr(args, 'pinf_latent_dim', 0))}\n")
+            f.write(f"pinf_epochs: {int(getattr(args, 'pinf_epochs', 0))}\n")
+            f.write(f"pinf_batch_size: {int(getattr(args, 'pinf_batch_size', 0))}\n")
+            f.write(f"pinf_lr: {float(getattr(args, 'pinf_lr', 0.0))}\n")
+            f.write(f"pinf_hidden_dim: {int(getattr(args, 'pinf_hidden_dim', 0))}\n")
+            f.write(f"pinf_transforms: {int(getattr(args, 'pinf_transforms', 0))}\n")
+            f.write(f"pinf_min_std: {float(getattr(args, 'pinf_min_std', 0.0))}\n")
+            f.write(f"pinf_recon_weight: {float(getattr(args, 'pinf_recon_weight', 1.0))}\n")
+            f.write(f"pinf_early_patience: {int(getattr(args, 'pinf_early_patience', 0))}\n")
+            f.write(f"pinf_pair_batch_size: {int(getattr(args, 'pinf_pair_batch_size', 0))}\n")
+        if str(getattr(args, "theta_field_method", "")).strip().lower() in (
+            "theta_flow_autoencoder",
+            "x_flow_autoencoder",
+        ):
+            f.write(f"gn_ae_latent_dim: {getattr(args, 'gn_ae_latent_dim', None)}\n")
+            f.write(f"gn_ae_epochs: {int(getattr(args, 'gn_ae_epochs', 0))}\n")
+            f.write(f"gn_ae_batch_size: {int(getattr(args, 'gn_ae_batch_size', 0))}\n")
+            f.write(f"gn_ae_lr: {float(getattr(args, 'gn_ae_lr', 0.0))}\n")
+            f.write(f"gn_ae_hidden_dim: {int(getattr(args, 'gn_ae_hidden_dim', 0))}\n")
+            f.write(f"gn_ae_depth: {int(getattr(args, 'gn_ae_depth', 0))}\n")
+            f.write(f"gn_ae_early_patience: {int(getattr(args, 'gn_ae_early_patience', 0))}\n")
         if bool(getattr(args, "theta_flow_fourier_state", False)):
             f.write(f"theta_flow_fourier_k: {int(getattr(args, 'theta_flow_fourier_k', 0))}\n")
             f.write(
@@ -2748,6 +5573,16 @@ def _render_convergence_figures_and_summary(
         dpi=160,
     )
 
+    gn_pretrain_panel_png = os.path.join(args.output_dir, "h_decoding_gn_pretrain_losses_panel.png")
+    gn_pretrain_panel_svg = ""
+    if _loss_dir_has_gn_pretrain(list(ns), loss_dir):
+        gn_pretrain_panel_svg = _render_gn_pretrain_losses_panel(
+            ns=list(ns),
+            loss_dir=loss_dir,
+            out_png_path=gn_pretrain_panel_png,
+            dpi=160,
+        )
+
     summary_path = os.path.join(args.output_dir, "h_decoding_convergence_summary.txt")
     paths_out = {
         "results_npz": out_npz,
@@ -2767,6 +5602,9 @@ def _render_convergence_figures_and_summary(
         "training_losses_dir": loss_dir,
         "training_losses_manifest": manifest_path,
     }
+    if gn_pretrain_panel_svg:
+        paths_out["gn_pretrain_losses_panel"] = gn_pretrain_panel_png
+        paths_out["gn_pretrain_losses_panel_svg"] = gn_pretrain_panel_svg
     if visualization_only:
         paths_out["mode"] = "visualization-only (figures/csv/summary regenerated from cached NPZ)"
     if binned_gaussian_h_cols is not None:
@@ -2829,6 +5667,9 @@ def _render_convergence_figures_and_summary(
     print(f"  - {combined_svg}")
     print(f"  - {loss_panel_png}")
     print(f"  - {loss_panel_svg}")
+    if gn_pretrain_panel_svg:
+        print(f"  - {gn_pretrain_panel_png}")
+        print(f"  - {gn_pretrain_panel_svg}")
     print(f"  - {loss_dir}/ (per-n training loss .npz + manifest.txt)")
     print(f"  - {summary_path}")
 
@@ -2999,6 +5840,8 @@ def main(argv: list[str] | None = None) -> None:
 
     clf_rs = base_seed if int(args.clf_random_state) < 0 else int(args.clf_random_state)
 
+    # Generative GT uses fisher.shared_fisher_est.generative_x_dim_from_meta when meta has PR embedding,
+    # so MC likelihood matches the low-d toy model behind embedded NPZs (not embedded x_dim).
     dataset_for_gt = build_dataset_from_meta(meta)
     gt_seed = base_seed if int(args.gt_hellinger_seed) < 0 else int(args.gt_hellinger_seed)
     if hasattr(dataset_for_gt, "rng"):
@@ -3052,6 +5895,18 @@ def main(argv: list[str] | None = None) -> None:
                 "(log p(theta|x) - log p(theta) via compute_likelihood; no theta-axis score integral).",
                 flush=True,
             )
+    elif tfm == "theta_flow_autoencoder":
+        print(
+            f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
+            f"(flow_arch={getattr(args, 'flow_arch', 'mlp')}; plain AE preprocessing)",
+            flush=True,
+        )
+        print(
+            "[convergence] theta_flow_autoencoder mode trains x->z autoencoder first, "
+            "then uses ODE log-likelihood on theta-space flows conditioned on z "
+            "(log p(theta|z) - log p(theta), or posterior-only if requested).",
+            flush=True,
+        )
     elif tfm == "theta_path_integral":
         print(
             f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
@@ -3072,6 +5927,17 @@ def main(argv: list[str] | None = None) -> None:
         print(
             "[convergence] x_flow mode uses ODE likelihood on x-space flow log p(x|theta) "
             "(no prior model).",
+            flush=True,
+        )
+    elif tfm == "x_flow_autoencoder":
+        print(
+            f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
+            f"(flow_arch={getattr(args, 'flow_arch', 'mlp')}; conditional latent z-flow only)",
+            flush=True,
+        )
+        print(
+            "[convergence] x_flow_autoencoder mode trains x->z autoencoder first, "
+            "uses ODE likelihood log p(z|theta), then DeltaL=C-diag(C), and H via 1-sech(DeltaL/2).",
             flush=True,
         )
     elif tfm == "ctsm_v":
@@ -3096,10 +5962,207 @@ def main(argv: list[str] | None = None) -> None:
             "forms R=C_post-log p(theta_j), then DeltaL=R-diag(R), and H via 1-sech(DeltaL/2).",
             flush=True,
         )
+    elif tfm == "contrastive":
+        print(
+            f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
+            f"(hidden_dim={int(getattr(args, 'contrastive_hidden_dim', 128))}; "
+            f"depth={int(getattr(args, 'contrastive_depth', 3))}; "
+            f"theta_encoding={str(getattr(args, 'contrastive_theta_encoding', 'one_hot_bin'))}; "
+            f"theta bins={int(args.num_theta_bins)}; identity x embedding)",
+            flush=True,
+        )
+        print(
+            "[convergence] contrastive mode trains scalar S(x,encode(bin(theta))) with row-wise shuffled-batch cross entropy, "
+            "then uses C[i,j]=S(x_i,theta_j), DeltaL=C-diag(C), and one-sided H^2 from exp(DeltaL/2).",
+            flush=True,
+        )
+    elif tfm == "contrastive_soft":
+        print(
+            f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
+            f"(score_arch={str(getattr(args, 'contrastive_soft_score_arch', 'normalized_dot'))}; "
+            f"dot_dim={int(getattr(args, 'contrastive_soft_dot_dim', 64))}; "
+            f"coord_embed_dim={int(getattr(args, 'contrastive_soft_coordinate_embed_dim', 16))}; "
+            f"gaussian_logvar=[{float(getattr(args, 'contrastive_soft_gaussian_logvar_min', -8.0)):g},"
+            f"{float(getattr(args, 'contrastive_soft_gaussian_logvar_max', 5.0)):g}]; "
+            f"hidden_dim={int(getattr(args, 'contrastive_hidden_dim', 128))}; "
+            f"depth={int(getattr(args, 'contrastive_depth', 3))}; "
+            f"bandwidth={float(getattr(args, 'contrastive_soft_bandwidth', 1.0)):g}; "
+            f"bandwidth_start={float(getattr(args, 'contrastive_soft_bandwidth_start', 0.0)):g}; "
+            f"bandwidth_end={float(getattr(args, 'contrastive_soft_bandwidth_end', 0.0)):g}; "
+            f"bandwidth_k={int(getattr(args, 'contrastive_soft_bandwidth_k', 5))}; "
+            f"periodic={bool(getattr(args, 'contrastive_soft_periodic', False))}; identity x embedding)",
+            flush=True,
+        )
+        print(
+            "[convergence] contrastive_soft mode trains scalar S(x,theta) with Gaussian-kernel soft positives "
+            "over shuffled minibatch theta candidates, then uses C[i,j]=S(x_i,theta_j), DeltaL=C-diag(C), "
+            "and one-sided H^2 from exp(DeltaL/2).",
+            flush=True,
+        )
+    elif tfm == "bidir_contrastive_soft":
+        _bidir_sa = str(getattr(args, "contrastive_soft_score_arch", "normalized_dot"))
+        print(
+            f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
+            f"(score_arch={_bidir_sa}; dot_dim={int(getattr(args, 'contrastive_soft_dot_dim', 64))}; "
+            f"hidden_dim={int(getattr(args, 'contrastive_hidden_dim', 128))}; "
+            f"depth={int(getattr(args, 'contrastive_depth', 3))}; "
+            f"bandwidth={float(getattr(args, 'contrastive_soft_bandwidth', 1.0)):g}; "
+            f"bandwidth_start={float(getattr(args, 'contrastive_soft_bandwidth_start', 0.0)):g}; "
+            f"bandwidth_end={float(getattr(args, 'contrastive_soft_bandwidth_end', 0.0)):g}; "
+            f"bandwidth_k={int(getattr(args, 'contrastive_soft_bandwidth_k', 5))}; "
+            f"periodic={bool(getattr(args, 'contrastive_soft_periodic', False))})",
+            flush=True,
+        )
+        if _bidir_sa == "mlp":
+            print(
+                "[convergence] bidir_contrastive_soft mode trains joint MLP S(x,theta) "
+                "with 0.5 row soft CE + 0.5 column soft CE over Gaussian-kernel theta targets.",
+                flush=True,
+            )
+        else:
+            print(
+                "[convergence] bidir_contrastive_soft mode trains S(x,theta)=alpha cos(g(x),a(theta))+b(theta) "
+                "with 0.5 row soft CE + 0.5 column soft CE over Gaussian-kernel theta targets.",
+                flush=True,
+            )
+    elif tfm == "contrastive_soft_gaussian_net":
+        print(
+            f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
+            f"(gn_hidden_dim={int(getattr(args, 'gn_hidden_dim', 128))}; "
+            f"gn_depth={int(getattr(args, 'gn_depth', 3))}; "
+            f"gn_diag_floor={float(getattr(args, 'gn_diag_floor', 1e-4)):g}; "
+            f"contrastive_hidden_dim={int(getattr(args, 'contrastive_hidden_dim', 128))}; "
+            f"bandwidth={float(getattr(args, 'contrastive_soft_bandwidth', 1.0)):g}; "
+            f"bandwidth_start={float(getattr(args, 'contrastive_soft_bandwidth_start', 0.0)):g}; "
+            f"bandwidth_end={float(getattr(args, 'contrastive_soft_bandwidth_end', 0.0)):g}; "
+            f"bandwidth_k={int(getattr(args, 'contrastive_soft_bandwidth_k', 5))}; "
+            f"periodic={bool(getattr(args, 'contrastive_soft_periodic', False))}; identity x embedding)",
+            flush=True,
+        )
+        print(
+            "[convergence] contrastive_soft_gaussian_net mode first trains a diagonal Gaussian "
+            "log p(x|theta) by MLE, then fine-tunes the same scalar Gaussian score with "
+            "Gaussian-kernel soft contrastive positives over shuffled minibatch theta candidates.",
+            flush=True,
+        )
+    elif tfm == "contrastive_soft_gaussian_net_no_finetune":
+        print(
+            f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
+            f"(gn_hidden_dim={int(getattr(args, 'gn_hidden_dim', 128))}; "
+            f"gn_depth={int(getattr(args, 'gn_depth', 3))}; "
+            f"gn_diag_floor={float(getattr(args, 'gn_diag_floor', 1e-4)):g}; "
+            f"bandwidth={float(getattr(args, 'contrastive_soft_bandwidth', 1.0)):g}; "
+            f"bandwidth_start={float(getattr(args, 'contrastive_soft_bandwidth_start', 0.0)):g}; "
+            f"bandwidth_end={float(getattr(args, 'contrastive_soft_bandwidth_end', 0.0)):g}; "
+            f"bandwidth_k={int(getattr(args, 'contrastive_soft_bandwidth_k', 5))}; "
+            f"periodic={bool(getattr(args, 'contrastive_soft_periodic', False))})",
+            flush=True,
+        )
+        print(
+            "[convergence] contrastive_soft_gaussian_net_no_finetune mode trains a diagonal Gaussian "
+            "log p(x|theta) by MLE only, then evaluates C[i,j]=log p(x_i|theta_j) without soft-contrastive fine-tuning.",
+            flush=True,
+        )
+    elif tfm == "nf_reduction":
+        print(
+            f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
+            f"(latent_dim={int(getattr(args, 'nfr_latent_dim', 2))}; invertible x->(z,epsilon) reduction)",
+            flush=True,
+        )
+        print(
+            "[convergence] nf_reduction mode trains an invertible x-space NSF and conditional z-flow, "
+            "then uses C[i,j]=log p(z_i|theta_j), DeltaL=C-diag(C), and H via 1-sech(DeltaL/2).",
+            flush=True,
+        )
+    elif tfm == "pi_nf":
+        print(
+            f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
+            f"(latent_dim={int(getattr(args, 'pinf_latent_dim', 2))}; diagonal Gaussian p(z|theta); "
+            f"recon_weight={float(getattr(args, 'pinf_recon_weight', 1.0)):g})",
+            flush=True,
+        )
+        print(
+            "[convergence] pi_nf mode trains an invertible x->(z,r) NSF with p(z|theta) diagonal Gaussian and r~N(0,I), "
+            "then uses C[i,j]=log p(z_i|theta_j), DeltaL=C-diag(C), and H via 1-sech(DeltaL/2).",
+            flush=True,
+        )
+    elif tfm == "gmm_z_decode":
+        print(
+            f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
+            f"(latent_dim={int(getattr(args, 'gzd_latent_dim', 2))}; components={int(getattr(args, 'gzd_components', 5))})",
+            flush=True,
+        )
+        print(
+            "[convergence] gmm_z_decode mode trains z=E(x) and q(theta|z), "
+            "then uses C[i,j]=log q(theta_j|z_i), DeltaL=C-diag(C), and H via 1-sech(DeltaL/2).",
+            flush=True,
+        )
+    elif tfm == "gaussian_x_flow":
+        print(
+            f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
+            f"(path_schedule={str(getattr(args, 'gxf_path_schedule', 'linear'))}; full covariance Cholesky FM)",
+            flush=True,
+        )
+        print(
+            "[convergence] gaussian_x_flow mode trains μ(θ) and full covariance Cholesky L(θ) with analytic FM velocity, "
+            "then uses C[i,j]=log p(x_i|theta_j), DeltaL=C-diag(C), and H via 1-sech(DeltaL/2).",
+            flush=True,
+        )
+    elif tfm == "gaussian_x_flow_diagonal":
+        print(
+            f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
+            f"(path_schedule={str(getattr(args, 'gxf_path_schedule', 'linear'))}; diagonal covariance FM)",
+            flush=True,
+        )
+        print(
+            "[convergence] gaussian_x_flow_diagonal mode trains μ(θ) and diagonal covariance Cholesky L(θ) with analytic FM velocity, "
+            "then uses C[i,j]=log p(x_i|theta_j), DeltaL=C-diag(C), and H via 1-sech(DeltaL/2).",
+            flush=True,
+        )
+    elif tfm in (
+        "gaussian_network",
+        "gaussian_network_diagonal",
+        "gaussian_network_low_rank",
+        "gaussian_network_autoencoder",
+        "gaussian_network_diagonal_autoencoder",
+    ):
+        if tfm == "gaussian_network_diagonal":
+            desc = " diagonal precision"
+            detail = "predicts mean and diagonal precision Cholesky factor L(theta)"
+        elif tfm == "gaussian_network_low_rank":
+            desc = " low-rank covariance"
+            detail = "predicts high-dimensional mean and latent covariance Cholesky factor L(theta), with learned A and Psi"
+        elif tfm == "gaussian_network_autoencoder":
+            desc = " autoencoder"
+            detail = "trains a plain x autoencoder first, then predicts latent mean and precision Cholesky factor L(theta)"
+        elif tfm == "gaussian_network_diagonal_autoencoder":
+            desc = " diagonal autoencoder"
+            detail = "trains a plain x autoencoder first, then predicts latent mean and diagonal precision Cholesky factor L(theta)"
+        else:
+            desc = ""
+            detail = "predicts mean and precision Cholesky factor L(theta)"
+        c_detail = (
+            "uses C[i,j]=log p(z_i|theta_j), then DeltaL=C-diag(C), and H via 1-sech(DeltaL/2)."
+            if "autoencoder" in tfm
+            else "uses C[i,j]=log p(x_i|theta_j), then DeltaL=C-diag(C), and H via 1-sech(DeltaL/2)."
+        )
+        print(
+            f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
+            f"(MLP conditional Gaussian{desc} likelihood)",
+            flush=True,
+        )
+        print(
+            f"[convergence] {tfm} mode {detail}, "
+            f"{c_detail}",
+            flush=True,
+        )
     else:
         raise ValueError(
             f"Unsupported --theta-field-method={tfm!r}; use "
-            "theta_flow, theta_path_integral, x_flow, ctsm_v, or nf."
+            "theta_flow, theta-flow-autoencoder, theta_path_integral, x_flow, x-flow-autoencoder, "
+            "ctsm_v, nf, contrastive, nf-reduction, gaussian-x-flow, gaussian-x-flow-diagonal, gaussian-network, "
+            "gaussian-network-diagonal, gaussian-network-low-rank, gaussian-network-autoencoder, "
+            "or gaussian-network-diagonal-autoencoder."
         )
     print(
         "[convergence] n_ref reference: no learned H training at n_ref; matrix-panel top row = MC GT sqrt(H^2); "
@@ -3180,7 +6243,11 @@ def main(argv: list[str] | None = None) -> None:
             run_dir = os.path.join(sweep_root, f"n_{n:06d}")
             os.makedirs(run_dir, exist_ok=True)
         else:
-            tmp_ctx = tempfile.TemporaryDirectory(prefix=f"h_conv_n{n}_", dir=args.output_dir)
+            tmp_ctx = tempfile.TemporaryDirectory(
+                prefix=f"h_conv_n{n}_",
+                dir=args.output_dir,
+                ignore_cleanup_errors=True,
+            )
             run_dir = tmp_ctx.name
 
         try:
@@ -3199,6 +6266,9 @@ def main(argv: list[str] | None = None) -> None:
                 bundle=subset_n.bundle,
                 output_dir=run_dir,
                 n_bins=n_bins,
+                bin_train=subset_n.bin_train,
+                bin_validation=subset_n.bin_validation,
+                bin_all=subset_n.bin_all,
             )
             per_diag = os.path.join(
                 args.output_dir,

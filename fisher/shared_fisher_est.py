@@ -56,6 +56,7 @@ from fisher.ctsm_models import (
 )
 from fisher.ctsm_objectives import ctsm_v_pair_conditioned_loss
 from fisher.ctsm_paths import TwoSB
+from fisher.gmm_z_decode import GMMZDecodeModel, compute_gmm_z_decode_c_matrix, train_gmm_z_decode
 from fisher.shared_dataset_io import (
     SHARED_DATASET_META_KEYS,
     apply_sigma_defaults_for_dataset_family,
@@ -128,8 +129,10 @@ def require_device(name: str) -> torch.device:
 
 def normalize_theta_field_method(method: str) -> str:
     m = str(method).strip().lower()
-    if m in ("theta_flow", "theta_path_integral", "x_flow", "ctsm_v"):
+    if m in ("theta_flow", "theta_path_integral", "x_flow", "ctsm_v", "gmm_z_decode"):
         return m
+    if m == "gmm-z-decode":
+        return "gmm_z_decode"
     legacy_names = (
         "flow",
         "flow_likelihood",
@@ -139,12 +142,12 @@ def normalize_theta_field_method(method: str) -> str:
     if m in legacy_names:
         raise ValueError(
             "Legacy --theta-field-method is removed. Use one of "
-            "{'theta_flow', 'theta_path_integral', 'x_flow', 'ctsm_v'}. "
+            "{'theta_flow', 'theta_path_integral', 'x_flow', 'ctsm_v', 'gmm_z_decode'}. "
             "theta_flow = theta-space flow ODE log-likelihood Bayes ratios; "
             "theta_path_integral = velocity-to-score plus trapezoid integral along sorted theta."
         )
     raise ValueError(
-        "--theta-field-method must be one of {'theta_flow','theta_path_integral','x_flow','ctsm_v'}."
+        "--theta-field-method must be one of {'theta_flow','theta_path_integral','x_flow','ctsm_v','gmm_z_decode'}."
     )
 
 
@@ -153,6 +156,39 @@ def normalize_flow_arch(args: Any) -> str:
     if arch in ("mlp", "soft_moe", "film", "film_fourier"):
         return arch
     raise ValueError("--flow-arch must be one of {'mlp','soft_moe','film','film_fourier'}.")
+
+
+def validate_gmm_z_decode_args(args: Any) -> None:
+    if int(getattr(args, "gzd_latent_dim", 0)) < 1:
+        raise ValueError("--gzd-latent-dim must be >= 1.")
+    if int(getattr(args, "gzd_components", 0)) < 1:
+        raise ValueError("--gzd-components must be >= 1.")
+    if int(getattr(args, "gzd_epochs", 0)) < 1:
+        raise ValueError("--gzd-epochs must be >= 1.")
+    if int(getattr(args, "gzd_batch_size", 0)) < 1:
+        raise ValueError("--gzd-batch-size must be >= 1.")
+    if float(getattr(args, "gzd_lr", 0.0)) <= 0.0:
+        raise ValueError("--gzd-lr must be > 0.")
+    if int(getattr(args, "gzd_hidden_dim", 0)) < 1:
+        raise ValueError("--gzd-hidden-dim must be >= 1.")
+    if int(getattr(args, "gzd_depth", 0)) < 1:
+        raise ValueError("--gzd-depth must be >= 1.")
+    if float(getattr(args, "gzd_weight_decay", 0.0)) < 0.0:
+        raise ValueError("--gzd-weight-decay must be >= 0.")
+    if float(getattr(args, "gzd_min_std", 0.0)) <= 0.0:
+        raise ValueError("--gzd-min-std must be > 0.")
+    if int(getattr(args, "gzd_early_patience", -1)) < 0:
+        raise ValueError("--gzd-early-patience must be >= 0.")
+    if float(getattr(args, "gzd_early_min_delta", 0.0)) < 0.0:
+        raise ValueError("--gzd-early-min-delta must be >= 0.")
+    alpha = float(getattr(args, "gzd_early_ema_alpha", 0.0))
+    if not np.isfinite(alpha) or alpha <= 0.0 or alpha > 1.0:
+        raise ValueError("--gzd-early-ema-alpha must be in (0, 1].")
+    max_grad = float(getattr(args, "gzd_max_grad_norm", 10.0))
+    if not np.isfinite(max_grad) or max_grad < 0.0:
+        raise ValueError("--gzd-max-grad-norm must be finite and >= 0.")
+    if int(getattr(args, "gzd_pair_batch_size", 0)) < 1:
+        raise ValueError("--gzd-pair-batch-size must be >= 1.")
 
 
 def build_posterior_score_model(
@@ -683,6 +719,21 @@ def fit_decoder_from_shared_data(
     return fisher, se, valid, diag
 
 
+def generative_x_dim_from_meta(meta: dict[str, Any]) -> int:
+    """Return the **generative** observation dimension for ``build_dataset_from_meta``.
+
+    PR-autoencoder outputs stored in shared NPZs set ``meta['x_dim']`` to the embedded
+    dimension ``h_dim``, while the toy likelihood used for Monte Carlo ground truth must
+    match the low-dimensional generative model (``pr_autoencoder_z_dim``). The
+    ``randamp_gaussian_sqrtd`` branch already relied on this split; the same rule applies
+    to cosine (and other) families embedded via ``bin/project_dataset_pr_autoencoder.py``.
+    """
+    xd = int(meta["x_dim"])
+    if bool(meta.get("pr_autoencoder_embedded", False)):
+        return int(meta.get("pr_autoencoder_z_dim", xd))
+    return xd
+
+
 def build_dataset_from_meta(
     meta: dict[str, Any],
 ) -> (
@@ -703,7 +754,7 @@ def build_dataset_from_meta(
         return ToyConditionalGaussianDataset(
             theta_low=float(meta["theta_low"]),
             theta_high=float(meta["theta_high"]),
-            x_dim=int(meta["x_dim"]),
+            x_dim=generative_x_dim_from_meta(meta),
             tuning_curve_family=str(meta.get("tuning_curve_family", "cosine")),
             vm_mu_amp=float(meta.get("vm_mu_amp", 1.0)),
             vm_kappa=float(meta.get("vm_kappa", 1.0)),
@@ -730,7 +781,7 @@ def build_dataset_from_meta(
         return ToyConditionalGaussianSqrtdDataset(
             theta_low=float(meta["theta_low"]),
             theta_high=float(meta["theta_high"]),
-            x_dim=int(meta["x_dim"]),
+            x_dim=generative_x_dim_from_meta(meta),
             tuning_curve_family=str(meta.get("tuning_curve_family", "cosine")),
             vm_mu_amp=float(meta.get("vm_mu_amp", 1.0)),
             vm_kappa=float(meta.get("vm_kappa", 1.0)),
@@ -763,7 +814,7 @@ def build_dataset_from_meta(
         return ToyConditionalGaussianCosineRandampSqrtdDataset(
             theta_low=float(meta["theta_low"]),
             theta_high=float(meta["theta_high"]),
-            x_dim=int(meta["x_dim"]),
+            x_dim=generative_x_dim_from_meta(meta),
             tuning_curve_family=str(meta.get("tuning_curve_family", "cosine")),
             vm_mu_amp=float(meta.get("vm_mu_amp", 1.0)),
             vm_kappa=float(meta.get("vm_kappa", 1.0)),
@@ -799,7 +850,7 @@ def build_dataset_from_meta(
         return ToyConditionalGaussianRandampDataset(
             theta_low=float(meta["theta_low"]),
             theta_high=float(meta["theta_high"]),
-            x_dim=int(meta["x_dim"]),
+            x_dim=generative_x_dim_from_meta(meta),
             tuning_curve_family=str(meta.get("tuning_curve_family", "cosine")),
             vm_mu_amp=float(meta.get("vm_mu_amp", 1.0)),
             vm_kappa=float(meta.get("vm_kappa", 1.0)),
@@ -834,13 +885,10 @@ def build_dataset_from_meta(
             amps_sqrt = np.asarray(amps_raw, dtype=np.float64).reshape(-1)
         else:
             amps_sqrt = None
-        gen_x_dim = int(meta["x_dim"])
-        if bool(meta.get("pr_autoencoder_embedded", False)):
-            gen_x_dim = int(meta.get("pr_autoencoder_z_dim", gen_x_dim))
         return ToyConditionalGaussianRandampSqrtdDataset(
             theta_low=float(meta["theta_low"]),
             theta_high=float(meta["theta_high"]),
-            x_dim=gen_x_dim,
+            x_dim=generative_x_dim_from_meta(meta),
             tuning_curve_family=str(meta.get("tuning_curve_family", "cosine")),
             vm_mu_amp=float(meta.get("vm_mu_amp", 1.0)),
             vm_kappa=float(meta.get("vm_kappa", 1.0)),
@@ -959,6 +1007,8 @@ def validate_estimation_args(args: Any) -> None:
     _arch = normalize_flow_arch(args)
     setattr(args, "theta_field_method", _tfm_val)
     setattr(args, "flow_arch", _arch)
+    if _tfm_val == "gmm_z_decode":
+        validate_gmm_z_decode_args(args)
     legacy_flow_score_arch = getattr(args, "flow_score_arch", None)
     legacy_flow_prior_arch = getattr(args, "flow_prior_arch", None)
     if legacy_flow_score_arch is not None:
@@ -1226,13 +1276,13 @@ def validate_estimation_args(args: Any) -> None:
     if (
         bool(getattr(args, "compute_h_matrix", False))
         and not bool(getattr(args, "prior_enable", True))
-        and _tfm_val != "x_flow"
+        and _tfm_val not in ("x_flow", "gmm_z_decode")
     ):
         raise ValueError("--compute-h-matrix requires prior score; do not use --no-prior-score.")
     if bool(getattr(args, "skip_shared_fisher_gt_compare", False)):
         if not bool(getattr(args, "compute_h_matrix", False)):
             raise ValueError("--skip-shared-fisher-gt-compare requires --compute-h-matrix.")
-        if not bool(getattr(args, "prior_enable", True)) and _tfm_val != "x_flow":
+        if not bool(getattr(args, "prior_enable", True)) and _tfm_val not in ("x_flow", "gmm_z_decode"):
             raise ValueError("--skip-shared-fisher-gt-compare requires prior score; do not use --no-prior-score.")
     if int(getattr(args, "ctsm_epochs", 1)) < 1:
         raise ValueError("--ctsm-epochs must be >= 1.")
@@ -1724,6 +1774,145 @@ def run_shared_fisher_estimation(
 
     theta_field_method = normalize_theta_field_method(str(getattr(args, "theta_field_method", "theta_flow")))
     flow_arch = normalize_flow_arch(args)
+    if theta_field_method == "gmm_z_decode":
+        if not bool(getattr(args, "compute_h_matrix", False)):
+            raise RuntimeError("gmm_z_decode requires --compute-h-matrix to produce output artifacts.")
+        theta_fit = np.asarray(theta_score_fit, dtype=np.float64)
+        theta_val = np.asarray(theta_score_val, dtype=np.float64)
+        theta_pool = np.asarray(theta_all, dtype=np.float64)
+        x_fit = np.asarray(x_score_fit, dtype=np.float64)
+        x_val = np.asarray(x_score_val, dtype=np.float64)
+        x_pool = np.asarray(x_all, dtype=np.float64)
+        if theta_fit.ndim == 1:
+            theta_fit = theta_fit.reshape(-1, 1)
+        if theta_val.ndim == 1:
+            theta_val = theta_val.reshape(-1, 1)
+        if theta_pool.ndim == 1:
+            theta_pool = theta_pool.reshape(-1, 1)
+        if int(theta_pool.shape[1]) != 1:
+            raise ValueError("gmm-z-decode v1 requires scalar theta.")
+        latent_dim = int(getattr(args, "gzd_latent_dim", 2))
+        components = int(getattr(args, "gzd_components", 5))
+        hidden_dim = int(getattr(args, "gzd_hidden_dim", 128))
+        depth = int(getattr(args, "gzd_depth", 2))
+        model = GMMZDecodeModel(
+            x_dim=int(x_pool.shape[1]),
+            latent_dim=latent_dim,
+            components=components,
+            hidden_dim=hidden_dim,
+            depth=depth,
+            min_std=float(getattr(args, "gzd_min_std", 1e-3)),
+        ).to(device)
+        print(
+            "[gmm_z_decode] "
+            f"fit={theta_fit.shape[0]} val={theta_val.shape[0]} x_dim={int(x_pool.shape[1])} "
+            f"latent_dim={latent_dim} components={components} hidden_dim={hidden_dim} depth={depth}"
+        )
+        train_out = train_gmm_z_decode(
+            model=model,
+            theta_train=theta_fit,
+            x_train=x_fit,
+            theta_val=theta_val,
+            x_val=x_val,
+            device=device,
+            epochs=int(getattr(args, "gzd_epochs", 2000)),
+            batch_size=int(getattr(args, "gzd_batch_size", 256)),
+            lr=float(getattr(args, "gzd_lr", 1e-3)),
+            weight_decay=float(getattr(args, "gzd_weight_decay", 0.0)),
+            patience=int(getattr(args, "gzd_early_patience", 300)),
+            min_delta=float(getattr(args, "gzd_early_min_delta", 1e-4)),
+            ema_alpha=float(getattr(args, "gzd_early_ema_alpha", 0.05)),
+            max_grad_norm=float(getattr(args, "gzd_max_grad_norm", 10.0)),
+            log_every=max(1, int(getattr(args, "log_every", 50))),
+            restore_best=True,
+        )
+        c_matrix, z_all = compute_gmm_z_decode_c_matrix(
+            model=model,
+            theta_all=theta_pool,
+            x_all=x_pool,
+            device=device,
+            x_mean=np.asarray(train_out["x_mean"], dtype=np.float64),
+            x_std=np.asarray(train_out["x_std"], dtype=np.float64),
+            theta_mean=np.asarray(train_out["theta_mean"], dtype=np.float64),
+            theta_std=np.asarray(train_out["theta_std"], dtype=np.float64),
+            pair_batch_size=int(getattr(args, "gzd_pair_batch_size", 65536)),
+        )
+        delta_l = HMatrixEstimator.compute_delta_l(c_matrix)
+        h_directed = HMatrixEstimator.compute_h_directed(delta_l)
+        h_sym = HMatrixEstimator.symmetrize(h_directed)
+        suffix = "_non_gauss" if args.dataset_family == "cosine_gmm" else "_theta_cov"
+        h_npz_path = os.path.join(args.output_dir, f"h_matrix_results{suffix}.npz")
+        np.savez_compressed(
+            h_npz_path,
+            theta_used=np.asarray(theta_pool.reshape(-1), dtype=np.float64),
+            h_directed=np.asarray(h_directed, dtype=np.float64),
+            h_sym=np.asarray(h_sym, dtype=np.float64),
+            c_matrix=np.asarray(c_matrix, dtype=np.float64),
+            delta_l_matrix=np.asarray(delta_l, dtype=np.float64),
+            h_field_method=np.asarray(["gmm_z_decode"], dtype=object),
+            h_eval_scalar_name=np.asarray(["gmm_z_decode_log_q_theta_given_z_uniform_prior"], dtype=object),
+            sigma_eval=np.asarray([np.nan], dtype=np.float64),
+            theta_field_method=np.asarray(["gmm_z_decode"], dtype=object),
+            gzd_latent_dim=np.int64(latent_dim),
+            gzd_components=np.int64(components),
+            gzd_hidden_dim=np.int64(hidden_dim),
+            gzd_depth=np.int64(depth),
+            gzd_x_mean=np.asarray(train_out["x_mean"], dtype=np.float64),
+            gzd_x_std=np.asarray(train_out["x_std"], dtype=np.float64),
+            gzd_theta_mean=np.asarray(train_out["theta_mean"], dtype=np.float64),
+            gzd_theta_std=np.asarray(train_out["theta_std"], dtype=np.float64),
+            gzd_z_all=np.asarray(z_all, dtype=np.float64),
+        )
+        loss_fig = os.path.join(args.output_dir, "score_loss_vs_epoch.png")
+        ep = np.arange(1, np.asarray(train_out["train_losses"]).size + 1)
+        plt.figure(figsize=(8.8, 5.0))
+        plt.plot(ep, train_out["train_losses"], label="GMM-z-decode train NLL", linewidth=2.0)
+        plt.plot(ep, train_out["val_losses"], label="GMM-z-decode val NLL", linewidth=2.0)
+        plt.plot(ep, train_out["val_ema_losses"], label="GMM-z-decode val EMA", linewidth=2.0, linestyle="--")
+        best_epoch = int(train_out["best_epoch"])
+        if 1 <= best_epoch <= ep.size:
+            plt.axvline(best_epoch, color="#2ca02c", linestyle="--", linewidth=1.5, label=f"Best epoch {best_epoch}")
+        plt.xlabel("Epoch")
+        plt.ylabel("NLL")
+        plt.title("GMM-z-decode posterior training")
+        plt.grid(alpha=0.25, linestyle="--", linewidth=0.8)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(loss_fig, dpi=180)
+        plt.close()
+        empty = np.asarray([], dtype=np.float64)
+        tnpz = _save_dsm_score_prior_training_losses_npz(
+            args.output_dir,
+            theta_all=theta_pool,
+            theta_score_fit=theta_fit,
+            theta_score_val=theta_val,
+            score_split="dataset_train_validation",
+            score_train_losses=np.asarray(train_out["train_losses"], dtype=np.float64),
+            score_val_losses=np.asarray(train_out["val_losses"], dtype=np.float64),
+            score_val_monitor_losses=np.asarray(train_out["val_ema_losses"], dtype=np.float64),
+            score_best_epoch=int(train_out["best_epoch"]),
+            score_stopped_epoch=int(train_out["stopped_epoch"]),
+            score_stopped_early=bool(train_out["stopped_early"]),
+            score_best_val_loss=float(train_out["best_val_ema"]),
+            prior_enable=False,
+            prior_train_losses=empty,
+            prior_val_losses=empty,
+            prior_val_monitor_losses=empty,
+            prior_best_epoch=0,
+            prior_stopped_epoch=0,
+            prior_stopped_early=False,
+            prior_best_val_loss=float("nan"),
+            score_n_clipped_steps=int(train_out.get("n_clipped_steps", 0)),
+            score_n_total_steps=int(train_out.get("n_total_steps", 0)),
+            score_lr_last=float(train_out.get("lr_last", float("nan"))),
+            theta_field_method="gmm_z_decode",
+        )
+        print("[summary] gmm_z_decode mode completed (posterior GMM q(theta|z), uniform-prior Bayes ratios).")
+        print("Saved artifacts:")
+        print(f"  - {loss_fig}")
+        print(f"  - {h_npz_path}")
+        print(f"  - {tnpz}")
+        return
     if theta_field_method == "ctsm_v":
         if not bool(getattr(args, "compute_h_matrix", False)):
             raise RuntimeError("ctsm_v requires --compute-h-matrix to produce output artifacts.")

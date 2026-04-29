@@ -727,6 +727,45 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         default=0.0,
         help="ctsm_v: AdamW weight decay (L2 penalty on weights). Default 0 preserves prior behavior.",
     )
+    p.add_argument("--gzd-latent-dim", type=int, default=2, help="gmm-z-decode only: z bottleneck dimension.")
+    p.add_argument("--gzd-components", type=int, default=5, help="gmm-z-decode only: GMM component count.")
+    p.add_argument("--gzd-epochs", type=int, default=2000, help="gmm-z-decode only: training epochs.")
+    p.add_argument("--gzd-batch-size", type=int, default=256, help="gmm-z-decode only: training batch size.")
+    p.add_argument("--gzd-lr", type=float, default=1e-3, help="gmm-z-decode only: learning rate.")
+    p.add_argument("--gzd-hidden-dim", type=int, default=128, help="gmm-z-decode only: MLP hidden width.")
+    p.add_argument("--gzd-depth", type=int, default=2, help="gmm-z-decode only: encoder MLP depth.")
+    p.add_argument("--gzd-weight-decay", type=float, default=0.0, help="gmm-z-decode only: AdamW weight decay.")
+    p.add_argument("--gzd-min-std", type=float, default=1e-3, help="gmm-z-decode only: minimum normalized-theta std.")
+    p.add_argument(
+        "--gzd-early-patience",
+        type=int,
+        default=300,
+        help="gmm-z-decode only: early-stop patience; 0 disables early stopping.",
+    )
+    p.add_argument(
+        "--gzd-early-min-delta",
+        type=float,
+        default=1e-4,
+        help="gmm-z-decode only: early-stop min delta.",
+    )
+    p.add_argument(
+        "--gzd-early-ema-alpha",
+        type=float,
+        default=0.05,
+        help="gmm-z-decode only: EMA alpha for validation NLL monitor.",
+    )
+    p.add_argument(
+        "--gzd-max-grad-norm",
+        type=float,
+        default=10.0,
+        help="gmm-z-decode only: gradient clipping max norm; <=0 disables clipping.",
+    )
+    p.add_argument(
+        "--gzd-pair-batch-size",
+        type=int,
+        default=65536,
+        help="gmm-z-decode only: approximate pair budget per C-matrix block (rows*cols).",
+    )
 
     p.add_argument(
         "--no-prior-score",
