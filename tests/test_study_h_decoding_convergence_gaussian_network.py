@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import subprocess
 import sys
 import tempfile
@@ -135,6 +136,36 @@ class TestStudyHDecodingConvergenceGaussianNetwork(unittest.TestCase):
             method_stored="gaussian_network_diagonal",
             expected_stdout="gaussian_network_diagonal mode predicts mean and diagonal precision Cholesky factor",
         )
+
+    def test_gaussian_network_diagonal_binned_pca_sweep_smoke(self) -> None:
+        self._run_smoke(
+            method_cli="gaussian-network-diagonal-binned-pca",
+            method_stored="gaussian_network_diagonal_binned_pca",
+            expected_stdout="gaussian_network_diagonal_binned_pca mode fits PCA from theta-binned train means",
+        )
+
+    def test_gaussian_network_diagonal_binned_pca_rejects_impossible_rank(self) -> None:
+        repo = Path(__file__).resolve().parent.parent
+        script = repo / "bin" / "study_h_decoding_convergence.py"
+        spec = importlib.util.spec_from_file_location("study_h_decoding_convergence", script)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        x = np.asarray([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], dtype=np.float64)
+        theta = np.asarray([0.0, 0.1, 1.0, 1.1], dtype=np.float64)
+        bins = np.asarray([0, 0, 1, 1], dtype=np.int64)
+        with self.assertRaisesRegex(ValueError, "exceeds available binned-mean PCA rank"):
+            mod._fit_binned_mean_pca_projection(
+                x_train=x,
+                theta_train=theta,
+                bin_train=bins,
+                x_val=x,
+                x_all=x,
+                n_bins=2,
+                pca_dim=2,
+            )
 
     def test_gaussian_network_low_rank_sweep_smoke(self) -> None:
         self._run_smoke(
@@ -321,6 +352,252 @@ class TestStudyHDecodingConvergenceGaussianNetwork(unittest.TestCase):
             self.assertTrue((out_dir / "h_decoding_convergence_results.npz").is_file())
             z = np.load(out_dir / "training_losses" / "n_000060.npz", allow_pickle=True)
             self.assertEqual(str(np.asarray(z["theta_field_method"]).reshape(-1)[0]), "gaussian_x_flow_diagonal")
+
+    def test_linear_x_flow_sweep_smoke(self) -> None:
+        repo = Path(__file__).resolve().parent.parent
+        script = repo / "bin" / "study_h_decoding_convergence.py"
+        n_total = 220
+        n_ref = 160
+        n_bins = 4
+        seed = 11
+
+        ns_ds = _ns(
+            dataset_family="cosine_gaussian_sqrtd",
+            x_dim=2,
+            n_total=n_total,
+            train_frac=0.5,
+            seed=seed,
+        )
+        ds = build_dataset_from_args(ns_ds)
+        theta_all, x_all = ds.sample_joint(n_total)
+        meta = meta_dict_from_args(ns_ds)
+        n_train = int(0.5 * n_total)
+        n_train = min(max(n_train, 1), n_total - 1)
+        tr = np.arange(0, n_train, dtype=np.int64)
+        va = np.arange(n_train, n_total, dtype=np.int64)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            ds_path = tmp_path / "ds.npz"
+            out_dir = tmp_path / "run_out"
+            save_shared_dataset_npz(
+                ds_path,
+                meta=meta,
+                theta_all=theta_all,
+                x_all=x_all,
+                train_idx=tr,
+                validation_idx=va,
+                theta_train=theta_all[tr],
+                x_train=x_all[tr],
+                theta_validation=theta_all[va],
+                x_validation=x_all[va],
+            )
+            cmd = [
+                sys.executable,
+                str(script),
+                "--dataset-npz",
+                str(ds_path),
+                "--dataset-family",
+                "cosine_gaussian_sqrtd",
+                "--n-ref",
+                str(n_ref),
+                "--n-list",
+                "60",
+                "--num-theta-bins",
+                str(n_bins),
+                "--theta-field-method",
+                "linear-x-flow",
+                "--lxf-epochs",
+                "4",
+                "--lxf-batch-size",
+                "32",
+                "--lxf-hidden-dim",
+                "16",
+                "--lxf-depth",
+                "1",
+                "--lxf-early-patience",
+                "5",
+                "--lxf-pair-batch-size",
+                "2048",
+                "--output-dir",
+                str(out_dir),
+                "--device",
+                "cpu",
+            ]
+            r = subprocess.run(cmd, cwd=str(repo), capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, msg=(r.stdout, r.stderr))
+            self.assertIn("linear_x_flow mode trains", r.stdout)
+            self.assertIn("shared linear A x plus theta-MLP offset FM", r.stdout)
+            self.assertTrue((out_dir / "h_decoding_convergence_results.npz").is_file())
+            z = np.load(out_dir / "training_losses" / "n_000060.npz", allow_pickle=True)
+            self.assertEqual(str(np.asarray(z["theta_field_method"]).reshape(-1)[0]), "linear_x_flow")
+
+    def test_linear_x_flow_schedule_sweep_smoke(self) -> None:
+        repo = Path(__file__).resolve().parent.parent
+        script = repo / "bin" / "study_h_decoding_convergence.py"
+        n_total = 220
+        n_ref = 160
+        n_bins = 4
+        seed = 11
+
+        ns_ds = _ns(
+            dataset_family="cosine_gaussian_sqrtd",
+            x_dim=2,
+            n_total=n_total,
+            train_frac=0.5,
+            seed=seed,
+        )
+        ds = build_dataset_from_args(ns_ds)
+        theta_all, x_all = ds.sample_joint(n_total)
+        meta = meta_dict_from_args(ns_ds)
+        n_train = int(0.5 * n_total)
+        n_train = min(max(n_train, 1), n_total - 1)
+        tr = np.arange(0, n_train, dtype=np.int64)
+        va = np.arange(n_train, n_total, dtype=np.int64)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            ds_path = tmp_path / "ds.npz"
+            out_dir = tmp_path / "run_out"
+            save_shared_dataset_npz(
+                ds_path,
+                meta=meta,
+                theta_all=theta_all,
+                x_all=x_all,
+                train_idx=tr,
+                validation_idx=va,
+                theta_train=theta_all[tr],
+                x_train=x_all[tr],
+                theta_validation=theta_all[va],
+                x_validation=x_all[va],
+            )
+            cmd = [
+                sys.executable,
+                str(script),
+                "--dataset-npz",
+                str(ds_path),
+                "--dataset-family",
+                "cosine_gaussian_sqrtd",
+                "--n-ref",
+                str(n_ref),
+                "--n-list",
+                "60",
+                "--num-theta-bins",
+                str(n_bins),
+                "--theta-field-method",
+                "linear-x-flow-schedule",
+                "--lxfs-path-schedule",
+                "cosine",
+                "--lxfs-epochs",
+                "4",
+                "--lxfs-batch-size",
+                "32",
+                "--lxfs-hidden-dim",
+                "16",
+                "--lxfs-depth",
+                "1",
+                "--lxfs-early-patience",
+                "5",
+                "--lxfs-pair-batch-size",
+                "2048",
+                "--output-dir",
+                str(out_dir),
+                "--device",
+                "cpu",
+            ]
+            r = subprocess.run(cmd, cwd=str(repo), capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, msg=(r.stdout, r.stderr))
+            self.assertIn("linear_x_flow_schedule mode trains", r.stdout)
+            self.assertIn("path_schedule=cosine", r.stdout)
+            self.assertTrue((out_dir / "h_decoding_convergence_results.npz").is_file())
+            z = np.load(out_dir / "training_losses" / "n_000060.npz", allow_pickle=True)
+            self.assertEqual(str(np.asarray(z["theta_field_method"]).reshape(-1)[0]), "linear_x_flow_schedule")
+            self.assertEqual(str(np.asarray(z["lxfs_path_schedule"]).reshape(-1)[0]), "cosine")
+
+    def test_linear_x_flow_restricted_drift_sweep_smokes(self) -> None:
+        repo = Path(__file__).resolve().parent.parent
+        script = repo / "bin" / "study_h_decoding_convergence.py"
+        n_total = 220
+        n_ref = 160
+        n_bins = 4
+        seed = 11
+
+        ns_ds = _ns(
+            dataset_family="cosine_gaussian_sqrtd",
+            x_dim=2,
+            n_total=n_total,
+            train_frac=0.5,
+            seed=seed,
+        )
+        ds = build_dataset_from_args(ns_ds)
+        theta_all, x_all = ds.sample_joint(n_total)
+        meta = meta_dict_from_args(ns_ds)
+        n_train = int(0.5 * n_total)
+        n_train = min(max(n_train, 1), n_total - 1)
+        tr = np.arange(0, n_train, dtype=np.int64)
+        va = np.arange(n_train, n_total, dtype=np.int64)
+
+        for method_cli, method_stored in (
+            ("linear-x-flow-scalar", "linear_x_flow_scalar"),
+            ("linear-x-flow-diagonal", "linear_x_flow_diagonal"),
+            ("linear-x-flow-low-rank", "linear_x_flow_low_rank"),
+        ):
+            with self.subTest(method=method_cli), tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                ds_path = tmp_path / "ds.npz"
+                out_dir = tmp_path / "run_out"
+                save_shared_dataset_npz(
+                    ds_path,
+                    meta=meta,
+                    theta_all=theta_all,
+                    x_all=x_all,
+                    train_idx=tr,
+                    validation_idx=va,
+                    theta_train=theta_all[tr],
+                    x_train=x_all[tr],
+                    theta_validation=theta_all[va],
+                    x_validation=x_all[va],
+                )
+                cmd = [
+                    sys.executable,
+                    str(script),
+                    "--dataset-npz",
+                    str(ds_path),
+                    "--dataset-family",
+                    "cosine_gaussian_sqrtd",
+                    "--n-ref",
+                    str(n_ref),
+                    "--n-list",
+                    "60",
+                    "--num-theta-bins",
+                    str(n_bins),
+                    "--theta-field-method",
+                    method_cli,
+                    "--lxf-epochs",
+                    "4",
+                    "--lxf-batch-size",
+                    "32",
+                    "--lxf-hidden-dim",
+                    "16",
+                    "--lxf-depth",
+                    "1",
+                    "--lxf-low-rank-dim",
+                    "1",
+                    "--lxf-early-patience",
+                    "5",
+                    "--lxf-pair-batch-size",
+                    "2048",
+                    "--output-dir",
+                    str(out_dir),
+                    "--device",
+                    "cpu",
+                ]
+                r = subprocess.run(cmd, cwd=str(repo), capture_output=True, text=True)
+                self.assertEqual(r.returncode, 0, msg=(r.stdout, r.stderr))
+                self.assertIn(f"{method_stored} mode trains", r.stdout)
+                self.assertTrue((out_dir / "h_decoding_convergence_results.npz").is_file())
+                z = np.load(out_dir / "training_losses" / "n_000060.npz", allow_pickle=True)
+                self.assertEqual(str(np.asarray(z["theta_field_method"]).reshape(-1)[0]), method_stored)
 
     def test_nf_reduction_sweep_smoke(self) -> None:
         repo = Path(__file__).resolve().parent.parent
