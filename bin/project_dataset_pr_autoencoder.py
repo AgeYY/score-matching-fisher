@@ -12,7 +12,9 @@ with ``pr_autoencoder_z_dim`` equal to the source latent dimension. Ground-truth
 the low-dimensional generative model use :func:`fisher.shared_fisher_est.build_dataset_from_meta`.
 
 Unless ``--skip-viz``, writes ``pr_projection_summary.{png,svg}`` next to ``--output-npz``:
-left panel = PCA of embedded ``x``; right panel = PR-autoencoder training loss vs epoch.
+same two-panel native layout as ``make_dataset.py`` (tuning curves, binned empirical mean of
+embedded samples with scatter overlaid in PCA), plus a third panel with PR-autoencoder training
+loss vs epoch.
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 _repo_root = Path(__file__).resolve().parent.parent
 if str(_repo_root) not in sys.path:
@@ -37,8 +40,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
+from fisher.dataset_visualization import plot_joint_and_tuning_on_axes
 from fisher.pr_autoencoder_embedding import pr_autoencoder_config_from_namespace, project_x_through_pr_autoencoder
 from fisher.shared_dataset_io import load_shared_dataset_npz, save_shared_dataset_npz
+from fisher.shared_fisher_est import build_dataset_from_meta
 
 
 def _file_sha256(path: Path) -> str:
@@ -49,11 +54,38 @@ def _file_sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def _pca_project_2d(x: np.ndarray) -> np.ndarray:
-    x0 = x - x.mean(axis=0, keepdims=True)
-    _, _, vh = np.linalg.svd(x0, full_matrices=False)
-    basis = vh[:2].T
-    return x0 @ basis
+def _binned_empirical_embedded_mean(
+    theta_all: np.ndarray,
+    x_embed: np.ndarray,
+    theta_low: float,
+    theta_high: float,
+    n_bins: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Bin by theta and return (bin_center[:, None], mean embedded x per non-empty bin)."""
+    th = np.asarray(theta_all, dtype=np.float64).reshape(-1)
+    x = np.asarray(x_embed, dtype=np.float64)
+    if x.ndim != 2:
+        raise ValueError(f"x_embed must be 2D; got {x.shape}")
+    nb = int(n_bins)
+    if nb < 2:
+        raise ValueError("n_bins must be >= 2")
+    bins = np.linspace(float(theta_low), float(theta_high), nb + 1, dtype=np.float64)
+    centers = 0.5 * (bins[:-1] + bins[1:])
+    idx = np.digitize(th, bins) - 1
+    valid = (idx >= 0) & (idx < nb)
+    idx_v = idx[valid]
+    x_v = x[valid]
+    ts: list[float] = []
+    means: list[np.ndarray] = []
+    for b in range(nb):
+        m = idx_v == b
+        if not np.any(m):
+            continue
+        ts.append(float(centers[b]))
+        means.append(x_v[m].mean(axis=0))
+    if not means:
+        raise ValueError("binned empirical embedded mean produced no non-empty bins")
+    return np.asarray(ts, dtype=np.float64).reshape(-1, 1), np.vstack(means)
 
 
 def _save_projection_summary_figure(
@@ -61,30 +93,53 @@ def _save_projection_summary_figure(
     x_embed: np.ndarray,
     train_metrics: dict[str, np.ndarray],
     out_dir: Path,
+    base_dataset: Any,
+    *,
+    scatter_max_points: int | None = 800,
+    scatter_subsample_seed: int = 0,
+    pr_viz_mean_bins: int = 60,
+    pr_viz_mean_smooth_window: int = 3,
 ) -> None:
-    """Single figure: (left) PCA of embedded ``x``; (right) PR-autoencoder loss vs epoch."""
-    th = np.asarray(theta_all, dtype=np.float64).reshape(-1)
-    x = np.asarray(x_embed, dtype=np.float64)
-    n, d = x.shape
+    """Three panels: tuning + overlaid PCA manifold/scatter for embedded ``x``, then loss vs epoch.
+
+    The manifold curve is the binned empirical mean of embedded samples (not ``AE(mu_z(theta))``).
+    """
+    th_all = np.asarray(theta_all, dtype=np.float64).reshape(-1, 1)
+    x_all = np.asarray(x_embed, dtype=np.float64)
+    n = int(th_all.shape[0])
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    fig, (ax_pca, ax_loss) = plt.subplots(1, 2, figsize=(11.2, 4.6))
+    theta_plot = th_all
+    x_plot = x_all
+    if scatter_max_points is not None and n > int(scatter_max_points):
+        k = int(scatter_max_points)
+        rng = np.random.default_rng(int(scatter_subsample_seed))
+        pick = rng.choice(n, size=k, replace=False)
+        theta_plot = theta_plot[pick]
+        x_plot = x_plot[pick]
 
-    if d >= 2 and n >= 2:
-        pca = _pca_project_2d(x)
-        sc = ax_pca.scatter(pca[:, 0], pca[:, 1], c=th, s=8, alpha=0.55, cmap="plasma")
-        fig.colorbar(sc, ax=ax_pca, label="theta")
-        ax_pca.set_xlabel("PC1")
-        ax_pca.set_ylabel("PC2")
-        ax_pca.set_title("Embedded x (PCA)")
-    elif n >= 1:
-        ax_pca.scatter(th, x[:, 0], s=8, alpha=0.55, color="#4c78a8")
-        ax_pca.set_xlabel("theta")
-        ax_pca.set_ylabel("x (1D embed)")
-        ax_pca.set_title("Embedded x (1D)")
-    else:
-        ax_pca.set_title("Embedded x (PCA)")
-        ax_pca.text(0.5, 0.5, "no samples", ha="center", va="center", transform=ax_pca.transAxes)
+    t_emp, mu_emp = _binned_empirical_embedded_mean(
+        th_all,
+        x_all,
+        float(base_dataset.theta_low),
+        float(base_dataset.theta_high),
+        int(pr_viz_mean_bins),
+    )
+
+    fig, axes = plt.subplots(1, 3, figsize=(12.0, 3.2), layout="constrained")
+    ax_tune, ax_manifold, ax_loss = axes[0], axes[1], axes[2]
+    plot_joint_and_tuning_on_axes(
+        fig,
+        ax_tune,
+        ax_manifold,
+        theta_plot,
+        x_plot,
+        base_dataset,
+        mu_override=mu_emp,
+        theta_grid_override=t_emp,
+        n_theta_grid=500,
+        smooth_mean_window=int(pr_viz_mean_smooth_window),
+    )
 
     loss_raw = train_metrics.get("loss")
     if loss_raw is not None and np.asarray(loss_raw).size >= 1:
@@ -98,7 +153,6 @@ def _save_projection_summary_figure(
         ax_loss.set_title("PR-autoencoder training loss")
         ax_loss.text(0.5, 0.5, "no training metrics", ha="center", va="center", transform=ax_loss.transAxes)
 
-    fig.tight_layout()
     png = out_dir / "pr_projection_summary.png"
     svg = out_dir / "pr_projection_summary.svg"
     fig.savefig(png, dpi=180, bbox_inches="tight")
@@ -139,11 +193,41 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Default: always train (force_retrain) so each run fits a fresh encoder."
         ),
     )
+    p.add_argument(
+        "--pr-viz-scatter-max",
+        type=int,
+        default=800,
+        metavar="N",
+        help=(
+            "Max number of (theta, x) rows subsampled for the PCA scatter in pr_projection_summary "
+            "(uniform random subset when the dataset is larger). Use 0 for no subsampling (all points)."
+        ),
+    )
+    p.add_argument(
+        "--pr-viz-mean-bins",
+        type=int,
+        default=60,
+        metavar="B",
+        help=(
+            "Number of theta bins for the empirical mean curve in pr_projection_summary "
+            "(mean embedded x per bin; non-empty bins only)."
+        ),
+    )
+    p.add_argument(
+        "--pr-viz-mean-smooth-window",
+        type=int,
+        default=3,
+        metavar="W",
+        help=(
+            "Odd-length moving-average window along binned theta for the empirical mean curve "
+            "before PCA (only when using binned embedded means). Use 0, 1, or 2 to disable smoothing."
+        ),
+    )
     p.add_argument("--allow-non-randamp-sqrtd", action="store_true", help="Skip dataset_family check (expert).")
     p.add_argument(
         "--skip-viz",
         action="store_true",
-        help="Do not write pr_projection_summary.{png,svg} (PCA + loss panels).",
+        help="Do not write pr_projection_summary.{png,svg} (tuning + overlaid PCA manifold/scatter + loss).",
     )
 
     p.add_argument("--pr-hidden1", type=int, default=None)
@@ -178,6 +262,8 @@ def main() -> None:
             "Start from a native low-dimensional archive from make_dataset.py."
         )
 
+    base_dataset = build_dataset_from_meta(meta)
+
     z_dim = int(meta["x_dim"])
     x_all = np.asarray(bundle.x_all, dtype=np.float64)
     if x_all.ndim != 2 or int(x_all.shape[1]) != z_dim:
@@ -209,7 +295,7 @@ def main() -> None:
     )
     cfg = pr_autoencoder_config_from_namespace(cfg_ns, h_dim=h_dim)
 
-    x_embed_all, cache_run_dir, loaded_from_cache, train_metrics = project_x_through_pr_autoencoder(
+    x_embed_all, cache_run_dir, loaded_from_cache, train_metrics, ae_model = project_x_through_pr_autoencoder(
         x_all,
         config=cfg,
         seed=seed,
@@ -264,11 +350,20 @@ def main() -> None:
     print(f"[embed] PR cache dir: {cache_run_dir}")
 
     if not args.skip_viz:
+        if int(args.pr_viz_mean_bins) < 2:
+            raise ValueError("--pr-viz-mean-bins must be >= 2.")
+        if int(args.pr_viz_mean_smooth_window) < 0:
+            raise ValueError("--pr-viz-mean-smooth-window must be >= 0.")
+        viz_cap: int | None = None if int(args.pr_viz_scatter_max) <= 0 else int(args.pr_viz_scatter_max)
         _save_projection_summary_figure(
             np.asarray(bundle.theta_all, dtype=np.float64),
             x_embed_all,
             train_metrics,
             out_path.parent,
+            base_dataset,
+            scatter_max_points=viz_cap,
+            pr_viz_mean_bins=int(args.pr_viz_mean_bins),
+            pr_viz_mean_smooth_window=int(args.pr_viz_mean_smooth_window),
         )
 
     # sidecar JSON for humans (optional quick provenance)

@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from fisher.autoencoder_embedding import PRAutoencoderConfig, train_or_load_pr_autoencoder
+from fisher.autoencoder_embedding import PRAutoencoderConfig, InputAutoencoder, train_or_load_pr_autoencoder
 from fisher.shared_fisher_est import build_dataset_from_args
 
 
@@ -55,11 +55,13 @@ def project_x_through_pr_autoencoder(
     device: torch.device,
     cache_dir: str,
     force_retrain: bool,
-) -> tuple[np.ndarray, Path, bool, dict[str, np.ndarray]]:
+) -> tuple[np.ndarray, Path, bool, dict[str, np.ndarray], InputAutoencoder]:
     """Map low-dimensional rows ``x_low`` (N, z_dim) to embedded ``x_embed`` (N, h_dim) via PR-AE encoder.
 
-    Returns ``(x_embed, cache_run_dir, loaded_from_cache, train_metrics)`` where ``train_metrics`` has
-    keys ``loss``, ``recon``, ``pr`` (per-epoch arrays from PR-autoencoder training or cache).
+    Returns ``(x_embed, cache_run_dir, loaded_from_cache, train_metrics, model)`` where
+    ``train_metrics`` has keys ``loss``, ``recon``, ``pr`` (per-epoch arrays from PR-autoencoder
+    training or cache), and ``model`` is the trained :class:`~fisher.autoencoder_embedding.InputAutoencoder`
+    in eval mode on ``device`` (for encoding additional curves such as ``mu(theta)``).
     """
     x_arr = np.asarray(x_low, dtype=np.float64)
     if x_arr.ndim != 2 or int(x_arr.shape[1]) != int(config.z_dim):
@@ -78,7 +80,7 @@ def project_x_through_pr_autoencoder(
         h_t, _ = built.model(z_t)
     x_embed = h_t.detach().cpu().numpy().astype(np.float64, copy=False)
     metrics = {k: np.asarray(v, dtype=np.float64) for k, v in built.metrics.items()}
-    return x_embed, built.cache_run_dir, bool(built.loaded_from_cache), metrics
+    return x_embed, built.cache_run_dir, bool(built.loaded_from_cache), metrics, built.model
 
 
 def build_randamp_gaussian_sqrtd_pr_autoencoder_dataset(ns: Any) -> PRAutoencoderDatasetBuildResult:
@@ -107,7 +109,7 @@ def build_randamp_gaussian_sqrtd_pr_autoencoder_dataset(ns: Any) -> PRAutoencode
 
     cache_dir = str(getattr(ns, "pr_autoencoder_cache_dir", "data/pr_autoencoder_cache"))
     force_retrain = bool(getattr(ns, "pr_autoencoder_force_retrain", False))
-    x_embed_all, cache_run_dir, loaded_from_cache, _metrics = project_x_through_pr_autoencoder(
+    x_embed_all, cache_run_dir, loaded_from_cache, _metrics, _model = project_x_through_pr_autoencoder(
         x_base_all,
         config=cfg,
         seed=int(getattr(ns, "seed")),

@@ -115,8 +115,8 @@ def _base_gaussian_like() -> dict[str, Any]:
         "cov_theta_phase1": 0.20,
         "cov_theta_phase2": -0.35,
         "cov_theta_phase_rho": 0.40,
-        "randamp_mu_low": 0.5,
-        "randamp_mu_high": 1.5,
+        "randamp_mu_low": 0.2,
+        "randamp_mu_high": 2.0,
         "randamp_kappa": 0.2,
         "randamp_omega": 1.0,
         "gmm_sep_scale": 1.10,
@@ -167,7 +167,16 @@ def family_recipe_dict(family: str) -> dict[str, Any]:
     if fam == "randamp_gaussian":
         return {**base, "sigma_x1": 0.30, "sigma_x2": 0.30}
     if fam == "randamp_gaussian_sqrtd":
-        return {**base, "sigma_x1": 0.20, "sigma_x2": 0.20}
+        # Half baseline variance (sigma_base^2) vs legacy 0.20; double activity alpha
+        # (alpha = 0.5 * (cov_theta_amp1 + cov_theta_amp2)) vs base 0.35/0.30.
+        _s = 0.20 / (2.0**0.5)
+        return {
+            **base,
+            "sigma_x1": _s,
+            "sigma_x2": _s,
+            "cov_theta_amp1": 0.70,
+            "cov_theta_amp2": 0.60,
+        }
     if fam == "cosine_gmm":
         return {**base, "sigma_x1": 0.30, "sigma_x2": 0.30}
     if fam == "cos_sin_piecewise":

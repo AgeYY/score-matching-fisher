@@ -12,7 +12,7 @@ The dataset family token `randamp_gaussian_sqrtd_pr_autoencoder` is **removed** 
    python bin/make_dataset.py --dataset-family randamp_gaussian_sqrtd --x-dim 2 ... --output-npz data/lowdim.npz
    ```
 
-2. **Embed into high-dimensional observation space** (one two-panel figure next to the output NPZ: `pr_projection_summary.{png,svg}` — PCA of embedded `x` and PR-autoencoder loss vs epoch):
+2. **Embed into high-dimensional observation space** (one four-panel figure next to the output NPZ: `pr_projection_summary.{png,svg}` — same layout as `make_dataset.py` tuning + manifold + scatter for embedded $x$, plus PR-autoencoder loss vs epoch):
 
    ```bash
    python bin/project_dataset_pr_autoencoder.py \

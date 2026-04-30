@@ -10,6 +10,7 @@ from typing import Any
 
 import numpy as np
 
+from fisher.data import RANDAMP_SQRTD_VAR_MU_LAW_ADDITIVE
 from fisher.dataset_family_recipes import apply_family_recipe_to_namespace
 
 SHARED_DATASET_NPZ_VERSION = 2
@@ -60,8 +61,8 @@ def meta_dict_from_args(ns: Any) -> dict[str, Any]:
         "gauss_mu_amp": float(getattr(ns, "gauss_mu_amp", 1.0)),
         "gauss_kappa": float(getattr(ns, "gauss_kappa", 0.2)),
         "gauss_omega": float(getattr(ns, "gauss_omega", 1.0)),
-        "randamp_mu_low": float(getattr(ns, "randamp_mu_low", 0.5)),
-        "randamp_mu_high": float(getattr(ns, "randamp_mu_high", 1.5)),
+        "randamp_mu_low": float(getattr(ns, "randamp_mu_low", 0.2)),
+        "randamp_mu_high": float(getattr(ns, "randamp_mu_high", 2.0)),
         "randamp_kappa": float(getattr(ns, "randamp_kappa", 0.2)),
         "randamp_omega": float(getattr(ns, "randamp_omega", 1.0)),
         "seed": int(ns.seed),
@@ -123,6 +124,11 @@ def meta_dict_from_args(ns: Any) -> dict[str, Any]:
     out["pr_autoencoder_pr_eps"] = float(getattr(ns, "pr_autoencoder_pr_eps", 1e-8))
     out["pr_autoencoder_seed"] = int(getattr(ns, "pr_autoencoder_seed", int(ns.seed)))
     out["pr_autoencoder_cache_key"] = str(getattr(ns, "pr_autoencoder_cache_key", ""))
+    out["randamp_sqrtd_obs_var_mu_law"] = (
+        RANDAMP_SQRTD_VAR_MU_LAW_ADDITIVE
+        if str(getattr(ns, "dataset_family", "")) == "randamp_gaussian_sqrtd"
+        else None
+    )
     return out
 
 

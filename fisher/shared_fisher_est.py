@@ -15,6 +15,8 @@ import torch
 from global_setting import SCORE_VAL_FRACTION
 
 from fisher.data import (
+    RANDAMP_SQRTD_VAR_MU_LAW_ADDITIVE,
+    RANDAMP_SQRTD_VAR_MU_LAW_LEGACY,
     ToyConditionalGMMNonGaussianDataset,
     ToyConditionalGaussianDataset,
     ToyConditionalGaussianCosineRandampSqrtdDataset,
@@ -871,8 +873,8 @@ def build_dataset_from_meta(
             cov_theta_phase2=float(meta["cov_theta_phase2"]),
             cov_theta_phase_rho=float(meta["cov_theta_phase_rho"]),
             rho_clip=float(meta["rho_clip"]),
-            randamp_mu_low=float(meta.get("randamp_mu_low", 0.5)),
-            randamp_mu_high=float(meta.get("randamp_mu_high", 1.5)),
+            randamp_mu_low=float(meta.get("randamp_mu_low", 0.2)),
+            randamp_mu_high=float(meta.get("randamp_mu_high", 2.0)),
             randamp_kappa=float(meta.get("randamp_kappa", 0.2)),
             randamp_omega=float(meta.get("randamp_omega", 1.0)),
             randamp_mu_amp_per_dim=amps,
@@ -885,6 +887,17 @@ def build_dataset_from_meta(
             amps_sqrt = np.asarray(amps_raw, dtype=np.float64).reshape(-1)
         else:
             amps_sqrt = None
+        law_raw = meta.get("randamp_sqrtd_obs_var_mu_law")
+        if law_raw is None or str(law_raw).strip() == "":
+            sqrtd_law = RANDAMP_SQRTD_VAR_MU_LAW_LEGACY
+        else:
+            sqrtd_law = str(law_raw).strip()
+            if sqrtd_law not in (RANDAMP_SQRTD_VAR_MU_LAW_ADDITIVE, RANDAMP_SQRTD_VAR_MU_LAW_LEGACY):
+                raise ValueError(
+                    "meta['randamp_sqrtd_obs_var_mu_law'] must be "
+                    f"{RANDAMP_SQRTD_VAR_MU_LAW_ADDITIVE!r}, {RANDAMP_SQRTD_VAR_MU_LAW_LEGACY!r}, "
+                    f"or absent/None for legacy (got {law_raw!r})."
+                )
         return ToyConditionalGaussianRandampSqrtdDataset(
             theta_low=float(meta["theta_low"]),
             theta_high=float(meta["theta_high"]),
@@ -909,11 +922,12 @@ def build_dataset_from_meta(
             cov_theta_phase2=float(meta["cov_theta_phase2"]),
             cov_theta_phase_rho=float(meta["cov_theta_phase_rho"]),
             rho_clip=float(meta["rho_clip"]),
-            randamp_mu_low=float(meta.get("randamp_mu_low", 0.5)),
-            randamp_mu_high=float(meta.get("randamp_mu_high", 1.5)),
+            randamp_mu_low=float(meta.get("randamp_mu_low", 0.2)),
+            randamp_mu_high=float(meta.get("randamp_mu_high", 2.0)),
             randamp_kappa=float(meta.get("randamp_kappa", 0.2)),
             randamp_omega=float(meta.get("randamp_omega", 1.0)),
             randamp_mu_amp_per_dim=amps_sqrt,
+            randamp_sqrtd_obs_var_mu_law=sqrtd_law,
             seed=seed,
         )
     if family == "cosine_gmm":

@@ -27,11 +27,13 @@ def apply_matplotlib_defaults() -> None:
 
     mpl.rcParams.update(
         {
-            "xtick.labelsize": 16,
-            "ytick.labelsize": 16,
-            "axes.labelsize": 16,
-            "axes.titlesize": 16,
-            "axes.linewidth": 2.0,
+            "xtick.labelsize": 18,
+            "ytick.labelsize": 18,
+            "xtick.major.width": 2.0,
+            "ytick.major.width": 2.0,
+            "axes.labelsize": 20,
+            "axes.titlesize": 18,
+            "axes.linewidth": 3.0,
             "axes.spines.top": False,
             "axes.spines.right": False,
         }

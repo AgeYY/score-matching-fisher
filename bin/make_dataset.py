@@ -22,11 +22,14 @@ Run ``python bin/make_dataset.py --help`` for argparse defaults and exact wordin
     - ``cosine_gaussian_sqrtd_rand_tune`` — Like ``cosine_gaussian_sqrtd``, but each coordinate's
       cosine mean amplitude is multiplied by an independent factor drawn once from ``Uniform(0.5, 1.5)``
       (stored in NPZ meta as ``cosine_tune_amp_per_dim``).
-    - ``randamp_gaussian`` — Random-amplitude Gaussian bump means (per-dim amplitudes drawn once);
-      Gaussian observation noise (baseline 0.30). Realized amplitudes in NPZ meta as
-      ``randamp_mu_amp_per_dim``.
-    - ``randamp_gaussian_sqrtd`` — Same bump tuning as ``randamp_gaussian`` with sqrt-d noise scaling
-      (baseline 0.20). For high-dimensional observation space via a PR-autoencoder, generate this
+    - ``randamp_gaussian`` — Random-amplitude Gaussian bump means (per-dim amplitudes ``a_j`` drawn
+      once from ``Uniform(0.2, 2.0)``); Gaussian observation noise (baseline 0.30). Realized
+      amplitudes in NPZ meta as ``randamp_mu_amp_per_dim``.
+    - ``randamp_gaussian_sqrtd`` — Same bump tuning as ``randamp_gaussian`` with sqrt-d baseline
+      scaling; diagonal variance ``V_j = d * sigma_base_j**2 + alpha_j * abs(mu_j) + eps`` (NPZ meta
+      ``randamp_sqrtd_obs_var_mu_law``; legacy archives omit it). Baseline ``sigma_x1``/``sigma_x2``
+      default ``0.2/sqrt(2)`` with stronger ``cov_theta`` amps in the fixed recipe. For high-dimensional
+      observation space via a PR-autoencoder, generate this
       family at low ``--x-dim``, then run ``bin/project_dataset_pr_autoencoder.py``.
     - ``cosine_gmm`` — Cosine-like mean branch inside a theta-dependent two-component mixture (see
       ``ToyConditionalGMMNonGaussianDataset``).
@@ -64,7 +67,8 @@ Older composition flags (e.g. ``--tuning-curve-family``, ``--sigma-x1``, ``--ran
 **Outputs**
 
 - NPZ at ``--output-npz``.
-- ``joint_scatter_and_tuning_curve.png`` and ``.svg`` next to that NPZ (same directory).
+- ``joint_scatter_and_tuning_curve.png`` and ``.svg`` next to that NPZ (same directory; two panels:
+  tuning curves and PCA manifold with samples overlaid).
 
 **Implementation notes**
 
@@ -103,7 +107,7 @@ def parse_make_dataset_args(argv: list[str] | None = None) -> argparse.Namespace
     p = argparse.ArgumentParser(
         description=(
             "Sample a synthetic conditional dataset (theta, x), save a shared .npz for Fisher/score "
-            "pipelines, and emit joint scatter + tuning-curve figures. "
+            "pipelines, and emit joint scatter + tuning-curve + mean-PCA figures. "
             "Set the number of samples with --n-total / --num-samples. "
             "Choose the generative model with --dataset-family only; tuning and noise are fixed internally. "
             "Run with --help to view per-argument defaults."

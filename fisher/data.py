@@ -307,8 +307,8 @@ class ToyConditionalGaussianRandampDataset(ToyConditionalGaussianDataset):
     """
 
     tuning_curve_family: str = "cosine"  # unused; tuning is overridden below
-    randamp_mu_low: float = 0.5
-    randamp_mu_high: float = 1.5
+    randamp_mu_low: float = 0.2
+    randamp_mu_high: float = 2.0
     randamp_kappa: float = 0.2
     randamp_omega: float = 1.0
     randamp_mu_amp_per_dim: np.ndarray | None = field(default=None)
@@ -344,27 +344,88 @@ class ToyConditionalGaussianRandampDataset(ToyConditionalGaussianDataset):
         return -2.0 * self.randamp_kappa * self.randamp_omega * z * g
 
 
+# ``randamp_gaussian_sqrtd`` diagonal variance vs |mu| (stored in NPZ meta as ``randamp_sqrtd_obs_var_mu_law``).
+RANDAMP_SQRTD_VAR_MU_LAW_ADDITIVE = "additive_abs_mu"
+RANDAMP_SQRTD_VAR_MU_LAW_LEGACY = "legacy_multiplicative_sqrtd"
+
+
 @dataclass
 class ToyConditionalGaussianRandampSqrtdDataset(ToyConditionalGaussianRandampDataset):
-    """Same tuning as :class:`ToyConditionalGaussianRandampDataset`, but observation variance is
-    scaled by ``x_dim`` (noise std scales like ``sqrt(d)``), matching :class:`ToyConditionalGaussianSqrtdDataset`.
+    """Same tuning as :class:`ToyConditionalGaussianRandampDataset`, but observation variance uses
+    sqrt-``x_dim`` scaling (noise std grows like ``sqrt(d)`` in the baseline term).
 
-    Baseline ``sigma_x1``/``sigma_x2`` default to ``0.2`` (CLI ``make_dataset.py`` matches via
-    ``apply_sigma_defaults_for_dataset_family`` when sigmas are omitted).
+    Two diagonal variance laws (``randamp_sqrtd_obs_var_mu_law``):
+
+    - **Additive** (default for new datasets): ``V_j = d * sigma_base_j**2 + alpha_j * abs(mu_j) + eps``.
+    - **Legacy** (archives without meta key): ``V_j = d * sigma_base_j**2 * (1 + alpha_j * abs(mu_j)) + eps``.
+
+    ``self.cov`` / ``cov_chol`` remain a theta-agnostic snapshot for compatibility; sampling uses
+    :meth:`covariance`.
+
+    Baseline ``sigma_x1``/``sigma_x2`` on the dataclass default to ``0.2``; the
+    ``randamp_gaussian_sqrtd`` recipe in ``fisher.dataset_family_recipes`` may override them
+    (e.g. ``0.2/sqrt(2)`` with stronger ``cov_theta`` amps).
     """
 
     sigma_x1: float = 0.2
     sigma_x2: float = 0.2
+    randamp_sqrtd_obs_var_mu_law: str = RANDAMP_SQRTD_VAR_MU_LAW_ADDITIVE
 
     def __post_init__(self) -> None:
+        law = str(self.randamp_sqrtd_obs_var_mu_law)
+        if law not in (RANDAMP_SQRTD_VAR_MU_LAW_ADDITIVE, RANDAMP_SQRTD_VAR_MU_LAW_LEGACY):
+            raise ValueError(
+                "randamp_sqrtd_obs_var_mu_law must be "
+                f"{RANDAMP_SQRTD_VAR_MU_LAW_ADDITIVE!r} or {RANDAMP_SQRTD_VAR_MU_LAW_LEGACY!r} "
+                f"(got {law!r})."
+            )
+        self.randamp_sqrtd_obs_var_mu_law = law
         super().__post_init__()
         d = float(self.x_dim)
         self.cov = np.diag(self._sigma_base**2 * d) + 1e-8 * np.eye(self.x_dim, dtype=np.float64)
         self.cov_chol = np.linalg.cholesky(self.cov)
 
     def _variance_diag_from_mu(self, mu: np.ndarray) -> np.ndarray:
+        mu = np.asarray(mu, dtype=np.float64)
+        d = float(self.x_dim)
+        sb = self._sigma_base.reshape(1, -1)
+        alpha = self._sigma_activity_alpha.reshape(1, -1)
+        if self.randamp_sqrtd_obs_var_mu_law == RANDAMP_SQRTD_VAR_MU_LAW_ADDITIVE:
+            return d * (sb**2) + alpha * np.abs(mu) + 1e-8
         v = super()._variance_diag_from_mu(mu)
-        return v * float(self.x_dim)
+        return v * d
+
+    def covariance_scales_derivative(self, theta: np.ndarray) -> np.ndarray:
+        mu = self.tuning_curve(theta)
+        dmu = self.tuning_curve_derivative(theta)
+        v = self._variance_diag_from_mu(mu)
+        sgn = np.sign(mu)
+        sb = self._sigma_base.reshape(1, -1)
+        alpha = self._sigma_activity_alpha.reshape(1, -1)
+        d = float(self.x_dim)
+        if self.randamp_sqrtd_obs_var_mu_law == RANDAMP_SQRTD_VAR_MU_LAW_ADDITIVE:
+            dv = alpha * sgn * dmu
+        else:
+            dv = d * (sb**2) * alpha * sgn * dmu
+        return dv / (2.0 * np.sqrt(np.maximum(v, 1e-12)))
+
+    def covariance_derivative(self, theta: np.ndarray) -> np.ndarray:
+        mu = self.tuning_curve(theta)
+        dmu = self.tuning_curve_derivative(theta)
+        sb = self._sigma_base.reshape(1, -1)
+        alpha = self._sigma_activity_alpha.reshape(1, -1)
+        sgn = np.sign(mu)
+        v = self._variance_diag_from_mu(mu)
+        d = float(self.x_dim)
+        if self.randamp_sqrtd_obs_var_mu_law == RANDAMP_SQRTD_VAR_MU_LAW_ADDITIVE:
+            dv = alpha * sgn * dmu
+        else:
+            dv = d * (sb**2) * alpha * sgn * dmu
+        n = dv.shape[0]
+        dcov = np.zeros((n, self.x_dim, self.x_dim), dtype=np.float64)
+        for j in range(self.x_dim):
+            dcov[:, j, j] = dv[:, j]
+        return dcov
 
 
 @dataclass
