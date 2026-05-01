@@ -161,8 +161,24 @@ def family_recipe_dict(family: str) -> dict[str, Any]:
             **base,
             "sigma_x1": 0.50,
             "sigma_x2": 0.50,
-            "cosine_tune_amp_low": 0.5,
-            "cosine_tune_amp_high": 1.5,
+            # Stronger activity coupling (alpha = 0.5*(amp1+amp2)) vs base Gaussian recipe,
+            # aligned with randamp_gaussian_sqrtd for comparable |mu|-driven noise modulation.
+            "cov_theta_amp1": 0.70,
+            "cov_theta_amp2": 0.60,
+            "cosine_tune_amp_low": 0.2,
+            "cosine_tune_amp_high": 2.0,
+            "cosine_sqrtd_obs_var_mu_law": "legacy_multiplicative_sqrtd",
+        }
+    if fam == "cosine_gaussian_sqrtd_rand_tune_additive":
+        return {
+            **base,
+            "sigma_x1": 0.50,
+            "sigma_x2": 0.50,
+            "cov_theta_amp1": 0.70,
+            "cov_theta_amp2": 0.60,
+            "cosine_tune_amp_low": 0.2,
+            "cosine_tune_amp_high": 2.0,
+            "cosine_sqrtd_obs_var_mu_law": "additive_abs_mu",
         }
     if fam == "randamp_gaussian":
         return {**base, "sigma_x1": 0.30, "sigma_x2": 0.30}
@@ -242,10 +258,19 @@ def format_resolved_family_summary(ns: Any) -> str:
             f"  randamp bumps: low={r['randamp_mu_low']}, high={r['randamp_mu_high']}, "
             f"kappa={r['randamp_kappa']}, omega={r['randamp_omega']}"
         )
-    if fam == "cosine_gaussian_sqrtd_rand_tune":
+    if fam in ("cosine_gaussian_sqrtd_rand_tune", "cosine_gaussian_sqrtd_rand_tune_additive"):
+        law_note = (
+            "additive |mu| term (same law token as randamp_gaussian_sqrtd additive)"
+            if fam == "cosine_gaussian_sqrtd_rand_tune_additive"
+            else "legacy multiplicative (1+alpha|mu|) inside d*sigma^2 term"
+        )
+        cta_scale = float(getattr(ns, "cosine_tune_amp_scale", 1.0))
+        if not math.isfinite(cta_scale) or cta_scale <= 0.0:
+            cta_scale = 1.0
         lines.append(
-            f"  cosine per-dim amp: Uniform({r['cosine_tune_amp_low']}, {r['cosine_tune_amp_high']}) "
-            "(fixed across samples; stored in NPZ meta)"
+            f"  cosine per-dim amp (randamp-style range): Uniform({r['cosine_tune_amp_low']}, "
+            f"{r['cosine_tune_amp_high']}) * cosine_tune_amp_scale={cta_scale} (after draw; fixed across samples; "
+            f"stored in NPZ meta as cosine_tune_amp_per_dim); sqrt-d variance law: {law_note}"
         )
     if fam == "cosine_gaussian_const_noise":
         lines.append("  constant noise: cov_theta_amp1=cov_theta_amp2=0 (no activity-coupled variance modulation)")

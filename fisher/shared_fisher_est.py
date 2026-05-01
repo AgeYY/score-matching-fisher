@@ -806,13 +806,27 @@ def build_dataset_from_meta(
             rho_clip=float(meta["rho_clip"]),
             seed=seed,
         )
-    if family == "cosine_gaussian_sqrtd_rand_tune":
+    if family in ("cosine_gaussian_sqrtd_rand_tune", "cosine_gaussian_sqrtd_rand_tune_additive"):
         cta_raw = meta.get("cosine_tune_amp_per_dim")
         cta: np.ndarray | None
         if cta_raw is not None:
             cta = np.asarray(cta_raw, dtype=np.float64).reshape(-1)
         else:
             cta = None
+        if family == "cosine_gaussian_sqrtd_rand_tune_additive":
+            cos_law = RANDAMP_SQRTD_VAR_MU_LAW_ADDITIVE
+        else:
+            law_raw = meta.get("cosine_sqrtd_obs_var_mu_law")
+            if law_raw is None or str(law_raw).strip() == "":
+                cos_law = RANDAMP_SQRTD_VAR_MU_LAW_LEGACY
+            else:
+                cos_law = str(law_raw).strip()
+                if cos_law not in (RANDAMP_SQRTD_VAR_MU_LAW_ADDITIVE, RANDAMP_SQRTD_VAR_MU_LAW_LEGACY):
+                    raise ValueError(
+                        "meta['cosine_sqrtd_obs_var_mu_law'] must be "
+                        f"{RANDAMP_SQRTD_VAR_MU_LAW_ADDITIVE!r}, {RANDAMP_SQRTD_VAR_MU_LAW_LEGACY!r}, "
+                        f"or absent/None for legacy (got {law_raw!r})."
+                    )
         return ToyConditionalGaussianCosineRandampSqrtdDataset(
             theta_low=float(meta["theta_low"]),
             theta_high=float(meta["theta_high"]),
@@ -840,6 +854,8 @@ def build_dataset_from_meta(
             cosine_tune_amp_low=float(meta.get("cosine_tune_amp_low", 0.5)),
             cosine_tune_amp_high=float(meta.get("cosine_tune_amp_high", 1.5)),
             cosine_tune_amp_per_dim=cta,
+            cosine_tune_amp_scale=float(meta.get("cosine_tune_amp_scale", 1.0)),
+            cosine_sqrtd_obs_var_mu_law=cos_law,
             seed=seed,
         )
     if family == "randamp_gaussian":
@@ -1002,6 +1018,9 @@ def validate_dataset_sample_args(args: Any) -> None:
     _ons = float(getattr(args, "obs_noise_scale", 1.0))
     if not math.isfinite(_ons) or _ons <= 0.0:
         raise ValueError("--obs-noise-scale must be a finite positive number.")
+    _cta_s = float(getattr(args, "cosine_tune_amp_scale", 1.0))
+    if not math.isfinite(_cta_s) or _cta_s <= 0.0:
+        raise ValueError("--cosine-tune-amp-scale must be a finite positive number.")
     if args.x_dim < 1:
         raise ValueError("--x-dim must be >= 1.")
     if str(getattr(args, "dataset_family", "")) in (
@@ -3488,6 +3507,7 @@ def run_shared_fisher_estimation(
         "cosine_gaussian_const_noise",
         "cosine_gaussian_sqrtd",
         "cosine_gaussian_sqrtd_rand_tune",
+        "cosine_gaussian_sqrtd_rand_tune_additive",
         "randamp_gaussian",
         "randamp_gaussian_sqrtd",
         "cos_sin_piecewise",
@@ -3881,6 +3901,7 @@ def run_shared_fisher_estimation(
             "cosine_gaussian_const_noise",
             "cosine_gaussian_sqrtd",
             "cosine_gaussian_sqrtd_rand_tune",
+            "cosine_gaussian_sqrtd_rand_tune_additive",
             "randamp_gaussian",
             "randamp_gaussian_sqrtd",
         ):

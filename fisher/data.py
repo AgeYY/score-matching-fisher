@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import ClassVar
 
@@ -18,6 +19,11 @@ def _theta_col(theta: np.ndarray) -> np.ndarray:
 def _tuning_centers_uniform_theta(theta_low: float, theta_high: float, x_dim: int) -> np.ndarray:
     """Per-dimension centers in theta, uniform on [theta_low, theta_high] (inclusive endpoints)."""
     return np.linspace(theta_low, theta_high, x_dim, dtype=np.float64)
+
+
+# ``randamp_gaussian_sqrtd`` / ``cosine_gaussian_sqrtd_rand_tune*`` diagonal variance vs |mu|.
+RANDAMP_SQRTD_VAR_MU_LAW_ADDITIVE = "additive_abs_mu"
+RANDAMP_SQRTD_VAR_MU_LAW_LEGACY = "legacy_multiplicative_sqrtd"
 
 
 @dataclass
@@ -254,16 +260,33 @@ class ToyConditionalGaussianCosineRandampSqrtdDataset(ToyConditionalGaussianSqrt
 
     Mean: ``mu_j(theta) = a_j * cos(omega * theta + phi_j)`` where each ``a_j`` is drawn once at
     init, ``a_j ~ Uniform(cosine_tune_amp_low, cosine_tune_amp_high)``, unless
-    ``cosine_tune_amp_per_dim`` is supplied (e.g. from saved NPZ meta).
+    ``cosine_tune_amp_per_dim`` is supplied (e.g. from saved NPZ meta). When amplitudes are drawn
+    (not supplied), the vector is multiplied by ``cosine_tune_amp_scale`` (default ``1.0``) after
+    the Uniform draw; supplied ``cosine_tune_amp_per_dim`` is already final and is not scaled again.
 
-    Observation variance uses the same sqrt-``x_dim`` scaling as :class:`ToyConditionalGaussianSqrtdDataset`.
+    Diagonal variance vs ``|mu|`` (``cosine_sqrtd_obs_var_mu_law``), same two laws as
+    :class:`ToyConditionalGaussianRandampSqrtdDataset`:
+
+    - **Legacy** (default): ``V_j = d * sigma_base_j**2 * (1 + alpha_j * |mu_j|) + d*eps`` (same as
+      :class:`ToyConditionalGaussianSqrtdDataset` on this mean).
+    - **Additive**: ``V_j = d * sigma_base_j**2 + alpha_j * |mu_j| + eps``.
     """
 
     cosine_tune_amp_low: float = 0.5
     cosine_tune_amp_high: float = 1.5
     cosine_tune_amp_per_dim: np.ndarray | None = field(default=None)
+    cosine_tune_amp_scale: float = 1.0
+    cosine_sqrtd_obs_var_mu_law: str = RANDAMP_SQRTD_VAR_MU_LAW_LEGACY
 
     def __post_init__(self) -> None:
+        law = str(self.cosine_sqrtd_obs_var_mu_law)
+        if law not in (RANDAMP_SQRTD_VAR_MU_LAW_ADDITIVE, RANDAMP_SQRTD_VAR_MU_LAW_LEGACY):
+            raise ValueError(
+                "cosine_sqrtd_obs_var_mu_law must be "
+                f"{RANDAMP_SQRTD_VAR_MU_LAW_ADDITIVE!r} or {RANDAMP_SQRTD_VAR_MU_LAW_LEGACY!r} "
+                f"(got {law!r})."
+            )
+        self.cosine_sqrtd_obs_var_mu_law = law
         if not (self.cosine_tune_amp_low < self.cosine_tune_amp_high):
             raise ValueError("cosine_tune_amp_low must be < cosine_tune_amp_high.")
         super().__post_init__()
@@ -277,6 +300,10 @@ class ToyConditionalGaussianCosineRandampSqrtdDataset(ToyConditionalGaussianSqrt
             self._cosine_tune_amp = self.rng.uniform(
                 self.cosine_tune_amp_low, self.cosine_tune_amp_high, size=(self.x_dim,)
             ).astype(np.float64)
+            s = float(self.cosine_tune_amp_scale)
+            if not math.isfinite(s) or s <= 0.0:
+                raise ValueError("cosine_tune_amp_scale must be a finite positive number.")
+            self._cosine_tune_amp *= s
 
     def tuning_curve(self, theta: np.ndarray) -> np.ndarray:
         if self.tuning_curve_family != "cosine":
@@ -291,6 +318,47 @@ class ToyConditionalGaussianCosineRandampSqrtdDataset(ToyConditionalGaussianSqrt
         t = _theta_col(theta)
         ph = self._mu_phases.reshape(1, -1)
         return self._cosine_tune_amp.reshape(1, -1) * (-self._mu_omega * np.sin(self._mu_omega * t + ph))
+
+    def _variance_diag_from_mu(self, mu: np.ndarray) -> np.ndarray:
+        mu = np.asarray(mu, dtype=np.float64)
+        d = float(self.x_dim)
+        sb = self._sigma_base.reshape(1, -1)
+        alpha = self._sigma_activity_alpha.reshape(1, -1)
+        if self.cosine_sqrtd_obs_var_mu_law == RANDAMP_SQRTD_VAR_MU_LAW_ADDITIVE:
+            return d * (sb**2) + alpha * np.abs(mu) + 1e-8
+        return super()._variance_diag_from_mu(mu)
+
+    def covariance_scales_derivative(self, theta: np.ndarray) -> np.ndarray:
+        mu = self.tuning_curve(theta)
+        dmu = self.tuning_curve_derivative(theta)
+        v = self._variance_diag_from_mu(mu)
+        sgn = np.sign(mu)
+        sb = self._sigma_base.reshape(1, -1)
+        alpha = self._sigma_activity_alpha.reshape(1, -1)
+        d = float(self.x_dim)
+        if self.cosine_sqrtd_obs_var_mu_law == RANDAMP_SQRTD_VAR_MU_LAW_ADDITIVE:
+            dv = alpha * sgn * dmu
+        else:
+            dv = d * (sb**2) * alpha * sgn * dmu
+        return dv / (2.0 * np.sqrt(np.maximum(v, 1e-12)))
+
+    def covariance_derivative(self, theta: np.ndarray) -> np.ndarray:
+        mu = self.tuning_curve(theta)
+        dmu = self.tuning_curve_derivative(theta)
+        sb = self._sigma_base.reshape(1, -1)
+        alpha = self._sigma_activity_alpha.reshape(1, -1)
+        sgn = np.sign(mu)
+        v = self._variance_diag_from_mu(mu)
+        d = float(self.x_dim)
+        if self.cosine_sqrtd_obs_var_mu_law == RANDAMP_SQRTD_VAR_MU_LAW_ADDITIVE:
+            dv = alpha * sgn * dmu
+        else:
+            dv = d * (sb**2) * alpha * sgn * dmu
+        n = dv.shape[0]
+        dcov = np.zeros((n, self.x_dim, self.x_dim), dtype=np.float64)
+        for j in range(self.x_dim):
+            dcov[:, j, j] = dv[:, j]
+        return dcov
 
 
 @dataclass
@@ -342,11 +410,6 @@ class ToyConditionalGaussianRandampDataset(ToyConditionalGaussianDataset):
         z = self.randamp_omega * (t - tc)
         g = self._randamp_amp.reshape(1, -1) * np.exp(-self.randamp_kappa * (z**2))
         return -2.0 * self.randamp_kappa * self.randamp_omega * z * g
-
-
-# ``randamp_gaussian_sqrtd`` diagonal variance vs |mu| (stored in NPZ meta as ``randamp_sqrtd_obs_var_mu_law``).
-RANDAMP_SQRTD_VAR_MU_LAW_ADDITIVE = "additive_abs_mu"
-RANDAMP_SQRTD_VAR_MU_LAW_LEGACY = "legacy_multiplicative_sqrtd"
 
 
 @dataclass

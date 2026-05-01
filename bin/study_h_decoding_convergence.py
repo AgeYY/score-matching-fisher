@@ -383,6 +383,7 @@ def build_parser() -> argparse.ArgumentParser:
             "cosine_gaussian_const_noise",
             "cosine_gaussian_sqrtd",
             "cosine_gaussian_sqrtd_rand_tune",
+            "cosine_gaussian_sqrtd_rand_tune_additive",
             "randamp_gaussian",
             "randamp_gaussian_sqrtd",
             "cosine_gmm",
@@ -858,7 +859,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=65536,
         help="gaussian-x-flow only: approximate pair budget per C-matrix block (rows*cols).",
     )
-    p.add_argument("--lxf-epochs", type=int, default=10000, help="linear-x-flow only: training epochs.")
+    p.add_argument("--lxf-epochs", type=int, default=50000, help="linear-x-flow only: training epochs.")
     p.add_argument("--lxf-batch-size", type=int, default=1024, help="linear-x-flow only: training batch size.")
     p.add_argument("--lxf-lr", type=float, default=1e-4, help="linear-x-flow only: learning rate.")
     p.add_argument("--lxf-hidden-dim", type=int, default=128, help="linear-x-flow only: b_phi MLP hidden width.")

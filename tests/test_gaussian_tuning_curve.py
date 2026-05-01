@@ -11,13 +11,18 @@ import numpy as np
 
 from fisher.cli_shared_fisher import add_dataset_arguments
 from fisher.data import (
+    ToyConditionalGaussianCosineRandampSqrtdDataset,
     ToyConditionalGaussianDataset,
     ToyConditionalGaussianRandampDataset,
     ToyConditionalGaussianRandampSqrtdDataset,
     ToyConditionalGaussianSqrtdDataset,
     _tuning_centers_uniform_theta,
 )
-from fisher.dataset_family_recipes import assert_no_legacy_dataset_cli_flags
+from fisher.dataset_family_recipes import (
+    assert_no_legacy_dataset_cli_flags,
+    family_recipe_dict,
+    format_resolved_family_summary,
+)
 from fisher.pr_autoencoder_embedding import build_randamp_gaussian_sqrtd_pr_autoencoder_dataset
 from fisher.shared_dataset_io import load_shared_dataset_npz, meta_dict_from_args, save_shared_dataset_npz
 from fisher.shared_fisher_est import build_dataset_from_args, build_dataset_from_meta, validate_dataset_sample_args
@@ -318,6 +323,119 @@ class TestGaussianTuningCurve(unittest.TestCase):
         self.assertEqual(theta.shape, (32, 1))
         self.assertEqual(x.shape, (32, int(ns.x_dim)))
         self.assertTrue(np.isfinite(x).all())
+
+    def test_family_recipe_cosine_sqrtd_rand_tune_uses_randamp_gain_bounds(self) -> None:
+        r = family_recipe_dict("cosine_gaussian_sqrtd_rand_tune")
+        self.assertAlmostEqual(float(r["cosine_tune_amp_low"]), 0.2, places=12)
+        self.assertAlmostEqual(float(r["cosine_tune_amp_high"]), 2.0, places=12)
+        self.assertAlmostEqual(float(r["cov_theta_amp1"]), 0.70, places=12)
+        self.assertAlmostEqual(float(r["cov_theta_amp2"]), 0.60, places=12)
+        self.assertEqual(r["cosine_sqrtd_obs_var_mu_law"], "legacy_multiplicative_sqrtd")
+        r_add = family_recipe_dict("cosine_gaussian_sqrtd_rand_tune_additive")
+        self.assertAlmostEqual(float(r_add["cov_theta_amp1"]), 0.70, places=12)
+        self.assertAlmostEqual(float(r_add["cov_theta_amp2"]), 0.60, places=12)
+
+    def test_format_resolved_family_summary_rand_tune_includes_gain_range(self) -> None:
+        ns = _ns(dataset_family="cosine_gaussian_sqrtd_rand_tune")
+        validate_dataset_sample_args(ns)
+        summary = format_resolved_family_summary(ns)
+        self.assertIn("0.2", summary)
+        self.assertIn("2.0", summary)
+        self.assertIn("randamp-style", summary)
+        self.assertIn("legacy multiplicative", summary)
+        self.assertIn("cosine_tune_amp_scale=1.0", summary)
+
+    def test_family_recipe_cosine_sqrtd_rand_tune_variance_laws(self) -> None:
+        r_leg = family_recipe_dict("cosine_gaussian_sqrtd_rand_tune")
+        r_add = family_recipe_dict("cosine_gaussian_sqrtd_rand_tune_additive")
+        self.assertEqual(r_leg["cosine_sqrtd_obs_var_mu_law"], "legacy_multiplicative_sqrtd")
+        self.assertEqual(r_add["cosine_sqrtd_obs_var_mu_law"], "additive_abs_mu")
+
+    def test_cosine_rand_tune_additive_vs_legacy_variance_diagonal(self) -> None:
+        from fisher.data import RANDAMP_SQRTD_VAR_MU_LAW_ADDITIVE, RANDAMP_SQRTD_VAR_MU_LAW_LEGACY
+
+        ns_a = _ns(
+            dataset_family="cosine_gaussian_sqrtd_rand_tune_additive",
+            x_dim=4,
+            n_total=8,
+            train_frac=1.0,
+            seed=41,
+        )
+        validate_dataset_sample_args(ns_a)
+        meta_a = meta_dict_from_args(ns_a)
+        meta_a["cosine_tune_amp_per_dim"] = [1.0, 1.0, 1.0, 1.0]
+        ds_a = build_dataset_from_meta(meta_a)
+        self.assertEqual(ds_a.cosine_sqrtd_obs_var_mu_law, RANDAMP_SQRTD_VAR_MU_LAW_ADDITIVE)
+
+        ns_l = _ns(
+            dataset_family="cosine_gaussian_sqrtd_rand_tune",
+            x_dim=4,
+            n_total=8,
+            train_frac=1.0,
+            seed=41,
+        )
+        validate_dataset_sample_args(ns_l)
+        meta_l = meta_dict_from_args(ns_l)
+        meta_l["cosine_tune_amp_per_dim"] = [1.0, 1.0, 1.0, 1.0]
+        ds_l = build_dataset_from_meta(meta_l)
+        self.assertEqual(ds_l.cosine_sqrtd_obs_var_mu_law, RANDAMP_SQRTD_VAR_MU_LAW_LEGACY)
+
+        t0 = np.array([[0.3]])
+        mu_a = ds_a.tuning_curve(t0)
+        mu_l = ds_l.tuning_curve(t0)
+        np.testing.assert_allclose(mu_a, mu_l, rtol=0, atol=1e-15)
+        v_a = ds_a._variance_diag_from_mu(mu_a)
+        v_l = ds_l._variance_diag_from_mu(mu_l)
+        self.assertFalse(np.allclose(v_a, v_l, rtol=0, atol=1e-9))
+
+    def test_cosine_sqrtd_rand_tune_gains_in_range_and_reproducible(self) -> None:
+        ns = _ns(
+            dataset_family="cosine_gaussian_sqrtd_rand_tune",
+            x_dim=6,
+            n_total=32,
+            train_frac=1.0,
+            seed=202,
+        )
+        validate_dataset_sample_args(ns)
+        ds1 = build_dataset_from_args(ns)
+        self.assertIsInstance(ds1, ToyConditionalGaussianCosineRandampSqrtdDataset)
+        amps = ds1._cosine_tune_amp
+        self.assertEqual(amps.shape, (6,))
+        self.assertTrue(np.all(amps >= 0.2 - 1e-12))
+        self.assertTrue(np.all(amps <= 2.0 + 1e-12))
+        ds2 = build_dataset_from_args(ns)
+        np.testing.assert_allclose(ds1._cosine_tune_amp, ds2._cosine_tune_amp, rtol=0, atol=0)
+
+    def test_cosine_tune_amp_scale_doubles_drawn_gains(self) -> None:
+        base = dict(
+            dataset_family="cosine_gaussian_sqrtd_rand_tune_additive",
+            x_dim=5,
+            n_total=8,
+            train_frac=1.0,
+            seed=99,
+        )
+        ns1 = _ns(**base)
+        setattr(ns1, "cosine_tune_amp_scale", 1.0)
+        validate_dataset_sample_args(ns1)
+        ds1 = build_dataset_from_args(ns1)
+        ns2 = _ns(**base)
+        setattr(ns2, "cosine_tune_amp_scale", 2.0)
+        validate_dataset_sample_args(ns2)
+        ds2 = build_dataset_from_args(ns2)
+        np.testing.assert_allclose(ds2._cosine_tune_amp, 2.0 * ds1._cosine_tune_amp, rtol=0, atol=0)
+
+    def test_cosine_gaussian_sqrtd_not_random_gain_variant(self) -> None:
+        ns = _ns(
+            dataset_family="cosine_gaussian_sqrtd",
+            x_dim=3,
+            n_total=16,
+            train_frac=1.0,
+            seed=7,
+        )
+        validate_dataset_sample_args(ns)
+        ds = build_dataset_from_args(ns)
+        self.assertIsInstance(ds, ToyConditionalGaussianSqrtdDataset)
+        self.assertNotIsInstance(ds, ToyConditionalGaussianCosineRandampSqrtdDataset)
 
     def test_meta_roundtrip_gaussian_sqrtd(self) -> None:
         ns = _ns(

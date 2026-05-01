@@ -34,6 +34,7 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
             "cosine_gaussian_const_noise",
             "cosine_gaussian_sqrtd",
             "cosine_gaussian_sqrtd_rand_tune",
+            "cosine_gaussian_sqrtd_rand_tune_additive",
             "randamp_gaussian",
             "randamp_gaussian_sqrtd",
             "cosine_gmm",
@@ -46,7 +47,10 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
             "'cosine_gaussian_const_noise' (cosine means + constant Gaussian obs. noise); "
             "'cosine_gaussian_sqrtd' (same means; obs. noise std scales by sqrt(x_dim)); "
             "'cosine_gaussian_sqrtd_rand_tune' (like cosine_gaussian_sqrtd but per-dim cosine "
-            "amplitudes drawn once from Uniform(0.5, 1.5)); "
+            "amplitudes drawn once from Uniform(0.2, 2.0), same range as randamp families; "
+            "legacy sqrt-d variance d*sigma^2*(1+alpha|mu|)); "
+            "'cosine_gaussian_sqrtd_rand_tune_additive' (same random cosine gains; sqrt-d variance "
+            "d*sigma^2 + alpha*|mu|, matching randamp_gaussian_sqrtd additive law); "
             "'randamp_gaussian' (Gaussian bumps with per-dim amp a_j~Uniform(0.2,2.0) + Gaussian obs. noise); "
             "'randamp_gaussian_sqrtd' (same bumps with sqrt-d baseline; diag variance d*sigma^2 + alpha*|mu|; "
             "NPZ meta randamp_sqrtd_obs_var_mu_law). "
@@ -100,6 +104,16 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
             "after applying --dataset-family (default 1.0). Example: 0.5 halves Gaussian observation noise."
         ),
     )
+    p.add_argument(
+        "--cosine-tune-amp-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "For cosine_gaussian_sqrtd_rand_tune / _additive only: multiplies each per-dimension "
+            "cosine mean amplitude after the family-fixed Uniform(0.2, 2.0) draw (default 1.0). "
+            "Ignored for other families except being stored in NPZ meta. Example: 2.0 doubles tuning gains."
+        ),
+    )
 
 
 def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
@@ -117,7 +131,7 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         ),
     )
 
-    p.add_argument("--score-epochs", type=int, default=10000)
+    p.add_argument("--score-epochs", type=int, default=50000)
     p.add_argument("--score-batch-size", type=int, default=1024)
     p.add_argument("--score-lr", type=float, default=1e-3)
     p.add_argument("--score-hidden-dim", type=int, default=128)
@@ -256,7 +270,7 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--flow-epochs",
         type=int,
-        default=10000,
+        default=50000,
         help=(
             "FM velocity pretraining epochs for flow-based fields. "
             "theta_flow: use 0 to skip pretraining and rely on --flow-likelihood-finetune-epochs (NLL) only."
@@ -791,7 +805,7 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
         choices=["posterior_only", "posterior_minus_prior"],
         help="When prior score is trained: which curve to treat as primary vs GT (combined uses s_post - s_prior).",
     )
-    p.add_argument("--prior-epochs", type=int, default=10000)
+    p.add_argument("--prior-epochs", type=int, default=50000)
     p.add_argument("--prior-batch-size", type=int, default=1024)
     p.add_argument("--prior-lr", type=float, default=1e-3)
     p.add_argument("--prior-hidden-dim", type=int, default=128)

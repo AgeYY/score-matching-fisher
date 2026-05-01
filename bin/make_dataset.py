@@ -19,9 +19,12 @@ Run ``python bin/make_dataset.py --help`` for argparse defaults and exact wordin
       activity-coupled variance modulation; baseline sigmas 0.50).
     - ``cosine_gaussian_sqrtd`` — Same cosine means; noise variance scaled by ``x_dim`` (baseline
       sigmas 0.50) so std ~ sqrt(d).
-    - ``cosine_gaussian_sqrtd_rand_tune`` — Like ``cosine_gaussian_sqrtd``, but each coordinate's
-      cosine mean amplitude is multiplied by an independent factor drawn once from ``Uniform(0.5, 1.5)``
-      (stored in NPZ meta as ``cosine_tune_amp_per_dim``).
+    - ``cosine_gaussian_sqrtd_rand_tune`` / ``cosine_gaussian_sqrtd_rand_tune_additive`` — Like
+      ``cosine_gaussian_sqrtd``, but per-dim cosine mean gains from ``Uniform(0.2, 2.0)``; activity
+      ``alpha = 0.5*(cov_theta_amp1+cov_theta_amp2)`` uses the same stronger ``cov_theta`` amps as
+      ``randamp_gaussian_sqrtd`` (0.70 / 0.60). The ``_additive`` family uses
+      ``V_j = d*sigma^2 + alpha*|mu_j|`` (randamp-style additive law); the base token uses legacy
+      ``V_j = d*sigma^2*(1+alpha*|mu_j|)``.
     - ``randamp_gaussian`` — Random-amplitude Gaussian bump means (per-dim amplitudes ``a_j`` drawn
       once from ``Uniform(0.2, 2.0)``); Gaussian observation noise (baseline 0.30). Realized
       amplitudes in NPZ meta as ``randamp_mu_amp_per_dim``.
@@ -53,6 +56,10 @@ Run ``python bin/make_dataset.py --help`` for argparse defaults and exact wordin
 
 - ``--obs-noise-scale`` (default 1.0) — Multiplies the family-fixed baseline ``sigma_x1`` / ``sigma_x2``
   (e.g. ``0.5`` halves observation noise relative to the default recipe).
+
+- ``--cosine-tune-amp-scale`` (default 1.0) — For ``cosine_gaussian_sqrtd_rand_tune`` / ``_additive`` only:
+  multiplies each per-dimension cosine mean amplitude after the family-fixed ``Uniform(0.2, 2.0)`` draw
+  (e.g. ``2.0`` doubles tuning gains and widens theta-dependent observation-noise spread).
 
 - ``--output-npz`` — Path to the written archive (default under ``global_setting.DATA_DIR`` /
   ``SCORE_MATCHING_FISHER_DATAROOT``). Contains ``theta_all``, ``x_all``, indices, splits, and
@@ -162,7 +169,10 @@ def main() -> None:
         "randamp_gaussian_sqrtd",
     ):
         meta["randamp_mu_amp_per_dim"] = dataset._randamp_amp.tolist()
-    if str(args.dataset_family) == "cosine_gaussian_sqrtd_rand_tune":
+    if str(args.dataset_family) in (
+        "cosine_gaussian_sqrtd_rand_tune",
+        "cosine_gaussian_sqrtd_rand_tune_additive",
+    ):
         meta["cosine_tune_amp_per_dim"] = dataset._cosine_tune_amp.tolist()
     save_shared_dataset_npz(
         args.output_npz,

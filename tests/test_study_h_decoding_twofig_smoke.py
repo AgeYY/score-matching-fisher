@@ -113,6 +113,7 @@ class TestStudyHDecodingTwoFigSmoke(unittest.TestCase):
             self.assertTrue((out_dir / "h_decoding_twofig_sweep.svg").is_file())
             self.assertTrue((out_dir / "h_decoding_twofig_gt.svg").is_file())
             self.assertTrue((out_dir / "h_decoding_twofig_corr_vs_n.svg").is_file())
+            self.assertTrue((out_dir / "h_decoding_twofig_nmse_vs_n.svg").is_file())
             self.assertTrue((out_dir / "h_decoding_twofig_training_losses_panel.svg").is_file())
             self.assertTrue((out_dir / "h_decoding_twofig_results.npz").is_file())
             self.assertTrue((out_dir / "h_decoding_twofig_summary.txt").is_file())
@@ -125,6 +126,8 @@ class TestStudyHDecodingTwoFigSmoke(unittest.TestCase):
             self.assertEqual(tuple(z["h_binned_sweep"].shape), (2, 2, n_bins, n_bins))
             self.assertEqual(tuple(z["decode_sweep"].shape), (2, n_bins, n_bins))
             self.assertEqual(tuple(z["corr_h_binned_vs_gt_mc"].shape), (2, 2))
+            self.assertEqual(tuple(z["nmse_h_binned_vs_gt_mc"].shape), (2, 2))
+            self.assertEqual(tuple(z["nmse_decode_vs_ref_shared"].shape), (2,))
             self.assertEqual(tuple(z["corr_decode_vs_ref_shared"].shape), (2,))
             self.assertEqual(tuple(z["wall_seconds"].shape), (2, 2))
             self.assertEqual(tuple(z["h_gt_sqrt"].shape), (n_bins, n_bins))
@@ -137,6 +140,8 @@ class TestStudyHDecodingTwoFigSmoke(unittest.TestCase):
             self.assertIn("training_losses_root", z.files)
             self.assertIn("training_losses_panel_svg", z.files)
             self.assertIn("corr_curve_svg", z.files)
+            self.assertIn("nmse_curve_svg", z.files)
+            self.assertIn("nmse_decode_vs_ref_shared", z.files)
 
     def test_twofig_backward_compat_single_method_shape(self) -> None:
         repo = Path(__file__).resolve().parent.parent
@@ -191,6 +196,8 @@ class TestStudyHDecodingTwoFigSmoke(unittest.TestCase):
             z = np.load(out_dir / "h_decoding_twofig_results.npz", allow_pickle=True)
             self.assertEqual(tuple(z["h_binned_sweep"].shape), (1, 2, 5, 5))
             self.assertEqual(tuple(z["decode_sweep"].shape), (2, 5, 5))
+            self.assertEqual(tuple(z["nmse_h_binned_vs_gt_mc"].shape), (1, 2))
+            self.assertEqual(tuple(z["nmse_decode_vs_ref_shared"].shape), (2,))
             self.assertEqual(tuple(z["wall_seconds"].shape), (1, 2))
             np.testing.assert_array_equal(z["theta_field_methods"], np.asarray(["theta_flow"], dtype=np.str_))
 

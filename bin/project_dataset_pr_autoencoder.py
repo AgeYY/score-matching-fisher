@@ -14,7 +14,7 @@ the low-dimensional generative model use :func:`fisher.shared_fisher_est.build_d
 Unless ``--skip-viz``, writes ``pr_projection_summary.{png,svg}`` next to ``--output-npz``:
 same two-panel native layout as ``make_dataset.py`` (tuning curves, binned empirical mean of
 embedded samples with scatter overlaid in PCA), plus a third panel with PR-autoencoder training
-loss vs epoch.
+loss vs epoch. The PCA scatter uses at most ``--pr-viz-scatter-max`` points (default 400).
 """
 
 from __future__ import annotations
@@ -95,7 +95,7 @@ def _save_projection_summary_figure(
     out_dir: Path,
     base_dataset: Any,
     *,
-    scatter_max_points: int | None = 800,
+    scatter_max_points: int | None = 400,
     scatter_subsample_seed: int = 0,
     pr_viz_mean_bins: int = 60,
     pr_viz_mean_smooth_window: int = 3,
@@ -196,7 +196,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--pr-viz-scatter-max",
         type=int,
-        default=800,
+        default=400,
         metavar="N",
         help=(
             "Max number of (theta, x) rows subsampled for the PCA scatter in pr_projection_summary "
