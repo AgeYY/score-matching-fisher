@@ -16,23 +16,18 @@ from fisher.linear_x_flow import (
     ConditionalRandomBasisLowRankLinearXFlowMLP,
     ConditionalScalarLinearXFlowMLP,
     ConditionalThetaDiagonalLinearXFlowMLP,
-    ConditionalThetaDiagonalSplineLinearXFlowMLP,
     ConditionalTimeDiagonalLinearXFlowMLP,
     _phi_expm1_div_a,
-    bspline_basis_phi_batch,
     compute_linear_x_flow_analytic_hellinger_matrix,
     compute_linear_x_flow_c_matrix,
     compute_time_diagonal_linear_x_flow_c_matrix,
-    estimate_binned_gaussian_shared_diagonal_covariance,
     fit_residual_pca_basis_from_linear_mean,
     gaussian_hellinger_sq_diag,
     gaussian_hellinger_sq_diag_matrix,
     gaussian_hellinger_sq_full,
     gaussian_hellinger_sq_shared_covariance_matrix,
-    open_uniform_clamped_knot_vector,
     train_linear_x_flow,
     train_pca_nonlinear_linear_x_flow,
-    train_linear_x_flow_schedule,
     train_time_diagonal_linear_x_flow_schedule,
 )
 from fisher.gaussian_x_flow import path_schedule_from_name
@@ -265,120 +260,6 @@ class TestLinearXFlow(unittest.TestCase):
         self.assertEqual(c.shape, (n, n))
         self.assertTrue(np.all(np.isfinite(c)))
 
-    def test_bspline_basis_partition_of_unity_and_nonneg(self) -> None:
-        knots = open_uniform_clamped_knot_vector(5, degree=3, dtype=torch.float64)
-        u = torch.linspace(0.01, 0.99, steps=50, dtype=torch.float64)
-        phi = bspline_basis_phi_batch(u, knots, degree=3)
-        self.assertEqual(tuple(phi.shape), (50, 5))
-        self.assertTrue(torch.all(phi >= -1e-10))
-        sums = torch.sum(phi, dim=1)
-        self.assertTrue(torch.allclose(sums, torch.ones_like(sums), atol=1e-5, rtol=1e-5))
-
-    def test_bspline_matches_scipy_when_available(self) -> None:
-        try:
-            from scipy.interpolate import BSpline as _BSpline  # type: ignore[import-not-found]
-        except Exception:  # pragma: no cover
-            self.skipTest("scipy not available")
-        knots = open_uniform_clamped_knot_vector(5, degree=3, dtype=torch.float64)
-        t_np = knots.detach().cpu().numpy()
-        u = torch.linspace(0.02, 0.98, steps=17, dtype=torch.float64)
-        u_np = u.detach().cpu().numpy()
-        phi_t = bspline_basis_phi_batch(u, knots, degree=3).detach().cpu().numpy()
-        phi_s = np.stack(
-            [_BSpline(t_np, np.eye(5)[i], 3)(u_np) for i in range(5)],
-            axis=1,
-        )
-        self.assertTrue(np.allclose(phi_t, phi_s, atol=1e-5, rtol=1e-5))
-
-    def test_spline_theta_diagonal_forward_and_likelihood_finite(self) -> None:
-        torch.manual_seed(1)
-        m = ConditionalThetaDiagonalSplineLinearXFlowMLP(
-            theta_dim=1,
-            x_dim=3,
-            theta_min=-1.0,
-            theta_max=1.0,
-            num_basis=5,
-        )
-        th = torch.linspace(-1.0, 1.0, steps=7).unsqueeze(-1)
-        x = torch.randn(7, 3)
-        v = m(x, th)
-        self.assertEqual(tuple(v.shape), (7, 3))
-        self.assertTrue(torch.all(torch.isfinite(v)))
-        lp = m.log_prob_normalized(x, th, solve_jitter=1e-6)
-        self.assertEqual(tuple(lp.shape), (7,))
-        self.assertTrue(torch.all(torch.isfinite(lp)))
-
-    def test_spline_theta_diagonal_endpoint_matches_elementwise_formula(self) -> None:
-        m = ConditionalThetaDiagonalSplineLinearXFlowMLP(
-            theta_dim=1,
-            x_dim=2,
-            theta_min=0.0,
-            theta_max=1.0,
-            num_basis=5,
-        )
-        with torch.no_grad():
-            m.Wa.zero_()
-            m.Wb.zero_()
-            m.ca.copy_(torch.tensor([0.5, -0.2]))
-            m.cb.copy_(torch.tensor([1.0, 2.0]))
-        th = torch.tensor([[0.37], [0.71], [0.05]])
-        mu, sig = m.endpoint_mean_covariance_diag(th, solve_jitter=1e-8)
-        a = torch.tensor([0.5, -0.2])
-        b = torch.tensor([1.0, 2.0])
-        phi = _phi_expm1_div_a(a)
-        mu_exp = phi * b
-        sig_exp = torch.exp(2.0 * a)
-        for row in range(3):
-            self.assertTrue(torch.allclose(mu[row], mu_exp))
-            self.assertTrue(torch.allclose(sig[row], sig_exp + 1e-8))
-
-    def test_spline_theta_diagonal_compute_c_matrix_finite(self) -> None:
-        torch.manual_seed(9)
-        n = 5
-        d = 2
-        theta_all = np.random.uniform(-0.5, 0.5, size=(n, 1)).astype(np.float64)
-        x_all = np.random.randn(n, d).astype(np.float64)
-        dev = torch.device("cpu")
-        m = ConditionalThetaDiagonalSplineLinearXFlowMLP(
-            theta_dim=1,
-            x_dim=d,
-            theta_min=float(np.min(theta_all)),
-            theta_max=float(np.max(theta_all)),
-            num_basis=5,
-        )
-        c = compute_linear_x_flow_c_matrix(
-            model=m,
-            theta_all=theta_all,
-            x_all=x_all,
-            device=dev,
-            x_mean=np.zeros(d, dtype=np.float64),
-            x_std=np.ones(d, dtype=np.float64),
-            solve_jitter=1e-6,
-            pair_batch_size=256,
-        )
-        self.assertEqual(c.shape, (n, n))
-        self.assertTrue(np.all(np.isfinite(c)))
-
-    def test_spline_raises_wrong_theta_dim(self) -> None:
-        with self.assertRaises(ValueError):
-            ConditionalThetaDiagonalSplineLinearXFlowMLP(
-                theta_dim=2,
-                x_dim=3,
-                theta_min=0.0,
-                theta_max=1.0,
-                num_basis=5,
-            )
-
-    def test_spline_raises_small_num_basis(self) -> None:
-        with self.assertRaises(ValueError):
-            ConditionalThetaDiagonalSplineLinearXFlowMLP(
-                theta_dim=1,
-                x_dim=3,
-                theta_min=0.0,
-                theta_max=1.0,
-                num_basis=3,
-            )
-
     def test_low_rank_drift_matrix(self) -> None:
         m = ConditionalLowRankLinearXFlowMLP(theta_dim=1, x_dim=3, rank=2, hidden_dim=8, depth=1)
         with torch.no_grad():
@@ -550,60 +431,6 @@ class TestLinearXFlow(unittest.TestCase):
         self.assertEqual(len(out["train_losses"]), 1)
         self.assertTrue(np.isfinite(out["train_losses"][0]))
 
-    def test_train_schedule_cosine_one_epoch_finite(self) -> None:
-        torch.manual_seed(4)
-        rng = np.random.default_rng(4)
-        theta = rng.normal(size=(24, 1)).astype(np.float64)
-        x = np.concatenate([theta, -theta], axis=1) + 0.1 * rng.normal(size=(24, 2))
-        m = ConditionalLinearXFlowMLP(theta_dim=1, x_dim=2, hidden_dim=8, depth=1)
-        out = train_linear_x_flow_schedule(
-            model=m,
-            theta_train=theta[:16],
-            x_train=x[:16],
-            theta_val=theta[16:],
-            x_val=x[16:],
-            device=torch.device("cpu"),
-            schedule=path_schedule_from_name("cosine"),
-            epochs=1,
-            batch_size=8,
-            lr=1e-3,
-            t_eps=1e-3,
-            patience=0,
-            log_every=1,
-        )
-        self.assertEqual(len(out["train_losses"]), 1)
-        self.assertEqual(len(out["val_losses"]), 1)
-        self.assertTrue(bool(out["weight_ema_enabled"]))
-        self.assertAlmostEqual(float(out["weight_ema_decay"]), 0.9)
-        self.assertEqual(out["final_eval_weights"], "ema")
-        self.assertTrue(np.isfinite(out["train_losses"][0]))
-        self.assertTrue(np.isfinite(out["val_losses"][0]))
-
-    def test_train_schedule_weight_ema_off_final_eval_is_raw(self) -> None:
-        torch.manual_seed(4)
-        rng = np.random.default_rng(4)
-        theta = rng.normal(size=(24, 1)).astype(np.float64)
-        x = np.concatenate([theta, -theta], axis=1) + 0.1 * rng.normal(size=(24, 2))
-        m = ConditionalLinearXFlowMLP(theta_dim=1, x_dim=2, hidden_dim=8, depth=1)
-        out = train_linear_x_flow_schedule(
-            model=m,
-            theta_train=theta[:16],
-            x_train=x[:16],
-            theta_val=theta[16:],
-            x_val=x[16:],
-            device=torch.device("cpu"),
-            schedule=path_schedule_from_name("cosine"),
-            epochs=1,
-            batch_size=8,
-            lr=1e-3,
-            t_eps=1e-3,
-            patience=0,
-            log_every=1,
-            weight_ema_decay=0.0,
-        )
-        self.assertFalse(bool(out["weight_ema_enabled"]))
-        self.assertEqual(out["final_eval_weights"], "raw")
-
     def test_time_diagonal_forward_and_likelihood_finite(self) -> None:
         torch.manual_seed(41)
         m = ConditionalTimeDiagonalLinearXFlowMLP(
@@ -661,88 +488,6 @@ class TestLinearXFlow(unittest.TestCase):
         )
         self.assertEqual(tuple(c.shape), (6, 6))
         self.assertTrue(np.all(np.isfinite(c)))
-
-    def test_binned_gaussian_lxf_covariance_and_bin_means(self) -> None:
-        theta = np.repeat(np.asarray([0.0, 1.0, 2.0], dtype=np.float64), 4).reshape(-1, 1)
-        bins = np.repeat(np.arange(3, dtype=np.int64), 4)
-        x = np.stack(
-            [
-                np.repeat(np.asarray([-1.0, 0.5, 2.0]), 4),
-                np.repeat(np.asarray([0.25, -0.75, 1.25]), 4),
-            ],
-            axis=1,
-        ).astype(np.float64)
-        x += np.tile(np.asarray([[-0.1, 0.1], [0.1, -0.1], [-0.05, 0.05], [0.05, -0.05]]), (3, 1))
-        meta = estimate_binned_gaussian_shared_diagonal_covariance(
-            x_train=x,
-            bin_train=bins,
-            n_bins=3,
-            variance_floor=1e-4,
-        )
-        shared_var = np.asarray(meta["shared_variance"], dtype=np.float64)
-        self.assertTrue(np.allclose(np.exp(2.0 * np.asarray(meta["a"], dtype=np.float64)), shared_var))
-        self.assertTrue(np.allclose(np.asarray(meta["bin_counts"]), np.asarray([4, 4, 4])))
-
-    def test_binned_gaussian_lxf_empty_bins_filled_like_binned_gaussian(self) -> None:
-        theta = np.asarray([0.0, 0.1, 2.0, 2.1], dtype=np.float64).reshape(-1, 1)
-        bins = np.asarray([0, 0, 2, 2], dtype=np.int64)
-        x = np.asarray([[0.0], [0.2], [2.0], [2.2]], dtype=np.float64)
-        meta = estimate_binned_gaussian_shared_diagonal_covariance(
-            x_train=x,
-            bin_train=bins,
-            n_bins=3,
-            variance_floor=1e-4,
-        )
-        self.assertEqual(int(np.asarray(meta["bin_counts"])[1]), 0)
-        means = np.asarray(meta["normalized_bin_means"], dtype=np.float64)
-        self.assertTrue(np.allclose(means[1], means[0]))
-
-    def test_binned_gaussian_fixed_a_training_updates_only_b_network(self) -> None:
-        torch.manual_seed(21)
-        rng = np.random.default_rng(21)
-        theta = rng.normal(size=(24, 2)).astype(np.float64)
-        x = np.stack([theta[:, 0] + 0.1 * theta[:, 1], -theta[:, 1]], axis=1) + 0.05 * rng.normal(size=(24, 2))
-        bins = np.repeat(np.arange(3, dtype=np.int64), 6)
-        meta = estimate_binned_gaussian_shared_diagonal_covariance(
-            x_train=x[:18],
-            bin_train=bins,
-            n_bins=3,
-            variance_floor=1e-4,
-        )
-        model = ConditionalDiagonalLinearXFlowMLP(theta_dim=2, x_dim=2, hidden_dim=8, depth=1)
-        with torch.no_grad():
-            model.a.copy_(torch.as_tensor(meta["a"], dtype=model.a.dtype))
-        model.a.requires_grad_(False)
-        a0 = model.a.detach().clone()
-        b0 = [p.detach().clone() for p in model.b_net.parameters()]
-        out = train_linear_x_flow(
-            model=model,
-            theta_train=theta[:18],
-            x_train=x[:18],
-            theta_val=theta[18:],
-            x_val=x[18:],
-            device=torch.device("cpu"),
-            epochs=2,
-            batch_size=6,
-            lr=1e-3,
-            patience=0,
-            log_every=1,
-            weight_ema_decay=0.0,
-            restore_best=False,
-        )
-        self.assertEqual(len(out["train_losses"]), 2)
-        self.assertTrue(torch.allclose(model.a.detach(), a0))
-        changed = any(not torch.allclose(p.detach(), p0) for p, p0 in zip(model.b_net.parameters(), b0))
-        self.assertTrue(changed)
-        lp = model.log_prob_observed(
-            torch.from_numpy(x[18:].astype(np.float32)),
-            torch.from_numpy(theta[18:].astype(np.float32)),
-            x_mean=torch.from_numpy(np.asarray(out["x_mean"], dtype=np.float32)),
-            x_std=torch.from_numpy(np.asarray(out["x_std"], dtype=np.float32)),
-            solve_jitter=1e-6,
-        )
-        self.assertTrue(torch.all(torch.isfinite(lp)))
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -65,7 +65,7 @@ from fisher.shared_fisher_est import build_dataset_from_meta, normalize_flow_arc
 # - bin_gaussian
 # - linear_x_flow, linear_x_flow_scalar, linear_x_flow_diagonal, linear_x_flow_diagonal_t,
 #   linear_x_flow_diagonal_theta,
-#   linear_x_flow_low_rank, linear_x_flow_schedule, ...
+#   linear_x_flow_low_rank, linear_x_flow_low_rank_randb, linear_x_flow_nonlinear_pca
 _FLOW_BASED_METHODS = {"theta_flow", "theta_path_integral", "x_flow"}
 _NO_TRAIN_METHODS = {"bin_gaussian"}
 
