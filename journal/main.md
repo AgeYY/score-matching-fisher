@@ -16,7 +16,7 @@ Collected markdown notes in `journal/notes/`: long-form chapters (moved from the
 
 ## 2026-05
 
-- [2026-05-02 Native 2D $\theta$ twofig: randamp vs gridcos with `theta2_grid`, `bin_gaussian` vs `linear_x_flow_diagonal_t` — metrics, GT figures, repro commands (`journal/notes/figs/…`)](notes/2026-05-02-native2d-randamp-gridcos-theta2grid-twofig-bin-lxf-diag-t.md)
+- [2026-05-02 Native 2D $\theta$ twofig: randamp vs gridcos `theta2_grid` — GT Hellinger MC math, `bin_gaussian` / `linear_x_flow_diagonal` / `linear_x_flow_diagonal_t`, skill gridcos rerun + metrics + figures](notes/2026-05-02-native2d-randamp-gridcos-theta2grid-twofig-bin-lxf-diag-t.md)
 
 - [2026-05-02 Minimal twofig: `bin_gaussian` vs `linear_x_flow_diagonal` on randamp 2D PR30D — metrics, figures, repro commands, follow-ups (`n_ref=10000`, `n=5000`), FiLM `--lxf-b-net film`, and 5k-epoch last-weights run (`--no-lxf-restore-best`), embedded figs](notes/2026-05-02-native2d-randamp-bin-vs-linear-x-flow-diagonal-minimal-twofig.md)
 
