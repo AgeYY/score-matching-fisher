@@ -54,6 +54,34 @@ class TestStudyHDecodingTwoFigSmoke(unittest.TestCase):
             x_validation=x_all[va],
         )
 
+    def _make_dataset_2d(self, ds_path: Path, *, n_total: int, seed: int) -> None:
+        ns_ds = _ns(
+            dataset_family="randamp_gaussian2d_sqrtd",
+            x_dim=2,
+            n_total=n_total,
+            train_frac=0.5,
+            seed=seed,
+        )
+        ds = build_dataset_from_args(ns_ds)
+        theta_all, x_all = ds.sample_joint(n_total)
+        meta = meta_dict_from_args(ns_ds)
+        n_train = int(0.5 * n_total)
+        n_train = min(max(n_train, 1), n_total - 1)
+        tr = np.arange(0, n_train, dtype=np.int64)
+        va = np.arange(n_train, n_total, dtype=np.int64)
+        save_shared_dataset_npz(
+            ds_path,
+            meta=meta,
+            theta_all=theta_all,
+            x_all=x_all,
+            train_idx=tr,
+            validation_idx=va,
+            theta_train=theta_all[tr],
+            x_train=x_all[tr],
+            theta_validation=theta_all[va],
+            x_validation=x_all[va],
+        )
+
     def test_twofig_smoke_multi_method_outputs_and_shapes(self) -> None:
         repo = Path(__file__).resolve().parent.parent
         script = repo / "bin" / "study_h_decoding_twofig.py"
@@ -142,6 +170,65 @@ class TestStudyHDecodingTwoFigSmoke(unittest.TestCase):
             self.assertIn("corr_curve_svg", z.files)
             self.assertIn("nmse_curve_svg", z.files)
             self.assertIn("nmse_decode_vs_ref_shared", z.files)
+
+    def test_twofig_theta2_grid_bin_gaussian_and_lxf_diag_t_smoke(self) -> None:
+        repo = Path(__file__).resolve().parent.parent
+        script = repo / "bin" / "study_h_decoding_twofig.py"
+        n_total = 90
+        n_ref = 72
+        n_bins_x = 3
+        n_bins_y = 3
+        total_bins = n_bins_x * n_bins_y
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            ds_path = tmp_path / "ds2d.npz"
+            out_dir = tmp_path / "run_out"
+            self._make_dataset_2d(ds_path, n_total=n_total, seed=12)
+            cmd = [
+                sys.executable,
+                str(script),
+                "--dataset-npz",
+                str(ds_path),
+                "--dataset-family",
+                "randamp_gaussian2d_sqrtd",
+                "--n-ref",
+                str(n_ref),
+                "--n-list",
+                "36",
+                "--num-theta-bins",
+                str(n_bins_x),
+                "--num-theta-bins-y",
+                str(n_bins_y),
+                "--theta-binning-mode",
+                "theta2_grid",
+                "--theta-field-methods",
+                "bin_gaussian,linear_x_flow_diagonal_t",
+                "--lxfs-epochs",
+                "1",
+                "--lxfs-batch-size",
+                "16",
+                "--lxfs-hidden-dim",
+                "8",
+                "--lxfs-depth",
+                "1",
+                "--lxfs-early-patience",
+                "0",
+                "--output-dir",
+                str(out_dir),
+                "--device",
+                "cpu",
+            ]
+            r = subprocess.run(cmd, cwd=str(repo), capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, msg=(r.stdout, r.stderr))
+
+            z = np.load(out_dir / "h_decoding_twofig_results.npz", allow_pickle=True)
+            self.assertEqual(tuple(z["h_binned_sweep"].shape), (2, 1, total_bins, total_bins))
+            self.assertEqual(tuple(z["decode_sweep"].shape), (1, total_bins, total_bins))
+            self.assertEqual(tuple(z["h_gt_sqrt"].shape), (total_bins, total_bins))
+            self.assertEqual(tuple(z["theta_bin_centers"].shape), (total_bins, 2))
+            np.testing.assert_array_equal(z["theta_grid_shape"], np.asarray([n_bins_x, n_bins_y], dtype=np.int64))
+            self.assertEqual(str(np.asarray(z["theta_binning_mode"]).reshape(-1)[0]), "theta2_grid")
 
     def test_twofig_backward_compat_single_method_shape(self) -> None:
         repo = Path(__file__).resolve().parent.parent

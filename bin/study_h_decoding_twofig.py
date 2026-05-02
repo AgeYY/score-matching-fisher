@@ -42,7 +42,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 import study_h_decoding_convergence as conv
-from fisher.hellinger_gt import bin_centers_from_edges, estimate_hellinger_sq_one_sided_mc
+from fisher.hellinger_gt import (
+    bin_centers_from_edges,
+    estimate_hellinger_sq_grid_centers_mc,
+    estimate_hellinger_sq_one_sided_mc,
+)
 from fisher.shared_dataset_io import load_shared_dataset_npz
 from fisher.shared_fisher_est import build_dataset_from_meta, normalize_flow_arch, normalize_theta_field_method
 
@@ -59,7 +63,8 @@ from fisher.shared_fisher_est import build_dataset_from_meta, normalize_flow_arc
 # - ctsm_v
 # - nf
 # - bin_gaussian
-# - linear_x_flow, linear_x_flow_scalar, linear_x_flow_diagonal, linear_x_flow_diagonal_theta,
+# - linear_x_flow, linear_x_flow_scalar, linear_x_flow_diagonal, linear_x_flow_diagonal_t,
+#   linear_x_flow_diagonal_theta,
 #   linear_x_flow_low_rank, linear_x_flow_schedule, ...
 _FLOW_BASED_METHODS = {"theta_flow", "theta_path_integral", "x_flow"}
 _NO_TRAIN_METHODS = {"bin_gaussian"}
@@ -113,6 +118,42 @@ def _matrix_nmse_offdiag(est: np.ndarray, gt: np.ndarray) -> float:
         return float("nan")
     mse = float(np.mean((ev - gv) ** 2))
     return float(mse / denom)
+
+
+def _theta_binning_mode(args: argparse.Namespace) -> str:
+    return str(getattr(args, "theta_binning_mode", "theta1")).strip().lower()
+
+
+def _num_theta_bins_y(args: argparse.Namespace) -> int:
+    return int(getattr(args, "num_theta_bins_y", 0)) or int(args.num_theta_bins)
+
+
+def _total_theta_bins_from_args(args: argparse.Namespace) -> int:
+    if _theta_binning_mode(args) == "theta2_grid":
+        return int(args.num_theta_bins) * _num_theta_bins_y(args)
+    return int(args.num_theta_bins)
+
+
+def _theta_center_array_for_axis(theta_centers: np.ndarray, n_bins: int) -> np.ndarray:
+    tc = np.asarray(theta_centers, dtype=np.float64)
+    if tc.ndim == 1:
+        if int(tc.size) != int(n_bins):
+            raise ValueError(f"theta_centers length {tc.size} must match n_bins={n_bins}.")
+        return tc.reshape(-1, 1)
+    if tc.ndim == 2 and int(tc.shape[0]) == int(n_bins):
+        return tc
+    raise ValueError(f"theta_centers shape {tc.shape} incompatible with n_bins={n_bins}.")
+
+
+def _theta_axis_tick_labels(theta_centers: np.ndarray, n_bins: int) -> tuple[list[int], list[str], str]:
+    tc = _theta_center_array_for_axis(theta_centers, n_bins)
+    tick_idx = conv._matrix_panel_tick_indices(int(n_bins), max_ticks=5)
+    tick_pos = tick_idx.tolist()
+    if int(tc.shape[1]) == 1:
+        labs_full = conv._format_theta_tick_labels(tc[:, 0])
+        return tick_pos, [labs_full[int(i)] for i in tick_idx], r"$\theta$"
+    labs = [f"{int(i)}\n({tc[int(i), 0]:.2g},{tc[int(i), 1]:.2g})" for i in tick_idx]
+    return tick_pos, labs, r"flat $(\theta_1,\theta_2)$ bin"
 
 
 def _nmse_h_binned_vs_gt_mc(h_sweep_arr: np.ndarray, h_gt_sqrt: np.ndarray) -> np.ndarray:
@@ -200,7 +241,7 @@ def _load_cached_twofig_results(output_dir: str) -> CachedTwofigBundle:
             raise KeyError(f"{out_npz} missing keys: {missing}")
 
         n_arr = np.asarray(z["n"], dtype=np.int64).ravel()
-        centers = np.asarray(z["theta_bin_centers"], dtype=np.float64).ravel()
+        centers = np.asarray(z["theta_bin_centers"], dtype=np.float64)
         h_gt = np.asarray(z["h_gt_sqrt"], dtype=np.float64)
         dec_ref = np.asarray(z["decode_ref"], dtype=np.float64)
         h_sw = np.asarray(z["h_binned_sweep"], dtype=np.float64)
@@ -212,10 +253,14 @@ def _load_cached_twofig_results(output_dir: str) -> CachedTwofigBundle:
         n_bins = int(h_gt.shape[0])
         if h_gt.ndim != 2 or h_gt.shape[0] != h_gt.shape[1]:
             raise ValueError(f"h_gt_sqrt must be square 2D; got shape {h_gt.shape}.")
-        if int(centers.size) != n_bins:
+        if (centers.ndim == 1 and int(centers.size) != n_bins) or (
+            centers.ndim == 2 and int(centers.shape[0]) != n_bins
+        ):
             raise ValueError(
-                f"theta_bin_centers length {centers.size} inconsistent with h_gt_sqrt dim {n_bins}."
+                f"theta_bin_centers shape {centers.shape} inconsistent with h_gt_sqrt dim {n_bins}."
             )
+        if centers.ndim not in (1, 2):
+            raise ValueError(f"theta_bin_centers must be 1D or 2D; got shape {centers.shape}.")
         if dec_ref.shape != (n_bins, n_bins):
             raise ValueError(f"decode_ref shape {dec_ref.shape} expected ({n_bins}, {n_bins}).")
 
@@ -266,9 +311,10 @@ def _validate_cached_twofig_cli(
         )
     h_gt = np.asarray(cached["h_gt_sqrt"], dtype=np.float64)
     n_bins_file = int(h_gt.shape[0])
-    if n_bins_file != int(args.num_theta_bins):
+    n_bins_cli = _total_theta_bins_from_args(args)
+    if n_bins_file != n_bins_cli:
         raise ValueError(
-            f"Cached matrices imply num_theta_bins={n_bins_file} but CLI has --num-theta-bins={args.num_theta_bins}."
+            f"Cached matrices imply total theta bins={n_bins_file} but CLI implies {n_bins_cli}."
         )
 
     if row_labels_cli != row_labels_cached:
@@ -283,6 +329,7 @@ def _validate_cached_twofig_cli(
     with np.load(z_path, allow_pickle=True) as z2:
         ds_cached = _npz_str_field(z2, "dataset_npz")
         fam_cached = _npz_str_field(z2, "dataset_family")
+        mode_cached = _npz_str_field(z2, "theta_binning_mode")
     if ds_cached is not None and os.path.abspath(str(args.dataset_npz)) != os.path.abspath(ds_cached):
         raise ValueError(
             f"--dataset-npz {args.dataset_npz!r} does not match cached dataset_npz={ds_cached!r}. "
@@ -291,6 +338,10 @@ def _validate_cached_twofig_cli(
     if fam_cached is not None and str(args.dataset_family) != str(fam_cached):
         raise ValueError(
             f"--dataset-family {args.dataset_family!r} does not match cached dataset_family={fam_cached!r}."
+        )
+    if mode_cached is not None and _theta_binning_mode(args) != str(mode_cached):
+        raise ValueError(
+            f"--theta-binning-mode {_theta_binning_mode(args)!r} does not match cached theta_binning_mode={mode_cached!r}."
         )
 
 
@@ -304,8 +355,8 @@ def _run_twofig_visualization_only(
     perm_seed: int,
     cached: CachedTwofigBundle,
 ) -> None:
-    n_bins = int(args.num_theta_bins)
-    centers = np.asarray(cached["theta_bin_centers"], dtype=np.float64).ravel()
+    n_bins = int(np.asarray(cached["h_gt_sqrt"], dtype=np.float64).shape[0])
+    centers = np.asarray(cached["theta_bin_centers"], dtype=np.float64)
     h_sweep_arr = np.asarray(cached["h_binned_sweep"], dtype=np.float64)
     clf_sweep_arr = np.asarray(cached["decode_sweep"], dtype=np.float64)
     h_gt_sqrt = np.asarray(cached["h_gt_sqrt"], dtype=np.float64)
@@ -436,7 +487,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Comma-separated theta-field methods to sweep in one run. "
             "Overrides --theta-field-method when non-empty. "
             "Supported values: theta_flow, theta_path_integral, x_flow, ctsm_v, nf, bin_gaussian, "
-            "and linear_x_flow variants (see study_h_decoding_convergence._normalize_linear_x_flow_method)."
+            "and linear_x_flow variants including linear_x_flow_diagonal_t "
+            "(see study_h_decoding_convergence._normalize_linear_x_flow_method)."
         ),
     )
     p.add_argument(
@@ -446,7 +498,8 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Comma-separated theta-field row specs, highest precedence over --theta-field-methods and "
             "--theta-field-method. Tokens are method or method:arch, e.g. "
-            "theta_flow:mlp,theta_flow:film,x_flow:film_fourier,ctsm_v,bin_gaussian,linear_x_flow_low_rank. "
+            "theta_flow:mlp,theta_flow:film,x_flow:film_fourier,ctsm_v,bin_gaussian,"
+            "linear_x_flow_low_rank,linear_x_flow_diagonal_t. "
             "For linear_x_flow_low_rank use --lxf-low-rank-dim."
         ),
     )
@@ -554,17 +607,12 @@ def _render_method_sweep_panel(
         raise ValueError(
             f"decode sweep shape mismatch: expected leading dims {(n_cols,)}, got {clf_sweep_shared.shape}."
         )
-    tc = np.asarray(theta_centers, dtype=np.float64).ravel()
-    if int(tc.size) != int(n_bins):
-        raise ValueError(f"theta_centers length {tc.size} must match n_bins={n_bins}.")
+    _theta_center_array_for_axis(theta_centers, n_bins)
 
     n_rows = n_methods + 1
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(2.8 * n_cols, 2.5 * n_rows), squeeze=False)
 
-    tick_labs_full = conv._format_theta_tick_labels(tc)
-    tick_idx = conv._matrix_panel_tick_indices(n_bins, max_ticks=5)
-    tick_pos = tick_idx.tolist()
-    tick_labs = [tick_labs_full[int(i)] for i in tick_idx]
+    tick_pos, tick_labs, axis_label = _theta_axis_tick_labels(theta_centers, n_bins)
     x_rot = 45 if len(tick_pos) > 6 else 0
 
     vmin_h, vmax_h = 0.0, 1.0
@@ -593,7 +641,7 @@ def _render_method_sweep_panel(
             if c_idx == 0:
                 ax_h.set_ylabel(f"{label} | sqrt(H^2)", fontsize=11)
             if m_idx == (n_methods - 1):
-                ax_h.set_xlabel(r"$\theta$", fontsize=11)
+                ax_h.set_xlabel(axis_label, fontsize=11)
             if c_idx == (n_cols - 1):
                 cb_h = plt.colorbar(im_h, ax=ax_h, fraction=0.046, pad=0.04)
                 cb_h.ax.tick_params(labelsize=11)
@@ -616,7 +664,7 @@ def _render_method_sweep_panel(
         conv._matrix_axes_show_top_right_spines(ax_c)
         if c_idx == 0:
             ax_c.set_ylabel("decoding", fontsize=11)
-        ax_c.set_xlabel(r"$\theta$", fontsize=11)
+        ax_c.set_xlabel(axis_label, fontsize=11)
         if c_idx == (n_cols - 1):
             cb_c = plt.colorbar(im_c, ax=ax_c, fraction=0.046, pad=0.04)
             cb_c.ax.tick_params(labelsize=11)
@@ -643,10 +691,7 @@ def _draw_single_heatmap(
     vmin: float,
     vmax: float,
 ) -> None:
-    tick_labs_full = conv._format_theta_tick_labels(np.asarray(theta_centers, dtype=np.float64).ravel())
-    tick_idx = conv._matrix_panel_tick_indices(int(n_bins), max_ticks=5)
-    tick_pos = tick_idx.tolist()
-    tick_labs = [tick_labs_full[int(i)] for i in tick_idx]
+    tick_pos, tick_labs, axis_label = _theta_axis_tick_labels(theta_centers, int(n_bins))
     x_rot = 45 if len(tick_pos) > 6 else 0
 
     im = ax.imshow(
@@ -662,7 +707,7 @@ def _draw_single_heatmap(
     ax.set_xticklabels(tick_labs, rotation=x_rot, ha="right" if x_rot else "center", fontsize=11)
     ax.set_yticks(tick_pos)
     ax.set_yticklabels(tick_labs, fontsize=11)
-    ax.set_xlabel(r"$\theta$", fontsize=11)
+    ax.set_xlabel(axis_label, fontsize=11)
     conv._matrix_axes_show_top_right_spines(ax)
     cb = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     cb.ax.tick_params(labelsize=11)
@@ -744,6 +789,10 @@ def _write_summary(
         f.write(f"theta_field_row_arches: {','.join(getattr(args, 'theta_field_row_arches_resolved', []))}\n")
         f.write(f"n_list: {args.n_list}\n")
         f.write(f"num_theta_bins: {int(args.num_theta_bins)}\n")
+        f.write(f"theta_binning_mode: {_theta_binning_mode(args)}\n")
+        if _theta_binning_mode(args) == "theta2_grid":
+            f.write(f"num_theta_bins_y: {_num_theta_bins_y(args)}\n")
+            f.write(f"total_theta_bins: {_total_theta_bins_from_args(args)}\n")
         f.write(f"dataset_pool_size: {int(n_pool)}\n")
         f.write(f"dataset_meta_seed: {int(meta.get('seed', 0))}\n")
         f.write(f"perm_seed: {int(perm_seed)}\n")
@@ -985,6 +1034,8 @@ def main(argv: list[str] | None = None) -> None:
         args.flow_arch = validation_row.arch
     conv._validate_cli(args)
     _validate_cli_for_rows(args, row_specs)
+    if _theta_binning_mode(args) == "theta2_grid" and bool(getattr(args, "theta_flow_fourier_state", False)):
+        raise ValueError("--theta-binning-mode theta2_grid does not support --theta-flow-fourier-state.")
     ns = conv._parse_n_list(args.n_list)
 
     if bool(getattr(args, "visualization_only", False)):
@@ -1045,20 +1096,44 @@ def main(argv: list[str] | None = None) -> None:
             f"Require max(n-list) <= n-ref for nested subsets; got max(n_list)={max(ns)} n_ref={args.n_ref}."
         )
 
-    n_bins = int(args.num_theta_bins)
+    theta_binning_mode = _theta_binning_mode(args)
+    n_bins_x = int(args.num_theta_bins)
+    n_bins_y = _num_theta_bins_y(args)
+    n_bins = n_bins_x
     base_seed = int(args.run_seed) if args.run_seed is not None else int(meta["seed"])
     perm_seed = base_seed + int(args.subset_seed_offset)
     rng_perm = np.random.default_rng(perm_seed)
     perm = rng_perm.permutation(n_pool)
 
     theta_raw_all = np.asarray(bundle.theta_all, dtype=np.float64)
-    theta_scalar_all, theta_ref, edges, _, _, bin_idx_all = conv.prepare_theta_binning_for_convergence(
-        theta_raw_all,
-        perm,
-        int(args.n_ref),
-        n_bins,
-    )
-    centers = bin_centers_from_edges(edges)
+    theta_grid_edges0 = np.asarray([], dtype=np.float64)
+    theta_grid_edges1 = np.asarray([], dtype=np.float64)
+    theta_grid_shape = np.asarray([], dtype=np.int64)
+    if theta_binning_mode == "theta2_grid":
+        grid = conv.prepare_theta2_grid_binning_for_convergence(
+            theta_raw_all,
+            perm,
+            int(args.n_ref),
+            n_bins_x,
+            n_bins_y,
+        )
+        theta_scalar_all = grid.theta_scalar_all
+        theta_ref = grid.theta_ref
+        edges = grid.edges0
+        bin_idx_all = grid.bin_idx_all
+        centers = grid.centers
+        n_bins = int(grid.grid_shape[0] * grid.grid_shape[1])
+        theta_grid_edges0 = grid.edges0
+        theta_grid_edges1 = grid.edges1
+        theta_grid_shape = np.asarray(grid.grid_shape, dtype=np.int64)
+    else:
+        theta_scalar_all, theta_ref, edges, _, _, bin_idx_all = conv.prepare_theta_binning_for_convergence(
+            theta_raw_all,
+            perm,
+            int(args.n_ref),
+            n_bins,
+        )
+        centers = bin_centers_from_edges(edges)
 
     theta_state_all: np.ndarray | None = None
     if bool(getattr(args, "theta_flow_onehot_state", False)):
@@ -1092,15 +1167,24 @@ def main(argv: list[str] | None = None) -> None:
         dataset_for_gt.rng = np.random.default_rng(gt_seed)
     gt_n_mc = int(args.n_ref) // n_bins
     t_gt0 = time.time()
-    h_gt_mc = estimate_hellinger_sq_one_sided_mc(
-        dataset_for_gt,
-        centers,
-        n_mc=gt_n_mc,
-        symmetrize=bool(args.gt_hellinger_symmetrize),
-    )
+    if theta_binning_mode == "theta2_grid":
+        h_gt_mc = estimate_hellinger_sq_grid_centers_mc(
+            dataset_for_gt,
+            centers,
+            n_mc=gt_n_mc,
+            symmetrize=bool(args.gt_hellinger_symmetrize),
+        )
+    else:
+        h_gt_mc = estimate_hellinger_sq_one_sided_mc(
+            dataset_for_gt,
+            centers,
+            n_mc=gt_n_mc,
+            symmetrize=bool(args.gt_hellinger_symmetrize),
+        )
     h_gt_sqrt = conv._sqrt_h_like(h_gt_mc)
     print(
-        f"[twofig] GT Hellinger (MC likelihood) n_bins={n_bins} n_mc={gt_n_mc} "
+        f"[twofig] GT Hellinger (MC likelihood) theta_binning_mode={theta_binning_mode} "
+        f"n_bins={n_bins} n_mc={gt_n_mc} "
         f"(n_bins*n_mc={n_bins * gt_n_mc} <= n_ref={int(args.n_ref)}) wall time: {time.time() - t_gt0:.1f}s",
         flush=True,
     )
@@ -1209,6 +1293,9 @@ def main(argv: list[str] | None = None) -> None:
                     bundle=subset_n.bundle,
                     output_dir=run_dir,
                     n_bins=n_bins,
+                    bin_train=subset_n.bin_train,
+                    bin_validation=subset_n.bin_validation,
+                    bin_all=subset_n.bin_all,
                 )
                 src_loss_npz = os.path.abspath(os.path.join(run_dir, "score_prior_training_losses.npz"))
                 if not os.path.isfile(src_loss_npz):
@@ -1302,8 +1389,13 @@ def main(argv: list[str] | None = None) -> None:
         perm_seed=np.int64(perm_seed),
         convergence_base_seed=np.int64(base_seed),
         dataset_meta_seed=np.int64(meta["seed"]),
+        theta_binning_mode=np.asarray([theta_binning_mode], dtype=object),
+        theta_grid_shape=np.asarray(theta_grid_shape, dtype=np.int64),
         theta_bin_edges=np.asarray(edges, dtype=np.float64),
         theta_bin_centers=np.asarray(centers, dtype=np.float64),
+        theta_grid_edges_0=np.asarray(theta_grid_edges0, dtype=np.float64),
+        theta_grid_edges_1=np.asarray(theta_grid_edges1, dtype=np.float64),
+        theta_grid_centers=np.asarray(centers if theta_binning_mode == "theta2_grid" else [], dtype=np.float64),
         gt_hellinger_n_mc=np.int64(gt_n_mc),
         gt_hellinger_seed=np.int64(gt_seed),
         gt_hellinger_symmetrize=np.int32(1 if bool(args.gt_hellinger_symmetrize) else 0),

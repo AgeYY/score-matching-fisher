@@ -50,6 +50,8 @@ and evaluates a diagonal Gaussian with theta-dependent mean and diagonal covaria
 are linear maps of fixed scalar-theta B-spline features (default ``K=5``).
 ``--theta-field-method linear-x-flow-schedule`` uses the same time-independent velocity network
 and likelihood, but trains on a scheduled affine probability path such as cosine.
+``--theta-field-method linear-x-flow-diagonal-t`` trains ``v(x,t,theta)=diag(a(t))x+b(t,theta)``
+on a scheduled affine probability path and evaluates its quadrature Gaussian likelihood.
 ``--theta-field-method linear-x-flow-nonlinear-pca`` first trains the full linear x-flow,
 fits PCA on residuals around the induced linear-flow mean, then adds a low-dimensional nonlinear
 correction and evaluates ODE log likelihood.
@@ -144,12 +146,17 @@ from fisher.linear_x_flow import (
     ConditionalScalarLinearXFlowMLP,
     ConditionalThetaDiagonalLinearXFlowMLP,
     ConditionalThetaDiagonalSplineLinearXFlowMLP,
+    ConditionalTimeDiagonalLinearXFlowMLP,
     compute_pca_nonlinear_linear_x_flow_c_matrix,
+    compute_time_diagonal_linear_x_flow_c_matrix,
+    compute_linear_x_flow_analytic_hellinger_matrix,
+    estimate_binned_gaussian_shared_diagonal_covariance,
     fit_residual_pca_basis_from_linear_mean,
     compute_linear_x_flow_c_matrix,
     train_linear_x_flow,
     train_pca_nonlinear_linear_x_flow,
     train_linear_x_flow_schedule,
+    train_time_diagonal_linear_x_flow_schedule,
 )
 from fisher.linear_theta_flow import (
     ConditionalLinearThetaFlowMixtureMLP,
@@ -451,6 +458,25 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Number of equal-width theta bins (default 10). GT Hellinger MC uses "
             "n_mc = n_ref // num_theta_bins (floor) samples per bin row."
+        ),
+    )
+    p.add_argument(
+        "--theta-binning-mode",
+        type=str,
+        default="theta1",
+        choices=["theta1", "theta2_grid"],
+        help=(
+            "Binning convention for H/decoding matrices. Default theta1 keeps legacy scalar/first-coordinate "
+            "bins. theta2_grid requires theta_dim=2 and flattens a 2D theta grid into one matrix axis."
+        ),
+    )
+    p.add_argument(
+        "--num-theta-bins-y",
+        type=int,
+        default=0,
+        help=(
+            "theta2_grid only: number of equal-width bins for theta_2. "
+            "If <=0, reuse --num-theta-bins."
         ),
     )
     p.add_argument(
@@ -927,6 +953,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.9,
         help="linear-x-flow only: model-weight EMA decay; <=0 disables weight EMA.",
     )
+    p.add_argument("--lxf-restore-best", action="store_true", default=True)
+    p.add_argument("--no-lxf-restore-best", action="store_false", dest="lxf_restore_best")
     p.add_argument(
         "--lxf-max-grad-norm",
         type=float,
@@ -938,6 +966,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=65536,
         help="linear-x-flow only: approximate pair budget per C-matrix block (rows*cols).",
+    )
+    p.add_argument(
+        "--lxf-save-c-matrix",
+        action="store_true",
+        help=(
+            "linear-x-flow Gaussian endpoint methods only: also save the legacy C and DeltaL matrices. "
+            "By default h_sym is computed analytically from Gaussian Hellinger and these expensive "
+            "likelihood-ratio diagnostics are omitted."
+        ),
     )
     p.add_argument("--lxf-nlpca-dim", type=int, default=8, help="linear-x-flow-nonlinear-pca only: residual PCA dimension k.")
     p.add_argument("--lxf-nlpca-epochs", type=int, default=0, help="linear-x-flow-nonlinear-pca only: second-stage epochs; 0 uses --lxf-epochs.")
@@ -1007,6 +1044,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=65536,
         help="linear-x-flow-schedule only: approximate pair budget per C-matrix block (rows*cols).",
+    )
+    p.add_argument(
+        "--lxfs-quadrature-steps",
+        type=int,
+        default=64,
+        help="linear-x-flow-diagonal-t only: fixed time grid size for endpoint Gaussian quadrature.",
     )
     p.add_argument("--ltf-num-components", type=int, default=3, help="linear-theta-flow only: Gaussian mixture components.")
     p.add_argument("--ltf-epochs", type=int, default=2000, help="linear-theta-flow only: training epochs.")
@@ -1283,6 +1326,10 @@ def _normalize_linear_x_flow_method(tfm: str) -> str | None:
         "linear_x_flow_scalar": "linear_x_flow_scalar",
         "linear-x-flow-diagonal": "linear_x_flow_diagonal",
         "linear_x_flow_diagonal": "linear_x_flow_diagonal",
+        "bin-gaussian-linear-x-flow-diagonal": "bin_gaussian_linear_x_flow_diagonal",
+        "bin_gaussian_linear_x_flow_diagonal": "bin_gaussian_linear_x_flow_diagonal",
+        "bin-lxf-diagonal": "bin_gaussian_linear_x_flow_diagonal",
+        "bin_lxf_diagonal": "bin_gaussian_linear_x_flow_diagonal",
         "linear-x-flow-diagonal-theta": "linear_x_flow_diagonal_theta",
         "linear_x_flow_diagonal_theta": "linear_x_flow_diagonal_theta",
         "linear-x-flow-diagonal-theta-spline": "linear_x_flow_diagonal_theta_spline",
@@ -1295,6 +1342,8 @@ def _normalize_linear_x_flow_method(tfm: str) -> str | None:
         "linear_x_flow_nonlinear_pca": "linear_x_flow_nonlinear_pca",
         "linear-x-flow-schedule": "linear_x_flow_schedule",
         "linear_x_flow_schedule": "linear_x_flow_schedule",
+        "linear-x-flow-diagonal-t": "linear_x_flow_diagonal_t",
+        "linear_x_flow_diagonal_t": "linear_x_flow_diagonal_t",
     }
     return aliases.get(key)
 
@@ -1469,7 +1518,7 @@ def _validate_gxf_cli(args: argparse.Namespace) -> None:
 
 def _validate_lxf_cli(args: argparse.Namespace) -> None:
     method = str(getattr(args, "theta_field_method", "linear_x_flow")).strip().lower()
-    scheduled = method == "linear_x_flow_schedule"
+    scheduled = method in ("linear_x_flow_schedule", "linear_x_flow_diagonal_t")
     prefix = "lxfs" if scheduled else "lxf"
     label = "--lxfs" if scheduled else "--lxf"
     if int(getattr(args, f"{prefix}_epochs", 0)) < 1:
@@ -1485,8 +1534,12 @@ def _validate_lxf_cli(args: argparse.Namespace) -> None:
     b_net_kind = str(getattr(args, "lxf_b_net", "mlp")).strip().lower()
     if b_net_kind not in ("mlp", "film"):
         raise ValueError("--lxf-b-net must be one of: mlp, film.")
-    if method != "linear_x_flow_diagonal" and b_net_kind != "mlp":
-        raise ValueError("--lxf-b-net=film is only supported for linear_x_flow_diagonal.")
+    if method not in ("linear_x_flow_diagonal", "bin_gaussian_linear_x_flow_diagonal") and b_net_kind != "mlp":
+        raise ValueError("--lxf-b-net=film is only supported for linear_x_flow_diagonal and bin_gaussian_linear_x_flow_diagonal.")
+    if method == "bin_gaussian_linear_x_flow_diagonal":
+        vf = float(getattr(args, "flow_theta_reg_variance_floor", getattr(args, "flow_x_reg_variance_floor", 1e-6)))
+        if not np.isfinite(vf) or vf <= 0.0:
+            raise ValueError("--flow-theta-reg-variance-floor must be finite and > 0.")
     if method in ("linear_x_flow_low_rank", "linear_x_flow_low_rank_randb") and int(getattr(args, "lxf_low_rank_dim", 0)) < 1:
         raise ValueError("--lxf-low-rank-dim must be >= 1.")
     if method == "linear_x_flow_nonlinear_pca":
@@ -1522,6 +1575,8 @@ def _validate_lxf_cli(args: argparse.Namespace) -> None:
         if not (0.0 < te < 0.5):
             raise ValueError("--lxfs-t-eps must be in (0, 0.5).")
         path_schedule_from_name(str(getattr(args, "lxfs_path_schedule", "cosine")))
+        if method == "linear_x_flow_diagonal_t" and int(getattr(args, "lxfs_quadrature_steps", 0)) < 2:
+            raise ValueError("--lxfs-quadrature-steps must be >= 2.")
     elif not (0.0 < te < 0.5):
         raise ValueError("--lxf-t-eps must be in (0, 0.5).")
     sj = float(getattr(args, f"{prefix}_solve_jitter", 1e-6))
@@ -1932,8 +1987,10 @@ def _validate_cli(args: argparse.Namespace) -> None:
         "linear_x_flow",
         "linear_x_flow_scalar",
         "linear_x_flow_diagonal",
+        "bin_gaussian_linear_x_flow_diagonal",
         "linear_x_flow_diagonal_theta",
         "linear_x_flow_diagonal_theta_spline",
+        "linear_x_flow_diagonal_t",
         "linear_x_flow_low_rank",
         "linear_x_flow_low_rank_randb",
         "linear_x_flow_nonlinear_pca",
@@ -1951,16 +2008,24 @@ def _validate_cli(args: argparse.Namespace) -> None:
         validate_estimation_args(args)
     if int(args.num_theta_bins) < 1:
         raise ValueError("--num-theta-bins must be >= 1.")
+    theta_binning_mode = str(getattr(args, "theta_binning_mode", "theta1")).strip().lower()
+    if theta_binning_mode not in ("theta1", "theta2_grid"):
+        raise ValueError("--theta-binning-mode must be one of: theta1, theta2_grid.")
+    if int(getattr(args, "num_theta_bins_y", 0)) < 0:
+        raise ValueError("--num-theta-bins-y must be >= 0.")
     if int(args.clf_min_class_count) < 1:
         raise ValueError("--clf-min-class-count must be >= 1.")
     n_ref = int(args.n_ref)
     n_bins_cli = int(args.num_theta_bins)
+    if theta_binning_mode == "theta2_grid":
+        n_bins_y = int(getattr(args, "num_theta_bins_y", 0)) or n_bins_cli
+        n_bins_cli = n_bins_cli * n_bins_y
     if n_ref < 2:
         raise ValueError("--n-ref must be >= 2.")
     if n_ref // n_bins_cli < 1:
         raise ValueError(
-            "GT Hellinger requires n_mc = n_ref // num_theta_bins >= 1 "
-            f"(got n_ref={n_ref} num_theta_bins={n_bins_cli})."
+            "GT Hellinger requires n_mc = n_ref // total_theta_bins >= 1 "
+            f"(got n_ref={n_ref} total_theta_bins={n_bins_cli})."
         )
     use_onehot = bool(getattr(args, "theta_flow_onehot_state", False))
     use_fourier = bool(getattr(args, "theta_flow_fourier_state", False))
@@ -2084,6 +2149,74 @@ def prepare_theta_binning_for_convergence(
     edges, edge_lo, edge_hi = vhb.theta_bin_edges(theta_ref, n_bins_i)
     bin_idx_all = vhb.theta_to_bin_index(theta_scalar_all, edges, n_bins_i)
     return theta_scalar_all, theta_ref, edges, float(edge_lo), float(edge_hi), bin_idx_all
+
+
+class Theta2GridBinning(NamedTuple):
+    theta_scalar_all: np.ndarray
+    theta_ref: np.ndarray
+    edges0: np.ndarray
+    edges1: np.ndarray
+    centers: np.ndarray
+    bin_idx_all: np.ndarray
+    grid_shape: tuple[int, int]
+    edge_lo0: float
+    edge_hi0: float
+    edge_lo1: float
+    edge_hi1: float
+
+
+def theta2_grid_centers_from_edges(edges0: np.ndarray, edges1: np.ndarray) -> np.ndarray:
+    """Flattened 2D bin centers in row-major order: ``flat = i * n_y + j``."""
+    c0 = bin_centers_from_edges(np.asarray(edges0, dtype=np.float64))
+    c1 = bin_centers_from_edges(np.asarray(edges1, dtype=np.float64))
+    grid0, grid1 = np.meshgrid(c0, c1, indexing="ij")
+    return np.stack([grid0.reshape(-1), grid1.reshape(-1)], axis=1).astype(np.float64, copy=False)
+
+
+def prepare_theta2_grid_binning_for_convergence(
+    theta_raw_all: np.ndarray,
+    perm: np.ndarray,
+    n_ref: int,
+    n_bins_x: int,
+    n_bins_y: int,
+) -> Theta2GridBinning:
+    """Equal-width bins on both theta coordinates, flattened to one matrix axis."""
+    th = np.asarray(theta_raw_all, dtype=np.float64)
+    if th.ndim != 2 or int(th.shape[1]) != 2:
+        raise ValueError(
+            "theta2_grid binning requires theta_all with shape (N, 2); "
+            f"got shape={th.shape}."
+        )
+    nx = int(n_bins_x)
+    ny = int(n_bins_y)
+    if nx < 1 or ny < 1:
+        raise ValueError("theta2_grid requires positive bin counts in both dimensions.")
+    n_ref_i = int(n_ref)
+    theta_ref_2d = np.asarray(th[np.asarray(perm, dtype=np.int64)[:n_ref_i]], dtype=np.float64)
+    edges0, lo0, hi0 = vhb.theta_bin_edges(theta_ref_2d[:, 0], nx)
+    edges1, lo1, hi1 = vhb.theta_bin_edges(theta_ref_2d[:, 1], ny)
+    ix = vhb.theta_to_bin_index(th[:, 0], edges0, nx)
+    iy = vhb.theta_to_bin_index(th[:, 1], edges1, ny)
+    flat = (ix * ny + iy).astype(np.int64, copy=False)
+    centers = theta2_grid_centers_from_edges(edges0, edges1)
+    print(
+        "[convergence] theta_dim=2: binning on a flattened theta_1 x theta_2 grid "
+        f"({nx} x {ny} = {nx * ny} bins); full theta retained for model training.",
+        flush=True,
+    )
+    return Theta2GridBinning(
+        theta_scalar_all=flat.astype(np.float64, copy=False),
+        theta_ref=theta_ref_2d,
+        edges0=np.asarray(edges0, dtype=np.float64),
+        edges1=np.asarray(edges1, dtype=np.float64),
+        centers=centers,
+        bin_idx_all=flat,
+        grid_shape=(nx, ny),
+        edge_lo0=float(lo0),
+        edge_hi0=float(hi0),
+        edge_lo1=float(lo1),
+        edge_hi1=float(hi1),
+    )
 
 
 class SweepSubset(NamedTuple):
@@ -2363,6 +2496,46 @@ def _binned_gaussian_hellinger_sq(
             out[i, j] = h2_ij
             out[j, i] = h2_ij
     return out
+
+
+def _save_empty_no_training_losses(path: str, *, method_name: str, **metadata: object) -> None:
+    empty = np.asarray([], dtype=np.float64)
+    payload: dict[str, object] = {
+        "theta_field_method": np.asarray([method_name], dtype=object),
+        "prior_enable": np.bool_(False),
+        "score_train_losses": empty,
+        "score_val_losses": empty,
+        "score_val_monitor_losses": empty,
+        "score_best_epoch": np.int64(0),
+        "score_stopped_epoch": np.int64(0),
+        "score_stopped_early": np.bool_(False),
+        "score_best_val_smooth": np.float64(float("nan")),
+        "score_grad_norm_mean": np.float64(float("nan")),
+        "score_grad_norm_max": np.float64(float("nan")),
+        "score_param_norm_final": np.float64(float("nan")),
+        "score_n_clipped_steps": np.int64(0),
+        "score_n_total_steps": np.int64(0),
+        "score_lr_last": np.float64(float("nan")),
+        "score_final_eval_weights": np.asarray(["analytic"], dtype=object),
+        "ae_train_losses": empty,
+        "ae_val_losses": empty,
+        "ae_val_monitor_losses": empty,
+        "ae_best_epoch": np.int64(0),
+        "ae_stopped_epoch": np.int64(0),
+        "ae_stopped_early": np.bool_(False),
+        "ae_latent_dim": np.int64(0),
+        "score_likelihood_finetune_train_losses": empty,
+        "score_likelihood_finetune_val_losses": empty,
+        "score_likelihood_finetune_val_monitor_losses": empty,
+        "prior_train_losses": empty,
+        "prior_val_losses": empty,
+        "prior_val_monitor_losses": empty,
+        "prior_likelihood_finetune_train_losses": empty,
+        "prior_likelihood_finetune_val_losses": empty,
+        "prior_likelihood_finetune_val_monitor_losses": empty,
+    }
+    payload.update(metadata)
+    np.savez_compressed(path, **payload)
 
 
 def _fit_binned_mean_pca_projection(
@@ -3403,7 +3576,7 @@ def _estimate_one(
     lxf_norm = _normalize_linear_x_flow_method(tfm)
     if lxf_norm is not None:
         method_name = lxf_norm
-        scheduled_lxf = method_name == "linear_x_flow_schedule"
+        scheduled_lxf = method_name in ("linear_x_flow_schedule", "linear_x_flow_diagonal_t")
         lxf_prefix = "lxfs" if scheduled_lxf else "lxf"
         sched_name = str(getattr(args, "lxfs_path_schedule", "cosine")).strip().lower() if scheduled_lxf else ""
         dev = require_device(str(getattr(args, "device", "cuda")))
@@ -3429,6 +3602,19 @@ def _estimate_one(
         if theta_train.shape[1] != theta_all.shape[1]:
             raise ValueError(f"{method_name} theta dimension mismatch.")
 
+        binned_lxf_cov_meta: dict[str, Any] | None = None
+        if method_name == "bin_gaussian_linear_x_flow_diagonal":
+            if bin_train is None:
+                raise ValueError("bin_gaussian_linear_x_flow_diagonal requires bin_train from the sweep subset.")
+            binned_lxf_cov_meta = estimate_binned_gaussian_shared_diagonal_covariance(
+                x_train=x_train,
+                bin_train=np.asarray(bin_train, dtype=np.int64),
+                n_bins=n_bins,
+                variance_floor=float(
+                    getattr(args, "flow_theta_reg_variance_floor", getattr(args, "flow_x_reg_variance_floor", 1e-6))
+                ),
+            )
+
         x_dim_lxf = int(x_all.shape[1])
         lxf_rank = int(getattr(args, "lxf_low_rank_dim", 4))
         if method_name == "linear_x_flow_scalar":
@@ -3439,7 +3625,7 @@ def _estimate_one(
                 hidden_dim=int(getattr(args, f"{lxf_prefix}_hidden_dim", 128)),
                 depth=int(getattr(args, f"{lxf_prefix}_depth", 3)),
             ).to(dev)
-        elif method_name == "linear_x_flow_diagonal":
+        elif method_name in ("linear_x_flow_diagonal", "bin_gaussian_linear_x_flow_diagonal"):
             drift_type = "diagonal"
             hidden_dim_lxf = int(getattr(args, f"{lxf_prefix}_hidden_dim", 128))
             depth_lxf = int(getattr(args, f"{lxf_prefix}_depth", 3))
@@ -3458,6 +3644,10 @@ def _estimate_one(
                     hidden_dim=hidden_dim_lxf,
                     depth=depth_lxf,
                 ).to(dev)
+            if binned_lxf_cov_meta is not None:
+                with torch.no_grad():
+                    model.a.copy_(torch.as_tensor(binned_lxf_cov_meta["a"], dtype=model.a.dtype, device=dev))
+                model.a.requires_grad_(False)
         elif method_name == "linear_x_flow_diagonal_theta":
             drift_type = "diagonal_theta"
             model = ConditionalThetaDiagonalLinearXFlowMLP(
@@ -3483,6 +3673,15 @@ def _estimate_one(
                 theta_max=theta_max,
                 num_basis=spline_k,
                 spline_degree=3,
+            ).to(dev)
+        elif method_name == "linear_x_flow_diagonal_t":
+            drift_type = "diagonal_time"
+            model = ConditionalTimeDiagonalLinearXFlowMLP(
+                theta_dim=int(theta_all.shape[1]),
+                x_dim=x_dim_lxf,
+                hidden_dim=int(getattr(args, f"{lxf_prefix}_hidden_dim", 128)),
+                depth=int(getattr(args, f"{lxf_prefix}_depth", 3)),
+                quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)),
             ).to(dev)
         elif method_name == "linear_x_flow_low_rank":
             if lxf_rank > x_dim_lxf:
@@ -3542,9 +3741,14 @@ def _estimate_one(
             weight_ema_decay=float(getattr(args, f"{lxf_prefix}_weight_ema_decay", 0.9)),
             max_grad_norm=float(getattr(args, f"{lxf_prefix}_max_grad_norm", 10.0)),
             log_every=max(1, int(getattr(args, "log_every", 50))),
-            restore_best=True,
+            restore_best=bool(getattr(args, "lxf_restore_best", True)),
         )
-        if scheduled_lxf:
+        if method_name == "linear_x_flow_diagonal_t":
+            train_out = train_time_diagonal_linear_x_flow_schedule(
+                **train_kwargs,
+                schedule=path_schedule_from_name(sched_name),
+            )
+        elif scheduled_lxf:
             train_out = train_linear_x_flow_schedule(
                 **train_kwargs,
                 schedule=path_schedule_from_name(sched_name),
@@ -3555,6 +3759,13 @@ def _estimate_one(
         x_std = np.asarray(train_out["x_std"], dtype=np.float64)
         nonlinear_train_out: dict[str, Any] | None = None
         pca_basis = np.asarray([], dtype=np.float32)
+        analytic_lxf_h = method_name != "linear_x_flow_nonlinear_pca"
+        save_lxf_c_matrix = bool(getattr(args, "lxf_save_c_matrix", False))
+        c_matrix: np.ndarray | None
+        delta_l: np.ndarray | None
+        endpoint_mu = np.asarray([], dtype=np.float64)
+        endpoint_cov_or_diag = np.asarray([], dtype=np.float64)
+        endpoint_is_diag = False
         if method_name == "linear_x_flow_nonlinear_pca":
             x_train_norm = (x_train - x_mean.reshape(1, -1)) / x_std.reshape(1, -1)
             pca_basis = fit_residual_pca_basis_from_linear_mean(
@@ -3613,37 +3824,91 @@ def _estimate_one(
                 ode_steps=int(getattr(args, "lxf_nlpca_ode_steps", 32)),
                 pair_batch_size=int(getattr(args, "lxf_pair_batch_size", 65536)),
             )
-        else:
-            c_matrix = compute_linear_x_flow_c_matrix(
+            delta_l = compute_delta_l_nf(c_matrix)
+            h_sym = symmetrize_nf(compute_h_directed_nf(delta_l))
+        elif method_name == "linear_x_flow_diagonal_t":
+            h_sym, endpoint_mu, endpoint_cov_or_diag, endpoint_is_diag = compute_linear_x_flow_analytic_hellinger_matrix(
                 model=model,
                 theta_all=theta_all,
-                x_all=x_all,
                 device=dev,
-                x_mean=x_mean,
-                x_std=x_std,
                 solve_jitter=float(getattr(args, f"{lxf_prefix}_solve_jitter", 1e-6)),
-                pair_batch_size=int(getattr(args, f"{lxf_prefix}_pair_batch_size", 65536)),
+                quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)),
             )
-        delta_l = compute_delta_l_nf(c_matrix)
-        h_sym = symmetrize_nf(compute_h_directed_nf(delta_l))
+            c_matrix = None
+            delta_l = None
+            if save_lxf_c_matrix:
+                c_matrix = compute_time_diagonal_linear_x_flow_c_matrix(
+                    model=cast(ConditionalTimeDiagonalLinearXFlowMLP, model),
+                    theta_all=theta_all,
+                    x_all=x_all,
+                    device=dev,
+                    x_mean=x_mean,
+                    x_std=x_std,
+                    solve_jitter=float(getattr(args, f"{lxf_prefix}_solve_jitter", 1e-6)),
+                    quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)),
+                    pair_batch_size=int(getattr(args, f"{lxf_prefix}_pair_batch_size", 65536)),
+                )
+                delta_l = compute_delta_l_nf(c_matrix)
+        else:
+            h_sym, endpoint_mu, endpoint_cov_or_diag, endpoint_is_diag = compute_linear_x_flow_analytic_hellinger_matrix(
+                model=model,
+                theta_all=theta_all,
+                device=dev,
+                solve_jitter=float(getattr(args, f"{lxf_prefix}_solve_jitter", 1e-6)),
+            )
+            c_matrix = None
+            delta_l = None
+            if save_lxf_c_matrix:
+                c_matrix = compute_linear_x_flow_c_matrix(
+                    model=model,
+                    theta_all=theta_all,
+                    x_all=x_all,
+                    device=dev,
+                    x_mean=x_mean,
+                    x_std=x_std,
+                    solve_jitter=float(getattr(args, f"{lxf_prefix}_solve_jitter", 1e-6)),
+                    pair_batch_size=int(getattr(args, f"{lxf_prefix}_pair_batch_size", 65536)),
+                )
+                delta_l = compute_delta_l_nf(c_matrix)
         theta_used = theta_all.reshape(-1) if int(theta_all.shape[1]) == 1 else theta_all.copy()
 
         lxf_b_net_saved = (
             str(getattr(args, "lxf_b_net", "mlp")).strip().lower()
-            if method_name == "linear_x_flow_diagonal"
+            if method_name in ("linear_x_flow_diagonal", "bin_gaussian_linear_x_flow_diagonal")
             else "mlp"
         )
+        binned_lxf_artifacts: dict[str, Any] = {}
+        if binned_lxf_cov_meta is not None:
+            binned_lxf_artifacts = {
+                "lxf_a_fixed": np.bool_(True),
+                "lxf_a_source": np.asarray(["binned_gaussian_shared_diagonal_covariance"], dtype=object),
+                "lxf_a": np.asarray(binned_lxf_cov_meta["a"], dtype=np.float64),
+                "lxf_shared_variance": np.asarray(binned_lxf_cov_meta["shared_variance"], dtype=np.float64),
+                "lxf_bin_counts": np.asarray(binned_lxf_cov_meta["bin_counts"], dtype=np.int64),
+                "lxf_normalized_bin_means": np.asarray(binned_lxf_cov_meta["normalized_bin_means"], dtype=np.float64),
+                "lxf_variance_floor": np.float64(float(binned_lxf_cov_meta["variance_floor"])),
+            }
 
-        np.savez_compressed(
-            os.path.join(output_dir, "h_matrix_results_theta_cov.npz"),
+        h_payload: dict[str, Any] = dict(
             theta_used=np.asarray(theta_used, dtype=np.float64),
             h_sym=np.asarray(h_sym, dtype=np.float64),
-            c_matrix=np.asarray(c_matrix, dtype=np.float64),
-            delta_l_matrix=np.asarray(delta_l, dtype=np.float64),
             h_field_method=np.asarray([method_name], dtype=object),
-            h_eval_scalar_name=np.asarray([f"{method_name}_log_p_x_given_theta"], dtype=object),
+            h_eval_scalar_name=np.asarray(
+                [
+                    f"{method_name}_log_p_x_given_theta"
+                    if not analytic_lxf_h
+                    else f"{method_name}_analytic_gaussian_hellinger"
+                ],
+                dtype=object,
+            ),
             sigma_eval=np.asarray([np.nan], dtype=np.float64),
             theta_field_method=np.asarray([method_name], dtype=object),
+            lxf_analytic_gaussian_hellinger=np.bool_(analytic_lxf_h),
+            lxf_save_c_matrix=np.bool_(save_lxf_c_matrix),
+            lxf_endpoint_mu=np.asarray(endpoint_mu, dtype=np.float64),
+            lxf_endpoint_covariance_or_variance_diag=np.asarray(endpoint_cov_or_diag, dtype=np.float64),
+            lxf_endpoint_is_diagonal=np.bool_(endpoint_is_diag),
+            lxf_fm_train=np.bool_(True),
             lxf_t_eps=np.float64(float(getattr(args, f"{lxf_prefix}_t_eps", 0.05))),
             lxf_solve_jitter=np.float64(float(getattr(args, f"{lxf_prefix}_solve_jitter", 1e-6))),
             lxf_hidden_dim=np.int64(int(getattr(args, f"{lxf_prefix}_hidden_dim", 128))),
@@ -3662,10 +3927,21 @@ def _estimate_one(
             lxf_weight_ema_decay=np.float64(train_out.get("weight_ema_decay", float(getattr(args, f"{lxf_prefix}_weight_ema_decay", 0.9)))),
             lxf_weight_ema_enabled=np.bool_(train_out.get("weight_ema_enabled", False)),
             lxf_final_eval_weights=np.asarray([str(train_out.get("final_eval_weights", "raw"))], dtype=object),
+            lxf_restore_best=np.bool_(bool(getattr(args, "lxf_restore_best", True))),
             lxfs_path_schedule=np.asarray([sched_name], dtype=object),
             lxfs_scheduled_train=np.bool_(scheduled_lxf),
+            lxfs_quadrature_steps=np.int64(int(getattr(args, "lxfs_quadrature_steps", 64)) if method_name == "linear_x_flow_diagonal_t" else 0),
             lxf_x_mean=np.asarray(x_mean, dtype=np.float64),
             lxf_x_std=np.asarray(x_std, dtype=np.float64),
+            **binned_lxf_artifacts,
+        )
+        if c_matrix is not None:
+            h_payload["c_matrix"] = np.asarray(c_matrix, dtype=np.float64)
+        if delta_l is not None:
+            h_payload["delta_l_matrix"] = np.asarray(delta_l, dtype=np.float64)
+        np.savez_compressed(
+            os.path.join(output_dir, "h_matrix_results_theta_cov.npz"),
+            **h_payload,
         )
         empty = np.asarray([], dtype=np.float64)
         np.savez_compressed(
@@ -3723,8 +3999,11 @@ def _estimate_one(
             lxf_weight_ema_decay=np.float64(train_out.get("weight_ema_decay", float(getattr(args, f"{lxf_prefix}_weight_ema_decay", 0.9)))),
             lxf_weight_ema_enabled=np.bool_(train_out.get("weight_ema_enabled", False)),
             lxf_final_eval_weights=np.asarray([str(train_out.get("final_eval_weights", "raw"))], dtype=object),
+            lxf_restore_best=np.bool_(bool(getattr(args, "lxf_restore_best", True))),
             lxfs_path_schedule=np.asarray([sched_name], dtype=object),
             lxfs_scheduled_train=np.bool_(scheduled_lxf),
+            lxfs_quadrature_steps=np.int64(int(getattr(args, "lxfs_quadrature_steps", 64)) if method_name == "linear_x_flow_diagonal_t" else 0),
+            **binned_lxf_artifacts,
         )
         loaded_lxf = SimpleNamespace(
             h_sym=np.asarray(h_sym, dtype=np.float64),
@@ -4929,6 +5208,8 @@ def _model_posterior_log_weights_for_fixed_x(
         return c, r"Linear X-flow random-basis low-rank $A$ log $p(x|\theta)$"
     if method == "linear_x_flow_schedule":
         return c, r"Linear X-flow schedule log $p(x|\theta)$"
+    if method == "linear_x_flow_diagonal_t":
+        return c, r"Linear X-flow diagonal $A(t)$ log $p(x|\theta)$"
     if method == "linear_theta_flow":
         return c, r"Linear theta-flow GMM log $p(\theta|x)$"
     return c, "matrix row"
@@ -5165,11 +5446,22 @@ def _write_fixed_x_posterior_diagnostic(
         return None
     z = np.load(h_path, allow_pickle=True)
     if "c_matrix" not in z.files:
+        analytic_lxf = (
+            bool(np.asarray(z["lxf_analytic_gaussian_hellinger"]).reshape(-1)[0])
+            if "lxf_analytic_gaussian_hellinger" in z.files
+            else False
+        )
+        msg = (
+            "c_matrix is not available for analytic Gaussian linear-X-flow Hellinger mode; "
+            "re-run with --lxf-save-c-matrix to save this diagnostic."
+            if analytic_lxf
+            else "c_matrix not in H-matrix npz (need h_save_intermediates=True)."
+        )
         fig, ax = plt.subplots(1, 1, figsize=(6.2, 2.2), dpi=120, layout="tight")
         ax.text(
             0.5,
             0.5,
-            "c_matrix not in H-matrix npz (need h_save_intermediates=True).",
+            msg,
             ha="center",
             va="center",
             transform=ax.transAxes,
@@ -5611,6 +5903,8 @@ def _render_training_losses_panel(
             post_lab = "linear-x-flow diagonal-theta FM likelihood"
         elif tfm == "linear_x_flow_diagonal_theta_spline":
             post_lab = "linear-x-flow diagonal-theta-spline FM likelihood"
+        elif tfm == "linear_x_flow_diagonal_t":
+            post_lab = "linear-x-flow diagonal-t FM likelihood"
         elif tfm == "linear_x_flow_low_rank":
             post_lab = "linear-x-flow low-rank FM likelihood"
         elif tfm == "linear_x_flow_low_rank_randb":
@@ -6052,6 +6346,8 @@ def _save_combined_convergence_figure(
             post_lab = "linear-x-flow diagonal-theta FM likelihood"
         elif tfm == "linear_x_flow_diagonal_theta_spline":
             post_lab = "linear-x-flow diagonal-theta-spline FM likelihood"
+        elif tfm == "linear_x_flow_diagonal_t":
+            post_lab = "linear-x-flow diagonal-t FM likelihood"
         elif tfm == "linear_x_flow_low_rank":
             post_lab = "linear-x-flow low-rank FM likelihood"
         elif tfm == "linear_x_flow_low_rank_randb":
@@ -6514,6 +6810,7 @@ def _write_summary(
             "linear_x_flow_diagonal",
             "linear_x_flow_diagonal_theta",
             "linear_x_flow_diagonal_theta_spline",
+            "linear_x_flow_diagonal_t",
             "linear_x_flow_low_rank",
             "linear_x_flow_low_rank_randb",
             "linear_x_flow_nonlinear_pca",
@@ -6532,6 +6829,7 @@ def _write_summary(
             f.write(f"lxf_solve_jitter: {float(getattr(args, 'lxf_solve_jitter', 0.0))}\n")
             f.write(f"lxf_weight_ema_decay: {float(getattr(args, 'lxf_weight_ema_decay', 0.0))}\n")
             f.write(f"lxf_early_patience: {int(getattr(args, 'lxf_early_patience', 0))}\n")
+            f.write(f"lxf_restore_best: {bool(getattr(args, 'lxf_restore_best', True))}\n")
             f.write(f"lxf_pair_batch_size: {int(getattr(args, 'lxf_pair_batch_size', 0))}\n")
             f.write(f"lxf_spline_k: {int(getattr(args, 'lxf_spline_k', 0))}\n")
             f.write(f"lxf_nlpca_dim: {int(getattr(args, 'lxf_nlpca_dim', 0))}\n")
@@ -6568,6 +6866,20 @@ def _write_summary(
             f.write(f"ltf_pair_batch_size: {int(getattr(args, 'ltf_pair_batch_size', 0))}\n")
             f.write(f"lxfs_early_patience: {int(getattr(args, 'lxfs_early_patience', 0))}\n")
             f.write(f"lxfs_pair_batch_size: {int(getattr(args, 'lxfs_pair_batch_size', 0))}\n")
+        if _tfm_sum == "linear_x_flow_diagonal_t":
+            f.write(f"lxfs_path_schedule: {getattr(args, 'lxfs_path_schedule', '')}\n")
+            f.write(f"lxfs_epochs: {int(getattr(args, 'lxfs_epochs', 0))}\n")
+            f.write(f"lxfs_batch_size: {int(getattr(args, 'lxfs_batch_size', 0))}\n")
+            f.write(f"lxfs_lr: {float(getattr(args, 'lxfs_lr', 0.0))}\n")
+            f.write(f"lxfs_hidden_dim: {int(getattr(args, 'lxfs_hidden_dim', 0))}\n")
+            f.write(f"lxfs_depth: {int(getattr(args, 'lxfs_depth', 0))}\n")
+            f.write(f"lxfs_weight_decay: {float(getattr(args, 'lxfs_weight_decay', 0.0))}\n")
+            f.write(f"lxfs_t_eps: {float(getattr(args, 'lxfs_t_eps', 0.0))}\n")
+            f.write(f"lxfs_solve_jitter: {float(getattr(args, 'lxfs_solve_jitter', 0.0))}\n")
+            f.write(f"lxfs_weight_ema_decay: {float(getattr(args, 'lxfs_weight_ema_decay', 0.0))}\n")
+            f.write(f"lxfs_early_patience: {int(getattr(args, 'lxfs_early_patience', 0))}\n")
+            f.write(f"lxfs_pair_batch_size: {int(getattr(args, 'lxfs_pair_batch_size', 0))}\n")
+            f.write(f"lxfs_quadrature_steps: {int(getattr(args, 'lxfs_quadrature_steps', 0))}\n")
         if _tfm_sum == "x_flow_pca":
             f.write(f"flow_pca_dim: {int(getattr(args, 'flow_pca_dim', 0))}\n")
             f.write(f"flow_pca_num_bins: {getattr(args, 'flow_pca_num_bins', None)}\n")
@@ -7536,6 +7848,20 @@ def main(argv: list[str] | None = None) -> None:
             "theta-dependent mean for C[i,j]=log p(x_i|theta_j), DeltaL=C-diag(C), and H via 1-sech(DeltaL/2).",
             flush=True,
         )
+    elif tfm == "linear_x_flow_diagonal_t":
+        print(
+            f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
+            f"(path_schedule={str(getattr(args, 'lxfs_path_schedule', 'cosine'))}; "
+            f"quadrature_steps={int(getattr(args, 'lxfs_quadrature_steps', 64))}; "
+            "time-dependent diagonal A(t) and b(t,theta) FM)",
+            flush=True,
+        )
+        print(
+            "[convergence] linear_x_flow_diagonal_t mode trains "
+            "v(x,t,theta)=diag(a(t)) x + b(t,theta) on a scheduled affine bridge, "
+            "then uses quadrature for the induced diagonal Gaussian p(x|theta) with shared covariance.",
+            flush=True,
+        )
     elif tfm in (
         "linear_x_flow",
         "linear_x_flow_scalar",
@@ -7543,12 +7869,19 @@ def main(argv: list[str] | None = None) -> None:
         "linear_x_flow_low_rank",
         "linear_x_flow_low_rank_randb",
         "linear_x_flow_nonlinear_pca",
+        "linear_x_flow_diagonal_t",
     ):
         if tfm == "linear_x_flow_scalar":
             drift_desc = "scalar A=aI"
         elif tfm == "linear_x_flow_diagonal":
             _bn = str(getattr(args, "lxf_b_net", "mlp")).strip().lower()
             drift_desc = f"diagonal A; b_phi={'FiLM trunk' if _bn == 'film' else 'MLP'}"
+        elif tfm == "linear_x_flow_diagonal_t":
+            drift_desc = (
+                f"time-dependent diagonal A(t) "
+                f"(path_schedule={str(getattr(args, 'lxfs_path_schedule', 'cosine'))}; "
+                f"quadrature_steps={int(getattr(args, 'lxfs_quadrature_steps', 64))})"
+            )
         elif tfm == "linear_x_flow_low_rank":
             drift_desc = f"low-rank A (rank={int(getattr(args, 'lxf_low_rank_dim', 4))})"
         elif tfm == "linear_x_flow_low_rank_randb":
@@ -7661,7 +7994,7 @@ def main(argv: list[str] | None = None) -> None:
             "linear-x-flow, linear-x-flow-scalar, linear-x-flow-diagonal, linear-x-flow-diagonal-theta, "
             "linear-x-flow-diagonal-theta-spline, "
             "linear-x-flow-low-rank, linear-x-flow-low-rank-randb, linear-x-flow-nonlinear-pca, "
-            "linear-x-flow-schedule, linear-theta-flow, gaussian-network, "
+            "linear-x-flow-schedule, linear-x-flow-diagonal-t, linear-theta-flow, gaussian-network, "
             "gaussian-network-diagonal, gaussian-network-diagonal-binned-pca, gaussian-network-low-rank, gaussian-network-autoencoder, "
             "or gaussian-network-diagonal-autoencoder."
         )
@@ -7798,10 +8131,14 @@ def main(argv: list[str] | None = None) -> None:
             wall_s[k] = time.time() - t1
             h_sweep.append(np.asarray(h_n_sqrt, dtype=np.float64))
             clf_sweep.append(np.asarray(clf_n, dtype=np.float64))
-            delta_l_in = _load_delta_l_from_run_dir(run_dir, dataset_family=ds_fam)
-            llr_n = _metrics_delta_l_binned(delta_l_in, subset_n, n_bins)
+            try:
+                delta_l_in = _load_delta_l_from_run_dir(run_dir, dataset_family=ds_fam)
+                llr_n = _metrics_delta_l_binned(delta_l_in, subset_n, n_bins)
+                corr_llr[k] = vhb.matrix_corr_offdiag_pearson(llr_n, np.asarray(llr_gt_mc, dtype=np.float64))
+            except KeyError as exc:
+                llr_n = np.full((n_bins, n_bins), np.nan, dtype=np.float64)
+                print(f"[convergence] n={n}  LLR diagnostic unavailable: {exc}", flush=True)
             llr_sweep.append(np.asarray(llr_n, dtype=np.float64))
-            corr_llr[k] = vhb.matrix_corr_offdiag_pearson(llr_n, np.asarray(llr_gt_mc, dtype=np.float64))
             print(
                 f"[convergence] n={n}  corr_h={corr_h[k]:.4f}  corr_clf={corr_clf[k]:.4f}  "
                 f"corr_llr={corr_llr[k]:.4f}  wall={wall_s[k]:.1f}s",

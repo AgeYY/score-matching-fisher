@@ -419,6 +419,7 @@ class TestStudyHDecodingConvergenceGaussianNetwork(unittest.TestCase):
                 "5",
                 "--lxf-pair-batch-size",
                 "2048",
+                "--keep-intermediate",
                 "--output-dir",
                 str(out_dir),
                 "--device",
@@ -431,6 +432,15 @@ class TestStudyHDecodingConvergenceGaussianNetwork(unittest.TestCase):
             self.assertTrue((out_dir / "h_decoding_convergence_results.npz").is_file())
             z = np.load(out_dir / "training_losses" / "n_000060.npz", allow_pickle=True)
             self.assertEqual(str(np.asarray(z["theta_field_method"]).reshape(-1)[0]), "linear_x_flow")
+            h_path = out_dir / "sweep_runs" / "n_000060" / "h_matrix_results_theta_cov.npz"
+            hz = np.load(h_path, allow_pickle=True)
+            self.assertTrue(np.isfinite(np.asarray(hz["h_sym"], dtype=np.float64)).all())
+            self.assertEqual(
+                str(np.asarray(hz["h_eval_scalar_name"]).reshape(-1)[0]),
+                "linear_x_flow_analytic_gaussian_hellinger",
+            )
+            self.assertTrue(bool(np.asarray(hz["lxf_analytic_gaussian_hellinger"]).reshape(-1)[0]))
+            self.assertNotIn("c_matrix", hz.files)
 
     def test_linear_x_flow_schedule_sweep_smoke(self) -> None:
         repo = Path(__file__).resolve().parent.parent
@@ -544,6 +554,7 @@ class TestStudyHDecodingConvergenceGaussianNetwork(unittest.TestCase):
             ("linear-x-flow-diagonal-theta-spline", "linear_x_flow_diagonal_theta_spline"),
             ("linear-x-flow-low-rank", "linear_x_flow_low_rank"),
             ("linear-x-flow-low-rank-randb", "linear_x_flow_low_rank_randb"),
+            ("linear-x-flow-diagonal-t", "linear_x_flow_diagonal_t"),
         ):
             with self.subTest(method=method_cli), tempfile.TemporaryDirectory() as tmp:
                 tmp_path = Path(tmp)
@@ -592,6 +603,20 @@ class TestStudyHDecodingConvergenceGaussianNetwork(unittest.TestCase):
                     "5",
                     "--lxf-pair-batch-size",
                     "2048",
+                    "--lxfs-epochs",
+                    "4",
+                    "--lxfs-batch-size",
+                    "32",
+                    "--lxfs-hidden-dim",
+                    "16",
+                    "--lxfs-depth",
+                    "1",
+                    "--lxfs-early-patience",
+                    "5",
+                    "--lxfs-pair-batch-size",
+                    "2048",
+                    "--lxfs-quadrature-steps",
+                    "8",
                     "--output-dir",
                     str(out_dir),
                     "--device",

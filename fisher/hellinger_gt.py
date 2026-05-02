@@ -130,6 +130,49 @@ def estimate_hellinger_sq_one_sided_mc(
     return h2
 
 
+def estimate_hellinger_sq_grid_centers_mc(
+    dataset: Any,
+    theta_centers: NDArray[np.float64],
+    *,
+    n_mc: int,
+    symmetrize: bool = False,
+) -> NDArray[np.float64]:
+    """Monte Carlo squared Hellinger between explicit theta grid centers.
+
+    ``theta_centers`` has shape ``(n_bins, theta_dim)``. For each row center i, samples
+    are drawn from ``p(x | theta_centers[i])`` and evaluated against every center j.
+    This is the true 2D-grid counterpart of ``estimate_hellinger_sq_one_sided_mc``.
+    """
+    centers = np.asarray(theta_centers, dtype=np.float64)
+    if centers.ndim == 1:
+        centers = centers.reshape(-1, 1)
+    if centers.ndim != 2 or centers.shape[0] < 1 or centers.shape[1] < 1:
+        raise ValueError("theta_centers must have shape (n_bins, theta_dim).")
+    if n_mc < 1:
+        raise ValueError("n_mc must be >= 1.")
+
+    n_bins = int(centers.shape[0])
+    h2 = np.zeros((n_bins, n_bins), dtype=np.float64)
+    for i in range(n_bins):
+        t_i = np.repeat(centers[i : i + 1], repeats=int(n_mc), axis=0)
+        x = dataset.sample_x(t_i)
+        lp_i = np.asarray(log_p_x_given_theta(x, t_i, dataset), dtype=np.float64).reshape(-1)
+        if lp_i.shape[0] != int(n_mc):
+            raise ValueError(f"log_p_x_given_theta length mismatch: got {lp_i.shape[0]}, expected {n_mc}.")
+        for j in range(n_bins):
+            t_j = np.repeat(centers[j : j + 1], repeats=int(n_mc), axis=0)
+            lp_j = np.asarray(log_p_x_given_theta(x, t_j, dataset), dtype=np.float64).reshape(-1)
+            log_half = 0.5 * (lp_j - lp_i)
+            m = float(np.max(log_half))
+            mean_exp = float(np.mean(np.exp(log_half - m)) * np.exp(m))
+            h2[i, j] = 1.0 - mean_exp
+
+    np.clip(h2, 0.0, 1.0, out=h2)
+    if symmetrize:
+        h2 = 0.5 * (h2 + h2.T)
+    return h2
+
+
 def estimate_mean_llr_one_sided_mc(
     dataset: Any,
     bin_centers: NDArray[np.float64],

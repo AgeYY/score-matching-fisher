@@ -174,6 +174,188 @@ def _as_2d_float64(a: np.ndarray, *, name: str) -> np.ndarray:
     return arr
 
 
+def gaussian_hellinger_sq_full(
+    mu1: np.ndarray,
+    cov1: np.ndarray,
+    mu2: np.ndarray,
+    cov2: np.ndarray,
+    *,
+    jitter: float = 1e-9,
+) -> float:
+    """Squared Hellinger distance between two full-covariance Gaussians."""
+    m1 = np.asarray(mu1, dtype=np.float64).reshape(-1)
+    m2 = np.asarray(mu2, dtype=np.float64).reshape(-1)
+    s1 = np.asarray(cov1, dtype=np.float64)
+    s2 = np.asarray(cov2, dtype=np.float64)
+    if m1.shape != m2.shape:
+        raise ValueError("mu1 and mu2 must have the same shape.")
+    d = int(m1.size)
+    if s1.shape != (d, d) or s2.shape != (d, d):
+        raise ValueError("covariance matrices must have shape [D, D].")
+    eye = np.eye(d, dtype=np.float64)
+    s1j = 0.5 * (s1 + s1.T) + float(jitter) * eye
+    s2j = 0.5 * (s2 + s2.T) + float(jitter) * eye
+    sbar = 0.5 * (s1j + s2j)
+    sign1, logdet1 = np.linalg.slogdet(s1j)
+    sign2, logdet2 = np.linalg.slogdet(s2j)
+    signb, logdetb = np.linalg.slogdet(sbar)
+    if sign1 <= 0 or sign2 <= 0 or signb <= 0:
+        raise ValueError("Gaussian covariance must be positive definite.")
+    diff = m1 - m2
+    quad = float(diff @ np.linalg.solve(sbar, diff))
+    log_bc = 0.25 * logdet1 + 0.25 * logdet2 - 0.5 * logdetb - 0.125 * quad
+    h2 = 1.0 - float(np.exp(np.clip(log_bc, -745.0, 0.0)))
+    return float(np.clip(h2, 0.0, 1.0))
+
+
+def gaussian_hellinger_sq_diag(
+    mu1: np.ndarray,
+    var1: np.ndarray,
+    mu2: np.ndarray,
+    var2: np.ndarray,
+    *,
+    jitter: float = 1e-12,
+) -> float:
+    """Squared Hellinger distance between two diagonal Gaussians."""
+    m1 = np.asarray(mu1, dtype=np.float64).reshape(-1)
+    m2 = np.asarray(mu2, dtype=np.float64).reshape(-1)
+    v1 = np.asarray(var1, dtype=np.float64).reshape(-1) + float(jitter)
+    v2 = np.asarray(var2, dtype=np.float64).reshape(-1) + float(jitter)
+    if m1.shape != m2.shape or v1.shape != m1.shape or v2.shape != m1.shape:
+        raise ValueError("mu and variance vectors must have matching shape.")
+    if np.any(v1 <= 0.0) or np.any(v2 <= 0.0):
+        raise ValueError("diagonal variances must be positive.")
+    vbar = 0.5 * (v1 + v2)
+    log_bc = 0.25 * np.sum(np.log(v1)) + 0.25 * np.sum(np.log(v2)) - 0.5 * np.sum(np.log(vbar))
+    log_bc -= 0.125 * float(np.sum((m1 - m2) ** 2 / vbar))
+    h2 = 1.0 - float(np.exp(np.clip(log_bc, -745.0, 0.0)))
+    return float(np.clip(h2, 0.0, 1.0))
+
+
+def gaussian_hellinger_sq_shared_covariance_matrix(
+    mu: np.ndarray,
+    cov: np.ndarray,
+    *,
+    jitter: float = 1e-9,
+) -> np.ndarray:
+    """Pairwise squared Hellinger matrix for Gaussians with shared full covariance."""
+    m = _as_2d_float64(mu, name="mu")
+    s = np.asarray(cov, dtype=np.float64)
+    d = int(m.shape[1])
+    if s.shape != (d, d):
+        raise ValueError("cov must have shape [D, D].")
+    sj = 0.5 * (s + s.T) + float(jitter) * np.eye(d, dtype=np.float64)
+    sol = np.linalg.solve(sj, (m[:, None, :] - m[None, :, :]).reshape(-1, d).T).T
+    diff = (m[:, None, :] - m[None, :, :]).reshape(-1, d)
+    quad = np.sum(diff * sol, axis=1).reshape(m.shape[0], m.shape[0])
+    h2 = 1.0 - np.exp(np.clip(-0.125 * quad, -745.0, 0.0))
+    h2 = np.clip(h2, 0.0, 1.0)
+    np.fill_diagonal(h2, 0.0)
+    return 0.5 * (h2 + h2.T)
+
+
+def gaussian_hellinger_sq_diag_matrix(
+    mu: np.ndarray,
+    var_diag: np.ndarray,
+    *,
+    jitter: float = 1e-12,
+) -> np.ndarray:
+    """Pairwise squared Hellinger matrix for diagonal Gaussian endpoints."""
+    m = _as_2d_float64(mu, name="mu")
+    v = _as_2d_float64(var_diag, name="var_diag") + float(jitter)
+    if v.shape[0] == 1 and m.shape[0] > 1:
+        v = np.repeat(v, repeats=m.shape[0], axis=0)
+    if v.shape != m.shape:
+        raise ValueError("var_diag must have shape [N, D] or [1, D].")
+    if np.any(v <= 0.0):
+        raise ValueError("diagonal variances must be positive.")
+    vbar = 0.5 * (v[:, None, :] + v[None, :, :])
+    log_bc = 0.25 * np.sum(np.log(v[:, None, :]), axis=2)
+    log_bc = log_bc + 0.25 * np.sum(np.log(v[None, :, :]), axis=2)
+    log_bc = log_bc - 0.5 * np.sum(np.log(vbar), axis=2)
+    log_bc -= 0.125 * np.sum((m[:, None, :] - m[None, :, :]) ** 2 / vbar, axis=2)
+    h2 = 1.0 - np.exp(np.clip(log_bc, -745.0, 0.0))
+    h2 = np.clip(h2, 0.0, 1.0)
+    np.fill_diagonal(h2, 0.0)
+    return 0.5 * (h2 + h2.T)
+
+
+def linear_x_flow_endpoint_gaussian(
+    *,
+    model: nn.Module,
+    theta_all: np.ndarray,
+    device: torch.device,
+    solve_jitter: float = 1e-6,
+    quadrature_steps: int | None = None,
+) -> tuple[np.ndarray, np.ndarray, bool]:
+    """Return endpoint ``(mu, covariance_or_diag, is_diagonal)`` in normalized x-space."""
+    theta = _as_2d_float64(theta_all, name="theta_all")
+    theta_t = torch.from_numpy(theta.astype(np.float32, copy=False)).to(device)
+    model.eval()
+    with torch.no_grad():
+        if isinstance(model, ConditionalTimeDiagonalLinearXFlowMLP):
+            mu_t, var_t = model.endpoint_mean_covariance_diag(
+                theta_t,
+                solve_jitter=float(solve_jitter),
+                quadrature_steps=quadrature_steps,
+            )
+            return (
+                mu_t.detach().cpu().numpy().astype(np.float64),
+                var_t.detach().cpu().numpy().astype(np.float64),
+                True,
+            )
+        if hasattr(model, "endpoint_mean_covariance_diag"):
+            mu_t, var_t = model.endpoint_mean_covariance_diag(theta_t, solve_jitter=float(solve_jitter))  # type: ignore[attr-defined]
+            return (
+                mu_t.detach().cpu().numpy().astype(np.float64),
+                var_t.detach().cpu().numpy().astype(np.float64),
+                True,
+            )
+        if hasattr(model, "endpoint_mean_covariance"):
+            mu_t, cov_t = model.endpoint_mean_covariance(theta_t, solve_jitter=float(solve_jitter))  # type: ignore[attr-defined]
+            return (
+                mu_t.detach().cpu().numpy().astype(np.float64),
+                cov_t.detach().cpu().numpy().astype(np.float64),
+                False,
+            )
+    raise TypeError(f"{type(model).__name__} does not expose a Gaussian endpoint.")
+
+
+def compute_linear_x_flow_analytic_hellinger_matrix(
+    *,
+    model: nn.Module,
+    theta_all: np.ndarray,
+    device: torch.device,
+    solve_jitter: float = 1e-6,
+    quadrature_steps: int | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool]:
+    """Compute pairwise squared Hellinger distances from learned Gaussian endpoints."""
+    mu, cov_or_diag, is_diag = linear_x_flow_endpoint_gaussian(
+        model=model,
+        theta_all=theta_all,
+        device=device,
+        solve_jitter=float(solve_jitter),
+        quadrature_steps=quadrature_steps,
+    )
+    if is_diag:
+        h = gaussian_hellinger_sq_diag_matrix(mu, cov_or_diag, jitter=float(solve_jitter) * 1e-3)
+    else:
+        h = gaussian_hellinger_sq_shared_covariance_matrix(mu, cov_or_diag, jitter=float(solve_jitter) * 1e-3)
+    return h, mu, cov_or_diag, bool(is_diag)
+
+
+def _fill_empty_bin_rows_nearest(values: np.ndarray, counts: np.ndarray) -> np.ndarray:
+    out = np.asarray(values, dtype=np.float64).copy()
+    c = np.asarray(counts, dtype=np.int64).reshape(-1)
+    nonempty_idx = np.flatnonzero(c > 0)
+    if nonempty_idx.size == 0:
+        raise ValueError("At least one non-empty theta bin is required.")
+    for b in np.flatnonzero(c <= 0):
+        nearest = int(nonempty_idx[np.argmin(np.abs(nonempty_idx - int(b)))])
+        out[int(b)] = out[nearest]
+    return out
+
+
 class _BaseConditionalLinearXFlowMLP(nn.Module):
     """Shared theta-conditioned offset MLP plus an ``A`` property supplied by subclasses."""
 
@@ -476,6 +658,166 @@ class ConditionalDiagonalLinearXFlowFiLMLP(nn.Module):
         return self.log_prob_normalized(z, theta, solve_jitter=solve_jitter) + logjac
 
 
+class ConditionalTimeDiagonalLinearXFlowMLP(nn.Module):
+    """Time-dependent diagonal drift ``A(t)=diag(a(t))`` and offset ``b(t, theta)``.
+
+    The endpoint distribution is diagonal Gaussian. Since ``a(t)`` has no theta input,
+    the endpoint covariance is shared across theta; the mean is obtained by fixed-grid
+    quadrature of the linear ODE solution.
+    """
+
+    def __init__(
+        self,
+        *,
+        theta_dim: int,
+        x_dim: int,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        quadrature_steps: int = 64,
+    ) -> None:
+        super().__init__()
+        if int(theta_dim) < 1:
+            raise ValueError("theta_dim must be >= 1.")
+        if int(x_dim) < 1:
+            raise ValueError("x_dim must be >= 1.")
+        if int(hidden_dim) < 1:
+            raise ValueError("hidden_dim must be >= 1.")
+        if int(depth) < 1:
+            raise ValueError("depth must be >= 1.")
+        if int(quadrature_steps) < 2:
+            raise ValueError("quadrature_steps must be >= 2.")
+        self.theta_dim = int(theta_dim)
+        self.x_dim = int(x_dim)
+        self.quadrature_steps = int(quadrature_steps)
+
+        a_layers: list[nn.Module] = []
+        in_dim = 1
+        for _ in range(int(depth)):
+            a_layers.append(nn.Linear(in_dim, int(hidden_dim)))
+            a_layers.append(nn.SiLU())
+            in_dim = int(hidden_dim)
+        a_out = nn.Linear(in_dim, self.x_dim)
+        nn.init.zeros_(a_out.weight)
+        nn.init.constant_(a_out.bias, 1e-3)
+        a_layers.append(a_out)
+        self.a_net = nn.Sequential(*a_layers)
+
+        b_layers: list[nn.Module] = []
+        in_dim = self.theta_dim + 1
+        for _ in range(int(depth)):
+            b_layers.append(nn.Linear(in_dim, int(hidden_dim)))
+            b_layers.append(nn.SiLU())
+            in_dim = int(hidden_dim)
+        b_out = nn.Linear(in_dim, self.x_dim)
+        nn.init.xavier_uniform_(b_out.weight, gain=0.01)
+        nn.init.zeros_(b_out.bias)
+        b_layers.append(b_out)
+        self.b_net = nn.Sequential(*b_layers)
+
+    def _as_col_t(self, t: torch.Tensor, *, batch: int | None = None) -> torch.Tensor:
+        if t.ndim == 0:
+            t = t.reshape(1, 1)
+        elif t.ndim == 1:
+            t = t.unsqueeze(-1)
+        if t.ndim != 2 or int(t.shape[1]) != 1:
+            raise ValueError("t must have shape [B] or [B, 1].")
+        if batch is not None and int(t.shape[0]) == 1 and int(batch) > 1:
+            t = t.expand(int(batch), 1)
+        return t
+
+    def a(self, t: torch.Tensor) -> torch.Tensor:
+        t = self._as_col_t(t)
+        return self.a_net(t)
+
+    def b(self, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        t = self._as_col_t(t, batch=int(theta.shape[0]))
+        return self.b_net(torch.cat([t, theta], dim=1))
+
+    def forward(self, x: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        t = self._as_col_t(t, batch=int(x.shape[0]))
+        return self.a(t) * x + self.b(theta, t)
+
+    def regularization_loss(self) -> torch.Tensor | None:
+        return None
+
+    def endpoint_mean_covariance_diag(
+        self,
+        theta: torch.Tensor,
+        *,
+        solve_jitter: float = 1e-6,
+        quadrature_steps: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        q = self.quadrature_steps if quadrature_steps is None else int(quadrature_steps)
+        if q < 2:
+            raise ValueError("quadrature_steps must be >= 2.")
+        grid = torch.linspace(0.0, 1.0, q, dtype=theta.dtype, device=theta.device).reshape(q, 1)
+        a_grid = self.a(grid)
+        s = torch.trapezoid(a_grid, grid.reshape(-1), dim=0)
+        tail = torch.zeros_like(a_grid)
+        if q > 1:
+            dt = grid[1:, 0] - grid[:-1, 0]
+            seg = 0.5 * (a_grid[:-1] + a_grid[1:]) * dt.unsqueeze(-1)
+            tail[:-1] = torch.flip(torch.cumsum(torch.flip(seg, dims=(0,)), dim=0), dims=(0,))
+
+        b_vals: list[torch.Tensor] = []
+        for k in range(q):
+            tk = grid[k].reshape(1, 1).expand(int(theta.shape[0]), 1)
+            b_vals.append(self.b(theta, tk))
+        b_grid = torch.stack(b_vals, dim=0)
+        weights = torch.exp(tail).unsqueeze(1)
+        integrand = weights * b_grid
+        mu = torch.trapezoid(integrand, grid.reshape(-1), dim=0)
+        sigma_diag = torch.exp(2.0 * s).reshape(1, -1).expand_as(mu) + float(solve_jitter)
+        return mu, sigma_diag
+
+    def log_prob_normalized(
+        self,
+        x_norm: torch.Tensor,
+        theta: torch.Tensor,
+        *,
+        solve_jitter: float = 1e-6,
+        quadrature_steps: int | None = None,
+    ) -> torch.Tensor:
+        if x_norm.ndim == 1:
+            x_norm = x_norm.unsqueeze(0)
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        if x_norm.shape[0] != theta.shape[0]:
+            raise ValueError("x and theta batch sizes must match.")
+        mu, sigma_diag = self.endpoint_mean_covariance_diag(
+            theta,
+            solve_jitter=float(solve_jitter),
+            quadrature_steps=quadrature_steps,
+        )
+        d = int(x_norm.shape[1])
+        quad = torch.sum((x_norm - mu) ** 2 / sigma_diag, dim=1)
+        log_det = torch.sum(torch.log(sigma_diag), dim=1)
+        return -0.5 * (quad + log_det + float(d) * math.log(2.0 * math.pi))
+
+    def log_prob_observed(
+        self,
+        x_raw: torch.Tensor,
+        theta: torch.Tensor,
+        *,
+        x_mean: torch.Tensor,
+        x_std: torch.Tensor,
+        solve_jitter: float = 1e-6,
+        quadrature_steps: int | None = None,
+    ) -> torch.Tensor:
+        z = (x_raw - x_mean) / x_std
+        logjac = -torch.sum(torch.log(x_std))
+        return self.log_prob_normalized(
+            z,
+            theta,
+            solve_jitter=float(solve_jitter),
+            quadrature_steps=quadrature_steps,
+        ) + logjac
+
+
 class ConditionalThetaDiagonalLinearXFlowMLP(nn.Module):
     """Diagonal drift ``a_phi(theta)`` and offset ``b_phi(theta)`` both from theta.
 
@@ -704,6 +1046,297 @@ class ConditionalThetaDiagonalSplineLinearXFlowMLP(nn.Module):
         z = (x_raw - x_mean) / x_std
         logjac = -torch.sum(torch.log(x_std))
         return self.log_prob_normalized(z, theta, solve_jitter=solve_jitter) + logjac
+
+
+class BinnedGaussianDiagonalLinearXFlow(nn.Module):
+    """Analytic diagonal linear X-flow converted from binned shared-covariance Gaussians.
+
+    The model is fit in normalized x-space. It uses a constant diagonal drift
+    ``A=diag(a)`` with ``exp(2a)=global_var`` and a scalar-theta cubic B-spline
+    offset ``b(theta)`` such that the endpoint mean approximates the fitted
+    per-bin means.
+    """
+
+    def __init__(
+        self,
+        *,
+        x_dim: int,
+        theta_min: float,
+        theta_max: float,
+        a: np.ndarray | torch.Tensor,
+        wb: np.ndarray | torch.Tensor,
+        cb: np.ndarray | torch.Tensor | None = None,
+        num_basis: int,
+        spline_degree: int = 3,
+    ) -> None:
+        super().__init__()
+        if int(x_dim) < 1:
+            raise ValueError("x_dim must be >= 1.")
+        self.theta_dim = 1
+        self.x_dim = int(x_dim)
+        self.num_basis = int(num_basis)
+        self.spline_degree = int(spline_degree)
+        if self.num_basis < self.spline_degree + 1:
+            raise ValueError(
+                f"num_basis must be >= spline_degree+1 (need {self.spline_degree + 1}); got {self.num_basis}."
+            )
+        tmn = float(theta_min)
+        tmx = float(theta_max)
+        if (not np.isfinite(tmn)) or (not np.isfinite(tmx)):
+            raise ValueError("theta_min and theta_max must be finite.")
+        if tmx <= tmn:
+            tmx = tmn + 1e-6
+        self.register_buffer("theta_min_buf", torch.tensor([tmn], dtype=torch.float32))
+        self.register_buffer("theta_max_buf", torch.tensor([tmx], dtype=torch.float32))
+        self.register_buffer(
+            "knots",
+            open_uniform_clamped_knot_vector(self.num_basis, degree=self.spline_degree, dtype=torch.float32),
+        )
+        a_t = torch.as_tensor(a, dtype=torch.float32).reshape(-1)
+        if int(a_t.numel()) != self.x_dim:
+            raise ValueError("a must have shape [x_dim].")
+        wb_t = torch.as_tensor(wb, dtype=torch.float32)
+        if wb_t.shape != (self.x_dim, self.num_basis):
+            raise ValueError("wb must have shape [x_dim, num_basis].")
+        if cb is None:
+            cb_t = torch.zeros(self.x_dim, dtype=torch.float32)
+        else:
+            cb_t = torch.as_tensor(cb, dtype=torch.float32).reshape(-1)
+            if int(cb_t.numel()) != self.x_dim:
+                raise ValueError("cb must have shape [x_dim].")
+        self.register_buffer("a", a_t)
+        self.register_buffer("Wb", wb_t)
+        self.register_buffer("cb", cb_t)
+
+    @property
+    def A(self) -> torch.Tensor:
+        return torch.diag(self.a)
+
+    def spline_phi(self, theta: torch.Tensor) -> torch.Tensor:
+        return spline_basis_features_normalized(
+            theta,
+            theta_min=self.theta_min_buf,
+            theta_max=self.theta_max_buf,
+            num_basis=self.num_basis,
+            knots=self.knots,
+            degree=self.spline_degree,
+        )
+
+    def b(self, theta: torch.Tensor) -> torch.Tensor:
+        phi = self.spline_phi(theta)
+        return phi @ self.Wb.T + self.cb
+
+    def forward(self, x: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
+        return self.a.reshape(1, -1).to(dtype=x.dtype, device=x.device) * x + self.b(theta)
+
+    def regularization_loss(self) -> torch.Tensor | None:
+        return None
+
+    def endpoint_mean_covariance_diag(
+        self,
+        theta: torch.Tensor,
+        *,
+        solve_jitter: float = 1e-6,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        b_theta = self.b(theta)
+        a = self.a.to(dtype=b_theta.dtype, device=b_theta.device).reshape(1, -1)
+        mu = _phi_expm1_div_a(a) * b_theta
+        sigma_diag = torch.exp(2.0 * a).expand_as(mu) + float(solve_jitter)
+        return mu, sigma_diag
+
+    def log_prob_normalized(
+        self,
+        x_norm: torch.Tensor,
+        theta: torch.Tensor,
+        *,
+        solve_jitter: float = 1e-6,
+    ) -> torch.Tensor:
+        if x_norm.ndim == 1:
+            x_norm = x_norm.unsqueeze(0)
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        if x_norm.shape[0] != theta.shape[0]:
+            raise ValueError("x and theta batch sizes must match.")
+        mu, sigma_diag = self.endpoint_mean_covariance_diag(theta, solve_jitter=solve_jitter)
+        d = int(x_norm.shape[1])
+        quad = torch.sum((x_norm - mu) ** 2 / sigma_diag, dim=1)
+        log_det = torch.sum(torch.log(sigma_diag), dim=1)
+        return -0.5 * (quad + log_det + float(d) * math.log(2.0 * math.pi))
+
+    def log_prob_observed(
+        self,
+        x_raw: torch.Tensor,
+        theta: torch.Tensor,
+        *,
+        x_mean: torch.Tensor,
+        x_std: torch.Tensor,
+        solve_jitter: float = 1e-6,
+    ) -> torch.Tensor:
+        z = (x_raw - x_mean) / x_std
+        logjac = -torch.sum(torch.log(x_std))
+        return self.log_prob_normalized(z, theta, solve_jitter=solve_jitter) + logjac
+
+
+def fit_binned_gaussian_diagonal_linear_x_flow(
+    *,
+    theta_train: np.ndarray,
+    x_train: np.ndarray,
+    bin_train: np.ndarray,
+    n_bins: int,
+    variance_floor: float = 1e-6,
+    spline_degree: int = 3,
+    ridge: float = 1e-10,
+) -> tuple[BinnedGaussianDiagonalLinearXFlow, dict[str, np.ndarray | float | int]]:
+    """Fit the analytic binned-Gaussian diagonal linear X-flow in normalized x-space.
+
+    The spline for ``b(theta)`` is scalar in ``theta``. If ``theta_train`` has
+    ``theta_dim > 1``, only ``theta_train[:, 0]`` is used (same coordinate as
+    theta-bin indices in the H-decoding pipeline).
+    """
+    th = _as_2d_float64(theta_train, name="theta_train")
+    x = _as_2d_float64(x_train, name="x_train")
+    bins = np.asarray(bin_train, dtype=np.int64).reshape(-1)
+    nb = int(n_bins)
+    vf = float(variance_floor)
+    if int(th.shape[1]) != 1:
+        # v1 spline is scalar in theta; use the same coordinate as theta-bin indices (theta[:, 0]).
+        th = np.asarray(th[:, 0], dtype=np.float64).reshape(-1, 1)
+    if x.shape[0] != th.shape[0] or bins.shape[0] != x.shape[0]:
+        raise ValueError("theta_train, x_train, and bin_train row counts must match.")
+    if nb < 1:
+        raise ValueError("n_bins must be >= 1.")
+    if not np.isfinite(vf) or vf <= 0.0:
+        raise ValueError("variance_floor must be a finite positive number.")
+    if float(ridge) < 0.0:
+        raise ValueError("ridge must be >= 0.")
+
+    x_mean = np.mean(x, axis=0, dtype=np.float64)
+    x_std = np.maximum(np.std(x, axis=0, dtype=np.float64), 1e-6)
+    x_norm = (x - x_mean.reshape(1, -1)) / x_std.reshape(1, -1)
+    d = int(x_norm.shape[1])
+    clipped_bins = np.clip(bins, 0, nb - 1)
+    counts = np.bincount(clipped_bins, minlength=nb).astype(np.int64)
+    means = np.zeros((nb, d), dtype=np.float64)
+    theta_centers = np.zeros(nb, dtype=np.float64)
+    global_theta_mean = float(np.mean(th[:, 0], dtype=np.float64))
+    for b in range(nb):
+        idx = np.flatnonzero(clipped_bins == b)
+        if idx.size > 0:
+            means[b] = np.mean(x_norm[idx], axis=0, dtype=np.float64)
+            theta_centers[b] = float(np.mean(th[idx, 0], dtype=np.float64))
+        else:
+            theta_centers[b] = global_theta_mean
+    means = _fill_empty_bin_rows_nearest(means, counts)
+    theta_centers = _fill_empty_bin_rows_nearest(theta_centers.reshape(-1, 1), counts).reshape(-1)
+
+    residual = x_norm - means[clipped_bins]
+    shared_var = np.maximum(np.mean(residual * residual, axis=0, dtype=np.float64), vf)
+    a = 0.5 * np.log(shared_var)
+    phi_scale = _phi_expm1_div_a(torch.from_numpy(a.astype(np.float64))).detach().cpu().numpy()
+    phi_safe = np.where(np.abs(phi_scale) < 1e-12, 1e-12, phi_scale)
+    b_targets = means / phi_safe.reshape(1, -1)
+
+    num_basis = max(int(spline_degree) + 1, nb)
+    theta_min = float(np.min(th[:, 0]))
+    theta_max = float(np.max(th[:, 0]))
+    knots = open_uniform_clamped_knot_vector(num_basis, degree=int(spline_degree), dtype=torch.float64)
+    phi_centers = spline_basis_features_normalized(
+        torch.from_numpy(theta_centers.astype(np.float64)).reshape(-1, 1),
+        theta_min=torch.tensor([theta_min], dtype=torch.float64),
+        theta_max=torch.tensor([theta_max if theta_max > theta_min else theta_min + 1e-6], dtype=torch.float64),
+        num_basis=num_basis,
+        knots=knots,
+        degree=int(spline_degree),
+    ).detach().cpu().numpy()
+    w = np.sqrt(np.maximum(counts.astype(np.float64), 1.0)).reshape(-1, 1)
+    lhs = phi_centers * w
+    rhs = b_targets * w
+    gram = lhs.T @ lhs + float(ridge) * np.eye(num_basis, dtype=np.float64)
+    coef = np.linalg.solve(gram, lhs.T @ rhs)
+    wb = coef.T
+    model = BinnedGaussianDiagonalLinearXFlow(
+        x_dim=d,
+        theta_min=theta_min,
+        theta_max=theta_max,
+        a=a,
+        wb=wb,
+        cb=np.zeros(d, dtype=np.float64),
+        num_basis=num_basis,
+        spline_degree=int(spline_degree),
+    )
+    meta: dict[str, np.ndarray | float | int] = {
+        "x_mean": x_mean,
+        "x_std": x_std,
+        "bin_counts": counts,
+        "theta_bin_centers": theta_centers,
+        "normalized_bin_means": means,
+        "shared_variance": shared_var,
+        "a": a,
+        "b_targets": b_targets,
+        "b_spline_coef": wb,
+        "spline_knots": knots.detach().cpu().numpy(),
+        "spline_degree": int(spline_degree),
+        "spline_num_basis": int(num_basis),
+        "theta_min": float(theta_min),
+        "theta_max": float(theta_max if theta_max > theta_min else theta_min + 1e-6),
+        "variance_floor": float(vf),
+        "ridge": float(ridge),
+    }
+    return model, meta
+
+
+def estimate_binned_gaussian_shared_diagonal_covariance(
+    *,
+    x_train: np.ndarray,
+    bin_train: np.ndarray,
+    n_bins: int,
+    variance_floor: float = 1e-6,
+) -> dict[str, np.ndarray | float]:
+    """Estimate normalized bin means and one shared diagonal covariance.
+
+    This keeps the binned-Gaussian residual convention used by the closed-form
+    binned Gaussian baseline: normalize train ``x``, compute bin means, fill
+    empty bins from the nearest non-empty bin, then estimate residual variance
+    around each row's filled bin mean.
+    """
+    x = _as_2d_float64(x_train, name="x_train")
+    bins = np.asarray(bin_train, dtype=np.int64).reshape(-1)
+    nb = int(n_bins)
+    vf = float(variance_floor)
+    if x.shape[0] != bins.shape[0]:
+        raise ValueError("x_train and bin_train row counts must match.")
+    if nb < 1:
+        raise ValueError("n_bins must be >= 1.")
+    if not np.isfinite(vf) or vf <= 0.0:
+        raise ValueError("variance_floor must be a finite positive number.")
+
+    x_mean = np.mean(x, axis=0, dtype=np.float64)
+    x_std = np.maximum(np.std(x, axis=0, dtype=np.float64), 1e-6)
+    x_norm = (x - x_mean.reshape(1, -1)) / x_std.reshape(1, -1)
+    d = int(x_norm.shape[1])
+    clipped_bins = np.clip(bins, 0, nb - 1)
+    counts = np.bincount(clipped_bins, minlength=nb).astype(np.int64)
+    means = np.zeros((nb, d), dtype=np.float64)
+    for b in range(nb):
+        idx = np.flatnonzero(clipped_bins == b)
+        if idx.size > 0:
+            means[b] = np.mean(x_norm[idx], axis=0, dtype=np.float64)
+    means = _fill_empty_bin_rows_nearest(means, counts)
+
+    residual = x_norm - means[clipped_bins]
+    shared_var = np.maximum(np.mean(residual * residual, axis=0, dtype=np.float64), vf)
+    a = 0.5 * np.log(shared_var)
+    return {
+        "x_mean": x_mean.astype(np.float64),
+        "x_std": x_std.astype(np.float64),
+        "bin_counts": counts,
+        "normalized_bin_means": means.astype(np.float64),
+        "shared_variance": shared_var.astype(np.float64),
+        "a": a.astype(np.float64),
+        "variance_floor": float(vf),
+    }
 
 
 class ConditionalLowRankLinearXFlowMLP(_BaseConditionalLinearXFlowMLP):
@@ -1366,6 +1999,196 @@ def train_linear_x_flow_schedule(
     }
 
 
+def train_time_diagonal_linear_x_flow_schedule(
+    *,
+    model: ConditionalTimeDiagonalLinearXFlowMLP,
+    theta_train: np.ndarray,
+    x_train: np.ndarray,
+    theta_val: np.ndarray,
+    x_val: np.ndarray,
+    device: torch.device,
+    schedule: GaussianAffinePathSchedule,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    weight_decay: float = 0.0,
+    t_eps: float = 0.05,
+    patience: int = 1000,
+    min_delta: float = 1e-4,
+    ema_alpha: float = 0.05,
+    weight_ema_decay: float = 0.9,
+    max_grad_norm: float = 10.0,
+    log_every: int = 50,
+    restore_best: bool = True,
+) -> dict[str, Any]:
+    """Train ``v(x,t,theta)=diag(a(t))x+b(t,theta)`` on a scheduled affine bridge."""
+    if int(epochs) < 1:
+        raise ValueError("epochs must be >= 1.")
+    if int(batch_size) < 1:
+        raise ValueError("batch_size must be >= 1.")
+    if float(lr) <= 0.0:
+        raise ValueError("lr must be > 0.")
+    if int(patience) < 0:
+        raise ValueError("patience must be >= 0.")
+    if float(min_delta) < 0.0:
+        raise ValueError("min_delta must be >= 0.")
+    if not (0.0 < float(ema_alpha) <= 1.0):
+        raise ValueError("ema_alpha must be in (0, 1].")
+    if not np.isfinite(float(weight_ema_decay)) or float(weight_ema_decay) >= 1.0:
+        raise ValueError("weight_ema_decay must be finite and < 1.")
+    te = float(t_eps)
+    if not (0.0 < te < 0.5):
+        raise ValueError("t_eps must be in (0, 0.5).")
+
+    th_tr = _as_2d_float64(theta_train, name="theta_train")
+    x_tr = _as_2d_float64(x_train, name="x_train")
+    th_va = _as_2d_float64(theta_val, name="theta_val")
+    x_va = _as_2d_float64(x_val, name="x_val")
+    if th_tr.shape[0] < 1 or th_va.shape[0] < 1:
+        raise ValueError("linear_x_flow_diagonal_t requires non-empty train and validation splits.")
+
+    x_mean = np.mean(x_tr, axis=0, dtype=np.float64)
+    x_std = np.maximum(np.std(x_tr, axis=0, dtype=np.float64), 1e-6)
+    x_tr_n = (x_tr - x_mean) / x_std
+    x_va_n = (x_va - x_mean) / x_std
+
+    train_ds = TensorDataset(torch.from_numpy(th_tr.astype(np.float32)), torch.from_numpy(x_tr_n.astype(np.float32)))
+    val_ds = TensorDataset(torch.from_numpy(th_va.astype(np.float32)), torch.from_numpy(x_va_n.astype(np.float32)))
+    train_loader = DataLoader(train_ds, batch_size=int(batch_size), shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=int(batch_size), shuffle=False)
+    opt = torch.optim.AdamW(model.parameters(), lr=float(lr), weight_decay=float(weight_decay))
+
+    train_losses: list[float] = []
+    val_losses: list[float] = []
+    val_monitor_losses: list[float] = []
+    best_val = float("inf")
+    best_epoch = 0
+    best_eval_state_cpu: dict[str, torch.Tensor] | None = None
+    weight_ema_enabled = float(weight_ema_decay) > 0.0
+    weight_ema_state = init_model_weight_ema(model) if weight_ema_enabled else None
+    patience_counter = 0
+    stopped_early = False
+    stopped_epoch = int(epochs)
+    n_clipped_steps = 0
+    n_total_steps = 0
+    val_ema: float | None = None
+    alpha = float(ema_alpha)
+
+    for epoch in range(1, int(epochs) + 1):
+        model.train()
+        ep_losses: list[float] = []
+        for tb, x1b in train_loader:
+            tb = tb.to(device)
+            x1b = x1b.to(device)
+            bs = int(x1b.shape[0])
+            t_raw = torch.rand(bs, 1, device=device, dtype=x1b.dtype)
+            t = te + (1.0 - 2.0 * te) * t_raw
+            x0b = torch.randn_like(x1b)
+            a, bcoef, ad, bd = schedule.ab_ad_bd(t)
+            xt = a * x0b + bcoef * x1b
+            ut = ad * x0b + bd * x1b
+            loss = torch.mean((model(xt, tb, t) - ut) ** 2)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            n_total_steps += 1
+            if float(max_grad_norm) > 0.0:
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float(max_grad_norm))
+                if float(grad_norm) > float(max_grad_norm):
+                    n_clipped_steps += 1
+            opt.step()
+            if weight_ema_state is not None:
+                update_model_weight_ema(weight_ema_state, model, decay=float(weight_ema_decay))
+            ep_losses.append(float(loss.detach().cpu()))
+
+        train_loss = float(np.mean(ep_losses))
+        train_losses.append(train_loss)
+
+        model.eval()
+        val_ep: list[float] = []
+        ema_ctx = evaluate_with_weight_ema(model, weight_ema_state) if weight_ema_state is not None else nullcontext()
+        with ema_ctx:
+            with torch.no_grad():
+                for tb, x1b in val_loader:
+                    tb = tb.to(device)
+                    x1b = x1b.to(device)
+                    bs = int(x1b.shape[0])
+                    t_raw = torch.rand(bs, 1, device=device, dtype=x1b.dtype)
+                    t = te + (1.0 - 2.0 * te) * t_raw
+                    x0b = torch.randn_like(x1b)
+                    a, bcoef, ad, bd = schedule.ab_ad_bd(t)
+                    xt = a * x0b + bcoef * x1b
+                    ut = ad * x0b + bd * x1b
+                    val_ep.append(float(torch.mean((model(xt, tb, t) - ut) ** 2).detach().cpu()))
+        val_raw = float(np.mean(val_ep))
+        val_losses.append(val_raw)
+        val_ema = scalar_val_ema_update(val_ema, val_raw, alpha)
+        val_smooth = float(val_ema)
+        val_monitor_losses.append(val_smooth)
+        if val_smooth < best_val - float(min_delta):
+            best_val = float(val_smooth)
+            best_epoch = int(epoch)
+            best_eval_state_cpu = (
+                clone_model_weight_ema(weight_ema_state)
+                if weight_ema_state is not None
+                else {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            )
+            patience_counter = 0
+        else:
+            patience_counter += 1
+        if epoch == 1 or epoch % max(1, int(log_every)) == 0 or epoch == int(epochs):
+            print(
+                f"[linear_x_flow_diagonal_t {epoch:4d}/{int(epochs)}] train_fm={train_loss:.6f} "
+                f"val_fm={val_raw:.6f} val_smooth={val_smooth:.6f} best_monitor={best_val:.6f} "
+                f"best_epoch={best_epoch}",
+                flush=True,
+            )
+        if int(patience) > 0 and patience_counter >= int(patience):
+            stopped_early = True
+            stopped_epoch = int(epoch)
+            print(
+                f"[linear_x_flow_diagonal_t early-stop] epoch={epoch} best_epoch={best_epoch} "
+                f"best_monitor={best_val:.6f} patience={int(patience)}",
+                flush=True,
+            )
+            break
+
+    final_eval_weights = "raw"
+    if restore_best and best_eval_state_cpu is not None:
+        if weight_ema_enabled:
+            load_model_weights_from_ema_state(model, best_eval_state_cpu)
+            final_eval_weights = "ema"
+            print(
+                f"[linear_x_flow_diagonal_t restore-best] restored EMA eval weights epoch={best_epoch} "
+                f"best_monitor={best_val:.6f}",
+                flush=True,
+            )
+        else:
+            model.load_state_dict(best_eval_state_cpu)
+            print(
+                f"[linear_x_flow_diagonal_t restore-best] restored raw eval weights epoch={best_epoch} "
+                f"best_monitor={best_val:.6f}",
+                flush=True,
+            )
+
+    return {
+        "train_losses": train_losses,
+        "val_losses": val_losses,
+        "val_monitor_losses": val_monitor_losses,
+        "best_val_loss": float(best_val),
+        "best_epoch": int(best_epoch),
+        "stopped_epoch": int(stopped_epoch),
+        "stopped_early": bool(stopped_early),
+        "lr_last": float(opt.param_groups[0]["lr"]),
+        "n_clipped_steps": int(n_clipped_steps),
+        "n_total_steps": int(n_total_steps),
+        "weight_ema_enabled": bool(weight_ema_enabled),
+        "weight_ema_decay": float(weight_ema_decay),
+        "final_eval_weights": final_eval_weights,
+        "x_mean": x_mean.astype(np.float64),
+        "x_std": x_std.astype(np.float64),
+    }
+
+
 def train_pca_nonlinear_linear_x_flow(
     *,
     model: ConditionalPCANonlinearLinearXFlowMLP,
@@ -1595,6 +2418,54 @@ def compute_linear_x_flow_c_matrix(
                 x_mean=x_mean_t,
                 x_std=x_std_t,
                 solve_jitter=float(solve_jitter),
+            )
+            c[i0:i1, :] = logp.reshape(b, n).detach().cpu().numpy().astype(np.float64)
+    return c
+
+
+def compute_time_diagonal_linear_x_flow_c_matrix(
+    *,
+    model: ConditionalTimeDiagonalLinearXFlowMLP,
+    theta_all: np.ndarray,
+    x_all: np.ndarray,
+    device: torch.device,
+    x_mean: np.ndarray,
+    x_std: np.ndarray,
+    solve_jitter: float = 1e-6,
+    quadrature_steps: int = 64,
+    pair_batch_size: int = 65536,
+) -> np.ndarray:
+    theta = _as_2d_float64(theta_all, name="theta_all")
+    x = _as_2d_float64(x_all, name="x_all")
+    if theta.shape[0] != x.shape[0]:
+        raise ValueError("theta_all and x_all row counts must match.")
+    n = int(theta.shape[0])
+    if int(pair_batch_size) < 1:
+        raise ValueError("pair_batch_size must be >= 1.")
+    if int(quadrature_steps) < 2:
+        raise ValueError("quadrature_steps must be >= 2.")
+    row_block = max(1, int(pair_batch_size) // max(n, 1))
+    theta32 = theta.astype(np.float32, copy=False)
+    x_mean_t = torch.from_numpy(np.asarray(x_mean, dtype=np.float32)).to(device)
+    x_std_t = torch.from_numpy(np.asarray(x_std, dtype=np.float32)).to(device)
+    c = np.zeros((n, n), dtype=np.float64)
+    model.eval()
+    with torch.no_grad():
+        for i0 in range(0, n, row_block):
+            i1 = min(n, i0 + row_block)
+            xb = x[i0:i1].astype(np.float32, copy=False)
+            b = int(i1 - i0)
+            x_rep = np.repeat(xb, repeats=n, axis=0)
+            theta_tile = np.tile(theta32, (b, 1))
+            x_t = torch.from_numpy(x_rep).to(device)
+            theta_t = torch.from_numpy(theta_tile).to(device)
+            logp = model.log_prob_observed(
+                x_t,
+                theta_t,
+                x_mean=x_mean_t,
+                x_std=x_std_t,
+                solve_jitter=float(solve_jitter),
+                quadrature_steps=int(quadrature_steps),
             )
             c[i0:i1, :] = logp.reshape(b, n).detach().cpu().numpy().astype(np.float64)
     return c

@@ -89,13 +89,13 @@ The GT panel is the same reference surface against which both method rows are sc
 | Log | `/grad/zeyuan/score-matching-fisher/data/experiments/native2d_randamp_pr30d_bin_vs_lxf_diag_minimal_20260502/run.log` |
 | Figures (SVG, same dir) | `h_decoding_twofig_sweep.svg`, `h_decoding_twofig_gt.svg`, `h_decoding_twofig_corr_vs_n.svg`, `h_decoding_twofig_nmse_vs_n.svg`, `h_decoding_twofig_training_losses_panel.svg` |
 
-Journal-local copies of sweep / GT / corr / NMSE / **training-loss panel** (original minimal run): `journal/notes/figs/2026-05-02-native2d-randamp-bin-vs-lxf-diagonal-minimal/` (`h_decoding_twofig_*.svg`, `h_decoding_twofig_training_losses_panel_minimal_n80_400_1000.svg`). Follow-up copies use the same folder with `followup_*` prefixes (embedded below).
+Journal-local copies of sweep / GT / corr / NMSE / **training-loss panel** (original minimal run): `journal/notes/figs/2026-05-02-native2d-randamp-bin-vs-lxf-diagonal-minimal/` (`h_decoding_twofig_*.svg`, `h_decoding_twofig_training_losses_panel_minimal_n80_400_1000.svg`). Follow-up copies use the same folder with `followup_*` prefixes (embedded in **Figures** and **Follow-up experiments** below), including **`followup_c_*`** (FiLM early-stop) and **`followup_d_*`** (FiLM 5000 epochs, last weights).
 
 ## Follow-up experiments (same NPZ; tighter GT MC and large-$n$ column)
 
 **GT MC convention (twofig):** `gt_n_mc = floor(n_ref / num_theta_bins)` Monte Carlo samples per $\theta_1$ bin row (default **`num_theta_bins = 10`**). Thus **`--n-ref 5000`** $\Rightarrow$ **`gt_n_mc = 500`** per row (original minimal run); **`--n-ref 10000`** $\Rightarrow$ **`gt_n_mc = 1000`** (reference prefix uses the full **$N=10000$** pool).
 
-Repro pattern: [AGENTS.md](../../AGENTS.md) (`mamba run -n geo_diffusion`, `--device cuda`). Locked methods / patience match the short skill **bin-lxfdiag** (`.cursor/skills/bin-lxfdiag/SKILL.md`), except where noted below.
+Repro pattern: [AGENTS.md](../../AGENTS.md) (`mamba run -n geo_diffusion`, `--device cuda`). Locked methods / patience match the short skill **bin-2d-lin-lxfdiag** (`.cursor/skills/bin-2d-lin-lxfdiag/SKILL.md`; legacy alias **bin-lxfdiag**), except where noted below.
 
 ### A — `bin_gaussian` only, `--n-ref 10000` (approx GT figure)
 
@@ -166,14 +166,102 @@ From **`h_decoding_twofig_results.npz`** (`gt_hellinger_n_mc = 1000`), rows **`[
 
 ![Follow-up B: training losses at n=5000, n_ref=10000](figs/2026-05-02-native2d-randamp-bin-vs-lxf-diagonal-minimal/followup_b_training_losses_panel_n5000_nref10000.svg)
 
+### C — FiLM offset (`--lxf-b-net film`), `--n-list 5000`, `--n-ref 10000` (plain MLP offset replaced)
+
+**Goal:** Same setting as follow-up B, but **`linear_x_flow_diagonal`** uses a **FiLM-conditioned** trunk for $b_\phi(\theta)$ (no Fourier features); diagonal drift $A=\mathrm{diag}(a)$ unchanged. See `ConditionalDiagonalLinearXFlowFiLMLP` in `fisher/linear_x_flow.py` and `--lxf-b-net` in `bin/study_h_decoding_convergence.py`.
+
+```bash
+PYTHONUNBUFFERED=1 mamba run -n geo_diffusion python bin/study_h_decoding_twofig.py \
+  --dataset-npz data/randamp_gaussian2d_sqrtd_xdim5/randamp_gaussian2d_sqrtd_xdim5_pr30d.npz \
+  --dataset-family randamp_gaussian2d_sqrtd \
+  --theta-field-methods bin_gaussian,linear_x_flow_diagonal \
+  --lxf-b-net film \
+  --lxf-early-patience 1000 \
+  --n-list 5000 \
+  --n-ref 10000 \
+  --device cuda \
+  --output-dir data/experiments/native2d_randamp_pr30d_bin_vs_lxf_diag_film_nlist5000_nref10000_20260502
+```
+
+From **`h_decoding_twofig_results.npz`** (`gt_hellinger_n_mc = 1000`), rows **`[bin_gaussian, linear_x_flow_diagonal]`**, column **$n=5000$**:
+
+| Metric | bin_gaussian | linear_x_flow_diagonal (FiLM $b_\phi$) |
+|--------|----------------|-------------------------|
+| `corr_h_binned_vs_gt_mc` | **0.934** | **0.508** |
+| `nmse_h_binned_vs_gt_mc` | **0.025** | **0.677** |
+
+**Training note:** FiLM row hit **early stopping** at epoch **1891** with **best epoch 891** (`--lxf-early-patience 1000`); **`run.log`** shows **`restore-best`** to EMA eval weights at best epoch.
+
+| Artifact | Path |
+|----------|------|
+| Directory | `/grad/zeyuan/score-matching-fisher/data/experiments/native2d_randamp_pr30d_bin_vs_lxf_diag_film_nlist5000_nref10000_20260502/` |
+| Results NPZ | `/grad/zeyuan/score-matching-fisher/data/experiments/native2d_randamp_pr30d_bin_vs_lxf_diag_film_nlist5000_nref10000_20260502/h_decoding_twofig_results.npz` |
+| Log | `/grad/zeyuan/score-matching-fisher/data/experiments/native2d_randamp_pr30d_bin_vs_lxf_diag_film_nlist5000_nref10000_20260502/run.log` |
+
+**Figures (journal-local copies):**
+
+![Follow-up C: FiLM early-stop sweep at n=5000, n_ref=10000](figs/2026-05-02-native2d-randamp-bin-vs-lxf-diagonal-minimal/followup_c_film_earlystop_n5000_sweep.svg)
+
+![Follow-up C: corr_h vs n (FiLM)](figs/2026-05-02-native2d-randamp-bin-vs-lxf-diagonal-minimal/followup_c_film_earlystop_n5000_corr_vs_n.svg)
+
+![Follow-up C: NMSE vs n (FiLM)](figs/2026-05-02-native2d-randamp-bin-vs-lxf-diagonal-minimal/followup_c_film_earlystop_n5000_nmse_vs_n.svg)
+
+![Follow-up C: training losses (FiLM), early stopping](figs/2026-05-02-native2d-randamp-bin-vs-lxf-diagonal-minimal/followup_c_film_earlystop_n5000_training_losses_panel.svg)
+
+### D — FiLM, **no early stopping**, **5000 epochs**, **last-epoch weights** (`--no-lxf-restore-best`)
+
+**Goal:** Test whether **training through epoch 5000** without patience-based stop, and **evaluating the final iterate** (no rollback to best validation), improves GT alignment vs follow-up C.
+
+```bash
+PYTHONUNBUFFERED=1 mamba run -n geo_diffusion python bin/study_h_decoding_twofig.py \
+  --dataset-npz data/randamp_gaussian2d_sqrtd_xdim5/randamp_gaussian2d_sqrtd_xdim5_pr30d.npz \
+  --dataset-family randamp_gaussian2d_sqrtd \
+  --theta-field-methods bin_gaussian,linear_x_flow_diagonal \
+  --lxf-b-net film \
+  --lxf-epochs 5000 \
+  --lxf-early-patience 0 \
+  --no-lxf-restore-best \
+  --n-list 5000 \
+  --n-ref 10000 \
+  --device cuda \
+  --output-dir data/experiments/native2d_randamp_pr30d_bin_vs_lxf_diag_film_n5000_last5000_nref10000_20260502
+```
+
+From **`h_decoding_twofig_results.npz`**, rows **`[bin_gaussian, linear_x_flow_diagonal]`**, **$n=5000$**:
+
+| Metric | bin_gaussian | linear_x_flow_diagonal (FiLM, last epoch) |
+|--------|----------------|-------------------------|
+| `corr_h_binned_vs_gt_mc` | **0.934** | **0.495** |
+| `nmse_h_binned_vs_gt_mc` | **0.025** | **0.799** |
+
+**Observation:** Last-epoch weights are **slightly worse** on **`corr_h`** and **clearly worse** on **`nmse_h`** vs FiLM with early stopping + restore-best (follow-up C)—so poor GT alignment here is **not** fixed by simply training longer without rollback.
+
+| Artifact | Path |
+|----------|------|
+| Directory | `/grad/zeyuan/score-matching-fisher/data/experiments/native2d_randamp_pr30d_bin_vs_lxf_diag_film_n5000_last5000_nref10000_20260502/` |
+| Results NPZ | `/grad/zeyuan/score-matching-fisher/data/experiments/native2d_randamp_pr30d_bin_vs_lxf_diag_film_n5000_last5000_nref10000_20260502/h_decoding_twofig_results.npz` |
+| Log | `/grad/zeyuan/score-matching-fisher/data/experiments/native2d_randamp_pr30d_bin_vs_lxf_diag_film_n5000_last5000_nref10000_20260502/run.log` |
+
+**Figures (journal-local copies):**
+
+![Follow-up D: FiLM last-epoch 5000 sweep at n=5000](figs/2026-05-02-native2d-randamp-bin-vs-lxf-diagonal-minimal/followup_d_film_lastepoch5000_n5000_sweep.svg)
+
+![Follow-up D: corr_h vs n (FiLM last epoch)](figs/2026-05-02-native2d-randamp-bin-vs-lxf-diagonal-minimal/followup_d_film_lastepoch5000_n5000_corr_vs_n.svg)
+
+![Follow-up D: NMSE vs n (FiLM last epoch)](figs/2026-05-02-native2d-randamp-bin-vs-lxf-diagonal-minimal/followup_d_film_lastepoch5000_n5000_nmse_vs_n.svg)
+
+![Follow-up D: training losses (FiLM), full 5000 epochs](figs/2026-05-02-native2d-randamp-bin-vs-lxf-diagonal-minimal/followup_d_film_lastepoch5000_n5000_training_losses_panel.svg)
+
 ## Takeaway
 
 This minimal pair isolates a **large diagnostic gap** at **$n=1000$** between **binned Gaussian** and **diagonal linear X-flow matching** on native randamp 2D PR30D under shared binning and GT MC. Treat it as a **controlled baseline** for explaining broader flow-vs-baseline trends in the multi-method twofig runs, not as a verdict on all flow architectures.
 
 **Follow-up:** With **`--n-ref 10000`** (richer GT MC) and a single column **`--n-list 5000`**, **binned Gaussian** reaches **high** off-diagonal correlation and **low** NMSE vs GT, while **diagonal linear X-flow** remains **far** from GT on NMSE at this setting—consistent with a **model / optimization / inductive-bias** limitation rather than only finite-$n$ noise in the baseline.
 
+**FiLM + training schedule:** Replacing the plain MLP offset with **`--lxf-b-net film`** does **not** close the gap to **`bin_gaussian`** at **`n=5000`** (follow-up C vs B: similar **`corr_h`**, NMSE still large). Training **5000 epochs** with **`--lxf-early-patience 0`** and **`--no-lxf-restore-best`** (follow-up D) **does not improve** and **hurts** NMSE vs FiLM with early stopping—so the bottleneck is **not** resolved by a richer $b_\phi$ alone nor by using the last iterate instead of best-validation weights.
+
 ## Possible solutions
 
-1. The network is not powerful enough -> no, changed to FiLM, the result is the same.
-2. Do not use early stopping, use the last epoch of 2000 epochs.
-2. We should add t parameter so that the flow matching method can learn more easily.
+1. The network is not powerful enough — FiLM $b_\phi$ did not fix the gap (follow-ups C–D).
+2. Do not use early stopping / use last epoch — tried at **5000** epochs with **`--no-lxf-restore-best`** (follow-up D); **no improvement** vs early-stop + restore-best (follow-up C).
+3. Add time $t$ to the velocity network so flow matching can adapt across the bridge (not tested in this note).

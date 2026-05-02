@@ -17,13 +17,23 @@ from fisher.linear_x_flow import (
     ConditionalScalarLinearXFlowMLP,
     ConditionalThetaDiagonalLinearXFlowMLP,
     ConditionalThetaDiagonalSplineLinearXFlowMLP,
+    ConditionalTimeDiagonalLinearXFlowMLP,
     _phi_expm1_div_a,
     bspline_basis_phi_batch,
+    compute_linear_x_flow_analytic_hellinger_matrix,
     compute_linear_x_flow_c_matrix,
+    compute_time_diagonal_linear_x_flow_c_matrix,
+    estimate_binned_gaussian_shared_diagonal_covariance,
     fit_residual_pca_basis_from_linear_mean,
+    gaussian_hellinger_sq_diag,
+    gaussian_hellinger_sq_diag_matrix,
+    gaussian_hellinger_sq_full,
+    gaussian_hellinger_sq_shared_covariance_matrix,
     open_uniform_clamped_knot_vector,
+    train_linear_x_flow,
     train_pca_nonlinear_linear_x_flow,
     train_linear_x_flow_schedule,
+    train_time_diagonal_linear_x_flow_schedule,
 )
 from fisher.gaussian_x_flow import path_schedule_from_name
 from fisher.model_weight_ema import (
@@ -35,6 +45,72 @@ from fisher.model_weight_ema import (
 
 
 class TestLinearXFlow(unittest.TestCase):
+    def test_gaussian_hellinger_shared_diagonal_matches_shortcut(self) -> None:
+        mu = np.asarray([[0.0, 0.0], [1.0, 2.0], [-0.5, 0.25]], dtype=np.float64)
+        var = np.asarray([0.5, 2.0], dtype=np.float64)
+        cov = np.diag(var)
+        h = gaussian_hellinger_sq_shared_covariance_matrix(mu, cov)
+        diff = mu[:, None, :] - mu[None, :, :]
+        expected = 1.0 - np.exp(-0.125 * np.sum(diff * diff / var.reshape(1, 1, -1), axis=2))
+        np.fill_diagonal(expected, 0.0)
+        np.testing.assert_allclose(h, expected, rtol=1e-8, atol=1e-10)
+        self.assertTrue(np.isfinite(h).all())
+        self.assertLessEqual(float(np.max(h)), 1.0)
+
+    def test_gaussian_hellinger_diag_matches_full(self) -> None:
+        mu1 = np.asarray([0.2, -0.7, 1.0])
+        mu2 = np.asarray([-0.4, 0.1, 0.5])
+        v1 = np.asarray([0.6, 1.5, 2.5])
+        v2 = np.asarray([1.2, 0.8, 3.0])
+        h_diag = gaussian_hellinger_sq_diag(mu1, v1, mu2, v2, jitter=0.0)
+        h_full = gaussian_hellinger_sq_full(mu1, np.diag(v1), mu2, np.diag(v2), jitter=0.0)
+        self.assertAlmostEqual(h_diag, h_full, places=12)
+
+    def test_gaussian_hellinger_diag_matrix_properties(self) -> None:
+        mu = np.asarray([[0.0, 0.0], [1.0, 0.5], [-0.25, 2.0]])
+        var = np.asarray([[1.0, 2.0], [1.5, 0.75], [0.8, 3.0]])
+        h = gaussian_hellinger_sq_diag_matrix(mu, var)
+        self.assertEqual(h.shape, (3, 3))
+        self.assertTrue(np.isfinite(h).all())
+        np.testing.assert_allclose(h, h.T, atol=1e-12)
+        np.testing.assert_allclose(np.diag(h), 0.0, atol=1e-12)
+        self.assertGreaterEqual(float(np.min(h)), 0.0)
+        self.assertLessEqual(float(np.max(h)), 1.0)
+
+    def test_linear_x_flow_analytic_hellinger_matches_endpoint_formula(self) -> None:
+        torch.manual_seed(0)
+        m = ConditionalDiagonalLinearXFlowMLP(theta_dim=1, x_dim=2, hidden_dim=8, depth=1)
+        theta = np.asarray([[-1.0], [0.0], [1.0]], dtype=np.float64)
+        h, mu, cov, is_diag = compute_linear_x_flow_analytic_hellinger_matrix(
+            model=m,
+            theta_all=theta,
+            device=torch.device("cpu"),
+        )
+        self.assertFalse(is_diag)
+        self.assertEqual(mu.shape, (3, 2))
+        self.assertEqual(cov.shape, (2, 2))
+        expected = gaussian_hellinger_sq_shared_covariance_matrix(mu, cov)
+        np.testing.assert_allclose(h, expected, rtol=1e-10, atol=1e-12)
+
+    def test_theta_and_time_diagonal_analytic_hellinger_finite(self) -> None:
+        theta = np.asarray([[-1.0], [0.0], [1.0]], dtype=np.float64)
+        for model in (
+            ConditionalThetaDiagonalLinearXFlowMLP(theta_dim=1, x_dim=2, hidden_dim=8, depth=1),
+            ConditionalTimeDiagonalLinearXFlowMLP(theta_dim=1, x_dim=2, hidden_dim=8, depth=1, quadrature_steps=5),
+        ):
+            h, mu, var, is_diag = compute_linear_x_flow_analytic_hellinger_matrix(
+                model=model,
+                theta_all=theta,
+                device=torch.device("cpu"),
+                quadrature_steps=5,
+            )
+            self.assertTrue(is_diag)
+            self.assertEqual(mu.shape, (3, 2))
+            self.assertEqual(var.shape, (3, 2))
+            self.assertTrue(np.isfinite(h).all())
+            np.testing.assert_allclose(h, h.T, atol=1e-12)
+            np.testing.assert_allclose(np.diag(h), 0.0, atol=1e-12)
+
     def test_load_model_weights_from_ema_state_applies_ema(self) -> None:
         m = torch.nn.Linear(2, 2, bias=True)
         with torch.no_grad():
@@ -527,6 +603,145 @@ class TestLinearXFlow(unittest.TestCase):
         )
         self.assertFalse(bool(out["weight_ema_enabled"]))
         self.assertEqual(out["final_eval_weights"], "raw")
+
+    def test_time_diagonal_forward_and_likelihood_finite(self) -> None:
+        torch.manual_seed(41)
+        m = ConditionalTimeDiagonalLinearXFlowMLP(
+            theta_dim=2,
+            x_dim=3,
+            hidden_dim=8,
+            depth=1,
+            quadrature_steps=8,
+        )
+        theta = torch.randn(5, 2)
+        x = torch.randn(5, 3)
+        t = torch.linspace(0.1, 0.9, 5).reshape(-1, 1)
+        v = m(x, theta, t)
+        self.assertEqual(tuple(v.shape), (5, 3))
+        mu, sigma_diag = m.endpoint_mean_covariance_diag(theta, quadrature_steps=8)
+        self.assertEqual(tuple(mu.shape), (5, 3))
+        self.assertEqual(tuple(sigma_diag.shape), (5, 3))
+        lp = m.log_prob_normalized(x, theta, quadrature_steps=8)
+        self.assertEqual(tuple(lp.shape), (5,))
+        self.assertTrue(torch.all(torch.isfinite(lp)))
+
+    def test_train_time_diagonal_schedule_one_epoch_finite(self) -> None:
+        torch.manual_seed(42)
+        rng = np.random.default_rng(42)
+        theta = rng.normal(size=(24, 1)).astype(np.float64)
+        x = np.concatenate([theta, -theta], axis=1) + 0.1 * rng.normal(size=(24, 2))
+        m = ConditionalTimeDiagonalLinearXFlowMLP(theta_dim=1, x_dim=2, hidden_dim=8, depth=1, quadrature_steps=8)
+        out = train_time_diagonal_linear_x_flow_schedule(
+            model=m,
+            theta_train=theta[:16],
+            x_train=x[:16],
+            theta_val=theta[16:],
+            x_val=x[16:],
+            device=torch.device("cpu"),
+            schedule=path_schedule_from_name("cosine"),
+            epochs=1,
+            batch_size=8,
+            lr=1e-3,
+            t_eps=1e-3,
+            patience=0,
+            log_every=1,
+            weight_ema_decay=0.0,
+        )
+        self.assertEqual(len(out["train_losses"]), 1)
+        self.assertTrue(np.isfinite(out["train_losses"][0]))
+        c = compute_time_diagonal_linear_x_flow_c_matrix(
+            model=m,
+            theta_all=theta[:6],
+            x_all=x[:6],
+            device=torch.device("cpu"),
+            x_mean=out["x_mean"],
+            x_std=out["x_std"],
+            quadrature_steps=8,
+            pair_batch_size=64,
+        )
+        self.assertEqual(tuple(c.shape), (6, 6))
+        self.assertTrue(np.all(np.isfinite(c)))
+
+    def test_binned_gaussian_lxf_covariance_and_bin_means(self) -> None:
+        theta = np.repeat(np.asarray([0.0, 1.0, 2.0], dtype=np.float64), 4).reshape(-1, 1)
+        bins = np.repeat(np.arange(3, dtype=np.int64), 4)
+        x = np.stack(
+            [
+                np.repeat(np.asarray([-1.0, 0.5, 2.0]), 4),
+                np.repeat(np.asarray([0.25, -0.75, 1.25]), 4),
+            ],
+            axis=1,
+        ).astype(np.float64)
+        x += np.tile(np.asarray([[-0.1, 0.1], [0.1, -0.1], [-0.05, 0.05], [0.05, -0.05]]), (3, 1))
+        meta = estimate_binned_gaussian_shared_diagonal_covariance(
+            x_train=x,
+            bin_train=bins,
+            n_bins=3,
+            variance_floor=1e-4,
+        )
+        shared_var = np.asarray(meta["shared_variance"], dtype=np.float64)
+        self.assertTrue(np.allclose(np.exp(2.0 * np.asarray(meta["a"], dtype=np.float64)), shared_var))
+        self.assertTrue(np.allclose(np.asarray(meta["bin_counts"]), np.asarray([4, 4, 4])))
+
+    def test_binned_gaussian_lxf_empty_bins_filled_like_binned_gaussian(self) -> None:
+        theta = np.asarray([0.0, 0.1, 2.0, 2.1], dtype=np.float64).reshape(-1, 1)
+        bins = np.asarray([0, 0, 2, 2], dtype=np.int64)
+        x = np.asarray([[0.0], [0.2], [2.0], [2.2]], dtype=np.float64)
+        meta = estimate_binned_gaussian_shared_diagonal_covariance(
+            x_train=x,
+            bin_train=bins,
+            n_bins=3,
+            variance_floor=1e-4,
+        )
+        self.assertEqual(int(np.asarray(meta["bin_counts"])[1]), 0)
+        means = np.asarray(meta["normalized_bin_means"], dtype=np.float64)
+        self.assertTrue(np.allclose(means[1], means[0]))
+
+    def test_binned_gaussian_fixed_a_training_updates_only_b_network(self) -> None:
+        torch.manual_seed(21)
+        rng = np.random.default_rng(21)
+        theta = rng.normal(size=(24, 2)).astype(np.float64)
+        x = np.stack([theta[:, 0] + 0.1 * theta[:, 1], -theta[:, 1]], axis=1) + 0.05 * rng.normal(size=(24, 2))
+        bins = np.repeat(np.arange(3, dtype=np.int64), 6)
+        meta = estimate_binned_gaussian_shared_diagonal_covariance(
+            x_train=x[:18],
+            bin_train=bins,
+            n_bins=3,
+            variance_floor=1e-4,
+        )
+        model = ConditionalDiagonalLinearXFlowMLP(theta_dim=2, x_dim=2, hidden_dim=8, depth=1)
+        with torch.no_grad():
+            model.a.copy_(torch.as_tensor(meta["a"], dtype=model.a.dtype))
+        model.a.requires_grad_(False)
+        a0 = model.a.detach().clone()
+        b0 = [p.detach().clone() for p in model.b_net.parameters()]
+        out = train_linear_x_flow(
+            model=model,
+            theta_train=theta[:18],
+            x_train=x[:18],
+            theta_val=theta[18:],
+            x_val=x[18:],
+            device=torch.device("cpu"),
+            epochs=2,
+            batch_size=6,
+            lr=1e-3,
+            patience=0,
+            log_every=1,
+            weight_ema_decay=0.0,
+            restore_best=False,
+        )
+        self.assertEqual(len(out["train_losses"]), 2)
+        self.assertTrue(torch.allclose(model.a.detach(), a0))
+        changed = any(not torch.allclose(p.detach(), p0) for p, p0 in zip(model.b_net.parameters(), b0))
+        self.assertTrue(changed)
+        lp = model.log_prob_observed(
+            torch.from_numpy(x[18:].astype(np.float32)),
+            torch.from_numpy(theta[18:].astype(np.float32)),
+            x_mean=torch.from_numpy(np.asarray(out["x_mean"], dtype=np.float32)),
+            x_std=torch.from_numpy(np.asarray(out["x_std"], dtype=np.float32)),
+            solve_jitter=1e-6,
+        )
+        self.assertTrue(torch.all(torch.isfinite(lp)))
 
 
 if __name__ == "__main__":
