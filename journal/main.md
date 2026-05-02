@@ -16,6 +16,14 @@ Collected markdown notes in `journal/notes/`: long-form chapters (moved from the
 
 ## 2026-05
 
+- [2026-05-02 Minimal twofig: `bin_gaussian` vs `linear_x_flow_diagonal` on randamp 2D PR30D — metrics, figures, repro commands, follow-up runs (`n_ref=10000`, `n=5000` column) with embedded journal figs](notes/2026-05-02-native2d-randamp-bin-vs-linear-x-flow-diagonal-minimal-twofig.md)
+
+- [2026-05-02 Native 2D-$\theta$ twofig / convergence pipeline: $\theta_1$ binning, paired-$\theta_2$ GT MC, code paths + PR30D twofig repro (Markdown + commands)](notes/2026-05-02-native-2d-theta-twofig-h-decoding-pipeline.md)
+
+- [2026-05-02 Native 2D-$\theta$ benchmark datasets: `randamp_gaussian2d_sqrtd`, grid-cosine 2D, PR 30D workflow, reproducible commands + figures](notes/2026-05-02-native-2d-theta-benchmark-datasets.md)
+
+- [2026-05-02 Two-dimensional $\theta$ coordinate benchmark: source dataset math, scalar-view H decoding, seven-method twofig repro](notes/2026-05-02-theta2d-coordinate-benchmark-method.md)
+
 - [2026-05-01 `linear_x_flow_nonlinear_pca`: PCA-subspace nonlinear correction to linear X-flow (math + likelihood ODE) + linearbench `study_h_decoding_twofig` repro (Markdown + commands)](notes/2026-05-01-linear-x-flow-nonlinear-pca-method-and-linearbench-twofig.md)
 
 ## 2026-04

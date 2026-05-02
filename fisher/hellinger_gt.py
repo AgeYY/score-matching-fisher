@@ -10,6 +10,13 @@ from numpy.typing import NDArray
 from fisher.evaluation import log_p_x_given_theta
 
 
+def _rng_from_dataset(dataset: Any) -> np.random.Generator:
+    r = getattr(dataset, "rng", None)
+    if isinstance(r, np.random.Generator):
+        return r
+    return np.random.default_rng(0)
+
+
 def bin_centers_from_edges(edges: NDArray[np.float64]) -> NDArray[np.float64]:
     """Return bin centers from contiguous edges (length n_bins+1 -> n_bins)."""
     e = np.asarray(edges, dtype=np.float64).reshape(-1)
@@ -51,6 +58,13 @@ def estimate_hellinger_sq_one_sided_mc(
     Returns
     -------
     (n_bins, n_bins) matrix of estimated **squared** Hellinger values in ``[0, 1]`` (clipped).
+
+    Notes
+    -----
+    When the dataset has ``theta_dim == 2``, ``bin_centers`` are interpreted as θ₁ bin centers.
+    For each MC replicate we draw θ₂ independently from Uniform(theta_low, theta_high) (dataset
+    bounds), form θ = (θ₁_center, θ₂), sample ``x``, and evaluate likelihoods using the **same**
+    θ₂ when contrasting θ₁ centers ``i`` and ``j`` (paired nuisance draw).
     """
     centers = np.asarray(bin_centers, dtype=np.float64).reshape(-1)
     n_bins = int(centers.size)
@@ -59,25 +73,56 @@ def estimate_hellinger_sq_one_sided_mc(
     if n_mc < 1:
         raise ValueError("n_mc must be >= 1.")
 
+    theta_dim = int(getattr(dataset, "theta_dim", 1))
     h2 = np.zeros((n_bins, n_bins), dtype=np.float64)
 
-    for i in range(n_bins):
-        theta_i = float(centers[i])
-        t_col = np.full((n_mc, 1), theta_i, dtype=np.float64)
-        x = dataset.sample_x(t_col)
-        lp_i = np.asarray(log_p_x_given_theta(x, t_col, dataset), dtype=np.float64).reshape(-1)
-        if lp_i.shape[0] != n_mc:
-            raise ValueError(f"log_p_x_given_theta length mismatch: got {lp_i.shape[0]}, expected {n_mc}.")
+    if theta_dim == 1:
+        for i in range(n_bins):
+            theta_i = float(centers[i])
+            t_col = np.full((n_mc, 1), theta_i, dtype=np.float64)
+            x = dataset.sample_x(t_col)
+            lp_i = np.asarray(log_p_x_given_theta(x, t_col, dataset), dtype=np.float64).reshape(-1)
+            if lp_i.shape[0] != n_mc:
+                raise ValueError(f"log_p_x_given_theta length mismatch: got {lp_i.shape[0]}, expected {n_mc}.")
 
-        for j in range(n_bins):
-            theta_j = float(centers[j])
-            t_j = np.full((n_mc, 1), theta_j, dtype=np.float64)
-            lp_j = np.asarray(log_p_x_given_theta(x, t_j, dataset), dtype=np.float64).reshape(-1)
-            log_half = 0.5 * (lp_j - lp_i)
-            # Stable mean(exp(log_half)) without scipy (numpy may not expose logsumexp)
-            m = float(np.max(log_half))
-            mean_exp = float(np.mean(np.exp(log_half - m)) * np.exp(m))
-            h2[i, j] = 1.0 - mean_exp
+            for j in range(n_bins):
+                theta_j = float(centers[j])
+                t_j = np.full((n_mc, 1), theta_j, dtype=np.float64)
+                lp_j = np.asarray(log_p_x_given_theta(x, t_j, dataset), dtype=np.float64).reshape(-1)
+                log_half = 0.5 * (lp_j - lp_i)
+                m = float(np.max(log_half))
+                mean_exp = float(np.mean(np.exp(log_half - m)) * np.exp(m))
+                h2[i, j] = 1.0 - mean_exp
+    elif theta_dim == 2:
+        low = float(getattr(dataset, "theta_low", -6.0))
+        high = float(getattr(dataset, "theta_high", 6.0))
+        if not (low < high):
+            raise ValueError(f"dataset theta bounds invalid for GT MC: theta_low={low} theta_high={high}")
+        rng = _rng_from_dataset(dataset)
+        for i in range(n_bins):
+            theta1_i = float(centers[i])
+            theta2_samples = rng.uniform(low, high, size=(n_mc,)).astype(np.float64)
+            t_col = np.stack(
+                [np.full(n_mc, theta1_i, dtype=np.float64), theta2_samples],
+                axis=1,
+            )
+            x = dataset.sample_x(t_col)
+            lp_i = np.asarray(log_p_x_given_theta(x, t_col, dataset), dtype=np.float64).reshape(-1)
+            if lp_i.shape[0] != n_mc:
+                raise ValueError(f"log_p_x_given_theta length mismatch: got {lp_i.shape[0]}, expected {n_mc}.")
+            for j in range(n_bins):
+                theta1_j = float(centers[j])
+                t_j = np.stack(
+                    [np.full(n_mc, theta1_j, dtype=np.float64), theta2_samples],
+                    axis=1,
+                )
+                lp_j = np.asarray(log_p_x_given_theta(x, t_j, dataset), dtype=np.float64).reshape(-1)
+                log_half = 0.5 * (lp_j - lp_i)
+                m = float(np.max(log_half))
+                mean_exp = float(np.mean(np.exp(log_half - m)) * np.exp(m))
+                h2[i, j] = 1.0 - mean_exp
+    else:
+        raise ValueError(f"GT MC Hellinger supports theta_dim 1 or 2; got theta_dim={theta_dim}")
 
     np.clip(h2, 0.0, 1.0, out=h2)
     if symmetrize:
@@ -109,19 +154,47 @@ def estimate_mean_llr_one_sided_mc(
     if n_mc < 1:
         raise ValueError("n_mc must be >= 1.")
 
+    theta_dim = int(getattr(dataset, "theta_dim", 1))
     out = np.zeros((n_bins, n_bins), dtype=np.float64)
-    for i in range(n_bins):
-        theta_i = float(centers[i])
-        t_col = np.full((n_mc, 1), theta_i, dtype=np.float64)
-        x = dataset.sample_x(t_col)
-        lp_i = np.asarray(log_p_x_given_theta(x, t_col, dataset), dtype=np.float64).reshape(-1)
-        if lp_i.shape[0] != n_mc:
-            raise ValueError(f"log_p_x_given_theta length mismatch: got {lp_i.shape[0]}, expected {n_mc}.")
-
-        for j in range(n_bins):
-            theta_j = float(centers[j])
-            t_j = np.full((n_mc, 1), theta_j, dtype=np.float64)
-            lp_j = np.asarray(log_p_x_given_theta(x, t_j, dataset), dtype=np.float64).reshape(-1)
-            out[i, j] = float(np.mean(lp_j - lp_i))
+    if theta_dim == 1:
+        for i in range(n_bins):
+            theta_i = float(centers[i])
+            t_col = np.full((n_mc, 1), theta_i, dtype=np.float64)
+            x = dataset.sample_x(t_col)
+            lp_i = np.asarray(log_p_x_given_theta(x, t_col, dataset), dtype=np.float64).reshape(-1)
+            if lp_i.shape[0] != n_mc:
+                raise ValueError(f"log_p_x_given_theta length mismatch: got {lp_i.shape[0]}, expected {n_mc}.")
+            for j in range(n_bins):
+                theta_j = float(centers[j])
+                t_j = np.full((n_mc, 1), theta_j, dtype=np.float64)
+                lp_j = np.asarray(log_p_x_given_theta(x, t_j, dataset), dtype=np.float64).reshape(-1)
+                out[i, j] = float(np.mean(lp_j - lp_i))
+    elif theta_dim == 2:
+        low = float(getattr(dataset, "theta_low", -6.0))
+        high = float(getattr(dataset, "theta_high", 6.0))
+        if not (low < high):
+            raise ValueError(f"dataset theta bounds invalid for GT MC: theta_low={low} theta_high={high}")
+        rng = _rng_from_dataset(dataset)
+        for i in range(n_bins):
+            theta1_i = float(centers[i])
+            theta2_samples = rng.uniform(low, high, size=(n_mc,)).astype(np.float64)
+            t_col = np.stack(
+                [np.full(n_mc, theta1_i, dtype=np.float64), theta2_samples],
+                axis=1,
+            )
+            x = dataset.sample_x(t_col)
+            lp_i = np.asarray(log_p_x_given_theta(x, t_col, dataset), dtype=np.float64).reshape(-1)
+            if lp_i.shape[0] != n_mc:
+                raise ValueError(f"log_p_x_given_theta length mismatch: got {lp_i.shape[0]}, expected {n_mc}.")
+            for j in range(n_bins):
+                theta1_j = float(centers[j])
+                t_j = np.stack(
+                    [np.full(n_mc, theta1_j, dtype=np.float64), theta2_samples],
+                    axis=1,
+                )
+                lp_j = np.asarray(log_p_x_given_theta(x, t_j, dataset), dtype=np.float64).reshape(-1)
+                out[i, j] = float(np.mean(lp_j - lp_i))
+    else:
+        raise ValueError(f"GT MC LLR supports theta_dim 1 or 2; got theta_dim={theta_dim}")
     np.fill_diagonal(out, 0.0)
     return out

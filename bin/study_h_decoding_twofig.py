@@ -1052,16 +1052,13 @@ def main(argv: list[str] | None = None) -> None:
     perm = rng_perm.permutation(n_pool)
 
     theta_raw_all = np.asarray(bundle.theta_all, dtype=np.float64)
-    if theta_raw_all.ndim == 2 and int(theta_raw_all.shape[1]) != 1:
-        raise ValueError(
-            "Convergence binning requires scalar theta in dataset bundle; "
-            f"got theta_all shape={theta_raw_all.shape}."
-        )
-    theta_scalar_all = theta_raw_all.reshape(-1)
-    theta_ref = np.asarray(theta_scalar_all[perm[: int(args.n_ref)]], dtype=np.float64).reshape(-1)
-    edges, _, _ = conv.vhb.theta_bin_edges(theta_ref, n_bins)
+    theta_scalar_all, theta_ref, edges, _, _, bin_idx_all = conv.prepare_theta_binning_for_convergence(
+        theta_raw_all,
+        perm,
+        int(args.n_ref),
+        n_bins,
+    )
     centers = bin_centers_from_edges(edges)
-    bin_idx_all = conv.vhb.theta_to_bin_index(theta_scalar_all, edges, n_bins)
 
     theta_state_all: np.ndarray | None = None
     if bool(getattr(args, "theta_flow_onehot_state", False)):

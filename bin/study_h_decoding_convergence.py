@@ -136,6 +136,7 @@ from fisher.gaussian_x_flow import (
 )
 from fisher.linear_x_flow import (
     ConditionalPCANonlinearLinearXFlowMLP,
+    ConditionalDiagonalLinearXFlowFiLMLP,
     ConditionalDiagonalLinearXFlowMLP,
     ConditionalLinearXFlowMLP,
     ConditionalLowRankLinearXFlowMLP,
@@ -393,6 +394,8 @@ def build_parser() -> argparse.ArgumentParser:
             "cosine_gaussian_sqrtd_rand_tune_additive",
             "randamp_gaussian",
             "randamp_gaussian_sqrtd",
+            "randamp_gaussian2d_sqrtd",
+            "gridcos_gaussian2d_sqrtd_rand_tune_additive",
             "cosine_gmm",
             "cos_sin_piecewise",
             "linear_piecewise",
@@ -871,6 +874,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lxf-lr", type=float, default=1e-4, help="linear-x-flow only: learning rate.")
     p.add_argument("--lxf-hidden-dim", type=int, default=128, help="linear-x-flow only: b_phi MLP hidden width.")
     p.add_argument("--lxf-depth", type=int, default=3, help="linear-x-flow only: b_phi MLP depth.")
+    p.add_argument(
+        "--lxf-b-net",
+        type=str,
+        default="mlp",
+        choices=["mlp", "film"],
+        help="linear-x-flow-diagonal only: offset b_phi parameterization (plain MLP vs FiLM trunk).",
+    )
     p.add_argument(
         "--lxf-spline-k",
         type=int,
@@ -1472,6 +1482,11 @@ def _validate_lxf_cli(args: argparse.Namespace) -> None:
         raise ValueError(f"{label}-hidden-dim must be >= 1.")
     if int(getattr(args, f"{prefix}_depth", 0)) < 1:
         raise ValueError(f"{label}-depth must be >= 1.")
+    b_net_kind = str(getattr(args, "lxf_b_net", "mlp")).strip().lower()
+    if b_net_kind not in ("mlp", "film"):
+        raise ValueError("--lxf-b-net must be one of: mlp, film.")
+    if method != "linear_x_flow_diagonal" and b_net_kind != "mlp":
+        raise ValueError("--lxf-b-net=film is only supported for linear_x_flow_diagonal.")
     if method in ("linear_x_flow_low_rank", "linear_x_flow_low_rank_randb") and int(getattr(args, "lxf_low_rank_dim", 0)) < 1:
         raise ValueError("--lxf-low-rank-dim must be >= 1.")
     if method == "linear_x_flow_nonlinear_pca":
@@ -2029,6 +2044,48 @@ def _build_theta_fourier_state(
     return out, ref_range, period, theta_center
 
 
+def prepare_theta_binning_for_convergence(
+    theta_raw_all: np.ndarray,
+    perm: np.ndarray,
+    n_ref: int,
+    n_bins: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float, np.ndarray]:
+    """Equal-width bins on θ₁ when ``theta_all`` has shape ``(N, 2)``; else scalar θ as before.
+
+    Bin membership is defined by the first coordinate only; full θ rows stay in the bundle for
+    training. Generative GT MC pairs each θ₁ bin center with an independent θ₂ ~ Uniform
+    (see :func:`fisher.hellinger_gt.estimate_hellinger_sq_one_sided_mc`).
+    """
+    th = np.asarray(theta_raw_all, dtype=np.float64)
+    if th.ndim == 1:
+        th = th.reshape(-1, 1)
+    elif th.ndim != 2:
+        raise ValueError(
+            "Convergence binning expects theta_all as 1D, (N, 1), or (N, 2); "
+            f"got shape {th.shape}."
+        )
+    d = int(th.shape[1])
+    if d > 2:
+        raise ValueError(
+            "Convergence binning supports theta_dim <= 2; " f"got theta_all shape={th.shape}."
+        )
+    if d == 2:
+        theta_scalar_all = np.asarray(th[:, 0], dtype=np.float64).reshape(-1)
+        print(
+            "[convergence] theta_dim=2: binning on theta[:, 0] (theta_1); "
+            "full (theta_1, theta_2) retained for model training.",
+            flush=True,
+        )
+    else:
+        theta_scalar_all = np.asarray(th[:, 0], dtype=np.float64).reshape(-1)
+    n_ref_i = int(n_ref)
+    n_bins_i = int(n_bins)
+    theta_ref = np.asarray(theta_scalar_all[perm[:n_ref_i]], dtype=np.float64).reshape(-1)
+    edges, edge_lo, edge_hi = vhb.theta_bin_edges(theta_ref, n_bins_i)
+    bin_idx_all = vhb.theta_to_bin_index(theta_scalar_all, edges, n_bins_i)
+    return theta_scalar_all, theta_ref, edges, float(edge_lo), float(edge_hi), bin_idx_all
+
+
 class SweepSubset(NamedTuple):
     bundle: SharedDatasetBundle
     bin_all: np.ndarray
@@ -2128,6 +2185,24 @@ def _run_ctx_for_bundle(
         rng=rng,
         device=dev,
     )
+
+
+def _validate_theta_used_matches_bundle(theta_chk: np.ndarray, theta_used_npz: np.ndarray, *, err_suffix: str) -> None:
+    """Align dimension-wise theta from bundle vs ``h_matrix_results*.npz`` (scalar or `(N, d)`)."""
+    tc = np.asarray(theta_chk, dtype=np.float64)
+    tu = np.asarray(theta_used_npz, dtype=np.float64)
+    if tc.ndim == 1:
+        tc = tc.reshape(-1, 1)
+    if tu.ndim == 1:
+        tu = tu.reshape(-1, 1)
+    if tc.shape != tu.shape:
+        raise ValueError(
+            f"theta/H shape mismatch: theta_chk={tc.shape} theta_used={tu.shape} ({err_suffix})"
+        )
+    if not np.allclose(tc, tu, rtol=0.0, atol=1e-5):
+        raise ValueError(
+            "theta_used from H-matrix npz does not match expected dataset rows " + f"({err_suffix})."
+        )
 
 
 def _rewrite_npz_fields(path: str, **updates: Any) -> None:
@@ -3366,12 +3441,23 @@ def _estimate_one(
             ).to(dev)
         elif method_name == "linear_x_flow_diagonal":
             drift_type = "diagonal"
-            model = ConditionalDiagonalLinearXFlowMLP(
-                theta_dim=int(theta_all.shape[1]),
-                x_dim=x_dim_lxf,
-                hidden_dim=int(getattr(args, f"{lxf_prefix}_hidden_dim", 128)),
-                depth=int(getattr(args, f"{lxf_prefix}_depth", 3)),
-            ).to(dev)
+            hidden_dim_lxf = int(getattr(args, f"{lxf_prefix}_hidden_dim", 128))
+            depth_lxf = int(getattr(args, f"{lxf_prefix}_depth", 3))
+            b_net_kind = str(getattr(args, "lxf_b_net", "mlp")).strip().lower()
+            if b_net_kind == "film":
+                model = ConditionalDiagonalLinearXFlowFiLMLP(
+                    theta_dim=int(theta_all.shape[1]),
+                    x_dim=x_dim_lxf,
+                    hidden_dim=hidden_dim_lxf,
+                    depth=depth_lxf,
+                ).to(dev)
+            else:
+                model = ConditionalDiagonalLinearXFlowMLP(
+                    theta_dim=int(theta_all.shape[1]),
+                    x_dim=x_dim_lxf,
+                    hidden_dim=hidden_dim_lxf,
+                    depth=depth_lxf,
+                ).to(dev)
         elif method_name == "linear_x_flow_diagonal_theta":
             drift_type = "diagonal_theta"
             model = ConditionalThetaDiagonalLinearXFlowMLP(
@@ -3542,6 +3628,12 @@ def _estimate_one(
         h_sym = symmetrize_nf(compute_h_directed_nf(delta_l))
         theta_used = theta_all.reshape(-1) if int(theta_all.shape[1]) == 1 else theta_all.copy()
 
+        lxf_b_net_saved = (
+            str(getattr(args, "lxf_b_net", "mlp")).strip().lower()
+            if method_name == "linear_x_flow_diagonal"
+            else "mlp"
+        )
+
         np.savez_compressed(
             os.path.join(output_dir, "h_matrix_results_theta_cov.npz"),
             theta_used=np.asarray(theta_used, dtype=np.float64),
@@ -3556,6 +3648,7 @@ def _estimate_one(
             lxf_solve_jitter=np.float64(float(getattr(args, f"{lxf_prefix}_solve_jitter", 1e-6))),
             lxf_hidden_dim=np.int64(int(getattr(args, f"{lxf_prefix}_hidden_dim", 128))),
             lxf_depth=np.int64(int(getattr(args, f"{lxf_prefix}_depth", 3))),
+            lxf_b_net=np.asarray([lxf_b_net_saved], dtype=object),
             lxf_drift_type=np.asarray([drift_type], dtype=object),
             lxf_low_rank_dim=np.int64(lxf_rank if method_name in ("linear_x_flow_low_rank", "linear_x_flow_low_rank_randb") else 0),
             lxf_randb_lambda_a=np.float64(float(getattr(args, "lxf_randb_lambda_a", 1e-4)) if method_name == "linear_x_flow_low_rank_randb" else 0.0),
@@ -3610,6 +3703,7 @@ def _estimate_one(
             prior_likelihood_finetune_val_losses=empty,
             prior_likelihood_finetune_val_monitor_losses=empty,
             lxf_fm_train=np.bool_(True),
+            lxf_b_net=np.asarray([lxf_b_net_saved], dtype=object),
             lxf_drift_type=np.asarray([drift_type], dtype=object),
             lxf_low_rank_dim=np.int64(lxf_rank if method_name in ("linear_x_flow_low_rank", "linear_x_flow_low_rank_randb") else 0),
             lxf_randb_lambda_a=np.float64(float(getattr(args, "lxf_randb_lambda_a", 1e-4)) if method_name == "linear_x_flow_low_rank_randb" else 0.0),
@@ -4604,14 +4698,11 @@ def _estimate_one(
         )
         loaded = vhb.load_h_matrix(ctx)
         theta_chk = vhb.theta_for_h_matrix_alignment(ctx.bundle, ctx.full_args)
-        if theta_chk.shape[0] != loaded.theta_used.shape[0]:
-            raise ValueError(
-                f"theta/H row mismatch: theta_chk={theta_chk.shape[0]} theta_used={loaded.theta_used.shape[0]}"
-            )
-        if not np.allclose(theta_chk, loaded.theta_used, rtol=0.0, atol=1e-5):
-            raise ValueError(
-                "theta_used from H-matrix npz does not match expected dataset rows for this h_field_method."
-            )
+        _validate_theta_used_matches_bundle(
+            theta_chk,
+            loaded.theta_used,
+            err_suffix=f"h_field_method={flow_ae_norm!r}",
+        )
         return loaded, np.asarray(bundle.x_all, dtype=np.float64), dev
 
     flow_pca_norm = _normalize_flow_pca_method(tfm)
@@ -4701,14 +4792,11 @@ def _estimate_one(
         )
         loaded = vhb.load_h_matrix(ctx)
         theta_chk = vhb.theta_for_h_matrix_alignment(ctx.bundle, ctx.full_args)
-        if theta_chk.shape[0] != loaded.theta_used.shape[0]:
-            raise ValueError(
-                f"theta/H row mismatch: theta_chk={theta_chk.shape[0]} theta_used={loaded.theta_used.shape[0]}"
-            )
-        if not np.allclose(theta_chk, loaded.theta_used, rtol=0.0, atol=1e-5):
-            raise ValueError(
-                "theta_used from H-matrix npz does not match expected dataset rows for x-flow-pca."
-            )
+        _validate_theta_used_matches_bundle(
+            theta_chk,
+            loaded.theta_used,
+            err_suffix="x-flow-pca",
+        )
         return loaded, np.asarray(bundle.x_all, dtype=np.float64), dev
 
     d = vars(args).copy()
@@ -4721,18 +4809,15 @@ def _estimate_one(
     vhb.run_h_estimation_if_needed(ctx)
     loaded = vhb.load_h_matrix(ctx)
     theta_chk = vhb.theta_for_h_matrix_alignment(ctx.bundle, ctx.full_args)
-    if theta_chk.shape[0] != loaded.theta_used.shape[0]:
-        raise ValueError(
-            f"theta/H row mismatch: theta_chk={theta_chk.shape[0]} theta_used={loaded.theta_used.shape[0]}"
-        )
-    if not np.allclose(theta_chk, loaded.theta_used, rtol=0.0, atol=1e-5):
-        raise ValueError(
-            "theta_used from H-matrix npz does not match expected dataset rows for this h_field_method."
-        )
+    _validate_theta_used_matches_bundle(
+        theta_chk,
+        loaded.theta_used,
+        err_suffix=f"h_field_method={str(getattr(args, 'theta_field_method', ''))!r}",
+    )
     x_aligned = vhb.x_for_h_matrix_alignment(ctx.bundle, ctx.full_args)
-    if x_aligned.shape[0] != loaded.theta_used.shape[0]:
+    if x_aligned.shape[0] != theta_chk.shape[0]:
         raise ValueError(
-            f"x/H row mismatch: x_aligned={x_aligned.shape[0]} theta_used={loaded.theta_used.shape[0]}"
+            f"x/H row mismatch: x_aligned={x_aligned.shape[0]} theta_used_rows={theta_chk.shape[0]}"
         )
     return loaded, x_aligned, ctx.device
 
@@ -6438,6 +6523,7 @@ def _write_summary(
             f.write(f"lxf_lr: {float(getattr(args, 'lxf_lr', 0.0))}\n")
             f.write(f"lxf_hidden_dim: {int(getattr(args, 'lxf_hidden_dim', 0))}\n")
             f.write(f"lxf_depth: {int(getattr(args, 'lxf_depth', 0))}\n")
+            f.write(f"lxf_b_net: {getattr(args, 'lxf_b_net', 'mlp')}\n")
             f.write(f"lxf_low_rank_dim: {int(getattr(args, 'lxf_low_rank_dim', 0))}\n")
             f.write(f"lxf_randb_lambda_a: {float(getattr(args, 'lxf_randb_lambda_a', 0.0))}\n")
             f.write(f"lxf_randb_lambda_s: {float(getattr(args, 'lxf_randb_lambda_s', 0.0))}\n")
@@ -7091,15 +7177,12 @@ def main(argv: list[str] | None = None) -> None:
         )
 
     theta_raw_all = np.asarray(bundle.theta_all, dtype=np.float64)
-    if theta_raw_all.ndim == 2 and int(theta_raw_all.shape[1]) != 1:
-        raise ValueError(
-            "Convergence binning requires scalar theta in dataset bundle; "
-            f"got theta_all shape={theta_raw_all.shape}."
-        )
-    theta_scalar_all = theta_raw_all.reshape(-1)
-    theta_ref = np.asarray(theta_scalar_all[perm[: int(args.n_ref)]], dtype=np.float64).reshape(-1)
-    edges, edge_lo, edge_hi = vhb.theta_bin_edges(theta_ref, n_bins)
-    bin_idx_all = vhb.theta_to_bin_index(theta_scalar_all, edges, n_bins)
+    theta_scalar_all, theta_ref, edges, edge_lo, edge_hi, bin_idx_all = prepare_theta_binning_for_convergence(
+        theta_raw_all,
+        perm,
+        int(args.n_ref),
+        n_bins,
+    )
     theta_state_all: np.ndarray | None = None
     if bool(getattr(args, "theta_flow_onehot_state", False)):
         theta_state_all = np.eye(n_bins, dtype=np.float64)[bin_idx_all]
@@ -7464,7 +7547,8 @@ def main(argv: list[str] | None = None) -> None:
         if tfm == "linear_x_flow_scalar":
             drift_desc = "scalar A=aI"
         elif tfm == "linear_x_flow_diagonal":
-            drift_desc = "diagonal A"
+            _bn = str(getattr(args, "lxf_b_net", "mlp")).strip().lower()
+            drift_desc = f"diagonal A; b_phi={'FiLM trunk' if _bn == 'film' else 'MLP'}"
         elif tfm == "linear_x_flow_low_rank":
             drift_desc = f"low-rank A (rank={int(getattr(args, 'lxf_low_rank_dim', 4))})"
         elif tfm == "linear_x_flow_low_rank_randb":

@@ -20,6 +20,8 @@ from fisher.data import (
     ToyConditionalGMMNonGaussianDataset,
     ToyConditionalGaussianDataset,
     ToyConditionalGaussianCosineRandampSqrtdDataset,
+    ToyConditionalGaussianGridcos2DSqrtdDataset,
+    ToyConditionalGaussianRandamp2DSqrtdDataset,
     ToyConditionalGaussianRandampDataset,
     ToyConditionalGaussianRandampSqrtdDataset,
     ToyConditionalGaussianSqrtdDataset,
@@ -742,6 +744,8 @@ def build_dataset_from_meta(
     ToyConditionalGaussianDataset
     | ToyConditionalGaussianSqrtdDataset
     | ToyConditionalGaussianCosineRandampSqrtdDataset
+    | ToyConditionalGaussianRandamp2DSqrtdDataset
+    | ToyConditionalGaussianGridcos2DSqrtdDataset
     | ToyConditionalGaussianRandampDataset
     | ToyConditionalGaussianRandampSqrtdDataset
     | ToyCosSinPiecewiseNoiseDataset
@@ -946,6 +950,73 @@ def build_dataset_from_meta(
             randamp_sqrtd_obs_var_mu_law=sqrtd_law,
             seed=seed,
         )
+    if family == "randamp_gaussian2d_sqrtd":
+        amps_raw = meta.get("randamp_mu_amp_per_dim")
+        centers_raw = meta.get("randamp_center_per_dim")
+        law_raw = meta.get("randamp_sqrtd_obs_var_mu_law") or RANDAMP_SQRTD_VAR_MU_LAW_ADDITIVE
+        return ToyConditionalGaussianRandamp2DSqrtdDataset(
+            theta_low=float(meta["theta_low"]),
+            theta_high=float(meta["theta_high"]),
+            x_dim=generative_x_dim_from_meta(meta),
+            sigma_x1=float(meta["sigma_x1"]),
+            sigma_x2=float(meta["sigma_x2"]),
+            rho=float(meta["rho"]),
+            cov_theta_amp1=float(meta["cov_theta_amp1"]),
+            cov_theta_amp2=float(meta["cov_theta_amp2"]),
+            cov_theta_amp_rho=float(meta["cov_theta_amp_rho"]),
+            cov_theta_freq1=float(meta["cov_theta_freq1"]),
+            cov_theta_freq2=float(meta["cov_theta_freq2"]),
+            cov_theta_freq_rho=float(meta["cov_theta_freq_rho"]),
+            cov_theta_phase1=float(meta["cov_theta_phase1"]),
+            cov_theta_phase2=float(meta["cov_theta_phase2"]),
+            cov_theta_phase_rho=float(meta["cov_theta_phase_rho"]),
+            rho_clip=float(meta["rho_clip"]),
+            randamp_mu_low=float(meta.get("randamp_mu_low", 0.2)),
+            randamp_mu_high=float(meta.get("randamp_mu_high", 2.0)),
+            randamp_kappa=float(meta.get("randamp_kappa", 0.2)),
+            randamp_omega=float(meta.get("randamp_omega", 1.0)),
+            randamp_mu_amp_per_dim=None if amps_raw is None else np.asarray(amps_raw, dtype=np.float64),
+            randamp_center_per_dim=None if centers_raw is None else np.asarray(centers_raw, dtype=np.float64),
+            randamp_sqrtd_obs_var_mu_law=str(law_raw),
+            theta_dim=2,
+            seed=seed,
+        )
+    if family == "gridcos_gaussian2d_sqrtd_rand_tune_additive":
+        cta_raw = meta.get("cosine_tune_amp_per_dim")
+        return ToyConditionalGaussianGridcos2DSqrtdDataset(
+            theta_low=float(meta["theta_low"]),
+            theta_high=float(meta["theta_high"]),
+            x_dim=generative_x_dim_from_meta(meta),
+            sigma_x1=float(meta["sigma_x1"]),
+            sigma_x2=float(meta["sigma_x2"]),
+            rho=float(meta["rho"]),
+            cov_theta_amp1=float(meta["cov_theta_amp1"]),
+            cov_theta_amp2=float(meta["cov_theta_amp2"]),
+            cov_theta_amp_rho=float(meta["cov_theta_amp_rho"]),
+            cov_theta_freq1=float(meta["cov_theta_freq1"]),
+            cov_theta_freq2=float(meta["cov_theta_freq2"]),
+            cov_theta_freq_rho=float(meta["cov_theta_freq_rho"]),
+            cov_theta_phase1=float(meta["cov_theta_phase1"]),
+            cov_theta_phase2=float(meta["cov_theta_phase2"]),
+            cov_theta_phase_rho=float(meta["cov_theta_phase_rho"]),
+            rho_clip=float(meta["rho_clip"]),
+            cosine_tune_amp_low=float(meta.get("cosine_tune_amp_low", 0.2)),
+            cosine_tune_amp_high=float(meta.get("cosine_tune_amp_high", 2.0)),
+            cosine_tune_amp_per_dim=None if cta_raw is None else np.asarray(cta_raw, dtype=np.float64),
+            cosine_tune_amp_scale=float(meta.get("cosine_tune_amp_scale", 1.0)),
+            cosine_sqrtd_obs_var_mu_law=RANDAMP_SQRTD_VAR_MU_LAW_ADDITIVE,
+            gridcos_orientation_per_dim=(
+                None if meta.get("gridcos_orientation_per_dim") is None else np.asarray(meta["gridcos_orientation_per_dim"], dtype=np.float64)
+            ),
+            gridcos_phase_per_dim=(
+                None if meta.get("gridcos_phase_per_dim") is None else np.asarray(meta["gridcos_phase_per_dim"], dtype=np.float64)
+            ),
+            gridcos_omega_per_dim=(
+                None if meta.get("gridcos_omega_per_dim") is None else np.asarray(meta["gridcos_omega_per_dim"], dtype=np.float64)
+            ),
+            theta_dim=2,
+            seed=seed,
+        )
     if family == "cosine_gmm":
         return ToyConditionalGMMNonGaussianDataset(
             theta_low=float(meta["theta_low"]),
@@ -1003,6 +1074,8 @@ def build_dataset_from_args(
     ToyConditionalGaussianDataset
     | ToyConditionalGaussianSqrtdDataset
     | ToyConditionalGaussianCosineRandampSqrtdDataset
+    | ToyConditionalGaussianRandamp2DSqrtdDataset
+    | ToyConditionalGaussianGridcos2DSqrtdDataset
     | ToyConditionalGaussianRandampDataset
     | ToyConditionalGaussianRandampSqrtdDataset
     | ToyCosSinPiecewiseNoiseDataset
@@ -1734,14 +1807,19 @@ def build_conditional_x_velocity_model(
     flow_arch: str,
     args: Any,
     device: torch.device,
+    theta_dim: int = 1,
 ) -> torch.nn.Module:
     arch = str(flow_arch).strip().lower()
+    td = int(theta_dim)
+    if td < 1:
+        raise ValueError("theta_dim must be >= 1.")
     if arch == "mlp":
         return ConditionalXFlowVelocity(
             x_dim=int(args.x_dim),
             hidden_dim=int(getattr(args, "flow_hidden_dim", 128)),
             depth=int(getattr(args, "flow_depth", 3)),
             use_logit_time=True,
+            theta_dim=td,
         ).to(device)
     if arch == "film":
         return ConditionalXFlowVelocityFiLMPerLayer(
@@ -2181,6 +2259,7 @@ def run_shared_fisher_estimation(
             flow_arch=flow_score_arch,
             args=args,
             device=device,
+            theta_dim=int(theta_score_fit.shape[1]) if theta_score_fit.ndim >= 2 else 1,
         )
         post_train_out = train_conditional_x_flow_model(
             model=x_flow_model,

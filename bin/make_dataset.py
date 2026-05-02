@@ -171,13 +171,21 @@ def main() -> None:
     if str(args.dataset_family) in (
         "randamp_gaussian",
         "randamp_gaussian_sqrtd",
+        "randamp_gaussian2d_sqrtd",
     ):
         meta["randamp_mu_amp_per_dim"] = dataset._randamp_amp.tolist()
+    if str(args.dataset_family) == "randamp_gaussian2d_sqrtd":
+        meta["randamp_center_per_dim"] = dataset._randamp_centers_2d.tolist()
     if str(args.dataset_family) in (
         "cosine_gaussian_sqrtd_rand_tune",
         "cosine_gaussian_sqrtd_rand_tune_additive",
+        "gridcos_gaussian2d_sqrtd_rand_tune_additive",
     ):
         meta["cosine_tune_amp_per_dim"] = dataset._cosine_tune_amp.tolist()
+    if str(args.dataset_family) == "gridcos_gaussian2d_sqrtd_rand_tune_additive":
+        meta["gridcos_orientation_per_dim"] = dataset._gridcos_orientation.tolist()
+        meta["gridcos_phase_per_dim"] = dataset._gridcos_phase.tolist()
+        meta["gridcos_omega_per_dim"] = dataset._gridcos_omega.tolist()
     save_shared_dataset_npz(
         args.output_npz,
         meta=meta,

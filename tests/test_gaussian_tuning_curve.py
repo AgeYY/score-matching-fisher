@@ -13,6 +13,8 @@ from fisher.cli_shared_fisher import add_dataset_arguments
 from fisher.data import (
     ToyConditionalGaussianCosineRandampSqrtdDataset,
     ToyConditionalGaussianDataset,
+    ToyConditionalGaussianGridcos2DSqrtdDataset,
+    ToyConditionalGaussianRandamp2DSqrtdDataset,
     ToyConditionalGaussianRandampDataset,
     ToyConditionalGaussianRandampSqrtdDataset,
     ToyConditionalGaussianSqrtdDataset,
@@ -528,6 +530,73 @@ class TestGaussianTuningCurve(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             build_dataset_from_meta(meta)
         self.assertIn("cosine_gaussian", str(ctx.exception))
+
+    def test_randamp_gaussian2d_sqrtd_samples_gradients_and_roundtrip(self) -> None:
+        ns = _ns(dataset_family="randamp_gaussian2d_sqrtd", x_dim=5, n_total=32, train_frac=1.0, seed=123)
+        validate_dataset_sample_args(ns)
+        ds = build_dataset_from_args(ns)
+        self.assertIsInstance(ds, ToyConditionalGaussianRandamp2DSqrtdDataset)
+        theta, x = ds.sample_joint(16)
+        self.assertEqual(theta.shape, (16, 2))
+        self.assertEqual(x.shape, (16, 5))
+        self.assertTrue(np.isfinite(x).all())
+        self.assertTrue(np.all(ds._variance_diag_from_mu(ds.tuning_curve(theta)) > 0.0))
+
+        t0 = np.array([[0.4, -0.7]], dtype=np.float64)
+        h = 1e-6
+        grad = ds.tuning_curve_derivative(t0)
+        for k in range(2):
+            step = np.zeros_like(t0)
+            step[0, k] = h
+            fd = (ds.tuning_curve(t0 + step) - ds.tuning_curve(t0 - step)) / (2.0 * h)
+            np.testing.assert_allclose(grad[:, :, k], fd, rtol=1e-4, atol=1e-5)
+
+        meta = meta_dict_from_args(ns)
+        meta["randamp_mu_amp_per_dim"] = ds._randamp_amp.tolist()
+        meta["randamp_center_per_dim"] = ds._randamp_centers_2d.tolist()
+        ds2 = build_dataset_from_meta(meta)
+        self.assertEqual(int(meta["theta_dim"]), 2)
+        self.assertIsInstance(ds2, ToyConditionalGaussianRandamp2DSqrtdDataset)
+        np.testing.assert_allclose(ds2._randamp_amp, ds._randamp_amp)
+        np.testing.assert_allclose(ds2._randamp_centers_2d, ds._randamp_centers_2d)
+
+    def test_gridcos_gaussian2d_sqrtd_samples_gradients_and_roundtrip(self) -> None:
+        ns = _ns(
+            dataset_family="gridcos_gaussian2d_sqrtd_rand_tune_additive",
+            x_dim=5,
+            n_total=32,
+            train_frac=1.0,
+            seed=321,
+            obs_noise_scale=0.5,
+            cov_theta_amp_scale=2.0,
+        )
+        validate_dataset_sample_args(ns)
+        ds = build_dataset_from_args(ns)
+        self.assertIsInstance(ds, ToyConditionalGaussianGridcos2DSqrtdDataset)
+        theta, x = ds.sample_joint(16)
+        self.assertEqual(theta.shape, (16, 2))
+        self.assertEqual(x.shape, (16, 5))
+        self.assertTrue(np.isfinite(ds.covariance_scales(theta)).all())
+
+        t0 = np.array([[0.2, 0.9]], dtype=np.float64)
+        h = 1e-6
+        grad = ds.tuning_curve_derivative(t0)
+        for k in range(2):
+            step = np.zeros_like(t0)
+            step[0, k] = h
+            fd = (ds.tuning_curve(t0 + step) - ds.tuning_curve(t0 - step)) / (2.0 * h)
+            np.testing.assert_allclose(grad[:, :, k], fd, rtol=1e-4, atol=1e-5)
+
+        meta = meta_dict_from_args(ns)
+        meta["cosine_tune_amp_per_dim"] = ds._cosine_tune_amp.tolist()
+        meta["gridcos_orientation_per_dim"] = ds._gridcos_orientation.tolist()
+        meta["gridcos_phase_per_dim"] = ds._gridcos_phase.tolist()
+        meta["gridcos_omega_per_dim"] = ds._gridcos_omega.tolist()
+        ds2 = build_dataset_from_meta(meta)
+        self.assertEqual(int(meta["theta_dim"]), 2)
+        self.assertIsInstance(ds2, ToyConditionalGaussianGridcos2DSqrtdDataset)
+        np.testing.assert_allclose(ds2._cosine_tune_amp, ds._cosine_tune_amp)
+        np.testing.assert_allclose(ds2._gridcos_phase, ds._gridcos_phase)
 
 
 if __name__ == "__main__":

@@ -17,6 +17,10 @@ diagonal Gaussian with
 
 :class:`ConditionalThetaDiagonalSplineLinearXFlowMLP` is the same diagonal flow, but ``a`` and ``b``
 are linear maps of fixed scalar-theta B-spline features (see ``spline_basis_features_normalized``).
+
+:class:`ConditionalDiagonalLinearXFlowFiLMLP` keeps the same global diagonal drift ``A=diag(a)`` as
+:class:`ConditionalDiagonalLinearXFlowMLP`, but parameterizes ``b_phi(theta)`` with a trunk whose hidden
+layers use FiLM conditioning from raw ``theta`` (no Fourier features).
 """
 
 from __future__ import annotations
@@ -335,6 +339,141 @@ class ConditionalDiagonalLinearXFlowMLP(_BaseConditionalLinearXFlowMLP):
     @property
     def A(self) -> torch.Tensor:
         return torch.diag(self.a)
+
+
+class ConditionalDiagonalLinearXFlowFiLMLP(nn.Module):
+    """Diagonal symmetric drift ``A=diag(a)`` plus theta-conditioned FiLM offset for ``b_phi(theta)``.
+
+    Uses ``depth`` hidden stages (aligned with :class:`ConditionalDiagonalLinearXFlowMLP` ``b_net`` depth):
+    the first linear maps ``theta -> hidden_dim``; each stage applies ``Linear``, FiLM
+    ``h <- (1+gamma(theta)) * h + beta(theta)``, then SiLU. Output linear maps to ``x_dim``.
+
+    FiLM heads are initialized to zero so initially ``(1+gamma) * h + beta = h``.
+    """
+
+    def __init__(
+        self,
+        *,
+        theta_dim: int,
+        x_dim: int,
+        hidden_dim: int = 128,
+        depth: int = 3,
+    ) -> None:
+        super().__init__()
+        if int(theta_dim) < 1:
+            raise ValueError("theta_dim must be >= 1.")
+        if int(x_dim) < 1:
+            raise ValueError("x_dim must be >= 1.")
+        if int(hidden_dim) < 1:
+            raise ValueError("hidden_dim must be >= 1.")
+        if int(depth) < 1:
+            raise ValueError("depth must be >= 1.")
+        self.theta_dim = int(theta_dim)
+        self.x_dim = int(x_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.depth = int(depth)
+
+        self.layer0 = nn.Linear(self.theta_dim, self.hidden_dim)
+        self.mid_layers = nn.ModuleList(
+            [nn.Linear(self.hidden_dim, self.hidden_dim) for _ in range(self.depth - 1)]
+        )
+        self.film_layers = nn.ModuleList(
+            [nn.Linear(self.theta_dim, 2 * self.hidden_dim) for _ in range(self.depth)]
+        )
+        self.out = nn.Linear(self.hidden_dim, self.x_dim)
+        self.a = nn.Parameter(torch.full((self.x_dim,), 1e-3, dtype=torch.float32))
+
+        for lin in self.film_layers:
+            nn.init.zeros_(lin.weight)
+            nn.init.zeros_(lin.bias)
+        nn.init.xavier_uniform_(self.out.weight, gain=0.01)
+        nn.init.zeros_(self.out.bias)
+
+    @property
+    def A(self) -> torch.Tensor:
+        return torch.diag(self.a)
+
+    def b(self, theta: torch.Tensor) -> torch.Tensor:
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        h = self.layer0(theta)
+        gb = self.film_layers[0](theta)
+        gamma, beta = gb.chunk(2, dim=-1)
+        h = (1.0 + gamma) * h + beta
+        h = torch.nn.functional.silu(h)
+        for i, lin in enumerate(self.mid_layers):
+            h = lin(h)
+            gb = self.film_layers[i + 1](theta)
+            gamma, beta = gb.chunk(2, dim=-1)
+            h = (1.0 + gamma) * h + beta
+            h = torch.nn.functional.silu(h)
+        return self.out(h)
+
+    def regularization_loss(self) -> torch.Tensor | None:
+        return None
+
+    def forward(self, x: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
+        a_mat = self.A
+        return x @ a_mat.transpose(0, 1) + self.b(theta)
+
+    def endpoint_mean_covariance(
+        self,
+        theta: torch.Tensor,
+        *,
+        solve_jitter: float = 1e-6,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        b_theta = self.b(theta)
+        e_a = torch.linalg.matrix_exp(self.A)
+        sigma = e_a @ e_a.transpose(0, 1)
+        rhs = b_theta @ (e_a - torch.eye(self.x_dim, dtype=e_a.dtype, device=e_a.device)).transpose(0, 1)
+        a_mat = self.A
+        try:
+            mu = torch.linalg.solve(a_mat, rhs.transpose(0, 1)).transpose(0, 1)
+        except RuntimeError:
+            eye = torch.eye(self.x_dim, dtype=a_mat.dtype, device=a_mat.device)
+            mu = torch.linalg.solve(a_mat + float(solve_jitter) * eye, rhs.transpose(0, 1)).transpose(0, 1)
+        if not torch.all(torch.isfinite(mu)):
+            eye = torch.eye(self.x_dim, dtype=a_mat.dtype, device=a_mat.device)
+            mu = torch.linalg.solve(a_mat + float(solve_jitter) * eye, rhs.transpose(0, 1)).transpose(0, 1)
+        return mu, sigma
+
+    def log_prob_normalized(
+        self,
+        x_norm: torch.Tensor,
+        theta: torch.Tensor,
+        *,
+        solve_jitter: float = 1e-6,
+    ) -> torch.Tensor:
+        if x_norm.ndim == 1:
+            x_norm = x_norm.unsqueeze(0)
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        if x_norm.shape[0] != theta.shape[0]:
+            raise ValueError("x and theta batch sizes must match.")
+        mu, sigma = self.endpoint_mean_covariance(theta, solve_jitter=solve_jitter)
+        d = int(x_norm.shape[1])
+        eye = torch.eye(d, dtype=x_norm.dtype, device=x_norm.device)
+        l = torch.linalg.cholesky(sigma + float(solve_jitter) * eye)
+        diff = x_norm - mu
+        z = torch.cholesky_solve(diff.unsqueeze(-1), l).squeeze(-1)
+        quad = torch.sum(diff * z, dim=1)
+        log_det = 2.0 * torch.sum(torch.log(torch.clamp(torch.diagonal(l), min=1e-12)))
+        return -0.5 * (quad + log_det + float(d) * math.log(2.0 * math.pi))
+
+    def log_prob_observed(
+        self,
+        x_raw: torch.Tensor,
+        theta: torch.Tensor,
+        *,
+        x_mean: torch.Tensor,
+        x_std: torch.Tensor,
+        solve_jitter: float = 1e-6,
+    ) -> torch.Tensor:
+        z = (x_raw - x_mean) / x_std
+        logjac = -torch.sum(torch.log(x_std))
+        return self.log_prob_normalized(z, theta, solve_jitter=solve_jitter) + logjac
 
 
 class ConditionalThetaDiagonalLinearXFlowMLP(nn.Module):

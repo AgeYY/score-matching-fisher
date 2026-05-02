@@ -16,6 +16,15 @@ def _theta_col(theta: np.ndarray) -> np.ndarray:
     return np.asarray(theta, dtype=np.float64).reshape(-1, 1)
 
 
+def _theta_2col(theta: np.ndarray) -> np.ndarray:
+    arr = np.asarray(theta, dtype=np.float64)
+    if arr.ndim == 1:
+        arr = arr.reshape(-1, 2)
+    if arr.ndim != 2 or int(arr.shape[1]) != 2:
+        raise ValueError(f"theta must have shape (N, 2); got {arr.shape}.")
+    return arr
+
+
 def _tuning_centers_uniform_theta(theta_low: float, theta_high: float, x_dim: int) -> np.ndarray:
     """Per-dimension centers in theta, uniform on [theta_low, theta_high] (inclusive endpoints)."""
     return np.linspace(theta_low, theta_high, x_dim, dtype=np.float64)
@@ -494,6 +503,179 @@ class ToyConditionalGaussianRandampSqrtdDataset(ToyConditionalGaussianRandampDat
         for j in range(self.x_dim):
             dcov[:, j, j] = dv[:, j]
         return dcov
+
+
+@dataclass
+class ToyConditionalGaussianRandamp2DSqrtdDataset(ToyConditionalGaussianRandampSqrtdDataset):
+    """Random-amplitude 2D Gaussian bump means with sqrt-d additive diagonal variance."""
+
+    theta_dim: int = 2
+    randamp_center_per_dim: np.ndarray | None = field(default=None)
+
+    def __post_init__(self) -> None:
+        if int(self.theta_dim) != 2:
+            raise ValueError("ToyConditionalGaussianRandamp2DSqrtdDataset requires theta_dim == 2.")
+        super().__post_init__()
+        if self.randamp_center_per_dim is not None:
+            centers = np.asarray(self.randamp_center_per_dim, dtype=np.float64).reshape(self.x_dim, 2)
+        else:
+            centers = self.rng.uniform(self.theta_low, self.theta_high, size=(self.x_dim, 2)).astype(np.float64)
+        self._randamp_centers_2d = centers
+
+    def sample_theta(self, n: int) -> np.ndarray:
+        theta = self.rng.uniform(self.theta_low, self.theta_high, size=(n, 2))
+        return theta.astype(np.float64)
+
+    def tuning_curve(self, theta: np.ndarray) -> np.ndarray:
+        t = _theta_2col(theta)
+        diff = t[:, None, :] - self._randamp_centers_2d[None, :, :]
+        r2 = np.sum(diff**2, axis=2)
+        return self._randamp_amp.reshape(1, -1) * np.exp(-self.randamp_kappa * r2)
+
+    def tuning_curve_derivative(self, theta: np.ndarray) -> np.ndarray:
+        t = _theta_2col(theta)
+        diff = t[:, None, :] - self._randamp_centers_2d[None, :, :]
+        mu = self.tuning_curve(t)
+        return -2.0 * self.randamp_kappa * diff * mu[:, :, None]
+
+    def covariance_scales_derivative(self, theta: np.ndarray) -> np.ndarray:
+        mu = self.tuning_curve(theta)
+        dmu = self.tuning_curve_derivative(theta)
+        v = self._variance_diag_from_mu(mu)
+        sgn = np.sign(mu)[:, :, None]
+        alpha = self._sigma_activity_alpha.reshape(1, -1, 1)
+        if self.randamp_sqrtd_obs_var_mu_law == RANDAMP_SQRTD_VAR_MU_LAW_ADDITIVE:
+            dv = alpha * sgn * dmu
+        else:
+            sb = self._sigma_base.reshape(1, -1, 1)
+            dv = float(self.x_dim) * (sb**2) * alpha * sgn * dmu
+        return dv / (2.0 * np.sqrt(np.maximum(v, 1e-12))[:, :, None])
+
+    def covariance_derivative(self, theta: np.ndarray) -> np.ndarray:
+        mu = self.tuning_curve(theta)
+        dmu = self.tuning_curve_derivative(theta)
+        sgn = np.sign(mu)[:, :, None]
+        alpha = self._sigma_activity_alpha.reshape(1, -1, 1)
+        if self.randamp_sqrtd_obs_var_mu_law == RANDAMP_SQRTD_VAR_MU_LAW_ADDITIVE:
+            dv = alpha * sgn * dmu
+        else:
+            sb = self._sigma_base.reshape(1, -1, 1)
+            dv = float(self.x_dim) * (sb**2) * alpha * sgn * dmu
+        n = dv.shape[0]
+        dcov = np.zeros((n, self.x_dim, self.x_dim, 2), dtype=np.float64)
+        for j in range(self.x_dim):
+            dcov[:, j, j, :] = dv[:, j, :]
+        return dcov
+
+    def log_p_x_given_theta(self, x: np.ndarray, theta: np.ndarray) -> np.ndarray:
+        """Use `(N, 2)` θ internally; do not apply scalar-only ``_theta_col`` reshaping."""
+        x = np.asarray(x, dtype=np.float64).reshape(-1, self.x_dim)
+        th = _theta_2col(theta)
+        mu = self.tuning_curve(th)
+        if not bool(type(self).diagonal_gaussian_observation_noise):
+            from fisher.evaluation import log_p_gaussian_mvnormal_from_cov
+
+            cov = self.covariance(th)
+            return log_p_gaussian_mvnormal_from_cov(x, mu, cov)
+        v = self._variance_diag_from_mu(mu)
+        delta = x - mu
+        quad = np.sum((delta**2) / v, axis=1)
+        logdet = np.sum(np.log(v), axis=1)
+        d = float(self.x_dim)
+        return -0.5 * (d * np.log(2.0 * np.pi) + logdet + quad)
+
+
+@dataclass
+class ToyConditionalGaussianGridcos2DSqrtdDataset(ToyConditionalGaussianCosineRandampSqrtdDataset):
+    """Three-orientation 2D random grid-cosine means with sqrt-d additive diagonal variance."""
+
+    theta_dim: int = 2
+    gridcos_orientation_per_dim: np.ndarray | None = field(default=None)
+    gridcos_phase_per_dim: np.ndarray | None = field(default=None)
+    gridcos_omega_per_dim: np.ndarray | None = field(default=None)
+
+    def __post_init__(self) -> None:
+        if int(self.theta_dim) != 2:
+            raise ValueError("ToyConditionalGaussianGridcos2DSqrtdDataset requires theta_dim == 2.")
+        super().__post_init__()
+        if self.gridcos_orientation_per_dim is not None:
+            rho = np.asarray(self.gridcos_orientation_per_dim, dtype=np.float64).reshape(self.x_dim)
+        else:
+            rho = self.rng.uniform(0.0, np.pi / 3.0, size=(self.x_dim,)).astype(np.float64)
+        if self.gridcos_phase_per_dim is not None:
+            phi = np.asarray(self.gridcos_phase_per_dim, dtype=np.float64).reshape(self.x_dim, 3)
+        else:
+            phi = self.rng.uniform(0.0, 2.0 * np.pi, size=(self.x_dim, 3)).astype(np.float64)
+        if self.gridcos_omega_per_dim is not None:
+            omega = np.asarray(self.gridcos_omega_per_dim, dtype=np.float64).reshape(self.x_dim)
+        else:
+            omega = np.ones(self.x_dim, dtype=np.float64)
+        angles = rho[:, None] + (np.pi / 3.0) * np.arange(3, dtype=np.float64).reshape(1, 3)
+        self._gridcos_orientation = rho
+        self._gridcos_phase = phi
+        self._gridcos_omega = omega
+        self._gridcos_k = omega[:, None, None] * np.stack([np.cos(angles), np.sin(angles)], axis=2)
+
+    def sample_theta(self, n: int) -> np.ndarray:
+        theta = self.rng.uniform(self.theta_low, self.theta_high, size=(n, 2))
+        return theta.astype(np.float64)
+
+    def tuning_curve(self, theta: np.ndarray) -> np.ndarray:
+        t = _theta_2col(theta)
+        arg = np.einsum("nt,jmt->njm", t, self._gridcos_k) + self._gridcos_phase[None, :, :]
+        return self._cosine_tune_amp.reshape(1, -1) * np.mean(np.cos(arg), axis=2)
+
+    def tuning_curve_derivative(self, theta: np.ndarray) -> np.ndarray:
+        t = _theta_2col(theta)
+        arg = np.einsum("nt,jmt->njm", t, self._gridcos_k) + self._gridcos_phase[None, :, :]
+        grad = -np.einsum("njm,jmt->njt", np.sin(arg), self._gridcos_k) / 3.0
+        return self._cosine_tune_amp.reshape(1, -1, 1) * grad
+
+    def covariance_scales_derivative(self, theta: np.ndarray) -> np.ndarray:
+        mu = self.tuning_curve(theta)
+        dmu = self.tuning_curve_derivative(theta)
+        v = self._variance_diag_from_mu(mu)
+        sgn = np.sign(mu)[:, :, None]
+        alpha = self._sigma_activity_alpha.reshape(1, -1, 1)
+        if self.cosine_sqrtd_obs_var_mu_law == RANDAMP_SQRTD_VAR_MU_LAW_ADDITIVE:
+            dv = alpha * sgn * dmu
+        else:
+            sb = self._sigma_base.reshape(1, -1, 1)
+            dv = float(self.x_dim) * (sb**2) * alpha * sgn * dmu
+        return dv / (2.0 * np.sqrt(np.maximum(v, 1e-12))[:, :, None])
+
+    def covariance_derivative(self, theta: np.ndarray) -> np.ndarray:
+        mu = self.tuning_curve(theta)
+        dmu = self.tuning_curve_derivative(theta)
+        sgn = np.sign(mu)[:, :, None]
+        alpha = self._sigma_activity_alpha.reshape(1, -1, 1)
+        if self.cosine_sqrtd_obs_var_mu_law == RANDAMP_SQRTD_VAR_MU_LAW_ADDITIVE:
+            dv = alpha * sgn * dmu
+        else:
+            sb = self._sigma_base.reshape(1, -1, 1)
+            dv = float(self.x_dim) * (sb**2) * alpha * sgn * dmu
+        n = dv.shape[0]
+        dcov = np.zeros((n, self.x_dim, self.x_dim, 2), dtype=np.float64)
+        for j in range(self.x_dim):
+            dcov[:, j, j, :] = dv[:, j, :]
+        return dcov
+
+    def log_p_x_given_theta(self, x: np.ndarray, theta: np.ndarray) -> np.ndarray:
+        """Use `(N, 2)` θ internally; do not apply scalar-only ``_theta_col`` reshaping."""
+        x = np.asarray(x, dtype=np.float64).reshape(-1, self.x_dim)
+        th = _theta_2col(theta)
+        mu = self.tuning_curve(th)
+        if not bool(type(self).diagonal_gaussian_observation_noise):
+            from fisher.evaluation import log_p_gaussian_mvnormal_from_cov
+
+            cov = self.covariance(th)
+            return log_p_gaussian_mvnormal_from_cov(x, mu, cov)
+        v = self._variance_diag_from_mu(mu)
+        delta = x - mu
+        quad = np.sum((delta**2) / v, axis=1)
+        logdet = np.sum(np.log(v), axis=1)
+        d = float(self.x_dim)
+        return -0.5 * (d * np.log(2.0 * np.pi) + logdet + quad)
 
 
 @dataclass

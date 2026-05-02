@@ -88,6 +88,35 @@ def _binned_empirical_embedded_mean(
     return np.asarray(ts, dtype=np.float64).reshape(-1, 1), np.vstack(means)
 
 
+def _binned_empirical_embedded_mean_2d(
+    theta_all: np.ndarray,
+    x_embed: np.ndarray,
+    theta_low: float,
+    theta_high: float,
+    n_bins: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    th = np.asarray(theta_all, dtype=np.float64)
+    x = np.asarray(x_embed, dtype=np.float64)
+    if th.ndim != 2 or int(th.shape[1]) != 2:
+        raise ValueError(f"theta_all must have shape (N, 2); got {th.shape}")
+    nb = int(n_bins)
+    bins = np.linspace(float(theta_low), float(theta_high), nb + 1, dtype=np.float64)
+    centers = 0.5 * (bins[:-1] + bins[1:])
+    i0 = np.digitize(th[:, 0], bins) - 1
+    i1 = np.digitize(th[:, 1], bins) - 1
+    grid_theta: list[list[float]] = []
+    means: list[np.ndarray] = []
+    for a in range(nb):
+        for b in range(nb):
+            mask = (i0 == a) & (i1 == b)
+            if np.any(mask):
+                grid_theta.append([float(centers[a]), float(centers[b])])
+                means.append(x[mask].mean(axis=0))
+    if not means:
+        raise ValueError("2D binned empirical embedded mean produced no non-empty bins")
+    return np.asarray(grid_theta, dtype=np.float64), np.vstack(means)
+
+
 def _save_projection_summary_figure(
     theta_all: np.ndarray,
     x_embed: np.ndarray,
@@ -104,10 +133,64 @@ def _save_projection_summary_figure(
 
     The manifold curve is the binned empirical mean of embedded samples (not ``AE(mu_z(theta))``).
     """
-    th_all = np.asarray(theta_all, dtype=np.float64).reshape(-1, 1)
+    th_raw = np.asarray(theta_all, dtype=np.float64)
+    th_all = th_raw.reshape(-1, 1) if not (th_raw.ndim == 2 and int(th_raw.shape[1]) == 2) else th_raw
     x_all = np.asarray(x_embed, dtype=np.float64)
-    n = int(th_all.shape[0])
+    n = int(th_raw.shape[0])
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    if th_raw.ndim == 2 and int(th_raw.shape[1]) == 2:
+        viz_theta = th_raw
+        viz_x = x_all
+        if scatter_max_points is not None and n > int(scatter_max_points):
+            rng = np.random.default_rng(int(scatter_subsample_seed))
+            pick = rng.choice(n, size=int(scatter_max_points), replace=False)
+            viz_theta = viz_theta[pick]
+            viz_x = viz_x[pick]
+        grid_theta, grid_mean = _binned_empirical_embedded_mean_2d(
+            th_raw,
+            x_all,
+            float(base_dataset.theta_low),
+            float(base_dataset.theta_high),
+            max(4, int(np.sqrt(max(4, int(pr_viz_mean_bins))))),
+        )
+        png = out_dir / "pr_projection_summary.png"
+        fig, axes = plt.subplots(2, 4, figsize=(13.6, 6.6), layout="constrained")
+        n_heat = min(4, int(grid_mean.shape[1]))
+        for j in range(n_heat):
+            ax = axes.ravel()[j]
+            sc = ax.scatter(grid_theta[:, 0], grid_theta[:, 1], c=grid_mean[:, j], s=24, cmap="viridis")
+            ax.set_title(rf"binned mean $x_{{{j + 1}}}$")
+            ax.set_xlabel(r"$\theta_1$")
+            ax.set_ylabel(r"$\theta_2$")
+            fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.02)
+        for j in range(n_heat, 4):
+            axes.ravel()[j].set_axis_off()
+        from fisher.dataset_visualization import pca_project
+
+        proj, _, _ = pca_project(viz_x, n_components=2)
+        for k, color_idx in enumerate((0, 1)):
+            ax = axes.ravel()[4 + k]
+            sc = ax.scatter(proj[:, 0], proj[:, 1], c=viz_theta[:, color_idx], s=8, alpha=0.45, cmap="viridis")
+            ax.set_aspect("equal", adjustable="datalim")
+            ax.set_axis_off()
+            ax.set_title(rf"PCA $x$ colored by $\theta_{color_idx + 1}$")
+            fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.02)
+        loss_raw = train_metrics.get("loss")
+        ax_loss = axes.ravel()[6]
+        if loss_raw is not None and np.asarray(loss_raw).size >= 1:
+            loss = np.asarray(loss_raw, dtype=np.float64).reshape(-1)
+            ax_loss.plot(np.arange(1, loss.shape[0] + 1), loss, color="#4c78a8", linewidth=1.2)
+        ax_loss.set_xlabel("epoch")
+        ax_loss.set_ylabel("loss")
+        ax_loss.set_title("PR-autoencoder training loss")
+        axes.ravel()[7].set_axis_off()
+        fig.savefig(png, dpi=180, bbox_inches="tight")
+        fig.savefig(png.with_suffix(".svg"), bbox_inches="tight")
+        plt.close(fig)
+        print(f"[embed] Saved visualization: {png}")
+        print(f"[embed] Saved visualization: {png.with_suffix('.svg')}")
+        return
 
     theta_plot = th_all
     x_plot = x_all

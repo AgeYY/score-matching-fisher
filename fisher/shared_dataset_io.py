@@ -70,6 +70,10 @@ def meta_dict_from_args(ns: Any) -> dict[str, Any]:
         "seed": int(ns.seed),
         "theta_low": float(ns.theta_low),
         "theta_high": float(ns.theta_high),
+        "theta_dim": 2 if str(ns.dataset_family) in (
+            "randamp_gaussian2d_sqrtd",
+            "gridcos_gaussian2d_sqrtd_rand_tune_additive",
+        ) else 1,
         "x_dim": int(ns.x_dim),
         "sigma_x1": float(ns.sigma_x1),
         "sigma_x2": float(ns.sigma_x2),
@@ -106,6 +110,10 @@ def meta_dict_from_args(ns: Any) -> dict[str, Any]:
         out["randamp_mu_amp_per_dim"] = np.asarray(_ra, dtype=np.float64).reshape(-1).tolist()
     else:
         out["randamp_mu_amp_per_dim"] = None
+    _rc = getattr(ns, "randamp_center_per_dim", None)
+    out["randamp_center_per_dim"] = (
+        np.asarray(_rc, dtype=np.float64).reshape(-1, 2).tolist() if _rc is not None else None
+    )
     out["cosine_tune_amp_low"] = float(getattr(ns, "cosine_tune_amp_low", 0.5))
     out["cosine_tune_amp_high"] = float(getattr(ns, "cosine_tune_amp_high", 1.5))
     _cta = getattr(ns, "cosine_tune_amp_per_dim", None)
@@ -128,14 +136,24 @@ def meta_dict_from_args(ns: Any) -> dict[str, Any]:
     out["pr_autoencoder_cache_key"] = str(getattr(ns, "pr_autoencoder_cache_key", ""))
     out["randamp_sqrtd_obs_var_mu_law"] = (
         RANDAMP_SQRTD_VAR_MU_LAW_ADDITIVE
-        if str(getattr(ns, "dataset_family", "")) == "randamp_gaussian_sqrtd"
+        if str(getattr(ns, "dataset_family", "")) in ("randamp_gaussian_sqrtd", "randamp_gaussian2d_sqrtd")
         else None
     )
     _fam = str(getattr(ns, "dataset_family", ""))
-    if _fam in ("cosine_gaussian_sqrtd_rand_tune", "cosine_gaussian_sqrtd_rand_tune_additive"):
+    if _fam in (
+        "cosine_gaussian_sqrtd_rand_tune",
+        "cosine_gaussian_sqrtd_rand_tune_additive",
+        "gridcos_gaussian2d_sqrtd_rand_tune_additive",
+    ):
         out["cosine_sqrtd_obs_var_mu_law"] = str(getattr(ns, "cosine_sqrtd_obs_var_mu_law", ""))
     else:
         out["cosine_sqrtd_obs_var_mu_law"] = None
+    for key in ("gridcos_orientation_per_dim", "gridcos_phase_per_dim", "gridcos_omega_per_dim"):
+        raw = getattr(ns, key, None)
+        out[key] = None if raw is None else np.asarray(raw, dtype=np.float64).tolist()
+    if int(out["theta_dim"]) == 2:
+        out["theta_low_vec"] = [float(ns.theta_low), float(ns.theta_low)]
+        out["theta_high_vec"] = [float(ns.theta_high), float(ns.theta_high)]
     return out
 
 

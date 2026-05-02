@@ -270,6 +270,17 @@ def theta_to_bin_index(theta: np.ndarray, edges: np.ndarray, n_bins: int) -> np.
     return np.clip(idx, 0, n_bins - 1).astype(np.int64)
 
 
+def theta_coordinate_for_binning(theta: np.ndarray) -> np.ndarray:
+    """First θ column when ``theta`` is `(N, 2)` or higher; otherwise flatten to `(N,)`.
+
+    Matches convergence scripts that bin on θ₁ while keeping full θ for conditional models.
+    """
+    t = np.asarray(theta, dtype=np.float64)
+    if t.ndim == 2 and t.shape[1] >= 2:
+        return np.asarray(t[:, 0], dtype=np.float64).reshape(-1)
+    return t.reshape(-1)
+
+
 def theta_segment_ids_equal_width(theta: np.ndarray, n_segments: int) -> tuple[np.ndarray, np.ndarray]:
     """Equal-width theta segmentation helper used by segmented theta-flow mode."""
     edges, _, _ = theta_bin_edges(theta, int(n_segments))
@@ -344,10 +355,16 @@ def hellinger_figure_labels(h_field_method: str) -> tuple[str, str, str]:
 def theta_for_h_matrix_alignment(bundle: SharedDatasetBundle, full_args: SimpleNamespace) -> np.ndarray:
     mode = str(getattr(full_args, "score_fisher_eval_data", "full"))
     if mode == "full":
-        return np.asarray(bundle.theta_all, dtype=np.float64).reshape(-1)
-    if mode == "score_eval":
-        return np.asarray(bundle.theta_eval, dtype=np.float64).reshape(-1)
-    raise ValueError(f"Unknown score_fisher_eval_data: {mode}")
+        th = np.asarray(bundle.theta_all, dtype=np.float64)
+    elif mode == "score_eval":
+        th = np.asarray(bundle.theta_eval, dtype=np.float64)
+    else:
+        raise ValueError(f"Unknown score_fisher_eval_data: {mode}")
+    if th.ndim == 1:
+        return th.reshape(-1, 1)
+    if th.ndim != 2:
+        raise ValueError(f"theta_for_h_matrix_alignment expects 1D or 2D theta; got shape {th.shape}")
+    return th
 
 
 def x_for_h_matrix_alignment(bundle: SharedDatasetBundle, full_args: SimpleNamespace) -> np.ndarray:
@@ -638,7 +655,15 @@ def load_h_matrix(ctx: RunContext) -> LoadedHMatrix:
 
     h_npz = np.load(h_path, allow_pickle=True)
     h_sym = np.asarray(h_npz["h_sym"], dtype=np.float64)
-    theta_used = np.asarray(h_npz["theta_used"], dtype=np.float64).reshape(-1)
+    theta_used = np.asarray(h_npz["theta_used"], dtype=np.float64)
+    if theta_used.ndim == 0:
+        theta_used = theta_used.reshape(1, 1)
+    elif theta_used.ndim == 1:
+        pass
+    elif theta_used.ndim == 2:
+        pass
+    else:
+        theta_used = theta_used.reshape(theta_used.shape[0], -1)
     h_field_method = str(h_npz["h_field_method"][0]) if "h_field_method" in h_npz.files else "dsm"
     h_eval_scalar_name = (
         str(h_npz["h_eval_scalar_name"][0]) if "h_eval_scalar_name" in h_npz.files else "sigma_eval"
@@ -668,17 +693,22 @@ def load_h_matrix(ctx: RunContext) -> LoadedHMatrix:
 
 def _validate_alignment(ctx: RunContext, loaded: LoadedHMatrix) -> np.ndarray:
     theta_chk = theta_for_h_matrix_alignment(ctx.bundle, ctx.full_args)
-    if theta_chk.shape[0] != loaded.theta_used.shape[0]:
+    theta_ld = np.asarray(loaded.theta_used, dtype=np.float64)
+    if theta_ld.ndim == 1:
+        theta_ld = theta_ld.reshape(-1, 1)
+    if theta_chk.shape != theta_ld.shape:
         raise ValueError(
-            f"theta/H row mismatch: theta_chk={theta_chk.shape[0]} theta_used={loaded.theta_used.shape[0]}"
+            f"theta/H shape mismatch: theta_chk={theta_chk.shape} theta_used={theta_ld.shape}"
         )
-    if not np.allclose(theta_chk, loaded.theta_used, rtol=0.0, atol=1e-5):
+    if not np.allclose(theta_chk, theta_ld, rtol=0.0, atol=1e-5):
         raise ValueError(
             "theta_used from H-matrix npz does not match dataset theta for score_fisher_eval_data split."
         )
     x_chk = x_for_h_matrix_alignment(ctx.bundle, ctx.full_args)
-    if x_chk.shape[0] != loaded.theta_used.shape[0]:
-        raise ValueError(f"x/H row mismatch: x_aligned={x_chk.shape[0]} theta_used={loaded.theta_used.shape[0]}")
+    if x_chk.shape[0] != theta_chk.shape[0]:
+        raise ValueError(
+            f"x/H row mismatch: x_aligned={x_chk.shape[0]} theta_used_rows={theta_chk.shape[0]}"
+        )
     return x_chk
 
 
@@ -687,8 +717,9 @@ def compute_binned_metrics(ctx: RunContext, loaded: LoadedHMatrix) -> BinnedMetr
     args = ctx.args
     x_chk = _validate_alignment(ctx, loaded)
 
-    edges, edge_lo, edge_hi = theta_bin_edges(loaded.theta_used, n_bins)
-    bin_idx = theta_to_bin_index(loaded.theta_used, edges, n_bins)
+    th_bin = theta_coordinate_for_binning(loaded.theta_used)
+    edges, edge_lo, edge_hi = theta_bin_edges(th_bin, n_bins)
+    bin_idx = theta_to_bin_index(th_bin, edges, n_bins)
     centers = 0.5 * (edges[:-1] + edges[1:])
 
     h_binned, count_matrix = average_matrix_by_bins(loaded.h_sym, bin_idx, n_bins)
@@ -708,9 +739,9 @@ def compute_binned_metrics(ctx: RunContext, loaded: LoadedHMatrix) -> BinnedMetr
 
     gt_seed = int(ctx.meta["seed"]) + 17
     theta_gt, x_gt = ctx.dataset.sample_joint(int(args.gt_approx_n_total))
-    theta_gt = np.asarray(theta_gt, dtype=np.float64).reshape(-1)
+    theta_gt = np.asarray(theta_gt, dtype=np.float64)
     x_gt = np.asarray(x_gt, dtype=np.float64)
-    gt_bin_idx = theta_to_bin_index(theta_gt, edges, n_bins)
+    gt_bin_idx = theta_to_bin_index(theta_coordinate_for_binning(theta_gt), edges, n_bins)
     gt_acc, gt_valid, gt_support, gt_stats = pairwise_bin_logistic_accuracy_matrix(
         x_gt,
         gt_bin_idx,
@@ -786,7 +817,9 @@ def run_sssd_analysis(ctx: RunContext, loaded: LoadedHMatrix, metrics: BinnedMet
         print("[h_binned] SSSD skipped: non-positive theta span.")
         return _empty_sssd(n_bins)
 
-    smin_def, smax_def = sssd.default_sigma_training_range_from_theta(loaded.theta_used)
+    smin_def, smax_def = sssd.default_sigma_training_range_from_theta(
+        theta_coordinate_for_binning(loaded.theta_used)
+    )
     if args.sssd_sigma_min is not None and args.sssd_sigma_max is not None:
         smin = float(args.sssd_sigma_min)
         smax = float(args.sssd_sigma_max)
@@ -809,9 +842,10 @@ def run_sssd_analysis(ctx: RunContext, loaded: LoadedHMatrix, metrics: BinnedMet
         eval_sigmas = np.asarray(sssd.parse_sigma_list(str(args.sssd_sigmas)), dtype=np.float64)
 
     sssd_seed = metrics.clf_rs if int(args.sssd_seed) < 0 else int(args.sssd_seed)
+    th_sssd = theta_coordinate_for_binning(loaded.theta_used)
     try:
         sssd.sanity_check_soft_targets(
-            loaded.theta_used[: min(50, loaded.theta_used.shape[0])],
+            th_sssd[: min(50, th_sssd.shape[0])],
             metrics.edges,
             sigma_small=max(smin * 0.5, 1e-12),
             sigma_large=smax,
@@ -825,7 +859,7 @@ def run_sssd_analysis(ctx: RunContext, loaded: LoadedHMatrix, metrics: BinnedMet
         f"max_epochs={int(args.sssd_epochs)} patience={int(args.sssd_patience)}"
     )
     model, train_res = sssd.train_sssd_decoder(
-        loaded.theta_used,
+        th_sssd,
         metrics.x_aligned,
         metrics.edges,
         sigma_min=smin,
@@ -857,9 +891,9 @@ def run_sssd_analysis(ctx: RunContext, loaded: LoadedHMatrix, metrics: BinnedMet
     )
 
     theta_gt, x_gt = ctx.dataset.sample_joint(int(args.gt_approx_n_total))
-    theta_gt = np.asarray(theta_gt, dtype=np.float64).reshape(-1)
+    theta_gt = np.asarray(theta_gt, dtype=np.float64)
     x_gt = np.asarray(x_gt, dtype=np.float64)
-    gt_bin_idx = theta_to_bin_index(theta_gt, metrics.edges, n_bins)
+    gt_bin_idx = theta_to_bin_index(theta_coordinate_for_binning(theta_gt), metrics.edges, n_bins)
 
     s = int(eval_sigmas.shape[0])
     m_stack = np.full((s, n_bins, n_bins), np.nan, dtype=np.float64)

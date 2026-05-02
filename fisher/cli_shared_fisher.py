@@ -37,6 +37,8 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
             "cosine_gaussian_sqrtd_rand_tune_additive",
             "randamp_gaussian",
             "randamp_gaussian_sqrtd",
+            "randamp_gaussian2d_sqrtd",
+            "gridcos_gaussian2d_sqrtd_rand_tune_additive",
             "cosine_gmm",
             "cos_sin_piecewise",
             "linear_piecewise",
@@ -54,6 +56,9 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
             "'randamp_gaussian' (Gaussian bumps with per-dim amp a_j~Uniform(0.2,2.0) + Gaussian obs. noise); "
             "'randamp_gaussian_sqrtd' (same bumps with sqrt-d baseline; diag variance d*sigma^2 + alpha*|mu|; "
             "NPZ meta randamp_sqrtd_obs_var_mu_law). "
+            "'randamp_gaussian2d_sqrtd' (2D theta Gaussian bumps with per-dim centers in [-6,6]^2); "
+            "'gridcos_gaussian2d_sqrtd_rand_tune_additive' (2D theta three-orientation grid cosine means; "
+            "diag variance d*sigma^2 + alpha*|mu|); "
             "For PR-autoencoder embedding into higher-dimensional x, generate this family first, then run "
             "`bin/project_dataset_pr_autoencoder.py`; "
             "'cosine_gmm' (theta-dependent 2-component mixture); "

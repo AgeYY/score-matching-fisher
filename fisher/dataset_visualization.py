@@ -81,6 +81,10 @@ def summarize_dataset(
         pi, _ = dataset._mix_weight(theta)
         print(f"  mixture weight pi(theta) range: [{pi.min():.4f}, {pi.max():.4f}]")
 
+    theta_arr = np.asarray(theta, dtype=np.float64)
+    theta_dim = int(theta_arr.shape[1]) if theta_arr.ndim == 2 else 1
+    if theta_dim != 1:
+        return
     n_bins = 18
     bins = np.linspace(dataset.theta_low, dataset.theta_high, n_bins + 1)
     centers = 0.5 * (bins[:-1] + bins[1:])
@@ -99,6 +103,56 @@ def summarize_dataset(
     used = counts > 0
     mae = np.mean(np.abs(empirical[used] - model_mean[used])) if used.any() else np.nan
     print(f"  binned E[x|theta] vs tuning curve MAE (all dims): {mae:.4f}")
+
+
+def _plot_joint_and_tuning_2d(
+    theta: np.ndarray,
+    x: np.ndarray,
+    dataset: ToyConditionalGaussianDataset
+    | ToyConditionalGMMNonGaussianDataset
+    | ToyCosSinPiecewiseNoiseDataset
+    | ToyLinearPiecewiseNoiseDataset,
+    out_path: str,
+) -> None:
+    th = np.asarray(theta, dtype=np.float64)
+    xx = np.asarray(x, dtype=np.float64)
+    if th.ndim != 2 or int(th.shape[1]) != 2:
+        raise ValueError(f"2D visualization requires theta shape (N, 2); got {th.shape}.")
+    n_heat = min(4, int(xx.shape[1]))
+    fig, axes = plt.subplots(2, 3, figsize=(10.8, 6.6), layout="constrained")
+    t1 = np.linspace(float(dataset.theta_low), float(dataset.theta_high), 80)
+    t2 = np.linspace(float(dataset.theta_low), float(dataset.theta_high), 80)
+    g1, g2 = np.meshgrid(t1, t2, indexing="xy")
+    grid = np.column_stack([g1.ravel(), g2.ravel()])
+    mu = np.asarray(dataset.tuning_curve(grid), dtype=np.float64)
+    for j in range(n_heat):
+        ax = axes.ravel()[j]
+        im = ax.imshow(
+            mu[:, j].reshape(g1.shape),
+            origin="lower",
+            extent=[t1[0], t1[-1], t2[0], t2[-1]],
+            aspect="auto",
+            cmap="viridis",
+        )
+        ax.set_title(rf"$\mu_{{{j + 1}}}(\theta_1,\theta_2)$")
+        ax.set_xlabel(r"$\theta_1$")
+        ax.set_ylabel(r"$\theta_2$")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
+    for j in range(n_heat, 4):
+        axes.ravel()[j].set_axis_off()
+
+    proj, _, _ = pca_project(xx, n_components=2)
+    for k, color_idx in enumerate((0, 1)):
+        ax = axes.ravel()[4 + k]
+        sc = ax.scatter(proj[:, 0], proj[:, 1], c=th[:, color_idx], s=8, alpha=0.45, cmap="viridis")
+        ax.set_aspect("equal", adjustable="datalim")
+        ax.set_axis_off()
+        ax.set_title(rf"PCA $x$ colored by $\theta_{color_idx + 1}$")
+        fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.02)
+    fig.savefig(out_path, dpi=180, bbox_inches="tight")
+    svg_path = str(Path(out_path).with_suffix(".svg"))
+    fig.savefig(svg_path, bbox_inches="tight")
+    plt.close(fig)
 
 
 def plot_joint_and_tuning_on_axes(
@@ -283,6 +337,10 @@ def plot_joint_and_tuning(
         pick = rng.choice(n, size=k, replace=False)
         theta_plot = theta_plot[pick]
         x_plot = x_plot[pick]
+
+    if theta_plot.ndim == 2 and int(theta_plot.shape[1]) == 2:
+        _plot_joint_and_tuning_2d(theta_plot, x_plot, dataset, out_path)
+        return
 
     fig, (ax_tune, ax_manifold) = plt.subplots(1, 2, figsize=(9.0, 3.2), layout="constrained")
     plot_joint_and_tuning_on_axes(

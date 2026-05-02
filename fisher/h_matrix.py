@@ -432,10 +432,11 @@ class HMatrixEstimator:
         return r
 
     def compute_x_conditional_loglik_matrix(self, theta_sorted: np.ndarray, x_sorted: np.ndarray) -> np.ndarray:
-        """Estimate C_ij = log p(x_i | theta_j) via conditional x-flow ODE likelihood (one solver call per block)."""
+        """Estimate C_ij = log p(x_i | theta_j) via conditional x-flow ODE likelihood (one solver call per block).
+
+        ``theta_sorted`` may be ``(N, 1)`` or ``(N, theta_dim)`` (e.g. native 2D θ); columns are tiled with ``x`` rows.
+        """
         theta_grid_col = self._theta_as_matrix(theta_sorted)
-        if theta_grid_col.shape[1] != 1:
-            raise ValueError("compute_x_conditional_loglik_matrix requires scalar theta (shape (N,1)).")
         n = int(theta_grid_col.shape[0])
         if n < 1:
             raise ValueError("Need at least one sample to compute H-matrix.")

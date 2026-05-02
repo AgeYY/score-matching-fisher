@@ -193,6 +193,26 @@ def family_recipe_dict(family: str) -> dict[str, Any]:
             "cov_theta_amp1": 0.70,
             "cov_theta_amp2": 0.60,
         }
+    if fam == "randamp_gaussian2d_sqrtd":
+        _s = 0.20 / math.sqrt(2.0)
+        return {
+            **base,
+            "sigma_x1": _s,
+            "sigma_x2": _s,
+            "cov_theta_amp1": 0.70,
+            "cov_theta_amp2": 0.60,
+        }
+    if fam == "gridcos_gaussian2d_sqrtd_rand_tune_additive":
+        return {
+            **base,
+            "sigma_x1": 0.50,
+            "sigma_x2": 0.50,
+            "cov_theta_amp1": 0.70,
+            "cov_theta_amp2": 0.60,
+            "cosine_tune_amp_low": 0.2,
+            "cosine_tune_amp_high": 2.0,
+            "cosine_sqrtd_obs_var_mu_law": "additive_abs_mu",
+        }
     if fam == "cosine_gmm":
         return {**base, "sigma_x1": 0.30, "sigma_x2": 0.30}
     if fam == "cos_sin_piecewise":
@@ -267,15 +287,20 @@ def format_resolved_family_summary(ns: Any) -> str:
     if fam in (
         "randamp_gaussian",
         "randamp_gaussian_sqrtd",
+        "randamp_gaussian2d_sqrtd",
     ):
         lines.append(
             f"  randamp bumps: low={r['randamp_mu_low']}, high={r['randamp_mu_high']}, "
             f"kappa={r['randamp_kappa']}, omega={r['randamp_omega']}"
         )
-    if fam in ("cosine_gaussian_sqrtd_rand_tune", "cosine_gaussian_sqrtd_rand_tune_additive"):
+    if fam in (
+        "cosine_gaussian_sqrtd_rand_tune",
+        "cosine_gaussian_sqrtd_rand_tune_additive",
+        "gridcos_gaussian2d_sqrtd_rand_tune_additive",
+    ):
         law_note = (
             "additive |mu| term (same law token as randamp_gaussian_sqrtd additive)"
-            if fam == "cosine_gaussian_sqrtd_rand_tune_additive"
+            if fam in ("cosine_gaussian_sqrtd_rand_tune_additive", "gridcos_gaussian2d_sqrtd_rand_tune_additive")
             else "legacy multiplicative (1+alpha|mu|) inside d*sigma^2 term"
         )
         cta_scale = float(getattr(ns, "cosine_tune_amp_scale", 1.0))

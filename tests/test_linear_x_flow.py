@@ -9,6 +9,7 @@ import torch
 
 from fisher.linear_x_flow import (
     ConditionalPCANonlinearLinearXFlowMLP,
+    ConditionalDiagonalLinearXFlowFiLMLP,
     ConditionalDiagonalLinearXFlowMLP,
     ConditionalLinearXFlowMLP,
     ConditionalLowRankLinearXFlowMLP,
@@ -107,6 +108,29 @@ class TestLinearXFlow(unittest.TestCase):
         with torch.no_grad():
             m.a.copy_(torch.tensor([0.1, 0.2, 0.3]))
         self.assertTrue(torch.allclose(m.A, torch.diag(torch.tensor([0.1, 0.2, 0.3]))))
+
+    def test_diagonal_film_shapes_velocity_and_likelihood_finite(self) -> None:
+        torch.manual_seed(0)
+        m = ConditionalDiagonalLinearXFlowFiLMLP(theta_dim=2, x_dim=3, hidden_dim=16, depth=2)
+        th = torch.randn(5, 2)
+        x = torch.randn(5, 3)
+        b = m.b(th)
+        v = m(x, th)
+        self.assertEqual(tuple(m.A.shape), (3, 3))
+        off = m.A - torch.diag(torch.diagonal(m.A))
+        self.assertTrue(torch.allclose(off, torch.zeros_like(off)))
+        self.assertEqual(tuple(b.shape), (5, 3))
+        self.assertEqual(tuple(v.shape), (5, 3))
+        self.assertTrue(torch.all(torch.isfinite(v)))
+        lp = m.log_prob_normalized(x, th, solve_jitter=1e-6)
+        self.assertEqual(tuple(lp.shape), (5,))
+        self.assertTrue(torch.all(torch.isfinite(lp)))
+
+    def test_diagonal_film_heads_initialized_zero(self) -> None:
+        m = ConditionalDiagonalLinearXFlowFiLMLP(theta_dim=2, x_dim=4, hidden_dim=8, depth=3)
+        for lin in m.film_layers:
+            self.assertTrue(torch.all(lin.weight == 0))
+            self.assertTrue(torch.all(lin.bias == 0))
 
     def test_phi_expm1_div_a_at_zero(self) -> None:
         a = torch.zeros(4)
