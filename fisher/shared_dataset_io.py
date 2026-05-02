@@ -55,6 +55,7 @@ def meta_dict_from_args(ns: Any) -> dict[str, Any]:
         "dataset_family": str(ns.dataset_family),
         "obs_noise_scale": float(getattr(ns, "obs_noise_scale", 1.0)),
         "cosine_tune_amp_scale": float(getattr(ns, "cosine_tune_amp_scale", 1.0)),
+        "cov_theta_amp_scale": float(getattr(ns, "cov_theta_amp_scale", 1.0)),
         "tuning_curve_family": str(ns.tuning_curve_family),
         "vm_mu_amp": float(ns.vm_mu_amp),
         "vm_kappa": float(ns.vm_kappa),

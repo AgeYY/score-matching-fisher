@@ -114,6 +114,16 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
             "Ignored for other families except being stored in NPZ meta. Example: 2.0 doubles tuning gains."
         ),
     )
+    p.add_argument(
+        "--cov-theta-amp-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Multiplies the family-fixed cov_theta_amp1 and cov_theta_amp2 after --dataset-family "
+            "(default 1.0). Mean activity alpha in summaries is 0.5*(amp1+amp2) after this scale. "
+            "Example: 2.0 doubles |mu|-driven variance coupling vs the recipe defaults."
+        ),
+    )
 
 
 def add_estimation_arguments(p: argparse.ArgumentParser) -> None:

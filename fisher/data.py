@@ -66,8 +66,13 @@ class ToyConditionalGaussianDataset:
             raise ValueError("x_dim must be >= 1.")
         if not (-0.99 < self.rho < 0.99):
             raise ValueError("rho must be in (-0.99, 0.99).")
-        if not (0.0 <= self.cov_theta_amp1 < 0.95 and 0.0 <= self.cov_theta_amp2 < 0.95):
-            raise ValueError("cov_theta_amp1 and cov_theta_amp2 must be in [0, 0.95).")
+        # Upper bound is permissive: diagonal / sqrt-d observation models only use these as nonnegative
+        # activity weights (e.g. additive law V ∝ d*sigma^2 + alpha*|mu|). Legacy cap 0.95 was overly tight.
+        _max_cov_theta_amp = 1.0e3
+        if not (
+            0.0 <= self.cov_theta_amp1 < _max_cov_theta_amp and 0.0 <= self.cov_theta_amp2 < _max_cov_theta_amp
+        ):
+            raise ValueError(f"cov_theta_amp1 and cov_theta_amp2 must be in [0, {_max_cov_theta_amp}).")
         if not (0.0 <= self.cov_theta_amp_rho <= 1.0):
             raise ValueError("cov_theta_amp_rho must be in [0, 1].")
         if not (0.1 <= self.rho_clip <= 0.95):

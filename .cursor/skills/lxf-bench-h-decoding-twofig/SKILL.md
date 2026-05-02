@@ -39,17 +39,17 @@ mamba run -n geo_diffusion python bin/study_h_decoding_twofig.py \
   --output-dir data/randamp_gaussian_sqrtd_xdim5/h_decoding_twofig_lxf_nlpca_n80_400_1000
 ```
 
-**Cosinebench** — replace dataset path/family only:
+**Cosinebench** (`noise2x_alpha2x` canonical NPZ; see **`cosinebench`** skill):
 
 ```bash
 mamba run -n geo_diffusion python bin/study_h_decoding_twofig.py \
-  --dataset-npz data/cosine_sqrtd_rand_tune_additive_xdim5/cosine_sqrtd_rand_tune_additive_xdim5_pr30d.npz \
+  --dataset-npz data/cosine_sqrtd_rand_tune_additive_xdim5_noise2x_alpha2x/cosine_sqrtd_rand_tune_additive_xdim5_noise2x_alpha2x_pr30d.npz \
   --dataset-family cosine_gaussian_sqrtd_rand_tune_additive \
   --theta-field-methods linear-x-flow,linear-x-flow-nonlinear-pca \
   --lxf-early-patience 1000 \
   --n-list 80,400,1000 \
   --device cuda \
-  --output-dir data/cosine_sqrtd_rand_tune_additive_xdim5/h_decoding_twofig_lxf_nlpca_n80_400_1000
+  --output-dir data/cosine_sqrtd_rand_tune_additive_xdim5_noise2x_alpha2x/h_decoding_twofig_lxf_nlpca_n80_400_1000
 ```
 
 Use **`--theta-field-method linear-x-flow`** alone when only **`linear_x_flow`** is requested.

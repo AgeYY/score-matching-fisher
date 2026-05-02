@@ -214,6 +214,12 @@ def apply_family_recipe_to_namespace(ns: Any) -> None:
     if scale != 1.0:
         setattr(ns, "sigma_x1", float(getattr(ns, "sigma_x1")) * scale)
         setattr(ns, "sigma_x2", float(getattr(ns, "sigma_x2")) * scale)
+    amp_scale = float(getattr(ns, "cov_theta_amp_scale", 1.0))
+    if not math.isfinite(amp_scale) or amp_scale <= 0.0:
+        raise ValueError("--cov-theta-amp-scale must be a finite positive number.")
+    if amp_scale != 1.0:
+        setattr(ns, "cov_theta_amp1", float(getattr(ns, "cov_theta_amp1")) * amp_scale)
+        setattr(ns, "cov_theta_amp2", float(getattr(ns, "cov_theta_amp2")) * amp_scale)
 
 
 def assert_no_legacy_dataset_cli_flags(argv: list[str]) -> None:
@@ -245,10 +251,18 @@ def format_resolved_family_summary(ns: Any) -> str:
         scale = 1.0
     sx1 = float(r["sigma_x1"]) * scale
     sx2 = float(r["sigma_x2"]) * scale
+    amp_scale = float(getattr(ns, "cov_theta_amp_scale", 1.0))
+    if not math.isfinite(amp_scale) or amp_scale <= 0.0:
+        amp_scale = 1.0
+    eff_amp1 = float(r["cov_theta_amp1"]) * amp_scale
+    eff_amp2 = float(r["cov_theta_amp2"]) * amp_scale
+    alpha_mean = 0.5 * (eff_amp1 + eff_amp2)
     lines = [
         f"dataset_family={fam} (fixed internal recipe; not configurable via CLI)",
         f"  tuning_curve_family={r['tuning_curve_family']!r}",
         f"  observation noise: sigma_x1={sx1}, sigma_x2={sx2}, rho={r['rho']}  (obs_noise_scale={scale})",
+        f"  theta-variance coupling: cov_theta_amp1={eff_amp1}, cov_theta_amp2={eff_amp2} "
+        f"(recipe * cov_theta_amp_scale={amp_scale}); alpha_mean_activity={alpha_mean}",
     ]
     if fam in (
         "randamp_gaussian",

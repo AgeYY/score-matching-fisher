@@ -57,6 +57,10 @@ Run ``python bin/make_dataset.py --help`` for argparse defaults and exact wordin
 - ``--obs-noise-scale`` (default 1.0) — Multiplies the family-fixed baseline ``sigma_x1`` / ``sigma_x2``
   (e.g. ``0.5`` halves observation noise relative to the default recipe).
 
+- ``--cov-theta-amp-scale`` (default 1.0) — Multiplies the family-fixed ``cov_theta_amp1`` /
+  ``cov_theta_amp2`` after ``--dataset-family`` (mean activity summaries use
+  ``alpha = 0.5*(amp1+amp2)`` after this scale).
+
 - ``--cosine-tune-amp-scale`` (default 1.0) — For ``cosine_gaussian_sqrtd_rand_tune`` / ``_additive`` only:
   multiplies each per-dimension cosine mean amplitude after the family-fixed ``Uniform(0.2, 2.0)`` draw
   (e.g. ``2.0`` doubles tuning gains and widens theta-dependent observation-noise spread).

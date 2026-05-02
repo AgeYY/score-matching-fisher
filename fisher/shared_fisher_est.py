@@ -1021,6 +1021,9 @@ def validate_dataset_sample_args(args: Any) -> None:
     _cta_s = float(getattr(args, "cosine_tune_amp_scale", 1.0))
     if not math.isfinite(_cta_s) or _cta_s <= 0.0:
         raise ValueError("--cosine-tune-amp-scale must be a finite positive number.")
+    _cov_amp_s = float(getattr(args, "cov_theta_amp_scale", 1.0))
+    if not math.isfinite(_cov_amp_s) or _cov_amp_s <= 0.0:
+        raise ValueError("--cov-theta-amp-scale must be a finite positive number.")
     if args.x_dim < 1:
         raise ValueError("--x-dim must be >= 1.")
     if str(getattr(args, "dataset_family", "")) in (
