@@ -312,11 +312,11 @@ class HMatrixEstimator:
 
     def compute_g_matrix(self, theta_sorted: np.ndarray, x_sorted: np.ndarray) -> np.ndarray:
         theta_grid_col = self._theta_as_matrix(theta_sorted)
-        if theta_grid_col.shape[1] != 1:
-            raise ValueError("compute_g_matrix requires scalar theta (shape (N,1)).")
         n = int(theta_grid_col.shape[0])
         if n < 1:
             raise ValueError("Need at least one sample to compute H-matrix.")
+        if int(theta_grid_col.shape[1]) < 1:
+            raise ValueError("theta must have at least one column.")
         row_block = max(1, int(self.pair_batch_size // n))
         theta_grid_col = np.asarray(theta_grid_col, dtype=np.float32)
         g = np.zeros((n, n), dtype=np.float64)
@@ -343,8 +343,13 @@ class HMatrixEstimator:
                     if self.model_prior is None:
                         raise RuntimeError("compute_g_matrix requires model_prior.")
                     v_prior = self.model_prior.predict_velocity(theta_t, t_eval=float(self.sigma_eval))
-                    f_post = self._velocity_to_score(v_post, theta_t, t_eval).cpu().numpy().reshape(b, n)
-                    f_prior = self._velocity_to_score(v_prior, theta_t, t_eval).cpu().numpy().reshape(b, n)
+                    s_post = self._velocity_to_score(v_post, theta_t, t_eval)
+                    s_prior = self._velocity_to_score(v_prior, theta_t, t_eval)
+                    if int(s_post.shape[-1]) > 1:
+                        s_post = s_post.sum(dim=-1, keepdim=False)
+                        s_prior = s_prior.sum(dim=-1, keepdim=False)
+                    f_post = s_post.cpu().numpy().reshape(b, n)
+                    f_prior = s_prior.cpu().numpy().reshape(b, n)
                 else:
                     f_post = (
                         self.model_post.predict_score(theta_t, x_t, sigma_eval=self.sigma_eval)
@@ -434,8 +439,6 @@ class HMatrixEstimator:
     def compute_x_conditional_loglik_matrix(self, theta_sorted: np.ndarray, x_sorted: np.ndarray) -> np.ndarray:
         """Estimate C_ij = log p(x_i | theta_j) via conditional x-flow ODE likelihood (one solver call per block)."""
         theta_grid_col = self._theta_as_matrix(theta_sorted)
-        if theta_grid_col.shape[1] != 1:
-            raise ValueError("compute_x_conditional_loglik_matrix requires scalar theta (shape (N,1)).")
         n = int(theta_grid_col.shape[0])
         if n < 1:
             raise ValueError("Need at least one sample to compute H-matrix.")
@@ -507,12 +510,20 @@ class HMatrixEstimator:
     @staticmethod
     def compute_c_matrix(theta_sorted: np.ndarray, g_matrix: np.ndarray) -> np.ndarray:
         theta_arr = np.asarray(theta_sorted, dtype=np.float64)
-        if theta_arr.ndim == 2 and theta_arr.shape[1] != 1:
-            raise ValueError("compute_c_matrix requires scalar theta (shape (N,1)).")
-        theta_flat = theta_arr.reshape(-1)
-        if g_matrix.ndim != 2 or g_matrix.shape[0] != theta_flat.size or g_matrix.shape[1] != theta_flat.size:
+        if theta_arr.ndim == 1:
+            theta_arr = theta_arr.reshape(-1, 1)
+        if theta_arr.ndim != 2 or theta_arr.shape[1] < 1:
+            raise ValueError("theta_sorted must be (N,) or (N, d) with d >= 1.")
+        n = int(theta_arr.shape[0])
+        if g_matrix.ndim != 2 or g_matrix.shape[0] != n or g_matrix.shape[1] != n:
             raise ValueError("g_matrix must have shape (N, N) matching theta_sorted.")
-        dtheta = np.diff(theta_flat).reshape(1, -1)
+        if n < 2:
+            return np.zeros_like(g_matrix, dtype=np.float64)
+        if theta_arr.shape[1] == 1:
+            dtheta = np.diff(theta_arr[:, 0]).reshape(1, -1)
+        else:
+            # Lex-sorted samples form a polyline in theta-space; use segment lengths as trapezoid spacings.
+            dtheta = np.linalg.norm(np.diff(theta_arr, axis=0), axis=1).reshape(1, -1)
         trapezoids = 0.5 * dtheta * (g_matrix[:, :-1] + g_matrix[:, 1:])
         c = np.zeros_like(g_matrix, dtype=np.float64)
         if trapezoids.shape[1] > 0:

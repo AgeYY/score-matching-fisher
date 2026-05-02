@@ -53,6 +53,7 @@ class ToyConditionalGaussianDataset:
     cov_theta_phase2: float = -0.35
     cov_theta_phase_rho: float = 0.40
     rho_clip: float = 0.85
+    theta_dim: int = 1
     seed: int = 42
     # If False, ``log_p_x_given_theta`` uses full ``covariance(theta)`` via
     # ``fisher.evaluation.log_p_gaussian_mvnormal_from_cov`` (O(d³) per batch row).
@@ -91,6 +92,9 @@ class ToyConditionalGaussianDataset:
                 raise ValueError("gauss_mu_amp must be positive for gaussian_raw.")
 
         self.rng = np.random.default_rng(self.seed)
+        self.theta_dim = int(self.theta_dim)
+        if self.theta_dim not in (1, 2):
+            raise ValueError("theta_dim must be 1 or 2.")
 
         # Cosine tuning curves: mu_j(theta) = A * cos(omega * theta + phi_j)
         # phi_j = 2*pi*j/d (periodic phases; cosine only).
@@ -109,12 +113,33 @@ class ToyConditionalGaussianDataset:
         self.cov = np.diag(self._sigma_base**2) + 1e-8 * np.eye(self.x_dim, dtype=np.float64)
         self.cov_chol = np.linalg.cholesky(self.cov)
 
+    def _theta_coords(self, theta: np.ndarray) -> np.ndarray:
+        """Return theta as (n, theta_dim)."""
+        t = np.asarray(theta, dtype=np.float64)
+        if t.ndim == 1:
+            t = t.reshape(-1, 1)
+        elif t.ndim != 2:
+            raise ValueError("theta must be 1D or 2D.")
+        if int(t.shape[1]) != int(self.theta_dim):
+            raise ValueError(f"theta has shape {t.shape} but dataset theta_dim={self.theta_dim}.")
+        return t
+
+    def _theta_effective_x_scalars(self, theta: np.ndarray) -> np.ndarray:
+        """Per observation coordinate j, scalar argument derived from theta (shape (n, x_dim))."""
+        th = self._theta_coords(theta)
+        n, td = th.shape
+        d = int(self.x_dim)
+        if td == 1:
+            return np.broadcast_to(th[:, 0:1], (n, d)).copy()
+        idx = np.arange(d, dtype=np.int64) % int(td)
+        return th[:, idx]
+
     def sample_theta(self, n: int) -> np.ndarray:
-        theta = self.rng.uniform(self.theta_low, self.theta_high, size=(n, 1))
+        theta = self.rng.uniform(self.theta_low, self.theta_high, size=(n, int(self.theta_dim)))
         return theta.astype(np.float64)
 
     def tuning_curve(self, theta: np.ndarray) -> np.ndarray:
-        t = _theta_col(theta)
+        t = self._theta_effective_x_scalars(theta)
         ph = self._mu_phases.reshape(1, -1)
         tc = self._tuning_centers_theta.reshape(1, -1)
         if self.tuning_curve_family == "cosine":
@@ -128,7 +153,7 @@ class ToyConditionalGaussianDataset:
         raise ValueError(f"Unknown tuning_curve_family: {self.tuning_curve_family!r}")
 
     def tuning_curve_derivative(self, theta: np.ndarray) -> np.ndarray:
-        t = _theta_col(theta)
+        t = self._theta_effective_x_scalars(theta)
         ph = self._mu_phases.reshape(1, -1)
         tc = self._tuning_centers_theta.reshape(1, -1)
         if self.tuning_curve_family == "cosine":
@@ -217,7 +242,7 @@ class ToyConditionalGaussianDataset:
         ``diagonal_gaussian_observation_noise = False`` on the class (or override this method).
         """
         x = np.asarray(x, dtype=np.float64).reshape(-1, self.x_dim)
-        theta = _theta_col(theta)
+        theta = self._theta_coords(theta)
         mu = self.tuning_curve(theta)
         if not bool(type(self).diagonal_gaussian_observation_noise):
             from fisher.evaluation import log_p_gaussian_mvnormal_from_cov
@@ -313,14 +338,14 @@ class ToyConditionalGaussianCosineRandampSqrtdDataset(ToyConditionalGaussianSqrt
     def tuning_curve(self, theta: np.ndarray) -> np.ndarray:
         if self.tuning_curve_family != "cosine":
             return super().tuning_curve(theta)
-        t = _theta_col(theta)
+        t = self._theta_effective_x_scalars(theta)
         ph = self._mu_phases.reshape(1, -1)
         return self._cosine_tune_amp.reshape(1, -1) * np.cos(self._mu_omega * t + ph)
 
     def tuning_curve_derivative(self, theta: np.ndarray) -> np.ndarray:
         if self.tuning_curve_family != "cosine":
             return super().tuning_curve_derivative(theta)
-        t = _theta_col(theta)
+        t = self._theta_effective_x_scalars(theta)
         ph = self._mu_phases.reshape(1, -1)
         return self._cosine_tune_amp.reshape(1, -1) * (-self._mu_omega * np.sin(self._mu_omega * t + ph))
 
@@ -404,13 +429,13 @@ class ToyConditionalGaussianRandampDataset(ToyConditionalGaussianDataset):
             ).astype(np.float64)
 
     def tuning_curve(self, theta: np.ndarray) -> np.ndarray:
-        t = _theta_col(theta)
+        t = self._theta_effective_x_scalars(theta)
         tc = self._tuning_centers_theta.reshape(1, -1)
         z = self.randamp_omega * (t - tc)
         return self._randamp_amp.reshape(1, -1) * np.exp(-self.randamp_kappa * (z**2))
 
     def tuning_curve_derivative(self, theta: np.ndarray) -> np.ndarray:
-        t = _theta_col(theta)
+        t = self._theta_effective_x_scalars(theta)
         tc = self._tuning_centers_theta.reshape(1, -1)
         z = self.randamp_omega * (t - tc)
         g = self._randamp_amp.reshape(1, -1) * np.exp(-self.randamp_kappa * (z**2))

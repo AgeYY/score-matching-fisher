@@ -84,7 +84,12 @@ def summarize_dataset(
     n_bins = 18
     bins = np.linspace(dataset.theta_low, dataset.theta_high, n_bins + 1)
     centers = 0.5 * (bins[:-1] + bins[1:])
-    idx = np.digitize(theta.ravel(), bins) - 1
+    th_arr = np.asarray(theta, dtype=np.float64)
+    if th_arr.ndim == 2 and th_arr.shape[1] > 1:
+        th_scalar = th_arr[:, 0].reshape(-1)
+    else:
+        th_scalar = th_arr.ravel()
+    idx = np.digitize(th_scalar, bins) - 1
     valid = (idx >= 0) & (idx < n_bins)
     idx = idx[valid]
     x_valid = x[valid]
@@ -95,7 +100,15 @@ def summarize_dataset(
         counts[b] = int(mask.sum())
         if counts[b] > 0:
             empirical[b] = x_valid[mask].mean(axis=0)
-    model_mean = dataset.tuning_curve(centers[:, None])
+    theta_mid = 0.5 * (float(dataset.theta_low) + float(dataset.theta_high))
+    td = int(getattr(dataset, "theta_dim", 1))
+    if td == 1:
+        theta_dense = centers[:, None]
+    else:
+        theta_dense = np.column_stack(
+            [centers.astype(np.float64), np.full(centers.shape[0], theta_mid, dtype=np.float64)]
+        )
+    model_mean = dataset.tuning_curve(theta_dense)
     used = counts > 0
     mae = np.mean(np.abs(empirical[used] - model_mean[used])) if used.any() else np.nan
     print(f"  binned E[x|theta] vs tuning curve MAE (all dims): {mae:.4f}")
@@ -141,13 +154,21 @@ def plot_joint_and_tuning_on_axes(
     """
     theta_plot = np.asarray(theta, dtype=np.float64)
     x_plot = np.asarray(x, dtype=np.float64)
+    if theta_plot.ndim == 2 and theta_plot.shape[1] > 1:
+        theta_color = np.asarray(theta_plot[:, 0], dtype=np.float64).reshape(-1)
+    else:
+        theta_color = theta_plot.ravel()
 
     if mu_override is None:
         if theta_grid_override is not None:
             raise ValueError("theta_grid_override is only valid when mu_override is set.")
-        t = np.linspace(dataset.theta_low, dataset.theta_high, int(n_theta_grid), dtype=np.float64)[
-            :, None
-        ]
+        td = int(getattr(dataset, "theta_dim", 1))
+        t1 = np.linspace(dataset.theta_low, dataset.theta_high, int(n_theta_grid), dtype=np.float64)
+        if td == 1:
+            t = t1[:, None]
+        else:
+            tmid = 0.5 * (float(dataset.theta_low) + float(dataset.theta_high))
+            t = np.column_stack([t1, np.full_like(t1, tmid)])
         mu = np.asarray(dataset.tuning_curve(t), dtype=np.float64)
     else:
         mu = np.asarray(mu_override, dtype=np.float64)
@@ -158,9 +179,13 @@ def plot_joint_and_tuning_on_axes(
                     f"mu_override rows ({mu.shape[0]}) must match theta_grid_override rows ({t.shape[0]})."
                 )
         else:
-            t = np.linspace(dataset.theta_low, dataset.theta_high, int(n_theta_grid), dtype=np.float64)[
-                :, None
-            ]
+            td = int(getattr(dataset, "theta_dim", 1))
+            t1 = np.linspace(dataset.theta_low, dataset.theta_high, int(n_theta_grid), dtype=np.float64)
+            if td == 1:
+                t = t1[:, None]
+            else:
+                tmid = 0.5 * (float(dataset.theta_low) + float(dataset.theta_high))
+                t = np.column_stack([t1, np.full_like(t1, tmid)])
             if mu.ndim != 2 or int(mu.shape[0]) != int(t.shape[0]):
                 raise ValueError(
                     f"mu_override must have shape ({t.shape[0]}, d); got {mu.shape} for n_theta_grid={n_theta_grid}."
@@ -190,12 +215,12 @@ def plot_joint_and_tuning_on_axes(
         mu_pc, mean_mu, basis_mu = pca_project(mu, n_components=2)
         x0 = x_plot - mean_mu
         proj_x = x0 @ basis_mu
-        th_line = np.asarray(t, dtype=np.float64).ravel()
+        th_line_dense = np.asarray(t[:, 0], dtype=np.float64).ravel()
         t_mu = int(mu_pc.shape[0])
         if t_mu >= 2:
             pts = mu_pc[:, :2]
             segs = np.stack([pts[:-1], pts[1:]], axis=1)
-            seg_theta = 0.5 * (th_line[:-1] + th_line[1:])
+            seg_theta = 0.5 * (th_line_dense[:-1] + th_line_dense[1:])
             lc = LineCollection(
                 segs,
                 cmap="viridis",
@@ -209,7 +234,7 @@ def plot_joint_and_tuning_on_axes(
         ax_manifold.scatter(
             mu_pc[:, 0],
             mu_pc[:, 1],
-            c=th_line,
+            c=th_line_dense,
             s=8,
             alpha=0.45,
             cmap="viridis",
@@ -219,7 +244,7 @@ def plot_joint_and_tuning_on_axes(
         ax_manifold.scatter(
             proj_x[:, 0],
             proj_x[:, 1],
-            c=theta_plot.ravel(),
+            c=theta_color,
             s=8,
             alpha=0.35,
             cmap="viridis",
@@ -232,7 +257,7 @@ def plot_joint_and_tuning_on_axes(
         cbar = fig.colorbar(sm_theta, ax=ax_manifold, fraction=0.035, pad=0.02)
         cbar.set_label(r"$\theta$")
     else:
-        th = theta_plot.ravel()
+        th = theta_color
         ax_manifold.plot(t[:, 0], mu[:, 0], color="#4c78a8", linewidth=2.0, zorder=1)
         ax_manifold.scatter(
             th,

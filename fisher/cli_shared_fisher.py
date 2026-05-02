@@ -73,6 +73,16 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
         default=6.0,
         help="Upper bound of theta (see --theta-low).",
     )
+    p.add_argument(
+        "--theta-dim",
+        type=int,
+        default=1,
+        choices=[1, 2],
+        help=(
+            "Latent dimension of theta (each component uniform on [theta-low, theta-high]). "
+            "Values 2 use alternating theta coordinates across observation dimensions in the Gaussian families."
+        ),
+    )
     p.add_argument("--x-dim", type=int, default=2, help="Observation dimension (length of x).")
     p.add_argument(
         "--n-total",

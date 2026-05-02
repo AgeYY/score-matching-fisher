@@ -59,19 +59,32 @@ def estimate_hellinger_sq_one_sided_mc(
     if n_mc < 1:
         raise ValueError("n_mc must be >= 1.")
 
+    theta_fill = 0.5 * (float(getattr(dataset, "theta_low", 0.0)) + float(getattr(dataset, "theta_high", 0.0)))
+    td = int(getattr(dataset, "theta_dim", 1))
+
     h2 = np.zeros((n_bins, n_bins), dtype=np.float64)
 
     for i in range(n_bins):
-        theta_i = float(centers[i])
-        t_col = np.full((n_mc, 1), theta_i, dtype=np.float64)
+        if td == 1:
+            t_col = np.full((n_mc, 1), float(centers[i]), dtype=np.float64)
+        else:
+            t_col = np.empty((n_mc, td), dtype=np.float64)
+            t_col[:, 0] = float(centers[i])
+            if td > 1:
+                t_col[:, 1:] = theta_fill
         x = dataset.sample_x(t_col)
         lp_i = np.asarray(log_p_x_given_theta(x, t_col, dataset), dtype=np.float64).reshape(-1)
         if lp_i.shape[0] != n_mc:
             raise ValueError(f"log_p_x_given_theta length mismatch: got {lp_i.shape[0]}, expected {n_mc}.")
 
         for j in range(n_bins):
-            theta_j = float(centers[j])
-            t_j = np.full((n_mc, 1), theta_j, dtype=np.float64)
+            if td == 1:
+                t_j = np.full((n_mc, 1), float(centers[j]), dtype=np.float64)
+            else:
+                t_j = np.empty((n_mc, td), dtype=np.float64)
+                t_j[:, 0] = float(centers[j])
+                if td > 1:
+                    t_j[:, 1:] = theta_fill
             lp_j = np.asarray(log_p_x_given_theta(x, t_j, dataset), dtype=np.float64).reshape(-1)
             log_half = 0.5 * (lp_j - lp_i)
             # Stable mean(exp(log_half)) without scipy (numpy may not expose logsumexp)
@@ -109,18 +122,31 @@ def estimate_mean_llr_one_sided_mc(
     if n_mc < 1:
         raise ValueError("n_mc must be >= 1.")
 
+    theta_fill = 0.5 * (float(getattr(dataset, "theta_low", 0.0)) + float(getattr(dataset, "theta_high", 0.0)))
+    td = int(getattr(dataset, "theta_dim", 1))
+
     out = np.zeros((n_bins, n_bins), dtype=np.float64)
     for i in range(n_bins):
-        theta_i = float(centers[i])
-        t_col = np.full((n_mc, 1), theta_i, dtype=np.float64)
+        if td == 1:
+            t_col = np.full((n_mc, 1), float(centers[i]), dtype=np.float64)
+        else:
+            t_col = np.empty((n_mc, td), dtype=np.float64)
+            t_col[:, 0] = float(centers[i])
+            if td > 1:
+                t_col[:, 1:] = theta_fill
         x = dataset.sample_x(t_col)
         lp_i = np.asarray(log_p_x_given_theta(x, t_col, dataset), dtype=np.float64).reshape(-1)
         if lp_i.shape[0] != n_mc:
             raise ValueError(f"log_p_x_given_theta length mismatch: got {lp_i.shape[0]}, expected {n_mc}.")
 
         for j in range(n_bins):
-            theta_j = float(centers[j])
-            t_j = np.full((n_mc, 1), theta_j, dtype=np.float64)
+            if td == 1:
+                t_j = np.full((n_mc, 1), float(centers[j]), dtype=np.float64)
+            else:
+                t_j = np.empty((n_mc, td), dtype=np.float64)
+                t_j[:, 0] = float(centers[j])
+                if td > 1:
+                    t_j[:, 1:] = theta_fill
             lp_j = np.asarray(log_p_x_given_theta(x, t_j, dataset), dtype=np.float64).reshape(-1)
             out[i, j] = float(np.mean(lp_j - lp_i))
     np.fill_diagonal(out, 0.0)

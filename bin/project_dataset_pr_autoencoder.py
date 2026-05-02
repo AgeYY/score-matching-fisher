@@ -62,7 +62,11 @@ def _binned_empirical_embedded_mean(
     n_bins: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Bin by theta and return (bin_center[:, None], mean embedded x per non-empty bin)."""
-    th = np.asarray(theta_all, dtype=np.float64).reshape(-1)
+    th2 = np.asarray(theta_all, dtype=np.float64)
+    if th2.ndim == 2 and th2.shape[1] > 1:
+        th = th2[:, 0].reshape(-1)
+    else:
+        th = th2.reshape(-1)
     x = np.asarray(x_embed, dtype=np.float64)
     if x.ndim != 2:
         raise ValueError(f"x_embed must be 2D; got {x.shape}")
@@ -104,12 +108,17 @@ def _save_projection_summary_figure(
 
     The manifold curve is the binned empirical mean of embedded samples (not ``AE(mu_z(theta))``).
     """
-    th_all = np.asarray(theta_all, dtype=np.float64).reshape(-1, 1)
+    th_all = np.asarray(theta_all, dtype=np.float64)
+    if th_all.ndim == 1:
+        th_all = th_all.reshape(-1, 1)
+    elif th_all.ndim != 2:
+        raise ValueError(f"theta_all must be 1D or 2D; got shape {th_all.shape}.")
+    th_plot = th_all[:, 0:1]
     x_all = np.asarray(x_embed, dtype=np.float64)
     n = int(th_all.shape[0])
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    theta_plot = th_all
+    theta_plot = th_plot
     x_plot = x_all
     if scatter_max_points is not None and n > int(scatter_max_points):
         k = int(scatter_max_points)

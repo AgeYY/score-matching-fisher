@@ -736,6 +736,13 @@ def generative_x_dim_from_meta(meta: dict[str, Any]) -> int:
     return xd
 
 
+def theta_dim_from_shared_meta(meta: dict[str, Any]) -> int:
+    td = int(meta.get("theta_dim", 1))
+    if td not in (1, 2):
+        raise ValueError(f"Unsupported theta_dim={td} in dataset meta (expected 1 or 2).")
+    return td
+
+
 def build_dataset_from_meta(
     meta: dict[str, Any],
 ) -> (
@@ -752,6 +759,7 @@ def build_dataset_from_meta(
     raise_if_removed_dataset_family(family)
     raise_if_legacy_dataset_family(family)
     seed = int(meta["seed"])
+    theta_dim = theta_dim_from_shared_meta(meta)
     if family in ("cosine_gaussian", "cosine_gaussian_const_noise"):
         return ToyConditionalGaussianDataset(
             theta_low=float(meta["theta_low"]),
@@ -777,6 +785,7 @@ def build_dataset_from_meta(
             cov_theta_phase2=float(meta["cov_theta_phase2"]),
             cov_theta_phase_rho=float(meta["cov_theta_phase_rho"]),
             rho_clip=float(meta["rho_clip"]),
+            theta_dim=theta_dim,
             seed=seed,
         )
     if family == "cosine_gaussian_sqrtd":
@@ -804,6 +813,7 @@ def build_dataset_from_meta(
             cov_theta_phase2=float(meta["cov_theta_phase2"]),
             cov_theta_phase_rho=float(meta["cov_theta_phase_rho"]),
             rho_clip=float(meta["rho_clip"]),
+            theta_dim=theta_dim,
             seed=seed,
         )
     if family in ("cosine_gaussian_sqrtd_rand_tune", "cosine_gaussian_sqrtd_rand_tune_additive"):
@@ -856,6 +866,7 @@ def build_dataset_from_meta(
             cosine_tune_amp_per_dim=cta,
             cosine_tune_amp_scale=float(meta.get("cosine_tune_amp_scale", 1.0)),
             cosine_sqrtd_obs_var_mu_law=cos_law,
+            theta_dim=theta_dim,
             seed=seed,
         )
     if family == "randamp_gaussian":
@@ -894,6 +905,7 @@ def build_dataset_from_meta(
             randamp_kappa=float(meta.get("randamp_kappa", 0.2)),
             randamp_omega=float(meta.get("randamp_omega", 1.0)),
             randamp_mu_amp_per_dim=amps,
+            theta_dim=theta_dim,
             seed=seed,
         )
     if family == "randamp_gaussian_sqrtd":
@@ -944,6 +956,7 @@ def build_dataset_from_meta(
             randamp_omega=float(meta.get("randamp_omega", 1.0)),
             randamp_mu_amp_per_dim=amps_sqrt,
             randamp_sqrtd_obs_var_mu_law=sqrtd_law,
+            theta_dim=theta_dim,
             seed=seed,
         )
     if family == "cosine_gmm":
@@ -1031,6 +1044,11 @@ def validate_dataset_sample_args(args: Any) -> None:
         "linear_piecewise",
     ) and int(args.x_dim) != 2:
         raise ValueError("--dataset-family cos_sin_piecewise / linear_piecewise requires --x-dim 2.")
+    if str(getattr(args, "dataset_family", "")) in ("cos_sin_piecewise", "linear_piecewise"):
+        if int(getattr(args, "theta_dim", 1)) != 1:
+            raise ValueError("--dataset-family cos_sin_piecewise / linear_piecewise requires --theta-dim 1.")
+    if int(getattr(args, "theta_dim", 1)) not in (1, 2):
+        raise ValueError("--theta-dim must be 1 or 2.")
     if int(args.n_total) < 2:
         raise ValueError("--n-total must be >= 2 for train/validation split.")
     if not (0.0 < float(args.train_frac) <= 1.0):
@@ -1742,6 +1760,7 @@ def build_conditional_x_velocity_model(
             hidden_dim=int(getattr(args, "flow_hidden_dim", 128)),
             depth=int(getattr(args, "flow_depth", 3)),
             use_logit_time=True,
+            theta_dim=int(getattr(args, "theta_dim", 1)),
         ).to(device)
     if arch == "film":
         return ConditionalXFlowVelocityFiLMPerLayer(

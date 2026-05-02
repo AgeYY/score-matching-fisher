@@ -1000,13 +1000,18 @@ class ConditionalXFlowVelocity(nn.Module):
         hidden_dim: int = 128,
         depth: int = 3,
         use_logit_time: bool = True,
+        *,
+        theta_dim: int = 1,
     ) -> None:
         super().__init__()
         if x_dim < 1:
             raise ValueError("x_dim must be >= 1.")
         self.x_dim = int(x_dim)
+        self.theta_dim = int(theta_dim)
+        if self.theta_dim < 1:
+            raise ValueError("theta_dim must be >= 1.")
         self.use_logit_time = bool(use_logit_time)
-        in_dim = x_dim + 1 + 1  # x_t, theta, t
+        in_dim = int(x_dim) + int(theta_dim) + 1  # x_t, theta, t
         layers: list[nn.Module] = []
         for _ in range(depth):
             layers.append(nn.Linear(in_dim, hidden_dim))

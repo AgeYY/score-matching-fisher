@@ -1052,12 +1052,17 @@ def main(argv: list[str] | None = None) -> None:
     perm = rng_perm.permutation(n_pool)
 
     theta_raw_all = np.asarray(bundle.theta_all, dtype=np.float64)
-    if theta_raw_all.ndim == 2 and int(theta_raw_all.shape[1]) != 1:
+    if theta_raw_all.ndim == 1:
+        theta_raw_all = theta_raw_all.reshape(-1, 1)
+    elif theta_raw_all.ndim != 2:
+        raise ValueError(f"theta_all must be 1D or 2D; got shape {theta_raw_all.shape}.")
+    tdim = int(theta_raw_all.shape[1])
+    if tdim not in (1, 2):
         raise ValueError(
-            "Convergence binning requires scalar theta in dataset bundle; "
+            "Convergence binning supports theta_all with last dimension 1 or 2; "
             f"got theta_all shape={theta_raw_all.shape}."
         )
-    theta_scalar_all = theta_raw_all.reshape(-1)
+    theta_scalar_all = theta_raw_all[:, 0].reshape(-1)
     theta_ref = np.asarray(theta_scalar_all[perm[: int(args.n_ref)]], dtype=np.float64).reshape(-1)
     edges, _, _ = conv.vhb.theta_bin_edges(theta_ref, n_bins)
     centers = bin_centers_from_edges(edges)

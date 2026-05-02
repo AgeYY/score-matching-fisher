@@ -344,9 +344,19 @@ def hellinger_figure_labels(h_field_method: str) -> tuple[str, str, str]:
 def theta_for_h_matrix_alignment(bundle: SharedDatasetBundle, full_args: SimpleNamespace) -> np.ndarray:
     mode = str(getattr(full_args, "score_fisher_eval_data", "full"))
     if mode == "full":
-        return np.asarray(bundle.theta_all, dtype=np.float64).reshape(-1)
+        th = np.asarray(bundle.theta_all, dtype=np.float64)
+        if th.ndim == 1:
+            return th.reshape(-1, 1)
+        if th.ndim == 2:
+            return th
+        raise ValueError(f"theta_all must be 1D or 2D; got shape {th.shape}.")
     if mode == "score_eval":
-        return np.asarray(bundle.theta_eval, dtype=np.float64).reshape(-1)
+        th = np.asarray(bundle.theta_eval, dtype=np.float64)
+        if th.ndim == 1:
+            return th.reshape(-1, 1)
+        if th.ndim == 2:
+            return th
+        raise ValueError(f"theta_eval must be 1D or 2D; got shape {th.shape}.")
     raise ValueError(f"Unknown score_fisher_eval_data: {mode}")
 
 
@@ -638,7 +648,11 @@ def load_h_matrix(ctx: RunContext) -> LoadedHMatrix:
 
     h_npz = np.load(h_path, allow_pickle=True)
     h_sym = np.asarray(h_npz["h_sym"], dtype=np.float64)
-    theta_used = np.asarray(h_npz["theta_used"], dtype=np.float64).reshape(-1)
+    theta_used = np.asarray(h_npz["theta_used"], dtype=np.float64)
+    if theta_used.ndim == 1:
+        theta_used = theta_used.reshape(-1, 1)
+    elif theta_used.ndim != 2:
+        raise ValueError(f"h_matrix_results theta_used must be 1D or 2D; got shape {theta_used.shape}.")
     h_field_method = str(h_npz["h_field_method"][0]) if "h_field_method" in h_npz.files else "dsm"
     h_eval_scalar_name = (
         str(h_npz["h_eval_scalar_name"][0]) if "h_eval_scalar_name" in h_npz.files else "sigma_eval"
@@ -682,13 +696,21 @@ def _validate_alignment(ctx: RunContext, loaded: LoadedHMatrix) -> np.ndarray:
     return x_chk
 
 
+def _theta_scalar_for_binning(theta_used: np.ndarray) -> np.ndarray:
+    th = np.asarray(theta_used, dtype=np.float64)
+    if th.ndim == 2 and th.shape[1] > 1:
+        return th[:, 0].reshape(-1)
+    return th.reshape(-1)
+
+
 def compute_binned_metrics(ctx: RunContext, loaded: LoadedHMatrix) -> BinnedMetrics:
     n_bins = ctx.config.n_bins
     args = ctx.args
     x_chk = _validate_alignment(ctx, loaded)
 
-    edges, edge_lo, edge_hi = theta_bin_edges(loaded.theta_used, n_bins)
-    bin_idx = theta_to_bin_index(loaded.theta_used, edges, n_bins)
+    tbin = _theta_scalar_for_binning(loaded.theta_used)
+    edges, edge_lo, edge_hi = theta_bin_edges(tbin, n_bins)
+    bin_idx = theta_to_bin_index(tbin, edges, n_bins)
     centers = 0.5 * (edges[:-1] + edges[1:])
 
     h_binned, count_matrix = average_matrix_by_bins(loaded.h_sym, bin_idx, n_bins)

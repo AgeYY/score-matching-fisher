@@ -16,6 +16,8 @@ Collected markdown notes in `journal/notes/`: long-form chapters (moved from the
 
 ## 2026-05
 
+- [2026-05-02 2D $\theta$ cosinebench-/linearbench-style generative model (equations), native + PR30D viz, seven-method `twofig` performance + full repro (Markdown + commands)](notes/2026-05-02-theta2d-cosine-linear-bench-h-decoding.md)
+
 - [2026-05-01 `linear_x_flow_nonlinear_pca`: PCA-subspace nonlinear correction to linear X-flow (math + likelihood ODE) + linearbench `study_h_decoding_twofig` repro (Markdown + commands)](notes/2026-05-01-linear-x-flow-nonlinear-pca-method-and-linearbench-twofig.md)
 
 ## 2026-04
