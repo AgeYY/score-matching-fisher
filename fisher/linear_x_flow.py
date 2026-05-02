@@ -638,6 +638,191 @@ class ConditionalRandomBasisLowRankLinearXFlowMLP(_BaseConditionalLinearXFlowMLP
         return float(self.lambda_a) * torch.sum(self.a**2) + float(self.lambda_s) * torch.sum(self.S**2)
 
 
+def fit_residual_pca_basis_from_linear_mean(
+    *,
+    linear_model: _BaseConditionalLinearXFlowMLP,
+    theta_train: np.ndarray,
+    x_train_norm: np.ndarray,
+    pca_dim: int,
+    device: torch.device,
+    solve_jitter: float = 1e-6,
+) -> np.ndarray:
+    """Fit a frozen PCA basis from residuals around the trained linear-flow mean."""
+    th = _as_2d_float64(theta_train, name="theta_train")
+    x = _as_2d_float64(x_train_norm, name="x_train_norm")
+    if th.shape[0] != x.shape[0]:
+        raise ValueError("theta_train and x_train_norm row counts must match.")
+    n, d = int(x.shape[0]), int(x.shape[1])
+    k = int(pca_dim)
+    if k < 1:
+        raise ValueError("pca_dim must be >= 1.")
+    max_rank = min(d, max(1, n - 1))
+    if k > max_rank:
+        raise ValueError(f"pca_dim must be <= min(x_dim, n_train-1)={max_rank}; got {k}.")
+    linear_model.eval()
+    with torch.no_grad():
+        th_t = torch.from_numpy(th.astype(np.float32)).to(device)
+        mu_t, _ = linear_model.endpoint_mean_covariance(th_t, solve_jitter=float(solve_jitter))
+        mu = mu_t.detach().cpu().numpy().astype(np.float64)
+    residual = x - mu
+    residual = residual - np.mean(residual, axis=0, keepdims=True, dtype=np.float64)
+    _, _, vh = np.linalg.svd(residual, full_matrices=False)
+    u = vh[:k].T.astype(np.float32, copy=False)
+    return u
+
+
+class ConditionalPCANonlinearLinearXFlowMLP(nn.Module):
+    """Linear x-flow plus a frozen-PCA nonlinear correction in normalized x-space."""
+
+    def __init__(
+        self,
+        *,
+        linear_model: _BaseConditionalLinearXFlowMLP,
+        pca_basis: np.ndarray | torch.Tensor,
+        hidden_dim: int = 128,
+        depth: int = 3,
+    ) -> None:
+        super().__init__()
+        if int(hidden_dim) < 1:
+            raise ValueError("hidden_dim must be >= 1.")
+        if int(depth) < 1:
+            raise ValueError("depth must be >= 1.")
+        self.linear_model = linear_model
+        self.theta_dim = int(linear_model.theta_dim)
+        self.x_dim = int(linear_model.x_dim)
+        u = torch.as_tensor(pca_basis, dtype=torch.float32)
+        if u.ndim != 2 or int(u.shape[0]) != self.x_dim:
+            raise ValueError("pca_basis must have shape [x_dim, k].")
+        self.pca_dim = int(u.shape[1])
+        if self.pca_dim < 1:
+            raise ValueError("pca_basis must have at least one component.")
+        self.register_buffer("U", u)
+        layers: list[nn.Module] = []
+        in_dim = self.pca_dim + 1 + self.theta_dim
+        for _ in range(int(depth)):
+            layers.append(nn.Linear(in_dim, int(hidden_dim)))
+            layers.append(nn.SiLU())
+            in_dim = int(hidden_dim)
+        out = nn.Linear(in_dim, self.pca_dim)
+        nn.init.zeros_(out.weight)
+        nn.init.zeros_(out.bias)
+        layers.append(out)
+        self.h_net = nn.Sequential(*layers)
+
+    @property
+    def A(self) -> torch.Tensor:
+        return self.linear_model.A
+
+    def linear_mean(self, theta: torch.Tensor, *, solve_jitter: float = 1e-6) -> torch.Tensor:
+        mu, _ = self.linear_model.endpoint_mean_covariance(theta, solve_jitter=float(solve_jitter))
+        return mu
+
+    def h(self, z: torch.Tensor, t: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        if t.ndim == 1:
+            t = t.unsqueeze(-1)
+        return self.h_net(torch.cat([z, t, theta], dim=1))
+
+    def nonlinear_correction(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        theta: torch.Tensor,
+        *,
+        solve_jitter: float = 1e-6,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        mu = self.linear_mean(theta, solve_jitter=float(solve_jitter))
+        z = (x - t * mu) @ self.U
+        h = self.h(z, t, theta)
+        return h @ self.U.transpose(0, 1), z, h
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        theta: torch.Tensor,
+        t: torch.Tensor,
+        *,
+        solve_jitter: float = 1e-6,
+    ) -> torch.Tensor:
+        delta, _, _ = self.nonlinear_correction(x, t, theta, solve_jitter=float(solve_jitter))
+        return self.linear_model(x, theta) + delta
+
+    def regularization_loss(self, h: torch.Tensor, lambda_h: float) -> torch.Tensor:
+        return float(lambda_h) * torch.mean(h**2)
+
+    def divergence(self, x: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        if t.ndim == 1:
+            t = t.unsqueeze(-1)
+        with torch.enable_grad():
+            mu = self.linear_mean(theta)
+            z = ((x - t * mu) @ self.U).detach().requires_grad_(True)
+            h = self.h(z, t, theta)
+            tr_h = torch.zeros(z.shape[0], dtype=z.dtype, device=z.device)
+            for j in range(self.pca_dim):
+                grad_j = torch.autograd.grad(
+                    h[:, j].sum(),
+                    z,
+                    create_graph=False,
+                    retain_graph=j < self.pca_dim - 1,
+                )[0]
+                tr_h = tr_h + grad_j[:, j]
+        tr_a = torch.trace(self.A).to(dtype=x.dtype, device=x.device).detach()
+        return tr_a + tr_h.detach()
+
+    def log_prob_normalized(
+        self,
+        x_norm: torch.Tensor,
+        theta: torch.Tensor,
+        *,
+        solve_jitter: float = 1e-6,
+        ode_steps: int = 32,
+    ) -> torch.Tensor:
+        if x_norm.ndim == 1:
+            x_norm = x_norm.unsqueeze(0)
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        if x_norm.shape[0] != theta.shape[0]:
+            raise ValueError("x and theta batch sizes must match.")
+        steps = int(ode_steps)
+        if steps < 1:
+            raise ValueError("ode_steps must be >= 1.")
+        x = x_norm
+        div_int = torch.zeros(x.shape[0], dtype=x.dtype, device=x.device)
+        dt = 1.0 / float(steps)
+        for s in range(steps, 0, -1):
+            t = torch.full((x.shape[0], 1), float(s) / float(steps), dtype=x.dtype, device=x.device)
+            div = self.divergence(x, theta, t)
+            div_int = div_int + dt * div
+            with torch.no_grad():
+                v = self.forward(x, theta, t, solve_jitter=float(solve_jitter))
+                x = x - dt * v
+        d = int(x.shape[1])
+        base = -0.5 * (torch.sum(x**2, dim=1) + float(d) * math.log(2.0 * math.pi))
+        return base - div_int
+
+    def log_prob_observed(
+        self,
+        x_raw: torch.Tensor,
+        theta: torch.Tensor,
+        *,
+        x_mean: torch.Tensor,
+        x_std: torch.Tensor,
+        solve_jitter: float = 1e-6,
+        ode_steps: int = 32,
+    ) -> torch.Tensor:
+        z = (x_raw - x_mean) / x_std
+        logjac = -torch.sum(torch.log(x_std))
+        return self.log_prob_normalized(
+            z,
+            theta,
+            solve_jitter=float(solve_jitter),
+            ode_steps=int(ode_steps),
+        ) + logjac
+
+
 def train_linear_x_flow(
     *,
     model: ConditionalLinearXFlowMLP,
@@ -651,7 +836,7 @@ def train_linear_x_flow(
     lr: float,
     weight_decay: float = 0.0,
     t_eps: float = 0.05,
-    patience: int = 300,
+    patience: int = 1000,
     min_delta: float = 1e-4,
     ema_alpha: float = 0.05,
     weight_ema_decay: float = 0.9,
@@ -855,7 +1040,7 @@ def train_linear_x_flow_schedule(
     lr: float,
     weight_decay: float = 0.0,
     t_eps: float = 0.05,
-    patience: int = 300,
+    patience: int = 1000,
     min_delta: float = 1e-4,
     ema_alpha: float = 0.05,
     weight_ema_decay: float = 0.9,
@@ -1042,6 +1227,196 @@ def train_linear_x_flow_schedule(
     }
 
 
+def train_pca_nonlinear_linear_x_flow(
+    *,
+    model: ConditionalPCANonlinearLinearXFlowMLP,
+    theta_train: np.ndarray,
+    x_train: np.ndarray,
+    theta_val: np.ndarray,
+    x_val: np.ndarray,
+    device: torch.device,
+    x_mean: np.ndarray,
+    x_std: np.ndarray,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    weight_decay: float = 0.0,
+    t_eps: float = 0.05,
+    lambda_h: float = 0.0,
+    freeze_linear: bool = False,
+    patience: int = 1000,
+    min_delta: float = 1e-4,
+    ema_alpha: float = 0.05,
+    weight_ema_decay: float = 0.9,
+    max_grad_norm: float = 10.0,
+    solve_jitter: float = 1e-6,
+    log_every: int = 50,
+    restore_best: bool = True,
+) -> dict[str, Any]:
+    if int(epochs) < 1:
+        raise ValueError("epochs must be >= 1.")
+    if int(batch_size) < 1:
+        raise ValueError("batch_size must be >= 1.")
+    if float(lr) <= 0.0:
+        raise ValueError("lr must be > 0.")
+    if float(lambda_h) < 0.0:
+        raise ValueError("lambda_h must be >= 0.")
+    if int(patience) < 0:
+        raise ValueError("patience must be >= 0.")
+    if float(min_delta) < 0.0:
+        raise ValueError("min_delta must be >= 0.")
+    if not (0.0 < float(ema_alpha) <= 1.0):
+        raise ValueError("ema_alpha must be in (0, 1].")
+    if not np.isfinite(float(weight_ema_decay)) or float(weight_ema_decay) >= 1.0:
+        raise ValueError("weight_ema_decay must be finite and < 1.")
+    te = float(t_eps)
+    if not (0.0 < te < 0.5):
+        raise ValueError("t_eps must be in (0, 0.5).")
+
+    th_tr = _as_2d_float64(theta_train, name="theta_train")
+    x_tr = _as_2d_float64(x_train, name="x_train")
+    th_va = _as_2d_float64(theta_val, name="theta_val")
+    x_va = _as_2d_float64(x_val, name="x_val")
+    xm = np.asarray(x_mean, dtype=np.float64).reshape(1, -1)
+    xs = np.asarray(x_std, dtype=np.float64).reshape(1, -1)
+    x_tr_n = (x_tr - xm) / xs
+    x_va_n = (x_va - xm) / xs
+
+    old_requires_grad = [p.requires_grad for p in model.linear_model.parameters()]
+    if bool(freeze_linear):
+        for p in model.linear_model.parameters():
+            p.requires_grad_(False)
+    params = [p for p in model.parameters() if p.requires_grad]
+    opt = torch.optim.AdamW(params, lr=float(lr), weight_decay=float(weight_decay))
+
+    train_ds = TensorDataset(torch.from_numpy(th_tr.astype(np.float32)), torch.from_numpy(x_tr_n.astype(np.float32)))
+    val_ds = TensorDataset(torch.from_numpy(th_va.astype(np.float32)), torch.from_numpy(x_va_n.astype(np.float32)))
+    train_loader = DataLoader(train_ds, batch_size=int(batch_size), shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=int(batch_size), shuffle=False)
+
+    train_losses: list[float] = []
+    val_losses: list[float] = []
+    val_monitor_losses: list[float] = []
+    best_val = float("inf")
+    best_epoch = 0
+    best_eval_state_cpu: dict[str, torch.Tensor] | None = None
+    weight_ema_enabled = float(weight_ema_decay) > 0.0
+    weight_ema_state = init_model_weight_ema(model) if weight_ema_enabled else None
+    patience_counter = 0
+    stopped_early = False
+    stopped_epoch = int(epochs)
+    n_clipped_steps = 0
+    n_total_steps = 0
+    val_ema: float | None = None
+    alpha = float(ema_alpha)
+
+    for epoch in range(1, int(epochs) + 1):
+        model.train()
+        ep_losses: list[float] = []
+        for tb, x1b in train_loader:
+            tb = tb.to(device)
+            x1b = x1b.to(device)
+            bs = int(x1b.shape[0])
+            t = te + (1.0 - 2.0 * te) * torch.rand(bs, 1, device=device, dtype=x1b.dtype)
+            x0b = torch.randn_like(x1b)
+            xt = (1.0 - t) * x0b + t * x1b
+            ut = x1b - x0b
+            v = model(xt, tb, t, solve_jitter=float(solve_jitter))
+            _, _, h = model.nonlinear_correction(xt, t, tb, solve_jitter=float(solve_jitter))
+            loss = torch.mean((v - ut) ** 2) + model.regularization_loss(h, float(lambda_h))
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            n_total_steps += 1
+            if float(max_grad_norm) > 0.0:
+                grad_norm = torch.nn.utils.clip_grad_norm_(params, float(max_grad_norm))
+                if float(grad_norm) > float(max_grad_norm):
+                    n_clipped_steps += 1
+            opt.step()
+            if weight_ema_state is not None:
+                update_model_weight_ema(weight_ema_state, model, decay=float(weight_ema_decay))
+            ep_losses.append(float(loss.detach().cpu()))
+        train_loss = float(np.mean(ep_losses))
+        train_losses.append(train_loss)
+
+        model.eval()
+        val_ep: list[float] = []
+        ema_ctx = evaluate_with_weight_ema(model, weight_ema_state) if weight_ema_state is not None else nullcontext()
+        with ema_ctx:
+            with torch.no_grad():
+                for tb, x1b in val_loader:
+                    tb = tb.to(device)
+                    x1b = x1b.to(device)
+                    bs = int(x1b.shape[0])
+                    t = te + (1.0 - 2.0 * te) * torch.rand(bs, 1, device=device, dtype=x1b.dtype)
+                    x0b = torch.randn_like(x1b)
+                    xt = (1.0 - t) * x0b + t * x1b
+                    ut = x1b - x0b
+                    v = model(xt, tb, t, solve_jitter=float(solve_jitter))
+                    _, _, h = model.nonlinear_correction(xt, t, tb, solve_jitter=float(solve_jitter))
+                    loss_b = torch.mean((v - ut) ** 2) + model.regularization_loss(h, float(lambda_h))
+                    val_ep.append(float(loss_b.detach().cpu()))
+        val_raw = float(np.mean(val_ep))
+        val_losses.append(val_raw)
+        val_ema = scalar_val_ema_update(val_ema, val_raw, alpha)
+        val_smooth = float(val_ema)
+        val_monitor_losses.append(val_smooth)
+        if val_smooth < best_val - float(min_delta):
+            best_val = float(val_smooth)
+            best_epoch = int(epoch)
+            best_eval_state_cpu = (
+                clone_model_weight_ema(weight_ema_state)
+                if weight_ema_state is not None
+                else {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            )
+            patience_counter = 0
+        else:
+            patience_counter += 1
+        if epoch == 1 or epoch % max(1, int(log_every)) == 0 or epoch == int(epochs):
+            print(
+                f"[linear_x_flow_nonlinear_pca {epoch:4d}/{int(epochs)}] train_fm={train_loss:.6f} "
+                f"val_fm={val_raw:.6f} val_smooth={val_smooth:.6f} best_monitor={best_val:.6f} "
+                f"best_epoch={best_epoch}",
+                flush=True,
+            )
+        if int(patience) > 0 and patience_counter >= int(patience):
+            stopped_early = True
+            stopped_epoch = int(epoch)
+            print(
+                f"[linear_x_flow_nonlinear_pca early-stop] epoch={epoch} best_epoch={best_epoch} "
+                f"best_monitor={best_val:.6f} patience={int(patience)}",
+                flush=True,
+            )
+            break
+
+    final_eval_weights = "raw"
+    if restore_best and best_eval_state_cpu is not None:
+        if weight_ema_enabled:
+            load_model_weights_from_ema_state(model, best_eval_state_cpu)
+            final_eval_weights = "ema"
+        else:
+            model.load_state_dict(best_eval_state_cpu)
+
+    if bool(freeze_linear):
+        for p, req in zip(model.linear_model.parameters(), old_requires_grad):
+            p.requires_grad_(req)
+
+    return {
+        "train_losses": train_losses,
+        "val_losses": val_losses,
+        "val_monitor_losses": val_monitor_losses,
+        "best_val_loss": float(best_val),
+        "best_epoch": int(best_epoch),
+        "stopped_epoch": int(stopped_epoch),
+        "stopped_early": bool(stopped_early),
+        "lr_last": float(opt.param_groups[0]["lr"]),
+        "n_clipped_steps": int(n_clipped_steps),
+        "n_total_steps": int(n_total_steps),
+        "weight_ema_enabled": bool(weight_ema_enabled),
+        "weight_ema_decay": float(weight_ema_decay),
+        "final_eval_weights": final_eval_weights,
+    }
+
+
 def compute_linear_x_flow_c_matrix(
     *,
     model: ConditionalLinearXFlowMLP,
@@ -1083,4 +1458,49 @@ def compute_linear_x_flow_c_matrix(
                 solve_jitter=float(solve_jitter),
             )
             c[i0:i1, :] = logp.reshape(b, n).detach().cpu().numpy().astype(np.float64)
+    return c
+
+
+def compute_pca_nonlinear_linear_x_flow_c_matrix(
+    *,
+    model: ConditionalPCANonlinearLinearXFlowMLP,
+    theta_all: np.ndarray,
+    x_all: np.ndarray,
+    device: torch.device,
+    x_mean: np.ndarray,
+    x_std: np.ndarray,
+    solve_jitter: float = 1e-6,
+    ode_steps: int = 32,
+    pair_batch_size: int = 65536,
+) -> np.ndarray:
+    theta = _as_2d_float64(theta_all, name="theta_all")
+    x = _as_2d_float64(x_all, name="x_all")
+    if theta.shape[0] != x.shape[0]:
+        raise ValueError("theta_all and x_all row counts must match.")
+    n = int(theta.shape[0])
+    if int(pair_batch_size) < 1:
+        raise ValueError("pair_batch_size must be >= 1.")
+    row_block = max(1, int(pair_batch_size) // max(n, 1))
+    theta32 = theta.astype(np.float32, copy=False)
+    x_mean_t = torch.from_numpy(np.asarray(x_mean, dtype=np.float32)).to(device)
+    x_std_t = torch.from_numpy(np.asarray(x_std, dtype=np.float32)).to(device)
+    c = np.zeros((n, n), dtype=np.float64)
+    model.eval()
+    for i0 in range(0, n, row_block):
+        i1 = min(n, i0 + row_block)
+        xb = x[i0:i1].astype(np.float32, copy=False)
+        b = int(i1 - i0)
+        x_rep = np.repeat(xb, repeats=n, axis=0)
+        theta_tile = np.tile(theta32, (b, 1))
+        x_t = torch.from_numpy(x_rep).to(device)
+        theta_t = torch.from_numpy(theta_tile).to(device)
+        logp = model.log_prob_observed(
+            x_t,
+            theta_t,
+            x_mean=x_mean_t,
+            x_std=x_std_t,
+            solve_jitter=float(solve_jitter),
+            ode_steps=int(ode_steps),
+        )
+        c[i0:i1, :] = logp.detach().cpu().numpy().reshape(b, n).astype(np.float64)
     return c

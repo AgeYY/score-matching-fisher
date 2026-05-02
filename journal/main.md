@@ -14,6 +14,10 @@ Collected markdown notes in `journal/notes/`: long-form chapters (moved from the
 
 5. **[Executable scripts (`bin/`)](notes/exec_code.md)** — What `visualize_dataset`, `fisher_make_dataset`, and `fisher_estimate_from_dataset` do and how to run them from the repo root.
 
+## 2026-05
+
+- [2026-05-01 `linear_x_flow_nonlinear_pca`: PCA-subspace nonlinear correction to linear X-flow (math + likelihood ODE) + linearbench `study_h_decoding_twofig` repro (Markdown + commands)](notes/2026-05-01-linear-x-flow-nonlinear-pca-method-and-linearbench-twofig.md)
+
 ## 2026-04
 
 - [2026-04-29 H-decoding: B-spline diagonal-$\theta$ linear X-flow (`linear_x_flow_diagonal_theta_spline`) on 10D `cosine_gaussian_sqrtd` — method, poor `corr_h` vs MLP baseline, repro + figure](notes/2026-04-29-h-decoding-lxf-diagonal-theta-spline-xdim10.md)

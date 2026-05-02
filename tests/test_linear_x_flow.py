@@ -8,6 +8,7 @@ import numpy as np
 import torch
 
 from fisher.linear_x_flow import (
+    ConditionalPCANonlinearLinearXFlowMLP,
     ConditionalDiagonalLinearXFlowMLP,
     ConditionalLinearXFlowMLP,
     ConditionalLowRankLinearXFlowMLP,
@@ -18,7 +19,9 @@ from fisher.linear_x_flow import (
     _phi_expm1_div_a,
     bspline_basis_phi_batch,
     compute_linear_x_flow_c_matrix,
+    fit_residual_pca_basis_from_linear_mean,
     open_uniform_clamped_knot_vector,
+    train_pca_nonlinear_linear_x_flow,
     train_linear_x_flow_schedule,
 )
 from fisher.gaussian_x_flow import path_schedule_from_name
@@ -353,6 +356,99 @@ class TestLinearXFlow(unittest.TestCase):
         )
         self.assertEqual(c.shape, (n, n))
         self.assertTrue(np.all(np.isfinite(c)))
+
+    def test_pca_nonlinear_zero_init_matches_linear_velocity(self) -> None:
+        torch.manual_seed(10)
+        base = ConditionalLinearXFlowMLP(theta_dim=1, x_dim=3, hidden_dim=8, depth=1)
+        m = ConditionalPCANonlinearLinearXFlowMLP(
+            linear_model=base,
+            pca_basis=torch.eye(3)[:, :2],
+            hidden_dim=8,
+            depth=1,
+        )
+        th = torch.randn(5, 1)
+        x = torch.randn(5, 3)
+        t = torch.rand(5, 1)
+        self.assertTrue(torch.allclose(m(x, th, t), base(x, th), atol=1e-6))
+
+    def test_fit_residual_pca_basis_orthonormal(self) -> None:
+        torch.manual_seed(11)
+        rng = np.random.default_rng(11)
+        base = ConditionalLinearXFlowMLP(theta_dim=1, x_dim=4, hidden_dim=8, depth=1)
+        theta = rng.normal(size=(12, 1)).astype(np.float64)
+        x = rng.normal(size=(12, 4)).astype(np.float64)
+        u = fit_residual_pca_basis_from_linear_mean(
+            linear_model=base,
+            theta_train=theta,
+            x_train_norm=x,
+            pca_dim=2,
+            device=torch.device("cpu"),
+        )
+        self.assertEqual(u.shape, (4, 2))
+        self.assertTrue(np.allclose(u.T @ u, np.eye(2), atol=1e-5))
+
+    def test_pca_nonlinear_divergence_zero_h_is_trace_a(self) -> None:
+        torch.manual_seed(12)
+        base = ConditionalLinearXFlowMLP(theta_dim=1, x_dim=3, hidden_dim=8, depth=1)
+        with torch.no_grad():
+            base.B.copy_(torch.diag(torch.tensor([0.1, 0.2, 0.3])))
+        m = ConditionalPCANonlinearLinearXFlowMLP(
+            linear_model=base,
+            pca_basis=torch.eye(3)[:, :2],
+            hidden_dim=8,
+            depth=1,
+        )
+        th = torch.randn(4, 1)
+        x = torch.randn(4, 3)
+        t = torch.rand(4, 1)
+        div = m.divergence(x, th, t)
+        self.assertTrue(torch.allclose(div, torch.full((4,), 0.6), atol=1e-6))
+
+    def test_pca_nonlinear_log_prob_finite(self) -> None:
+        torch.manual_seed(13)
+        base = ConditionalLinearXFlowMLP(theta_dim=1, x_dim=2, hidden_dim=8, depth=1)
+        m = ConditionalPCANonlinearLinearXFlowMLP(
+            linear_model=base,
+            pca_basis=torch.eye(2)[:, :1],
+            hidden_dim=8,
+            depth=1,
+        )
+        th = torch.randn(3, 1)
+        x = torch.randn(3, 2)
+        lp = m.log_prob_normalized(x, th, ode_steps=2)
+        self.assertEqual(tuple(lp.shape), (3,))
+        self.assertTrue(torch.all(torch.isfinite(lp)))
+
+    def test_train_pca_nonlinear_one_epoch_finite(self) -> None:
+        torch.manual_seed(14)
+        rng = np.random.default_rng(14)
+        theta = rng.normal(size=(20, 1)).astype(np.float64)
+        x = np.concatenate([theta, -theta], axis=1) + 0.1 * rng.normal(size=(20, 2))
+        base = ConditionalLinearXFlowMLP(theta_dim=1, x_dim=2, hidden_dim=8, depth=1)
+        model = ConditionalPCANonlinearLinearXFlowMLP(
+            linear_model=base,
+            pca_basis=np.eye(2, 1, dtype=np.float32),
+            hidden_dim=8,
+            depth=1,
+        )
+        out = train_pca_nonlinear_linear_x_flow(
+            model=model,
+            theta_train=theta[:12],
+            x_train=x[:12],
+            theta_val=theta[12:],
+            x_val=x[12:],
+            device=torch.device("cpu"),
+            x_mean=np.zeros(2, dtype=np.float64),
+            x_std=np.ones(2, dtype=np.float64),
+            epochs=1,
+            batch_size=4,
+            lr=1e-3,
+            patience=0,
+            log_every=1,
+            weight_ema_decay=0.0,
+        )
+        self.assertEqual(len(out["train_losses"]), 1)
+        self.assertTrue(np.isfinite(out["train_losses"][0]))
 
     def test_train_schedule_cosine_one_epoch_finite(self) -> None:
         torch.manual_seed(4)
