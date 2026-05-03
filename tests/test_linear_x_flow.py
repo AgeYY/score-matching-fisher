@@ -19,6 +19,7 @@ from fisher.linear_x_flow import (
     ConditionalThetaDiagonalLinearXFlowMLP,
     ConditionalTimeDiagonalLinearXFlowMLP,
     ConditionalTimeLinearXFlowMLP,
+    ConditionalTimeLowRankCorrectionLinearXFlowMLP,
     ConditionalTimeLowRankLinearXFlowMLP,
     ConditionalTimeRandomBasisLowRankLinearXFlowMLP,
     ConditionalTimeScalarLinearXFlowMLP,
@@ -26,6 +27,7 @@ from fisher.linear_x_flow import (
     _phi_expm1_div_a,
     compute_linear_x_flow_analytic_hellinger_matrix,
     compute_linear_x_flow_c_matrix,
+    compute_ode_time_linear_x_flow_c_matrix,
     compute_pca_nonlinear_time_linear_x_flow_c_matrix,
     compute_time_linear_x_flow_c_matrix,
     compute_time_diagonal_linear_x_flow_c_matrix,
@@ -683,6 +685,128 @@ class TestLinearXFlow(unittest.TestCase):
         )
         self.assertEqual(tuple(c.shape), (4, 4))
         self.assertTrue(np.all(np.isfinite(c)))
+
+    def test_time_low_rank_correction_U_orthonormal_after_steps(self) -> None:
+        torch.manual_seed(48)
+        m = ConditionalTimeLowRankCorrectionLinearXFlowMLP(
+            theta_dim=1, x_dim=3, correction_rank=2, hidden_dim=8, depth=1, quadrature_steps=8
+        )
+        u0 = m.U.detach().cpu().numpy()
+        self.assertTrue(np.allclose(u0.T @ u0, np.eye(2), atol=1e-5))
+        opt = torch.optim.AdamW(m.parameters(), lr=0.05, weight_decay=0.0)
+        for _ in range(4):
+            x = torch.randn(6, 3)
+            th = torch.randn(6, 1)
+            t = torch.rand(6, 1)
+            loss = (m(x, th, t) ** 2).mean()
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+        u1 = m.U.detach().cpu().numpy()
+        self.assertTrue(np.allclose(u1.T @ u1, np.eye(2), atol=1e-4))
+
+    def test_time_low_rank_correction_zero_h_matches_linear_submodule(self) -> None:
+        torch.manual_seed(49)
+        m = ConditionalTimeLowRankCorrectionLinearXFlowMLP(
+            theta_dim=1, x_dim=3, correction_rank=2, hidden_dim=8, depth=1, quadrature_steps=5
+        )
+        th = torch.randn(5, 1)
+        x = torch.randn(5, 3)
+        t = torch.linspace(0.2, 0.8, 5).reshape(-1, 1)
+        self.assertTrue(torch.allclose(m(x, th, t), m.linear(x, th, t), atol=1e-6))
+
+    def test_time_low_rank_correction_divergence_zero_h_is_trace_A(self) -> None:
+        torch.manual_seed(50)
+        m = ConditionalTimeLowRankCorrectionLinearXFlowMLP(
+            theta_dim=1, x_dim=3, correction_rank=2, hidden_dim=8, depth=1, quadrature_steps=6
+        )
+        th = torch.randn(4, 1)
+        x = torch.randn(4, 3)
+        t = torch.full((4, 1), 0.5)
+        with torch.no_grad():
+            a_mat = m.linear.A(t)
+            tr = torch.diagonal(a_mat, dim1=-2, dim2=-1).sum(dim=1)
+        div = m.divergence(x, th, t)
+        self.assertTrue(torch.allclose(div, tr, atol=1e-6))
+
+    def test_time_low_rank_correction_divergence_exact_kwarg_finite(self) -> None:
+        torch.manual_seed(52)
+        m = ConditionalTimeLowRankCorrectionLinearXFlowMLP(
+            theta_dim=1,
+            x_dim=3,
+            correction_rank=2,
+            hidden_dim=8,
+            depth=1,
+            quadrature_steps=6,
+            divergence_estimator="exact",
+            hutchinson_probes=3,
+        )
+        th = torch.randn(3, 1)
+        x = torch.randn(3, 3)
+        t = torch.full((3, 1), 0.4)
+        div = m.divergence(x, th, t)
+        self.assertEqual(tuple(div.shape), (3,))
+        self.assertTrue(torch.all(torch.isfinite(div)))
+
+    def test_time_low_rank_correction_hutchinson_mean_near_exact(self) -> None:
+        torch.manual_seed(53)
+        m_exact = ConditionalTimeLowRankCorrectionLinearXFlowMLP(
+            theta_dim=1,
+            x_dim=3,
+            correction_rank=3,
+            hidden_dim=12,
+            depth=1,
+            quadrature_steps=6,
+            divergence_estimator="exact",
+        )
+        m_h = ConditionalTimeLowRankCorrectionLinearXFlowMLP(
+            theta_dim=1,
+            x_dim=3,
+            correction_rank=3,
+            hidden_dim=12,
+            depth=1,
+            quadrature_steps=6,
+            divergence_estimator="hutchinson",
+            hutchinson_probes=512,
+        )
+        m_h.load_state_dict(m_exact.state_dict())
+        th = torch.randn(4, 1)
+        x = torch.randn(4, 3)
+        t = torch.full((4, 1), 0.37)
+        d_e = m_exact.divergence(x, th, t)
+        torch.manual_seed(2026)
+        d_h = m_h.divergence(x, th, t)
+        self.assertTrue(torch.all(torch.isfinite(d_h)))
+        self.assertTrue(torch.allclose(d_e, d_h, rtol=0.25, atol=0.12))
+
+    def test_time_low_rank_correction_log_prob_and_c_matrix_finite(self) -> None:
+        torch.manual_seed(51)
+        m = ConditionalTimeLowRankCorrectionLinearXFlowMLP(
+            theta_dim=1, x_dim=2, correction_rank=1, hidden_dim=8, depth=1, quadrature_steps=8
+        )
+        th = torch.randn(3, 1)
+        x = torch.randn(3, 2)
+        lp = m.log_prob_normalized(x, th, quadrature_steps=8, ode_steps=2)
+        self.assertEqual(tuple(lp.shape), (3,))
+        self.assertTrue(torch.all(torch.isfinite(lp)))
+        theta_np = th.detach().cpu().numpy().astype(np.float64)
+        x_np = x.detach().cpu().numpy().astype(np.float64)
+        xm = np.zeros(2, dtype=np.float64)
+        xs = np.ones(2, dtype=np.float64)
+        c = compute_ode_time_linear_x_flow_c_matrix(
+            model=m,
+            theta_all=theta_np,
+            x_all=x_np,
+            device=torch.device("cpu"),
+            x_mean=xm,
+            x_std=xs,
+            quadrature_steps=8,
+            ode_steps=2,
+            pair_batch_size=64,
+        )
+        self.assertEqual(tuple(c.shape), (3, 3))
+        self.assertTrue(np.all(np.isfinite(c)))
+
 
 if __name__ == "__main__":
     unittest.main()

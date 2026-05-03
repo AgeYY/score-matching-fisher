@@ -144,10 +144,12 @@ from fisher.linear_x_flow import (
     ConditionalThetaDiagonalLinearXFlowMLP,
     ConditionalTimeDiagonalLinearXFlowMLP,
     ConditionalTimeLinearXFlowMLP,
+    ConditionalTimeLowRankCorrectionLinearXFlowMLP,
     ConditionalTimeLowRankLinearXFlowMLP,
     ConditionalTimeRandomBasisLowRankLinearXFlowMLP,
     ConditionalTimeScalarLinearXFlowMLP,
     ConditionalTimeThetaDiagonalLinearXFlowMLP,
+    compute_ode_time_linear_x_flow_c_matrix,
     compute_pca_nonlinear_linear_x_flow_c_matrix,
     compute_pca_nonlinear_time_linear_x_flow_c_matrix,
     compute_time_linear_x_flow_c_matrix,
@@ -924,7 +926,33 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["mlp", "film"],
         help="linear-x-flow-diagonal only: offset b_phi parameterization (plain MLP vs FiLM trunk).",
     )
-    p.add_argument("--lxf-low-rank-dim", type=int, default=4, help="linear-x-flow-low-rank only: rank r.")
+    p.add_argument(
+        "--lxf-low-rank-dim",
+        type=int,
+        default=4,
+        help=(
+            "linear_x_flow_low_rank / linear_x_flow_low_rank_randb: rank of the low-rank linear drift A. "
+            "linear_x_flow_low_rank_t: rank r of the learnable orthonormal correction U h(U^T x). "
+            "linear_x_flow_nonlinear_pca_low_rank_*: same r as the low-rank A(t) base inside that method."
+        ),
+    )
+    p.add_argument(
+        "--lxf-low-rank-divergence-estimator",
+        type=str,
+        default="hutchinson",
+        choices=["hutchinson", "exact"],
+        help=(
+            "linear_x_flow_low_rank_t only: trace of dh/dz in z=U^T x. "
+            "`hutchinson` uses Rademacher probes (default; faster when r is large). "
+            "`exact` uses one autograd per output dimension (r calls)."
+        ),
+    )
+    p.add_argument(
+        "--lxf-hutchinson-probes",
+        type=int,
+        default=1,
+        help="linear_x_flow_low_rank_t with hutchinson: number of Rademacher probes per divergence (averaged).",
+    )
     p.add_argument("--lxf-randb-lambda-a", type=float, default=1e-4, help="linear-x-flow-low-rank-randb only: L2 penalty on diagonal a.")
     p.add_argument("--lxf-randb-lambda-s", type=float, default=1e-4, help="linear-x-flow-low-rank-randb only: L2 penalty on symmetric S.")
     p.add_argument("--lxf-weight-decay", type=float, default=0.0, help="linear-x-flow only: AdamW weight decay.")
@@ -1570,6 +1598,11 @@ def _validate_lxf_cli(args: argparse.Namespace) -> None:
         "linear_x_flow_nonlinear_pca_low_rank_randb_t",
     ) and int(getattr(args, "lxf_low_rank_dim", 0)) < 1:
         raise ValueError("--lxf-low-rank-dim must be >= 1.")
+    _lrdiv = str(getattr(args, "lxf_low_rank_divergence_estimator", "hutchinson")).strip().lower()
+    if _lrdiv not in ("hutchinson", "exact"):
+        raise ValueError("--lxf-low-rank-divergence-estimator must be one of: hutchinson, exact.")
+    if int(getattr(args, "lxf_hutchinson_probes", 1)) < 1:
+        raise ValueError("--lxf-hutchinson-probes must be >= 1.")
     if method.startswith("linear_x_flow_nonlinear_pca"):
         if int(getattr(args, "lxf_nlpca_dim", 0)) < 1:
             raise ValueError("--lxf-nlpca-dim must be >= 1.")
@@ -3711,14 +3744,16 @@ def _estimate_one(
         elif method_name == "linear_x_flow_low_rank_t":
             if lxf_rank > x_dim_lxf:
                 raise ValueError(f"--lxf-low-rank-dim must be <= x_dim={x_dim_lxf}; got {lxf_rank}.")
-            drift_type = "low_rank_time"
-            model = ConditionalTimeLowRankLinearXFlowMLP(
+            drift_type = "low_rank_correction_time"
+            model = ConditionalTimeLowRankCorrectionLinearXFlowMLP(
                 theta_dim=int(theta_all.shape[1]),
                 x_dim=x_dim_lxf,
-                rank=lxf_rank,
+                correction_rank=lxf_rank,
                 hidden_dim=int(getattr(args, f"{lxf_prefix}_hidden_dim", 128)),
                 depth=int(getattr(args, f"{lxf_prefix}_depth", 3)),
                 quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)),
+                divergence_estimator=str(getattr(args, "lxf_low_rank_divergence_estimator", "hutchinson")).strip().lower(),
+                hutchinson_probes=int(getattr(args, "lxf_hutchinson_probes", 1)),
             ).to(dev)
         elif method_name == "linear_x_flow_low_rank_randb":
             if lxf_rank > x_dim_lxf:
@@ -3824,7 +3859,9 @@ def _estimate_one(
         x_std = np.asarray(train_out["x_std"], dtype=np.float64)
         nonlinear_train_out: dict[str, Any] | None = None
         pca_basis = np.asarray([], dtype=np.float32)
-        analytic_lxf_h = not method_name.startswith("linear_x_flow_nonlinear_pca")
+        analytic_lxf_h = not (
+            method_name.startswith("linear_x_flow_nonlinear_pca") or method_name == "linear_x_flow_low_rank_t"
+        )
         save_lxf_c_matrix = bool(getattr(args, "lxf_save_c_matrix", False))
         c_matrix: np.ndarray | None
         delta_l: np.ndarray | None
@@ -3918,6 +3955,24 @@ def _estimate_one(
                 )
             delta_l = compute_delta_l_nf(c_matrix)
             h_sym = symmetrize_nf(compute_h_directed_nf(delta_l))
+        elif method_name == "linear_x_flow_low_rank_t":
+            c_matrix = compute_ode_time_linear_x_flow_c_matrix(
+                model=model,
+                theta_all=theta_all,
+                x_all=x_all,
+                device=dev,
+                x_mean=x_mean,
+                x_std=x_std,
+                solve_jitter=float(getattr(args, "lxfs_solve_jitter", 1e-6)),
+                quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)),
+                ode_steps=int(getattr(args, "lxf_nlpca_ode_steps", 32)),
+                pair_batch_size=int(getattr(args, "lxfs_pair_batch_size", 65536)),
+            )
+            delta_l = compute_delta_l_nf(c_matrix)
+            h_sym = symmetrize_nf(compute_h_directed_nf(delta_l))
+            endpoint_mu = np.asarray([], dtype=np.float64)
+            endpoint_cov_or_diag = np.asarray([], dtype=np.float64)
+            endpoint_is_diag = False
         elif scheduled_lxf:
             h_sym, endpoint_mu, endpoint_cov_or_diag, endpoint_is_diag = compute_linear_x_flow_analytic_hellinger_matrix(
                 model=model,
@@ -3970,6 +4025,15 @@ def _estimate_one(
             else "mlp"
         )
 
+        lxf_low_rank_div_est_save = (
+            str(getattr(args, "lxf_low_rank_divergence_estimator", "hutchinson")).strip().lower()
+            if method_name == "linear_x_flow_low_rank_t"
+            else ""
+        )
+        lxf_hutchinson_probes_save = np.int64(
+            int(getattr(args, "lxf_hutchinson_probes", 1)) if method_name == "linear_x_flow_low_rank_t" else 0
+        )
+
         h_payload: dict[str, Any] = dict(
             theta_used=np.asarray(theta_used, dtype=np.float64),
             h_sym=np.asarray(h_sym, dtype=np.float64),
@@ -4002,7 +4066,13 @@ def _estimate_one(
             lxf_nlpca_dim=np.int64(int(getattr(args, "lxf_nlpca_dim", 4)) if method_name.startswith("linear_x_flow_nonlinear_pca") else 0),
             lxf_nlpca_lambda_h=np.float64(float(getattr(args, "lxf_nlpca_lambda_h", 0.0)) if method_name.startswith("linear_x_flow_nonlinear_pca") else 0.0),
             lxf_nlpca_freeze_linear=np.bool_(bool(getattr(args, "lxf_nlpca_freeze_linear", False)) if method_name.startswith("linear_x_flow_nonlinear_pca") else False),
-            lxf_nlpca_ode_steps=np.int64(int(getattr(args, "lxf_nlpca_ode_steps", 32)) if method_name.startswith("linear_x_flow_nonlinear_pca") else 0),
+            lxf_nlpca_ode_steps=np.int64(
+                int(getattr(args, "lxf_nlpca_ode_steps", 32))
+                if method_name.startswith("linear_x_flow_nonlinear_pca") or method_name == "linear_x_flow_low_rank_t"
+                else 0
+            ),
+            lxf_low_rank_divergence_estimator=np.asarray([lxf_low_rank_div_est_save], dtype=object),
+            lxf_hutchinson_probes=lxf_hutchinson_probes_save,
             lxf_nlpca_pca_basis=np.asarray(pca_basis, dtype=np.float32),
             lxf_weight_ema_decay=np.float64(train_out.get("weight_ema_decay", float(getattr(args, f"{lxf_prefix}_weight_ema_decay", 0.9)))),
             lxf_weight_ema_enabled=np.bool_(train_out.get("weight_ema_enabled", False)),
@@ -4073,7 +4143,13 @@ def _estimate_one(
             lxf_nlpca_dim=np.int64(int(getattr(args, "lxf_nlpca_dim", 4)) if method_name.startswith("linear_x_flow_nonlinear_pca") else 0),
             lxf_nlpca_lambda_h=np.float64(float(getattr(args, "lxf_nlpca_lambda_h", 0.0)) if method_name.startswith("linear_x_flow_nonlinear_pca") else 0.0),
             lxf_nlpca_freeze_linear=np.bool_(bool(getattr(args, "lxf_nlpca_freeze_linear", False)) if method_name.startswith("linear_x_flow_nonlinear_pca") else False),
-            lxf_nlpca_ode_steps=np.int64(int(getattr(args, "lxf_nlpca_ode_steps", 32)) if method_name.startswith("linear_x_flow_nonlinear_pca") else 0),
+            lxf_nlpca_ode_steps=np.int64(
+                int(getattr(args, "lxf_nlpca_ode_steps", 32))
+                if method_name.startswith("linear_x_flow_nonlinear_pca") or method_name == "linear_x_flow_low_rank_t"
+                else 0
+            ),
+            lxf_low_rank_divergence_estimator=np.asarray([lxf_low_rank_div_est_save], dtype=object),
+            lxf_hutchinson_probes=lxf_hutchinson_probes_save,
             lxf_weight_ema_decay=np.float64(train_out.get("weight_ema_decay", float(getattr(args, f"{lxf_prefix}_weight_ema_decay", 0.9)))),
             lxf_weight_ema_enabled=np.bool_(train_out.get("weight_ema_enabled", False)),
             lxf_final_eval_weights=np.asarray([str(train_out.get("final_eval_weights", "raw"))], dtype=object),
@@ -5286,7 +5362,7 @@ def _model_posterior_log_weights_for_fixed_x(
     if method == "linear_x_flow_low_rank":
         return c, r"Linear X-flow low-rank $A$ log $p(x|\theta)$"
     if method == "linear_x_flow_low_rank_t":
-        return c, r"Linear X-flow low-rank $A(t)$ log $p(x|\theta)$"
+        return c, r"Linear X-flow full $A(t)$ + orthonormal low-rank correction log $p(x|\theta)$"
     if method == "linear_x_flow_low_rank_randb":
         return c, r"Linear X-flow random-basis low-rank $A$ log $p(x|\theta)$"
     if method == "linear_x_flow_low_rank_randb_t":
@@ -5995,7 +6071,7 @@ def _render_training_losses_panel(
         elif tfm == "linear_x_flow_low_rank":
             post_lab = "linear-x-flow low-rank FM likelihood"
         elif tfm == "linear_x_flow_low_rank_t":
-            post_lab = "linear-x-flow low-rank-t FM likelihood"
+            post_lab = "linear-x-flow full-A(t) + low-rank correction FM likelihood"
         elif tfm == "linear_x_flow_low_rank_randb":
             post_lab = "linear-x-flow random-basis low-rank FM likelihood"
         elif tfm == "linear_x_flow_low_rank_randb_t":
@@ -6444,7 +6520,7 @@ def _save_combined_convergence_figure(
         elif tfm == "linear_x_flow_low_rank":
             post_lab = "linear-x-flow low-rank FM likelihood"
         elif tfm == "linear_x_flow_low_rank_t":
-            post_lab = "linear-x-flow low-rank-t FM likelihood"
+            post_lab = "linear-x-flow full-A(t) + low-rank correction FM likelihood"
         elif tfm == "linear_x_flow_low_rank_randb":
             post_lab = "linear-x-flow random-basis low-rank FM likelihood"
         elif tfm == "linear_x_flow_low_rank_randb_t":
@@ -6938,6 +7014,11 @@ def _write_summary(
             f.write(f"lxf_nlpca_lambda_h: {float(getattr(args, 'lxf_nlpca_lambda_h', 0.0))}\n")
             f.write(f"lxf_nlpca_freeze_linear: {bool(getattr(args, 'lxf_nlpca_freeze_linear', False))}\n")
             f.write(f"lxf_nlpca_ode_steps: {int(getattr(args, 'lxf_nlpca_ode_steps', 0))}\n")
+            if _tfm_sum == "linear_x_flow_low_rank_t":
+                f.write(
+                    f"lxf_low_rank_divergence_estimator: {str(getattr(args, 'lxf_low_rank_divergence_estimator', 'hutchinson')).strip().lower()}\n"
+                )
+                f.write(f"lxf_hutchinson_probes: {int(getattr(args, 'lxf_hutchinson_probes', 1))}\n")
         if _tfm_sum == "linear_theta_flow":
             f.write(f"ltf_num_components: {int(getattr(args, 'ltf_num_components', 0))}\n")
             f.write(f"ltf_epochs: {int(getattr(args, 'ltf_epochs', 0))}\n")
@@ -7989,9 +8070,13 @@ def main(argv: list[str] | None = None) -> None:
             drift_desc = f"low-rank A (rank={int(getattr(args, 'lxf_low_rank_dim', 4))})"
         elif tfm == "linear_x_flow_low_rank_t":
             drift_desc = (
-                f"time-dependent low-rank A(t) (rank={int(getattr(args, 'lxf_low_rank_dim', 4))}; "
+                f"full symmetric time-dependent A(t) plus learnable orthonormal low-rank correction "
+                f"(rank={int(getattr(args, 'lxf_low_rank_dim', 4))}; "
                 f"path_schedule={str(getattr(args, 'lxfs_path_schedule', 'cosine'))}; "
-                f"quadrature_steps={int(getattr(args, 'lxfs_quadrature_steps', 64))})"
+                f"quadrature_steps={int(getattr(args, 'lxfs_quadrature_steps', 64))}; "
+                f"ode_likelihood_steps={int(getattr(args, 'lxf_nlpca_ode_steps', 32))}; "
+                f"divergence={str(getattr(args, 'lxf_low_rank_divergence_estimator', 'hutchinson')).strip().lower()}; "
+                f"hutchinson_probes={int(getattr(args, 'lxf_hutchinson_probes', 1))})"
             )
         elif tfm == "linear_x_flow_low_rank_randb":
             drift_desc = (

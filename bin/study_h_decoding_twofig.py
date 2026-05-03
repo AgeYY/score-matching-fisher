@@ -66,7 +66,8 @@ from fisher.shared_fisher_est import build_dataset_from_meta, normalize_flow_arc
 # - linear_x_flow, linear_x_flow_t, linear_x_flow_scalar, linear_x_flow_scalar_t,
 #   linear_x_flow_diagonal, linear_x_flow_diagonal_t,
 #   linear_x_flow_diagonal_theta, linear_x_flow_diagonal_theta_t,
-#   linear_x_flow_low_rank, linear_x_flow_low_rank_t,
+#   linear_x_flow_low_rank, linear_x_flow_low_rank_t (full A(t) + learnable U h(U^T x) correction;
+#     divergence default: --lxf-low-rank-divergence-estimator hutchinson, --lxf-hutchinson-probes 1),
 #   linear_x_flow_low_rank_randb, linear_x_flow_low_rank_randb_t,
 #   linear_x_flow_nonlinear_pca
 _FLOW_BASED_METHODS = {"theta_flow", "theta_path_integral", "x_flow"}

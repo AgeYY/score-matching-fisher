@@ -29,6 +29,7 @@ from typing import Any
 import numpy as np
 import torch
 from torch import nn
+from torch.nn.utils import parametrizations
 from torch.utils.data import DataLoader, TensorDataset
 
 from fisher.gaussian_x_flow import GaussianAffinePathSchedule
@@ -954,6 +955,195 @@ class ConditionalTimeLinearXFlowMLP(_BaseTimeLinearXFlowMLP):
         return 0.5 * (raw + raw.transpose(1, 2)) + 1e-3 * eye
 
 
+class ConditionalTimeLowRankCorrectionLinearXFlowMLP(nn.Module):
+    """Full symmetric scheduled ``A(t)`` linear x-flow plus learnable orthonormal low-rank correction.
+
+    Velocity is ``v(x,t,theta) = A(t) x + b(t,theta) + U h(U^T x, t, theta)`` with ``U`` in ``R^{D x r}``
+    having orthonormal columns (``U^T U = I``).  The base ``(A,b)`` matches :class:`ConditionalTimeLinearXFlowMLP`.
+
+    Likelihood uses the same reverse-Euler divergence integral as
+    :class:`ConditionalPCANonlinearTimeLinearXFlowMLP` (no closed-form Gaussian endpoint).
+
+    The reduced-space Jacobian trace ``\\mathrm{tr}\\,\\partial h/\\partial z`` (with ``z = U^T x``)
+    defaults to a Hutchinson estimator (Rademacher probes); set ``divergence_estimator="exact"`` for the
+    rank-loop autograd sum (slower when ``correction_rank`` is large).
+    """
+
+    def __init__(
+        self,
+        *,
+        theta_dim: int,
+        x_dim: int,
+        correction_rank: int,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        quadrature_steps: int = 64,
+        divergence_estimator: str = "hutchinson",
+        hutchinson_probes: int = 1,
+    ) -> None:
+        super().__init__()
+        if int(correction_rank) < 1:
+            raise ValueError("correction_rank must be >= 1.")
+        if int(correction_rank) > int(x_dim):
+            raise ValueError("correction_rank must be <= x_dim.")
+        if int(quadrature_steps) < 2:
+            raise ValueError("quadrature_steps must be >= 2.")
+        de = str(divergence_estimator).strip().lower()
+        if de not in ("hutchinson", "exact"):
+            raise ValueError("divergence_estimator must be one of: hutchinson, exact.")
+        if int(hutchinson_probes) < 1:
+            raise ValueError("hutchinson_probes must be >= 1.")
+        self.divergence_estimator = de
+        self.hutchinson_probes = int(hutchinson_probes)
+        self.linear = ConditionalTimeLinearXFlowMLP(
+            theta_dim=int(theta_dim),
+            x_dim=int(x_dim),
+            hidden_dim=int(hidden_dim),
+            depth=int(depth),
+            quadrature_steps=int(quadrature_steps),
+        )
+        self.theta_dim = int(theta_dim)
+        self.x_dim = int(x_dim)
+        self.quadrature_steps = int(quadrature_steps)
+        self.correction_rank = int(correction_rank)
+        u_lin = nn.Linear(self.correction_rank, self.x_dim, bias=False)
+        nn.init.orthogonal_(u_lin.weight)
+        self.u_layer = parametrizations.orthogonal(u_lin, "weight", orthogonal_map="householder")
+        self.h_net = _make_mlp(
+            in_dim=self.correction_rank + 1 + self.theta_dim,
+            out_dim=self.correction_rank,
+            hidden_dim=int(hidden_dim),
+            depth=int(depth),
+            final_gain=0.0,
+            final_bias=0.0,
+        )
+
+    @property
+    def U(self) -> torch.Tensor:
+        """Orthonormal columns ``[D, r]`` (``nn.Linear(r, D).weight``)."""
+        return self.u_layer.weight
+
+    def forward(self, x: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        base = self.linear(x, theta, t)
+        u_mat = self.U
+        z = x @ u_mat
+        if theta.ndim == 1:
+            theta2 = theta.unsqueeze(-1)
+        else:
+            theta2 = theta
+        tcol = _as_col_t(t, batch=int(x.shape[0]))
+        h = self.h_net(torch.cat([z, tcol, theta2], dim=1))
+        return base + h @ u_mat.T
+
+    def regularization_loss(self) -> torch.Tensor | None:
+        return None
+
+    def _reduced_trace_exact(self, z: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+        """``sum_j \\partial h_j / \\partial z_j`` via one autograd per output component."""
+        tr_h = torch.zeros(z.shape[0], dtype=z.dtype, device=z.device)
+        for j in range(self.correction_rank):
+            grad_j = torch.autograd.grad(
+                h[:, j].sum(),
+                z,
+                create_graph=False,
+                retain_graph=j < self.correction_rank - 1,
+            )[0]
+            tr_h = tr_h + grad_j[:, j]
+        return tr_h
+
+    def _reduced_trace_hutchinson(self, z: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+        """Hutchinson estimate of ``\\mathrm{tr}\\,\\partial h/\\partial z`` with Rademacher probes."""
+        b = int(z.shape[0])
+        r = int(self.correction_rank)
+        n_probe = int(self.hutchinson_probes)
+        acc = torch.zeros(b, dtype=z.dtype, device=z.device)
+        for pi in range(n_probe):
+            probe = torch.empty(b, r, dtype=z.dtype, device=z.device)
+            probe.bernoulli_(0.5).mul_(2.0).sub_(1.0)
+            dot = (h * probe).sum(dim=1)
+            vjp = torch.autograd.grad(
+                dot.sum(),
+                z,
+                create_graph=False,
+                retain_graph=pi < n_probe - 1,
+            )[0]
+            acc = acc + (vjp * probe).sum(dim=-1)
+        return acc / float(n_probe)
+
+    def divergence(self, x: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        t = _as_col_t(t, batch=int(x.shape[0]))
+        a_mat = self.linear.A(t)
+        if a_mat.ndim == 2:
+            tr_a = torch.trace(a_mat).to(dtype=x.dtype, device=x.device).reshape(1).expand(int(x.shape[0]))
+        else:
+            tr_a = torch.diagonal(a_mat, dim1=-2, dim2=-1).sum(dim=-1)
+        u_mat = self.U
+        with torch.enable_grad():
+            z = (x @ u_mat).detach().requires_grad_(True)
+            tcol = _as_col_t(t, batch=int(z.shape[0]))
+            h = self.h_net(torch.cat([z, tcol, theta], dim=1))
+            if self.divergence_estimator == "exact":
+                tr_h = self._reduced_trace_exact(z, h)
+            else:
+                tr_h = self._reduced_trace_hutchinson(z, h)
+        return tr_a.detach() + tr_h.detach()
+
+    def log_prob_normalized(
+        self,
+        x_norm: torch.Tensor,
+        theta: torch.Tensor,
+        *,
+        solve_jitter: float = 1e-6,
+        quadrature_steps: int | None = None,
+        ode_steps: int = 32,
+    ) -> torch.Tensor:
+        del solve_jitter, quadrature_steps  # API parity with other scheduled LXF likelihoods
+        if x_norm.ndim == 1:
+            x_norm = x_norm.unsqueeze(0)
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        if x_norm.shape[0] != theta.shape[0]:
+            raise ValueError("x and theta batch sizes must match.")
+        steps = int(ode_steps)
+        if steps < 1:
+            raise ValueError("ode_steps must be >= 1.")
+        x = x_norm
+        div_int = torch.zeros(x.shape[0], dtype=x.dtype, device=x.device)
+        dt = 1.0 / float(steps)
+        for s in range(steps, 0, -1):
+            t = torch.full((x.shape[0], 1), float(s) / float(steps), dtype=x.dtype, device=x.device)
+            div_int = div_int + dt * self.divergence(x, theta, t)
+            with torch.no_grad():
+                v = self.forward(x, theta, t)
+                x = x - dt * v
+        d = int(x.shape[1])
+        base = -0.5 * (torch.sum(x**2, dim=1) + float(d) * math.log(2.0 * math.pi))
+        return base - div_int
+
+    def log_prob_observed(
+        self,
+        x_raw: torch.Tensor,
+        theta: torch.Tensor,
+        *,
+        x_mean: torch.Tensor,
+        x_std: torch.Tensor,
+        solve_jitter: float = 1e-6,
+        quadrature_steps: int | None = None,
+        ode_steps: int = 32,
+    ) -> torch.Tensor:
+        z = (x_raw - x_mean) / x_std
+        logjac = -torch.sum(torch.log(x_std))
+        return self.log_prob_normalized(
+            z,
+            theta,
+            solve_jitter=float(solve_jitter),
+            quadrature_steps=quadrature_steps,
+            ode_steps=int(ode_steps),
+        ) + logjac
+
+
 class ConditionalTimeScalarLinearXFlowMLP(_BaseTimeLinearXFlowMLP):
     """Scalar time-dependent drift ``A(t)=a(t) I`` plus offset ``b(t, theta)``."""
 
@@ -1145,7 +1335,12 @@ class ConditionalTimeThetaDiagonalLinearXFlowMLP(_BaseTimeLinearXFlowMLP):
 
 
 class ConditionalTimeLowRankLinearXFlowMLP(_BaseTimeLinearXFlowMLP):
-    """Time-dependent low-rank symmetric drift ``A(t)=diag(a(t))+U(t)diag(s(t))U(t)^T``."""
+    """Time-dependent low-rank symmetric drift ``A(t)=diag(a(t))+U(t)diag(s(t))U(t)^T``.
+
+    Note: the CLI token ``linear_x_flow_low_rank_t`` is wired to
+    :class:`ConditionalTimeLowRankCorrectionLinearXFlowMLP` (full ``A(t)`` plus nonlinear ``U h``);
+    this class is the low-rank *linear drift* used by ``linear_x_flow_nonlinear_pca_low_rank_t`` and tests.
+    """
 
     def __init__(
         self,
@@ -1858,6 +2053,31 @@ class ConditionalPCANonlinearTimeLinearXFlowMLP(nn.Module):
         ) + logjac
 
 
+def _adamw_param_groups_no_wd_on_parametrizations(model: nn.Module, *, weight_decay: float) -> list[dict[str, Any]]:
+    """AdamW param groups: disable weight decay on ``torch.nn.utils.parametrizations`` internals.
+
+    Decaying unconstrained ``.original`` tensors breaks orthogonal maps (e.g. collapses ``U`` to zeros).
+    """
+    wd = float(weight_decay)
+    decay: list[nn.Parameter] = []
+    no_decay: list[nn.Parameter] = []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if "parametrizations" in name:
+            no_decay.append(p)
+        else:
+            decay.append(p)
+    groups: list[dict[str, Any]] = []
+    if decay:
+        groups.append({"params": decay, "weight_decay": wd})
+    if no_decay:
+        groups.append({"params": no_decay, "weight_decay": 0.0})
+    if not groups:
+        raise ValueError("model has no trainable parameters for AdamW.")
+    return groups
+
+
 def train_linear_x_flow(
     *,
     model: ConditionalLinearXFlowMLP,
@@ -1919,7 +2139,7 @@ def train_linear_x_flow(
     )
     train_loader = DataLoader(train_ds, batch_size=int(batch_size), shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=int(batch_size), shuffle=False)
-    opt = torch.optim.AdamW(model.parameters(), lr=float(lr), weight_decay=float(weight_decay))
+    opt = torch.optim.AdamW(_adamw_param_groups_no_wd_on_parametrizations(model, weight_decay=float(weight_decay)), lr=float(lr))
 
     train_losses: list[float] = []
     val_losses: list[float] = []
@@ -2119,7 +2339,7 @@ def train_time_linear_x_flow_schedule(
     val_ds = TensorDataset(torch.from_numpy(th_va.astype(np.float32)), torch.from_numpy(x_va_n.astype(np.float32)))
     train_loader = DataLoader(train_ds, batch_size=int(batch_size), shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=int(batch_size), shuffle=False)
-    opt = torch.optim.AdamW(model.parameters(), lr=float(lr), weight_decay=float(weight_decay))
+    opt = torch.optim.AdamW(_adamw_param_groups_no_wd_on_parametrizations(model, weight_decay=float(weight_decay)), lr=float(lr))
 
     train_losses: list[float] = []
     val_losses: list[float] = []
@@ -2848,9 +3068,9 @@ def compute_pca_nonlinear_linear_x_flow_c_matrix(
     return c
 
 
-def compute_pca_nonlinear_time_linear_x_flow_c_matrix(
+def compute_ode_time_linear_x_flow_c_matrix(
     *,
-    model: ConditionalPCANonlinearTimeLinearXFlowMLP,
+    model: nn.Module,
     theta_all: np.ndarray,
     x_all: np.ndarray,
     device: torch.device,
@@ -2861,6 +3081,7 @@ def compute_pca_nonlinear_time_linear_x_flow_c_matrix(
     ode_steps: int = 32,
     pair_batch_size: int = 65536,
 ) -> np.ndarray:
+    """Pairwise log ``p(x_i | theta_j)`` for ODE-likelihood scheduled LXF models (e.g. PCA correction)."""
     theta = _as_2d_float64(theta_all, name="theta_all")
     x = _as_2d_float64(x_all, name="x_all")
     if theta.shape[0] != x.shape[0]:
@@ -2893,3 +3114,30 @@ def compute_pca_nonlinear_time_linear_x_flow_c_matrix(
         )
         c[i0:i1, :] = logp.detach().cpu().numpy().reshape(b, n).astype(np.float64)
     return c
+
+
+def compute_pca_nonlinear_time_linear_x_flow_c_matrix(
+    *,
+    model: ConditionalPCANonlinearTimeLinearXFlowMLP,
+    theta_all: np.ndarray,
+    x_all: np.ndarray,
+    device: torch.device,
+    x_mean: np.ndarray,
+    x_std: np.ndarray,
+    solve_jitter: float = 1e-6,
+    quadrature_steps: int = 64,
+    ode_steps: int = 32,
+    pair_batch_size: int = 65536,
+) -> np.ndarray:
+    return compute_ode_time_linear_x_flow_c_matrix(
+        model=model,
+        theta_all=theta_all,
+        x_all=x_all,
+        device=device,
+        x_mean=x_mean,
+        x_std=x_std,
+        solve_jitter=float(solve_jitter),
+        quadrature_steps=int(quadrature_steps),
+        ode_steps=int(ode_steps),
+        pair_batch_size=int(pair_batch_size),
+    )
