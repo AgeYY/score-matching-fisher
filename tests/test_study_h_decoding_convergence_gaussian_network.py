@@ -167,6 +167,28 @@ class TestStudyHDecodingConvergenceGaussianNetwork(unittest.TestCase):
                 pca_dim=2,
             )
 
+    def test_lxf_theta_fourier_feature_builder_shape_and_values(self) -> None:
+        repo = Path(__file__).resolve().parent.parent
+        script = repo / "bin" / "study_h_decoding_convergence.py"
+        spec = importlib.util.spec_from_file_location("study_h_decoding_convergence", script)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        theta_ref = np.asarray([[0.0, -1.0], [2.0, 3.0]], dtype=np.float64)
+        theta = np.asarray([[0.0, -1.0], [1.0, 1.0], [2.0, 3.0]], dtype=np.float64)
+        feats, center, ref_range, period = mod._build_lxf_theta_fourier_features(theta, theta_ref=theta_ref, k=2)
+        self.assertEqual(feats.shape, (3, 10))
+        np.testing.assert_allclose(center, np.asarray([1.0, 1.0]))
+        np.testing.assert_allclose(ref_range, np.asarray([2.0, 4.0]))
+        np.testing.assert_allclose(period, ref_range)
+        np.testing.assert_allclose(feats[:, 0], np.asarray([-0.5, 0.0, 0.5]))
+        np.testing.assert_allclose(feats[:, 5], np.asarray([-0.5, 0.0, 0.5]))
+        self.assertTrue(np.all(np.isfinite(feats)))
+        with self.assertRaisesRegex(ValueError, "--lxf-theta-fourier-k must be >= 1"):
+            mod._build_lxf_theta_fourier_features(theta, theta_ref=theta_ref, k=0)
+
     def test_gaussian_network_low_rank_sweep_smoke(self) -> None:
         self._run_smoke(
             method_cli="gaussian-network-low-rank",
@@ -551,6 +573,7 @@ class TestStudyHDecodingConvergenceGaussianNetwork(unittest.TestCase):
 
         for method_cli, method_stored in (
             ("linear-x-flow-t", "linear_x_flow_t"),
+            ("linear-x-flow-t-p", "linear_x_flow_t_p"),
             ("linear-x-flow-scalar", "linear_x_flow_scalar"),
             ("linear-x-flow-scalar-t", "linear_x_flow_scalar_t"),
             ("linear-x-flow-diagonal", "linear_x_flow_diagonal"),
@@ -558,6 +581,7 @@ class TestStudyHDecodingConvergenceGaussianNetwork(unittest.TestCase):
             ("linear-x-flow-diagonal-theta-t", "linear_x_flow_diagonal_theta_t"),
             ("linear-x-flow-low-rank", "linear_x_flow_low_rank"),
             ("linear-x-flow-low-rank-t", "linear_x_flow_low_rank_t"),
+            ("linear-x-flow-lr-t-p", "linear_x_flow_lr_t_p"),
             ("linear-x-flow-low-rank-randb", "linear_x_flow_low_rank_randb"),
             ("linear-x-flow-low-rank-randb-t", "linear_x_flow_low_rank_randb_t"),
             ("linear-x-flow-diagonal-t", "linear_x_flow_diagonal_t"),
@@ -626,7 +650,7 @@ class TestStudyHDecodingConvergenceGaussianNetwork(unittest.TestCase):
                     "--device",
                     "cpu",
                 ]
-                if method_stored == "linear_x_flow_low_rank_t":
+                if method_stored in ("linear_x_flow_low_rank_t", "linear_x_flow_lr_t_p"):
                     cmd.extend(["--lxf-low-rank-t-warmup-epochs", "1"])
                 r = subprocess.run(cmd, cwd=str(repo), capture_output=True, text=True)
                 self.assertEqual(r.returncode, 0, msg=(r.stdout, r.stderr))
@@ -637,7 +661,12 @@ class TestStudyHDecodingConvergenceGaussianNetwork(unittest.TestCase):
                 if method_stored.endswith("_t"):
                     self.assertEqual(str(np.asarray(z["lxfs_path_schedule"]).reshape(-1)[0]), "cosine")
                     self.assertTrue(bool(np.asarray(z["lxfs_scheduled_train"]).reshape(-1)[0]))
-                if method_stored == "linear_x_flow_low_rank_t":
+                if method_stored in ("linear_x_flow_t_p", "linear_x_flow_lr_t_p"):
+                    self.assertTrue(bool(np.asarray(z["lxf_theta_fourier_enabled"]).reshape(-1)[0]))
+                    self.assertEqual(int(np.asarray(z["lxf_theta_fourier_k"]).reshape(-1)[0]), 6)
+                    self.assertEqual(int(np.asarray(z["lxf_theta_original_dim"]).reshape(-1)[0]), 1)
+                    self.assertEqual(int(np.asarray(z["lxf_theta_feature_dim"]).reshape(-1)[0]), 13)
+                if method_stored in ("linear_x_flow_low_rank_t", "linear_x_flow_lr_t_p"):
                     self.assertTrue(bool(np.asarray(z["lxf_low_rank_t_warmup_enabled"]).reshape(-1)[0]))
                     self.assertEqual(int(np.asarray(z["lxf_low_rank_t_warmup_epochs"]).reshape(-1)[0]), 1)
                     self.assertEqual(np.asarray(z["lxf_low_rank_t_warmup_train_losses"]).shape, (1,))
