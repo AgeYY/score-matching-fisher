@@ -236,6 +236,7 @@ def linear_x_flow_endpoint_gaussian(
             model,
             (
                 ConditionalTimeLinearXFlowMLP,
+                ConditionalTimeThetaLinearXFlowMLP,
                 ConditionalTimeLowRankLinearXFlowMLP,
                 ConditionalTimeRandomBasisLowRankLinearXFlowMLP,
             ),
@@ -954,6 +955,82 @@ class ConditionalTimeLinearXFlowMLP(_BaseTimeLinearXFlowMLP):
         return 0.5 * (raw + raw.transpose(1, 2)) + 1e-3 * eye
 
 
+class ConditionalTimeThetaLinearXFlowMLP(_BaseTimeLinearXFlowMLP):
+    """Full symmetric drift ``A(t, theta)`` plus offset ``b(t, theta)``."""
+
+    def __init__(
+        self,
+        *,
+        theta_dim: int,
+        x_dim: int,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        quadrature_steps: int = 64,
+    ) -> None:
+        super().__init__(
+            theta_dim=theta_dim,
+            x_dim=x_dim,
+            hidden_dim=hidden_dim,
+            depth=depth,
+            quadrature_steps=quadrature_steps,
+        )
+        self.a_net = _make_mlp(
+            in_dim=self.theta_dim + 1,
+            out_dim=self.x_dim * self.x_dim,
+            hidden_dim=self.hidden_dim,
+            depth=self.depth,
+            final_gain=0.01,
+            final_bias=0.0,
+        )
+
+    def A_theta(self, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        t_col = _as_col_t(t, batch=int(theta.shape[0]))
+        raw = self.a_net(torch.cat([t_col, theta], dim=1)).reshape(int(theta.shape[0]), self.x_dim, self.x_dim)
+        eye = torch.eye(self.x_dim, dtype=raw.dtype, device=raw.device).reshape(1, self.x_dim, self.x_dim)
+        return 0.5 * (raw + raw.transpose(1, 2)) + 1e-3 * eye
+
+    def A(self, t: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError(
+            "ConditionalTimeThetaLinearXFlowMLP needs theta to build A; use A_theta(theta, t)."
+        )
+
+    def forward(self, x: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        t = _as_col_t(t, batch=int(x.shape[0]))
+        a = self.A_theta(theta, t)
+        b = self.b(theta, t)
+        return torch.bmm(a, x.unsqueeze(-1)).squeeze(-1) + b
+
+    def endpoint_mean_covariance(
+        self,
+        theta: torch.Tensor,
+        *,
+        solve_jitter: float = 1e-6,
+        quadrature_steps: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        q = self.quadrature_steps if quadrature_steps is None else int(quadrature_steps)
+        if q < 2:
+            raise ValueError("quadrature_steps must be >= 2.")
+        batch = int(theta.shape[0])
+        d = int(self.x_dim)
+        mu = torch.zeros(batch, d, dtype=theta.dtype, device=theta.device)
+        cov = torch.eye(d, dtype=theta.dtype, device=theta.device).reshape(1, d, d).expand(batch, d, d).clone()
+        dt = 1.0 / float(q)
+        for k in range(q):
+            tk = torch.full((batch, 1), (float(k) + 0.5) / float(q), dtype=theta.dtype, device=theta.device)
+            a = self.A_theta(theta, tk)
+            b = self.b(theta, tk)
+            mu = mu + dt * (torch.bmm(a, mu.unsqueeze(-1)).squeeze(-1) + b)
+            cov = cov + dt * (torch.bmm(a, cov) + torch.bmm(cov, a.transpose(1, 2)))
+            cov = 0.5 * (cov + cov.transpose(1, 2))
+        eye = torch.eye(d, dtype=theta.dtype, device=theta.device).reshape(1, d, d)
+        cov = 0.5 * (cov + cov.transpose(1, 2)) + float(solve_jitter) * eye
+        return mu, cov
+
+
 class ConditionalTimeScalarLinearXFlowMLP(_BaseTimeLinearXFlowMLP):
     """Scalar time-dependent drift ``A(t)=a(t) I`` plus offset ``b(t, theta)``."""
 
@@ -1517,6 +1594,9 @@ def time_linear_x_flow_trace(model: nn.Module, theta: torch.Tensor, t: torch.Ten
     if isinstance(model, ConditionalTimeThetaDiagonalLinearXFlowMLP):
         a, _ = model.a_b(theta, t)
         return torch.sum(a, dim=1)
+    if isinstance(model, ConditionalTimeThetaLinearXFlowMLP):
+        a_th = model.A_theta(theta, t)
+        return torch.diagonal(a_th, dim1=-2, dim2=-1).sum(dim=1)
     a = model.A(t)  # type: ignore[attr-defined]
     if a.ndim == 2:
         tr = torch.trace(a).to(dtype=theta.dtype, device=theta.device)

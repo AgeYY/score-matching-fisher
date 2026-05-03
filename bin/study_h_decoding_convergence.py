@@ -48,6 +48,8 @@ induced Gaussian with theta-dependent mean and shared covariance.
 and evaluates a diagonal Gaussian with theta-dependent mean and diagonal covariance.
 ``--theta-field-method linear-x-flow-diagonal-t`` trains ``v(x,t,theta)=diag(a(t))x+b(t,theta)``
 on a scheduled affine probability path and evaluates its quadrature Gaussian likelihood.
+``--theta-field-method linear-x-flow-theta-t`` trains ``v(x,t,theta)=A(t,theta)x+b(t,theta)``
+with full symmetric ``A(t,theta)`` on the same scheduled path.
 ``--theta-field-method linear-x-flow-nonlinear-pca`` first trains the full linear x-flow,
 fits PCA on residuals around the induced linear-flow mean, then adds a low-dimensional nonlinear
 correction and evaluates ODE log likelihood.
@@ -144,6 +146,7 @@ from fisher.linear_x_flow import (
     ConditionalThetaDiagonalLinearXFlowMLP,
     ConditionalTimeDiagonalLinearXFlowMLP,
     ConditionalTimeLinearXFlowMLP,
+    ConditionalTimeThetaLinearXFlowMLP,
     ConditionalTimeLowRankLinearXFlowMLP,
     ConditionalTimeRandomBasisLowRankLinearXFlowMLP,
     ConditionalTimeScalarLinearXFlowMLP,
@@ -186,6 +189,7 @@ from fisher.contrastive_llr import (
 
 _TIME_LXF_METHODS = {
     "linear_x_flow_t",
+    "linear_x_flow_theta_t",
     "linear_x_flow_scalar_t",
     "linear_x_flow_diagonal_t",
     "linear_x_flow_diagonal_theta_t",
@@ -1335,6 +1339,8 @@ def _normalize_linear_x_flow_method(tfm: str) -> str | None:
         "linear_x_flow": "linear_x_flow",
         "linear-x-flow-t": "linear_x_flow_t",
         "linear_x_flow_t": "linear_x_flow_t",
+        "linear-x-flow-theta-t": "linear_x_flow_theta_t",
+        "linear_x_flow_theta_t": "linear_x_flow_theta_t",
         "linear-x-flow-scalar": "linear_x_flow_scalar",
         "linear_x_flow_scalar": "linear_x_flow_scalar",
         "linear-x-flow-scalar-t": "linear_x_flow_scalar_t",
@@ -2008,6 +2014,7 @@ def _validate_cli(args: argparse.Namespace) -> None:
         "gaussian_x_flow_diagonal",
         "linear_x_flow",
         "linear_x_flow_t",
+        "linear_x_flow_theta_t",
         "linear_x_flow_scalar",
         "linear_x_flow_scalar_t",
         "linear_x_flow_diagonal",
@@ -3784,6 +3791,15 @@ def _estimate_one(
                 depth=int(getattr(args, f"{lxf_prefix}_depth", 3)),
                 quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)),
             ).to(dev)
+        elif method_name == "linear_x_flow_theta_t":
+            drift_type = "full_symmetric_theta_time"
+            model = ConditionalTimeThetaLinearXFlowMLP(
+                theta_dim=int(theta_all.shape[1]),
+                x_dim=x_dim_lxf,
+                hidden_dim=int(getattr(args, f"{lxf_prefix}_hidden_dim", 128)),
+                depth=int(getattr(args, f"{lxf_prefix}_depth", 3)),
+                quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)),
+            ).to(dev)
         else:
             drift_type = "full_symmetric"
             model = ConditionalLinearXFlowMLP(
@@ -5273,6 +5289,8 @@ def _model_posterior_log_weights_for_fixed_x(
         return c, r"Linear X-flow log $p(x|\theta)$"
     if method == "linear_x_flow_t":
         return c, r"Linear X-flow time-dependent $A(t)$ log $p(x|\theta)$"
+    if method == "linear_x_flow_theta_t":
+        return c, r"Linear X-flow $A(t,\theta)$ (full symmetric) log $p(x|\theta)$"
     if method == "linear_x_flow_scalar":
         return c, r"Linear X-flow scalar $A$ log $p(x|\theta)$"
     if method == "linear_x_flow_scalar_t":
@@ -5980,6 +5998,8 @@ def _render_training_losses_panel(
             post_lab = "linear-x-flow FM likelihood"
         elif tfm == "linear_x_flow_t":
             post_lab = "linear-x-flow time FM likelihood"
+        elif tfm == "linear_x_flow_theta_t":
+            post_lab = "linear-x-flow theta-time FM likelihood"
         elif tfm == "linear_x_flow_scalar":
             post_lab = "linear-x-flow scalar FM likelihood"
         elif tfm == "linear_x_flow_scalar_t":
@@ -6429,6 +6449,8 @@ def _save_combined_convergence_figure(
             post_lab = "linear-x-flow FM likelihood"
         elif tfm == "linear_x_flow_t":
             post_lab = "linear-x-flow time FM likelihood"
+        elif tfm == "linear_x_flow_theta_t":
+            post_lab = "linear-x-flow theta-time FM likelihood"
         elif tfm == "linear_x_flow_scalar":
             post_lab = "linear-x-flow scalar FM likelihood"
         elif tfm == "linear_x_flow_scalar_t":
@@ -6902,6 +6924,7 @@ def _write_summary(
         if _tfm_sum in (
             "linear_x_flow",
             "linear_x_flow_t",
+            "linear_x_flow_theta_t",
             "linear_x_flow_scalar",
             "linear_x_flow_scalar_t",
             "linear_x_flow_diagonal",
@@ -7939,6 +7962,7 @@ def main(argv: list[str] | None = None) -> None:
     elif tfm in (
         "linear_x_flow",
         "linear_x_flow_t",
+        "linear_x_flow_theta_t",
         "linear_x_flow_scalar",
         "linear_x_flow_scalar_t",
         "linear_x_flow_diagonal",
@@ -7970,6 +7994,12 @@ def main(argv: list[str] | None = None) -> None:
         elif tfm == "linear_x_flow_t":
             drift_desc = (
                 f"full symmetric time-dependent A(t) "
+                f"(path_schedule={str(getattr(args, 'lxfs_path_schedule', 'cosine'))}; "
+                f"quadrature_steps={int(getattr(args, 'lxfs_quadrature_steps', 64))})"
+            )
+        elif tfm == "linear_x_flow_theta_t":
+            drift_desc = (
+                f"full symmetric theta- and time-dependent A(t,theta) "
                 f"(path_schedule={str(getattr(args, 'lxfs_path_schedule', 'cosine'))}; "
                 f"quadrature_steps={int(getattr(args, 'lxfs_quadrature_steps', 64))})"
             )
@@ -8094,7 +8124,7 @@ def main(argv: list[str] | None = None) -> None:
             f"Unsupported --theta-field-method={tfm!r}; use "
             "theta_flow, theta-flow-autoencoder, theta_path_integral, x_flow, x-flow-autoencoder, x-flow-pca, "
             "ctsm_v, nf, contrastive, nf-reduction, gaussian-x-flow, gaussian-x-flow-diagonal, "
-            "linear-x-flow, linear-x-flow-t, linear-x-flow-scalar, linear-x-flow-scalar-t, "
+            "linear-x-flow, linear-x-flow-t, linear-x-flow-theta-t, linear-x-flow-scalar, linear-x-flow-scalar-t, "
             "linear-x-flow-diagonal, linear-x-flow-diagonal-theta, linear-x-flow-diagonal-theta-t, "
             "linear-x-flow-low-rank, linear-x-flow-low-rank-t, linear-x-flow-low-rank-randb, "
             "linear-x-flow-low-rank-randb-t, linear-x-flow-nonlinear-pca, "

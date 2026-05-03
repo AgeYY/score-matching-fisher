@@ -467,6 +467,7 @@ class TestStudyHDecodingConvergenceGaussianNetwork(unittest.TestCase):
 
         for method_cli, method_stored in (
             ("linear-x-flow-t", "linear_x_flow_t"),
+            ("linear-x-flow-theta-t", "linear_x_flow_theta_t"),
             ("linear-x-flow-scalar", "linear_x_flow_scalar"),
             ("linear-x-flow-scalar-t", "linear_x_flow_scalar_t"),
             ("linear-x-flow-diagonal", "linear_x_flow_diagonal"),
