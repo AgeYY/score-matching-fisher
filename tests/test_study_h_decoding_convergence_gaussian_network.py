@@ -437,9 +437,93 @@ class TestStudyHDecodingConvergenceGaussianNetwork(unittest.TestCase):
             self.assertTrue(np.isfinite(np.asarray(hz["h_sym"], dtype=np.float64)).all())
             self.assertEqual(
                 str(np.asarray(hz["h_eval_scalar_name"]).reshape(-1)[0]),
+                "linear_x_flow_bin_log_p_x_given_theta",
+            )
+            self.assertFalse(bool(np.asarray(hz["lxf_analytic_gaussian_hellinger"]).reshape(-1)[0]))
+            self.assertTrue(bool(np.asarray(hz["lxf_bin_likelihood_hellinger"]).reshape(-1)[0]))
+            for key in ("c_matrix", "bin_log_likelihood_matrix", "bin_delta_l_matrix", "h_binned_bin_likelihood", "bin_counts"):
+                self.assertIn(key, hz.files)
+
+    def test_linear_x_flow_analytic_gaussian_hellinger_opt_in_smoke(self) -> None:
+        repo = Path(__file__).resolve().parent.parent
+        script = repo / "bin" / "study_h_decoding_convergence.py"
+        n_total = 180
+        n_ref = 140
+        n_bins = 4
+        seed = 10
+
+        ns_ds = _ns(
+            dataset_family="cosine_gaussian_sqrtd",
+            x_dim=2,
+            n_total=n_total,
+            train_frac=0.5,
+            seed=seed,
+        )
+        ds = build_dataset_from_args(ns_ds)
+        theta_all, x_all = ds.sample_joint(n_total)
+        meta = meta_dict_from_args(ns_ds)
+        n_train = int(0.5 * n_total)
+        tr = np.arange(0, n_train, dtype=np.int64)
+        va = np.arange(n_train, n_total, dtype=np.int64)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            ds_path = tmp_path / "ds.npz"
+            out_dir = tmp_path / "run_out"
+            save_shared_dataset_npz(
+                ds_path,
+                meta=meta,
+                theta_all=theta_all,
+                x_all=x_all,
+                train_idx=tr,
+                validation_idx=va,
+                theta_train=theta_all[tr],
+                x_train=x_all[tr],
+                theta_validation=theta_all[va],
+                x_validation=x_all[va],
+            )
+            cmd = [
+                sys.executable,
+                str(script),
+                "--dataset-npz",
+                str(ds_path),
+                "--dataset-family",
+                "cosine_gaussian_sqrtd",
+                "--n-ref",
+                str(n_ref),
+                "--n-list",
+                "60",
+                "--num-theta-bins",
+                str(n_bins),
+                "--theta-field-method",
+                "linear-x-flow",
+                "--lxf-epochs",
+                "2",
+                "--lxf-batch-size",
+                "32",
+                "--lxf-hidden-dim",
+                "16",
+                "--lxf-depth",
+                "1",
+                "--lxf-early-patience",
+                "5",
+                "--lxf-analytic-gaussian-hellinger",
+                "--keep-intermediate",
+                "--output-dir",
+                str(out_dir),
+                "--device",
+                "cpu",
+            ]
+            r = subprocess.run(cmd, cwd=str(repo), capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, msg=(r.stdout, r.stderr))
+            h_path = out_dir / "sweep_runs" / "n_000060" / "h_matrix_results_theta_cov.npz"
+            hz = np.load(h_path, allow_pickle=True)
+            self.assertEqual(
+                str(np.asarray(hz["h_eval_scalar_name"]).reshape(-1)[0]),
                 "linear_x_flow_analytic_gaussian_hellinger",
             )
             self.assertTrue(bool(np.asarray(hz["lxf_analytic_gaussian_hellinger"]).reshape(-1)[0]))
+            self.assertFalse(bool(np.asarray(hz["lxf_bin_likelihood_hellinger"]).reshape(-1)[0]))
             self.assertNotIn("c_matrix", hz.files)
 
     def test_linear_x_flow_restricted_drift_sweep_smokes(self) -> None:
@@ -644,8 +728,8 @@ class TestStudyHDecodingConvergenceGaussianNetwork(unittest.TestCase):
                 h_path = out_dir / "sweep_runs" / "n_000050" / "h_matrix_results_theta_cov.npz"
                 hz = np.load(h_path, allow_pickle=True)
                 self.assertFalse(bool(np.asarray(hz["lxf_analytic_gaussian_hellinger"]).reshape(-1)[0]))
-                self.assertEqual(str(np.asarray(hz["h_eval_scalar_name"]).reshape(-1)[0]), f"{method_stored}_log_p_x_given_theta")
-                for key in ("h_sym", "c_matrix", "delta_l_matrix", "lxf_nlpca_pca_basis"):
+                self.assertEqual(str(np.asarray(hz["h_eval_scalar_name"]).reshape(-1)[0]), f"{method_stored}_bin_log_p_x_given_theta")
+                for key in ("h_sym", "c_matrix", "delta_l_matrix", "bin_log_likelihood_matrix", "bin_delta_l_matrix", "lxf_nlpca_pca_basis"):
                     self.assertIn(key, hz.files)
                     self.assertTrue(np.isfinite(np.asarray(hz[key], dtype=np.float64)).all())
 

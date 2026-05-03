@@ -1010,9 +1010,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--lxf-save-c-matrix",
         action="store_true",
         help=(
-            "linear-x-flow Gaussian endpoint methods only: also save the legacy C and DeltaL matrices. "
-            "By default h_sym is computed analytically from Gaussian Hellinger and these expensive "
-            "likelihood-ratio diagnostics are omitted."
+            "linear-x-flow only: save the C and DeltaL matrices. C is computed by default for "
+            "bin-likelihood Hellinger; this flag is kept for compatibility and still controls "
+            "extra C/DeltaL diagnostics when --lxf-analytic-gaussian-hellinger is used."
+        ),
+    )
+    p.add_argument(
+        "--lxf-analytic-gaussian-hellinger",
+        action="store_true",
+        help=(
+            "linear-x-flow Gaussian endpoint methods only: use the legacy analytic endpoint "
+            "Gaussian Hellinger matrix instead of the default bin-level likelihood estimate."
         ),
     )
     p.add_argument("--lxf-nlpca-dim", type=int, default=4, help="linear-x-flow-nonlinear-pca only: residual PCA dimension k.")
@@ -2561,6 +2569,79 @@ def _binned_gaussian_hellinger_sq(
     return out
 
 
+def _lxf_bin_likelihood_hellinger(
+    c_matrix: np.ndarray,
+    bin_all: np.ndarray,
+    n_bins: int,
+) -> dict[str, np.ndarray]:
+    r"""Compute linear-x-flow H from bin-level likelihoods.
+
+    ``c_matrix[i, j]`` is ``log p(x_i | theta_j)``. For each target bin ``b``,
+    this estimates ``log p(x_i | B_b)`` as a stable log-mean-exp over all
+    ``theta_j`` whose source sample belongs to ``b``. The row's own bin is the
+    likelihood-ratio baseline, so same-bin expanded entries are exactly zero.
+    """
+    c = np.asarray(c_matrix, dtype=np.float64)
+    bins = np.asarray(bin_all, dtype=np.int64).reshape(-1)
+    nb = int(n_bins)
+    if c.ndim != 2 or c.shape[0] != c.shape[1]:
+        raise ValueError("c_matrix must be a square 2D array.")
+    n = int(c.shape[0])
+    if bins.shape[0] != n:
+        raise ValueError("bin_all length must match c_matrix rows.")
+    if nb < 1:
+        raise ValueError("n_bins must be >= 1.")
+    if np.any((bins < 0) | (bins >= nb)):
+        raise ValueError("bin_all contains labels outside [0, n_bins).")
+
+    counts = np.bincount(bins, minlength=nb).astype(np.int64)
+    bin_log_likelihood = np.full((n, nb), np.nan, dtype=np.float64)
+    for b in range(nb):
+        idx = np.flatnonzero(bins == b)
+        if idx.size == 0:
+            continue
+        vals = c[:, idx]
+        vmax = np.max(vals, axis=1)
+        finite_max = np.isfinite(vmax)
+        out = np.full(n, np.nan, dtype=np.float64)
+        if np.any(finite_max):
+            shifted = vals[finite_max] - vmax[finite_max, None]
+            out[finite_max] = (
+                vmax[finite_max]
+                + np.log(np.mean(np.exp(shifted), axis=1))
+            )
+        bin_log_likelihood[:, b] = out
+
+    baseline = bin_log_likelihood[np.arange(n), bins]
+    bin_delta_l = bin_log_likelihood - baseline[:, None]
+    half_delta = np.clip(0.5 * bin_delta_l, -60.0, 60.0)
+    h_directed_bin = 1.0 - (1.0 / np.cosh(half_delta))
+    h_directed_bin[np.arange(n), bins] = 0.0
+
+    h_binned_directed = np.full((nb, nb), np.nan, dtype=np.float64)
+    for a in range(nb):
+        rows = np.flatnonzero(bins == a)
+        if rows.size == 0:
+            continue
+        for b in range(nb):
+            if counts[b] > 0:
+                h_binned_directed[a, b] = float(np.mean(h_directed_bin[rows, b], dtype=np.float64))
+        h_binned_directed[a, a] = 0.0
+    h_binned = 0.5 * (h_binned_directed + h_binned_directed.T)
+
+    h_sym = 0.5 * (h_directed_bin[:, bins] + h_directed_bin[:, bins].T)
+    same_bin = bins[:, None] == bins[None, :]
+    h_sym[same_bin] = 0.0
+    return {
+        "bin_log_likelihood": bin_log_likelihood,
+        "bin_delta_l": bin_delta_l,
+        "h_directed_bin": h_directed_bin,
+        "h_binned": h_binned,
+        "h_sym": h_sym,
+        "bin_counts": counts,
+    }
+
+
 def _save_empty_no_training_losses(path: str, *, method_name: str, **metadata: object) -> None:
     empty = np.asarray([], dtype=np.float64)
     payload: dict[str, object] = {
@@ -3859,15 +3940,19 @@ def _estimate_one(
         x_std = np.asarray(train_out["x_std"], dtype=np.float64)
         nonlinear_train_out: dict[str, Any] | None = None
         pca_basis = np.asarray([], dtype=np.float32)
-        analytic_lxf_h = not (
+        analytic_lxf_supported = not (
             method_name.startswith("linear_x_flow_nonlinear_pca") or method_name == "linear_x_flow_low_rank_t"
         )
+        analytic_lxf_h = bool(getattr(args, "lxf_analytic_gaussian_hellinger", False)) and analytic_lxf_supported
         save_lxf_c_matrix = bool(getattr(args, "lxf_save_c_matrix", False))
         c_matrix: np.ndarray | None
         delta_l: np.ndarray | None
+        lxf_bin_h: dict[str, np.ndarray] | None = None
         endpoint_mu = np.asarray([], dtype=np.float64)
         endpoint_cov_or_diag = np.asarray([], dtype=np.float64)
         endpoint_is_diag = False
+        if bin_all is None:
+            raise ValueError("linear-x-flow bin-likelihood Hellinger requires theta bin labels from the convergence subset.")
         if method_name.startswith("linear_x_flow_nonlinear_pca"):
             x_train_norm = (x_train - x_mean.reshape(1, -1)) / x_std.reshape(1, -1)
             if scheduled_lxf:
@@ -3954,7 +4039,8 @@ def _estimate_one(
                     pair_batch_size=int(getattr(args, "lxf_pair_batch_size", 65536)),
                 )
             delta_l = compute_delta_l_nf(c_matrix)
-            h_sym = symmetrize_nf(compute_h_directed_nf(delta_l))
+            lxf_bin_h = _lxf_bin_likelihood_hellinger(c_matrix, np.asarray(bin_all, dtype=np.int64), int(n_bins))
+            h_sym = lxf_bin_h["h_sym"]
         elif method_name == "linear_x_flow_low_rank_t":
             c_matrix = compute_ode_time_linear_x_flow_c_matrix(
                 model=model,
@@ -3969,21 +4055,39 @@ def _estimate_one(
                 pair_batch_size=int(getattr(args, "lxfs_pair_batch_size", 65536)),
             )
             delta_l = compute_delta_l_nf(c_matrix)
-            h_sym = symmetrize_nf(compute_h_directed_nf(delta_l))
+            lxf_bin_h = _lxf_bin_likelihood_hellinger(c_matrix, np.asarray(bin_all, dtype=np.int64), int(n_bins))
+            h_sym = lxf_bin_h["h_sym"]
             endpoint_mu = np.asarray([], dtype=np.float64)
             endpoint_cov_or_diag = np.asarray([], dtype=np.float64)
             endpoint_is_diag = False
         elif scheduled_lxf:
-            h_sym, endpoint_mu, endpoint_cov_or_diag, endpoint_is_diag = compute_linear_x_flow_analytic_hellinger_matrix(
+            endpoint_h_sym, endpoint_mu, endpoint_cov_or_diag, endpoint_is_diag = compute_linear_x_flow_analytic_hellinger_matrix(
                 model=model,
                 theta_all=theta_all,
                 device=dev,
                 solve_jitter=float(getattr(args, f"{lxf_prefix}_solve_jitter", 1e-6)),
                 quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)),
             )
-            c_matrix = None
-            delta_l = None
-            if save_lxf_c_matrix:
+            if analytic_lxf_h:
+                h_sym = endpoint_h_sym
+                c_matrix = None
+                delta_l = None
+            else:
+                c_matrix = compute_time_linear_x_flow_c_matrix(
+                    model=model,
+                    theta_all=theta_all,
+                    x_all=x_all,
+                    device=dev,
+                    x_mean=x_mean,
+                    x_std=x_std,
+                    solve_jitter=float(getattr(args, f"{lxf_prefix}_solve_jitter", 1e-6)),
+                    quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)),
+                    pair_batch_size=int(getattr(args, f"{lxf_prefix}_pair_batch_size", 65536)),
+                )
+                delta_l = compute_delta_l_nf(c_matrix)
+                lxf_bin_h = _lxf_bin_likelihood_hellinger(c_matrix, np.asarray(bin_all, dtype=np.int64), int(n_bins))
+                h_sym = lxf_bin_h["h_sym"]
+            if analytic_lxf_h and save_lxf_c_matrix:
                 c_matrix = compute_time_linear_x_flow_c_matrix(
                     model=model,
                     theta_all=theta_all,
@@ -3997,15 +4101,31 @@ def _estimate_one(
                 )
                 delta_l = compute_delta_l_nf(c_matrix)
         else:
-            h_sym, endpoint_mu, endpoint_cov_or_diag, endpoint_is_diag = compute_linear_x_flow_analytic_hellinger_matrix(
+            endpoint_h_sym, endpoint_mu, endpoint_cov_or_diag, endpoint_is_diag = compute_linear_x_flow_analytic_hellinger_matrix(
                 model=model,
                 theta_all=theta_all,
                 device=dev,
                 solve_jitter=float(getattr(args, f"{lxf_prefix}_solve_jitter", 1e-6)),
             )
-            c_matrix = None
-            delta_l = None
-            if save_lxf_c_matrix:
+            if analytic_lxf_h:
+                h_sym = endpoint_h_sym
+                c_matrix = None
+                delta_l = None
+            else:
+                c_matrix = compute_linear_x_flow_c_matrix(
+                    model=model,
+                    theta_all=theta_all,
+                    x_all=x_all,
+                    device=dev,
+                    x_mean=x_mean,
+                    x_std=x_std,
+                    solve_jitter=float(getattr(args, f"{lxf_prefix}_solve_jitter", 1e-6)),
+                    pair_batch_size=int(getattr(args, f"{lxf_prefix}_pair_batch_size", 65536)),
+                )
+                delta_l = compute_delta_l_nf(c_matrix)
+                lxf_bin_h = _lxf_bin_likelihood_hellinger(c_matrix, np.asarray(bin_all, dtype=np.int64), int(n_bins))
+                h_sym = lxf_bin_h["h_sym"]
+            if analytic_lxf_h and save_lxf_c_matrix:
                 c_matrix = compute_linear_x_flow_c_matrix(
                     model=model,
                     theta_all=theta_all,
@@ -4040,7 +4160,7 @@ def _estimate_one(
             h_field_method=np.asarray([method_name], dtype=object),
             h_eval_scalar_name=np.asarray(
                 [
-                    f"{method_name}_log_p_x_given_theta"
+                    f"{method_name}_bin_log_p_x_given_theta"
                     if not analytic_lxf_h
                     else f"{method_name}_analytic_gaussian_hellinger"
                 ],
@@ -4049,6 +4169,7 @@ def _estimate_one(
             sigma_eval=np.asarray([np.nan], dtype=np.float64),
             theta_field_method=np.asarray([method_name], dtype=object),
             lxf_analytic_gaussian_hellinger=np.bool_(analytic_lxf_h),
+            lxf_bin_likelihood_hellinger=np.bool_(not analytic_lxf_h),
             lxf_save_c_matrix=np.bool_(save_lxf_c_matrix),
             lxf_endpoint_mu=np.asarray(endpoint_mu, dtype=np.float64),
             lxf_endpoint_covariance_or_variance_diag=np.asarray(endpoint_cov_or_diag, dtype=np.float64),
@@ -4088,6 +4209,12 @@ def _estimate_one(
             h_payload["c_matrix"] = np.asarray(c_matrix, dtype=np.float64)
         if delta_l is not None:
             h_payload["delta_l_matrix"] = np.asarray(delta_l, dtype=np.float64)
+        if lxf_bin_h is not None:
+            h_payload["bin_log_likelihood_matrix"] = np.asarray(lxf_bin_h["bin_log_likelihood"], dtype=np.float64)
+            h_payload["bin_delta_l_matrix"] = np.asarray(lxf_bin_h["bin_delta_l"], dtype=np.float64)
+            h_payload["h_directed_bin_likelihood"] = np.asarray(lxf_bin_h["h_directed_bin"], dtype=np.float64)
+            h_payload["h_binned_bin_likelihood"] = np.asarray(lxf_bin_h["h_binned"], dtype=np.float64)
+            h_payload["bin_counts"] = np.asarray(lxf_bin_h["bin_counts"], dtype=np.int64)
         np.savez_compressed(
             os.path.join(output_dir, "h_matrix_results_theta_cov.npz"),
             **h_payload,

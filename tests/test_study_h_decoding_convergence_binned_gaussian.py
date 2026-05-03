@@ -64,6 +64,60 @@ def test_binned_gaussian_hellinger_fills_empty_bins_and_stays_finite() -> None:
     assert np.all((h2 >= 0.0) & (h2 <= 1.0))
 
 
+def test_lxf_bin_likelihood_hellinger_matches_hand_logmeanexp_example() -> None:
+    mod = _load_module()
+    c = np.asarray(
+        [
+            [0.0, math.log(0.5), math.log(0.25), math.log(0.25)],
+            [math.log(0.5), 0.0, math.log(0.25), math.log(0.125)],
+            [math.log(0.25), math.log(0.25), 0.0, math.log(0.5)],
+            [math.log(0.125), math.log(0.25), math.log(0.5), 0.0],
+        ],
+        dtype=np.float64,
+    )
+    bins = np.asarray([0, 0, 1, 1], dtype=np.int64)
+    out = mod._lxf_bin_likelihood_hellinger(c, bins, 2)
+
+    expected_bin_ll = np.column_stack(
+        [
+            np.log(np.mean(np.exp(c[:, [0, 1]]), axis=1)),
+            np.log(np.mean(np.exp(c[:, [2, 3]]), axis=1)),
+        ]
+    )
+    np.testing.assert_allclose(out["bin_log_likelihood"], expected_bin_ll, rtol=1e-12, atol=1e-12)
+    expected_delta = expected_bin_ll - expected_bin_ll[np.arange(4), bins][:, None]
+    np.testing.assert_allclose(out["bin_delta_l"], expected_delta, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(np.diag(out["h_binned"]), 0.0, rtol=0.0, atol=0.0)
+
+
+def test_lxf_bin_likelihood_hellinger_expanded_averages_back_to_binned() -> None:
+    mod = _load_module()
+    c = np.asarray(
+        [
+            [1.0, 0.0, -1.0, -2.0],
+            [0.5, 1.5, -1.5, -1.0],
+            [-2.0, -1.0, 1.0, 0.5],
+            [-1.5, -2.5, 0.0, 1.5],
+        ],
+        dtype=np.float64,
+    )
+    bins = np.asarray([0, 0, 1, 1], dtype=np.int64)
+    out = mod._lxf_bin_likelihood_hellinger(c, bins, 2)
+    h_binned_avg, _ = mod.vhb.average_matrix_by_bins(out["h_sym"], bins, 2)
+    np.testing.assert_allclose(h_binned_avg, out["h_binned"], rtol=1e-12, atol=1e-12)
+    assert np.all(out["h_sym"][bins[:, None] == bins[None, :]] == 0.0)
+
+
+def test_lxf_bin_likelihood_hellinger_empty_bins_are_nan() -> None:
+    mod = _load_module()
+    c = np.asarray([[0.0, -1.0], [-1.0, 0.0]], dtype=np.float64)
+    out = mod._lxf_bin_likelihood_hellinger(c, np.asarray([0, 2], dtype=np.int64), 3)
+    assert out["h_binned"].shape == (3, 3)
+    assert np.isnan(out["h_binned"][1, :]).all()
+    assert np.isnan(out["h_binned"][:, 1]).all()
+    assert np.isfinite(out["h_sym"]).all()
+
+
 def test_theta2_grid_binning_flattens_row_major() -> None:
     mod = _load_module()
     theta = np.asarray(
