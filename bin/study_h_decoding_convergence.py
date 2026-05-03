@@ -134,6 +134,7 @@ from fisher.gaussian_x_flow import (
 )
 from fisher.linear_x_flow import (
     ConditionalPCANonlinearLinearXFlowMLP,
+    ConditionalPCANonlinearTimeLinearXFlowMLP,
     ConditionalDiagonalLinearXFlowFiLMLP,
     ConditionalDiagonalLinearXFlowMLP,
     ConditionalLinearXFlowMLP,
@@ -142,14 +143,22 @@ from fisher.linear_x_flow import (
     ConditionalScalarLinearXFlowMLP,
     ConditionalThetaDiagonalLinearXFlowMLP,
     ConditionalTimeDiagonalLinearXFlowMLP,
+    ConditionalTimeLinearXFlowMLP,
+    ConditionalTimeLowRankLinearXFlowMLP,
+    ConditionalTimeRandomBasisLowRankLinearXFlowMLP,
+    ConditionalTimeScalarLinearXFlowMLP,
+    ConditionalTimeThetaDiagonalLinearXFlowMLP,
     compute_pca_nonlinear_linear_x_flow_c_matrix,
-    compute_time_diagonal_linear_x_flow_c_matrix,
+    compute_pca_nonlinear_time_linear_x_flow_c_matrix,
+    compute_time_linear_x_flow_c_matrix,
     compute_linear_x_flow_analytic_hellinger_matrix,
     fit_residual_pca_basis_from_linear_mean,
     compute_linear_x_flow_c_matrix,
     train_linear_x_flow,
     train_pca_nonlinear_linear_x_flow,
-    train_time_diagonal_linear_x_flow_schedule,
+    train_pca_nonlinear_time_linear_x_flow_schedule,
+    train_time_linear_x_flow_schedule,
+    fit_residual_pca_basis_from_time_linear_mean,
 )
 from fisher.linear_theta_flow import (
     ConditionalLinearThetaFlowMixtureMLP,
@@ -174,6 +183,21 @@ from fisher.contrastive_llr import (
     train_contrastive_llr,
     train_contrastive_soft_llr,
 )
+
+_TIME_LXF_METHODS = {
+    "linear_x_flow_t",
+    "linear_x_flow_scalar_t",
+    "linear_x_flow_diagonal_t",
+    "linear_x_flow_diagonal_theta_t",
+    "linear_x_flow_low_rank_t",
+    "linear_x_flow_low_rank_randb_t",
+    "linear_x_flow_nonlinear_pca_t",
+    "linear_x_flow_nonlinear_pca_scalar_t",
+    "linear_x_flow_nonlinear_pca_diagonal_t",
+    "linear_x_flow_nonlinear_pca_diagonal_theta_t",
+    "linear_x_flow_nonlinear_pca_low_rank_t",
+    "linear_x_flow_nonlinear_pca_low_rank_randb_t",
+}
 from fisher.gmm_z_decode import GMMZDecodeModel, compute_gmm_z_decode_c_matrix, train_gmm_z_decode
 from fisher.nf_hellinger import (
     ConditionalThetaNF,
@@ -963,7 +987,7 @@ def build_parser() -> argparse.ArgumentParser:
             "likelihood-ratio diagnostics are omitted."
         ),
     )
-    p.add_argument("--lxf-nlpca-dim", type=int, default=8, help="linear-x-flow-nonlinear-pca only: residual PCA dimension k.")
+    p.add_argument("--lxf-nlpca-dim", type=int, default=4, help="linear-x-flow-nonlinear-pca only: residual PCA dimension k.")
     p.add_argument("--lxf-nlpca-epochs", type=int, default=0, help="linear-x-flow-nonlinear-pca only: second-stage epochs; 0 uses --lxf-epochs.")
     p.add_argument("--lxf-nlpca-lr", type=float, default=0.0, help="linear-x-flow-nonlinear-pca only: second-stage learning rate; 0 uses --lxf-lr.")
     p.add_argument("--lxf-nlpca-hidden-dim", type=int, default=128, help="linear-x-flow-nonlinear-pca only: h_phi hidden width.")
@@ -1309,18 +1333,40 @@ def _normalize_linear_x_flow_method(tfm: str) -> str | None:
     aliases = {
         "linear-x-flow": "linear_x_flow",
         "linear_x_flow": "linear_x_flow",
+        "linear-x-flow-t": "linear_x_flow_t",
+        "linear_x_flow_t": "linear_x_flow_t",
         "linear-x-flow-scalar": "linear_x_flow_scalar",
         "linear_x_flow_scalar": "linear_x_flow_scalar",
+        "linear-x-flow-scalar-t": "linear_x_flow_scalar_t",
+        "linear_x_flow_scalar_t": "linear_x_flow_scalar_t",
         "linear-x-flow-diagonal": "linear_x_flow_diagonal",
         "linear_x_flow_diagonal": "linear_x_flow_diagonal",
         "linear-x-flow-diagonal-theta": "linear_x_flow_diagonal_theta",
         "linear_x_flow_diagonal_theta": "linear_x_flow_diagonal_theta",
+        "linear-x-flow-diagonal-theta-t": "linear_x_flow_diagonal_theta_t",
+        "linear_x_flow_diagonal_theta_t": "linear_x_flow_diagonal_theta_t",
         "linear-x-flow-low-rank": "linear_x_flow_low_rank",
         "linear_x_flow_low_rank": "linear_x_flow_low_rank",
+        "linear-x-flow-low-rank-t": "linear_x_flow_low_rank_t",
+        "linear_x_flow_low_rank_t": "linear_x_flow_low_rank_t",
         "linear-x-flow-low-rank-randb": "linear_x_flow_low_rank_randb",
         "linear_x_flow_low_rank_randb": "linear_x_flow_low_rank_randb",
+        "linear-x-flow-low-rank-randb-t": "linear_x_flow_low_rank_randb_t",
+        "linear_x_flow_low_rank_randb_t": "linear_x_flow_low_rank_randb_t",
         "linear-x-flow-nonlinear-pca": "linear_x_flow_nonlinear_pca",
         "linear_x_flow_nonlinear_pca": "linear_x_flow_nonlinear_pca",
+        "linear-x-flow-nonlinear-pca-t": "linear_x_flow_nonlinear_pca_t",
+        "linear_x_flow_nonlinear_pca_t": "linear_x_flow_nonlinear_pca_t",
+        "linear-x-flow-nonlinear-pca-scalar-t": "linear_x_flow_nonlinear_pca_scalar_t",
+        "linear_x_flow_nonlinear_pca_scalar_t": "linear_x_flow_nonlinear_pca_scalar_t",
+        "linear-x-flow-nonlinear-pca-diagonal-t": "linear_x_flow_nonlinear_pca_diagonal_t",
+        "linear_x_flow_nonlinear_pca_diagonal_t": "linear_x_flow_nonlinear_pca_diagonal_t",
+        "linear-x-flow-nonlinear-pca-diagonal-theta-t": "linear_x_flow_nonlinear_pca_diagonal_theta_t",
+        "linear_x_flow_nonlinear_pca_diagonal_theta_t": "linear_x_flow_nonlinear_pca_diagonal_theta_t",
+        "linear-x-flow-nonlinear-pca-low-rank-t": "linear_x_flow_nonlinear_pca_low_rank_t",
+        "linear_x_flow_nonlinear_pca_low_rank_t": "linear_x_flow_nonlinear_pca_low_rank_t",
+        "linear-x-flow-nonlinear-pca-low-rank-randb-t": "linear_x_flow_nonlinear_pca_low_rank_randb_t",
+        "linear_x_flow_nonlinear_pca_low_rank_randb_t": "linear_x_flow_nonlinear_pca_low_rank_randb_t",
         "linear-x-flow-diagonal-t": "linear_x_flow_diagonal_t",
         "linear_x_flow_diagonal_t": "linear_x_flow_diagonal_t",
     }
@@ -1497,7 +1543,7 @@ def _validate_gxf_cli(args: argparse.Namespace) -> None:
 
 def _validate_lxf_cli(args: argparse.Namespace) -> None:
     method = str(getattr(args, "theta_field_method", "linear_x_flow")).strip().lower()
-    scheduled = method == "linear_x_flow_diagonal_t"
+    scheduled = method in _TIME_LXF_METHODS
     prefix = "lxfs" if scheduled else "lxf"
     label = "--lxfs" if scheduled else "--lxf"
     if int(getattr(args, f"{prefix}_epochs", 0)) < 1:
@@ -1515,9 +1561,16 @@ def _validate_lxf_cli(args: argparse.Namespace) -> None:
         raise ValueError("--lxf-b-net must be one of: mlp, film.")
     if method != "linear_x_flow_diagonal" and b_net_kind != "mlp":
         raise ValueError("--lxf-b-net=film is only supported for linear_x_flow_diagonal.")
-    if method in ("linear_x_flow_low_rank", "linear_x_flow_low_rank_randb") and int(getattr(args, "lxf_low_rank_dim", 0)) < 1:
+    if method in (
+        "linear_x_flow_low_rank",
+        "linear_x_flow_low_rank_randb",
+        "linear_x_flow_low_rank_t",
+        "linear_x_flow_low_rank_randb_t",
+        "linear_x_flow_nonlinear_pca_low_rank_t",
+        "linear_x_flow_nonlinear_pca_low_rank_randb_t",
+    ) and int(getattr(args, "lxf_low_rank_dim", 0)) < 1:
         raise ValueError("--lxf-low-rank-dim must be >= 1.")
-    if method == "linear_x_flow_nonlinear_pca":
+    if method.startswith("linear_x_flow_nonlinear_pca"):
         if int(getattr(args, "lxf_nlpca_dim", 0)) < 1:
             raise ValueError("--lxf-nlpca-dim must be >= 1.")
         if int(getattr(args, "lxf_nlpca_epochs", 0)) < 0:
@@ -1532,7 +1585,7 @@ def _validate_lxf_cli(args: argparse.Namespace) -> None:
             raise ValueError("--lxf-nlpca-lambda-h must be >= 0.")
         if int(getattr(args, "lxf_nlpca_ode_steps", 0)) < 1:
             raise ValueError("--lxf-nlpca-ode-steps must be >= 1.")
-    if method == "linear_x_flow_low_rank_randb":
+    if method in ("linear_x_flow_low_rank_randb", "linear_x_flow_low_rank_randb_t", "linear_x_flow_nonlinear_pca_low_rank_randb_t"):
         if float(getattr(args, "lxf_randb_lambda_a", 0.0)) < 0.0:
             raise ValueError("--lxf-randb-lambda-a must be >= 0.")
         if float(getattr(args, "lxf_randb_lambda_s", 0.0)) < 0.0:
@@ -1544,7 +1597,7 @@ def _validate_lxf_cli(args: argparse.Namespace) -> None:
         if not (0.0 < te < 0.5):
             raise ValueError("--lxfs-t-eps must be in (0, 0.5).")
         path_schedule_from_name(str(getattr(args, "lxfs_path_schedule", "cosine")))
-        if method == "linear_x_flow_diagonal_t" and int(getattr(args, "lxfs_quadrature_steps", 0)) < 2:
+        if int(getattr(args, "lxfs_quadrature_steps", 0)) < 2:
             raise ValueError("--lxfs-quadrature-steps must be >= 2.")
     elif not (0.0 < te < 0.5):
         raise ValueError("--lxf-t-eps must be in (0, 0.5).")
@@ -1954,13 +2007,24 @@ def _validate_cli(args: argparse.Namespace) -> None:
         "gaussian_x_flow",
         "gaussian_x_flow_diagonal",
         "linear_x_flow",
+        "linear_x_flow_t",
         "linear_x_flow_scalar",
+        "linear_x_flow_scalar_t",
         "linear_x_flow_diagonal",
         "linear_x_flow_diagonal_theta",
+        "linear_x_flow_diagonal_theta_t",
         "linear_x_flow_diagonal_t",
         "linear_x_flow_low_rank",
+        "linear_x_flow_low_rank_t",
         "linear_x_flow_low_rank_randb",
+        "linear_x_flow_low_rank_randb_t",
         "linear_x_flow_nonlinear_pca",
+        "linear_x_flow_nonlinear_pca_t",
+        "linear_x_flow_nonlinear_pca_scalar_t",
+        "linear_x_flow_nonlinear_pca_diagonal_t",
+        "linear_x_flow_nonlinear_pca_diagonal_theta_t",
+        "linear_x_flow_nonlinear_pca_low_rank_t",
+        "linear_x_flow_nonlinear_pca_low_rank_randb_t",
         "linear_theta_flow",
         "nf_reduction",
         "gmm_z_decode",
@@ -3542,7 +3606,7 @@ def _estimate_one(
     lxf_norm = _normalize_linear_x_flow_method(tfm)
     if lxf_norm is not None:
         method_name = lxf_norm
-        scheduled_lxf = method_name == "linear_x_flow_diagonal_t"
+        scheduled_lxf = method_name in _TIME_LXF_METHODS
         lxf_prefix = "lxfs" if scheduled_lxf else "lxf"
         sched_name = str(getattr(args, "lxfs_path_schedule", "cosine")).strip().lower() if scheduled_lxf else ""
         dev = require_device(str(getattr(args, "device", "cuda")))
@@ -3570,6 +3634,7 @@ def _estimate_one(
 
         x_dim_lxf = int(x_all.shape[1])
         lxf_rank = int(getattr(args, "lxf_low_rank_dim", 4))
+        nlpca_time_base = method_name.removeprefix("linear_x_flow_nonlinear_pca_").removesuffix("_t") if method_name.startswith("linear_x_flow_nonlinear_pca_") else ""
         if method_name == "linear_x_flow_scalar":
             drift_type = "scalar"
             model = ConditionalScalarLinearXFlowMLP(
@@ -3577,6 +3642,15 @@ def _estimate_one(
                 x_dim=x_dim_lxf,
                 hidden_dim=int(getattr(args, f"{lxf_prefix}_hidden_dim", 128)),
                 depth=int(getattr(args, f"{lxf_prefix}_depth", 3)),
+            ).to(dev)
+        elif method_name == "linear_x_flow_scalar_t":
+            drift_type = "scalar_time"
+            model = ConditionalTimeScalarLinearXFlowMLP(
+                theta_dim=int(theta_all.shape[1]),
+                x_dim=x_dim_lxf,
+                hidden_dim=int(getattr(args, f"{lxf_prefix}_hidden_dim", 128)),
+                depth=int(getattr(args, f"{lxf_prefix}_depth", 3)),
+                quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)),
             ).to(dev)
         elif method_name == "linear_x_flow_diagonal":
             drift_type = "diagonal"
@@ -3605,6 +3679,15 @@ def _estimate_one(
                 hidden_dim=int(getattr(args, f"{lxf_prefix}_hidden_dim", 128)),
                 depth=int(getattr(args, f"{lxf_prefix}_depth", 3)),
             ).to(dev)
+        elif method_name == "linear_x_flow_diagonal_theta_t":
+            drift_type = "diagonal_theta_time"
+            model = ConditionalTimeThetaDiagonalLinearXFlowMLP(
+                theta_dim=int(theta_all.shape[1]),
+                x_dim=x_dim_lxf,
+                hidden_dim=int(getattr(args, f"{lxf_prefix}_hidden_dim", 128)),
+                depth=int(getattr(args, f"{lxf_prefix}_depth", 3)),
+                quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)),
+            ).to(dev)
         elif method_name == "linear_x_flow_diagonal_t":
             drift_type = "diagonal_time"
             model = ConditionalTimeDiagonalLinearXFlowMLP(
@@ -3625,6 +3708,18 @@ def _estimate_one(
                 hidden_dim=int(getattr(args, f"{lxf_prefix}_hidden_dim", 128)),
                 depth=int(getattr(args, f"{lxf_prefix}_depth", 3)),
             ).to(dev)
+        elif method_name == "linear_x_flow_low_rank_t":
+            if lxf_rank > x_dim_lxf:
+                raise ValueError(f"--lxf-low-rank-dim must be <= x_dim={x_dim_lxf}; got {lxf_rank}.")
+            drift_type = "low_rank_time"
+            model = ConditionalTimeLowRankLinearXFlowMLP(
+                theta_dim=int(theta_all.shape[1]),
+                x_dim=x_dim_lxf,
+                rank=lxf_rank,
+                hidden_dim=int(getattr(args, f"{lxf_prefix}_hidden_dim", 128)),
+                depth=int(getattr(args, f"{lxf_prefix}_depth", 3)),
+                quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)),
+            ).to(dev)
         elif method_name == "linear_x_flow_low_rank_randb":
             if lxf_rank > x_dim_lxf:
                 raise ValueError(f"--lxf-low-rank-dim must be <= x_dim={x_dim_lxf}; got {lxf_rank}.")
@@ -3638,13 +3733,56 @@ def _estimate_one(
                 lambda_a=float(getattr(args, "lxf_randb_lambda_a", 1e-4)),
                 lambda_s=float(getattr(args, "lxf_randb_lambda_s", 1e-4)),
             ).to(dev)
-        elif method_name == "linear_x_flow_nonlinear_pca":
+        elif method_name == "linear_x_flow_low_rank_randb_t":
+            if lxf_rank > x_dim_lxf:
+                raise ValueError(f"--lxf-low-rank-dim must be <= x_dim={x_dim_lxf}; got {lxf_rank}.")
+            drift_type = "low_rank_randb_time"
+            model = ConditionalTimeRandomBasisLowRankLinearXFlowMLP(
+                theta_dim=int(theta_all.shape[1]),
+                x_dim=x_dim_lxf,
+                rank=lxf_rank,
+                hidden_dim=int(getattr(args, f"{lxf_prefix}_hidden_dim", 128)),
+                depth=int(getattr(args, f"{lxf_prefix}_depth", 3)),
+                quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)),
+                lambda_a=float(getattr(args, "lxf_randb_lambda_a", 1e-4)),
+                lambda_s=float(getattr(args, "lxf_randb_lambda_s", 1e-4)),
+            ).to(dev)
+        elif method_name.startswith("linear_x_flow_nonlinear_pca") or method_name == "linear_x_flow_nonlinear_pca_t":
             drift_type = "nonlinear_pca_full_symmetric"
-            model = ConditionalLinearXFlowMLP(
+            model = (ConditionalTimeLinearXFlowMLP if method_name.endswith("_t") else ConditionalLinearXFlowMLP)(
                 theta_dim=int(theta_all.shape[1]),
                 x_dim=x_dim_lxf,
                 hidden_dim=int(getattr(args, f"{lxf_prefix}_hidden_dim", 128)),
                 depth=int(getattr(args, f"{lxf_prefix}_depth", 3)),
+                **({"quadrature_steps": int(getattr(args, "lxfs_quadrature_steps", 64))} if method_name.endswith("_t") else {}),
+            ).to(dev)
+        elif method_name == "linear_x_flow_nonlinear_pca_scalar_t":
+            drift_type = "nonlinear_pca_scalar_time"
+            model = ConditionalTimeScalarLinearXFlowMLP(theta_dim=int(theta_all.shape[1]), x_dim=x_dim_lxf, hidden_dim=int(getattr(args, f"{lxf_prefix}_hidden_dim", 128)), depth=int(getattr(args, f"{lxf_prefix}_depth", 3)), quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64))).to(dev)
+        elif method_name == "linear_x_flow_nonlinear_pca_diagonal_t":
+            drift_type = "nonlinear_pca_diagonal_time"
+            model = ConditionalTimeDiagonalLinearXFlowMLP(theta_dim=int(theta_all.shape[1]), x_dim=x_dim_lxf, hidden_dim=int(getattr(args, f"{lxf_prefix}_hidden_dim", 128)), depth=int(getattr(args, f"{lxf_prefix}_depth", 3)), quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64))).to(dev)
+        elif method_name == "linear_x_flow_nonlinear_pca_diagonal_theta_t":
+            drift_type = "nonlinear_pca_diagonal_theta_time"
+            model = ConditionalTimeThetaDiagonalLinearXFlowMLP(theta_dim=int(theta_all.shape[1]), x_dim=x_dim_lxf, hidden_dim=int(getattr(args, f"{lxf_prefix}_hidden_dim", 128)), depth=int(getattr(args, f"{lxf_prefix}_depth", 3)), quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64))).to(dev)
+        elif method_name == "linear_x_flow_nonlinear_pca_low_rank_t":
+            if lxf_rank > x_dim_lxf:
+                raise ValueError(f"--lxf-low-rank-dim must be <= x_dim={x_dim_lxf}; got {lxf_rank}.")
+            drift_type = "nonlinear_pca_low_rank_time"
+            model = ConditionalTimeLowRankLinearXFlowMLP(theta_dim=int(theta_all.shape[1]), x_dim=x_dim_lxf, rank=lxf_rank, hidden_dim=int(getattr(args, f"{lxf_prefix}_hidden_dim", 128)), depth=int(getattr(args, f"{lxf_prefix}_depth", 3)), quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64))).to(dev)
+        elif method_name == "linear_x_flow_nonlinear_pca_low_rank_randb_t":
+            if lxf_rank > x_dim_lxf:
+                raise ValueError(f"--lxf-low-rank-dim must be <= x_dim={x_dim_lxf}; got {lxf_rank}.")
+            drift_type = "nonlinear_pca_low_rank_randb_time"
+            model = ConditionalTimeRandomBasisLowRankLinearXFlowMLP(theta_dim=int(theta_all.shape[1]), x_dim=x_dim_lxf, rank=lxf_rank, hidden_dim=int(getattr(args, f"{lxf_prefix}_hidden_dim", 128)), depth=int(getattr(args, f"{lxf_prefix}_depth", 3)), quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)), lambda_a=float(getattr(args, "lxf_randb_lambda_a", 1e-4)), lambda_s=float(getattr(args, "lxf_randb_lambda_s", 1e-4))).to(dev)
+        elif method_name == "linear_x_flow_t":
+            drift_type = "full_symmetric_time"
+            model = ConditionalTimeLinearXFlowMLP(
+                theta_dim=int(theta_all.shape[1]),
+                x_dim=x_dim_lxf,
+                hidden_dim=int(getattr(args, f"{lxf_prefix}_hidden_dim", 128)),
+                depth=int(getattr(args, f"{lxf_prefix}_depth", 3)),
+                quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)),
             ).to(dev)
         else:
             drift_type = "full_symmetric"
@@ -3674,10 +3812,11 @@ def _estimate_one(
             log_every=max(1, int(getattr(args, "log_every", 50))),
             restore_best=bool(getattr(args, "lxf_restore_best", True)),
         )
-        if method_name == "linear_x_flow_diagonal_t":
-            train_out = train_time_diagonal_linear_x_flow_schedule(
+        if scheduled_lxf:
+            train_out = train_time_linear_x_flow_schedule(
                 **train_kwargs,
                 schedule=path_schedule_from_name(sched_name),
+                log_name=method_name,
             )
         else:
             train_out = train_linear_x_flow(**train_kwargs)
@@ -3685,74 +3824,101 @@ def _estimate_one(
         x_std = np.asarray(train_out["x_std"], dtype=np.float64)
         nonlinear_train_out: dict[str, Any] | None = None
         pca_basis = np.asarray([], dtype=np.float32)
-        analytic_lxf_h = method_name != "linear_x_flow_nonlinear_pca"
+        analytic_lxf_h = not method_name.startswith("linear_x_flow_nonlinear_pca")
         save_lxf_c_matrix = bool(getattr(args, "lxf_save_c_matrix", False))
         c_matrix: np.ndarray | None
         delta_l: np.ndarray | None
         endpoint_mu = np.asarray([], dtype=np.float64)
         endpoint_cov_or_diag = np.asarray([], dtype=np.float64)
         endpoint_is_diag = False
-        if method_name == "linear_x_flow_nonlinear_pca":
+        if method_name.startswith("linear_x_flow_nonlinear_pca"):
             x_train_norm = (x_train - x_mean.reshape(1, -1)) / x_std.reshape(1, -1)
-            pca_basis = fit_residual_pca_basis_from_linear_mean(
-                linear_model=cast(ConditionalLinearXFlowMLP, model),
-                theta_train=theta_train,
-                x_train_norm=x_train_norm,
-                pca_dim=int(getattr(args, "lxf_nlpca_dim", 8)),
-                device=dev,
-                solve_jitter=float(getattr(args, "lxf_solve_jitter", 1e-6)),
-            )
-            model = ConditionalPCANonlinearLinearXFlowMLP(
-                linear_model=cast(ConditionalLinearXFlowMLP, model),
-                pca_basis=pca_basis,
-                hidden_dim=int(getattr(args, "lxf_nlpca_hidden_dim", 128)),
-                depth=int(getattr(args, "lxf_nlpca_depth", 3)),
-            ).to(dev)
+            if scheduled_lxf:
+                pca_basis = fit_residual_pca_basis_from_time_linear_mean(
+                    linear_model=model,
+                    theta_train=theta_train,
+                    x_train_norm=x_train_norm,
+                    pca_dim=int(getattr(args, "lxf_nlpca_dim", 4)),
+                    device=dev,
+                    solve_jitter=float(getattr(args, "lxfs_solve_jitter", 1e-6)),
+                    quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)),
+                )
+                model = ConditionalPCANonlinearTimeLinearXFlowMLP(
+                    linear_model=model,
+                    pca_basis=pca_basis,
+                    schedule=path_schedule_from_name(sched_name),
+                    hidden_dim=int(getattr(args, "lxf_nlpca_hidden_dim", 128)),
+                    depth=int(getattr(args, "lxf_nlpca_depth", 3)),
+                    quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)),
+                ).to(dev)
+            else:
+                pca_basis = fit_residual_pca_basis_from_linear_mean(
+                    linear_model=cast(ConditionalLinearXFlowMLP, model),
+                    theta_train=theta_train,
+                    x_train_norm=x_train_norm,
+                    pca_dim=int(getattr(args, "lxf_nlpca_dim", 4)),
+                    device=dev,
+                    solve_jitter=float(getattr(args, "lxf_solve_jitter", 1e-6)),
+                )
+                model = ConditionalPCANonlinearLinearXFlowMLP(
+                    linear_model=cast(ConditionalLinearXFlowMLP, model),
+                    pca_basis=pca_basis,
+                    hidden_dim=int(getattr(args, "lxf_nlpca_hidden_dim", 128)),
+                    depth=int(getattr(args, "lxf_nlpca_depth", 3)),
+                ).to(dev)
             nlpca_epochs = int(getattr(args, "lxf_nlpca_epochs", 0))
             if nlpca_epochs <= 0:
-                nlpca_epochs = int(getattr(args, "lxf_epochs", 2000))
+                nlpca_epochs = int(getattr(args, f"{lxf_prefix}_epochs", 2000))
             nlpca_lr = float(getattr(args, "lxf_nlpca_lr", 0.0))
             if nlpca_lr <= 0.0:
-                nlpca_lr = float(getattr(args, "lxf_lr", 1e-3))
-            nonlinear_train_out = train_pca_nonlinear_linear_x_flow(
-                model=cast(ConditionalPCANonlinearLinearXFlowMLP, model),
-                theta_train=theta_train,
-                x_train=x_train,
-                theta_val=theta_val,
-                x_val=x_val,
-                device=dev,
-                x_mean=x_mean,
-                x_std=x_std,
-                epochs=nlpca_epochs,
-                batch_size=int(getattr(args, "lxf_batch_size", 1024)),
-                lr=nlpca_lr,
-                weight_decay=float(getattr(args, "lxf_weight_decay", 0.0)),
-                t_eps=float(getattr(args, "lxf_t_eps", 0.05)),
+                nlpca_lr = float(getattr(args, f"{lxf_prefix}_lr", 1e-3))
+            common_nlpca = dict(
+                theta_train=theta_train, x_train=x_train, theta_val=theta_val, x_val=x_val,
+                device=dev, x_mean=x_mean, x_std=x_std, epochs=nlpca_epochs,
+                batch_size=int(getattr(args, f"{lxf_prefix}_batch_size", 1024)),
+                lr=nlpca_lr, weight_decay=float(getattr(args, f"{lxf_prefix}_weight_decay", 0.0)),
+                t_eps=float(getattr(args, f"{lxf_prefix}_t_eps", 0.05)),
                 lambda_h=float(getattr(args, "lxf_nlpca_lambda_h", 0.0)),
                 freeze_linear=bool(getattr(args, "lxf_nlpca_freeze_linear", False)),
-                patience=int(getattr(args, "lxf_early_patience", 1000)),
-                min_delta=float(getattr(args, "lxf_early_min_delta", 1e-4)),
-                ema_alpha=float(getattr(args, "lxf_early_ema_alpha", 0.05)),
-                weight_ema_decay=float(getattr(args, "lxf_weight_ema_decay", 0.9)),
-                max_grad_norm=float(getattr(args, "lxf_max_grad_norm", 10.0)),
-                solve_jitter=float(getattr(args, "lxf_solve_jitter", 1e-6)),
-                log_every=max(1, int(getattr(args, "log_every", 50))),
-                restore_best=True,
+                patience=int(getattr(args, f"{lxf_prefix}_early_patience", 1000)),
+                min_delta=float(getattr(args, f"{lxf_prefix}_early_min_delta", 1e-4)),
+                ema_alpha=float(getattr(args, f"{lxf_prefix}_early_ema_alpha", 0.05)),
+                weight_ema_decay=float(getattr(args, f"{lxf_prefix}_weight_ema_decay", 0.9)),
+                max_grad_norm=float(getattr(args, f"{lxf_prefix}_max_grad_norm", 10.0)),
+                solve_jitter=float(getattr(args, f"{lxf_prefix}_solve_jitter", 1e-6)),
+                log_every=max(1, int(getattr(args, "log_every", 50))), restore_best=True,
             )
-            c_matrix = compute_pca_nonlinear_linear_x_flow_c_matrix(
-                model=cast(ConditionalPCANonlinearLinearXFlowMLP, model),
-                theta_all=theta_all,
-                x_all=x_all,
-                device=dev,
-                x_mean=x_mean,
-                x_std=x_std,
-                solve_jitter=float(getattr(args, "lxf_solve_jitter", 1e-6)),
-                ode_steps=int(getattr(args, "lxf_nlpca_ode_steps", 32)),
-                pair_batch_size=int(getattr(args, "lxf_pair_batch_size", 65536)),
-            )
+            if scheduled_lxf:
+                nonlinear_train_out = train_pca_nonlinear_time_linear_x_flow_schedule(
+                    model=cast(ConditionalPCANonlinearTimeLinearXFlowMLP, model),
+                    schedule=path_schedule_from_name(sched_name),
+                    quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)),
+                    log_name=method_name,
+                    **common_nlpca,
+                )
+                c_matrix = compute_pca_nonlinear_time_linear_x_flow_c_matrix(
+                    model=cast(ConditionalPCANonlinearTimeLinearXFlowMLP, model),
+                    theta_all=theta_all, x_all=x_all, device=dev, x_mean=x_mean, x_std=x_std,
+                    solve_jitter=float(getattr(args, "lxfs_solve_jitter", 1e-6)),
+                    quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)),
+                    ode_steps=int(getattr(args, "lxf_nlpca_ode_steps", 32)),
+                    pair_batch_size=int(getattr(args, "lxfs_pair_batch_size", 65536)),
+                )
+            else:
+                nonlinear_train_out = train_pca_nonlinear_linear_x_flow(
+                    model=cast(ConditionalPCANonlinearLinearXFlowMLP, model),
+                    **common_nlpca,
+                )
+                c_matrix = compute_pca_nonlinear_linear_x_flow_c_matrix(
+                    model=cast(ConditionalPCANonlinearLinearXFlowMLP, model),
+                    theta_all=theta_all, x_all=x_all, device=dev, x_mean=x_mean, x_std=x_std,
+                    solve_jitter=float(getattr(args, "lxf_solve_jitter", 1e-6)),
+                    ode_steps=int(getattr(args, "lxf_nlpca_ode_steps", 32)),
+                    pair_batch_size=int(getattr(args, "lxf_pair_batch_size", 65536)),
+                )
             delta_l = compute_delta_l_nf(c_matrix)
             h_sym = symmetrize_nf(compute_h_directed_nf(delta_l))
-        elif method_name == "linear_x_flow_diagonal_t":
+        elif scheduled_lxf:
             h_sym, endpoint_mu, endpoint_cov_or_diag, endpoint_is_diag = compute_linear_x_flow_analytic_hellinger_matrix(
                 model=model,
                 theta_all=theta_all,
@@ -3763,8 +3929,8 @@ def _estimate_one(
             c_matrix = None
             delta_l = None
             if save_lxf_c_matrix:
-                c_matrix = compute_time_diagonal_linear_x_flow_c_matrix(
-                    model=cast(ConditionalTimeDiagonalLinearXFlowMLP, model),
+                c_matrix = compute_time_linear_x_flow_c_matrix(
+                    model=model,
                     theta_all=theta_all,
                     x_all=x_all,
                     device=dev,
@@ -3830,13 +3996,13 @@ def _estimate_one(
             lxf_depth=np.int64(int(getattr(args, f"{lxf_prefix}_depth", 3))),
             lxf_b_net=np.asarray([lxf_b_net_saved], dtype=object),
             lxf_drift_type=np.asarray([drift_type], dtype=object),
-            lxf_low_rank_dim=np.int64(lxf_rank if method_name in ("linear_x_flow_low_rank", "linear_x_flow_low_rank_randb") else 0),
-            lxf_randb_lambda_a=np.float64(float(getattr(args, "lxf_randb_lambda_a", 1e-4)) if method_name == "linear_x_flow_low_rank_randb" else 0.0),
-            lxf_randb_lambda_s=np.float64(float(getattr(args, "lxf_randb_lambda_s", 1e-4)) if method_name == "linear_x_flow_low_rank_randb" else 0.0),
-            lxf_nlpca_dim=np.int64(int(getattr(args, "lxf_nlpca_dim", 8)) if method_name == "linear_x_flow_nonlinear_pca" else 0),
-            lxf_nlpca_lambda_h=np.float64(float(getattr(args, "lxf_nlpca_lambda_h", 0.0)) if method_name == "linear_x_flow_nonlinear_pca" else 0.0),
-            lxf_nlpca_freeze_linear=np.bool_(bool(getattr(args, "lxf_nlpca_freeze_linear", False)) if method_name == "linear_x_flow_nonlinear_pca" else False),
-            lxf_nlpca_ode_steps=np.int64(int(getattr(args, "lxf_nlpca_ode_steps", 32)) if method_name == "linear_x_flow_nonlinear_pca" else 0),
+            lxf_low_rank_dim=np.int64(lxf_rank if method_name in ("linear_x_flow_low_rank", "linear_x_flow_low_rank_t", "linear_x_flow_low_rank_randb", "linear_x_flow_low_rank_randb_t", "linear_x_flow_nonlinear_pca_low_rank_t", "linear_x_flow_nonlinear_pca_low_rank_randb_t") else 0),
+            lxf_randb_lambda_a=np.float64(float(getattr(args, "lxf_randb_lambda_a", 1e-4)) if method_name in ("linear_x_flow_low_rank_randb", "linear_x_flow_low_rank_randb_t", "linear_x_flow_nonlinear_pca_low_rank_randb_t") else 0.0),
+            lxf_randb_lambda_s=np.float64(float(getattr(args, "lxf_randb_lambda_s", 1e-4)) if method_name in ("linear_x_flow_low_rank_randb", "linear_x_flow_low_rank_randb_t", "linear_x_flow_nonlinear_pca_low_rank_randb_t") else 0.0),
+            lxf_nlpca_dim=np.int64(int(getattr(args, "lxf_nlpca_dim", 4)) if method_name.startswith("linear_x_flow_nonlinear_pca") else 0),
+            lxf_nlpca_lambda_h=np.float64(float(getattr(args, "lxf_nlpca_lambda_h", 0.0)) if method_name.startswith("linear_x_flow_nonlinear_pca") else 0.0),
+            lxf_nlpca_freeze_linear=np.bool_(bool(getattr(args, "lxf_nlpca_freeze_linear", False)) if method_name.startswith("linear_x_flow_nonlinear_pca") else False),
+            lxf_nlpca_ode_steps=np.int64(int(getattr(args, "lxf_nlpca_ode_steps", 32)) if method_name.startswith("linear_x_flow_nonlinear_pca") else 0),
             lxf_nlpca_pca_basis=np.asarray(pca_basis, dtype=np.float32),
             lxf_weight_ema_decay=np.float64(train_out.get("weight_ema_decay", float(getattr(args, f"{lxf_prefix}_weight_ema_decay", 0.9)))),
             lxf_weight_ema_enabled=np.bool_(train_out.get("weight_ema_enabled", False)),
@@ -3844,7 +4010,7 @@ def _estimate_one(
             lxf_restore_best=np.bool_(bool(getattr(args, "lxf_restore_best", True))),
             lxfs_path_schedule=np.asarray([sched_name], dtype=object),
             lxfs_scheduled_train=np.bool_(scheduled_lxf),
-            lxfs_quadrature_steps=np.int64(int(getattr(args, "lxfs_quadrature_steps", 64)) if method_name == "linear_x_flow_diagonal_t" else 0),
+            lxfs_quadrature_steps=np.int64(int(getattr(args, "lxfs_quadrature_steps", 64)) if scheduled_lxf else 0),
             lxf_x_mean=np.asarray(x_mean, dtype=np.float64),
             lxf_x_std=np.asarray(x_std, dtype=np.float64),
         )
@@ -3894,9 +4060,9 @@ def _estimate_one(
             lxf_fm_train=np.bool_(True),
             lxf_b_net=np.asarray([lxf_b_net_saved], dtype=object),
             lxf_drift_type=np.asarray([drift_type], dtype=object),
-            lxf_low_rank_dim=np.int64(lxf_rank if method_name in ("linear_x_flow_low_rank", "linear_x_flow_low_rank_randb") else 0),
-            lxf_randb_lambda_a=np.float64(float(getattr(args, "lxf_randb_lambda_a", 1e-4)) if method_name == "linear_x_flow_low_rank_randb" else 0.0),
-            lxf_randb_lambda_s=np.float64(float(getattr(args, "lxf_randb_lambda_s", 1e-4)) if method_name == "linear_x_flow_low_rank_randb" else 0.0),
+            lxf_low_rank_dim=np.int64(lxf_rank if method_name in ("linear_x_flow_low_rank", "linear_x_flow_low_rank_t", "linear_x_flow_low_rank_randb", "linear_x_flow_low_rank_randb_t", "linear_x_flow_nonlinear_pca_low_rank_t", "linear_x_flow_nonlinear_pca_low_rank_randb_t") else 0),
+            lxf_randb_lambda_a=np.float64(float(getattr(args, "lxf_randb_lambda_a", 1e-4)) if method_name in ("linear_x_flow_low_rank_randb", "linear_x_flow_low_rank_randb_t", "linear_x_flow_nonlinear_pca_low_rank_randb_t") else 0.0),
+            lxf_randb_lambda_s=np.float64(float(getattr(args, "lxf_randb_lambda_s", 1e-4)) if method_name in ("linear_x_flow_low_rank_randb", "linear_x_flow_low_rank_randb_t", "linear_x_flow_nonlinear_pca_low_rank_randb_t") else 0.0),
             lxf_nlpca_train_losses=np.asarray(nonlinear_train_out["train_losses"], dtype=np.float64) if nonlinear_train_out is not None else empty,
             lxf_nlpca_val_losses=np.asarray(nonlinear_train_out["val_losses"], dtype=np.float64) if nonlinear_train_out is not None else empty,
             lxf_nlpca_val_monitor_losses=np.asarray(nonlinear_train_out["val_monitor_losses"], dtype=np.float64) if nonlinear_train_out is not None else empty,
@@ -3904,17 +4070,17 @@ def _estimate_one(
             lxf_nlpca_stopped_epoch=np.int64(nonlinear_train_out["stopped_epoch"] if nonlinear_train_out is not None else 0),
             lxf_nlpca_stopped_early=np.bool_(nonlinear_train_out["stopped_early"] if nonlinear_train_out is not None else False),
             lxf_nlpca_best_val_smooth=np.float64(nonlinear_train_out["best_val_loss"] if nonlinear_train_out is not None else float("nan")),
-            lxf_nlpca_dim=np.int64(int(getattr(args, "lxf_nlpca_dim", 8)) if method_name == "linear_x_flow_nonlinear_pca" else 0),
-            lxf_nlpca_lambda_h=np.float64(float(getattr(args, "lxf_nlpca_lambda_h", 0.0)) if method_name == "linear_x_flow_nonlinear_pca" else 0.0),
-            lxf_nlpca_freeze_linear=np.bool_(bool(getattr(args, "lxf_nlpca_freeze_linear", False)) if method_name == "linear_x_flow_nonlinear_pca" else False),
-            lxf_nlpca_ode_steps=np.int64(int(getattr(args, "lxf_nlpca_ode_steps", 32)) if method_name == "linear_x_flow_nonlinear_pca" else 0),
+            lxf_nlpca_dim=np.int64(int(getattr(args, "lxf_nlpca_dim", 4)) if method_name.startswith("linear_x_flow_nonlinear_pca") else 0),
+            lxf_nlpca_lambda_h=np.float64(float(getattr(args, "lxf_nlpca_lambda_h", 0.0)) if method_name.startswith("linear_x_flow_nonlinear_pca") else 0.0),
+            lxf_nlpca_freeze_linear=np.bool_(bool(getattr(args, "lxf_nlpca_freeze_linear", False)) if method_name.startswith("linear_x_flow_nonlinear_pca") else False),
+            lxf_nlpca_ode_steps=np.int64(int(getattr(args, "lxf_nlpca_ode_steps", 32)) if method_name.startswith("linear_x_flow_nonlinear_pca") else 0),
             lxf_weight_ema_decay=np.float64(train_out.get("weight_ema_decay", float(getattr(args, f"{lxf_prefix}_weight_ema_decay", 0.9)))),
             lxf_weight_ema_enabled=np.bool_(train_out.get("weight_ema_enabled", False)),
             lxf_final_eval_weights=np.asarray([str(train_out.get("final_eval_weights", "raw"))], dtype=object),
             lxf_restore_best=np.bool_(bool(getattr(args, "lxf_restore_best", True))),
             lxfs_path_schedule=np.asarray([sched_name], dtype=object),
             lxfs_scheduled_train=np.bool_(scheduled_lxf),
-            lxfs_quadrature_steps=np.int64(int(getattr(args, "lxfs_quadrature_steps", 64)) if method_name == "linear_x_flow_diagonal_t" else 0),
+            lxfs_quadrature_steps=np.int64(int(getattr(args, "lxfs_quadrature_steps", 64)) if scheduled_lxf else 0),
         )
         loaded_lxf = SimpleNamespace(
             h_sym=np.asarray(h_sym, dtype=np.float64),
@@ -5105,16 +5271,26 @@ def _model_posterior_log_weights_for_fixed_x(
         return c, r"Gaussian X-flow (diagonal cov.) log $p(x|\theta)$"
     if method == "linear_x_flow":
         return c, r"Linear X-flow log $p(x|\theta)$"
+    if method == "linear_x_flow_t":
+        return c, r"Linear X-flow time-dependent $A(t)$ log $p(x|\theta)$"
     if method == "linear_x_flow_scalar":
         return c, r"Linear X-flow scalar $A$ log $p(x|\theta)$"
+    if method == "linear_x_flow_scalar_t":
+        return c, r"Linear X-flow scalar $A(t)$ log $p(x|\theta)$"
     if method == "linear_x_flow_diagonal":
         return c, r"Linear X-flow diagonal $A$ log $p(x|\theta)$"
     if method == "linear_x_flow_diagonal_theta":
         return c, r"Linear X-flow diagonal $A(\theta)$ log $p(x|\theta)$"
+    if method == "linear_x_flow_diagonal_theta_t":
+        return c, r"Linear X-flow diagonal $A(t,\theta)$ log $p(x|\theta)$"
     if method == "linear_x_flow_low_rank":
         return c, r"Linear X-flow low-rank $A$ log $p(x|\theta)$"
+    if method == "linear_x_flow_low_rank_t":
+        return c, r"Linear X-flow low-rank $A(t)$ log $p(x|\theta)$"
     if method == "linear_x_flow_low_rank_randb":
         return c, r"Linear X-flow random-basis low-rank $A$ log $p(x|\theta)$"
+    if method == "linear_x_flow_low_rank_randb_t":
+        return c, r"Linear X-flow random-basis low-rank $A(t)$ log $p(x|\theta)$"
     if method == "linear_x_flow_diagonal_t":
         return c, r"Linear X-flow diagonal $A(t)$ log $p(x|\theta)$"
     if method == "linear_theta_flow":
@@ -5802,18 +5978,28 @@ def _render_training_losses_panel(
             post_lab = "gaussian-x-flow-diagonal FM likelihood"
         elif tfm == "linear_x_flow":
             post_lab = "linear-x-flow FM likelihood"
+        elif tfm == "linear_x_flow_t":
+            post_lab = "linear-x-flow time FM likelihood"
         elif tfm == "linear_x_flow_scalar":
             post_lab = "linear-x-flow scalar FM likelihood"
+        elif tfm == "linear_x_flow_scalar_t":
+            post_lab = "linear-x-flow scalar-t FM likelihood"
         elif tfm == "linear_x_flow_diagonal":
             post_lab = "linear-x-flow diagonal FM likelihood"
         elif tfm == "linear_x_flow_diagonal_theta":
             post_lab = "linear-x-flow diagonal-theta FM likelihood"
+        elif tfm == "linear_x_flow_diagonal_theta_t":
+            post_lab = "linear-x-flow diagonal-theta-t FM likelihood"
         elif tfm == "linear_x_flow_diagonal_t":
             post_lab = "linear-x-flow diagonal-t FM likelihood"
         elif tfm == "linear_x_flow_low_rank":
             post_lab = "linear-x-flow low-rank FM likelihood"
+        elif tfm == "linear_x_flow_low_rank_t":
+            post_lab = "linear-x-flow low-rank-t FM likelihood"
         elif tfm == "linear_x_flow_low_rank_randb":
             post_lab = "linear-x-flow random-basis low-rank FM likelihood"
+        elif tfm == "linear_x_flow_low_rank_randb_t":
+            post_lab = "linear-x-flow random-basis low-rank-t FM likelihood"
         elif tfm == "linear_theta_flow":
             post_lab = "linear-theta-flow mixture FM likelihood"
         else:
@@ -6241,18 +6427,28 @@ def _save_combined_convergence_figure(
             post_lab = "gaussian-x-flow-diagonal FM likelihood"
         elif tfm == "linear_x_flow":
             post_lab = "linear-x-flow FM likelihood"
+        elif tfm == "linear_x_flow_t":
+            post_lab = "linear-x-flow time FM likelihood"
         elif tfm == "linear_x_flow_scalar":
             post_lab = "linear-x-flow scalar FM likelihood"
+        elif tfm == "linear_x_flow_scalar_t":
+            post_lab = "linear-x-flow scalar-t FM likelihood"
         elif tfm == "linear_x_flow_diagonal":
             post_lab = "linear-x-flow diagonal FM likelihood"
         elif tfm == "linear_x_flow_diagonal_theta":
             post_lab = "linear-x-flow diagonal-theta FM likelihood"
+        elif tfm == "linear_x_flow_diagonal_theta_t":
+            post_lab = "linear-x-flow diagonal-theta-t FM likelihood"
         elif tfm == "linear_x_flow_diagonal_t":
             post_lab = "linear-x-flow diagonal-t FM likelihood"
         elif tfm == "linear_x_flow_low_rank":
             post_lab = "linear-x-flow low-rank FM likelihood"
+        elif tfm == "linear_x_flow_low_rank_t":
+            post_lab = "linear-x-flow low-rank-t FM likelihood"
         elif tfm == "linear_x_flow_low_rank_randb":
             post_lab = "linear-x-flow random-basis low-rank FM likelihood"
+        elif tfm == "linear_x_flow_low_rank_randb_t":
+            post_lab = "linear-x-flow random-basis low-rank-t FM likelihood"
         elif tfm == "linear_theta_flow":
             post_lab = "linear-theta-flow mixture FM likelihood"
         else:
@@ -6705,12 +6901,17 @@ def _write_summary(
             f.write(f"gxf_diagonal_covariance: {_tfm_sum == 'gaussian_x_flow_diagonal'}\n")
         if _tfm_sum in (
             "linear_x_flow",
+            "linear_x_flow_t",
             "linear_x_flow_scalar",
+            "linear_x_flow_scalar_t",
             "linear_x_flow_diagonal",
             "linear_x_flow_diagonal_theta",
+            "linear_x_flow_diagonal_theta_t",
             "linear_x_flow_diagonal_t",
             "linear_x_flow_low_rank",
+            "linear_x_flow_low_rank_t",
             "linear_x_flow_low_rank_randb",
+            "linear_x_flow_low_rank_randb_t",
             "linear_x_flow_nonlinear_pca",
         ):
             f.write(f"lxf_epochs: {int(getattr(args, 'lxf_epochs', 0))}\n")
@@ -6752,7 +6953,7 @@ def _write_summary(
             f.write(f"ltf_pair_batch_size: {int(getattr(args, 'ltf_pair_batch_size', 0))}\n")
             f.write(f"lxfs_early_patience: {int(getattr(args, 'lxfs_early_patience', 0))}\n")
             f.write(f"lxfs_pair_batch_size: {int(getattr(args, 'lxfs_pair_batch_size', 0))}\n")
-        if _tfm_sum == "linear_x_flow_diagonal_t":
+        if _tfm_sum in _TIME_LXF_METHODS:
             f.write(f"lxfs_path_schedule: {getattr(args, 'lxfs_path_schedule', '')}\n")
             f.write(f"lxfs_epochs: {int(getattr(args, 'lxfs_epochs', 0))}\n")
             f.write(f"lxfs_batch_size: {int(getattr(args, 'lxfs_batch_size', 0))}\n")
@@ -7737,18 +7938,47 @@ def main(argv: list[str] | None = None) -> None:
         )
     elif tfm in (
         "linear_x_flow",
+        "linear_x_flow_t",
         "linear_x_flow_scalar",
+        "linear_x_flow_scalar_t",
         "linear_x_flow_diagonal",
+        "linear_x_flow_diagonal_theta_t",
         "linear_x_flow_low_rank",
+        "linear_x_flow_low_rank_t",
         "linear_x_flow_low_rank_randb",
+        "linear_x_flow_low_rank_randb_t",
         "linear_x_flow_nonlinear_pca",
+        "linear_x_flow_nonlinear_pca_t",
+        "linear_x_flow_nonlinear_pca_scalar_t",
+        "linear_x_flow_nonlinear_pca_diagonal_t",
+        "linear_x_flow_nonlinear_pca_diagonal_theta_t",
+        "linear_x_flow_nonlinear_pca_low_rank_t",
+        "linear_x_flow_nonlinear_pca_low_rank_randb_t",
         "linear_x_flow_diagonal_t",
     ):
         if tfm == "linear_x_flow_scalar":
             drift_desc = "scalar A=aI"
+        elif tfm == "linear_x_flow_scalar_t":
+            drift_desc = (
+                f"scalar time-dependent A(t)=a(t)I "
+                f"(path_schedule={str(getattr(args, 'lxfs_path_schedule', 'cosine'))}; "
+                f"quadrature_steps={int(getattr(args, 'lxfs_quadrature_steps', 64))})"
+            )
         elif tfm == "linear_x_flow_diagonal":
             _bn = str(getattr(args, "lxf_b_net", "mlp")).strip().lower()
             drift_desc = f"diagonal A; b_phi={'FiLM trunk' if _bn == 'film' else 'MLP'}"
+        elif tfm == "linear_x_flow_t":
+            drift_desc = (
+                f"full symmetric time-dependent A(t) "
+                f"(path_schedule={str(getattr(args, 'lxfs_path_schedule', 'cosine'))}; "
+                f"quadrature_steps={int(getattr(args, 'lxfs_quadrature_steps', 64))})"
+            )
+        elif tfm == "linear_x_flow_diagonal_theta_t":
+            drift_desc = (
+                f"theta- and time-dependent diagonal A(t,theta) "
+                f"(path_schedule={str(getattr(args, 'lxfs_path_schedule', 'cosine'))}; "
+                f"quadrature_steps={int(getattr(args, 'lxfs_quadrature_steps', 64))})"
+            )
         elif tfm == "linear_x_flow_diagonal_t":
             drift_desc = (
                 f"time-dependent diagonal A(t) "
@@ -7757,16 +7987,30 @@ def main(argv: list[str] | None = None) -> None:
             )
         elif tfm == "linear_x_flow_low_rank":
             drift_desc = f"low-rank A (rank={int(getattr(args, 'lxf_low_rank_dim', 4))})"
+        elif tfm == "linear_x_flow_low_rank_t":
+            drift_desc = (
+                f"time-dependent low-rank A(t) (rank={int(getattr(args, 'lxf_low_rank_dim', 4))}; "
+                f"path_schedule={str(getattr(args, 'lxfs_path_schedule', 'cosine'))}; "
+                f"quadrature_steps={int(getattr(args, 'lxfs_quadrature_steps', 64))})"
+            )
         elif tfm == "linear_x_flow_low_rank_randb":
             drift_desc = (
                 f"random-basis low-rank A (rank={int(getattr(args, 'lxf_low_rank_dim', 4))}; "
                 f"lambda_a={float(getattr(args, 'lxf_randb_lambda_a', 1e-4)):g}; "
                 f"lambda_s={float(getattr(args, 'lxf_randb_lambda_s', 1e-4)):g})"
             )
-        elif tfm == "linear_x_flow_nonlinear_pca":
+        elif tfm == "linear_x_flow_low_rank_randb_t":
             drift_desc = (
-                f"full symmetric A plus nonlinear residual PCA correction "
-                f"(k={int(getattr(args, 'lxf_nlpca_dim', 8))}; "
+                f"time-dependent random-basis low-rank A(t) (rank={int(getattr(args, 'lxf_low_rank_dim', 4))}; "
+                f"lambda_a={float(getattr(args, 'lxf_randb_lambda_a', 1e-4)):g}; "
+                f"lambda_s={float(getattr(args, 'lxf_randb_lambda_s', 1e-4)):g}; "
+                f"path_schedule={str(getattr(args, 'lxfs_path_schedule', 'cosine'))}; "
+                f"quadrature_steps={int(getattr(args, 'lxfs_quadrature_steps', 64))})"
+            )
+        elif tfm.startswith("linear_x_flow_nonlinear_pca"):
+            drift_desc = (
+                f"{'scheduled time-linear' if tfm in _TIME_LXF_METHODS else 'full symmetric A'} plus nonlinear residual PCA correction "
+                f"(k={int(getattr(args, 'lxf_nlpca_dim', 4))}; "
                 f"lambda_h={float(getattr(args, 'lxf_nlpca_lambda_h', 0.0)):g}; "
                 f"freeze_linear={bool(getattr(args, 'lxf_nlpca_freeze_linear', False))})"
             )
@@ -7774,7 +8018,7 @@ def main(argv: list[str] | None = None) -> None:
             drift_desc = "full symmetric A"
         print(
             f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
-            f"({drift_desc}; shared linear A x plus theta-MLP offset FM)",
+            f"({drift_desc}; {'scheduled affine bridge' if tfm in _TIME_LXF_METHODS else 'shared linear A x plus theta-MLP offset FM'})",
             flush=True,
         )
         print(
@@ -7783,7 +8027,7 @@ def main(argv: list[str] | None = None) -> None:
                 "fits residual PCA around the induced linear-flow mean, retrains with "
                 "U h_phi(U^T(x_t - t mu_linear(theta)), t, theta), then uses ODE log p(x|theta) "
                 "for C[i,j]=log p(x_i|theta_j), DeltaL=C-diag(C), and H via 1-sech(DeltaL/2)."
-                if tfm == "linear_x_flow_nonlinear_pca"
+                if tfm.startswith("linear_x_flow_nonlinear_pca")
                 else f"[convergence] {tfm} mode trains v(x,theta)=A x + b_phi(theta), "
                 "then uses the induced Gaussian with theta-dependent mean and shared covariance for "
                 "C[i,j]=log p(x_i|theta_j), DeltaL=C-diag(C), and H via 1-sech(DeltaL/2)."
@@ -7850,8 +8094,10 @@ def main(argv: list[str] | None = None) -> None:
             f"Unsupported --theta-field-method={tfm!r}; use "
             "theta_flow, theta-flow-autoencoder, theta_path_integral, x_flow, x-flow-autoencoder, x-flow-pca, "
             "ctsm_v, nf, contrastive, nf-reduction, gaussian-x-flow, gaussian-x-flow-diagonal, "
-            "linear-x-flow, linear-x-flow-scalar, linear-x-flow-diagonal, linear-x-flow-diagonal-theta, "
-            "linear-x-flow-low-rank, linear-x-flow-low-rank-randb, linear-x-flow-nonlinear-pca, "
+            "linear-x-flow, linear-x-flow-t, linear-x-flow-scalar, linear-x-flow-scalar-t, "
+            "linear-x-flow-diagonal, linear-x-flow-diagonal-theta, linear-x-flow-diagonal-theta-t, "
+            "linear-x-flow-low-rank, linear-x-flow-low-rank-t, linear-x-flow-low-rank-randb, "
+            "linear-x-flow-low-rank-randb-t, linear-x-flow-nonlinear-pca, "
             "linear-x-flow-diagonal-t, linear-theta-flow, gaussian-network, "
             "gaussian-network-diagonal, gaussian-network-diagonal-binned-pca, gaussian-network-low-rank, gaussian-network-autoencoder, "
             "or gaussian-network-diagonal-autoencoder."

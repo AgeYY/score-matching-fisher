@@ -9,6 +9,7 @@ import torch
 
 from fisher.linear_x_flow import (
     ConditionalPCANonlinearLinearXFlowMLP,
+    ConditionalPCANonlinearTimeLinearXFlowMLP,
     ConditionalDiagonalLinearXFlowFiLMLP,
     ConditionalDiagonalLinearXFlowMLP,
     ConditionalLinearXFlowMLP,
@@ -17,17 +18,27 @@ from fisher.linear_x_flow import (
     ConditionalScalarLinearXFlowMLP,
     ConditionalThetaDiagonalLinearXFlowMLP,
     ConditionalTimeDiagonalLinearXFlowMLP,
+    ConditionalTimeLinearXFlowMLP,
+    ConditionalTimeLowRankLinearXFlowMLP,
+    ConditionalTimeRandomBasisLowRankLinearXFlowMLP,
+    ConditionalTimeScalarLinearXFlowMLP,
+    ConditionalTimeThetaDiagonalLinearXFlowMLP,
     _phi_expm1_div_a,
     compute_linear_x_flow_analytic_hellinger_matrix,
     compute_linear_x_flow_c_matrix,
+    compute_pca_nonlinear_time_linear_x_flow_c_matrix,
+    compute_time_linear_x_flow_c_matrix,
     compute_time_diagonal_linear_x_flow_c_matrix,
     fit_residual_pca_basis_from_linear_mean,
+    fit_residual_pca_basis_from_time_linear_mean,
     gaussian_hellinger_sq_diag,
     gaussian_hellinger_sq_diag_matrix,
     gaussian_hellinger_sq_full,
     gaussian_hellinger_sq_shared_covariance_matrix,
     train_linear_x_flow,
     train_pca_nonlinear_linear_x_flow,
+    train_pca_nonlinear_time_linear_x_flow_schedule,
+    train_time_linear_x_flow_schedule,
     train_time_diagonal_linear_x_flow_schedule,
 )
 from fisher.gaussian_x_flow import path_schedule_from_name
@@ -452,6 +463,42 @@ class TestLinearXFlow(unittest.TestCase):
         self.assertEqual(tuple(lp.shape), (5,))
         self.assertTrue(torch.all(torch.isfinite(lp)))
 
+    def test_time_lxf_variants_forward_endpoint_and_likelihood_finite(self) -> None:
+        torch.manual_seed(43)
+        theta = torch.randn(4, 2)
+        x = torch.randn(4, 3)
+        t = torch.linspace(0.1, 0.9, 4).reshape(-1, 1)
+        models = (
+            ConditionalTimeLinearXFlowMLP(theta_dim=2, x_dim=3, hidden_dim=8, depth=1, quadrature_steps=5),
+            ConditionalTimeScalarLinearXFlowMLP(theta_dim=2, x_dim=3, hidden_dim=8, depth=1, quadrature_steps=5),
+            ConditionalTimeThetaDiagonalLinearXFlowMLP(theta_dim=2, x_dim=3, hidden_dim=8, depth=1, quadrature_steps=5),
+            ConditionalTimeLowRankLinearXFlowMLP(theta_dim=2, x_dim=3, rank=2, hidden_dim=8, depth=1, quadrature_steps=5),
+            ConditionalTimeRandomBasisLowRankLinearXFlowMLP(theta_dim=2, x_dim=3, rank=2, hidden_dim=8, depth=1, quadrature_steps=5),
+        )
+        for model in models:
+            with self.subTest(model=type(model).__name__):
+                v = model(x, theta, t)
+                self.assertEqual(tuple(v.shape), (4, 3))
+                self.assertTrue(torch.all(torch.isfinite(v)))
+                h, mu, cov_or_var, is_diag = compute_linear_x_flow_analytic_hellinger_matrix(
+                    model=model,
+                    theta_all=theta.detach().cpu().numpy(),
+                    device=torch.device("cpu"),
+                    quadrature_steps=5,
+                )
+                self.assertEqual(tuple(h.shape), (4, 4))
+                self.assertEqual(tuple(mu.shape), (4, 3))
+                self.assertTrue(np.isfinite(cov_or_var).all())
+                self.assertTrue(np.isfinite(h).all())
+                np.testing.assert_allclose(h, h.T, atol=1e-8)
+                np.testing.assert_allclose(np.diag(h), 0.0, atol=1e-8)
+                if isinstance(model, (ConditionalTimeScalarLinearXFlowMLP, ConditionalTimeThetaDiagonalLinearXFlowMLP)):
+                    self.assertTrue(is_diag)
+                    self.assertEqual(tuple(cov_or_var.shape), (4, 3))
+                else:
+                    self.assertFalse(is_diag)
+                    self.assertIn(cov_or_var.ndim, (2, 3))
+
     def test_train_time_diagonal_schedule_one_epoch_finite(self) -> None:
         torch.manual_seed(42)
         rng = np.random.default_rng(42)
@@ -487,6 +534,154 @@ class TestLinearXFlow(unittest.TestCase):
             pair_batch_size=64,
         )
         self.assertEqual(tuple(c.shape), (6, 6))
+        self.assertTrue(np.all(np.isfinite(c)))
+
+    def test_train_time_full_schedule_linear_one_epoch_finite(self) -> None:
+        torch.manual_seed(44)
+        rng = np.random.default_rng(44)
+        theta = rng.normal(size=(24, 1)).astype(np.float64)
+        x = np.concatenate([theta, -theta], axis=1) + 0.1 * rng.normal(size=(24, 2))
+        m = ConditionalTimeLinearXFlowMLP(theta_dim=1, x_dim=2, hidden_dim=8, depth=1, quadrature_steps=5)
+        out = train_time_linear_x_flow_schedule(
+            model=m,
+            theta_train=theta[:16],
+            x_train=x[:16],
+            theta_val=theta[16:],
+            x_val=x[16:],
+            device=torch.device("cpu"),
+            schedule=path_schedule_from_name("linear"),
+            epochs=1,
+            batch_size=8,
+            lr=1e-3,
+            t_eps=1e-3,
+            patience=0,
+            log_every=1,
+            weight_ema_decay=0.0,
+            log_name="linear_x_flow_t",
+        )
+        self.assertEqual(len(out["train_losses"]), 1)
+        self.assertTrue(np.isfinite(out["train_losses"][0]))
+        c = compute_time_linear_x_flow_c_matrix(
+            model=m,
+            theta_all=theta[:6],
+            x_all=x[:6],
+            device=torch.device("cpu"),
+            x_mean=out["x_mean"],
+            x_std=out["x_std"],
+            quadrature_steps=5,
+            pair_batch_size=64,
+        )
+        self.assertEqual(tuple(c.shape), (6, 6))
+        self.assertTrue(np.all(np.isfinite(c)))
+
+    def test_time_pca_nonlinear_zero_init_matches_base_velocity_and_centering(self) -> None:
+        torch.manual_seed(45)
+        sched = path_schedule_from_name("linear")
+        base = ConditionalTimeLinearXFlowMLP(theta_dim=1, x_dim=3, hidden_dim=8, depth=1, quadrature_steps=5)
+        model = ConditionalPCANonlinearTimeLinearXFlowMLP(
+            linear_model=base,
+            pca_basis=torch.eye(3)[:, :2],
+            schedule=sched,
+            hidden_dim=8,
+            depth=1,
+            quadrature_steps=5,
+        )
+        theta = torch.randn(4, 1)
+        x = torch.randn(4, 3)
+        t = torch.linspace(0.2, 0.8, 4).reshape(-1, 1)
+        self.assertTrue(torch.allclose(model(x, theta, t), base(x, theta, t), atol=1e-6))
+        _, z, h = model.nonlinear_correction(x, t, theta)
+        mu = model.linear_mean(theta)
+        expected_z = (x - t * mu) @ model.U
+        self.assertTrue(torch.allclose(z, expected_z, atol=1e-6))
+        self.assertTrue(torch.allclose(h, torch.zeros_like(h), atol=1e-6))
+
+    def test_time_pca_nonlinear_divergence_and_log_prob_finite_variants(self) -> None:
+        torch.manual_seed(46)
+        theta = torch.randn(3, 2)
+        x = torch.randn(3, 2)
+        t = torch.full((3, 1), 0.5)
+        sched = path_schedule_from_name("cosine")
+        bases = (
+            ConditionalTimeLinearXFlowMLP(theta_dim=2, x_dim=2, hidden_dim=8, depth=1, quadrature_steps=5),
+            ConditionalTimeDiagonalLinearXFlowMLP(theta_dim=2, x_dim=2, hidden_dim=8, depth=1, quadrature_steps=5),
+            ConditionalTimeThetaDiagonalLinearXFlowMLP(theta_dim=2, x_dim=2, hidden_dim=8, depth=1, quadrature_steps=5),
+            ConditionalTimeLowRankLinearXFlowMLP(theta_dim=2, x_dim=2, rank=1, hidden_dim=8, depth=1, quadrature_steps=5),
+        )
+        for base in bases:
+            with self.subTest(model=type(base).__name__):
+                model = ConditionalPCANonlinearTimeLinearXFlowMLP(
+                    linear_model=base,
+                    pca_basis=torch.eye(2)[:, :1],
+                    schedule=sched,
+                    hidden_dim=8,
+                    depth=1,
+                    quadrature_steps=5,
+                )
+                div = model.divergence(x, theta, t)
+                self.assertEqual(tuple(div.shape), (3,))
+                self.assertTrue(torch.all(torch.isfinite(div)))
+                lp = model.log_prob_normalized(x, theta, quadrature_steps=5, ode_steps=2)
+                self.assertEqual(tuple(lp.shape), (3,))
+                self.assertTrue(torch.all(torch.isfinite(lp)))
+
+    def test_train_time_pca_nonlinear_one_epoch_and_c_matrix_finite(self) -> None:
+        torch.manual_seed(47)
+        rng = np.random.default_rng(47)
+        theta = rng.normal(size=(24, 1)).astype(np.float64)
+        x = np.concatenate([theta, -theta], axis=1) + 0.1 * rng.normal(size=(24, 2))
+        base = ConditionalTimeLinearXFlowMLP(theta_dim=1, x_dim=2, hidden_dim=8, depth=1, quadrature_steps=5)
+        x_mean = np.mean(x[:16], axis=0)
+        x_std = np.maximum(np.std(x[:16], axis=0), 1e-6)
+        pca = fit_residual_pca_basis_from_time_linear_mean(
+            linear_model=base,
+            theta_train=theta[:16],
+            x_train_norm=(x[:16] - x_mean) / x_std,
+            pca_dim=1,
+            device=torch.device("cpu"),
+            quadrature_steps=5,
+        )
+        model = ConditionalPCANonlinearTimeLinearXFlowMLP(
+            linear_model=base,
+            pca_basis=pca,
+            schedule=path_schedule_from_name("linear"),
+            hidden_dim=8,
+            depth=1,
+            quadrature_steps=5,
+        )
+        out = train_pca_nonlinear_time_linear_x_flow_schedule(
+            model=model,
+            theta_train=theta[:16],
+            x_train=x[:16],
+            theta_val=theta[16:],
+            x_val=x[16:],
+            device=torch.device("cpu"),
+            x_mean=x_mean,
+            x_std=x_std,
+            schedule=path_schedule_from_name("linear"),
+            epochs=1,
+            batch_size=8,
+            lr=1e-3,
+            t_eps=1e-3,
+            patience=0,
+            log_every=1,
+            weight_ema_decay=0.0,
+            quadrature_steps=5,
+        )
+        self.assertEqual(len(out["train_losses"]), 1)
+        self.assertTrue(np.isfinite(out["train_losses"][0]))
+        c = compute_pca_nonlinear_time_linear_x_flow_c_matrix(
+            model=model,
+            theta_all=theta[:4],
+            x_all=x[:4],
+            device=torch.device("cpu"),
+            x_mean=x_mean,
+            x_std=x_std,
+            quadrature_steps=5,
+            ode_steps=2,
+            pair_batch_size=32,
+        )
+        self.assertEqual(tuple(c.shape), (4, 4))
         self.assertTrue(np.all(np.isfinite(c)))
 
 if __name__ == "__main__":

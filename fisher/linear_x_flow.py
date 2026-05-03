@@ -61,6 +61,40 @@ def _as_2d_float64(a: np.ndarray, *, name: str) -> np.ndarray:
     return arr
 
 
+def _as_col_t(t: torch.Tensor, *, batch: int | None = None) -> torch.Tensor:
+    if t.ndim == 0:
+        t = t.reshape(1, 1)
+    elif t.ndim == 1:
+        t = t.unsqueeze(-1)
+    if t.ndim != 2 or int(t.shape[1]) != 1:
+        raise ValueError("t must have shape [B] or [B, 1].")
+    if batch is not None and int(t.shape[0]) == 1 and int(batch) > 1:
+        t = t.expand(int(batch), 1)
+    return t
+
+
+def _make_mlp(
+    *,
+    in_dim: int,
+    out_dim: int,
+    hidden_dim: int,
+    depth: int,
+    final_gain: float = 0.01,
+    final_bias: float = 0.0,
+) -> nn.Sequential:
+    layers: list[nn.Module] = []
+    cur = int(in_dim)
+    for _ in range(int(depth)):
+        layers.append(nn.Linear(cur, int(hidden_dim)))
+        layers.append(nn.SiLU())
+        cur = int(hidden_dim)
+    out = nn.Linear(cur, int(out_dim))
+    nn.init.xavier_uniform_(out.weight, gain=float(final_gain))
+    nn.init.constant_(out.bias, float(final_bias))
+    layers.append(out)
+    return nn.Sequential(*layers)
+
+
 def gaussian_hellinger_sq_full(
     mu1: np.ndarray,
     cov1: np.ndarray,
@@ -180,7 +214,14 @@ def linear_x_flow_endpoint_gaussian(
     theta_t = torch.from_numpy(theta.astype(np.float32, copy=False)).to(device)
     model.eval()
     with torch.no_grad():
-        if isinstance(model, ConditionalTimeDiagonalLinearXFlowMLP):
+        if isinstance(
+            model,
+            (
+                ConditionalTimeDiagonalLinearXFlowMLP,
+                ConditionalTimeScalarLinearXFlowMLP,
+                ConditionalTimeThetaDiagonalLinearXFlowMLP,
+            ),
+        ):
             mu_t, var_t = model.endpoint_mean_covariance_diag(
                 theta_t,
                 solve_jitter=float(solve_jitter),
@@ -190,6 +231,29 @@ def linear_x_flow_endpoint_gaussian(
                 mu_t.detach().cpu().numpy().astype(np.float64),
                 var_t.detach().cpu().numpy().astype(np.float64),
                 True,
+            )
+        if isinstance(
+            model,
+            (
+                ConditionalTimeLinearXFlowMLP,
+                ConditionalTimeLowRankLinearXFlowMLP,
+                ConditionalTimeRandomBasisLowRankLinearXFlowMLP,
+            ),
+        ):
+            mu_t, cov_t = model.endpoint_mean_covariance(
+                theta_t,
+                solve_jitter=float(solve_jitter),
+                quadrature_steps=quadrature_steps,
+            )
+            cov_np = cov_t.detach().cpu().numpy().astype(np.float64)
+            if cov_np.ndim == 3 and cov_np.shape[0] == theta.shape[0]:
+                cov0 = cov_np[0]
+                if np.allclose(cov_np, cov0.reshape(1, *cov0.shape), rtol=1e-5, atol=1e-7):
+                    cov_np = cov0
+            return (
+                mu_t.detach().cpu().numpy().astype(np.float64),
+                cov_np,
+                False,
             )
         if hasattr(model, "endpoint_mean_covariance_diag"):
             mu_t, var_t = model.endpoint_mean_covariance_diag(theta_t, solve_jitter=float(solve_jitter))  # type: ignore[attr-defined]
@@ -226,6 +290,19 @@ def compute_linear_x_flow_analytic_hellinger_matrix(
     )
     if is_diag:
         h = gaussian_hellinger_sq_diag_matrix(mu, cov_or_diag, jitter=float(solve_jitter) * 1e-3)
+    elif cov_or_diag.ndim == 3:
+        n = int(mu.shape[0])
+        h = np.zeros((n, n), dtype=np.float64)
+        for i in range(n):
+            for j in range(i + 1, n):
+                h_ij = gaussian_hellinger_sq_full(
+                    mu[i],
+                    cov_or_diag[i],
+                    mu[j],
+                    cov_or_diag[j],
+                    jitter=float(solve_jitter) * 1e-3,
+                )
+                h[i, j] = h[j, i] = h_ij
     else:
         h = gaussian_hellinger_sq_shared_covariance_matrix(mu, cov_or_diag, jitter=float(solve_jitter) * 1e-3)
     return h, mu, cov_or_diag, bool(is_diag)
@@ -705,6 +782,481 @@ class ConditionalTimeDiagonalLinearXFlowMLP(nn.Module):
         ) + logjac
 
 
+class _BaseTimeLinearXFlowMLP(nn.Module):
+    """Shared utilities for scheduled time-dependent linear X-flow models."""
+
+    endpoint_is_diagonal = False
+
+    def __init__(
+        self,
+        *,
+        theta_dim: int,
+        x_dim: int,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        quadrature_steps: int = 64,
+    ) -> None:
+        super().__init__()
+        if int(theta_dim) < 1:
+            raise ValueError("theta_dim must be >= 1.")
+        if int(x_dim) < 1:
+            raise ValueError("x_dim must be >= 1.")
+        if int(hidden_dim) < 1:
+            raise ValueError("hidden_dim must be >= 1.")
+        if int(depth) < 1:
+            raise ValueError("depth must be >= 1.")
+        if int(quadrature_steps) < 2:
+            raise ValueError("quadrature_steps must be >= 2.")
+        self.theta_dim = int(theta_dim)
+        self.x_dim = int(x_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.depth = int(depth)
+        self.quadrature_steps = int(quadrature_steps)
+        self.b_net = _make_mlp(
+            in_dim=self.theta_dim + 1,
+            out_dim=self.x_dim,
+            hidden_dim=self.hidden_dim,
+            depth=self.depth,
+            final_gain=0.01,
+            final_bias=0.0,
+        )
+
+    def b(self, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        t = _as_col_t(t, batch=int(theta.shape[0]))
+        return self.b_net(torch.cat([t, theta], dim=1))
+
+    def A(self, t: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
+
+    def regularization_loss(self) -> torch.Tensor | None:
+        return None
+
+    def forward(self, x: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        t = _as_col_t(t, batch=int(x.shape[0]))
+        a = self.A(t)
+        b = self.b(theta, t)
+        if a.ndim == 2:
+            return x @ a.transpose(0, 1) + b
+        return torch.bmm(a, x.unsqueeze(-1)).squeeze(-1) + b
+
+    def endpoint_mean_covariance(
+        self,
+        theta: torch.Tensor,
+        *,
+        solve_jitter: float = 1e-6,
+        quadrature_steps: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        q = self.quadrature_steps if quadrature_steps is None else int(quadrature_steps)
+        if q < 2:
+            raise ValueError("quadrature_steps must be >= 2.")
+        batch = int(theta.shape[0])
+        d = int(self.x_dim)
+        mu = torch.zeros(batch, d, dtype=theta.dtype, device=theta.device)
+        cov = torch.eye(d, dtype=theta.dtype, device=theta.device).reshape(1, d, d).expand(batch, d, d).clone()
+        dt = 1.0 / float(q)
+        for k in range(q):
+            tk = torch.full((batch, 1), (float(k) + 0.5) / float(q), dtype=theta.dtype, device=theta.device)
+            a = self.A(tk)
+            if a.ndim == 2:
+                a = a.unsqueeze(0).expand(batch, d, d)
+            b = self.b(theta, tk)
+            mu = mu + dt * (torch.bmm(a, mu.unsqueeze(-1)).squeeze(-1) + b)
+            cov = cov + dt * (torch.bmm(a, cov) + torch.bmm(cov, a.transpose(1, 2)))
+            cov = 0.5 * (cov + cov.transpose(1, 2))
+        eye = torch.eye(d, dtype=theta.dtype, device=theta.device).reshape(1, d, d)
+        cov = 0.5 * (cov + cov.transpose(1, 2)) + float(solve_jitter) * eye
+        return mu, cov
+
+    def log_prob_normalized(
+        self,
+        x_norm: torch.Tensor,
+        theta: torch.Tensor,
+        *,
+        solve_jitter: float = 1e-6,
+        quadrature_steps: int | None = None,
+    ) -> torch.Tensor:
+        if x_norm.ndim == 1:
+            x_norm = x_norm.unsqueeze(0)
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        if x_norm.shape[0] != theta.shape[0]:
+            raise ValueError("x and theta batch sizes must match.")
+        mu, cov = self.endpoint_mean_covariance(
+            theta,
+            solve_jitter=float(solve_jitter),
+            quadrature_steps=quadrature_steps,
+        )
+        d = int(x_norm.shape[1])
+        eye = torch.eye(d, dtype=x_norm.dtype, device=x_norm.device).reshape(1, d, d)
+        l = torch.linalg.cholesky(cov + float(solve_jitter) * eye)
+        diff = x_norm - mu
+        z = torch.cholesky_solve(diff.unsqueeze(-1), l).squeeze(-1)
+        quad = torch.sum(diff * z, dim=1)
+        log_det = 2.0 * torch.sum(torch.log(torch.clamp(torch.diagonal(l, dim1=-2, dim2=-1), min=1e-12)), dim=1)
+        return -0.5 * (quad + log_det + float(d) * math.log(2.0 * math.pi))
+
+    def log_prob_observed(
+        self,
+        x_raw: torch.Tensor,
+        theta: torch.Tensor,
+        *,
+        x_mean: torch.Tensor,
+        x_std: torch.Tensor,
+        solve_jitter: float = 1e-6,
+        quadrature_steps: int | None = None,
+    ) -> torch.Tensor:
+        z = (x_raw - x_mean) / x_std
+        logjac = -torch.sum(torch.log(x_std))
+        return self.log_prob_normalized(
+            z,
+            theta,
+            solve_jitter=float(solve_jitter),
+            quadrature_steps=quadrature_steps,
+        ) + logjac
+
+
+class ConditionalTimeLinearXFlowMLP(_BaseTimeLinearXFlowMLP):
+    """Full symmetric time-dependent drift ``A(t)`` plus offset ``b(t, theta)``."""
+
+    def __init__(
+        self,
+        *,
+        theta_dim: int,
+        x_dim: int,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        quadrature_steps: int = 64,
+    ) -> None:
+        super().__init__(
+            theta_dim=theta_dim,
+            x_dim=x_dim,
+            hidden_dim=hidden_dim,
+            depth=depth,
+            quadrature_steps=quadrature_steps,
+        )
+        self.a_net = _make_mlp(
+            in_dim=1,
+            out_dim=self.x_dim * self.x_dim,
+            hidden_dim=self.hidden_dim,
+            depth=self.depth,
+            final_gain=0.01,
+            final_bias=0.0,
+        )
+
+    def A(self, t: torch.Tensor) -> torch.Tensor:
+        t = _as_col_t(t)
+        raw = self.a_net(t).reshape(int(t.shape[0]), self.x_dim, self.x_dim)
+        eye = torch.eye(self.x_dim, dtype=raw.dtype, device=raw.device).reshape(1, self.x_dim, self.x_dim)
+        return 0.5 * (raw + raw.transpose(1, 2)) + 1e-3 * eye
+
+
+class ConditionalTimeScalarLinearXFlowMLP(_BaseTimeLinearXFlowMLP):
+    """Scalar time-dependent drift ``A(t)=a(t) I`` plus offset ``b(t, theta)``."""
+
+    endpoint_is_diagonal = True
+
+    def __init__(
+        self,
+        *,
+        theta_dim: int,
+        x_dim: int,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        quadrature_steps: int = 64,
+    ) -> None:
+        super().__init__(
+            theta_dim=theta_dim,
+            x_dim=x_dim,
+            hidden_dim=hidden_dim,
+            depth=depth,
+            quadrature_steps=quadrature_steps,
+        )
+        self.a_net = _make_mlp(
+            in_dim=1,
+            out_dim=1,
+            hidden_dim=self.hidden_dim,
+            depth=self.depth,
+            final_gain=0.01,
+            final_bias=1e-3,
+        )
+
+    def a(self, t: torch.Tensor) -> torch.Tensor:
+        return self.a_net(_as_col_t(t))
+
+    def A(self, t: torch.Tensor) -> torch.Tensor:
+        a = self.a(t).reshape(-1)
+        eye = torch.eye(self.x_dim, dtype=a.dtype, device=a.device).reshape(1, self.x_dim, self.x_dim)
+        mats = a.reshape(-1, 1, 1) * eye
+        return mats[0] if int(mats.shape[0]) == 1 else mats
+
+    def endpoint_mean_covariance_diag(
+        self,
+        theta: torch.Tensor,
+        *,
+        solve_jitter: float = 1e-6,
+        quadrature_steps: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        q = self.quadrature_steps if quadrature_steps is None else int(quadrature_steps)
+        if q < 2:
+            raise ValueError("quadrature_steps must be >= 2.")
+        grid = torch.linspace(0.0, 1.0, q, dtype=theta.dtype, device=theta.device).reshape(q, 1)
+        a_grid = self.a(grid)
+        s = torch.trapezoid(a_grid.reshape(q), grid.reshape(-1), dim=0)
+        tail = torch.zeros(q, dtype=theta.dtype, device=theta.device)
+        if q > 1:
+            dt = grid[1:, 0] - grid[:-1, 0]
+            seg = 0.5 * (a_grid[:-1, 0] + a_grid[1:, 0]) * dt
+            tail[:-1] = torch.flip(torch.cumsum(torch.flip(seg, dims=(0,)), dim=0), dims=(0,))
+        b_vals: list[torch.Tensor] = []
+        for k in range(q):
+            tk = grid[k].reshape(1, 1).expand(int(theta.shape[0]), 1)
+            b_vals.append(self.b(theta, tk))
+        b_grid = torch.stack(b_vals, dim=0)
+        mu = torch.trapezoid(torch.exp(tail).reshape(q, 1, 1) * b_grid, grid.reshape(-1), dim=0)
+        var = torch.exp(2.0 * s).reshape(1, 1).expand_as(mu) + float(solve_jitter)
+        return mu, var
+
+    def log_prob_normalized(
+        self,
+        x_norm: torch.Tensor,
+        theta: torch.Tensor,
+        *,
+        solve_jitter: float = 1e-6,
+        quadrature_steps: int | None = None,
+    ) -> torch.Tensor:
+        if x_norm.ndim == 1:
+            x_norm = x_norm.unsqueeze(0)
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        if x_norm.shape[0] != theta.shape[0]:
+            raise ValueError("x and theta batch sizes must match.")
+        mu, var = self.endpoint_mean_covariance_diag(
+            theta,
+            solve_jitter=float(solve_jitter),
+            quadrature_steps=quadrature_steps,
+        )
+        d = int(x_norm.shape[1])
+        quad = torch.sum((x_norm - mu) ** 2 / var, dim=1)
+        log_det = torch.sum(torch.log(var), dim=1)
+        return -0.5 * (quad + log_det + float(d) * math.log(2.0 * math.pi))
+
+
+class ConditionalTimeThetaDiagonalLinearXFlowMLP(_BaseTimeLinearXFlowMLP):
+    """Diagonal drift ``a(t, theta)`` and offset ``b(t, theta)``."""
+
+    endpoint_is_diagonal = True
+
+    def __init__(
+        self,
+        *,
+        theta_dim: int,
+        x_dim: int,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        quadrature_steps: int = 64,
+    ) -> None:
+        super().__init__(
+            theta_dim=theta_dim,
+            x_dim=x_dim,
+            hidden_dim=hidden_dim,
+            depth=depth,
+            quadrature_steps=quadrature_steps,
+        )
+        self.ab_net = _make_mlp(
+            in_dim=self.theta_dim + 1,
+            out_dim=2 * self.x_dim,
+            hidden_dim=self.hidden_dim,
+            depth=self.depth,
+            final_gain=0.01,
+            final_bias=0.0,
+        )
+
+    def a_b(self, theta: torch.Tensor, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        t = _as_col_t(t, batch=int(theta.shape[0]))
+        out = self.ab_net(torch.cat([t, theta], dim=1))
+        a, b = out.chunk(2, dim=1)
+        return a + 1e-3, b
+
+    def A(self, t: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError("ConditionalTimeThetaDiagonalLinearXFlowMLP needs theta to build A.")
+
+    def b(self, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        _, b = self.a_b(theta, t)
+        return b
+
+    def forward(self, x: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        a, b = self.a_b(theta, t)
+        return a * x + b
+
+    def endpoint_mean_covariance_diag(
+        self,
+        theta: torch.Tensor,
+        *,
+        solve_jitter: float = 1e-6,
+        quadrature_steps: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        q = self.quadrature_steps if quadrature_steps is None else int(quadrature_steps)
+        if q < 2:
+            raise ValueError("quadrature_steps must be >= 2.")
+        mu = torch.zeros(int(theta.shape[0]), self.x_dim, dtype=theta.dtype, device=theta.device)
+        var = torch.ones_like(mu)
+        dt = 1.0 / float(q)
+        for k in range(q):
+            tk = torch.full((int(theta.shape[0]), 1), (float(k) + 0.5) / float(q), dtype=theta.dtype, device=theta.device)
+            a, b = self.a_b(theta, tk)
+            mu = mu + dt * (a * mu + b)
+            var = var + dt * (2.0 * a * var)
+            var = torch.clamp(var, min=float(solve_jitter))
+        return mu, var + float(solve_jitter)
+
+    def log_prob_normalized(
+        self,
+        x_norm: torch.Tensor,
+        theta: torch.Tensor,
+        *,
+        solve_jitter: float = 1e-6,
+        quadrature_steps: int | None = None,
+    ) -> torch.Tensor:
+        if x_norm.ndim == 1:
+            x_norm = x_norm.unsqueeze(0)
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        if x_norm.shape[0] != theta.shape[0]:
+            raise ValueError("x and theta batch sizes must match.")
+        mu, var = self.endpoint_mean_covariance_diag(
+            theta,
+            solve_jitter=float(solve_jitter),
+            quadrature_steps=quadrature_steps,
+        )
+        d = int(x_norm.shape[1])
+        quad = torch.sum((x_norm - mu) ** 2 / var, dim=1)
+        log_det = torch.sum(torch.log(var), dim=1)
+        return -0.5 * (quad + log_det + float(d) * math.log(2.0 * math.pi))
+
+
+class ConditionalTimeLowRankLinearXFlowMLP(_BaseTimeLinearXFlowMLP):
+    """Time-dependent low-rank symmetric drift ``A(t)=diag(a(t))+U(t)diag(s(t))U(t)^T``."""
+
+    def __init__(
+        self,
+        *,
+        theta_dim: int,
+        x_dim: int,
+        rank: int,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        quadrature_steps: int = 64,
+    ) -> None:
+        if int(rank) < 1:
+            raise ValueError("rank must be >= 1.")
+        if int(rank) > int(x_dim):
+            raise ValueError("rank must be <= x_dim.")
+        super().__init__(
+            theta_dim=theta_dim,
+            x_dim=x_dim,
+            hidden_dim=hidden_dim,
+            depth=depth,
+            quadrature_steps=quadrature_steps,
+        )
+        self.rank = int(rank)
+        self.a_net = _make_mlp(
+            in_dim=1,
+            out_dim=self.x_dim + self.x_dim * self.rank + self.rank,
+            hidden_dim=self.hidden_dim,
+            depth=self.depth,
+            final_gain=0.01,
+            final_bias=0.0,
+        )
+
+    def A(self, t: torch.Tensor) -> torch.Tensor:
+        t = _as_col_t(t)
+        out = self.a_net(t)
+        d = self.x_dim
+        r = self.rank
+        a = out[:, :d] + 1e-3
+        u = out[:, d : d + d * r].reshape(-1, d, r)
+        s = out[:, d + d * r :].reshape(-1, r)
+        diag = torch.diag_embed(a)
+        low = torch.bmm(u * s.unsqueeze(1), u.transpose(1, 2))
+        mats = diag + low
+        return mats[0] if int(mats.shape[0]) == 1 else mats
+
+
+class ConditionalTimeRandomBasisLowRankLinearXFlowMLP(_BaseTimeLinearXFlowMLP):
+    """Time-dependent random-basis low-rank drift ``A(t)=diag(a(t))+Q S(t) Q.T``."""
+
+    def __init__(
+        self,
+        *,
+        theta_dim: int,
+        x_dim: int,
+        rank: int,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        quadrature_steps: int = 64,
+        lambda_a: float = 1e-4,
+        lambda_s: float = 1e-4,
+    ) -> None:
+        if int(rank) < 1:
+            raise ValueError("rank must be >= 1.")
+        if int(rank) > int(x_dim):
+            raise ValueError("rank must be <= x_dim.")
+        if float(lambda_a) < 0.0:
+            raise ValueError("lambda_a must be >= 0.")
+        if float(lambda_s) < 0.0:
+            raise ValueError("lambda_s must be >= 0.")
+        super().__init__(
+            theta_dim=theta_dim,
+            x_dim=x_dim,
+            hidden_dim=hidden_dim,
+            depth=depth,
+            quadrature_steps=quadrature_steps,
+        )
+        self.rank = int(rank)
+        self.lambda_a = float(lambda_a)
+        self.lambda_s = float(lambda_s)
+        q, _ = torch.linalg.qr(torch.randn(self.x_dim, self.rank), mode="reduced")
+        self.register_buffer("Q", q)
+        self.a_net = _make_mlp(
+            in_dim=1,
+            out_dim=self.x_dim + self.rank * self.rank,
+            hidden_dim=self.hidden_dim,
+            depth=self.depth,
+            final_gain=0.01,
+            final_bias=0.0,
+        )
+
+    def A(self, t: torch.Tensor) -> torch.Tensor:
+        t = _as_col_t(t)
+        out = self.a_net(t)
+        d = self.x_dim
+        r = self.rank
+        a = out[:, :d]
+        s_raw = out[:, d:].reshape(-1, r, r)
+        s = 0.5 * (s_raw + s_raw.transpose(1, 2))
+        q = self.Q.to(dtype=out.dtype, device=out.device).reshape(1, d, r).expand(int(out.shape[0]), d, r)
+        mats = torch.diag_embed(a) + torch.bmm(torch.bmm(q, s), q.transpose(1, 2))
+        return mats[0] if int(mats.shape[0]) == 1 else mats
+
+    def regularization_loss(self) -> torch.Tensor:
+        grid = torch.linspace(0.0, 1.0, 5, dtype=self.Q.dtype, device=self.Q.device).reshape(5, 1)
+        out = self.a_net(grid)
+        a = out[:, : self.x_dim]
+        s_raw = out[:, self.x_dim :].reshape(5, self.rank, self.rank)
+        s = 0.5 * (s_raw + s_raw.transpose(1, 2))
+        return float(self.lambda_a) * torch.mean(a**2) + float(self.lambda_s) * torch.mean(s**2)
+
+
 class ConditionalThetaDiagonalLinearXFlowMLP(nn.Module):
     """Diagonal drift ``a_phi(theta)`` and offset ``b_phi(theta)`` both from theta.
 
@@ -911,6 +1463,67 @@ def fit_residual_pca_basis_from_linear_mean(
     return u
 
 
+def fit_residual_pca_basis_from_time_linear_mean(
+    *,
+    linear_model: nn.Module,
+    theta_train: np.ndarray,
+    x_train_norm: np.ndarray,
+    pca_dim: int,
+    device: torch.device,
+    solve_jitter: float = 1e-6,
+    quadrature_steps: int | None = None,
+) -> np.ndarray:
+    """Fit a frozen PCA basis from residuals around a scheduled linear-flow endpoint mean."""
+    th = _as_2d_float64(theta_train, name="theta_train")
+    x = _as_2d_float64(x_train_norm, name="x_train_norm")
+    if th.shape[0] != x.shape[0]:
+        raise ValueError("theta_train and x_train_norm row counts must match.")
+    n, d = int(x.shape[0]), int(x.shape[1])
+    k = int(pca_dim)
+    if k < 1:
+        raise ValueError("pca_dim must be >= 1.")
+    max_rank = min(d, max(1, n - 1))
+    if k > max_rank:
+        raise ValueError(f"pca_dim must be <= min(x_dim, n_train-1)={max_rank}; got {k}.")
+    linear_model.eval()
+    with torch.no_grad():
+        th_t = torch.from_numpy(th.astype(np.float32)).to(device)
+        if hasattr(linear_model, "endpoint_mean_covariance_diag"):
+            mu_t, _ = linear_model.endpoint_mean_covariance_diag(  # type: ignore[attr-defined]
+                th_t,
+                solve_jitter=float(solve_jitter),
+                quadrature_steps=quadrature_steps,
+            )
+        else:
+            mu_t, _ = linear_model.endpoint_mean_covariance(  # type: ignore[attr-defined]
+                th_t,
+                solve_jitter=float(solve_jitter),
+                quadrature_steps=quadrature_steps,
+            )
+        mu = mu_t.detach().cpu().numpy().astype(np.float64)
+    residual = x - mu
+    residual = residual - np.mean(residual, axis=0, keepdims=True, dtype=np.float64)
+    _, _, vh = np.linalg.svd(residual, full_matrices=False)
+    return vh[:k].T.astype(np.float32, copy=False)
+
+
+def time_linear_x_flow_trace(model: nn.Module, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    """Trace of the scheduled linear drift for supported time-linear base families."""
+    if theta.ndim == 1:
+        theta = theta.unsqueeze(-1)
+    t = _as_col_t(t, batch=int(theta.shape[0]))
+    if isinstance(model, ConditionalTimeDiagonalLinearXFlowMLP):
+        return torch.sum(model.a(t), dim=1)
+    if isinstance(model, ConditionalTimeThetaDiagonalLinearXFlowMLP):
+        a, _ = model.a_b(theta, t)
+        return torch.sum(a, dim=1)
+    a = model.A(t)  # type: ignore[attr-defined]
+    if a.ndim == 2:
+        tr = torch.trace(a).to(dtype=theta.dtype, device=theta.device)
+        return tr.reshape(1).expand(int(theta.shape[0]))
+    return torch.diagonal(a, dim1=-2, dim2=-1).sum(dim=1)
+
+
 class ConditionalPCANonlinearLinearXFlowMLP(nn.Module):
     """Linear x-flow plus a frozen-PCA nonlinear correction in normalized x-space."""
 
@@ -1059,6 +1672,188 @@ class ConditionalPCANonlinearLinearXFlowMLP(nn.Module):
             z,
             theta,
             solve_jitter=float(solve_jitter),
+            ode_steps=int(ode_steps),
+        ) + logjac
+
+
+class ConditionalPCANonlinearTimeLinearXFlowMLP(nn.Module):
+    """Scheduled time-linear x-flow plus a frozen-PCA nonlinear correction."""
+
+    def __init__(
+        self,
+        *,
+        linear_model: nn.Module,
+        pca_basis: np.ndarray | torch.Tensor,
+        schedule: GaussianAffinePathSchedule,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        quadrature_steps: int = 64,
+    ) -> None:
+        super().__init__()
+        if int(hidden_dim) < 1:
+            raise ValueError("hidden_dim must be >= 1.")
+        if int(depth) < 1:
+            raise ValueError("depth must be >= 1.")
+        if int(quadrature_steps) < 2:
+            raise ValueError("quadrature_steps must be >= 2.")
+        self.linear_model = linear_model
+        self.schedule = schedule
+        self.theta_dim = int(getattr(linear_model, "theta_dim"))
+        self.x_dim = int(getattr(linear_model, "x_dim"))
+        self.quadrature_steps = int(quadrature_steps)
+        u = torch.as_tensor(pca_basis, dtype=torch.float32)
+        if u.ndim != 2 or int(u.shape[0]) != self.x_dim:
+            raise ValueError("pca_basis must have shape [x_dim, k].")
+        self.pca_dim = int(u.shape[1])
+        if self.pca_dim < 1:
+            raise ValueError("pca_basis must have at least one component.")
+        self.register_buffer("U", u)
+        self.h_net = _make_mlp(
+            in_dim=self.pca_dim + 1 + self.theta_dim,
+            out_dim=self.pca_dim,
+            hidden_dim=int(hidden_dim),
+            depth=int(depth),
+            final_gain=0.0,
+            final_bias=0.0,
+        )
+
+    def linear_mean(
+        self,
+        theta: torch.Tensor,
+        *,
+        solve_jitter: float = 1e-6,
+        quadrature_steps: int | None = None,
+    ) -> torch.Tensor:
+        q = self.quadrature_steps if quadrature_steps is None else int(quadrature_steps)
+        if hasattr(self.linear_model, "endpoint_mean_covariance_diag"):
+            mu, _ = self.linear_model.endpoint_mean_covariance_diag(  # type: ignore[attr-defined]
+                theta,
+                solve_jitter=float(solve_jitter),
+                quadrature_steps=q,
+            )
+        else:
+            mu, _ = self.linear_model.endpoint_mean_covariance(  # type: ignore[attr-defined]
+                theta,
+                solve_jitter=float(solve_jitter),
+                quadrature_steps=q,
+            )
+        return mu
+
+    def h(self, z: torch.Tensor, t: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        t = _as_col_t(t, batch=int(z.shape[0]))
+        return self.h_net(torch.cat([z, t, theta], dim=1))
+
+    def nonlinear_correction(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        theta: torch.Tensor,
+        *,
+        solve_jitter: float = 1e-6,
+        quadrature_steps: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        t = _as_col_t(t, batch=int(x.shape[0]))
+        mu = self.linear_mean(theta, solve_jitter=float(solve_jitter), quadrature_steps=quadrature_steps)
+        _, bcoef, _, _ = self.schedule.ab_ad_bd(t)
+        z = (x - bcoef * mu) @ self.U
+        h = self.h(z, t, theta)
+        return h @ self.U.transpose(0, 1), z, h
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        theta: torch.Tensor,
+        t: torch.Tensor,
+        *,
+        solve_jitter: float = 1e-6,
+        quadrature_steps: int | None = None,
+    ) -> torch.Tensor:
+        delta, _, _ = self.nonlinear_correction(
+            x,
+            t,
+            theta,
+            solve_jitter=float(solve_jitter),
+            quadrature_steps=quadrature_steps,
+        )
+        return self.linear_model(x, theta, t) + delta
+
+    def regularization_loss(self, h: torch.Tensor, lambda_h: float) -> torch.Tensor:
+        return float(lambda_h) * torch.mean(h**2)
+
+    def divergence(self, x: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        t = _as_col_t(t, batch=int(x.shape[0]))
+        with torch.enable_grad():
+            mu = self.linear_mean(theta)
+            _, bcoef, _, _ = self.schedule.ab_ad_bd(t)
+            z = ((x - bcoef * mu) @ self.U).detach().requires_grad_(True)
+            h = self.h(z, t, theta)
+            tr_h = torch.zeros(z.shape[0], dtype=z.dtype, device=z.device)
+            for j in range(self.pca_dim):
+                grad_j = torch.autograd.grad(
+                    h[:, j].sum(),
+                    z,
+                    create_graph=False,
+                    retain_graph=j < self.pca_dim - 1,
+                )[0]
+                tr_h = tr_h + grad_j[:, j]
+        return time_linear_x_flow_trace(self.linear_model, theta, t).to(dtype=x.dtype, device=x.device).detach() + tr_h.detach()
+
+    def log_prob_normalized(
+        self,
+        x_norm: torch.Tensor,
+        theta: torch.Tensor,
+        *,
+        solve_jitter: float = 1e-6,
+        quadrature_steps: int | None = None,
+        ode_steps: int = 32,
+    ) -> torch.Tensor:
+        if x_norm.ndim == 1:
+            x_norm = x_norm.unsqueeze(0)
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        if x_norm.shape[0] != theta.shape[0]:
+            raise ValueError("x and theta batch sizes must match.")
+        steps = int(ode_steps)
+        if steps < 1:
+            raise ValueError("ode_steps must be >= 1.")
+        x = x_norm
+        div_int = torch.zeros(x.shape[0], dtype=x.dtype, device=x.device)
+        dt = 1.0 / float(steps)
+        q = self.quadrature_steps if quadrature_steps is None else int(quadrature_steps)
+        for s in range(steps, 0, -1):
+            t = torch.full((x.shape[0], 1), float(s) / float(steps), dtype=x.dtype, device=x.device)
+            div_int = div_int + dt * self.divergence(x, theta, t)
+            with torch.no_grad():
+                v = self.forward(x, theta, t, solve_jitter=float(solve_jitter), quadrature_steps=q)
+                x = x - dt * v
+        d = int(x.shape[1])
+        base = -0.5 * (torch.sum(x**2, dim=1) + float(d) * math.log(2.0 * math.pi))
+        return base - div_int
+
+    def log_prob_observed(
+        self,
+        x_raw: torch.Tensor,
+        theta: torch.Tensor,
+        *,
+        x_mean: torch.Tensor,
+        x_std: torch.Tensor,
+        solve_jitter: float = 1e-6,
+        quadrature_steps: int | None = None,
+        ode_steps: int = 32,
+    ) -> torch.Tensor:
+        z = (x_raw - x_mean) / x_std
+        logjac = -torch.sum(torch.log(x_std))
+        return self.log_prob_normalized(
+            z,
+            theta,
+            solve_jitter=float(solve_jitter),
+            quadrature_steps=quadrature_steps,
             ode_steps=int(ode_steps),
         ) + logjac
 
@@ -1266,9 +2061,9 @@ def train_linear_x_flow(
     }
 
 
-def train_time_diagonal_linear_x_flow_schedule(
+def train_time_linear_x_flow_schedule(
     *,
-    model: ConditionalTimeDiagonalLinearXFlowMLP,
+    model: nn.Module,
     theta_train: np.ndarray,
     x_train: np.ndarray,
     theta_val: np.ndarray,
@@ -1287,8 +2082,9 @@ def train_time_diagonal_linear_x_flow_schedule(
     max_grad_norm: float = 10.0,
     log_every: int = 50,
     restore_best: bool = True,
+    log_name: str = "linear_x_flow_t",
 ) -> dict[str, Any]:
-    """Train ``v(x,t,theta)=diag(a(t))x+b(t,theta)`` on a scheduled affine bridge."""
+    """Train ``v(x,t,theta)`` on a scheduled affine bridge."""
     if int(epochs) < 1:
         raise ValueError("epochs must be >= 1.")
     if int(batch_size) < 1:
@@ -1312,7 +2108,7 @@ def train_time_diagonal_linear_x_flow_schedule(
     th_va = _as_2d_float64(theta_val, name="theta_val")
     x_va = _as_2d_float64(x_val, name="x_val")
     if th_tr.shape[0] < 1 or th_va.shape[0] < 1:
-        raise ValueError("linear_x_flow_diagonal_t requires non-empty train and validation splits.")
+        raise ValueError(f"{log_name} requires non-empty train and validation splits.")
 
     x_mean = np.mean(x_tr, axis=0, dtype=np.float64)
     x_std = np.maximum(np.std(x_tr, axis=0, dtype=np.float64), 1e-6)
@@ -1404,7 +2200,7 @@ def train_time_diagonal_linear_x_flow_schedule(
             patience_counter += 1
         if epoch == 1 or epoch % max(1, int(log_every)) == 0 or epoch == int(epochs):
             print(
-                f"[linear_x_flow_diagonal_t {epoch:4d}/{int(epochs)}] train_fm={train_loss:.6f} "
+                f"[{log_name} {epoch:4d}/{int(epochs)}] train_fm={train_loss:.6f} "
                 f"val_fm={val_raw:.6f} val_smooth={val_smooth:.6f} best_monitor={best_val:.6f} "
                 f"best_epoch={best_epoch}",
                 flush=True,
@@ -1413,7 +2209,7 @@ def train_time_diagonal_linear_x_flow_schedule(
             stopped_early = True
             stopped_epoch = int(epoch)
             print(
-                f"[linear_x_flow_diagonal_t early-stop] epoch={epoch} best_epoch={best_epoch} "
+                f"[{log_name} early-stop] epoch={epoch} best_epoch={best_epoch} "
                 f"best_monitor={best_val:.6f} patience={int(patience)}",
                 flush=True,
             )
@@ -1425,14 +2221,14 @@ def train_time_diagonal_linear_x_flow_schedule(
             load_model_weights_from_ema_state(model, best_eval_state_cpu)
             final_eval_weights = "ema"
             print(
-                f"[linear_x_flow_diagonal_t restore-best] restored EMA eval weights epoch={best_epoch} "
+                f"[{log_name} restore-best] restored EMA eval weights epoch={best_epoch} "
                 f"best_monitor={best_val:.6f}",
                 flush=True,
             )
         else:
             model.load_state_dict(best_eval_state_cpu)
             print(
-                f"[linear_x_flow_diagonal_t restore-best] restored raw eval weights epoch={best_epoch} "
+                f"[{log_name} restore-best] restored raw eval weights epoch={best_epoch} "
                 f"best_monitor={best_val:.6f}",
                 flush=True,
             )
@@ -1454,6 +2250,53 @@ def train_time_diagonal_linear_x_flow_schedule(
         "x_mean": x_mean.astype(np.float64),
         "x_std": x_std.astype(np.float64),
     }
+
+
+def train_time_diagonal_linear_x_flow_schedule(
+    *,
+    model: ConditionalTimeDiagonalLinearXFlowMLP,
+    theta_train: np.ndarray,
+    x_train: np.ndarray,
+    theta_val: np.ndarray,
+    x_val: np.ndarray,
+    device: torch.device,
+    schedule: GaussianAffinePathSchedule,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    weight_decay: float = 0.0,
+    t_eps: float = 0.05,
+    patience: int = 1000,
+    min_delta: float = 1e-4,
+    ema_alpha: float = 0.05,
+    weight_ema_decay: float = 0.9,
+    max_grad_norm: float = 10.0,
+    log_every: int = 50,
+    restore_best: bool = True,
+) -> dict[str, Any]:
+    """Compatibility wrapper for the original diagonal-time method."""
+    return train_time_linear_x_flow_schedule(
+        model=model,
+        theta_train=theta_train,
+        x_train=x_train,
+        theta_val=theta_val,
+        x_val=x_val,
+        device=device,
+        schedule=schedule,
+        epochs=epochs,
+        batch_size=batch_size,
+        lr=lr,
+        weight_decay=weight_decay,
+        t_eps=t_eps,
+        patience=patience,
+        min_delta=min_delta,
+        ema_alpha=ema_alpha,
+        weight_ema_decay=weight_ema_decay,
+        max_grad_norm=max_grad_norm,
+        log_every=log_every,
+        restore_best=restore_best,
+        log_name="linear_x_flow_diagonal_t",
+    )
 
 
 def train_pca_nonlinear_linear_x_flow(
@@ -1646,6 +2489,203 @@ def train_pca_nonlinear_linear_x_flow(
     }
 
 
+def train_pca_nonlinear_time_linear_x_flow_schedule(
+    *,
+    model: ConditionalPCANonlinearTimeLinearXFlowMLP,
+    theta_train: np.ndarray,
+    x_train: np.ndarray,
+    theta_val: np.ndarray,
+    x_val: np.ndarray,
+    device: torch.device,
+    x_mean: np.ndarray,
+    x_std: np.ndarray,
+    schedule: GaussianAffinePathSchedule,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    weight_decay: float = 0.0,
+    t_eps: float = 0.05,
+    lambda_h: float = 0.0,
+    freeze_linear: bool = False,
+    patience: int = 1000,
+    min_delta: float = 1e-4,
+    ema_alpha: float = 0.05,
+    weight_ema_decay: float = 0.9,
+    max_grad_norm: float = 10.0,
+    solve_jitter: float = 1e-6,
+    quadrature_steps: int | None = None,
+    log_every: int = 50,
+    restore_best: bool = True,
+    log_name: str = "linear_x_flow_nonlinear_pca_t",
+) -> dict[str, Any]:
+    if int(epochs) < 1:
+        raise ValueError("epochs must be >= 1.")
+    if int(batch_size) < 1:
+        raise ValueError("batch_size must be >= 1.")
+    if float(lr) <= 0.0:
+        raise ValueError("lr must be > 0.")
+    if float(lambda_h) < 0.0:
+        raise ValueError("lambda_h must be >= 0.")
+    te = float(t_eps)
+    if not (0.0 < te < 0.5):
+        raise ValueError("t_eps must be in (0, 0.5).")
+    if int(patience) < 0:
+        raise ValueError("patience must be >= 0.")
+    if float(min_delta) < 0.0:
+        raise ValueError("min_delta must be >= 0.")
+    if not (0.0 < float(ema_alpha) <= 1.0):
+        raise ValueError("ema_alpha must be in (0, 1].")
+    if not np.isfinite(float(weight_ema_decay)) or float(weight_ema_decay) >= 1.0:
+        raise ValueError("weight_ema_decay must be finite and < 1.")
+
+    th_tr = _as_2d_float64(theta_train, name="theta_train")
+    x_tr = _as_2d_float64(x_train, name="x_train")
+    th_va = _as_2d_float64(theta_val, name="theta_val")
+    x_va = _as_2d_float64(x_val, name="x_val")
+    xm = np.asarray(x_mean, dtype=np.float64).reshape(1, -1)
+    xs = np.asarray(x_std, dtype=np.float64).reshape(1, -1)
+    x_tr_n = (x_tr - xm) / xs
+    x_va_n = (x_va - xm) / xs
+
+    old_requires_grad = [p.requires_grad for p in model.linear_model.parameters()]
+    if bool(freeze_linear):
+        for p in model.linear_model.parameters():
+            p.requires_grad_(False)
+    params = [p for p in model.parameters() if p.requires_grad]
+    opt = torch.optim.AdamW(params, lr=float(lr), weight_decay=float(weight_decay))
+
+    train_loader = DataLoader(
+        TensorDataset(torch.from_numpy(th_tr.astype(np.float32)), torch.from_numpy(x_tr_n.astype(np.float32))),
+        batch_size=int(batch_size),
+        shuffle=True,
+    )
+    val_loader = DataLoader(
+        TensorDataset(torch.from_numpy(th_va.astype(np.float32)), torch.from_numpy(x_va_n.astype(np.float32))),
+        batch_size=int(batch_size),
+        shuffle=False,
+    )
+
+    train_losses: list[float] = []
+    val_losses: list[float] = []
+    val_monitor_losses: list[float] = []
+    best_val = float("inf")
+    best_epoch = 0
+    best_eval_state_cpu: dict[str, torch.Tensor] | None = None
+    weight_ema_enabled = float(weight_ema_decay) > 0.0
+    weight_ema_state = init_model_weight_ema(model) if weight_ema_enabled else None
+    patience_counter = 0
+    stopped_early = False
+    stopped_epoch = int(epochs)
+    n_clipped_steps = 0
+    n_total_steps = 0
+    val_ema: float | None = None
+    alpha = float(ema_alpha)
+    q = model.quadrature_steps if quadrature_steps is None else int(quadrature_steps)
+
+    for epoch in range(1, int(epochs) + 1):
+        model.train()
+        ep_losses: list[float] = []
+        for tb, x1b in train_loader:
+            tb = tb.to(device)
+            x1b = x1b.to(device)
+            bs = int(x1b.shape[0])
+            t = te + (1.0 - 2.0 * te) * torch.rand(bs, 1, device=device, dtype=x1b.dtype)
+            x0b = torch.randn_like(x1b)
+            a, bcoef, ad, bd = schedule.ab_ad_bd(t)
+            xt = a * x0b + bcoef * x1b
+            ut = ad * x0b + bd * x1b
+            v = model(xt, tb, t, solve_jitter=float(solve_jitter), quadrature_steps=q)
+            _, _, h = model.nonlinear_correction(xt, t, tb, solve_jitter=float(solve_jitter), quadrature_steps=q)
+            loss = torch.mean((v - ut) ** 2) + model.regularization_loss(h, float(lambda_h))
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            n_total_steps += 1
+            if float(max_grad_norm) > 0.0:
+                grad_norm = torch.nn.utils.clip_grad_norm_(params, float(max_grad_norm))
+                if float(grad_norm) > float(max_grad_norm):
+                    n_clipped_steps += 1
+            opt.step()
+            if weight_ema_state is not None:
+                update_model_weight_ema(weight_ema_state, model, decay=float(weight_ema_decay))
+            ep_losses.append(float(loss.detach().cpu()))
+        train_loss = float(np.mean(ep_losses))
+        train_losses.append(train_loss)
+
+        model.eval()
+        val_ep: list[float] = []
+        ema_ctx = evaluate_with_weight_ema(model, weight_ema_state) if weight_ema_state is not None else nullcontext()
+        with ema_ctx:
+            with torch.no_grad():
+                for tb, x1b in val_loader:
+                    tb = tb.to(device)
+                    x1b = x1b.to(device)
+                    bs = int(x1b.shape[0])
+                    t = te + (1.0 - 2.0 * te) * torch.rand(bs, 1, device=device, dtype=x1b.dtype)
+                    x0b = torch.randn_like(x1b)
+                    a, bcoef, ad, bd = schedule.ab_ad_bd(t)
+                    xt = a * x0b + bcoef * x1b
+                    ut = ad * x0b + bd * x1b
+                    v = model(xt, tb, t, solve_jitter=float(solve_jitter), quadrature_steps=q)
+                    _, _, h = model.nonlinear_correction(xt, t, tb, solve_jitter=float(solve_jitter), quadrature_steps=q)
+                    val_ep.append(float((torch.mean((v - ut) ** 2) + model.regularization_loss(h, float(lambda_h))).detach().cpu()))
+        val_raw = float(np.mean(val_ep))
+        val_losses.append(val_raw)
+        val_ema = scalar_val_ema_update(val_ema, val_raw, alpha)
+        val_smooth = float(val_ema)
+        val_monitor_losses.append(val_smooth)
+        if val_smooth < best_val - float(min_delta):
+            best_val = float(val_smooth)
+            best_epoch = int(epoch)
+            best_eval_state_cpu = clone_model_weight_ema(weight_ema_state) if weight_ema_state is not None else {
+                k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+            }
+            patience_counter = 0
+        else:
+            patience_counter += 1
+        if epoch == 1 or epoch % max(1, int(log_every)) == 0 or epoch == int(epochs):
+            print(
+                f"[{log_name} {epoch:4d}/{int(epochs)}] train_fm={train_loss:.6f} "
+                f"val_fm={val_raw:.6f} val_smooth={val_smooth:.6f} best_monitor={best_val:.6f} "
+                f"best_epoch={best_epoch}",
+                flush=True,
+            )
+        if int(patience) > 0 and patience_counter >= int(patience):
+            stopped_early = True
+            stopped_epoch = int(epoch)
+            print(
+                f"[{log_name} early-stop] epoch={epoch} best_epoch={best_epoch} "
+                f"best_monitor={best_val:.6f} patience={int(patience)}",
+                flush=True,
+            )
+            break
+
+    final_eval_weights = "raw"
+    if restore_best and best_eval_state_cpu is not None:
+        if weight_ema_enabled:
+            load_model_weights_from_ema_state(model, best_eval_state_cpu)
+            final_eval_weights = "ema"
+        else:
+            model.load_state_dict(best_eval_state_cpu)
+    if bool(freeze_linear):
+        for p, req in zip(model.linear_model.parameters(), old_requires_grad):
+            p.requires_grad_(req)
+    return {
+        "train_losses": train_losses,
+        "val_losses": val_losses,
+        "val_monitor_losses": val_monitor_losses,
+        "best_val_loss": float(best_val),
+        "best_epoch": int(best_epoch),
+        "stopped_epoch": int(stopped_epoch),
+        "stopped_early": bool(stopped_early),
+        "lr_last": float(opt.param_groups[0]["lr"]),
+        "n_clipped_steps": int(n_clipped_steps),
+        "n_total_steps": int(n_total_steps),
+        "weight_ema_enabled": bool(weight_ema_enabled),
+        "weight_ema_decay": float(weight_ema_decay),
+        "final_eval_weights": final_eval_weights,
+    }
+
+
 def compute_linear_x_flow_c_matrix(
     *,
     model: ConditionalLinearXFlowMLP,
@@ -1690,9 +2730,9 @@ def compute_linear_x_flow_c_matrix(
     return c
 
 
-def compute_time_diagonal_linear_x_flow_c_matrix(
+def compute_time_linear_x_flow_c_matrix(
     *,
-    model: ConditionalTimeDiagonalLinearXFlowMLP,
+    model: nn.Module,
     theta_all: np.ndarray,
     x_all: np.ndarray,
     device: torch.device,
@@ -1738,6 +2778,31 @@ def compute_time_diagonal_linear_x_flow_c_matrix(
     return c
 
 
+def compute_time_diagonal_linear_x_flow_c_matrix(
+    *,
+    model: ConditionalTimeDiagonalLinearXFlowMLP,
+    theta_all: np.ndarray,
+    x_all: np.ndarray,
+    device: torch.device,
+    x_mean: np.ndarray,
+    x_std: np.ndarray,
+    solve_jitter: float = 1e-6,
+    quadrature_steps: int = 64,
+    pair_batch_size: int = 65536,
+) -> np.ndarray:
+    return compute_time_linear_x_flow_c_matrix(
+        model=model,
+        theta_all=theta_all,
+        x_all=x_all,
+        device=device,
+        x_mean=x_mean,
+        x_std=x_std,
+        solve_jitter=solve_jitter,
+        quadrature_steps=quadrature_steps,
+        pair_batch_size=pair_batch_size,
+    )
+
+
 def compute_pca_nonlinear_linear_x_flow_c_matrix(
     *,
     model: ConditionalPCANonlinearLinearXFlowMLP,
@@ -1777,6 +2842,53 @@ def compute_pca_nonlinear_linear_x_flow_c_matrix(
             x_mean=x_mean_t,
             x_std=x_std_t,
             solve_jitter=float(solve_jitter),
+            ode_steps=int(ode_steps),
+        )
+        c[i0:i1, :] = logp.detach().cpu().numpy().reshape(b, n).astype(np.float64)
+    return c
+
+
+def compute_pca_nonlinear_time_linear_x_flow_c_matrix(
+    *,
+    model: ConditionalPCANonlinearTimeLinearXFlowMLP,
+    theta_all: np.ndarray,
+    x_all: np.ndarray,
+    device: torch.device,
+    x_mean: np.ndarray,
+    x_std: np.ndarray,
+    solve_jitter: float = 1e-6,
+    quadrature_steps: int = 64,
+    ode_steps: int = 32,
+    pair_batch_size: int = 65536,
+) -> np.ndarray:
+    theta = _as_2d_float64(theta_all, name="theta_all")
+    x = _as_2d_float64(x_all, name="x_all")
+    if theta.shape[0] != x.shape[0]:
+        raise ValueError("theta_all and x_all row counts must match.")
+    n = int(theta.shape[0])
+    if int(pair_batch_size) < 1:
+        raise ValueError("pair_batch_size must be >= 1.")
+    row_block = max(1, int(pair_batch_size) // max(n, 1))
+    theta32 = theta.astype(np.float32, copy=False)
+    x_mean_t = torch.from_numpy(np.asarray(x_mean, dtype=np.float32)).to(device)
+    x_std_t = torch.from_numpy(np.asarray(x_std, dtype=np.float32)).to(device)
+    c = np.zeros((n, n), dtype=np.float64)
+    model.eval()
+    for i0 in range(0, n, row_block):
+        i1 = min(n, i0 + row_block)
+        xb = x[i0:i1].astype(np.float32, copy=False)
+        b = int(i1 - i0)
+        x_rep = np.repeat(xb, repeats=n, axis=0)
+        theta_tile = np.tile(theta32, (b, 1))
+        x_t = torch.from_numpy(x_rep).to(device)
+        theta_t = torch.from_numpy(theta_tile).to(device)
+        logp = model.log_prob_observed(
+            x_t,
+            theta_t,
+            x_mean=x_mean_t,
+            x_std=x_std_t,
+            solve_jitter=float(solve_jitter),
+            quadrature_steps=int(quadrature_steps),
             ode_steps=int(ode_steps),
         )
         c[i0:i1, :] = logp.detach().cpu().numpy().reshape(b, n).astype(np.float64)
