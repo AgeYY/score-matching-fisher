@@ -626,6 +626,8 @@ class TestStudyHDecodingConvergenceGaussianNetwork(unittest.TestCase):
                     "--device",
                     "cpu",
                 ]
+                if method_stored == "linear_x_flow_low_rank_t":
+                    cmd.extend(["--lxf-low-rank-t-warmup-epochs", "1"])
                 r = subprocess.run(cmd, cwd=str(repo), capture_output=True, text=True)
                 self.assertEqual(r.returncode, 0, msg=(r.stdout, r.stderr))
                 self.assertIn(f"{method_stored} mode trains", r.stdout)
@@ -635,6 +637,10 @@ class TestStudyHDecodingConvergenceGaussianNetwork(unittest.TestCase):
                 if method_stored.endswith("_t"):
                     self.assertEqual(str(np.asarray(z["lxfs_path_schedule"]).reshape(-1)[0]), "cosine")
                     self.assertTrue(bool(np.asarray(z["lxfs_scheduled_train"]).reshape(-1)[0]))
+                if method_stored == "linear_x_flow_low_rank_t":
+                    self.assertTrue(bool(np.asarray(z["lxf_low_rank_t_warmup_enabled"]).reshape(-1)[0]))
+                    self.assertEqual(int(np.asarray(z["lxf_low_rank_t_warmup_epochs"]).reshape(-1)[0]), 1)
+                    self.assertEqual(np.asarray(z["lxf_low_rank_t_warmup_train_losses"]).shape, (1,))
 
     def test_linear_x_flow_time_nonlinear_pca_sweep_smokes(self) -> None:
         repo = Path(__file__).resolve().parent.parent

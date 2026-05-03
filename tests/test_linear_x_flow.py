@@ -40,6 +40,7 @@ from fisher.linear_x_flow import (
     train_linear_x_flow,
     train_pca_nonlinear_linear_x_flow,
     train_pca_nonlinear_time_linear_x_flow_schedule,
+    train_low_rank_t_warmup_then_full,
     train_time_linear_x_flow_schedule,
     train_time_diagonal_linear_x_flow_schedule,
 )
@@ -714,6 +715,101 @@ class TestLinearXFlow(unittest.TestCase):
         x = torch.randn(5, 3)
         t = torch.linspace(0.2, 0.8, 5).reshape(-1, 1)
         self.assertTrue(torch.allclose(m(x, th, t), m.linear(x, th, t), atol=1e-6))
+
+    def test_time_low_rank_correction_base_A_initializes_exactly_zero(self) -> None:
+        torch.manual_seed(54)
+        m = ConditionalTimeLowRankCorrectionLinearXFlowMLP(
+            theta_dim=1, x_dim=4, correction_rank=2, hidden_dim=8, depth=1, quadrature_steps=5
+        )
+        t = torch.linspace(0.0, 1.0, 7).reshape(-1, 1)
+        self.assertTrue(torch.allclose(m.linear.A(t), torch.zeros(7, 4, 4), atol=0.0, rtol=0.0))
+
+    def test_time_low_rank_correction_warmup_freezes_non_b_parameters(self) -> None:
+        torch.manual_seed(55)
+        rng = np.random.default_rng(55)
+        theta = rng.normal(size=(24, 1)).astype(np.float64)
+        x = np.concatenate([theta, -theta, 0.5 * theta], axis=1) + 0.05 * rng.normal(size=(24, 3))
+        m = ConditionalTimeLowRankCorrectionLinearXFlowMLP(
+            theta_dim=1, x_dim=3, correction_rank=2, hidden_dim=8, depth=1, quadrature_steps=5
+        )
+        before = {name: p.detach().clone() for name, p in m.named_parameters()}
+        for p in m.parameters():
+            p.requires_grad_(False)
+        for p in m.linear.b_net.parameters():
+            p.requires_grad_(True)
+        out = train_time_linear_x_flow_schedule(
+            model=m,
+            theta_train=theta[:16],
+            x_train=x[:16],
+            theta_val=theta[16:],
+            x_val=x[16:],
+            device=torch.device("cpu"),
+            schedule=path_schedule_from_name("linear"),
+            epochs=1,
+            batch_size=8,
+            lr=1e-2,
+            t_eps=1e-3,
+            patience=0,
+            log_every=1,
+            weight_ema_decay=0.0,
+            restore_best=False,
+            log_name="linear_x_flow_low_rank_t_warmup_test",
+        )
+        self.assertEqual(len(out["train_losses"]), 1)
+        b_changed = False
+        for name, p in m.named_parameters():
+            changed = not torch.allclose(p.detach(), before[name])
+            if name.startswith("linear.b_net."):
+                b_changed = b_changed or changed
+            else:
+                self.assertFalse(changed, msg=name)
+        self.assertTrue(b_changed)
+        self.assertTrue(torch.allclose(m.linear.A(torch.full((3, 1), 0.5)), torch.zeros(3, 3, 3), atol=0.0, rtol=0.0))
+
+    def test_train_low_rank_t_warmup_then_full_restores_trainability_and_finite_c_matrix(self) -> None:
+        torch.manual_seed(56)
+        rng = np.random.default_rng(56)
+        theta = rng.normal(size=(24, 1)).astype(np.float64)
+        x = np.concatenate([theta, -theta], axis=1) + 0.05 * rng.normal(size=(24, 2))
+        m = ConditionalTimeLowRankCorrectionLinearXFlowMLP(
+            theta_dim=1, x_dim=2, correction_rank=1, hidden_dim=8, depth=1, quadrature_steps=5
+        )
+        out = train_low_rank_t_warmup_then_full(
+            model=m,
+            theta_train=theta[:16],
+            x_train=x[:16],
+            theta_val=theta[16:],
+            x_val=x[16:],
+            device=torch.device("cpu"),
+            schedule=path_schedule_from_name("linear"),
+            warmup_epochs=1,
+            epochs=1,
+            batch_size=8,
+            lr=1e-3,
+            t_eps=1e-3,
+            patience=0,
+            log_every=1,
+            weight_ema_decay=0.0,
+            restore_best=False,
+        )
+        self.assertEqual(len(out["warmup_train_losses"]), 1)
+        self.assertEqual(len(out["train_losses"]), 1)
+        self.assertTrue(np.isfinite(out["warmup_train_losses"][0]))
+        self.assertTrue(np.isfinite(out["train_losses"][0]))
+        self.assertTrue(all(p.requires_grad for p in m.parameters()))
+        c = compute_ode_time_linear_x_flow_c_matrix(
+            model=m,
+            theta_all=theta[:4],
+            x_all=x[:4],
+            device=torch.device("cpu"),
+            x_mean=out["x_mean"],
+            x_std=out["x_std"],
+            quadrature_steps=5,
+            ode_steps=2,
+            pair_batch_size=32,
+        )
+        self.assertEqual(tuple(c.shape), (4, 4))
+        self.assertTrue(np.all(np.isfinite(c)))
 
     def test_time_low_rank_correction_divergence_zero_h_is_trace_A(self) -> None:
         torch.manual_seed(50)

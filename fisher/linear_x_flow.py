@@ -931,6 +931,9 @@ class ConditionalTimeLinearXFlowMLP(_BaseTimeLinearXFlowMLP):
         hidden_dim: int = 128,
         depth: int = 3,
         quadrature_steps: int = 64,
+        a_final_gain: float = 0.01,
+        a_final_bias: float = 0.0,
+        a_identity_offset: float = 1e-3,
     ) -> None:
         super().__init__(
             theta_dim=theta_dim,
@@ -944,15 +947,16 @@ class ConditionalTimeLinearXFlowMLP(_BaseTimeLinearXFlowMLP):
             out_dim=self.x_dim * self.x_dim,
             hidden_dim=self.hidden_dim,
             depth=self.depth,
-            final_gain=0.01,
-            final_bias=0.0,
+            final_gain=float(a_final_gain),
+            final_bias=float(a_final_bias),
         )
+        self.a_identity_offset = float(a_identity_offset)
 
     def A(self, t: torch.Tensor) -> torch.Tensor:
         t = _as_col_t(t)
         raw = self.a_net(t).reshape(int(t.shape[0]), self.x_dim, self.x_dim)
         eye = torch.eye(self.x_dim, dtype=raw.dtype, device=raw.device).reshape(1, self.x_dim, self.x_dim)
-        return 0.5 * (raw + raw.transpose(1, 2)) + 1e-3 * eye
+        return 0.5 * (raw + raw.transpose(1, 2)) + self.a_identity_offset * eye
 
 
 class ConditionalTimeLowRankCorrectionLinearXFlowMLP(nn.Module):
@@ -1001,6 +1005,9 @@ class ConditionalTimeLowRankCorrectionLinearXFlowMLP(nn.Module):
             hidden_dim=int(hidden_dim),
             depth=int(depth),
             quadrature_steps=int(quadrature_steps),
+            a_final_gain=0.0,
+            a_final_bias=0.0,
+            a_identity_offset=0.0,
         )
         self.theta_dim = int(theta_dim)
         self.x_dim = int(x_dim)
@@ -2470,6 +2477,114 @@ def train_time_linear_x_flow_schedule(
         "x_mean": x_mean.astype(np.float64),
         "x_std": x_std.astype(np.float64),
     }
+
+
+def train_low_rank_t_warmup_then_full(
+    *,
+    model: ConditionalTimeLowRankCorrectionLinearXFlowMLP,
+    theta_train: np.ndarray,
+    x_train: np.ndarray,
+    theta_val: np.ndarray,
+    x_val: np.ndarray,
+    device: torch.device,
+    schedule: GaussianAffinePathSchedule,
+    warmup_epochs: int,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    weight_decay: float = 0.0,
+    t_eps: float = 0.05,
+    patience: int = 1000,
+    min_delta: float = 1e-4,
+    ema_alpha: float = 0.05,
+    weight_ema_decay: float = 0.9,
+    max_grad_norm: float = 10.0,
+    log_every: int = 50,
+    restore_best: bool = True,
+    log_name: str = "linear_x_flow_low_rank_t",
+) -> dict[str, Any]:
+    """Warm up only ``b(t, theta)``, then run the normal scheduled low-rank-t trainer."""
+    if int(warmup_epochs) < 1:
+        raise ValueError("warmup_epochs must be >= 1.")
+
+    original_requires_grad = {name: p.requires_grad for name, p in model.named_parameters()}
+    try:
+        for p in model.parameters():
+            p.requires_grad_(False)
+        for p in model.linear.b_net.parameters():
+            p.requires_grad_(True)
+
+        warmup_out = train_time_linear_x_flow_schedule(
+            model=model,
+            theta_train=theta_train,
+            x_train=x_train,
+            theta_val=theta_val,
+            x_val=x_val,
+            device=device,
+            schedule=schedule,
+            epochs=int(warmup_epochs),
+            batch_size=batch_size,
+            lr=lr,
+            weight_decay=weight_decay,
+            t_eps=t_eps,
+            patience=patience,
+            min_delta=min_delta,
+            ema_alpha=ema_alpha,
+            weight_ema_decay=weight_ema_decay,
+            max_grad_norm=max_grad_norm,
+            log_every=log_every,
+            restore_best=restore_best,
+            log_name=f"{log_name}_warmup",
+        )
+    finally:
+        for name, p in model.named_parameters():
+            p.requires_grad_(original_requires_grad.get(name, True))
+
+    for p in model.parameters():
+        p.requires_grad_(True)
+
+    full_out = train_time_linear_x_flow_schedule(
+        model=model,
+        theta_train=theta_train,
+        x_train=x_train,
+        theta_val=theta_val,
+        x_val=x_val,
+        device=device,
+        schedule=schedule,
+        epochs=epochs,
+        batch_size=batch_size,
+        lr=lr,
+        weight_decay=weight_decay,
+        t_eps=t_eps,
+        patience=patience,
+        min_delta=min_delta,
+        ema_alpha=ema_alpha,
+        weight_ema_decay=weight_ema_decay,
+        max_grad_norm=max_grad_norm,
+        log_every=log_every,
+        restore_best=restore_best,
+        log_name=log_name,
+    )
+    full_out.update(
+        {
+            "lxf_low_rank_t_warmup_enabled": True,
+            "lxf_low_rank_t_warmup_epochs": int(warmup_epochs),
+            "warmup_train_losses": warmup_out["train_losses"],
+            "warmup_val_losses": warmup_out["val_losses"],
+            "warmup_val_monitor_losses": warmup_out["val_monitor_losses"],
+            "warmup_best_val_loss": float(warmup_out["best_val_loss"]),
+            "warmup_best_epoch": int(warmup_out["best_epoch"]),
+            "warmup_stopped_epoch": int(warmup_out["stopped_epoch"]),
+            "warmup_stopped_early": bool(warmup_out["stopped_early"]),
+            "warmup_lr_last": float(warmup_out.get("lr_last", float("nan"))),
+            "warmup_n_clipped_steps": int(warmup_out.get("n_clipped_steps", 0)),
+            "warmup_n_total_steps": int(warmup_out.get("n_total_steps", 0)),
+            "warmup_weight_ema_enabled": bool(warmup_out.get("weight_ema_enabled", False)),
+            "warmup_weight_ema_decay": float(warmup_out.get("weight_ema_decay", weight_ema_decay)),
+            "warmup_final_eval_weights": str(warmup_out.get("final_eval_weights", "raw")),
+        }
+    )
+    return full_out
 
 
 def train_time_diagonal_linear_x_flow_schedule(

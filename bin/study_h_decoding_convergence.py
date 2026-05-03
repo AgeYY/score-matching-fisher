@@ -159,6 +159,7 @@ from fisher.linear_x_flow import (
     train_linear_x_flow,
     train_pca_nonlinear_linear_x_flow,
     train_pca_nonlinear_time_linear_x_flow_schedule,
+    train_low_rank_t_warmup_then_full,
     train_time_linear_x_flow_schedule,
     fit_residual_pca_basis_from_time_linear_mean,
 )
@@ -1039,6 +1040,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="linear-x-flow-diagonal-t only: affine path a(t), b(t) for FM training.",
     )
     p.add_argument("--lxfs-epochs", type=int, default=2000, help="linear-x-flow-diagonal-t only: training epochs.")
+    p.add_argument(
+        "--lxf-low-rank-t-warmup-epochs",
+        type=int,
+        default=1000,
+        help="linear-x-flow-low-rank-t only: b(t, theta)-only warmup epochs before full lxfs training; set 0 to disable.",
+    )
     p.add_argument("--lxfs-batch-size", type=int, default=1024, help="linear-x-flow-diagonal-t only: training batch size.")
     p.add_argument("--lxfs-lr", type=float, default=1e-4, help="linear-x-flow-diagonal-t only: learning rate.")
     p.add_argument("--lxfs-hidden-dim", type=int, default=128, help="linear-x-flow-diagonal-t only: b_phi MLP hidden width.")
@@ -3929,11 +3936,21 @@ def _estimate_one(
             restore_best=bool(getattr(args, "lxf_restore_best", True)),
         )
         if scheduled_lxf:
-            train_out = train_time_linear_x_flow_schedule(
-                **train_kwargs,
-                schedule=path_schedule_from_name(sched_name),
-                log_name=method_name,
-            )
+            schedule = path_schedule_from_name(sched_name)
+            warmup_epochs = int(getattr(args, "lxf_low_rank_t_warmup_epochs", 0))
+            if method_name == "linear_x_flow_low_rank_t" and warmup_epochs > 0:
+                train_out = train_low_rank_t_warmup_then_full(
+                    **train_kwargs,
+                    schedule=schedule,
+                    warmup_epochs=warmup_epochs,
+                    log_name=method_name,
+                )
+            else:
+                train_out = train_time_linear_x_flow_schedule(
+                    **train_kwargs,
+                    schedule=schedule,
+                    log_name=method_name,
+                )
         else:
             train_out = train_linear_x_flow(**train_kwargs)
         x_mean = np.asarray(train_out["x_mean"], dtype=np.float64)
@@ -4153,6 +4170,12 @@ def _estimate_one(
         lxf_hutchinson_probes_save = np.int64(
             int(getattr(args, "lxf_hutchinson_probes", 1)) if method_name == "linear_x_flow_low_rank_t" else 0
         )
+        lxf_low_rank_t_warmup_epochs_save = np.int64(
+            int(getattr(args, "lxf_low_rank_t_warmup_epochs", 0)) if method_name == "linear_x_flow_low_rank_t" else 0
+        )
+        lxf_low_rank_t_warmup_enabled_save = np.bool_(
+            bool(train_out.get("lxf_low_rank_t_warmup_enabled", False))
+        )
 
         h_payload: dict[str, Any] = dict(
             theta_used=np.asarray(theta_used, dtype=np.float64),
@@ -4194,6 +4217,8 @@ def _estimate_one(
             ),
             lxf_low_rank_divergence_estimator=np.asarray([lxf_low_rank_div_est_save], dtype=object),
             lxf_hutchinson_probes=lxf_hutchinson_probes_save,
+            lxf_low_rank_t_warmup_epochs=lxf_low_rank_t_warmup_epochs_save,
+            lxf_low_rank_t_warmup_enabled=lxf_low_rank_t_warmup_enabled_save,
             lxf_nlpca_pca_basis=np.asarray(pca_basis, dtype=np.float32),
             lxf_weight_ema_decay=np.float64(train_out.get("weight_ema_decay", float(getattr(args, f"{lxf_prefix}_weight_ema_decay", 0.9)))),
             lxf_weight_ema_enabled=np.bool_(train_out.get("weight_ema_enabled", False)),
@@ -4277,6 +4302,19 @@ def _estimate_one(
             ),
             lxf_low_rank_divergence_estimator=np.asarray([lxf_low_rank_div_est_save], dtype=object),
             lxf_hutchinson_probes=lxf_hutchinson_probes_save,
+            lxf_low_rank_t_warmup_enabled=lxf_low_rank_t_warmup_enabled_save,
+            lxf_low_rank_t_warmup_epochs=lxf_low_rank_t_warmup_epochs_save,
+            lxf_low_rank_t_warmup_train_losses=np.asarray(train_out.get("warmup_train_losses", empty), dtype=np.float64),
+            lxf_low_rank_t_warmup_val_losses=np.asarray(train_out.get("warmup_val_losses", empty), dtype=np.float64),
+            lxf_low_rank_t_warmup_val_monitor_losses=np.asarray(train_out.get("warmup_val_monitor_losses", empty), dtype=np.float64),
+            lxf_low_rank_t_warmup_best_epoch=np.int64(train_out.get("warmup_best_epoch", 0)),
+            lxf_low_rank_t_warmup_stopped_epoch=np.int64(train_out.get("warmup_stopped_epoch", 0)),
+            lxf_low_rank_t_warmup_stopped_early=np.bool_(train_out.get("warmup_stopped_early", False)),
+            lxf_low_rank_t_warmup_best_val_smooth=np.float64(train_out.get("warmup_best_val_loss", float("nan"))),
+            lxf_low_rank_t_warmup_n_clipped_steps=np.int64(train_out.get("warmup_n_clipped_steps", 0)),
+            lxf_low_rank_t_warmup_n_total_steps=np.int64(train_out.get("warmup_n_total_steps", 0)),
+            lxf_low_rank_t_warmup_lr_last=np.float64(train_out.get("warmup_lr_last", float("nan"))),
+            lxf_low_rank_t_warmup_final_eval_weights=np.asarray([str(train_out.get("warmup_final_eval_weights", ""))], dtype=object),
             lxf_weight_ema_decay=np.float64(train_out.get("weight_ema_decay", float(getattr(args, f"{lxf_prefix}_weight_ema_decay", 0.9)))),
             lxf_weight_ema_enabled=np.bool_(train_out.get("weight_ema_enabled", False)),
             lxf_final_eval_weights=np.asarray([str(train_out.get("final_eval_weights", "raw"))], dtype=object),
