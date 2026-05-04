@@ -42,6 +42,8 @@ PCA components fit from theta-binned train-set means, then fits a diagonal Gauss
 in that low-dimensional PCA space. ``--theta-field-method gaussian-x-flow`` trains a full covariance
 Cholesky Gaussian via analytic flow-matching velocity on an affine noise bridge; ``gaussian-x-flow-diagonal``
 uses the same objective with a diagonal covariance / Cholesky (see ``fisher/gaussian_x_flow.py``).
+``--theta-field-method linear-x-flow`` trains ``v(x,theta)=A x+b_phi(theta)`` and evaluates the
+induced Gaussian with theta-dependent mean and shared covariance.
 ``--theta-field-method linear-x-flow-diagonal-t`` trains ``v(x,t,theta)=diag(a(t))x+b(t,theta)``
 on a scheduled affine probability path and evaluates its quadrature Gaussian likelihood.
 ``--theta-field-method nf-reduction`` learns an invertible x-space flow to ``(z, epsilon)`` and
@@ -129,6 +131,7 @@ from fisher.linear_x_flow import (
     ConditionalTimeDiagonalLinearXFlowMLP,
     ConditionalTimeLinearXFlowMLP,
     ConditionalTimeLowRankCorrectionLinearXFlowMLP,
+    ConditionalTimePureLowRankLinearXFlowMLP,
     ConditionalTimeThetaOnlyBLowRankCorrectionLinearXFlowMLP,
     ConditionalTimeRandomBasisLowRankLinearXFlowMLP,
     ConditionalTimeScalarLinearXFlowMLP,
@@ -895,8 +898,9 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=4,
         help=(
+            ""
             "linear_x_flow_low_rank_t / linear_x_flow_lr_t_ts: rank r of the low-rank "
-            "correction U h(U^T x) with static orthonormal U. "
+            "correction U h(U^T x). "
             "linear_x_flow_low_rank_randb_t: rank of the low-rank random-basis A(t) term."
         ),
     )
@@ -906,8 +910,10 @@ def build_parser() -> argparse.ArgumentParser:
         default="hutchinson",
         choices=["hutchinson", "exact"],
         help=(
-            "linear_x_flow_low_rank_t / linear_x_flow_lr_t_ts: trace of dh/dz in z=U^T x "
-            "(U orthonormal columns; lr_t_ts freezes b after mean-regression pretrain). "
+            "linear_x_flow_low_rank_t / linear_x_flow_lr_t_ts: trace of dh/dz in z=U^T x (U orthonormal columns). "
+            "linear_x_flow_lr_t_ts: same Hutchinson/exact trace on h as low_rank_t (b is frozen after mean-regression pretrain); "
+            ""
+            ""
             "`hutchinson` uses Rademacher probes (default; faster when r is large). "
             "`exact` uses one autograd per output dimension (r calls)."
         ),
@@ -918,8 +924,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         help="linear_x_flow_low_rank_t / linear_x_flow_lr_t_ts with hutchinson: number of Rademacher probes per divergence.",
     )
-    p.add_argument("--lxf-randb-lambda-a", type=float, default=1e-4, help="linear-x-flow-low-rank-randb-t only: L2 penalty on diagonal a(t).")
-    p.add_argument("--lxf-randb-lambda-s", type=float, default=1e-4, help="linear-x-flow-low-rank-randb-t only: L2 penalty on symmetric S(t).")
+    p.add_argument("--lxf-randb-lambda-a", type=float, default=1e-4, help="scheduled random-basis LXF only: L2 penalty on diagonal a.")
+    p.add_argument("--lxf-randb-lambda-s", type=float, default=1e-4, help="scheduled random-basis LXF only: L2 penalty on symmetric S.")
     p.add_argument("--lxf-weight-decay", type=float, default=0.0, help="linear-x-flow only: AdamW weight decay.")
     p.add_argument(
         "--lxf-t-eps",
@@ -994,9 +1000,9 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default="cosine",
         choices=["linear", "straight", "cosine", "cos"],
-        help="linear-x-flow-diagonal-t only: affine path a(t), b(t) for FM training.",
+        help="scheduled linear-x-flow only: affine path a(t), b(t) for FM training.",
     )
-    p.add_argument("--lxfs-epochs", type=int, default=2000, help="linear-x-flow-diagonal-t only: training epochs.")
+    p.add_argument("--lxfs-epochs", type=int, default=2000, help="scheduled linear-x-flow only: training epochs.")
     p.add_argument(
         "--lxf-low-rank-t-warmup-epochs",
         type=int,
@@ -1006,64 +1012,64 @@ def build_parser() -> argparse.ArgumentParser:
             "linear_x_flow_lr_t_ts: epochs of mean-squared regression pretraining b(theta) to normalized x1 (required >= 1); then b is frozen for lxfs training."
         ),
     )
-    p.add_argument("--lxfs-batch-size", type=int, default=1024, help="linear-x-flow-diagonal-t only: training batch size.")
-    p.add_argument("--lxfs-lr", type=float, default=1e-4, help="linear-x-flow-diagonal-t only: learning rate.")
-    p.add_argument("--lxfs-hidden-dim", type=int, default=128, help="linear-x-flow-diagonal-t only: b_phi MLP hidden width.")
-    p.add_argument("--lxfs-depth", type=int, default=3, help="linear-x-flow-diagonal-t only: b_phi MLP depth.")
-    p.add_argument("--lxfs-weight-decay", type=float, default=0.0, help="linear-x-flow-diagonal-t only: AdamW weight decay.")
+    p.add_argument("--lxfs-batch-size", type=int, default=1024, help="scheduled linear-x-flow only: training batch size.")
+    p.add_argument("--lxfs-lr", type=float, default=1e-4, help="scheduled linear-x-flow only: learning rate.")
+    p.add_argument("--lxfs-hidden-dim", type=int, default=128, help="scheduled linear-x-flow only: b_phi MLP hidden width.")
+    p.add_argument("--lxfs-depth", type=int, default=3, help="scheduled linear-x-flow only: b_phi MLP depth.")
+    p.add_argument("--lxfs-weight-decay", type=float, default=0.0, help="scheduled linear-x-flow only: AdamW weight decay.")
     p.add_argument(
         "--lxfs-t-eps",
         type=float,
         default=0.05,
-        help="linear-x-flow-diagonal-t only: bridge time is sampled in [t_eps, 1-t_eps].",
+        help="scheduled linear-x-flow only: bridge time is sampled in [t_eps, 1-t_eps].",
     )
     p.add_argument(
         "--lxfs-solve-jitter",
         type=float,
         default=1e-6,
-        help="linear-x-flow-diagonal-t only: jitter for solving A mu=(exp(A)-I)b and Cholesky log likelihood.",
+        help="scheduled linear-x-flow only: jitter for solving A mu=(exp(A)-I)b and Cholesky log likelihood.",
     )
     p.add_argument(
         "--lxfs-early-patience",
         type=int,
         default=300,
-        help="linear-x-flow-diagonal-t only: early-stop patience; 0 disables early stopping.",
+        help="scheduled linear-x-flow only: early-stop patience; 0 disables early stopping.",
     )
     p.add_argument(
         "--lxfs-early-min-delta",
         type=float,
         default=1e-4,
-        help="linear-x-flow-diagonal-t only: early-stop min delta on smoothed validation FM loss.",
+        help="scheduled linear-x-flow only: early-stop min delta on smoothed validation FM loss.",
     )
     p.add_argument(
         "--lxfs-early-ema-alpha",
         type=float,
         default=0.05,
-        help="linear-x-flow-diagonal-t only: EMA alpha for validation FM loss monitor.",
+        help="scheduled linear-x-flow only: EMA alpha for validation FM loss monitor.",
     )
     p.add_argument(
         "--lxfs-weight-ema-decay",
         type=float,
         default=0.9,
-        help="linear-x-flow-diagonal-t only: model-weight EMA decay; <=0 disables weight EMA.",
+        help="scheduled linear-x-flow only: model-weight EMA decay; <=0 disables weight EMA.",
     )
     p.add_argument(
         "--lxfs-max-grad-norm",
         type=float,
         default=10.0,
-        help="linear-x-flow-diagonal-t only: gradient clipping max norm; <=0 disables clipping.",
+        help="scheduled linear-x-flow only: gradient clipping max norm; <=0 disables clipping.",
     )
     p.add_argument(
         "--lxfs-pair-batch-size",
         type=int,
         default=65536,
-        help="linear-x-flow-diagonal-t only: approximate pair budget per C-matrix block (rows*cols).",
+        help="scheduled linear-x-flow only: approximate pair budget per C-matrix block (rows*cols).",
     )
     p.add_argument(
         "--lxfs-quadrature-steps",
         type=int,
         default=64,
-        help="linear-x-flow-diagonal-t only: fixed time grid size for endpoint Gaussian quadrature.",
+        help="scheduled linear-x-flow only: fixed time grid size for endpoint Gaussian quadrature.",
     )
     p.add_argument("--ltf-num-components", type=int, default=3, help="linear-theta-flow only: Gaussian mixture components.")
     p.add_argument("--ltf-epochs", type=int, default=2000, help="linear-theta-flow only: training epochs.")
@@ -1370,6 +1376,7 @@ def _normalize_nf_reduction_method(tfm: str) -> str | None:
     return aliases.get(key)
 
 
+
 def _normalize_pi_nf_method(tfm: str) -> str | None:
     key = str(tfm).strip().lower()
     aliases = {
@@ -1528,6 +1535,7 @@ def _validate_lxf_cli(args: argparse.Namespace) -> None:
         raise ValueError(f"{label}-depth must be >= 1.")
     if method in (
         "linear_x_flow_low_rank_t",
+        "linear_x_flow_pure_low_rank_t",
         "linear_x_flow_lr_t_ts",
         "linear_x_flow_low_rank_randb_t",
     ) and int(getattr(args, "lxf_low_rank_dim", 0)) < 1:
@@ -1962,6 +1970,7 @@ def _validate_cli(args: argparse.Namespace) -> None:
         "linear_x_flow_diagonal_theta_t",
         "linear_x_flow_diagonal_t",
         "linear_x_flow_low_rank_t",
+        "linear_x_flow_pure_low_rank_t",
         "linear_x_flow_lr_t_ts",
         "linear_x_flow_low_rank_randb_t",
         "linear_theta_flow",
@@ -3685,91 +3694,39 @@ def _estimate_one(
         if theta_train.shape[1] != theta_all.shape[1]:
             raise ValueError(f"{method_name} theta dimension mismatch.")
 
-        lxf_theta_fourier_enabled = False
-        lxf_theta_original_dim = int(theta_all.shape[1])
-        lxf_theta_fourier_k = 0
-        lxf_theta_fourier_center = np.asarray([], dtype=np.float64)
-        lxf_theta_fourier_range = np.asarray([], dtype=np.float64)
-        lxf_theta_fourier_period = np.asarray([], dtype=np.float64)
         theta_train_model = theta_train
         theta_val_model = theta_val
         theta_all_model = theta_all
-
         x_dim_lxf = int(x_all.shape[1])
         lxf_rank = int(getattr(args, "lxf_low_rank_dim", 4))
-        common_model_kwargs = dict(
-            theta_dim=int(theta_all.shape[1]),
-            x_dim=x_dim_lxf,
-            hidden_dim=int(getattr(args, f"{lxf_prefix}_hidden_dim", 128)),
-            depth=int(getattr(args, f"{lxf_prefix}_depth", 3)),
-        )
-        if method_name == "linear_x_flow_scalar_t":
+        common = dict(theta_dim=int(theta_all.shape[1]), x_dim=x_dim_lxf, hidden_dim=int(getattr(args, f"{lxf_prefix}_hidden_dim", 128)), depth=int(getattr(args, f"{lxf_prefix}_depth", 3)))
+        if method_name == "linear_x_flow_t":
+            drift_type = "full_symmetric_time"
+            model = ConditionalTimeLinearXFlowMLP(**common, quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64))).to(dev)
+        elif method_name == "linear_x_flow_scalar_t":
             drift_type = "scalar_time"
-            model = ConditionalTimeScalarLinearXFlowMLP(**common_model_kwargs, quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64))).to(dev)
-        elif method_name == "linear_x_flow_diagonal_theta_t":
-            drift_type = "diagonal_theta_time"
-            model = ConditionalTimeThetaDiagonalLinearXFlowMLP(**common_model_kwargs, quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64))).to(dev)
+            model = ConditionalTimeScalarLinearXFlowMLP(**common, quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64))).to(dev)
         elif method_name == "linear_x_flow_diagonal_t":
             drift_type = "diagonal_time"
-            model = ConditionalTimeDiagonalLinearXFlowMLP(**common_model_kwargs, quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64))).to(dev)
+            model = ConditionalTimeDiagonalLinearXFlowMLP(**common, quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64))).to(dev)
+        elif method_name == "linear_x_flow_diagonal_theta_t":
+            drift_type = "diagonal_theta_time"
+            model = ConditionalTimeThetaDiagonalLinearXFlowMLP(**common, quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64))).to(dev)
         elif method_name == "linear_x_flow_low_rank_t":
-            if lxf_rank > x_dim_lxf:
-                raise ValueError(f"--lxf-low-rank-dim must be <= x_dim={x_dim_lxf}; got {lxf_rank}.")
+            if lxf_rank > x_dim_lxf: raise ValueError(f"--lxf-low-rank-dim must be <= x_dim={x_dim_lxf}; got {lxf_rank}.")
             drift_type = "low_rank_correction_time"
-            model = ConditionalTimeLowRankCorrectionLinearXFlowMLP(
-                **common_model_kwargs,
-                correction_rank=lxf_rank,
-                quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)),
-                divergence_estimator=str(getattr(args, "lxf_low_rank_divergence_estimator", "hutchinson")).strip().lower(),
-                hutchinson_probes=int(getattr(args, "lxf_hutchinson_probes", 1)),
-            ).to(dev)
+            model = ConditionalTimeLowRankCorrectionLinearXFlowMLP(**common, correction_rank=lxf_rank, quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)), divergence_estimator=str(getattr(args, "lxf_low_rank_divergence_estimator", "hutchinson")).strip().lower(), hutchinson_probes=int(getattr(args, "lxf_hutchinson_probes", 1))).to(dev)
         elif method_name == "linear_x_flow_lr_t_ts":
-            if lxf_rank > x_dim_lxf:
-                raise ValueError(f"--lxf-low-rank-dim must be <= x_dim={x_dim_lxf}; got {lxf_rank}.")
+            if lxf_rank > x_dim_lxf: raise ValueError(f"--lxf-low-rank-dim must be <= x_dim={x_dim_lxf}; got {lxf_rank}.")
             drift_type = "low_rank_correction_time_theta_only_b"
-            model = ConditionalTimeThetaOnlyBLowRankCorrectionLinearXFlowMLP(
-                **common_model_kwargs,
-                correction_rank=lxf_rank,
-                quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)),
-                divergence_estimator=str(getattr(args, "lxf_low_rank_divergence_estimator", "hutchinson")).strip().lower(),
-                hutchinson_probes=int(getattr(args, "lxf_hutchinson_probes", 1)),
-            ).to(dev)
+            model = ConditionalTimeThetaOnlyBLowRankCorrectionLinearXFlowMLP(**common, correction_rank=lxf_rank, quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)), divergence_estimator=str(getattr(args, "lxf_low_rank_divergence_estimator", "hutchinson")).strip().lower(), hutchinson_probes=int(getattr(args, "lxf_hutchinson_probes", 1))).to(dev)
         elif method_name == "linear_x_flow_low_rank_randb_t":
-            if lxf_rank > x_dim_lxf:
-                raise ValueError(f"--lxf-low-rank-dim must be <= x_dim={x_dim_lxf}; got {lxf_rank}.")
+            if lxf_rank > x_dim_lxf: raise ValueError(f"--lxf-low-rank-dim must be <= x_dim={x_dim_lxf}; got {lxf_rank}.")
             drift_type = "low_rank_randb_time"
-            model = ConditionalTimeRandomBasisLowRankLinearXFlowMLP(
-                **common_model_kwargs,
-                rank=lxf_rank,
-                quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)),
-                lambda_a=float(getattr(args, "lxf_randb_lambda_a", 1e-4)),
-                lambda_s=float(getattr(args, "lxf_randb_lambda_s", 1e-4)),
-            ).to(dev)
-        elif method_name == "linear_x_flow_t":
-            drift_type = "full_symmetric_time"
-            model = ConditionalTimeLinearXFlowMLP(**common_model_kwargs, quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64))).to(dev)
+            model = ConditionalTimeRandomBasisLowRankLinearXFlowMLP(**common, rank=lxf_rank, quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)), lambda_a=float(getattr(args, "lxf_randb_lambda_a", 1e-4)), lambda_s=float(getattr(args, "lxf_randb_lambda_s", 1e-4))).to(dev)
         else:
             raise ValueError(f"Unsupported linear_x_flow method: {method_name!r}.")
-        train_kwargs = dict(
-            model=model,
-            theta_train=theta_train_model,
-            x_train=x_train,
-            theta_val=theta_val_model,
-            x_val=x_val,
-            device=dev,
-            epochs=int(getattr(args, f"{lxf_prefix}_epochs", 2000)),
-            batch_size=int(getattr(args, f"{lxf_prefix}_batch_size", 1024)),
-            lr=float(getattr(args, f"{lxf_prefix}_lr", 1e-3)),
-            weight_decay=float(getattr(args, f"{lxf_prefix}_weight_decay", 0.0)),
-            t_eps=float(getattr(args, f"{lxf_prefix}_t_eps", 0.05)),
-            patience=int(getattr(args, f"{lxf_prefix}_early_patience", 1000)),
-            min_delta=float(getattr(args, f"{lxf_prefix}_early_min_delta", 1e-4)),
-            ema_alpha=float(getattr(args, f"{lxf_prefix}_early_ema_alpha", 0.05)),
-            weight_ema_decay=float(getattr(args, f"{lxf_prefix}_weight_ema_decay", 0.9)),
-            max_grad_norm=float(getattr(args, f"{lxf_prefix}_max_grad_norm", 10.0)),
-            log_every=max(1, int(getattr(args, "log_every", 50))),
-            restore_best=bool(getattr(args, "lxf_restore_best", True)),
-        )
+        train_kwargs = dict(model=model, theta_train=theta_train_model, x_train=x_train, theta_val=theta_val_model, x_val=x_val, device=dev, epochs=int(getattr(args, f"{lxf_prefix}_epochs", 2000)), batch_size=int(getattr(args, f"{lxf_prefix}_batch_size", 1024)), lr=float(getattr(args, f"{lxf_prefix}_lr", 1e-3)), weight_decay=float(getattr(args, f"{lxf_prefix}_weight_decay", 0.0)), t_eps=float(getattr(args, f"{lxf_prefix}_t_eps", 0.05)), patience=int(getattr(args, f"{lxf_prefix}_early_patience", 1000)), min_delta=float(getattr(args, f"{lxf_prefix}_early_min_delta", 1e-4)), ema_alpha=float(getattr(args, f"{lxf_prefix}_early_ema_alpha", 0.05)), weight_ema_decay=float(getattr(args, f"{lxf_prefix}_weight_ema_decay", 0.9)), max_grad_norm=float(getattr(args, f"{lxf_prefix}_max_grad_norm", 10.0)), log_every=max(1, int(getattr(args, "log_every", 50))), restore_best=bool(getattr(args, "lxf_restore_best", True)))
         schedule = path_schedule_from_name(sched_name)
         warmup_epochs = int(getattr(args, "lxf_low_rank_t_warmup_epochs", 0))
         if method_name == "linear_x_flow_lr_t_ts":
@@ -3781,226 +3738,27 @@ def _estimate_one(
         x_mean = np.asarray(train_out["x_mean"], dtype=np.float64)
         x_std = np.asarray(train_out["x_std"], dtype=np.float64)
         correction_methods = {"linear_x_flow_low_rank_t", "linear_x_flow_lr_t_ts"}
-        low_rank_methods = correction_methods | {"linear_x_flow_low_rank_randb_t"}
         analytic_lxf_h = bool(getattr(args, "lxf_analytic_gaussian_hellinger", False)) and method_name not in correction_methods
-        save_lxf_c_matrix = bool(getattr(args, "lxf_save_c_matrix", False))
-        c_matrix: np.ndarray | None
-        delta_l: np.ndarray | None
-        lxf_bin_h: dict[str, np.ndarray] | None = None
-        endpoint_mu = np.asarray([], dtype=np.float64)
-        endpoint_cov_or_diag = np.asarray([], dtype=np.float64)
-        endpoint_is_diag = False
-        if bin_all is None:
-            raise ValueError("linear-x-flow bin-likelihood Hellinger requires theta bin labels from the convergence subset.")
+        c_matrix = None; delta_l = None; lxf_bin_h = None
+        endpoint_mu = np.asarray([], dtype=np.float64); endpoint_cov_or_diag = np.asarray([], dtype=np.float64); endpoint_is_diag = False
+        if bin_all is None: raise ValueError("linear-x-flow bin-likelihood Hellinger requires theta bin labels from the convergence subset.")
         if method_name in correction_methods:
-            c_matrix = compute_ode_time_linear_x_flow_c_matrix(
-                model=model,
-                theta_all=theta_all_model,
-                x_all=x_all,
-                device=dev,
-                x_mean=x_mean,
-                x_std=x_std,
-                solve_jitter=float(getattr(args, "lxfs_solve_jitter", 1e-6)),
-                quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)),
-                ode_steps=int(getattr(args, "lxf_nlpca_ode_steps", 32)),
-                pair_batch_size=int(getattr(args, "lxfs_pair_batch_size", 65536)),
-            )
-            delta_l = compute_delta_l_nf(c_matrix)
-            lxf_bin_h = _lxf_bin_likelihood_hellinger(c_matrix, np.asarray(bin_all, dtype=np.int64), int(n_bins))
-            h_sym = lxf_bin_h["h_sym"]
+            c_matrix = compute_ode_time_linear_x_flow_c_matrix(model=model, theta_all=theta_all_model, x_all=x_all, device=dev, x_mean=x_mean, x_std=x_std, solve_jitter=float(getattr(args, "lxfs_solve_jitter", 1e-6)), quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)), ode_steps=int(getattr(args, "lxf_nlpca_ode_steps", 32)), pair_batch_size=int(getattr(args, "lxfs_pair_batch_size", 65536)))
+            delta_l = compute_delta_l_nf(c_matrix); lxf_bin_h = _lxf_bin_likelihood_hellinger(c_matrix, np.asarray(bin_all, dtype=np.int64), int(n_bins)); h_sym = lxf_bin_h["h_sym"]
         else:
-            endpoint_h_sym, endpoint_mu, endpoint_cov_or_diag, endpoint_is_diag = compute_linear_x_flow_analytic_hellinger_matrix(
-                model=model,
-                theta_all=theta_all_model,
-                device=dev,
-                solve_jitter=float(getattr(args, f"{lxf_prefix}_solve_jitter", 1e-6)),
-                quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)),
-            )
-            if analytic_lxf_h:
-                h_sym = endpoint_h_sym
-                c_matrix = None
-                delta_l = None
+            endpoint_h_sym, endpoint_mu, endpoint_cov_or_diag, endpoint_is_diag = compute_linear_x_flow_analytic_hellinger_matrix(model=model, theta_all=theta_all_model, device=dev, solve_jitter=float(getattr(args, f"{lxf_prefix}_solve_jitter", 1e-6)), quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)))
+            if analytic_lxf_h: h_sym = endpoint_h_sym
             else:
-                c_matrix = compute_time_linear_x_flow_c_matrix(
-                    model=model,
-                    theta_all=theta_all_model,
-                    x_all=x_all,
-                    device=dev,
-                    x_mean=x_mean,
-                    x_std=x_std,
-                    solve_jitter=float(getattr(args, f"{lxf_prefix}_solve_jitter", 1e-6)),
-                    quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)),
-                    pair_batch_size=int(getattr(args, f"{lxf_prefix}_pair_batch_size", 65536)),
-                )
-                delta_l = compute_delta_l_nf(c_matrix)
-                lxf_bin_h = _lxf_bin_likelihood_hellinger(c_matrix, np.asarray(bin_all, dtype=np.int64), int(n_bins))
-                h_sym = lxf_bin_h["h_sym"]
-            if analytic_lxf_h and save_lxf_c_matrix:
-                c_matrix = compute_time_linear_x_flow_c_matrix(
-                    model=model,
-                    theta_all=theta_all_model,
-                    x_all=x_all,
-                    device=dev,
-                    x_mean=x_mean,
-                    x_std=x_std,
-                    solve_jitter=float(getattr(args, f"{lxf_prefix}_solve_jitter", 1e-6)),
-                    quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)),
-                    pair_batch_size=int(getattr(args, f"{lxf_prefix}_pair_batch_size", 65536)),
-                )
-                delta_l = compute_delta_l_nf(c_matrix)
+                c_matrix = compute_time_linear_x_flow_c_matrix(model=model, theta_all=theta_all_model, x_all=x_all, device=dev, x_mean=x_mean, x_std=x_std, solve_jitter=float(getattr(args, f"{lxf_prefix}_solve_jitter", 1e-6)), quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)), pair_batch_size=int(getattr(args, f"{lxf_prefix}_pair_batch_size", 65536)))
+                delta_l = compute_delta_l_nf(c_matrix); lxf_bin_h = _lxf_bin_likelihood_hellinger(c_matrix, np.asarray(bin_all, dtype=np.int64), int(n_bins)); h_sym = lxf_bin_h["h_sym"]
         theta_used = theta_all.reshape(-1) if int(theta_all.shape[1]) == 1 else theta_all.copy()
-
-        div_est = str(getattr(args, "lxf_low_rank_divergence_estimator", "hutchinson")).strip().lower() if method_name in correction_methods else ""
-        probes = np.int64(int(getattr(args, "lxf_hutchinson_probes", 1)) if method_name in correction_methods else 0)
-        warmup_save = np.int64(int(getattr(args, "lxf_low_rank_t_warmup_epochs", 0)) if method_name in correction_methods else 0)
-        warmup_enabled = np.bool_(bool(train_out.get("lxf_low_rank_t_warmup_enabled", False)))
         empty = np.asarray([], dtype=np.float64)
-
-        h_payload: dict[str, Any] = dict(
-            theta_used=np.asarray(theta_used, dtype=np.float64),
-            h_sym=np.asarray(h_sym, dtype=np.float64),
-            h_field_method=np.asarray([method_name], dtype=object),
-            h_eval_scalar_name=np.asarray([f"{method_name}_bin_log_p_x_given_theta" if not analytic_lxf_h else f"{method_name}_analytic_gaussian_hellinger"], dtype=object),
-            sigma_eval=np.asarray([np.nan], dtype=np.float64),
-            theta_field_method=np.asarray([method_name], dtype=object),
-            lxf_analytic_gaussian_hellinger=np.bool_(analytic_lxf_h),
-            lxf_bin_likelihood_hellinger=np.bool_(not analytic_lxf_h),
-            lxf_save_c_matrix=np.bool_(save_lxf_c_matrix),
-            lxf_endpoint_mu=np.asarray(endpoint_mu, dtype=np.float64),
-            lxf_endpoint_covariance_or_variance_diag=np.asarray(endpoint_cov_or_diag, dtype=np.float64),
-            lxf_endpoint_is_diagonal=np.bool_(endpoint_is_diag),
-            lxf_fm_train=np.bool_(True),
-            lxf_t_eps=np.float64(float(getattr(args, f"{lxf_prefix}_t_eps", 0.05))),
-            lxf_solve_jitter=np.float64(float(getattr(args, f"{lxf_prefix}_solve_jitter", 1e-6))),
-            lxf_hidden_dim=np.int64(int(getattr(args, f"{lxf_prefix}_hidden_dim", 128))),
-            lxf_depth=np.int64(int(getattr(args, f"{lxf_prefix}_depth", 3))),
-            lxf_b_net=np.asarray(["mlp"], dtype=object),
-            lxf_drift_type=np.asarray([drift_type], dtype=object),
-            lxf_low_rank_dim=np.int64(lxf_rank if method_name in low_rank_methods else 0),
-            lxf_randb_lambda_a=np.float64(float(getattr(args, "lxf_randb_lambda_a", 1e-4)) if method_name == "linear_x_flow_low_rank_randb_t" else 0.0),
-            lxf_randb_lambda_s=np.float64(float(getattr(args, "lxf_randb_lambda_s", 1e-4)) if method_name == "linear_x_flow_low_rank_randb_t" else 0.0),
-            lxf_nlpca_dim=np.int64(0),
-            lxf_nlpca_lambda_h=np.float64(0.0),
-            lxf_nlpca_freeze_linear=np.bool_(False),
-            lxf_nlpca_ode_steps=np.int64(int(getattr(args, "lxf_nlpca_ode_steps", 32)) if method_name in correction_methods else 0),
-            lxf_low_rank_divergence_estimator=np.asarray([div_est], dtype=object),
-            lxf_hutchinson_probes=probes,
-            lxf_lr_utt_dynamic_u=np.bool_(False),
-            lxf_low_rank_t_warmup_epochs=warmup_save,
-            lxf_low_rank_t_warmup_enabled=warmup_enabled,
-            lxf_low_rank_t_warmup_objective=np.asarray([str(train_out.get("lxf_low_rank_t_warmup_objective", ""))], dtype=object),
-            lxf_theta_fourier_enabled=np.bool_(False),
-            lxf_theta_fourier_k=np.int64(0),
-            lxf_theta_original_dim=np.int64(lxf_theta_original_dim),
-            lxf_theta_feature_dim=np.int64(int(theta_all_model.shape[1])),
-            lxf_theta_fourier_center=np.asarray(lxf_theta_fourier_center, dtype=np.float64),
-            lxf_theta_fourier_range=np.asarray(lxf_theta_fourier_range, dtype=np.float64),
-            lxf_theta_fourier_period=np.asarray(lxf_theta_fourier_period, dtype=np.float64),
-            lxf_nlpca_pca_basis=np.asarray([], dtype=np.float32),
-            lxf_weight_ema_decay=np.float64(train_out.get("weight_ema_decay", float(getattr(args, f"{lxf_prefix}_weight_ema_decay", 0.9)))),
-            lxf_weight_ema_enabled=np.bool_(train_out.get("weight_ema_enabled", False)),
-            lxf_final_eval_weights=np.asarray([str(train_out.get("final_eval_weights", "raw"))], dtype=object),
-            lxf_restore_best=np.bool_(bool(getattr(args, "lxf_restore_best", True))),
-            lxfs_path_schedule=np.asarray([sched_name], dtype=object),
-            lxfs_scheduled_train=np.bool_(scheduled_lxf),
-            lxfs_quadrature_steps=np.int64(int(getattr(args, "lxfs_quadrature_steps", 64)) if scheduled_lxf else 0),
-            lxf_x_mean=np.asarray(x_mean, dtype=np.float64),
-            lxf_x_std=np.asarray(x_std, dtype=np.float64),
-        )
-        if c_matrix is not None:
-            h_payload["c_matrix"] = np.asarray(c_matrix, dtype=np.float64)
-        if delta_l is not None:
-            h_payload["delta_l_matrix"] = np.asarray(delta_l, dtype=np.float64)
-        if lxf_bin_h is not None:
-            h_payload["bin_log_likelihood_matrix"] = np.asarray(lxf_bin_h["bin_log_likelihood"], dtype=np.float64)
-            h_payload["bin_delta_l_matrix"] = np.asarray(lxf_bin_h["bin_delta_l"], dtype=np.float64)
-            h_payload["h_directed_bin_likelihood"] = np.asarray(lxf_bin_h["h_directed_bin"], dtype=np.float64)
-            h_payload["h_binned_bin_likelihood"] = np.asarray(lxf_bin_h["h_binned"], dtype=np.float64)
-            h_payload["bin_counts"] = np.asarray(lxf_bin_h["bin_counts"], dtype=np.int64)
+        h_payload = dict(theta_used=np.asarray(theta_used, dtype=np.float64), h_sym=np.asarray(h_sym, dtype=np.float64), h_field_method=np.asarray([method_name], dtype=object), h_eval_scalar_name=np.asarray([f"{method_name}_bin_log_p_x_given_theta" if not analytic_lxf_h else f"{method_name}_analytic_gaussian_hellinger"], dtype=object), sigma_eval=np.asarray([np.nan], dtype=np.float64), theta_field_method=np.asarray([method_name], dtype=object), lxf_drift_type=np.asarray([drift_type], dtype=object), lxf_endpoint_mu=np.asarray(endpoint_mu, dtype=np.float64), lxf_endpoint_covariance_or_variance_diag=np.asarray(endpoint_cov_or_diag, dtype=np.float64), lxf_endpoint_is_diagonal=np.bool_(endpoint_is_diag), lxfs_path_schedule=np.asarray([sched_name], dtype=object), lxfs_scheduled_train=np.bool_(True), lxfs_quadrature_steps=np.int64(int(getattr(args, "lxfs_quadrature_steps", 64))))
+        if c_matrix is not None: h_payload["c_matrix"] = np.asarray(c_matrix, dtype=np.float64)
+        if delta_l is not None: h_payload["delta_l_matrix"] = np.asarray(delta_l, dtype=np.float64)
+        if lxf_bin_h is not None: h_payload.update(bin_log_likelihood_matrix=np.asarray(lxf_bin_h["bin_log_likelihood"], dtype=np.float64), bin_delta_l_matrix=np.asarray(lxf_bin_h["bin_delta_l"], dtype=np.float64), h_directed_bin_likelihood=np.asarray(lxf_bin_h["h_directed_bin"], dtype=np.float64), h_binned_bin_likelihood=np.asarray(lxf_bin_h["h_binned"], dtype=np.float64), bin_counts=np.asarray(lxf_bin_h["bin_counts"], dtype=np.int64))
         np.savez_compressed(os.path.join(output_dir, "h_matrix_results_theta_cov.npz"), **h_payload)
-        np.savez_compressed(
-            os.path.join(output_dir, "score_prior_training_losses.npz"),
-            theta_field_method=np.asarray([method_name], dtype=object),
-            prior_enable=np.bool_(False),
-            score_train_losses=np.asarray(train_out["train_losses"], dtype=np.float64),
-            score_val_losses=np.asarray(train_out["val_losses"], dtype=np.float64),
-            score_val_monitor_losses=np.asarray(train_out["val_monitor_losses"], dtype=np.float64),
-            score_best_epoch=np.int64(train_out["best_epoch"]),
-            score_stopped_epoch=np.int64(train_out["stopped_epoch"]),
-            score_stopped_early=np.bool_(train_out["stopped_early"]),
-            score_best_val_smooth=np.float64(train_out["best_val_loss"]),
-            score_grad_norm_mean=np.float64(float("nan")),
-            score_grad_norm_max=np.float64(float("nan")),
-            score_param_norm_final=np.float64(float("nan")),
-            score_n_clipped_steps=np.int64(train_out.get("n_clipped_steps", 0)),
-            score_n_total_steps=np.int64(train_out.get("n_total_steps", 0)),
-            score_lr_last=np.float64(train_out.get("lr_last", float("nan"))),
-            score_final_eval_weights=np.asarray([str(train_out.get("final_eval_weights", "raw"))], dtype=object),
-            ae_train_losses=empty,
-            ae_val_losses=empty,
-            ae_val_monitor_losses=empty,
-            ae_best_epoch=np.int64(0),
-            ae_stopped_epoch=np.int64(0),
-            ae_stopped_early=np.bool_(False),
-            ae_latent_dim=np.int64(0),
-            score_likelihood_finetune_train_losses=empty,
-            score_likelihood_finetune_val_losses=empty,
-            score_likelihood_finetune_val_monitor_losses=empty,
-            prior_train_losses=empty,
-            prior_val_losses=empty,
-            prior_val_monitor_losses=empty,
-            prior_likelihood_finetune_train_losses=empty,
-            prior_likelihood_finetune_val_losses=empty,
-            prior_likelihood_finetune_val_monitor_losses=empty,
-            lxf_fm_train=np.bool_(True),
-            lxf_b_net=np.asarray(["mlp"], dtype=object),
-            lxf_drift_type=np.asarray([drift_type], dtype=object),
-            lxf_low_rank_dim=np.int64(lxf_rank if method_name in low_rank_methods else 0),
-            lxf_randb_lambda_a=np.float64(float(getattr(args, "lxf_randb_lambda_a", 1e-4)) if method_name == "linear_x_flow_low_rank_randb_t" else 0.0),
-            lxf_randb_lambda_s=np.float64(float(getattr(args, "lxf_randb_lambda_s", 1e-4)) if method_name == "linear_x_flow_low_rank_randb_t" else 0.0),
-            lxf_nlpca_train_losses=empty,
-            lxf_nlpca_val_losses=empty,
-            lxf_nlpca_val_monitor_losses=empty,
-            lxf_nlpca_best_epoch=np.int64(0),
-            lxf_nlpca_stopped_epoch=np.int64(0),
-            lxf_nlpca_stopped_early=np.bool_(False),
-            lxf_nlpca_best_val_smooth=np.float64(float("nan")),
-            lxf_nlpca_dim=np.int64(0),
-            lxf_nlpca_lambda_h=np.float64(0.0),
-            lxf_nlpca_freeze_linear=np.bool_(False),
-            lxf_nlpca_ode_steps=np.int64(int(getattr(args, "lxf_nlpca_ode_steps", 32)) if method_name in correction_methods else 0),
-            lxf_low_rank_divergence_estimator=np.asarray([div_est], dtype=object),
-            lxf_hutchinson_probes=probes,
-            lxf_lr_utt_dynamic_u=np.bool_(False),
-            lxf_theta_fourier_enabled=np.bool_(False),
-            lxf_theta_fourier_k=np.int64(0),
-            lxf_theta_original_dim=np.int64(lxf_theta_original_dim),
-            lxf_theta_feature_dim=np.int64(int(theta_all_model.shape[1])),
-            lxf_theta_fourier_center=np.asarray(lxf_theta_fourier_center, dtype=np.float64),
-            lxf_theta_fourier_range=np.asarray(lxf_theta_fourier_range, dtype=np.float64),
-            lxf_theta_fourier_period=np.asarray(lxf_theta_fourier_period, dtype=np.float64),
-            lxf_low_rank_t_warmup_enabled=warmup_enabled,
-            lxf_low_rank_t_warmup_epochs=warmup_save,
-            lxf_low_rank_t_warmup_objective=np.asarray([str(train_out.get("lxf_low_rank_t_warmup_objective", ""))], dtype=object),
-            lxf_low_rank_t_warmup_train_losses=np.asarray(train_out.get("warmup_train_losses", empty), dtype=np.float64),
-            lxf_low_rank_t_warmup_val_losses=np.asarray(train_out.get("warmup_val_losses", empty), dtype=np.float64),
-            lxf_low_rank_t_warmup_val_monitor_losses=np.asarray(train_out.get("warmup_val_monitor_losses", empty), dtype=np.float64),
-            lxf_low_rank_t_warmup_best_epoch=np.int64(train_out.get("warmup_best_epoch", 0)),
-            lxf_low_rank_t_warmup_stopped_epoch=np.int64(train_out.get("warmup_stopped_epoch", 0)),
-            lxf_low_rank_t_warmup_stopped_early=np.bool_(train_out.get("warmup_stopped_early", False)),
-            lxf_low_rank_t_warmup_best_val_smooth=np.float64(train_out.get("warmup_best_val_loss", float("nan"))),
-            lxf_low_rank_t_warmup_n_clipped_steps=np.int64(train_out.get("warmup_n_clipped_steps", 0)),
-            lxf_low_rank_t_warmup_n_total_steps=np.int64(train_out.get("warmup_n_total_steps", 0)),
-            lxf_low_rank_t_warmup_lr_last=np.float64(train_out.get("warmup_lr_last", float("nan"))),
-            lxf_low_rank_t_warmup_final_eval_weights=np.asarray([str(train_out.get("warmup_final_eval_weights", ""))], dtype=object),
-            lxf_weight_ema_decay=np.float64(train_out.get("weight_ema_decay", float(getattr(args, f"{lxf_prefix}_weight_ema_decay", 0.9)))),
-            lxf_weight_ema_enabled=np.bool_(train_out.get("weight_ema_enabled", False)),
-            lxf_final_eval_weights=np.asarray([str(train_out.get("final_eval_weights", "raw"))], dtype=object),
-            lxf_restore_best=np.bool_(bool(getattr(args, "lxf_restore_best", True))),
-            lxfs_path_schedule=np.asarray([sched_name], dtype=object),
-            lxfs_scheduled_train=np.bool_(scheduled_lxf),
-            lxfs_quadrature_steps=np.int64(int(getattr(args, "lxfs_quadrature_steps", 64)) if scheduled_lxf else 0),
-        )
+        np.savez_compressed(os.path.join(output_dir, "score_prior_training_losses.npz"), theta_field_method=np.asarray([method_name], dtype=object), prior_enable=np.bool_(False), score_train_losses=np.asarray(train_out["train_losses"], dtype=np.float64), score_val_losses=np.asarray(train_out["val_losses"], dtype=np.float64), score_val_monitor_losses=np.asarray(train_out["val_monitor_losses"], dtype=np.float64), score_best_epoch=np.int64(train_out["best_epoch"]), score_stopped_epoch=np.int64(train_out["stopped_epoch"]), score_stopped_early=np.bool_(train_out["stopped_early"]), score_best_val_smooth=np.float64(train_out["best_val_loss"]), score_likelihood_finetune_train_losses=empty, score_likelihood_finetune_val_losses=empty, score_likelihood_finetune_val_monitor_losses=empty, prior_train_losses=empty, prior_val_losses=empty, prior_val_monitor_losses=empty, prior_likelihood_finetune_train_losses=empty, prior_likelihood_finetune_val_losses=empty, prior_likelihood_finetune_val_monitor_losses=empty, lxf_drift_type=np.asarray([drift_type], dtype=object), lxfs_path_schedule=np.asarray([sched_name], dtype=object), lxfs_scheduled_train=np.bool_(True), lxfs_quadrature_steps=np.int64(int(getattr(args, "lxfs_quadrature_steps", 64))))
         loaded_lxf = SimpleNamespace(
             h_sym=np.asarray(h_sym, dtype=np.float64),
             theta_used=np.asarray(theta_used, dtype=np.float64),
@@ -5064,6 +4822,8 @@ def _model_posterior_log_weights_for_fixed_x(
         return c, r"Gaussian X-flow log $p(x|\theta)$"
     if method == "gaussian_x_flow_diagonal":
         return c, r"Gaussian X-flow (diagonal cov.) log $p(x|\theta)$"
+    if method == "linear_x_flow":
+        return c, r"Linear X-flow log $p(x|\theta)$"
     if method == "linear_x_flow_t":
         return c, r"Linear X-flow time-dependent $A(t)$ log $p(x|\theta)$"
     if method == "linear_x_flow_scalar_t":
@@ -5072,6 +4832,8 @@ def _model_posterior_log_weights_for_fixed_x(
         return c, r"Linear X-flow diagonal $A(t,\theta)$ log $p(x|\theta)$"
     if method == "linear_x_flow_low_rank_t":
         return c, r"Linear X-flow full $A(t)$ + orthonormal low-rank correction log $p(x|\theta)$"
+    if method == "linear_x_flow_pure_low_rank_t":
+        return c, r"Linear X-flow pure orthonormal low-rank $U h(U^{\mathsf T}x)$ log $p(x|\theta)$"
     if method == "linear_x_flow_lr_t_ts":
         return c, r"Linear X-flow full $A(t)$ + low-rank correction with $b(\theta)$ log $p(x|\theta)$"
     if method == "linear_x_flow_low_rank_randb_t":
@@ -5771,6 +5533,8 @@ def _render_training_losses_panel(
             post_lab = "linear-x-flow diagonal-t FM likelihood"
         elif tfm == "linear_x_flow_low_rank_t":
             post_lab = "linear-x-flow full-A(t) + low-rank correction FM likelihood"
+        elif tfm == "linear_x_flow_pure_low_rank_t":
+            post_lab = "linear-x-flow pure low-rank U h(U^T x) FM likelihood"
         elif tfm == "linear_x_flow_lr_t_ts":
             post_lab = "linear-x-flow full-A(t) + low-rank correction b(theta) FM likelihood"
         elif tfm == "linear_x_flow_low_rank_randb_t":
@@ -6210,6 +5974,8 @@ def _save_combined_convergence_figure(
             post_lab = "linear-x-flow diagonal-t FM likelihood"
         elif tfm == "linear_x_flow_low_rank_t":
             post_lab = "linear-x-flow full-A(t) + low-rank correction FM likelihood"
+        elif tfm == "linear_x_flow_pure_low_rank_t":
+            post_lab = "linear-x-flow pure low-rank U h(U^T x) FM likelihood"
         elif tfm == "linear_x_flow_lr_t_ts":
             post_lab = "linear-x-flow full-A(t) + low-rank correction b(theta) FM likelihood"
         elif tfm == "linear_x_flow_low_rank_randb_t":
@@ -6665,19 +6431,21 @@ def _write_summary(
             f.write(f"gxf_pair_batch_size: {int(getattr(args, 'gxf_pair_batch_size', 0))}\n")
             f.write(f"gxf_diagonal_covariance: {_tfm_sum == 'gaussian_x_flow_diagonal'}\n")
         if _tfm_sum in (
-            "linear_x_flow_t",
-            "linear_x_flow_scalar_t",
-            "linear_x_flow_diagonal_theta_t",
+                "linear_x_flow_t",
+                    "linear_x_flow_scalar_t",
+                    "linear_x_flow_diagonal_theta_t",
             "linear_x_flow_diagonal_t",
-            "linear_x_flow_low_rank_t",
-            "linear_x_flow_lr_t_ts",
-            "linear_x_flow_low_rank_randb_t",
-        ):
+                "linear_x_flow_low_rank_t",
+            "linear_x_flow_pure_low_rank_t",
+                "linear_x_flow_lr_t_ts",
+                            "linear_x_flow_low_rank_randb_t",
+            ):
             f.write(f"lxf_epochs: {int(getattr(args, 'lxf_epochs', 0))}\n")
             f.write(f"lxf_batch_size: {int(getattr(args, 'lxf_batch_size', 0))}\n")
             f.write(f"lxf_lr: {float(getattr(args, 'lxf_lr', 0.0))}\n")
             f.write(f"lxf_hidden_dim: {int(getattr(args, 'lxf_hidden_dim', 0))}\n")
             f.write(f"lxf_depth: {int(getattr(args, 'lxf_depth', 0))}\n")
+            f.write(f"lxf_b_net: {getattr(args, 'lxf_b_net', 'mlp')}\n")
             f.write(f"lxf_low_rank_dim: {int(getattr(args, 'lxf_low_rank_dim', 0))}\n")
             f.write(f"lxf_randb_lambda_a: {float(getattr(args, 'lxf_randb_lambda_a', 0.0))}\n")
             f.write(f"lxf_randb_lambda_s: {float(getattr(args, 'lxf_randb_lambda_s', 0.0))}\n")
@@ -6688,11 +6456,19 @@ def _write_summary(
             f.write(f"lxf_early_patience: {int(getattr(args, 'lxf_early_patience', 0))}\n")
             f.write(f"lxf_restore_best: {bool(getattr(args, 'lxf_restore_best', True))}\n")
             f.write(f"lxf_pair_batch_size: {int(getattr(args, 'lxf_pair_batch_size', 0))}\n")
+            f.write(f"lxf_nlpca_dim: {int(getattr(args, 'lxf_nlpca_dim', 0))}\n")
+            f.write(f"lxf_nlpca_epochs: {int(getattr(args, 'lxf_nlpca_epochs', 0))}\n")
+            f.write(f"lxf_nlpca_lr: {float(getattr(args, 'lxf_nlpca_lr', 0.0))}\n")
+            f.write(f"lxf_nlpca_hidden_dim: {int(getattr(args, 'lxf_nlpca_hidden_dim', 0))}\n")
+            f.write(f"lxf_nlpca_depth: {int(getattr(args, 'lxf_nlpca_depth', 0))}\n")
+            f.write(f"lxf_nlpca_lambda_h: {float(getattr(args, 'lxf_nlpca_lambda_h', 0.0))}\n")
+            f.write(f"lxf_nlpca_freeze_linear: {bool(getattr(args, 'lxf_nlpca_freeze_linear', False))}\n")
             f.write(f"lxf_nlpca_ode_steps: {int(getattr(args, 'lxf_nlpca_ode_steps', 0))}\n")
             if _tfm_sum in (
                 "linear_x_flow_low_rank_t",
-                "linear_x_flow_lr_t_ts",
-            ):
+                "linear_x_flow_pure_low_rank_t",
+                        "linear_x_flow_lr_t_ts",
+                                    ):
                 f.write(
                     f"lxf_low_rank_divergence_estimator: {str(getattr(args, 'lxf_low_rank_divergence_estimator', 'hutchinson')).strip().lower()}\n"
                 )

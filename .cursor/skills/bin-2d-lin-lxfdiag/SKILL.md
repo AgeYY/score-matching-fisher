@@ -14,7 +14,7 @@ description: >-
 
 Fixed experimental bundle for **`bin/study_h_decoding_twofig.py`** — isolate **binned Gaussian** vs **diagonal linear X-flow matching** on **`randamp_gaussian2d_sqrtd`** embedded to **30D**, with Hellinger / binning on a **flattened $(\theta_1,\theta_2)$ grid** (`theta2_grid`), not a $\theta_1$-only slice.
 
-Journal write-up: **`journal/notes/2026-05-02-native2d-randamp-bin-vs-linear-x-flow-diagonal-minimal-twofig.md`**.
+See the native 2D benchmark notes under `journal/notes/` for historical run context.
 
 ## Locked choices
 

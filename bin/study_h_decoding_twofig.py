@@ -73,6 +73,7 @@ from fisher.shared_fisher_est import build_dataset_from_meta, normalize_flow_arc
 #   linear_x_flow_diagonal_theta_t,
 #   linear_x_flow_low_rank_t (full A(t) + learnable U h(U^T x) correction;
 #     static orthonormal U; divergence default: --lxf-low-rank-divergence-estimator hutchinson, --lxf-hutchinson-probes 1),
+#   linear_x_flow_pure_low_rank_t (velocity U h(U^T x) only; same divergence / ODE likelihood path),
 #   linear_x_flow_lr_t_ts (same scheduled low-rank correction but b(theta) only; mean-regression pretrain then freeze b),
 #   linear_x_flow_low_rank_randb_t
 _FLOW_BASED_METHODS = {"theta_flow", "theta_path_integral", "x_flow"}
@@ -515,7 +516,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Comma-separated theta-field row specs, highest precedence over --theta-field-methods and "
             "--theta-field-method. Tokens are method or method:arch, e.g. "
             "theta_flow:mlp,theta_flow:film,x_flow:film_fourier,ctsm_v,bin_gaussian,"
-            "linear_x_flow_low_rank_t,linear_x_flow_diagonal_t. "
+            "linear_x_flow_low_rank_t,linear_x_flow_pure_low_rank_t,linear_x_flow_diagonal_t. "
             "For low-rank linear_x_flow rows use --lxf-low-rank-dim."
         ),
     )

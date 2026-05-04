@@ -99,7 +99,7 @@ PYTHONUNBUFFERED=1 mamba run -n geo_diffusion python bin/study_h_decoding_twofig
 
 Example substitutions:
 
-- **`<METHOD_ARGS>`** — e.g. `--theta-field-methods bin_gaussian,linear_x_flow_diagonal` or `--theta-field-rows bin_gaussian,linear_x_flow_diagonal_t,...`
+- **`<METHOD_ARGS>`** — e.g. `--theta-field-rows bin_gaussian,linear_x_flow_diagonal_t,...`
 - **`<TRAIN_FLAGS>`** — e.g. `--lxf-epochs 50000 --lxf-early-patience 1000` **or** `--lxfs-epochs 50000 --lxfs-early-patience 1000 --lxfs-path-schedule cosine --lxf-low-rank-dim 4`
 
 Always set a fresh **`--output-dir`** so runs do not overwrite each other.
