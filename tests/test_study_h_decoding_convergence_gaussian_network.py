@@ -582,6 +582,7 @@ class TestStudyHDecodingConvergenceGaussianNetwork(unittest.TestCase):
             ("linear-x-flow-low-rank", "linear_x_flow_low_rank"),
             ("linear-x-flow-low-rank-t", "linear_x_flow_low_rank_t"),
             ("linear-x-flow-lr-t-p", "linear_x_flow_lr_t_p"),
+            ("linear-x-flow-lr-utt", "linear_x_flow_lr_utt"),
             ("linear-x-flow-low-rank-randb", "linear_x_flow_low_rank_randb"),
             ("linear-x-flow-low-rank-randb-t", "linear_x_flow_low_rank_randb_t"),
             ("linear-x-flow-diagonal-t", "linear_x_flow_diagonal_t"),
@@ -650,7 +651,7 @@ class TestStudyHDecodingConvergenceGaussianNetwork(unittest.TestCase):
                     "--device",
                     "cpu",
                 ]
-                if method_stored in ("linear_x_flow_low_rank_t", "linear_x_flow_lr_t_p"):
+                if method_stored in ("linear_x_flow_low_rank_t", "linear_x_flow_lr_t_p", "linear_x_flow_lr_utt"):
                     cmd.extend(["--lxf-low-rank-t-warmup-epochs", "1"])
                 r = subprocess.run(cmd, cwd=str(repo), capture_output=True, text=True)
                 self.assertEqual(r.returncode, 0, msg=(r.stdout, r.stderr))
@@ -666,10 +667,13 @@ class TestStudyHDecodingConvergenceGaussianNetwork(unittest.TestCase):
                     self.assertEqual(int(np.asarray(z["lxf_theta_fourier_k"]).reshape(-1)[0]), 6)
                     self.assertEqual(int(np.asarray(z["lxf_theta_original_dim"]).reshape(-1)[0]), 1)
                     self.assertEqual(int(np.asarray(z["lxf_theta_feature_dim"]).reshape(-1)[0]), 13)
-                if method_stored in ("linear_x_flow_low_rank_t", "linear_x_flow_lr_t_p"):
+                if method_stored in ("linear_x_flow_low_rank_t", "linear_x_flow_lr_t_p", "linear_x_flow_lr_utt"):
                     self.assertTrue(bool(np.asarray(z["lxf_low_rank_t_warmup_enabled"]).reshape(-1)[0]))
                     self.assertEqual(int(np.asarray(z["lxf_low_rank_t_warmup_epochs"]).reshape(-1)[0]), 1)
                     self.assertEqual(np.asarray(z["lxf_low_rank_t_warmup_train_losses"]).shape, (1,))
+                if method_stored == "linear_x_flow_lr_utt":
+                    self.assertTrue(bool(np.asarray(z["lxf_lr_utt_dynamic_u"]).reshape(-1)[0]))
+                    self.assertFalse(bool(np.asarray(z["lxf_lr_utt_orthonormal_u"]).reshape(-1)[0]))
 
     def test_linear_x_flow_time_nonlinear_pca_sweep_smokes(self) -> None:
         repo = Path(__file__).resolve().parent.parent

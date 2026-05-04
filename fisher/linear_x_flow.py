@@ -1151,6 +1151,214 @@ class ConditionalTimeLowRankCorrectionLinearXFlowMLP(nn.Module):
         ) + logjac
 
 
+class ConditionalTimeThetaULowRankCorrectionLinearXFlowMLP(nn.Module):
+    """Scheduled full ``A(t)`` linear x-flow plus low-rank correction with dense ``U = U(t, theta)``.
+
+    Velocity is ``v(x,t,theta) = A(t) x + b(t,theta) + U(t,theta) h(U(t,theta)^T x, t, theta)``.
+
+    ``U(t,theta)`` is an unconstrained ``[x_dim, r]`` matrix from an MLP on ``[t, theta]`` (small
+    final-layer gain). The base ``(A,b)`` matches :class:`ConditionalTimeLinearXFlowMLP` (same
+    initialization as :class:`ConditionalTimeLowRankCorrectionLinearXFlowMLP`).
+
+    Because ``U`` does not depend on ``x``, the correction contributes
+    ``tr((U^T U) \\, \\partial h / \\partial z)`` to ``\\nabla_x \\cdot v`` (not ``tr(\\partial h/\\partial z)``
+    unless ``U^T U = I``). This class implements ``exact`` and ``hutchinson`` estimators for that
+    weighted trace; see ``divergence_estimator`` / ``hutchinson_probes``.
+    """
+
+    def __init__(
+        self,
+        *,
+        theta_dim: int,
+        x_dim: int,
+        correction_rank: int,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        quadrature_steps: int = 64,
+        divergence_estimator: str = "hutchinson",
+        hutchinson_probes: int = 1,
+    ) -> None:
+        super().__init__()
+        if int(correction_rank) < 1:
+            raise ValueError("correction_rank must be >= 1.")
+        if int(correction_rank) > int(x_dim):
+            raise ValueError("correction_rank must be <= x_dim.")
+        if int(quadrature_steps) < 2:
+            raise ValueError("quadrature_steps must be >= 2.")
+        de = str(divergence_estimator).strip().lower()
+        if de not in ("hutchinson", "exact"):
+            raise ValueError("divergence_estimator must be one of: hutchinson, exact.")
+        if int(hutchinson_probes) < 1:
+            raise ValueError("hutchinson_probes must be >= 1.")
+        self.divergence_estimator = de
+        self.hutchinson_probes = int(hutchinson_probes)
+        self.linear = ConditionalTimeLinearXFlowMLP(
+            theta_dim=int(theta_dim),
+            x_dim=int(x_dim),
+            hidden_dim=int(hidden_dim),
+            depth=int(depth),
+            quadrature_steps=int(quadrature_steps),
+            a_final_gain=0.0,
+            a_final_bias=0.0,
+            a_identity_offset=0.0,
+        )
+        self.theta_dim = int(theta_dim)
+        self.x_dim = int(x_dim)
+        self.quadrature_steps = int(quadrature_steps)
+        self.correction_rank = int(correction_rank)
+        self.u_net = _make_mlp(
+            in_dim=1 + self.theta_dim,
+            out_dim=self.x_dim * self.correction_rank,
+            hidden_dim=int(hidden_dim),
+            depth=int(depth),
+            final_gain=1e-2,
+            final_bias=0.0,
+        )
+        self.h_net = _make_mlp(
+            in_dim=self.correction_rank + 1 + self.theta_dim,
+            out_dim=self.correction_rank,
+            hidden_dim=int(hidden_dim),
+            depth=int(depth),
+            final_gain=0.0,
+            final_bias=0.0,
+        )
+
+    def U_theta_t(self, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """Dense ``U(t,theta)`` with shape ``[B, x_dim, r]`` (MLP output, not QR-projected)."""
+        if theta.ndim == 1:
+            theta2 = theta.unsqueeze(-1)
+        else:
+            theta2 = theta
+        tcol = _as_col_t(t, batch=int(theta2.shape[0]))
+        inp = torch.cat([tcol, theta2], dim=1)
+        b = int(theta2.shape[0])
+        return self.u_net(inp).reshape(b, self.x_dim, self.correction_rank)
+
+    def forward(self, x: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        base = self.linear(x, theta, t)
+        if theta.ndim == 1:
+            theta2 = theta.unsqueeze(-1)
+        else:
+            theta2 = theta
+        tcol = _as_col_t(t, batch=int(x.shape[0]))
+        u_mat = self.U_theta_t(theta, t)
+        z = torch.bmm(x.unsqueeze(1), u_mat).squeeze(1)
+        h = self.h_net(torch.cat([z, tcol, theta2], dim=1))
+        corr = torch.bmm(h.unsqueeze(1), u_mat.transpose(1, 2)).squeeze(1)
+        return base + corr
+
+    def regularization_loss(self) -> torch.Tensor | None:
+        return None
+
+    def _weighted_trace_exact(self, z: torch.Tensor, h: torch.Tensor, g_mat: torch.Tensor) -> torch.Tensor:
+        """``tr(G J_h)`` with ``G = U^T U`` of shape ``[B, r, r]``, ``J_h = dh/dz``."""
+        tr_h = torch.zeros(z.shape[0], dtype=z.dtype, device=z.device)
+        r = int(self.correction_rank)
+        for j in range(r):
+            grad_j = torch.autograd.grad(
+                h[:, j].sum(),
+                z,
+                create_graph=False,
+                retain_graph=j < r - 1,
+            )[0]
+            tr_h = tr_h + (g_mat[:, :, j] * grad_j).sum(dim=-1)
+        return tr_h
+
+    def _weighted_trace_hutchinson(self, z: torch.Tensor, h: torch.Tensor, g_mat: torch.Tensor) -> torch.Tensor:
+        """Hutchinson estimate of ``tr(G J_h)`` with Rademacher ``eps`` and symmetric ``G``."""
+        b = int(z.shape[0])
+        r = int(self.correction_rank)
+        n_probe = int(self.hutchinson_probes)
+        acc = torch.zeros(b, dtype=z.dtype, device=z.device)
+        for pi in range(n_probe):
+            probe = torch.empty(b, r, dtype=z.dtype, device=z.device)
+            probe.bernoulli_(0.5).mul_(2.0).sub_(1.0)
+            geps = torch.bmm(g_mat, probe.unsqueeze(-1)).squeeze(-1)
+            dot = (h * geps).sum(dim=1)
+            vjp = torch.autograd.grad(
+                dot.sum(),
+                z,
+                create_graph=False,
+                retain_graph=pi < n_probe - 1,
+            )[0]
+            acc = acc + (vjp * probe).sum(dim=-1)
+        return acc / float(n_probe)
+
+    def divergence(self, x: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        t = _as_col_t(t, batch=int(x.shape[0]))
+        a_mat = self.linear.A(t)
+        if a_mat.ndim == 2:
+            tr_a = torch.trace(a_mat).to(dtype=x.dtype, device=x.device).reshape(1).expand(int(x.shape[0]))
+        else:
+            tr_a = torch.diagonal(a_mat, dim1=-2, dim2=-1).sum(dim=-1)
+        u_mat = self.U_theta_t(theta, t)
+        g_mat = torch.bmm(u_mat.transpose(1, 2), u_mat)
+        with torch.enable_grad():
+            z = torch.bmm(x.unsqueeze(1), u_mat).squeeze(1).detach().requires_grad_(True)
+            tcol = _as_col_t(t, batch=int(z.shape[0]))
+            h = self.h_net(torch.cat([z, tcol, theta], dim=1))
+            if self.divergence_estimator == "exact":
+                tr_h = self._weighted_trace_exact(z, h, g_mat)
+            else:
+                tr_h = self._weighted_trace_hutchinson(z, h, g_mat)
+        return tr_a.detach() + tr_h.detach()
+
+    def log_prob_normalized(
+        self,
+        x_norm: torch.Tensor,
+        theta: torch.Tensor,
+        *,
+        solve_jitter: float = 1e-6,
+        quadrature_steps: int | None = None,
+        ode_steps: int = 32,
+    ) -> torch.Tensor:
+        del solve_jitter, quadrature_steps
+        if x_norm.ndim == 1:
+            x_norm = x_norm.unsqueeze(0)
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        if x_norm.shape[0] != theta.shape[0]:
+            raise ValueError("x and theta batch sizes must match.")
+        steps = int(ode_steps)
+        if steps < 1:
+            raise ValueError("ode_steps must be >= 1.")
+        x = x_norm
+        div_int = torch.zeros(x.shape[0], dtype=x.dtype, device=x.device)
+        dt = 1.0 / float(steps)
+        for s in range(steps, 0, -1):
+            t = torch.full((x.shape[0], 1), float(s) / float(steps), dtype=x.dtype, device=x.device)
+            div_int = div_int + dt * self.divergence(x, theta, t)
+            with torch.no_grad():
+                v = self.forward(x, theta, t)
+                x = x - dt * v
+        d = int(x.shape[1])
+        base = -0.5 * (torch.sum(x**2, dim=1) + float(d) * math.log(2.0 * math.pi))
+        return base - div_int
+
+    def log_prob_observed(
+        self,
+        x_raw: torch.Tensor,
+        theta: torch.Tensor,
+        *,
+        x_mean: torch.Tensor,
+        x_std: torch.Tensor,
+        solve_jitter: float = 1e-6,
+        quadrature_steps: int | None = None,
+        ode_steps: int = 32,
+    ) -> torch.Tensor:
+        z = (x_raw - x_mean) / x_std
+        logjac = -torch.sum(torch.log(x_std))
+        return self.log_prob_normalized(
+            z,
+            theta,
+            solve_jitter=float(solve_jitter),
+            quadrature_steps=quadrature_steps,
+            ode_steps=int(ode_steps),
+        ) + logjac
+
+
 class ConditionalTimeScalarLinearXFlowMLP(_BaseTimeLinearXFlowMLP):
     """Scalar time-dependent drift ``A(t)=a(t) I`` plus offset ``b(t, theta)``."""
 
@@ -1344,9 +1552,11 @@ class ConditionalTimeThetaDiagonalLinearXFlowMLP(_BaseTimeLinearXFlowMLP):
 class ConditionalTimeLowRankLinearXFlowMLP(_BaseTimeLinearXFlowMLP):
     """Time-dependent low-rank symmetric drift ``A(t)=diag(a(t))+U(t)diag(s(t))U(t)^T``.
 
-    Note: the CLI token ``linear_x_flow_low_rank_t`` is wired to
-    :class:`ConditionalTimeLowRankCorrectionLinearXFlowMLP` (full ``A(t)`` plus nonlinear ``U h``);
-    this class is the low-rank *linear drift* used by ``linear_x_flow_nonlinear_pca_low_rank_t`` and tests.
+    Note: the CLI token     ``linear_x_flow_low_rank_t`` is wired to
+    :class:`ConditionalTimeLowRankCorrectionLinearXFlowMLP` (full ``A(t)`` plus nonlinear ``U h`` with
+    static orthonormal ``U``); ``linear_x_flow_lr_utt`` uses :class:`ConditionalTimeThetaULowRankCorrectionLinearXFlowMLP`
+    (same structure but dense learnable ``U=U(t,theta)`` from an MLP). This class is the low-rank *linear drift* used by
+    ``linear_x_flow_nonlinear_pca_low_rank_t`` and tests.
     """
 
     def __init__(
@@ -2481,7 +2691,7 @@ def train_time_linear_x_flow_schedule(
 
 def train_low_rank_t_warmup_then_full(
     *,
-    model: ConditionalTimeLowRankCorrectionLinearXFlowMLP,
+    model: nn.Module,
     theta_train: np.ndarray,
     x_train: np.ndarray,
     theta_val: np.ndarray,

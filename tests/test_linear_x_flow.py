@@ -20,6 +20,7 @@ from fisher.linear_x_flow import (
     ConditionalTimeDiagonalLinearXFlowMLP,
     ConditionalTimeLinearXFlowMLP,
     ConditionalTimeLowRankCorrectionLinearXFlowMLP,
+    ConditionalTimeThetaULowRankCorrectionLinearXFlowMLP,
     ConditionalTimeLowRankLinearXFlowMLP,
     ConditionalTimeRandomBasisLowRankLinearXFlowMLP,
     ConditionalTimeScalarLinearXFlowMLP,
@@ -902,6 +903,173 @@ class TestLinearXFlow(unittest.TestCase):
         )
         self.assertEqual(tuple(c.shape), (3, 3))
         self.assertTrue(np.all(np.isfinite(c)))
+
+    def test_lr_utt_U_dense_shape_and_typically_not_orthonormal(self) -> None:
+        torch.manual_seed(60)
+        m = ConditionalTimeThetaULowRankCorrectionLinearXFlowMLP(
+            theta_dim=2, x_dim=4, correction_rank=3, hidden_dim=16, depth=1, quadrature_steps=8
+        )
+        th = torch.randn(11, 2)
+        t = torch.rand(11, 1)
+        u = m.U_theta_t(th, t)
+        self.assertEqual(tuple(u.shape), (11, 4, 3))
+        gram = torch.bmm(u.transpose(1, 2), u)
+        eye = torch.eye(3, dtype=u.dtype, device=u.device).unsqueeze(0).expand_as(gram)
+        off = torch.linalg.matrix_norm(gram - eye, ord="fro", dim=(-2, -1))
+        self.assertTrue(torch.all(off > 1e-3))
+
+    def test_lr_utt_weighted_divergence_linear_h_matches_trace_GJ(self) -> None:
+        torch.manual_seed(71)
+        theta_dim, x_dim, r = 1, 3, 2
+        m = ConditionalTimeThetaULowRankCorrectionLinearXFlowMLP(
+            theta_dim=theta_dim,
+            x_dim=x_dim,
+            correction_rank=r,
+            hidden_dim=8,
+            depth=1,
+            quadrature_steps=6,
+            divergence_estimator="exact",
+            hutchinson_probes=1,
+        )
+        lin = torch.nn.Linear(r + 1 + theta_dim, r, bias=False)
+        torch.nn.init.zeros_(lin.weight)
+        scale = 0.31
+        lin.weight.data[:, :r] = torch.eye(r, dtype=lin.weight.dtype, device=lin.weight.device) * scale
+        m.h_net = torch.nn.Sequential(lin)
+        th = torch.randn(5, theta_dim)
+        x = torch.randn(5, x_dim)
+        t = torch.full((5, 1), 0.37)
+        with torch.no_grad():
+            a_mat = m.linear.A(t)
+            tr_a = torch.diagonal(a_mat, dim1=-2, dim2=-1).sum(dim=-1)
+            u_mat = m.U_theta_t(th, t)
+            g_mat = torch.bmm(u_mat.transpose(1, 2), u_mat)
+            tr_gj = scale * torch.diagonal(g_mat, dim1=-2, dim2=-1).sum(dim=-1)
+        div = m.divergence(x, th, t)
+        self.assertTrue(torch.allclose(div, tr_a + tr_gj, atol=1e-5, rtol=1e-4))
+
+    def test_lr_utt_zero_h_matches_linear_submodule(self) -> None:
+        torch.manual_seed(61)
+        m = ConditionalTimeThetaULowRankCorrectionLinearXFlowMLP(
+            theta_dim=1, x_dim=3, correction_rank=2, hidden_dim=8, depth=1, quadrature_steps=5
+        )
+        th = torch.randn(5, 1)
+        x = torch.randn(5, 3)
+        t = torch.linspace(0.2, 0.8, 5).reshape(-1, 1)
+        self.assertTrue(torch.allclose(m(x, th, t), m.linear(x, th, t), atol=1e-5))
+
+    def test_lr_utt_divergence_zero_h_is_trace_A(self) -> None:
+        torch.manual_seed(62)
+        m = ConditionalTimeThetaULowRankCorrectionLinearXFlowMLP(
+            theta_dim=1, x_dim=3, correction_rank=2, hidden_dim=8, depth=1, quadrature_steps=6
+        )
+        th = torch.randn(4, 1)
+        x = torch.randn(4, 3)
+        t = torch.full((4, 1), 0.5)
+        with torch.no_grad():
+            a_mat = m.linear.A(t)
+            tr = torch.diagonal(a_mat, dim1=-2, dim2=-1).sum(dim=-1)
+        div = m.divergence(x, th, t)
+        self.assertTrue(torch.allclose(div, tr, atol=1e-5))
+
+    def test_lr_utt_warmup_freezes_u_and_h_parameters(self) -> None:
+        torch.manual_seed(63)
+        rng = np.random.default_rng(63)
+        theta = rng.normal(size=(24, 1)).astype(np.float64)
+        x = np.concatenate([theta, -theta, 0.5 * theta], axis=1) + 0.05 * rng.normal(size=(24, 3))
+        m = ConditionalTimeThetaULowRankCorrectionLinearXFlowMLP(
+            theta_dim=1, x_dim=3, correction_rank=2, hidden_dim=8, depth=1, quadrature_steps=5
+        )
+        before = {name: p.detach().clone() for name, p in m.named_parameters()}
+        for p in m.parameters():
+            p.requires_grad_(False)
+        for p in m.linear.b_net.parameters():
+            p.requires_grad_(True)
+        out = train_time_linear_x_flow_schedule(
+            model=m,
+            theta_train=theta[:16],
+            x_train=x[:16],
+            theta_val=theta[16:],
+            x_val=x[16:],
+            device=torch.device("cpu"),
+            schedule=path_schedule_from_name("linear"),
+            epochs=1,
+            batch_size=8,
+            lr=1e-2,
+            t_eps=1e-3,
+            patience=0,
+            log_every=1,
+            weight_ema_decay=0.0,
+            restore_best=False,
+            log_name="linear_x_flow_lr_utt_warmup_test",
+        )
+        self.assertEqual(len(out["train_losses"]), 1)
+        b_changed = False
+        for name, p in m.named_parameters():
+            changed = not torch.allclose(p.detach(), before[name])
+            if name.startswith("linear.b_net."):
+                b_changed = b_changed or changed
+            else:
+                self.assertFalse(changed, msg=name)
+        self.assertTrue(b_changed)
+
+    def test_lr_utt_log_prob_and_c_matrix_finite(self) -> None:
+        torch.manual_seed(64)
+        m = ConditionalTimeThetaULowRankCorrectionLinearXFlowMLP(
+            theta_dim=1, x_dim=2, correction_rank=1, hidden_dim=8, depth=1, quadrature_steps=8
+        )
+        th = torch.randn(3, 1)
+        x = torch.randn(3, 2)
+        lp = m.log_prob_normalized(x, th, quadrature_steps=8, ode_steps=2)
+        self.assertEqual(tuple(lp.shape), (3,))
+        self.assertTrue(torch.all(torch.isfinite(lp)))
+        theta_np = th.detach().cpu().numpy().astype(np.float64)
+        x_np = x.detach().cpu().numpy().astype(np.float64)
+        xm = np.zeros(2, dtype=np.float64)
+        xs = np.ones(2, dtype=np.float64)
+        c = compute_ode_time_linear_x_flow_c_matrix(
+            model=m,
+            theta_all=theta_np,
+            x_all=x_np,
+            device=torch.device("cpu"),
+            x_mean=xm,
+            x_std=xs,
+            quadrature_steps=8,
+            ode_steps=2,
+            pair_batch_size=64,
+        )
+        self.assertEqual(tuple(c.shape), (3, 3))
+        self.assertTrue(np.all(np.isfinite(c)))
+
+    def test_lr_utt_train_low_rank_t_warmup_then_full_smoke(self) -> None:
+        torch.manual_seed(65)
+        rng = np.random.default_rng(65)
+        theta = rng.normal(size=(24, 1)).astype(np.float64)
+        x = np.concatenate([theta, -theta], axis=1) + 0.05 * rng.normal(size=(24, 2))
+        m = ConditionalTimeThetaULowRankCorrectionLinearXFlowMLP(
+            theta_dim=1, x_dim=2, correction_rank=1, hidden_dim=8, depth=1, quadrature_steps=5
+        )
+        out = train_low_rank_t_warmup_then_full(
+            model=m,
+            theta_train=theta[:16],
+            x_train=x[:16],
+            theta_val=theta[16:],
+            x_val=x[16:],
+            device=torch.device("cpu"),
+            schedule=path_schedule_from_name("linear"),
+            warmup_epochs=1,
+            epochs=1,
+            batch_size=8,
+            lr=1e-3,
+            t_eps=1e-3,
+            patience=0,
+            log_every=1,
+            weight_ema_decay=0.0,
+            restore_best=False,
+            log_name="linear_x_flow_lr_utt",
+        )
+        self.assertEqual(len(out["warmup_train_losses"]), 1)
+        self.assertEqual(len(out["train_losses"]), 1)
 
 
 if __name__ == "__main__":

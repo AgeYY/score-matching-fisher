@@ -1,0 +1,18 @@
+[twofig] GT Hellinger (MC likelihood) theta_binning_mode=theta1 n_bins=4 n_mc=40 (n_bins*n_mc=160 <= n_ref=160) wall time: 0.0s
+[twofig] row=linear_x_flow_lr_utt start
+[linear_x_flow_lr_utt_warmup    1/1] train_fm=1.433897 val_fm=2.169291 val_smooth=2.169291 best_monitor=2.169291 best_epoch=1
+[linear_x_flow_lr_utt_warmup restore-best] restored EMA eval weights epoch=1 best_monitor=2.169291
+[linear_x_flow_lr_utt    1/4] train_fm=2.455579 val_fm=2.113172 val_smooth=2.113172 best_monitor=2.113172 best_epoch=1
+[linear_x_flow_lr_utt    4/4] train_fm=2.451145 val_fm=1.852109 val_smooth=2.104916 best_monitor=2.096881 best_epoch=2
+[linear_x_flow_lr_utt restore-best] restored EMA eval weights epoch=2 best_monitor=2.096881
+[twofig] row=linear_x_flow_lr_utt n=60 done in 8.7s
+[twofig] Saved:
+  - /grad/zeyuan/score-matching-fisher/.tmp_twofig_lr_utt_smoke/twofig_out/h_decoding_twofig_sweep.svg
+  - /grad/zeyuan/score-matching-fisher/.tmp_twofig_lr_utt_smoke/twofig_out/h_decoding_twofig_gt.svg
+  - /grad/zeyuan/score-matching-fisher/.tmp_twofig_lr_utt_smoke/twofig_out/h_decoding_twofig_corr_vs_n.svg
+  - /grad/zeyuan/score-matching-fisher/.tmp_twofig_lr_utt_smoke/twofig_out/h_decoding_twofig_nmse_vs_n.svg
+  - /grad/zeyuan/score-matching-fisher/.tmp_twofig_lr_utt_smoke/twofig_out/h_decoding_twofig_training_losses_panel.svg
+  - /grad/zeyuan/score-matching-fisher/.tmp_twofig_lr_utt_smoke/twofig_out/training_losses/
+  - /grad/zeyuan/score-matching-fisher/.tmp_twofig_lr_utt_smoke/twofig_out/h_decoding_twofig_results.npz
+  - /grad/zeyuan/score-matching-fisher/.tmp_twofig_lr_utt_smoke/twofig_out/h_decoding_twofig_summary.txt
+
