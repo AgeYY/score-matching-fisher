@@ -173,6 +173,7 @@ _TIME_LXF_METHODS = {
     "linear_x_flow_diagonal_t",
     "linear_x_flow_diagonal_theta_t",
     "linear_x_flow_low_rank_t",
+    "linear_x_flow_pure_low_rank_t",
     "linear_x_flow_lr_t_ts",
     "linear_x_flow_low_rank_randb_t",
 }
@@ -899,8 +900,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=4,
         help=(
             ""
-            "linear_x_flow_low_rank_t / linear_x_flow_lr_t_ts: rank r of the low-rank "
-            "correction U h(U^T x). "
+            "linear_x_flow_low_rank_t / linear_x_flow_pure_low_rank_t / linear_x_flow_lr_t_ts: rank r of U "
+            "in U h(U^T x) (pure_low_rank_t is velocity U h(U^T x) only). "
             "linear_x_flow_low_rank_randb_t: rank of the low-rank random-basis A(t) term."
         ),
     )
@@ -910,7 +911,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="hutchinson",
         choices=["hutchinson", "exact"],
         help=(
-            "linear_x_flow_low_rank_t / linear_x_flow_lr_t_ts: trace of dh/dz in z=U^T x (U orthonormal columns). "
+            "linear_x_flow_low_rank_t / linear_x_flow_pure_low_rank_t / linear_x_flow_lr_t_ts: trace of dh/dz "
+            "in z=U^T x (U orthonormal columns). "
             "linear_x_flow_lr_t_ts: same Hutchinson/exact trace on h as low_rank_t (b is frozen after mean-regression pretrain); "
             ""
             ""
@@ -922,7 +924,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--lxf-hutchinson-probes",
         type=int,
         default=1,
-        help="linear_x_flow_low_rank_t / linear_x_flow_lr_t_ts with hutchinson: number of Rademacher probes per divergence.",
+        help=(
+            "linear_x_flow_low_rank_t / linear_x_flow_pure_low_rank_t / linear_x_flow_lr_t_ts with hutchinson: "
+            "number of Rademacher probes per divergence."
+        ),
     )
     p.add_argument("--lxf-randb-lambda-a", type=float, default=1e-4, help="scheduled random-basis LXF only: L2 penalty on diagonal a.")
     p.add_argument("--lxf-randb-lambda-s", type=float, default=1e-4, help="scheduled random-basis LXF only: L2 penalty on symmetric S.")
@@ -994,7 +999,15 @@ def build_parser() -> argparse.ArgumentParser:
             "Gaussian Hellinger matrix instead of the default bin-level likelihood estimate."
         ),
     )
-    p.add_argument("--lxf-nlpca-ode-steps", type=int, default=32, help="linear_x_flow_low_rank_t / linear_x_flow_lr_t_ts only: fixed Euler steps for ODE likelihood.")
+    p.add_argument(
+        "--lxf-nlpca-ode-steps",
+        type=int,
+        default=32,
+        help=(
+            "linear_x_flow_low_rank_t / linear_x_flow_pure_low_rank_t / linear_x_flow_lr_t_ts only: "
+            "fixed Euler steps for ODE likelihood."
+        ),
+    )
     p.add_argument(
         "--lxfs-path-schedule",
         type=str,
@@ -1348,6 +1361,8 @@ def _normalize_linear_x_flow_method(tfm: str) -> str | None:
         "linear_x_flow_diagonal_theta_t": "linear_x_flow_diagonal_theta_t",
         "linear-x-flow-low-rank-t": "linear_x_flow_low_rank_t",
         "linear_x_flow_low_rank_t": "linear_x_flow_low_rank_t",
+        "linear-x-flow-pure-low-rank-t": "linear_x_flow_pure_low_rank_t",
+        "linear_x_flow_pure_low_rank_t": "linear_x_flow_pure_low_rank_t",
         "linear-x-flow-lr-t-ts": "linear_x_flow_lr_t_ts",
         "linear_x_flow_lr_t_ts": "linear_x_flow_lr_t_ts",
         "linear-x-flow-low-rank-randb-t": "linear_x_flow_low_rank_randb_t",
@@ -3716,6 +3731,10 @@ def _estimate_one(
             if lxf_rank > x_dim_lxf: raise ValueError(f"--lxf-low-rank-dim must be <= x_dim={x_dim_lxf}; got {lxf_rank}.")
             drift_type = "low_rank_correction_time"
             model = ConditionalTimeLowRankCorrectionLinearXFlowMLP(**common, correction_rank=lxf_rank, quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)), divergence_estimator=str(getattr(args, "lxf_low_rank_divergence_estimator", "hutchinson")).strip().lower(), hutchinson_probes=int(getattr(args, "lxf_hutchinson_probes", 1))).to(dev)
+        elif method_name == "linear_x_flow_pure_low_rank_t":
+            if lxf_rank > x_dim_lxf: raise ValueError(f"--lxf-low-rank-dim must be <= x_dim={x_dim_lxf}; got {lxf_rank}.")
+            drift_type = "pure_low_rank_time"
+            model = ConditionalTimePureLowRankLinearXFlowMLP(**common, correction_rank=lxf_rank, quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)), divergence_estimator=str(getattr(args, "lxf_low_rank_divergence_estimator", "hutchinson")).strip().lower(), hutchinson_probes=int(getattr(args, "lxf_hutchinson_probes", 1))).to(dev)
         elif method_name == "linear_x_flow_lr_t_ts":
             if lxf_rank > x_dim_lxf: raise ValueError(f"--lxf-low-rank-dim must be <= x_dim={x_dim_lxf}; got {lxf_rank}.")
             drift_type = "low_rank_correction_time_theta_only_b"
@@ -3737,7 +3756,7 @@ def _estimate_one(
             train_out = train_time_linear_x_flow_schedule(**train_kwargs, schedule=schedule, log_name=method_name)
         x_mean = np.asarray(train_out["x_mean"], dtype=np.float64)
         x_std = np.asarray(train_out["x_std"], dtype=np.float64)
-        correction_methods = {"linear_x_flow_low_rank_t", "linear_x_flow_lr_t_ts"}
+        correction_methods = {"linear_x_flow_low_rank_t", "linear_x_flow_pure_low_rank_t", "linear_x_flow_lr_t_ts"}
         analytic_lxf_h = bool(getattr(args, "lxf_analytic_gaussian_hellinger", False)) and method_name not in correction_methods
         c_matrix = None; delta_l = None; lxf_bin_h = None
         endpoint_mu = np.asarray([], dtype=np.float64); endpoint_cov_or_diag = np.asarray([], dtype=np.float64); endpoint_is_diag = False
