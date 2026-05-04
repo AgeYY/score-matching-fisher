@@ -1049,6 +1049,202 @@ class ConditionalTimePureLowRankLinearXFlowMLP(nn.Module):
         ) + logjac
 
 
+class ConditionalTimePureConditionalLowRankLinearXFlowMLP(nn.Module):
+    """Pure low-rank velocity with a conditional basis ``U(theta,t)`` (not necessarily orthonormal).
+
+    Velocity is ``v(x,t,theta) = U(theta,t) h(U(theta,t)^T x, t, theta)`` with ``U`` in ``R^{D x r}``
+    produced by an MLP on ``(theta,t)``. Divergence uses
+    ``\\nabla_x\\cdot v = \\mathrm{tr}\\bigl(U^T U \\, \\partial h/\\partial z\\bigr)`` with
+    ``z = U^T x``, evaluated with ``U`` detached from ``x`` (``U`` depends only on ``(theta,t)``).
+
+    Likelihood follows the same reverse-Euler divergence integral as
+    :class:`ConditionalTimePureLowRankLinearXFlowMLP`.
+    """
+
+    def __init__(
+        self,
+        *,
+        theta_dim: int,
+        x_dim: int,
+        correction_rank: int,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        quadrature_steps: int = 64,
+        divergence_estimator: str = "hutchinson",
+        hutchinson_probes: int = 1,
+    ) -> None:
+        super().__init__()
+        if int(correction_rank) < 1:
+            raise ValueError("correction_rank must be >= 1.")
+        if int(correction_rank) > int(x_dim):
+            raise ValueError("correction_rank must be <= x_dim.")
+        if int(quadrature_steps) < 2:
+            raise ValueError("quadrature_steps must be >= 2.")
+        de = str(divergence_estimator).strip().lower()
+        if de not in ("hutchinson", "exact"):
+            raise ValueError("divergence_estimator must be one of: hutchinson, exact.")
+        if int(hutchinson_probes) < 1:
+            raise ValueError("hutchinson_probes must be >= 1.")
+        self.divergence_estimator = de
+        self.hutchinson_probes = int(hutchinson_probes)
+        self.theta_dim = int(theta_dim)
+        self.x_dim = int(x_dim)
+        self.quadrature_steps = int(quadrature_steps)
+        self.correction_rank = int(correction_rank)
+        u_out = int(self.x_dim) * int(self.correction_rank)
+        self.U_net = _make_mlp(
+            in_dim=self.theta_dim + 1,
+            out_dim=u_out,
+            hidden_dim=int(hidden_dim),
+            depth=int(depth),
+            final_gain=0.0,
+            final_bias=0.0,
+        )
+        with torch.no_grad():
+            u0 = torch.empty(int(self.x_dim), int(self.correction_rank))
+            nn.init.orthogonal_(u0)
+            last = self.U_net[-1]
+            if not isinstance(last, nn.Linear):
+                raise TypeError("U_net last layer must be nn.Linear.")
+            last.bias.copy_(u0.reshape(-1))
+        self.h_net = _make_mlp(
+            in_dim=self.correction_rank + 1 + self.theta_dim,
+            out_dim=self.correction_rank,
+            hidden_dim=int(hidden_dim),
+            depth=int(depth),
+            final_gain=0.0,
+            final_bias=0.0,
+        )
+
+    def U_theta_t(self, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """``U(theta,t)`` with shape ``[B, D, r]``."""
+        if theta.ndim == 1:
+            theta2 = theta.unsqueeze(-1)
+        else:
+            theta2 = theta
+        tcol = _as_col_t(t, batch=int(theta2.shape[0]))
+        cond = torch.cat([theta2, tcol], dim=-1)
+        b = int(theta2.shape[0])
+        return self.U_net(cond).view(b, self.x_dim, self.correction_rank)
+
+    def forward(self, x: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        u = self.U_theta_t(theta, t)
+        z = torch.einsum("bd,bdr->br", x, u)
+        if theta.ndim == 1:
+            theta2 = theta.unsqueeze(-1)
+        else:
+            theta2 = theta
+        tcol = _as_col_t(t, batch=int(x.shape[0]))
+        h = self.h_net(torch.cat([z, tcol, theta2], dim=1))
+        return torch.einsum("bdr,br->bd", u, h)
+
+    def regularization_loss(self) -> torch.Tensor | None:
+        return None
+
+    def _reduced_trace_gram_exact(self, z: torch.Tensor, h: torch.Tensor, g_gram: torch.Tensor) -> torch.Tensor:
+        """``\\mathrm{tr}(G \\, \\partial h/\\partial z)`` with ``G = U^T U`` shape ``[B, r, r]``."""
+        tr_h = torch.zeros(z.shape[0], dtype=z.dtype, device=z.device)
+        for j in range(self.correction_rank):
+            grad_j = torch.autograd.grad(
+                h[:, j].sum(),
+                z,
+                create_graph=False,
+                retain_graph=j < self.correction_rank - 1,
+            )[0]
+            gj = g_gram[:, :, j]
+            tr_h = tr_h + (gj * grad_j).sum(dim=-1)
+        return tr_h
+
+    def _reduced_trace_gram_hutchinson(self, z: torch.Tensor, h: torch.Tensor, g_gram: torch.Tensor) -> torch.Tensor:
+        """Hutchinson estimate of ``\\mathrm{tr}(G \\, \\partial h/\\partial z)`` with Rademacher probes."""
+        b = int(z.shape[0])
+        r = int(self.correction_rank)
+        n_probe = int(self.hutchinson_probes)
+        acc = torch.zeros(b, dtype=z.dtype, device=z.device)
+        for pi in range(n_probe):
+            probe = torch.empty(b, r, dtype=z.dtype, device=z.device)
+            probe.bernoulli_(0.5).mul_(2.0).sub_(1.0)
+            g_eps = torch.einsum("brs,bs->br", g_gram, probe)
+            vjp = torch.autograd.grad(
+                h,
+                z,
+                grad_outputs=g_eps,
+                create_graph=False,
+                retain_graph=pi < n_probe - 1,
+            )[0]
+            acc = acc + (probe * vjp).sum(dim=-1)
+        return acc / float(n_probe)
+
+    def divergence(self, x: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        t = _as_col_t(t, batch=int(x.shape[0]))
+        u_mat = self.U_theta_t(theta, t).detach()
+        g_gram = torch.einsum("bdr,bds->brs", u_mat, u_mat)
+        with torch.enable_grad():
+            z = torch.einsum("bd,bdr->br", x, u_mat).detach().requires_grad_(True)
+            tcol = _as_col_t(t, batch=int(z.shape[0]))
+            h = self.h_net(torch.cat([z, tcol, theta], dim=1))
+            if self.divergence_estimator == "exact":
+                tr_h = self._reduced_trace_gram_exact(z, h, g_gram)
+            else:
+                tr_h = self._reduced_trace_gram_hutchinson(z, h, g_gram)
+        return tr_h.detach()
+
+    def log_prob_normalized(
+        self,
+        x_norm: torch.Tensor,
+        theta: torch.Tensor,
+        *,
+        solve_jitter: float = 1e-6,
+        quadrature_steps: int | None = None,
+        ode_steps: int = 32,
+    ) -> torch.Tensor:
+        del solve_jitter, quadrature_steps
+        if x_norm.ndim == 1:
+            x_norm = x_norm.unsqueeze(0)
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        if x_norm.shape[0] != theta.shape[0]:
+            raise ValueError("x and theta batch sizes must match.")
+        steps = int(ode_steps)
+        if steps < 1:
+            raise ValueError("ode_steps must be >= 1.")
+        x = x_norm
+        div_int = torch.zeros(x.shape[0], dtype=x.dtype, device=x.device)
+        dt = 1.0 / float(steps)
+        for s in range(steps, 0, -1):
+            t = torch.full((x.shape[0], 1), float(s) / float(steps), dtype=x.dtype, device=x.device)
+            div_int = div_int + dt * self.divergence(x, theta, t)
+            with torch.no_grad():
+                v = self.forward(x, theta, t)
+                x = x - dt * v
+        d = int(x.shape[1])
+        base = -0.5 * (torch.sum(x**2, dim=1) + float(d) * math.log(2.0 * math.pi))
+        return base - div_int
+
+    def log_prob_observed(
+        self,
+        x_raw: torch.Tensor,
+        theta: torch.Tensor,
+        *,
+        x_mean: torch.Tensor,
+        x_std: torch.Tensor,
+        solve_jitter: float = 1e-6,
+        quadrature_steps: int | None = None,
+        ode_steps: int = 32,
+    ) -> torch.Tensor:
+        z = (x_raw - x_mean) / x_std
+        logjac = -torch.sum(torch.log(x_std))
+        return self.log_prob_normalized(
+            z,
+            theta,
+            solve_jitter=float(solve_jitter),
+            quadrature_steps=quadrature_steps,
+            ode_steps=int(ode_steps),
+        ) + logjac
+
+
 class ConditionalTimeThetaOnlyBLowRankCorrectionLinearXFlowMLP(nn.Module):
     """Scheduled full ``A(t)`` linear x-flow plus low-rank correction with ``b(theta)`` (no ``t`` in ``b``).
 

@@ -131,6 +131,7 @@ from fisher.linear_x_flow import (
     ConditionalTimeDiagonalLinearXFlowMLP,
     ConditionalTimeLinearXFlowMLP,
     ConditionalTimeLowRankCorrectionLinearXFlowMLP,
+    ConditionalTimePureConditionalLowRankLinearXFlowMLP,
     ConditionalTimePureLowRankLinearXFlowMLP,
     ConditionalTimeThetaOnlyBLowRankCorrectionLinearXFlowMLP,
     ConditionalTimeRandomBasisLowRankLinearXFlowMLP,
@@ -174,6 +175,7 @@ _TIME_LXF_METHODS = {
     "linear_x_flow_diagonal_theta_t",
     "linear_x_flow_low_rank_t",
     "linear_x_flow_pure_low_rank_t",
+    "linear_x_flow_pure_cond_low_rank_t",
     "linear_x_flow_lr_t_ts",
     "linear_x_flow_low_rank_randb_t",
 }
@@ -900,8 +902,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=4,
         help=(
             ""
-            "linear_x_flow_low_rank_t / linear_x_flow_pure_low_rank_t / linear_x_flow_lr_t_ts: rank r of U "
-            "in U h(U^T x) (pure_low_rank_t is velocity U h(U^T x) only). "
+            "linear_x_flow_low_rank_t / linear_x_flow_pure_low_rank_t / linear_x_flow_pure_cond_low_rank_t / "
+            "linear_x_flow_lr_t_ts: rank r of U in U h(U^T x) (pure_low_rank_t: fixed orthonormal U; "
+            "pure_cond_low_rank_t: U(theta,t) from MLP; pure_low_rank_t velocity is U h(U^T x) only). "
             "linear_x_flow_low_rank_randb_t: rank of the low-rank random-basis A(t) term."
         ),
     )
@@ -911,8 +914,9 @@ def build_parser() -> argparse.ArgumentParser:
         default="hutchinson",
         choices=["hutchinson", "exact"],
         help=(
-            "linear_x_flow_low_rank_t / linear_x_flow_pure_low_rank_t / linear_x_flow_lr_t_ts: trace of dh/dz "
-            "in z=U^T x (U orthonormal columns). "
+            "linear_x_flow_low_rank_t / linear_x_flow_pure_low_rank_t / linear_x_flow_pure_cond_low_rank_t / "
+            "linear_x_flow_lr_t_ts: reduced divergence in z=U^T x (pure_low_rank_t / low_rank_t / lr_t_ts: "
+            "orthonormal U, trace of dh/dz; pure_cond_low_rank_t: tr((U^T U) dh/dz) with U(theta,t) detached in div). "
             "linear_x_flow_lr_t_ts: same Hutchinson/exact trace on h as low_rank_t (b is frozen after mean-regression pretrain); "
             ""
             ""
@@ -925,8 +929,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help=(
-            "linear_x_flow_low_rank_t / linear_x_flow_pure_low_rank_t / linear_x_flow_lr_t_ts with hutchinson: "
-            "number of Rademacher probes per divergence."
+            "linear_x_flow_low_rank_t / linear_x_flow_pure_low_rank_t / linear_x_flow_pure_cond_low_rank_t / "
+            "linear_x_flow_lr_t_ts with hutchinson: number of Rademacher probes per divergence."
         ),
     )
     p.add_argument("--lxf-randb-lambda-a", type=float, default=1e-4, help="scheduled random-basis LXF only: L2 penalty on diagonal a.")
@@ -1004,8 +1008,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=32,
         help=(
-            "linear_x_flow_low_rank_t / linear_x_flow_pure_low_rank_t / linear_x_flow_lr_t_ts only: "
-            "fixed Euler steps for ODE likelihood."
+            "linear_x_flow_low_rank_t / linear_x_flow_pure_low_rank_t / linear_x_flow_pure_cond_low_rank_t / "
+            "linear_x_flow_lr_t_ts only: fixed Euler steps for ODE likelihood."
         ),
     )
     p.add_argument(
@@ -1363,6 +1367,8 @@ def _normalize_linear_x_flow_method(tfm: str) -> str | None:
         "linear_x_flow_low_rank_t": "linear_x_flow_low_rank_t",
         "linear-x-flow-pure-low-rank-t": "linear_x_flow_pure_low_rank_t",
         "linear_x_flow_pure_low_rank_t": "linear_x_flow_pure_low_rank_t",
+        "linear-x-flow-pure-cond-low-rank-t": "linear_x_flow_pure_cond_low_rank_t",
+        "linear_x_flow_pure_cond_low_rank_t": "linear_x_flow_pure_cond_low_rank_t",
         "linear-x-flow-lr-t-ts": "linear_x_flow_lr_t_ts",
         "linear_x_flow_lr_t_ts": "linear_x_flow_lr_t_ts",
         "linear-x-flow-low-rank-randb-t": "linear_x_flow_low_rank_randb_t",
@@ -1551,6 +1557,7 @@ def _validate_lxf_cli(args: argparse.Namespace) -> None:
     if method in (
         "linear_x_flow_low_rank_t",
         "linear_x_flow_pure_low_rank_t",
+        "linear_x_flow_pure_cond_low_rank_t",
         "linear_x_flow_lr_t_ts",
         "linear_x_flow_low_rank_randb_t",
     ) and int(getattr(args, "lxf_low_rank_dim", 0)) < 1:
@@ -1986,6 +1993,7 @@ def _validate_cli(args: argparse.Namespace) -> None:
         "linear_x_flow_diagonal_t",
         "linear_x_flow_low_rank_t",
         "linear_x_flow_pure_low_rank_t",
+        "linear_x_flow_pure_cond_low_rank_t",
         "linear_x_flow_lr_t_ts",
         "linear_x_flow_low_rank_randb_t",
         "linear_theta_flow",
@@ -3735,6 +3743,10 @@ def _estimate_one(
             if lxf_rank > x_dim_lxf: raise ValueError(f"--lxf-low-rank-dim must be <= x_dim={x_dim_lxf}; got {lxf_rank}.")
             drift_type = "pure_low_rank_time"
             model = ConditionalTimePureLowRankLinearXFlowMLP(**common, correction_rank=lxf_rank, quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)), divergence_estimator=str(getattr(args, "lxf_low_rank_divergence_estimator", "hutchinson")).strip().lower(), hutchinson_probes=int(getattr(args, "lxf_hutchinson_probes", 1))).to(dev)
+        elif method_name == "linear_x_flow_pure_cond_low_rank_t":
+            if lxf_rank > x_dim_lxf: raise ValueError(f"--lxf-low-rank-dim must be <= x_dim={x_dim_lxf}; got {lxf_rank}.")
+            drift_type = "pure_cond_low_rank_time"
+            model = ConditionalTimePureConditionalLowRankLinearXFlowMLP(**common, correction_rank=lxf_rank, quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)), divergence_estimator=str(getattr(args, "lxf_low_rank_divergence_estimator", "hutchinson")).strip().lower(), hutchinson_probes=int(getattr(args, "lxf_hutchinson_probes", 1))).to(dev)
         elif method_name == "linear_x_flow_lr_t_ts":
             if lxf_rank > x_dim_lxf: raise ValueError(f"--lxf-low-rank-dim must be <= x_dim={x_dim_lxf}; got {lxf_rank}.")
             drift_type = "low_rank_correction_time_theta_only_b"
@@ -3756,7 +3768,12 @@ def _estimate_one(
             train_out = train_time_linear_x_flow_schedule(**train_kwargs, schedule=schedule, log_name=method_name)
         x_mean = np.asarray(train_out["x_mean"], dtype=np.float64)
         x_std = np.asarray(train_out["x_std"], dtype=np.float64)
-        correction_methods = {"linear_x_flow_low_rank_t", "linear_x_flow_pure_low_rank_t", "linear_x_flow_lr_t_ts"}
+        correction_methods = {
+            "linear_x_flow_low_rank_t",
+            "linear_x_flow_pure_low_rank_t",
+            "linear_x_flow_pure_cond_low_rank_t",
+            "linear_x_flow_lr_t_ts",
+        }
         analytic_lxf_h = bool(getattr(args, "lxf_analytic_gaussian_hellinger", False)) and method_name not in correction_methods
         c_matrix = None; delta_l = None; lxf_bin_h = None
         endpoint_mu = np.asarray([], dtype=np.float64); endpoint_cov_or_diag = np.asarray([], dtype=np.float64); endpoint_is_diag = False
@@ -4853,6 +4870,8 @@ def _model_posterior_log_weights_for_fixed_x(
         return c, r"Linear X-flow full $A(t)$ + orthonormal low-rank correction log $p(x|\theta)$"
     if method == "linear_x_flow_pure_low_rank_t":
         return c, r"Linear X-flow pure orthonormal low-rank $U h(U^{\mathsf T}x)$ log $p(x|\theta)$"
+    if method == "linear_x_flow_pure_cond_low_rank_t":
+        return c, r"Linear X-flow pure conditional $U(\theta,t) h(U^{\mathsf T}x)$ log $p(x|\theta)$"
     if method == "linear_x_flow_lr_t_ts":
         return c, r"Linear X-flow full $A(t)$ + low-rank correction with $b(\theta)$ log $p(x|\theta)$"
     if method == "linear_x_flow_low_rank_randb_t":
@@ -5554,6 +5573,8 @@ def _render_training_losses_panel(
             post_lab = "linear-x-flow full-A(t) + low-rank correction FM likelihood"
         elif tfm == "linear_x_flow_pure_low_rank_t":
             post_lab = "linear-x-flow pure low-rank U h(U^T x) FM likelihood"
+        elif tfm == "linear_x_flow_pure_cond_low_rank_t":
+            post_lab = "linear-x-flow pure conditional U(theta,t) h(U^T x) FM likelihood"
         elif tfm == "linear_x_flow_lr_t_ts":
             post_lab = "linear-x-flow full-A(t) + low-rank correction b(theta) FM likelihood"
         elif tfm == "linear_x_flow_low_rank_randb_t":
@@ -5995,6 +6016,8 @@ def _save_combined_convergence_figure(
             post_lab = "linear-x-flow full-A(t) + low-rank correction FM likelihood"
         elif tfm == "linear_x_flow_pure_low_rank_t":
             post_lab = "linear-x-flow pure low-rank U h(U^T x) FM likelihood"
+        elif tfm == "linear_x_flow_pure_cond_low_rank_t":
+            post_lab = "linear-x-flow pure conditional U(theta,t) h(U^T x) FM likelihood"
         elif tfm == "linear_x_flow_lr_t_ts":
             post_lab = "linear-x-flow full-A(t) + low-rank correction b(theta) FM likelihood"
         elif tfm == "linear_x_flow_low_rank_randb_t":
@@ -6456,6 +6479,7 @@ def _write_summary(
             "linear_x_flow_diagonal_t",
                 "linear_x_flow_low_rank_t",
             "linear_x_flow_pure_low_rank_t",
+            "linear_x_flow_pure_cond_low_rank_t",
                 "linear_x_flow_lr_t_ts",
                             "linear_x_flow_low_rank_randb_t",
             ):
@@ -6486,6 +6510,7 @@ def _write_summary(
             if _tfm_sum in (
                 "linear_x_flow_low_rank_t",
                 "linear_x_flow_pure_low_rank_t",
+                "linear_x_flow_pure_cond_low_rank_t",
                         "linear_x_flow_lr_t_ts",
                                     ):
                 f.write(
