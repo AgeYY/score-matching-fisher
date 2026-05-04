@@ -25,6 +25,8 @@ config_from_args = _MODULE.config_from_args
 hellinger_acc_lb_from_binned_h_squared = _MODULE.hellinger_acc_lb_from_binned_h_squared
 hellinger_acc_ub_from_binned_h_squared = _MODULE.hellinger_acc_ub_from_binned_h_squared
 matrix_corr_offdiag = _MODULE.matrix_corr_offdiag
+matrix_corr_offdiag_pearson = _MODULE.matrix_corr_offdiag_pearson
+impute_offdiag_nan_mean = _MODULE.impute_offdiag_nan_mean
 pairwise_bin_logistic_accuracy_train_val = _MODULE.pairwise_bin_logistic_accuracy_train_val
 parse_args = _MODULE.parse_args
 run_binned_visualization = _MODULE.run_binned_visualization
@@ -175,6 +177,39 @@ def test_hellinger_bounds_and_correlation() -> None:
     corr = matrix_corr_offdiag(a, b)
     assert np.isfinite(corr)
     assert corr > 0.0
+
+
+def test_impute_offdiag_nan_mean_then_pearson_matches_full_offdiag() -> None:
+    """NaN off-diagonals in estimate are filled with finite off-diag mean before Pearson r."""
+    n = 4
+    a = np.full((n, n), np.nan, dtype=np.float64)
+    np.fill_diagonal(a, np.nan)
+    # Finite off-diagonal entries: mean = (0.5 + 0.6 + 0.7) / 3 = 0.6
+    a[0, 1] = a[1, 0] = 0.5
+    a[0, 2] = a[2, 0] = 0.6
+    a[1, 2] = a[2, 1] = 0.7
+    # Rest off-diagonal stay nan -> impute to 0.6
+    b = np.zeros((n, n), dtype=np.float64)
+    np.fill_diagonal(b, np.nan)
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                b[i, j] = float(i) + 0.1 * float(j)
+
+    imp = impute_offdiag_nan_mean(a)
+    off = ~np.eye(n, dtype=bool)
+    assert np.all(np.isfinite(imp[off]))
+    assert np.all(np.isnan(np.diag(imp)))
+    mu = float(np.mean(a[off & np.isfinite(a)]))
+    assert np.allclose(imp[off & ~np.isfinite(a)], mu)
+
+    r_imputed = matrix_corr_offdiag_pearson(imp, b)
+    # Build fully finite pair vectors by same imputation on a then mask finite(b) - b is finite offdiag
+    mask = off & np.isfinite(b)
+    av = imp[mask]
+    bv = b[mask]
+    r_direct = float(np.corrcoef(av, bv)[0, 1])
+    assert np.isclose(r_imputed, r_direct, rtol=0.0, atol=1e-12)
 
 
 def test_integration_gpu_smoke_or_explicit_cuda_error(tmp_path: Path) -> None:

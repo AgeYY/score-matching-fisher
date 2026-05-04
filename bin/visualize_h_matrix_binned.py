@@ -531,6 +531,29 @@ def pairwise_bin_logistic_accuracy_train_val(
     return acc, valid, support, stats
 
 
+def impute_offdiag_nan_mean(a: np.ndarray) -> np.ndarray:
+    """Return a copy of square matrix ``a`` with NaN **off-diagonal** entries filled.
+
+    Each missing off-diagonal value is set to the mean of finite off-diagonal entries in ``a``.
+    The diagonal is left unchanged (typically already NaN from pairwise decoding conventions).
+
+    Used before correlating an **estimated** pairwise decoding accuracy matrix with a reference
+    so correlation does not silently drop pairs where the estimate is missing.
+    """
+    aa = np.asarray(a, dtype=np.float64).copy()
+    if aa.ndim != 2 or aa.shape[0] != aa.shape[1]:
+        raise ValueError("impute_offdiag_nan_mean requires a square 2D matrix.")
+    n = int(aa.shape[0])
+    off = ~np.eye(n, dtype=bool)
+    finite_off = off & np.isfinite(aa)
+    if not bool(np.any(finite_off)):
+        return aa
+    mu = float(np.mean(aa[finite_off]))
+    bad_off = off & ~np.isfinite(aa)
+    aa[bad_off] = mu
+    return aa
+
+
 def matrix_corr_offdiag(a: np.ndarray, b: np.ndarray) -> float:
     """Spearman rank correlation between vectorized off-diagonal entries (finite pairs only)."""
     aa = np.asarray(a, dtype=np.float64)
@@ -752,7 +775,7 @@ def compute_binned_metrics(ctx: RunContext, loaded: LoadedHMatrix) -> BinnedMetr
     )
 
     corr_h_vs_gt = matrix_corr_offdiag(h_binned_sqrt, gt_acc)
-    corr_clf_vs_gt = matrix_corr_offdiag(clf_acc, gt_acc)
+    corr_clf_vs_gt = matrix_corr_offdiag(impute_offdiag_nan_mean(clf_acc), gt_acc)
     corr_hellinger_lb_vs_gt = matrix_corr_offdiag(hellinger_acc_lb_binned, gt_acc)
     corr_hellinger_ub_vs_gt = matrix_corr_offdiag(hellinger_acc_ub_binned, gt_acc)
 

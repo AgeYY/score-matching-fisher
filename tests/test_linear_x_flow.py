@@ -20,6 +20,8 @@ from fisher.linear_x_flow import (
     ConditionalTimeDiagonalLinearXFlowMLP,
     ConditionalTimeLinearXFlowMLP,
     ConditionalTimeLowRankCorrectionLinearXFlowMLP,
+    ConditionalTimeThetaOnlyBLowRankCorrectionLinearXFlowMLP,
+    ConditionalTimeThetaMatrixThetaOnlyBLowRankCorrectionLinearXFlowMLP,
     ConditionalTimeThetaULowRankCorrectionLinearXFlowMLP,
     ConditionalTimeLowRankLinearXFlowMLP,
     ConditionalTimeRandomBasisLowRankLinearXFlowMLP,
@@ -42,6 +44,7 @@ from fisher.linear_x_flow import (
     train_pca_nonlinear_linear_x_flow,
     train_pca_nonlinear_time_linear_x_flow_schedule,
     train_low_rank_t_warmup_then_full,
+    train_low_rank_t_theta_only_b_mean_regression_pretrain_then_freeze_b,
     train_time_linear_x_flow_schedule,
     train_time_diagonal_linear_x_flow_schedule,
 )
@@ -811,6 +814,114 @@ class TestLinearXFlow(unittest.TestCase):
         )
         self.assertEqual(tuple(c.shape), (4, 4))
         self.assertTrue(np.all(np.isfinite(c)))
+
+    def test_theta_only_b_low_rank_b_independent_of_t(self) -> None:
+        torch.manual_seed(77)
+        m = ConditionalTimeThetaOnlyBLowRankCorrectionLinearXFlowMLP(
+            theta_dim=1, x_dim=2, correction_rank=1, hidden_dim=8, depth=1, quadrature_steps=5
+        )
+        th = torch.randn(5, 1)
+        t1 = torch.zeros(5, 1)
+        t2 = torch.ones(5, 1)
+        self.assertTrue(torch.allclose(m.linear.b(th, t1), m.linear.b(th, t2)))
+
+    def test_lr_t_ts_mean_regression_pretrain_then_freeze_b_smoke(self) -> None:
+        torch.manual_seed(78)
+        rng = np.random.default_rng(78)
+        theta = rng.normal(size=(32, 1)).astype(np.float64)
+        x = np.concatenate([theta, -theta], axis=1) + 0.05 * rng.normal(size=(32, 2))
+        m = ConditionalTimeThetaOnlyBLowRankCorrectionLinearXFlowMLP(
+            theta_dim=1, x_dim=2, correction_rank=1, hidden_dim=8, depth=1, quadrature_steps=5
+        )
+        before_b = {n: p.detach().clone() for n, p in m.linear.b_net.named_parameters()}
+        before_a = {n: p.detach().clone() for n, p in m.linear.a_net.named_parameters()}
+        before_u = m.U.detach().clone()
+        out = train_low_rank_t_theta_only_b_mean_regression_pretrain_then_freeze_b(
+            model=m,
+            theta_train=theta[:24],
+            x_train=x[:24],
+            theta_val=theta[24:],
+            x_val=x[24:],
+            device=torch.device("cpu"),
+            schedule=path_schedule_from_name("linear"),
+            warmup_epochs=1,
+            epochs=1,
+            batch_size=8,
+            lr=1e-2,
+            t_eps=1e-3,
+            patience=0,
+            log_every=1,
+            weight_ema_decay=0.0,
+            restore_best=False,
+            log_name="linear_x_flow_lr_t_ts_test",
+        )
+        self.assertEqual(out.get("lxf_low_rank_t_warmup_objective"), "mean_regression")
+        self.assertTrue(out.get("lxf_low_rank_t_second_stage_freeze_b_enabled"))
+        b_changed = any(
+            not torch.allclose(p.detach(), before_b[n]) for n, p in m.linear.b_net.named_parameters()
+        )
+        self.assertTrue(b_changed)
+        a_changed = any(
+            not torch.allclose(p.detach(), before_a[n]) for n, p in m.linear.a_net.named_parameters()
+        )
+        u_changed = not torch.allclose(m.U.detach(), before_u)
+        self.assertTrue(a_changed or u_changed)
+
+    def test_lr_t_ts_atheta_b_independent_of_t_A_depends_on_theta(self) -> None:
+        torch.manual_seed(79)
+        m = ConditionalTimeThetaMatrixThetaOnlyBLowRankCorrectionLinearXFlowMLP(
+            theta_dim=1, x_dim=2, correction_rank=1, hidden_dim=8, depth=1, quadrature_steps=5
+        )
+        th1 = torch.zeros(4, 1)
+        th2 = torch.ones(4, 1)
+        t1 = torch.zeros(4, 1)
+        t2 = torch.ones(4, 1)
+        self.assertTrue(torch.allclose(m.linear.b(th1, t1), m.linear.b(th1, t2)))
+        a_th0 = m.linear.A_theta_t(th1, t1)
+        a_th1 = m.linear.A_theta_t(th2, t1)
+        self.assertFalse(torch.allclose(a_th0, a_th1))
+
+    def test_lr_t_ts_atheta_mean_regression_pretrain_then_freeze_b_smoke(self) -> None:
+        torch.manual_seed(80)
+        rng = np.random.default_rng(80)
+        theta = rng.normal(size=(32, 1)).astype(np.float64)
+        x = np.concatenate([theta, -theta], axis=1) + 0.05 * rng.normal(size=(32, 2))
+        m = ConditionalTimeThetaMatrixThetaOnlyBLowRankCorrectionLinearXFlowMLP(
+            theta_dim=1, x_dim=2, correction_rank=1, hidden_dim=8, depth=1, quadrature_steps=5
+        )
+        before_b = {n: p.detach().clone() for n, p in m.linear.b_net.named_parameters()}
+        before_matrix = {n: p.detach().clone() for n, p in m.linear.matrix_net.named_parameters()}
+        before_u = m.U.detach().clone()
+        out = train_low_rank_t_theta_only_b_mean_regression_pretrain_then_freeze_b(
+            model=m,
+            theta_train=theta[:24],
+            x_train=x[:24],
+            theta_val=theta[24:],
+            x_val=x[24:],
+            device=torch.device("cpu"),
+            schedule=path_schedule_from_name("linear"),
+            warmup_epochs=1,
+            epochs=1,
+            batch_size=8,
+            lr=1e-2,
+            t_eps=1e-3,
+            patience=0,
+            log_every=1,
+            weight_ema_decay=0.0,
+            restore_best=False,
+            log_name="linear_x_flow_lr_t_ts_atheta_test",
+        )
+        self.assertEqual(out.get("lxf_low_rank_t_warmup_objective"), "mean_regression")
+        self.assertTrue(out.get("lxf_low_rank_t_second_stage_freeze_b_enabled"))
+        b_changed = any(
+            not torch.allclose(p.detach(), before_b[n]) for n, p in m.linear.b_net.named_parameters()
+        )
+        self.assertTrue(b_changed)
+        matrix_changed = any(
+            not torch.allclose(p.detach(), before_matrix[n]) for n, p in m.linear.matrix_net.named_parameters()
+        )
+        u_changed = not torch.allclose(m.U.detach(), before_u)
+        self.assertTrue(matrix_changed or u_changed)
 
     def test_time_low_rank_correction_divergence_zero_h_is_trace_A(self) -> None:
         torch.manual_seed(50)

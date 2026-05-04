@@ -13,6 +13,11 @@ but emits only two matrix-figure artifacts:
 Also writes correlation, normalized-MSE-vs-n, and training-loss SVGs. Pass
 ``--visualization-only`` with the same ``--output-dir`` as a prior full run to
 regenerate figures from ``h_decoding_twofig_results.npz`` without retraining.
+
+Off-diagonal Pearson correlations and off-diagonal NMSE use
+``visualize_h_matrix_binned.impute_offdiag_nan_mean`` on both matrices in each
+pair (sweep vs GT / MC reference, and decoding sweep vs shared reference) before
+the finite-pair mask inside each metric.
 """
 
 from __future__ import annotations
@@ -69,6 +74,9 @@ from fisher.shared_fisher_est import build_dataset_from_meta, normalize_flow_arc
 #   linear_x_flow_low_rank, linear_x_flow_low_rank_t (full A(t) + learnable U h(U^T x) correction;
 #     static orthonormal U; divergence default: --lxf-low-rank-divergence-estimator hutchinson, --lxf-hutchinson-probes 1),
 #   linear_x_flow_lr_t_p (same as low_rank_t with Fourier theta features for b and h inputs),
+#   linear_x_flow_lr_t_ts (same scheduled low-rank correction but b(theta) only; mean-regression pretrain then freeze b),
+#   linear_x_flow_lr_t_ts_p (same as lr_t_ts but b/h see Fourier(theta) features like linear_x_flow_t_p / linear_x_flow_lr_t_p),
+#   linear_x_flow_lr_t_ts_atheta (symmetric A(t,theta)=(B+B^T)/2 from B(t,theta); same correction and b(theta) warmup/freeze as lr_t_ts),
 #   linear_x_flow_lr_utt (same scheduled base + correction but dense U=U(t,theta) from an MLP),
 #   linear_x_flow_low_rank_randb, linear_x_flow_low_rank_randb_t,
 #   linear_x_flow_nonlinear_pca
@@ -107,6 +115,8 @@ def _matrix_nmse_offdiag(est: np.ndarray, gt: np.ndarray) -> float:
     """Off-diagonal normalized MSE: mean((est - gt)^2) / mean(gt^2); finite pairs only.
 
     Uses the same off-diagonal mask as ``visualize_h_matrix_binned.matrix_corr_offdiag_pearson``.
+    Twofig callers pass matrices already imputed with ``impute_offdiag_nan_mean``
+    so NaN cells do not drop pairs asymmetrically.
     """
     aa = np.asarray(est, dtype=np.float64)
     bb = np.asarray(gt, dtype=np.float64)
@@ -170,9 +180,13 @@ def _nmse_h_binned_vs_gt_mc(h_sweep_arr: np.ndarray, h_gt_sqrt: np.ndarray) -> n
         raise ValueError(f"h_sweep_arr must be 4D; got {h_sw.shape}.")
     n_m, n_cols = int(h_sw.shape[0]), int(h_sw.shape[1])
     out = np.full((n_m, n_cols), np.nan, dtype=np.float64)
+    h_gt_imp = conv.vhb.impute_offdiag_nan_mean(h_gt)
     for i in range(n_m):
         for j in range(n_cols):
-            out[i, j] = _matrix_nmse_offdiag(h_sw[i, j], h_gt)
+            out[i, j] = _matrix_nmse_offdiag(
+                conv.vhb.impute_offdiag_nan_mean(np.asarray(h_sw[i, j], dtype=np.float64)),
+                h_gt_imp,
+            )
     return out
 
 
@@ -184,8 +198,9 @@ def _nmse_decode_vs_ref_shared(decode_sweep: np.ndarray, decode_ref: np.ndarray)
         raise ValueError(f"decode_sweep must be 3D (n_cols, n_bins, n_bins); got {d_sw.shape}.")
     n_cols = int(d_sw.shape[0])
     out = np.full((n_cols,), np.nan, dtype=np.float64)
+    d_ref_imp = conv.vhb.impute_offdiag_nan_mean(d_ref)
     for j in range(n_cols):
-        out[j] = _matrix_nmse_offdiag(d_sw[j], d_ref)
+        out[j] = _matrix_nmse_offdiag(conv.vhb.impute_offdiag_nan_mean(np.asarray(d_sw[j], dtype=np.float64)), d_ref_imp)
     return out
 
 
@@ -1327,18 +1342,20 @@ def main(argv: list[str] | None = None) -> None:
 
     h_sweep_arr = np.stack(h_sweep_by_method, axis=0)
     clf_sweep_arr = np.stack(clf_sweep_shared, axis=0)
+    h_gt_sqrt_imp = conv.vhb.impute_offdiag_nan_mean(np.asarray(h_gt_sqrt, dtype=np.float64))
+    clf_ref_imp = conv.vhb.impute_offdiag_nan_mean(np.asarray(clf_ref, dtype=np.float64))
     corr_h_binned_vs_gt_mc = np.full((len(row_specs), len(ns)), np.nan, dtype=np.float64)
     for i in range(len(row_specs)):
         for j in range(len(ns)):
             corr_h_binned_vs_gt_mc[i, j] = conv.vhb.matrix_corr_offdiag_pearson(
-                np.asarray(h_sweep_arr[i, j], dtype=np.float64),
-                np.asarray(h_gt_sqrt, dtype=np.float64),
+                conv.vhb.impute_offdiag_nan_mean(np.asarray(h_sweep_arr[i, j], dtype=np.float64)),
+                h_gt_sqrt_imp,
             )
     corr_decode_vs_ref_shared = np.full((len(ns),), np.nan, dtype=np.float64)
     for j in range(len(ns)):
         corr_decode_vs_ref_shared[j] = conv.vhb.matrix_corr_offdiag_pearson(
-            np.asarray(clf_sweep_arr[j], dtype=np.float64),
-            np.asarray(clf_ref, dtype=np.float64),
+            conv.vhb.impute_offdiag_nan_mean(np.asarray(clf_sweep_arr[j], dtype=np.float64)),
+            clf_ref_imp,
         )
     nmse_h_binned_vs_gt_mc = _nmse_h_binned_vs_gt_mc(h_sweep_arr, h_gt_sqrt)
     nmse_decode_vs_ref_shared = _nmse_decode_vs_ref_shared(clf_sweep_arr, clf_ref)

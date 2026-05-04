@@ -72,7 +72,7 @@ def test_rejects_n_ref_theta_bin_budget() -> None:
     ]
     r = subprocess.run(cmd, cwd=str(repo), capture_output=True, text=True)
     assert r.returncode != 0
-    assert "n_mc = n_ref // num_theta_bins" in (r.stderr + r.stdout)
+    assert "n_mc = n_ref // total_theta_bins" in (r.stderr + r.stdout)
 
 
 def test_rejects_max_n_list_exceeds_n_ref() -> None:
