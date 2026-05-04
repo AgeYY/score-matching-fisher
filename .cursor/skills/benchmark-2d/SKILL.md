@@ -3,8 +3,8 @@ name: benchmark-2d
 description: >-
   Score-matching-fisher native 2D-θ PR30D H-decoding twofig: theta2_grid (10×10), n_ref 10000,
   n-list 80,400,1000, randamp_gaussian2d_sqrtd or gridcos_gaussian2d_sqrtd_rand_tune_additive NPZ.
-  Method rows are configurable (--theta-field-rows / --theta-field-methods); use lxfs_* for
-  scheduled *_t LXF and lxf_* for time-independent LXF. See journal note for bin_gaussian + all *_t run.
+  Method rows are configurable (--theta-field-rows / --theta-field-methods); supported LXF rows are
+  scheduled *_t variants that use lxfs_* flags. See journal note for bin_gaussian + all *_t run.
   Use when the user says benchmark-2d, benchmark 2D, native 2D theta twofig, or 2D theta2grid PR30.
 ---
 
@@ -47,12 +47,12 @@ Pass **`--theta-field-rows tok1,tok2,...`** (highest precedence) or **`--theta-f
 
 Examples:
 
-- Minimal diagonal baseline (skills **`bin-2d-lin-lxfdiag`**, **`bin-2d-cos-lxfdiag`**): `bin_gaussian,linear_x_flow_diagonal` with **`--lxf-epochs`**, **`--lxf-early-patience`**.
+- Minimal diagonal baseline (skills **`bin-2d-lin-lxfdiag`**, **`bin-2d-cos-lxfdiag`**): `bin_gaussian,linear_x_flow_diagonal_t` with **`--lxfs-epochs`**, **`--lxfs-early-patience`**.
 - Full scheduled **`_t`** family + baseline (documented run):  
   `bin_gaussian,linear_x_flow_t,linear_x_flow_scalar_t,linear_x_flow_diagonal_t,linear_x_flow_diagonal_theta_t,linear_x_flow_low_rank_t,linear_x_flow_low_rank_randb_t`  
   with **`--lxfs-path-schedule`**, **`--lxfs-epochs`**, **`--lxfs-early-patience`**, and **`--lxf-low-rank-dim`** for low-rank rows.
 
-**Training-flag routing:** methods in `_TIME_LXF_METHODS` in [`bin/study_h_decoding_convergence.py`](../../../bin/study_h_decoding_convergence.py) use the **`lxfs_*`** CLI prefix; time-independent linear X-flow uses **`lxf_*`**.
+**Training-flag routing:** supported LXF rows in `_TIME_LXF_METHODS` in [`bin/study_h_decoding_convergence.py`](../../../bin/study_h_decoding_convergence.py) use the **`lxfs_*`** CLI prefix.
 
 ## Example completed run (all `*_t` + `bin_gaussian`, LXFS 50k cap)
 

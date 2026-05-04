@@ -68,18 +68,13 @@ from fisher.shared_fisher_est import build_dataset_from_meta, normalize_flow_arc
 # - ctsm_v
 # - nf
 # - bin_gaussian
-# - linear_x_flow, linear_x_flow_t, linear_x_flow_scalar, linear_x_flow_scalar_t,
-#   linear_x_flow_diagonal, linear_x_flow_diagonal_t,
-#   linear_x_flow_diagonal_theta, linear_x_flow_diagonal_theta_t,
-#   linear_x_flow_low_rank, linear_x_flow_low_rank_t (full A(t) + learnable U h(U^T x) correction;
+# - linear_x_flow_t, linear_x_flow_scalar_t,
+#   linear_x_flow_diagonal_t,
+#   linear_x_flow_diagonal_theta_t,
+#   linear_x_flow_low_rank_t (full A(t) + learnable U h(U^T x) correction;
 #     static orthonormal U; divergence default: --lxf-low-rank-divergence-estimator hutchinson, --lxf-hutchinson-probes 1),
-#   linear_x_flow_lr_t_p (same as low_rank_t with Fourier theta features for b and h inputs),
 #   linear_x_flow_lr_t_ts (same scheduled low-rank correction but b(theta) only; mean-regression pretrain then freeze b),
-#   linear_x_flow_lr_t_ts_p (same as lr_t_ts but b/h see Fourier(theta) features like linear_x_flow_t_p / linear_x_flow_lr_t_p),
-#   linear_x_flow_lr_t_ts_atheta (symmetric A(t,theta)=(B+B^T)/2 from B(t,theta); same correction and b(theta) warmup/freeze as lr_t_ts),
-#   linear_x_flow_lr_utt (same scheduled base + correction but dense U=U(t,theta) from an MLP),
-#   linear_x_flow_low_rank_randb, linear_x_flow_low_rank_randb_t,
-#   linear_x_flow_nonlinear_pca
+#   linear_x_flow_low_rank_randb_t
 _FLOW_BASED_METHODS = {"theta_flow", "theta_path_integral", "x_flow"}
 _NO_TRAIN_METHODS = {"bin_gaussian"}
 
@@ -508,7 +503,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Comma-separated theta-field methods to sweep in one run. "
             "Overrides --theta-field-method when non-empty. "
             "Supported values: theta_flow, theta_path_integral, x_flow, ctsm_v, nf, bin_gaussian, "
-            "and linear_x_flow variants including linear_x_flow_diagonal_t "
+            "and supported scheduled linear_x_flow variants including linear_x_flow_diagonal_t "
             "(see study_h_decoding_convergence._normalize_linear_x_flow_method)."
         ),
     )
@@ -520,8 +515,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Comma-separated theta-field row specs, highest precedence over --theta-field-methods and "
             "--theta-field-method. Tokens are method or method:arch, e.g. "
             "theta_flow:mlp,theta_flow:film,x_flow:film_fourier,ctsm_v,bin_gaussian,"
-            "linear_x_flow_low_rank,linear_x_flow_diagonal_t. "
-            "For linear_x_flow_low_rank use --lxf-low-rank-dim."
+            "linear_x_flow_low_rank_t,linear_x_flow_diagonal_t. "
+            "For low-rank linear_x_flow rows use --lxf-low-rank-dim."
         ),
     )
     return p

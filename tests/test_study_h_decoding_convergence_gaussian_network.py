@@ -573,20 +573,10 @@ class TestStudyHDecodingConvergenceGaussianNetwork(unittest.TestCase):
 
         for method_cli, method_stored in (
             ("linear-x-flow-t", "linear_x_flow_t"),
-            ("linear-x-flow-t-p", "linear_x_flow_t_p"),
-            ("linear-x-flow-scalar", "linear_x_flow_scalar"),
             ("linear-x-flow-scalar-t", "linear_x_flow_scalar_t"),
-            ("linear-x-flow-diagonal", "linear_x_flow_diagonal"),
-            ("linear-x-flow-diagonal-theta", "linear_x_flow_diagonal_theta"),
             ("linear-x-flow-diagonal-theta-t", "linear_x_flow_diagonal_theta_t"),
-            ("linear-x-flow-low-rank", "linear_x_flow_low_rank"),
             ("linear-x-flow-low-rank-t", "linear_x_flow_low_rank_t"),
-            ("linear-x-flow-lr-t-p", "linear_x_flow_lr_t_p"),
             ("linear-x-flow-lr-t-ts", "linear_x_flow_lr_t_ts"),
-            ("linear-x-flow-lr-t-ts-p", "linear_x_flow_lr_t_ts_p"),
-            ("linear-x-flow-lr-t-ts-atheta", "linear_x_flow_lr_t_ts_atheta"),
-            ("linear-x-flow-lr-utt", "linear_x_flow_lr_utt"),
-            ("linear-x-flow-low-rank-randb", "linear_x_flow_low_rank_randb"),
             ("linear-x-flow-low-rank-randb-t", "linear_x_flow_low_rank_randb_t"),
             ("linear-x-flow-diagonal-t", "linear_x_flow_diagonal_t"),
         ):
@@ -656,11 +646,7 @@ class TestStudyHDecodingConvergenceGaussianNetwork(unittest.TestCase):
                 ]
                 if method_stored in (
                     "linear_x_flow_low_rank_t",
-                    "linear_x_flow_lr_t_p",
                     "linear_x_flow_lr_t_ts",
-                    "linear_x_flow_lr_t_ts_p",
-                    "linear_x_flow_lr_t_ts_atheta",
-                    "linear_x_flow_lr_utt",
                 ):
                     cmd.extend(["--lxf-low-rank-t-warmup-epochs", "1"])
                 r = subprocess.run(cmd, cwd=str(repo), capture_output=True, text=True)
@@ -672,127 +658,19 @@ class TestStudyHDecodingConvergenceGaussianNetwork(unittest.TestCase):
                 if method_stored.endswith("_t"):
                     self.assertEqual(str(np.asarray(z["lxfs_path_schedule"]).reshape(-1)[0]), "cosine")
                     self.assertTrue(bool(np.asarray(z["lxfs_scheduled_train"]).reshape(-1)[0]))
-                if method_stored in ("linear_x_flow_t_p", "linear_x_flow_lr_t_p", "linear_x_flow_lr_t_ts_p"):
-                    self.assertTrue(bool(np.asarray(z["lxf_theta_fourier_enabled"]).reshape(-1)[0]))
-                    self.assertEqual(int(np.asarray(z["lxf_theta_fourier_k"]).reshape(-1)[0]), 6)
-                    self.assertEqual(int(np.asarray(z["lxf_theta_original_dim"]).reshape(-1)[0]), 1)
-                    self.assertEqual(int(np.asarray(z["lxf_theta_feature_dim"]).reshape(-1)[0]), 13)
                 if method_stored in (
                     "linear_x_flow_low_rank_t",
-                    "linear_x_flow_lr_t_p",
                     "linear_x_flow_lr_t_ts",
-                    "linear_x_flow_lr_t_ts_p",
-                    "linear_x_flow_lr_t_ts_atheta",
-                    "linear_x_flow_lr_utt",
                 ):
                     self.assertTrue(bool(np.asarray(z["lxf_low_rank_t_warmup_enabled"]).reshape(-1)[0]))
                     self.assertEqual(int(np.asarray(z["lxf_low_rank_t_warmup_epochs"]).reshape(-1)[0]), 1)
                     self.assertEqual(np.asarray(z["lxf_low_rank_t_warmup_train_losses"]).shape, (1,))
-                    if method_stored in ("linear_x_flow_lr_t_ts", "linear_x_flow_lr_t_ts_p", "linear_x_flow_lr_t_ts_atheta"):
+                    if method_stored == "linear_x_flow_lr_t_ts":
                         self.assertEqual(
                             str(np.asarray(z["lxf_low_rank_t_warmup_objective"]).reshape(-1)[0]),
                             "mean_regression",
                         )
-                if method_stored == "linear_x_flow_lr_utt":
-                    self.assertTrue(bool(np.asarray(z["lxf_lr_utt_dynamic_u"]).reshape(-1)[0]))
-                    self.assertFalse(bool(np.asarray(z["lxf_lr_utt_orthonormal_u"]).reshape(-1)[0]))
 
-    def test_linear_x_flow_time_nonlinear_pca_sweep_smokes(self) -> None:
-        repo = Path(__file__).resolve().parent.parent
-        script = repo / "bin" / "study_h_decoding_convergence.py"
-        n_total = 180
-        n_ref = 140
-        n_bins = 4
-        ns_ds = _ns(
-            dataset_family="cosine_gaussian_sqrtd",
-            x_dim=2,
-            n_total=n_total,
-            train_frac=0.5,
-            seed=12,
-        )
-        ds = build_dataset_from_args(ns_ds)
-        theta_all, x_all = ds.sample_joint(n_total)
-        meta = meta_dict_from_args(ns_ds)
-        n_train = int(0.5 * n_total)
-        tr = np.arange(0, n_train, dtype=np.int64)
-        va = np.arange(n_train, n_total, dtype=np.int64)
-
-        for method_cli, method_stored in (
-            ("linear-x-flow-nonlinear-pca-t", "linear_x_flow_nonlinear_pca_t"),
-            ("linear-x-flow-nonlinear-pca-diagonal-theta-t", "linear_x_flow_nonlinear_pca_diagonal_theta_t"),
-        ):
-            with self.subTest(method=method_cli), tempfile.TemporaryDirectory() as tmp:
-                tmp_path = Path(tmp)
-                ds_path = tmp_path / "ds.npz"
-                out_dir = tmp_path / "run_out"
-                save_shared_dataset_npz(
-                    ds_path,
-                    meta=meta,
-                    theta_all=theta_all,
-                    x_all=x_all,
-                    train_idx=tr,
-                    validation_idx=va,
-                    theta_train=theta_all[tr],
-                    x_train=x_all[tr],
-                    theta_validation=theta_all[va],
-                    x_validation=x_all[va],
-                )
-                cmd = [
-                    sys.executable,
-                    str(script),
-                    "--dataset-npz",
-                    str(ds_path),
-                    "--dataset-family",
-                    "cosine_gaussian_sqrtd",
-                    "--n-ref",
-                    str(n_ref),
-                    "--n-list",
-                    "50",
-                    "--num-theta-bins",
-                    str(n_bins),
-                    "--theta-field-method",
-                    method_cli,
-                    "--lxfs-epochs",
-                    "2",
-                    "--lxfs-batch-size",
-                    "32",
-                    "--lxfs-hidden-dim",
-                    "8",
-                    "--lxfs-depth",
-                    "1",
-                    "--lxfs-early-patience",
-                    "3",
-                    "--lxfs-pair-batch-size",
-                    "1024",
-                    "--lxfs-quadrature-steps",
-                    "5",
-                    "--lxf-nlpca-dim",
-                    "1",
-                    "--lxf-nlpca-epochs",
-                    "1",
-                    "--lxf-nlpca-hidden-dim",
-                    "8",
-                    "--lxf-nlpca-depth",
-                    "1",
-                    "--lxf-nlpca-ode-steps",
-                    "2",
-                    "--keep-intermediate",
-                    "--output-dir",
-                    str(out_dir),
-                    "--device",
-                    "cpu",
-                ]
-                r = subprocess.run(cmd, cwd=str(repo), capture_output=True, text=True)
-                self.assertEqual(r.returncode, 0, msg=(r.stdout, r.stderr))
-                z = np.load(out_dir / "training_losses" / "n_000050.npz", allow_pickle=True)
-                self.assertEqual(str(np.asarray(z["theta_field_method"]).reshape(-1)[0]), method_stored)
-                h_path = out_dir / "sweep_runs" / "n_000050" / "h_matrix_results_theta_cov.npz"
-                hz = np.load(h_path, allow_pickle=True)
-                self.assertFalse(bool(np.asarray(hz["lxf_analytic_gaussian_hellinger"]).reshape(-1)[0]))
-                self.assertEqual(str(np.asarray(hz["h_eval_scalar_name"]).reshape(-1)[0]), f"{method_stored}_bin_log_p_x_given_theta")
-                for key in ("h_sym", "c_matrix", "delta_l_matrix", "bin_log_likelihood_matrix", "bin_delta_l_matrix", "lxf_nlpca_pca_basis"):
-                    self.assertIn(key, hz.files)
-                    self.assertTrue(np.isfinite(np.asarray(hz[key], dtype=np.float64)).all())
 
     def test_nf_reduction_sweep_smoke(self) -> None:
         repo = Path(__file__).resolve().parent.parent
@@ -962,3 +840,23 @@ class TestStudyHDecodingConvergenceGaussianNetwork(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_removed_linear_x_flow_aliases_are_rejected(self) -> None:
+        for method_cli in (
+            "linear-x-flow",
+            "linear-x-flow-t-p",
+            "linear-x-flow-scalar",
+            "linear-x-flow-diagonal",
+            "linear-x-flow-diagonal-theta",
+            "linear-x-flow-low-rank",
+            "linear-x-flow-lr-t-p",
+            "linear-x-flow-lr-t-ts-p",
+            "linear-x-flow-lr-t-ts-atheta",
+            "linear-x-flow-lr-utt",
+            "linear-x-flow-low-rank-randb",
+            "linear-x-flow-nonlinear-pca",
+            "linear-x-flow-nonlinear-pca-t",
+        ):
+            with self.subTest(method=method_cli):
+                self.assertIsNone(conv._normalize_linear_x_flow_method(method_cli))
+

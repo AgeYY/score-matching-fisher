@@ -33,9 +33,9 @@ METHODS_ALL = (
     "theta_path_integral",
     "theta_flow",
     "x_flow",
-    "linear_x_flow",
-    "linear_x_flow_nonlinear_pca",
-    "linear_x_flow_diagonal",
+    "linear_x_flow_t",
+    "linear_x_flow_diagonal_t",
+    "linear_x_flow_low_rank_t",
 )
 
 
