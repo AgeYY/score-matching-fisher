@@ -1796,6 +1796,7 @@ def train_time_linear_x_flow_schedule(
     log_every: int = 50,
     restore_best: bool = True,
     log_name: str = "linear_x_flow_t",
+    target_noise_std: float = 0.0,
 ) -> dict[str, Any]:
     """Train ``v(x,t,theta)`` on a scheduled affine bridge."""
     if int(epochs) < 1:
@@ -1815,6 +1816,9 @@ def train_time_linear_x_flow_schedule(
     te = float(t_eps)
     if not (0.0 < te < 0.5):
         raise ValueError("t_eps must be in (0, 0.5).")
+    tn = float(target_noise_std)
+    if not np.isfinite(tn) or tn < 0.0:
+        raise ValueError("target_noise_std must be finite and >= 0.")
 
     th_tr = _as_2d_float64(theta_train, name="theta_train")
     x_tr = _as_2d_float64(x_train, name="x_train")
@@ -1856,13 +1860,17 @@ def train_time_linear_x_flow_schedule(
         for tb, x1b in train_loader:
             tb = tb.to(device)
             x1b = x1b.to(device)
+            if tn > 0.0:
+                x1b_target = x1b + tn * torch.randn_like(x1b)
+            else:
+                x1b_target = x1b
             bs = int(x1b.shape[0])
             t_raw = torch.rand(bs, 1, device=device, dtype=x1b.dtype)
             t = te + (1.0 - 2.0 * te) * t_raw
             x0b = torch.randn_like(x1b)
             a, bcoef, ad, bd = schedule.ab_ad_bd(t)
-            xt = a * x0b + bcoef * x1b
-            ut = ad * x0b + bd * x1b
+            xt = a * x0b + bcoef * x1b_target
+            ut = ad * x0b + bd * x1b_target
             loss = torch.mean((model(xt, tb, t) - ut) ** 2)
             opt.zero_grad(set_to_none=True)
             loss.backward()

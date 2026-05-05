@@ -170,6 +170,8 @@ from fisher.contrastive_llr import (
 
 _TIME_LXF_METHODS = {
     "linear_x_flow_t",
+    "linear_x_flow_t_aug",
+    "linear_x_flow_t_noise",
     "linear_x_flow_scalar_t",
     "linear_x_flow_diagonal_t",
     "linear_x_flow_diagonal_theta_t",
@@ -1106,6 +1108,36 @@ def build_parser() -> argparse.ArgumentParser:
         default=64,
         help="scheduled linear-x-flow only: fixed time grid size for endpoint Gaussian quadrature.",
     )
+    p.add_argument(
+        "--lxfs-augment-replicas",
+        type=int,
+        default=10,
+        help="linear_x_flow_t_aug only: noisy x replicas per original point (no clean copy).",
+    )
+    p.add_argument(
+        "--lxfs-augment-noise-std",
+        type=float,
+        default=0.2,
+        help="linear_x_flow_t_aug only: isotropic Gaussian noise std added around each x.",
+    )
+    p.add_argument(
+        "--lxfs-augment-seed",
+        type=int,
+        default=-1,
+        help=(
+            "linear_x_flow_t_aug only: RNG seed for augmentation noise; "
+            "<0 uses --run-seed when set, otherwise the dataset NPZ meta seed."
+        ),
+    )
+    p.add_argument(
+        "--lxfs-target-noise-std",
+        type=float,
+        default=0.2,
+        help=(
+            "linear_x_flow_t_noise only: isotropic Gaussian std added to normalized training batch "
+            "targets x1 before the FM bridge (validation unchanged)."
+        ),
+    )
     p.add_argument("--ltf-num-components", type=int, default=3, help="linear-theta-flow only: Gaussian mixture components.")
     p.add_argument("--ltf-epochs", type=int, default=2000, help="linear-theta-flow only: training epochs.")
     p.add_argument("--ltf-batch-size", type=int, default=1024, help="linear-theta-flow only: training batch size.")
@@ -1377,6 +1409,10 @@ def _normalize_linear_x_flow_method(tfm: str) -> str | None:
     aliases = {
         "linear-x-flow-t": "linear_x_flow_t",
         "linear_x_flow_t": "linear_x_flow_t",
+        "linear-x-flow-t-aug": "linear_x_flow_t_aug",
+        "linear_x_flow_t_aug": "linear_x_flow_t_aug",
+        "linear-x-flow-t-noise": "linear_x_flow_t_noise",
+        "linear_x_flow_t_noise": "linear_x_flow_t_noise",
         "linear-x-flow-scalar-t": "linear_x_flow_scalar_t",
         "linear_x_flow_scalar_t": "linear_x_flow_scalar_t",
         "linear-x-flow-diagonal-theta-t": "linear_x_flow_diagonal_theta_t",
@@ -2083,6 +2119,8 @@ def _validate_cli(args: argparse.Namespace) -> None:
         "linear_x_flow_pure_cond_low_rank_t",
         "linear_x_flow_lr_t_ts",
         "linear_x_flow_low_rank_randb_t",
+        "linear_x_flow_t_aug",
+        "linear_x_flow_t_noise",
         "linear_theta_flow",
         "nf_reduction",
         "pi_nf",
@@ -2698,6 +2736,44 @@ def _lxf_bin_likelihood_hellinger(
         "h_sym": h_sym,
         "bin_counts": counts,
     }
+
+
+def _lxfs_gaussian_augment_x(
+    theta: np.ndarray,
+    x: np.ndarray,
+    *,
+    k: int,
+    sigma: float,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Expand each row into ``k`` noisy ``x`` replicas (no clean copy); repeat ``theta``."""
+    th = np.asarray(theta, dtype=np.float64)
+    xx = np.asarray(x, dtype=np.float64)
+    if th.shape[0] != xx.shape[0]:
+        raise ValueError("theta and x must have the same number of rows.")
+    kk = int(k)
+    if kk < 1:
+        raise ValueError("lxfs-augment-replicas must be >= 1.")
+    sg = float(sigma)
+    if not np.isfinite(sg) or sg <= 0.0:
+        raise ValueError("lxfs-augment-noise-std must be finite and > 0.")
+    n, d = int(xx.shape[0]), int(xx.shape[1])
+    theta_rep = np.repeat(th, kk, axis=0)
+    noise = rng.standard_normal((n * kk, d), dtype=np.float64)
+    x_aug = np.repeat(xx, kk, axis=0) + sg * noise
+    return theta_rep, x_aug
+
+
+def _collapse_kn_square_mean_blocks(mat: np.ndarray, k: int, n_orig: int) -> np.ndarray:
+    """Average ``k×k`` blocks of a ``(k*n)×(k*n)`` matrix into ``n×n``."""
+    m = np.asarray(mat, dtype=np.float64)
+    kk = int(k)
+    n = int(n_orig)
+    if m.ndim != 2 or m.shape[0] != m.shape[1]:
+        raise ValueError("mat must be square.")
+    if m.shape[0] != kk * n:
+        raise ValueError(f"expected matrix side {kk * n}, got {m.shape[0]}")
+    return m.reshape(n, kk, n, kk).mean(axis=(1, 3))
 
 
 def _save_empty_no_training_losses(path: str, *, method_name: str, **metadata: object) -> None:
@@ -4026,13 +4102,35 @@ def _estimate_one(
         if theta_train.shape[1] != theta_all.shape[1]:
             raise ValueError(f"{method_name} theta dimension mismatch.")
 
+        theta_all_orig = np.asarray(theta_all, dtype=np.float64)
+        x_all_orig = np.asarray(x_all, dtype=np.float64)
+        aug_method = method_name == "linear_x_flow_t_aug"
+        aug_k = int(getattr(args, "lxfs_augment_replicas", 10))
+        aug_sigma = float(getattr(args, "lxfs_augment_noise_std", 0.2))
+        aug_seed_used = 0
+        if aug_method:
+            _augment_seed_arg = int(getattr(args, "lxfs_augment_seed", -1))
+            if _augment_seed_arg >= 0:
+                aug_seed_used = _augment_seed_arg
+            else:
+                _run_seed = getattr(args, "run_seed", None)
+                aug_seed_used = int(_run_seed) if _run_seed is not None else int(meta.get("seed", 0))
+            aug_rng = np.random.default_rng(int(aug_seed_used))
+            theta_train, x_train = _lxfs_gaussian_augment_x(
+                theta_train, x_train, k=aug_k, sigma=aug_sigma, rng=aug_rng
+            )
+            theta_val, x_val = _lxfs_gaussian_augment_x(theta_val, x_val, k=aug_k, sigma=aug_sigma, rng=aug_rng)
+            theta_all, x_all = _lxfs_gaussian_augment_x(theta_all, x_all, k=aug_k, sigma=aug_sigma, rng=aug_rng)
+            if bin_all is not None:
+                bin_all = np.repeat(np.asarray(bin_all, dtype=np.int64), aug_k)
+
         theta_train_model = theta_train
         theta_val_model = theta_val
         theta_all_model = theta_all
         x_dim_lxf = int(x_all.shape[1])
         lxf_rank = int(getattr(args, "lxf_low_rank_dim", 4))
         common = dict(theta_dim=int(theta_all.shape[1]), x_dim=x_dim_lxf, hidden_dim=int(getattr(args, f"{lxf_prefix}_hidden_dim", 128)), depth=int(getattr(args, f"{lxf_prefix}_depth", 3)))
-        if method_name == "linear_x_flow_t":
+        if method_name in ("linear_x_flow_t", "linear_x_flow_t_aug", "linear_x_flow_t_noise"):
             drift_type = "full_symmetric_time"
             model = ConditionalTimeLinearXFlowMLP(**common, quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64))).to(dev)
         elif method_name == "linear_x_flow_scalar_t":
@@ -4066,7 +4164,27 @@ def _estimate_one(
             model = ConditionalTimeRandomBasisLowRankLinearXFlowMLP(**common, rank=lxf_rank, quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)), lambda_a=float(getattr(args, "lxf_randb_lambda_a", 1e-4)), lambda_s=float(getattr(args, "lxf_randb_lambda_s", 1e-4))).to(dev)
         else:
             raise ValueError(f"Unsupported linear_x_flow method: {method_name!r}.")
-        train_kwargs = dict(model=model, theta_train=theta_train_model, x_train=x_train, theta_val=theta_val_model, x_val=x_val, device=dev, epochs=int(getattr(args, f"{lxf_prefix}_epochs", 2000)), batch_size=int(getattr(args, f"{lxf_prefix}_batch_size", 1024)), lr=float(getattr(args, f"{lxf_prefix}_lr", 1e-3)), weight_decay=float(getattr(args, f"{lxf_prefix}_weight_decay", 0.0)), t_eps=float(getattr(args, f"{lxf_prefix}_t_eps", 0.05)), patience=int(getattr(args, f"{lxf_prefix}_early_patience", 1000)), min_delta=float(getattr(args, f"{lxf_prefix}_early_min_delta", 1e-4)), ema_alpha=float(getattr(args, f"{lxf_prefix}_early_ema_alpha", 0.05)), weight_ema_decay=float(getattr(args, f"{lxf_prefix}_weight_ema_decay", 0.9)), max_grad_norm=float(getattr(args, f"{lxf_prefix}_max_grad_norm", 10.0)), log_every=max(1, int(getattr(args, "log_every", 50))), restore_best=bool(getattr(args, "lxf_restore_best", True)))
+        train_kwargs = dict(
+            model=model,
+            theta_train=theta_train_model,
+            x_train=x_train,
+            theta_val=theta_val_model,
+            x_val=x_val,
+            device=dev,
+            epochs=int(getattr(args, f"{lxf_prefix}_epochs", 2000)),
+            batch_size=int(getattr(args, f"{lxf_prefix}_batch_size", 1024)),
+            lr=float(getattr(args, f"{lxf_prefix}_lr", 1e-3)),
+            weight_decay=float(getattr(args, f"{lxf_prefix}_weight_decay", 0.0)),
+            t_eps=float(getattr(args, f"{lxf_prefix}_t_eps", 0.05)),
+            patience=int(getattr(args, f"{lxf_prefix}_early_patience", 1000)),
+            min_delta=float(getattr(args, f"{lxf_prefix}_early_min_delta", 1e-4)),
+            ema_alpha=float(getattr(args, f"{lxf_prefix}_early_ema_alpha", 0.05)),
+            weight_ema_decay=float(getattr(args, f"{lxf_prefix}_weight_ema_decay", 0.9)),
+            max_grad_norm=float(getattr(args, f"{lxf_prefix}_max_grad_norm", 10.0)),
+            log_every=max(1, int(getattr(args, "log_every", 50))),
+            restore_best=bool(getattr(args, "lxf_restore_best", True)),
+        )
+        fm_target_noise_std = float(getattr(args, "lxfs_target_noise_std", 0.2)) if method_name == "linear_x_flow_t_noise" else 0.0
         schedule = path_schedule_from_name(sched_name)
         warmup_epochs = int(getattr(args, "lxf_low_rank_t_warmup_epochs", 0))
         if method_name == "linear_x_flow_lr_t_ts":
@@ -4074,7 +4192,9 @@ def _estimate_one(
         elif method_name == "linear_x_flow_low_rank_t" and warmup_epochs > 0:
             train_out = train_low_rank_t_warmup_then_full(**train_kwargs, schedule=schedule, warmup_epochs=warmup_epochs, log_name=method_name)
         else:
-            train_out = train_time_linear_x_flow_schedule(**train_kwargs, schedule=schedule, log_name=method_name)
+            train_out = train_time_linear_x_flow_schedule(
+                **train_kwargs, schedule=schedule, log_name=method_name, target_noise_std=fm_target_noise_std
+            )
         x_mean = np.asarray(train_out["x_mean"], dtype=np.float64)
         x_std = np.asarray(train_out["x_std"], dtype=np.float64)
         correction_methods = {
@@ -4083,7 +4203,11 @@ def _estimate_one(
             "linear_x_flow_pure_cond_low_rank_t",
             "linear_x_flow_lr_t_ts",
         }
-        analytic_lxf_h = bool(getattr(args, "lxf_analytic_gaussian_hellinger", False)) and method_name not in correction_methods
+        analytic_lxf_h = (
+            bool(getattr(args, "lxf_analytic_gaussian_hellinger", False))
+            and method_name not in correction_methods
+            and not aug_method
+        )
         c_matrix = None; delta_l = None; lxf_bin_h = None
         endpoint_mu = np.asarray([], dtype=np.float64); endpoint_cov_or_diag = np.asarray([], dtype=np.float64); endpoint_is_diag = False
         if bin_all is None: raise ValueError("linear-x-flow bin-likelihood Hellinger requires theta bin labels from the convergence subset.")
@@ -4096,19 +4220,101 @@ def _estimate_one(
             else:
                 c_matrix = compute_time_linear_x_flow_c_matrix(model=model, theta_all=theta_all_model, x_all=x_all, device=dev, x_mean=x_mean, x_std=x_std, solve_jitter=float(getattr(args, f"{lxf_prefix}_solve_jitter", 1e-6)), quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)), pair_batch_size=int(getattr(args, f"{lxf_prefix}_pair_batch_size", 65536)))
                 delta_l = compute_delta_l_nf(c_matrix); lxf_bin_h = _lxf_bin_likelihood_hellinger(c_matrix, np.asarray(bin_all, dtype=np.int64), int(n_bins)); h_sym = lxf_bin_h["h_sym"]
-        theta_used = theta_all.reshape(-1) if int(theta_all.shape[1]) == 1 else theta_all.copy()
+        if aug_method:
+            n_o = int(theta_all_orig.shape[0])
+            h_sym = _collapse_kn_square_mean_blocks(np.asarray(h_sym, dtype=np.float64), aug_k, n_o)
+            theta_used = theta_all_orig.reshape(-1) if int(theta_all_orig.shape[1]) == 1 else theta_all_orig.copy()
+        else:
+            theta_used = theta_all.reshape(-1) if int(theta_all.shape[1]) == 1 else theta_all.copy()
         empty = np.asarray([], dtype=np.float64)
-        h_payload = dict(theta_used=np.asarray(theta_used, dtype=np.float64), h_sym=np.asarray(h_sym, dtype=np.float64), h_field_method=np.asarray([method_name], dtype=object), h_eval_scalar_name=np.asarray([f"{method_name}_bin_log_p_x_given_theta" if not analytic_lxf_h else f"{method_name}_analytic_gaussian_hellinger"], dtype=object), sigma_eval=np.asarray([np.nan], dtype=np.float64), theta_field_method=np.asarray([method_name], dtype=object), lxf_drift_type=np.asarray([drift_type], dtype=object), lxf_endpoint_mu=np.asarray(endpoint_mu, dtype=np.float64), lxf_endpoint_covariance_or_variance_diag=np.asarray(endpoint_cov_or_diag, dtype=np.float64), lxf_endpoint_is_diagonal=np.bool_(endpoint_is_diag), lxfs_path_schedule=np.asarray([sched_name], dtype=object), lxfs_scheduled_train=np.bool_(True), lxfs_quadrature_steps=np.int64(int(getattr(args, "lxfs_quadrature_steps", 64))))
-        if c_matrix is not None: h_payload["c_matrix"] = np.asarray(c_matrix, dtype=np.float64)
-        if delta_l is not None: h_payload["delta_l_matrix"] = np.asarray(delta_l, dtype=np.float64)
-        if lxf_bin_h is not None: h_payload.update(bin_log_likelihood_matrix=np.asarray(lxf_bin_h["bin_log_likelihood"], dtype=np.float64), bin_delta_l_matrix=np.asarray(lxf_bin_h["bin_delta_l"], dtype=np.float64), h_directed_bin_likelihood=np.asarray(lxf_bin_h["h_directed_bin"], dtype=np.float64), h_binned_bin_likelihood=np.asarray(lxf_bin_h["h_binned"], dtype=np.float64), bin_counts=np.asarray(lxf_bin_h["bin_counts"], dtype=np.int64))
+        lxfs_extra_npz: dict[str, object] = {}
+        if aug_method:
+            lxfs_extra_npz.update(
+                {
+                    "lxfs_x_augmentation_enabled": np.bool_(True),
+                    "lxfs_augment_replicas": np.int64(aug_k),
+                    "lxfs_augment_noise_std": np.float64(aug_sigma),
+                    "lxfs_augment_seed": np.int64(int(aug_seed_used)),
+                }
+            )
+        if method_name == "linear_x_flow_t_noise":
+            lxfs_extra_npz.update(
+                {
+                    "lxfs_target_noise_enabled": np.bool_(True),
+                    "lxfs_target_noise_std": np.float64(float(getattr(args, "lxfs_target_noise_std", 0.2))),
+                }
+            )
+        h_payload = dict(
+            theta_used=np.asarray(theta_used, dtype=np.float64),
+            h_sym=np.asarray(h_sym, dtype=np.float64),
+            h_field_method=np.asarray([method_name], dtype=object),
+            h_eval_scalar_name=np.asarray(
+                [f"{method_name}_bin_log_p_x_given_theta" if not analytic_lxf_h else f"{method_name}_analytic_gaussian_hellinger"],
+                dtype=object,
+            ),
+            sigma_eval=np.asarray([np.nan], dtype=np.float64),
+            theta_field_method=np.asarray([method_name], dtype=object),
+            lxf_drift_type=np.asarray([drift_type], dtype=object),
+            lxf_endpoint_mu=np.asarray(endpoint_mu, dtype=np.float64),
+            lxf_endpoint_covariance_or_variance_diag=np.asarray(endpoint_cov_or_diag, dtype=np.float64),
+            lxf_endpoint_is_diagonal=np.bool_(endpoint_is_diag),
+            lxfs_path_schedule=np.asarray([sched_name], dtype=object),
+            lxfs_scheduled_train=np.bool_(True),
+            lxfs_quadrature_steps=np.int64(int(getattr(args, "lxfs_quadrature_steps", 64))),
+            **lxfs_extra_npz,
+        )
+        if c_matrix is not None and not aug_method:
+            h_payload["c_matrix"] = np.asarray(c_matrix, dtype=np.float64)
+        if delta_l is not None and not aug_method:
+            h_payload["delta_l_matrix"] = np.asarray(delta_l, dtype=np.float64)
+        if lxf_bin_h is not None:
+            if aug_method:
+                h_payload.update(
+                    h_binned_bin_likelihood=np.asarray(lxf_bin_h["h_binned"], dtype=np.float64),
+                    bin_counts=np.asarray(lxf_bin_h["bin_counts"], dtype=np.int64),
+                )
+            else:
+                h_payload.update(
+                    bin_log_likelihood_matrix=np.asarray(lxf_bin_h["bin_log_likelihood"], dtype=np.float64),
+                    bin_delta_l_matrix=np.asarray(lxf_bin_h["bin_delta_l"], dtype=np.float64),
+                    h_directed_bin_likelihood=np.asarray(lxf_bin_h["h_directed_bin"], dtype=np.float64),
+                    h_binned_bin_likelihood=np.asarray(lxf_bin_h["h_binned"], dtype=np.float64),
+                    bin_counts=np.asarray(lxf_bin_h["bin_counts"], dtype=np.int64),
+                )
         np.savez_compressed(os.path.join(output_dir, "h_matrix_results_theta_cov.npz"), **h_payload)
-        np.savez_compressed(os.path.join(output_dir, "score_prior_training_losses.npz"), theta_field_method=np.asarray([method_name], dtype=object), prior_enable=np.bool_(False), score_train_losses=np.asarray(train_out["train_losses"], dtype=np.float64), score_val_losses=np.asarray(train_out["val_losses"], dtype=np.float64), score_val_monitor_losses=np.asarray(train_out["val_monitor_losses"], dtype=np.float64), score_best_epoch=np.int64(train_out["best_epoch"]), score_stopped_epoch=np.int64(train_out["stopped_epoch"]), score_stopped_early=np.bool_(train_out["stopped_early"]), score_best_val_smooth=np.float64(train_out["best_val_loss"]), score_likelihood_finetune_train_losses=empty, score_likelihood_finetune_val_losses=empty, score_likelihood_finetune_val_monitor_losses=empty, prior_train_losses=empty, prior_val_losses=empty, prior_val_monitor_losses=empty, prior_likelihood_finetune_train_losses=empty, prior_likelihood_finetune_val_losses=empty, prior_likelihood_finetune_val_monitor_losses=empty, lxf_drift_type=np.asarray([drift_type], dtype=object), lxfs_path_schedule=np.asarray([sched_name], dtype=object), lxfs_scheduled_train=np.bool_(True), lxfs_quadrature_steps=np.int64(int(getattr(args, "lxfs_quadrature_steps", 64))))
+        loss_npz_extra: dict[str, object] = dict(lxfs_extra_npz)
+        np.savez_compressed(
+            os.path.join(output_dir, "score_prior_training_losses.npz"),
+            theta_field_method=np.asarray([method_name], dtype=object),
+            prior_enable=np.bool_(False),
+            score_train_losses=np.asarray(train_out["train_losses"], dtype=np.float64),
+            score_val_losses=np.asarray(train_out["val_losses"], dtype=np.float64),
+            score_val_monitor_losses=np.asarray(train_out["val_monitor_losses"], dtype=np.float64),
+            score_best_epoch=np.int64(train_out["best_epoch"]),
+            score_stopped_epoch=np.int64(train_out["stopped_epoch"]),
+            score_stopped_early=np.bool_(train_out["stopped_early"]),
+            score_best_val_smooth=np.float64(train_out["best_val_loss"]),
+            score_likelihood_finetune_train_losses=empty,
+            score_likelihood_finetune_val_losses=empty,
+            score_likelihood_finetune_val_monitor_losses=empty,
+            prior_train_losses=empty,
+            prior_val_losses=empty,
+            prior_val_monitor_losses=empty,
+            prior_likelihood_finetune_train_losses=empty,
+            prior_likelihood_finetune_val_losses=empty,
+            prior_likelihood_finetune_val_monitor_losses=empty,
+            lxf_drift_type=np.asarray([drift_type], dtype=object),
+            lxfs_path_schedule=np.asarray([sched_name], dtype=object),
+            lxfs_scheduled_train=np.bool_(True),
+            lxfs_quadrature_steps=np.int64(int(getattr(args, "lxfs_quadrature_steps", 64))),
+            **loss_npz_extra,
+        )
         loaded_lxf = SimpleNamespace(
             h_sym=np.asarray(h_sym, dtype=np.float64),
             theta_used=np.asarray(theta_used, dtype=np.float64),
         )
-        return loaded_lxf, np.asarray(x_all, dtype=np.float64), dev
+        x_ret = x_all_orig if aug_method else x_all
+        return loaded_lxf, np.asarray(x_ret, dtype=np.float64), dev
 
     ltf_norm = _normalize_linear_theta_flow_method(tfm)
     if ltf_norm is not None:
@@ -5177,6 +5383,10 @@ def _model_posterior_log_weights_for_fixed_x(
         return c, r"Linear X-flow log $p(x|\theta)$"
     if method == "linear_x_flow_t":
         return c, r"Linear X-flow time-dependent $A(t)$ log $p(x|\theta)$"
+    if method == "linear_x_flow_t_aug":
+        return c, r"Linear X-flow time-dependent $A(t)$ log $p(x|\theta)$ (noisy-$x$ augmentation)"
+    if method == "linear_x_flow_t_noise":
+        return c, r"Linear X-flow time-dependent $A(t)$ log $p(x|\theta)$ (noisy training $x_1$)"
     if method == "linear_x_flow_scalar_t":
         return c, r"Linear X-flow scalar $A(t)$ log $p(x|\theta)$"
     if method == "linear_x_flow_diagonal_theta_t":
@@ -5884,6 +6094,10 @@ def _render_training_losses_panel(
             post_lab = "linear-x-flow FM likelihood"
         elif tfm == "linear_x_flow_t":
             post_lab = "linear-x-flow time FM likelihood"
+        elif tfm == "linear_x_flow_t_aug":
+            post_lab = "linear-x-flow time FM likelihood (noisy-x augmentation)"
+        elif tfm == "linear_x_flow_t_noise":
+            post_lab = "linear-x-flow time FM likelihood (noisy training x1)"
         elif tfm == "linear_x_flow_scalar_t":
             post_lab = "linear-x-flow scalar-t FM likelihood"
         elif tfm == "linear_x_flow_diagonal_theta_t":
@@ -6333,6 +6547,10 @@ def _save_combined_convergence_figure(
             post_lab = "linear-x-flow FM likelihood"
         elif tfm == "linear_x_flow_t":
             post_lab = "linear-x-flow time FM likelihood"
+        elif tfm == "linear_x_flow_t_aug":
+            post_lab = "linear-x-flow time FM likelihood (noisy-x augmentation)"
+        elif tfm == "linear_x_flow_t_noise":
+            post_lab = "linear-x-flow time FM likelihood (noisy training x1)"
         elif tfm == "linear_x_flow_scalar_t":
             post_lab = "linear-x-flow scalar-t FM likelihood"
         elif tfm == "linear_x_flow_diagonal_theta_t":
@@ -6801,7 +7019,9 @@ def _write_summary(
             f.write(f"gxf_diagonal_covariance: {_tfm_sum == 'gaussian_x_flow_diagonal'}\n")
         if _tfm_sum in (
                 "linear_x_flow_t",
-                    "linear_x_flow_scalar_t",
+                "linear_x_flow_t_aug",
+                "linear_x_flow_t_noise",
+                "linear_x_flow_scalar_t",
                     "linear_x_flow_diagonal_theta_t",
             "linear_x_flow_diagonal_t",
                 "linear_x_flow_low_rank_t",
@@ -6875,6 +7095,12 @@ def _write_summary(
             f.write(f"lxfs_early_patience: {int(getattr(args, 'lxfs_early_patience', 0))}\n")
             f.write(f"lxfs_pair_batch_size: {int(getattr(args, 'lxfs_pair_batch_size', 0))}\n")
             f.write(f"lxfs_quadrature_steps: {int(getattr(args, 'lxfs_quadrature_steps', 0))}\n")
+        if _tfm_sum == "linear_x_flow_t_aug":
+            f.write(f"lxfs_augment_replicas: {int(getattr(args, 'lxfs_augment_replicas', 0))}\n")
+            f.write(f"lxfs_augment_noise_std: {float(getattr(args, 'lxfs_augment_noise_std', 0.0))}\n")
+            f.write(f"lxfs_augment_seed: {int(getattr(args, 'lxfs_augment_seed', -1))}\n")
+        if _tfm_sum == "linear_x_flow_t_noise":
+            f.write(f"lxfs_target_noise_std: {float(getattr(args, 'lxfs_target_noise_std', 0.0))}\n")
         if _tfm_sum == "x_flow_pca":
             f.write(f"flow_pca_dim: {int(getattr(args, 'flow_pca_dim', 0))}\n")
             f.write(f"flow_pca_num_bins: {getattr(args, 'flow_pca_num_bins', None)}\n")

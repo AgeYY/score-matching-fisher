@@ -68,7 +68,9 @@ from fisher.shared_fisher_est import build_dataset_from_meta, normalize_flow_arc
 # - ctsm_v
 # - nf
 # - bin_gaussian
-# - linear_x_flow_t, linear_x_flow_scalar_t,
+# - linear_x_flow_t, linear_x_flow_t_aug (same scheduled LXF as linear_x_flow_t with noisy-x augmentation),
+#   linear_x_flow_t_noise (same model; training batches perturb normalized x1 with Gaussian noise),
+#   linear_x_flow_scalar_t,
 #   linear_x_flow_diagonal_t,
 #   linear_x_flow_diagonal_theta_t,
 #   linear_x_flow_low_rank_t (full A(t) + learnable U h(U^T x) correction;

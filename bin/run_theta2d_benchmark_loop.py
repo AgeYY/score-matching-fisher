@@ -34,6 +34,8 @@ METHODS_ALL = (
     "theta_flow",
     "x_flow",
     "linear_x_flow_t",
+    "linear_x_flow_t_aug",
+    "linear_x_flow_t_noise",
     "linear_x_flow_diagonal_t",
     "linear_x_flow_low_rank_t",
 )
