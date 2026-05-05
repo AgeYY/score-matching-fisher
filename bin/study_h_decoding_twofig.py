@@ -49,8 +49,10 @@ import numpy as np
 import study_h_decoding_convergence as conv
 from fisher.hellinger_gt import (
     bin_centers_from_edges,
+    estimate_hellinger_sq_grid_centers_analytic,
     estimate_hellinger_sq_grid_centers_mc,
     estimate_hellinger_sq_one_sided_mc,
+    theta_centers_for_analytic_gt,
 )
 from fisher.shared_dataset_io import load_shared_dataset_npz
 from fisher.shared_fisher_est import build_dataset_from_meta, normalize_flow_arch, normalize_theta_field_method
@@ -75,6 +77,12 @@ from fisher.shared_fisher_est import build_dataset_from_meta, normalize_flow_arc
 #   linear_x_flow_diagonal_theta_t,
 #   linear_x_flow_low_rank_t (full A(t) + learnable U h(U^T x) correction;
 #     static orthonormal U; divergence default: --lxf-low-rank-divergence-estimator hutchinson, --lxf-hutchinson-probes 1),
+#   xflow_sir_lrank (same full-x low-rank correction, but fixed raw SIR directions for U;
+#     rank from --lxf-low-rank-dim, SIR bins/ridge from --sir-num-bins/--sir-ridge),
+#   xflow_sir_lrank_dia (same fixed raw SIR directions, but diagonal A(t)),
+#   xflow_sir_lrank_dia_theta (same fixed raw SIR directions, but diagonal A(theta,t)),
+#   xflow_sir_lrank_scalar (same fixed raw SIR directions, but scalar A(t)=a(t)I),
+#   xflow_sir_lrank_scalar_theta (same fixed raw SIR directions, but scalar A(theta,t)=a(theta,t)I),
 #   linear_x_flow_pure_low_rank_t (velocity U h(U^T x) only; same divergence / ODE likelihood path),
 #   linear_x_flow_pure_cond_low_rank_t (U(theta,t) from MLP; tr((U^T U) dh/dz) divergence; same ODE likelihood path),
 #   linear_x_flow_lr_t_ts (same scheduled low-rank correction but b(theta) only; mean-regression pretrain then freeze b),
@@ -514,6 +522,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Overrides --theta-field-method when non-empty. "
             "Supported values: theta_flow, theta_path_integral, x_flow, ctsm_v, nf, bin_gaussian, "
             "and supported scheduled linear_x_flow variants including linear_x_flow_diagonal_t "
+            "and xflow_sir_lrank / xflow_sir_lrank_dia / xflow_sir_lrank_dia_theta / xflow_sir_lrank_scalar / xflow_sir_lrank_scalar_theta, "
             "plus SIR wrappers sir_xflow_lrank_t, sir_xflow, sir_thetaflow."
         ),
     )
@@ -526,7 +535,9 @@ def build_parser() -> argparse.ArgumentParser:
             "--theta-field-method. Tokens are method or method:arch, e.g. "
             "theta_flow:mlp,theta_flow:film,x_flow:film_fourier,ctsm_v,bin_gaussian,"
             "linear_x_flow_low_rank_t,linear_x_flow_pure_low_rank_t,linear_x_flow_pure_cond_low_rank_t,linear_x_flow_diagonal_t. "
-            "For low-rank linear_x_flow rows use --lxf-low-rank-dim. "
+            "For low-rank linear_x_flow rows use --lxf-low-rank-dim (default 3). "
+            "For xflow_sir_lrank variants, --lxf-low-rank-dim is the raw SIR U rank and "
+            "--sir-num-bins/--sir-ridge control SIR. "
             "For SIR preprocessing use sir_xflow_lrank_t, sir_xflow, or sir_thetaflow with --sir-dim and --sir-num-bins "
             "(sir_xflow_lrank_t also needs --lxf-low-rank-dim <= --sir-dim)."
         ),
@@ -1195,25 +1206,35 @@ def main(argv: list[str] | None = None) -> None:
         dataset_for_gt.rng = np.random.default_rng(gt_seed)
     gt_n_mc = int(args.n_ref) // n_bins
     t_gt0 = time.time()
-    if theta_binning_mode == "theta2_grid":
-        h_gt_mc = estimate_hellinger_sq_grid_centers_mc(
+    gt_method = "analytic_gaussian_centers"
+    gt_theta_centers = theta_centers_for_analytic_gt(dataset_for_gt, centers)
+    try:
+        h_gt_mc = estimate_hellinger_sq_grid_centers_analytic(
             dataset_for_gt,
-            centers,
-            n_mc=gt_n_mc,
+            gt_theta_centers,
             symmetrize=bool(args.gt_hellinger_symmetrize),
         )
-    else:
-        h_gt_mc = estimate_hellinger_sq_one_sided_mc(
-            dataset_for_gt,
-            centers,
-            n_mc=gt_n_mc,
-            symmetrize=bool(args.gt_hellinger_symmetrize),
-        )
+    except TypeError:
+        gt_method = "mc_likelihood"
+        if theta_binning_mode == "theta2_grid":
+            h_gt_mc = estimate_hellinger_sq_grid_centers_mc(
+                dataset_for_gt,
+                centers,
+                n_mc=gt_n_mc,
+                symmetrize=bool(args.gt_hellinger_symmetrize),
+            )
+        else:
+            h_gt_mc = estimate_hellinger_sq_one_sided_mc(
+                dataset_for_gt,
+                centers,
+                n_mc=gt_n_mc,
+                symmetrize=bool(args.gt_hellinger_symmetrize),
+            )
     h_gt_sqrt = conv._sqrt_h_like(h_gt_mc)
     print(
-        f"[twofig] GT Hellinger (MC likelihood) theta_binning_mode={theta_binning_mode} "
-        f"n_bins={n_bins} n_mc={gt_n_mc} "
-        f"(n_bins*n_mc={n_bins * gt_n_mc} <= n_ref={int(args.n_ref)}) wall time: {time.time() - t_gt0:.1f}s",
+        f"[twofig] GT Hellinger ({gt_method}) theta_binning_mode={theta_binning_mode} "
+        f"n_bins={n_bins} center_shape={gt_theta_centers.shape} "
+        f"legacy_n_mc={gt_n_mc} wall time: {time.time() - t_gt0:.1f}s",
         flush=True,
     )
 
@@ -1426,6 +1447,8 @@ def main(argv: list[str] | None = None) -> None:
         theta_grid_edges_0=np.asarray(theta_grid_edges0, dtype=np.float64),
         theta_grid_edges_1=np.asarray(theta_grid_edges1, dtype=np.float64),
         theta_grid_centers=np.asarray(centers if theta_binning_mode == "theta2_grid" else [], dtype=np.float64),
+        gt_hellinger_method=np.asarray([gt_method], dtype=object),
+        gt_hellinger_theta_centers=np.asarray(gt_theta_centers, dtype=np.float64),
         gt_hellinger_n_mc=np.int64(gt_n_mc),
         gt_hellinger_seed=np.int64(gt_seed),
         gt_hellinger_symmetrize=np.int32(1 if bool(args.gt_hellinger_symmetrize) else 0),

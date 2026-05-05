@@ -1,4 +1,4 @@
-"""Monte Carlo ground-truth Hellinger distance from generative model log-likelihoods."""
+"""Ground-truth Hellinger distance from known toy generative models."""
 
 from __future__ import annotations
 
@@ -23,6 +23,146 @@ def bin_centers_from_edges(edges: NDArray[np.float64]) -> NDArray[np.float64]:
     if e.size < 2:
         raise ValueError("edges must have length >= 2.")
     return 0.5 * (e[:-1] + e[1:])
+
+
+def theta_centers_for_analytic_gt(dataset: Any, centers: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Return center theta points for analytical GT Hellinger.
+
+    One-dimensional ``centers`` are interpreted as theta1 bin centers. For
+    two-dimensional theta datasets, theta2 is fixed at the midpoint of the
+    dataset theta bounds.
+    """
+    tc = np.asarray(centers, dtype=np.float64)
+    if tc.ndim == 2:
+        return tc
+    tc = tc.reshape(-1)
+    theta_dim = int(getattr(dataset, "theta_dim", 1))
+    if theta_dim == 1:
+        return tc.reshape(-1, 1)
+    if theta_dim == 2:
+        low = float(getattr(dataset, "theta_low", -6.0))
+        high = float(getattr(dataset, "theta_high", 6.0))
+        if not (low < high):
+            raise ValueError(f"dataset theta bounds invalid: theta_low={low} theta_high={high}")
+        theta2_mid = 0.5 * (low + high)
+        return np.stack([tc, np.full_like(tc, theta2_mid, dtype=np.float64)], axis=1)
+    raise ValueError(f"Analytical GT Hellinger supports theta_dim 1 or 2; got theta_dim={theta_dim}")
+
+
+def hellinger_sq_gaussian_diag(
+    mu1: NDArray[np.float64],
+    var1: NDArray[np.float64],
+    mu2: NDArray[np.float64],
+    var2: NDArray[np.float64],
+) -> float:
+    """Squared Hellinger distance between diagonal-covariance Gaussians."""
+    m1 = np.asarray(mu1, dtype=np.float64).reshape(-1)
+    m2 = np.asarray(mu2, dtype=np.float64).reshape(-1)
+    v1 = np.asarray(var1, dtype=np.float64).reshape(-1)
+    v2 = np.asarray(var2, dtype=np.float64).reshape(-1)
+    if m1.shape != m2.shape or m1.shape != v1.shape or m1.shape != v2.shape:
+        raise ValueError("mu and variance arrays must have matching 1D shapes.")
+    if np.any(v1 <= 0.0) or np.any(v2 <= 0.0):
+        raise ValueError("Gaussian variances must be positive.")
+    vbar = 0.5 * (v1 + v2)
+    db = np.sum(((m1 - m2) ** 2) / (8.0 * vbar) + 0.5 * np.log(vbar / np.sqrt(v1 * v2)))
+    h2 = 1.0 - float(np.exp(-float(db)))
+    return float(np.clip(h2, 0.0, 1.0))
+
+
+def hellinger_sq_gaussian_full(
+    mu1: NDArray[np.float64],
+    cov1: NDArray[np.float64],
+    mu2: NDArray[np.float64],
+    cov2: NDArray[np.float64],
+) -> float:
+    """Squared Hellinger distance between full-covariance Gaussians."""
+    m1 = np.asarray(mu1, dtype=np.float64).reshape(-1)
+    m2 = np.asarray(mu2, dtype=np.float64).reshape(-1)
+    c1 = np.asarray(cov1, dtype=np.float64)
+    c2 = np.asarray(cov2, dtype=np.float64)
+    if m1.shape != m2.shape:
+        raise ValueError("Gaussian means must have matching shapes.")
+    d = int(m1.size)
+    if c1.shape != (d, d) or c2.shape != (d, d):
+        raise ValueError("Gaussian covariances must have shape (d, d).")
+    cbar = 0.5 * (c1 + c2)
+    s1, ld1 = np.linalg.slogdet(c1)
+    s2, ld2 = np.linalg.slogdet(c2)
+    sb, ldb = np.linalg.slogdet(cbar)
+    if s1 <= 0.0 or s2 <= 0.0 or sb <= 0.0:
+        raise ValueError("Gaussian covariances must be positive definite.")
+    dm = m1 - m2
+    quad = float(dm @ np.linalg.solve(cbar, dm))
+    db = 0.125 * quad + 0.5 * (float(ldb) - 0.5 * (float(ld1) + float(ld2)))
+    h2 = 1.0 - float(np.exp(-float(db)))
+    return float(np.clip(h2, 0.0, 1.0))
+
+
+def estimate_hellinger_sq_grid_centers_analytic(
+    dataset: Any,
+    theta_centers: NDArray[np.float64],
+    *,
+    symmetrize: bool = False,
+) -> NDArray[np.float64]:
+    """Analytical squared Hellinger between Gaussian conditionals at theta centers.
+
+    ``theta_centers`` has shape ``(n_bins, theta_dim)``. The returned matrix is
+    center-to-center ``H^2(p(x|theta_i), p(x|theta_j))`` with no sampling.
+    """
+    centers = np.asarray(theta_centers, dtype=np.float64)
+    if centers.ndim == 1:
+        centers = centers.reshape(-1, 1)
+    if centers.ndim != 2 or centers.shape[0] < 1 or centers.shape[1] < 1:
+        raise ValueError("theta_centers must have shape (n_bins, theta_dim).")
+    if not hasattr(dataset, "tuning_curve"):
+        raise TypeError("Analytical Gaussian Hellinger requires dataset.tuning_curve(theta).")
+
+    mu = np.asarray(dataset.tuning_curve(centers), dtype=np.float64)
+    if mu.ndim != 2 or int(mu.shape[0]) != int(centers.shape[0]):
+        raise ValueError(
+            "dataset.tuning_curve(theta_centers) must return shape (n_bins, x_dim); "
+            f"got {mu.shape}."
+        )
+
+    use_diag = bool(getattr(dataset, "diagonal_gaussian_observation_noise", False))
+    if use_diag:
+        if not hasattr(dataset, "_variance_diag_from_mu"):
+            raise TypeError("Diagonal analytical Gaussian Hellinger requires dataset._variance_diag_from_mu(mu).")
+        var = np.asarray(dataset._variance_diag_from_mu(mu), dtype=np.float64)
+        if var.shape != mu.shape:
+            raise ValueError(f"variance shape {var.shape} must match mean shape {mu.shape}.")
+        n_bins = int(mu.shape[0])
+        h2 = np.zeros((n_bins, n_bins), dtype=np.float64)
+        for i in range(n_bins):
+            for j in range(n_bins):
+                h2[i, j] = hellinger_sq_gaussian_diag(mu[i], var[i], mu[j], var[j])
+    else:
+        if not hasattr(dataset, "covariance"):
+            raise TypeError("Full analytical Gaussian Hellinger requires dataset.covariance(theta).")
+        cov = np.asarray(dataset.covariance(centers), dtype=np.float64)
+        if (
+            cov.ndim != 3
+            or int(cov.shape[0]) != int(mu.shape[0])
+            or int(cov.shape[1]) != int(mu.shape[1])
+            or int(cov.shape[2]) != int(mu.shape[1])
+        ):
+            raise ValueError(
+                "dataset.covariance(theta_centers) must return shape (n_bins, x_dim, x_dim); "
+                f"got {cov.shape}."
+            )
+        n_bins = int(mu.shape[0])
+        h2 = np.zeros((n_bins, n_bins), dtype=np.float64)
+        for i in range(n_bins):
+            for j in range(n_bins):
+                h2[i, j] = hellinger_sq_gaussian_full(mu[i], cov[i], mu[j], cov[j])
+
+    np.fill_diagonal(h2, 0.0)
+    np.clip(h2, 0.0, 1.0, out=h2)
+    if symmetrize:
+        h2 = 0.5 * (h2 + h2.T)
+        np.fill_diagonal(h2, 0.0)
+    return h2
 
 
 def estimate_hellinger_sq_one_sided_mc(

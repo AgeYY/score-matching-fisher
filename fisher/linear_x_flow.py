@@ -688,17 +688,19 @@ class ConditionalTimeThetaOnlyLinearXFlowMLP(ConditionalTimeLinearXFlowMLP):
 
 
 class ConditionalTimeLowRankCorrectionLinearXFlowMLP(nn.Module):
-    """Full symmetric scheduled ``A(t)`` linear x-flow plus learnable orthonormal low-rank correction.
+    """Full symmetric scheduled ``A(t)`` linear x-flow plus low-rank correction.
 
     Velocity is ``v(x,t,theta) = A(t) x + b(t,theta) + U h(U^T x, t, theta)`` with ``U`` in ``R^{D x r}``
-    having orthonormal columns (``U^T U = I``).  The base ``(A,b)`` matches :class:`ConditionalTimeLinearXFlowMLP`.
+    having orthonormal columns (``U^T U = I``) by default. If ``fixed_u`` is supplied, ``U`` is a fixed
+    raw basis and need not be orthonormal. The base ``(A,b)`` matches :class:`ConditionalTimeLinearXFlowMLP`.
 
     Likelihood uses the same reverse-Euler divergence integral as
     a reverse-Euler divergence integral (no closed-form Gaussian endpoint).
 
-    The reduced-space Jacobian trace ``\\mathrm{tr}\\,\\partial h/\\partial z`` (with ``z = U^T x``)
-    defaults to a Hutchinson estimator (Rademacher probes); set ``divergence_estimator="exact"`` for the
-    rank-loop autograd sum (slower when ``correction_rank`` is large).
+    For orthonormal ``U``, the reduced-space Jacobian contribution is
+    ``\\mathrm{tr}\\,\\partial h/\\partial z`` (with ``z = U^T x``). For raw fixed ``U``, it is
+    ``\\mathrm{tr}((U^T U) \\partial h/\\partial z)``. The trace defaults to a Hutchinson estimator
+    (Rademacher probes); set ``divergence_estimator="exact"`` for the rank-loop autograd sum.
     """
 
     def __init__(
@@ -712,6 +714,7 @@ class ConditionalTimeLowRankCorrectionLinearXFlowMLP(nn.Module):
         quadrature_steps: int = 64,
         divergence_estimator: str = "hutchinson",
         hutchinson_probes: int = 1,
+        fixed_u: np.ndarray | torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         if int(correction_rank) < 1:
@@ -741,9 +744,24 @@ class ConditionalTimeLowRankCorrectionLinearXFlowMLP(nn.Module):
         self.x_dim = int(x_dim)
         self.quadrature_steps = int(quadrature_steps)
         self.correction_rank = int(correction_rank)
-        u_lin = nn.Linear(self.correction_rank, self.x_dim, bias=False)
-        nn.init.orthogonal_(u_lin.weight)
-        self.u_layer = parametrizations.orthogonal(u_lin, "weight", orthogonal_map="householder")
+        self.fixed_u_enabled = fixed_u is not None
+        if fixed_u is None:
+            u_lin = nn.Linear(self.correction_rank, self.x_dim, bias=False)
+            nn.init.orthogonal_(u_lin.weight)
+            self.u_layer = parametrizations.orthogonal(u_lin, "weight", orthogonal_map="householder")
+            self.register_buffer("_fixed_u", torch.empty(0))
+            self.register_buffer("_fixed_u_gram", torch.eye(self.correction_rank))
+        else:
+            u_arr = torch.as_tensor(fixed_u, dtype=torch.float32)
+            if u_arr.ndim != 2 or tuple(u_arr.shape) != (self.x_dim, self.correction_rank):
+                raise ValueError(
+                    f"fixed_u must have shape ({self.x_dim}, {self.correction_rank}); got {tuple(u_arr.shape)}."
+                )
+            if not torch.isfinite(u_arr).all():
+                raise ValueError("fixed_u must contain only finite values.")
+            self.u_layer = None
+            self.register_buffer("_fixed_u", u_arr.contiguous())
+            self.register_buffer("_fixed_u_gram", (u_arr.T @ u_arr).contiguous())
         self.h_net = _make_mlp(
             in_dim=self.correction_rank + 1 + self.theta_dim,
             out_dim=self.correction_rank,
@@ -755,7 +773,11 @@ class ConditionalTimeLowRankCorrectionLinearXFlowMLP(nn.Module):
 
     @property
     def U(self) -> torch.Tensor:
-        """Orthonormal columns ``[D, r]`` (``nn.Linear(r, D).weight``)."""
+        """Low-rank basis columns ``[D, r]``."""
+        if self.fixed_u_enabled:
+            return self._fixed_u
+        if self.u_layer is None:
+            raise RuntimeError("u_layer is unexpectedly absent for learnable-U model.")
         return self.u_layer.weight
 
     def forward(self, x: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
@@ -773,8 +795,13 @@ class ConditionalTimeLowRankCorrectionLinearXFlowMLP(nn.Module):
     def regularization_loss(self) -> torch.Tensor | None:
         return None
 
-    def _reduced_trace_exact(self, z: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
-        """``sum_j \\partial h_j / \\partial z_j`` via one autograd per output component."""
+    def _reduced_trace_exact(
+        self,
+        z: torch.Tensor,
+        h: torch.Tensor,
+        gram: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """``tr(G dh/dz)`` via one autograd per output component; ``G=I`` for orthonormal ``U``."""
         tr_h = torch.zeros(z.shape[0], dtype=z.dtype, device=z.device)
         for j in range(self.correction_rank):
             grad_j = torch.autograd.grad(
@@ -783,11 +810,19 @@ class ConditionalTimeLowRankCorrectionLinearXFlowMLP(nn.Module):
                 create_graph=False,
                 retain_graph=j < self.correction_rank - 1,
             )[0]
-            tr_h = tr_h + grad_j[:, j]
+            if gram is None:
+                tr_h = tr_h + grad_j[:, j]
+            else:
+                tr_h = tr_h + torch.sum(grad_j * gram[:, j].reshape(1, -1), dim=1)
         return tr_h
 
-    def _reduced_trace_hutchinson(self, z: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
-        """Hutchinson estimate of ``\\mathrm{tr}\\,\\partial h/\\partial z`` with Rademacher probes."""
+    def _reduced_trace_hutchinson(
+        self,
+        z: torch.Tensor,
+        h: torch.Tensor,
+        gram: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Hutchinson estimate of ``tr(G dh/dz)`` with Rademacher probes."""
         b = int(z.shape[0])
         r = int(self.correction_rank)
         n_probe = int(self.hutchinson_probes)
@@ -795,7 +830,8 @@ class ConditionalTimeLowRankCorrectionLinearXFlowMLP(nn.Module):
         for pi in range(n_probe):
             probe = torch.empty(b, r, dtype=z.dtype, device=z.device)
             probe.bernoulli_(0.5).mul_(2.0).sub_(1.0)
-            dot = (h * probe).sum(dim=1)
+            h_probe = probe if gram is None else probe @ gram.T
+            dot = (h * h_probe).sum(dim=1)
             vjp = torch.autograd.grad(
                 dot.sum(),
                 z,
@@ -809,20 +845,32 @@ class ConditionalTimeLowRankCorrectionLinearXFlowMLP(nn.Module):
         if theta.ndim == 1:
             theta = theta.unsqueeze(-1)
         t = _as_col_t(t, batch=int(x.shape[0]))
-        a_mat = self.linear.A(t)
-        if a_mat.ndim == 2:
-            tr_a = torch.trace(a_mat).to(dtype=x.dtype, device=x.device).reshape(1).expand(int(x.shape[0]))
+        if hasattr(self.linear, "a_for_divergence"):
+            a_diag = self.linear.a_for_divergence(theta, t)
+            tr_a = a_diag.sum(dim=-1)
+        elif hasattr(self.linear, "A"):
+            a_mat = self.linear.A(t)
+            if a_mat.ndim == 2 and int(a_mat.shape[0]) == self.x_dim and int(a_mat.shape[1]) == self.x_dim:
+                tr_a = torch.trace(a_mat).to(dtype=x.dtype, device=x.device).reshape(1).expand(int(x.shape[0]))
+            elif a_mat.ndim == 2:
+                tr_a = a_mat.sum(dim=-1)
+            else:
+                tr_a = torch.diagonal(a_mat, dim1=-2, dim2=-1).sum(dim=-1)
         else:
-            tr_a = torch.diagonal(a_mat, dim1=-2, dim2=-1).sum(dim=-1)
+            a_mat = self.linear.a(t)
+            tr_a = a_mat.sum(dim=-1)
         u_mat = self.U
         with torch.enable_grad():
             z = (x @ u_mat).detach().requires_grad_(True)
             tcol = _as_col_t(t, batch=int(z.shape[0]))
             h = self.h_net(torch.cat([z, tcol, theta], dim=1))
+            gram = None
+            if self.fixed_u_enabled:
+                gram = self._fixed_u_gram.to(dtype=z.dtype, device=z.device)
             if self.divergence_estimator == "exact":
-                tr_h = self._reduced_trace_exact(z, h)
+                tr_h = self._reduced_trace_exact(z, h, gram=gram)
             else:
-                tr_h = self._reduced_trace_hutchinson(z, h)
+                tr_h = self._reduced_trace_hutchinson(z, h, gram=gram)
         return tr_a.detach() + tr_h.detach()
 
     def log_prob_normalized(
@@ -877,6 +925,88 @@ class ConditionalTimeLowRankCorrectionLinearXFlowMLP(nn.Module):
             quadrature_steps=quadrature_steps,
             ode_steps=int(ode_steps),
         ) + logjac
+
+
+class ConditionalTimeDiagonalLowRankCorrectionLinearXFlowMLP(ConditionalTimeLowRankCorrectionLinearXFlowMLP):
+    """Diagonal scheduled ``A(t)`` linear x-flow plus low-rank correction.
+
+    Velocity is ``v(x,t,theta) = diag(a(t)) x + b(t,theta) + U h(U^T x,t,theta)``.
+    This matches :class:`ConditionalTimeLowRankCorrectionLinearXFlowMLP` except that the
+    base linear drift is constrained to be diagonal.
+    """
+
+    def __init__(
+        self,
+        *,
+        theta_dim: int,
+        x_dim: int,
+        correction_rank: int,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        quadrature_steps: int = 64,
+        divergence_estimator: str = "hutchinson",
+        hutchinson_probes: int = 1,
+        fixed_u: np.ndarray | torch.Tensor | None = None,
+    ) -> None:
+        super().__init__(
+            theta_dim=int(theta_dim),
+            x_dim=int(x_dim),
+            correction_rank=int(correction_rank),
+            hidden_dim=int(hidden_dim),
+            depth=int(depth),
+            quadrature_steps=int(quadrature_steps),
+            divergence_estimator=str(divergence_estimator),
+            hutchinson_probes=int(hutchinson_probes),
+            fixed_u=fixed_u,
+        )
+        self.linear = ConditionalTimeDiagonalLinearXFlowMLP(
+            theta_dim=int(theta_dim),
+            x_dim=int(x_dim),
+            hidden_dim=int(hidden_dim),
+            depth=int(depth),
+            quadrature_steps=int(quadrature_steps),
+        )
+
+
+class ConditionalTimeScalarLowRankCorrectionLinearXFlowMLP(ConditionalTimeLowRankCorrectionLinearXFlowMLP):
+    """Scalar scheduled ``A(t)=a(t)I`` linear x-flow plus low-rank correction.
+
+    Velocity is ``v(x,t,theta) = a(t) x + b(t,theta) + U h(U^T x,t,theta)``.
+    This matches :class:`ConditionalTimeLowRankCorrectionLinearXFlowMLP` except that the
+    base linear drift is constrained to a scalar multiple of identity.
+    """
+
+    def __init__(
+        self,
+        *,
+        theta_dim: int,
+        x_dim: int,
+        correction_rank: int,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        quadrature_steps: int = 64,
+        divergence_estimator: str = "hutchinson",
+        hutchinson_probes: int = 1,
+        fixed_u: np.ndarray | torch.Tensor | None = None,
+    ) -> None:
+        super().__init__(
+            theta_dim=int(theta_dim),
+            x_dim=int(x_dim),
+            correction_rank=int(correction_rank),
+            hidden_dim=int(hidden_dim),
+            depth=int(depth),
+            quadrature_steps=int(quadrature_steps),
+            divergence_estimator=str(divergence_estimator),
+            hutchinson_probes=int(hutchinson_probes),
+            fixed_u=fixed_u,
+        )
+        self.linear = ConditionalTimeScalarLinearXFlowMLP(
+            theta_dim=int(theta_dim),
+            x_dim=int(x_dim),
+            hidden_dim=int(hidden_dim),
+            depth=int(depth),
+            quadrature_steps=int(quadrature_steps),
+        )
 
 
 class ConditionalTimePureLowRankLinearXFlowMLP(nn.Module):
@@ -1522,6 +1652,137 @@ class ConditionalTimeScalarLinearXFlowMLP(_BaseTimeLinearXFlowMLP):
         return -0.5 * (quad + log_det + float(d) * math.log(2.0 * math.pi))
 
 
+class ConditionalTimeThetaScalarLinearXFlowMLP(_BaseTimeLinearXFlowMLP):
+    """Scalar drift ``A(t, theta)=a(t, theta) I`` plus offset ``b(t, theta)``."""
+
+    endpoint_is_diagonal = True
+
+    def __init__(
+        self,
+        *,
+        theta_dim: int,
+        x_dim: int,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        quadrature_steps: int = 64,
+    ) -> None:
+        super().__init__(
+            theta_dim=theta_dim,
+            x_dim=x_dim,
+            hidden_dim=hidden_dim,
+            depth=depth,
+            quadrature_steps=quadrature_steps,
+        )
+        self.a_net = _make_mlp(
+            in_dim=self.theta_dim + 1,
+            out_dim=1,
+            hidden_dim=self.hidden_dim,
+            depth=self.depth,
+            final_gain=0.01,
+            final_bias=1e-3,
+        )
+
+    def a(self, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        t = _as_col_t(t, batch=int(theta.shape[0]))
+        return self.a_net(torch.cat([t, theta], dim=1))
+
+    def a_for_divergence(self, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        a = self.a(theta, t)
+        return a.expand(int(a.shape[0]), self.x_dim)
+
+    def A(self, t: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError("ConditionalTimeThetaScalarLinearXFlowMLP needs theta to build A.")
+
+    def forward(self, x: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        return self.a(theta, t) * x + self.b(theta, t)
+
+    def endpoint_mean_covariance_diag(
+        self,
+        theta: torch.Tensor,
+        *,
+        solve_jitter: float = 1e-6,
+        quadrature_steps: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        q = self.quadrature_steps if quadrature_steps is None else int(quadrature_steps)
+        if q < 2:
+            raise ValueError("quadrature_steps must be >= 2.")
+        mu = torch.zeros(int(theta.shape[0]), self.x_dim, dtype=theta.dtype, device=theta.device)
+        var = torch.ones_like(mu)
+        dt = 1.0 / float(q)
+        for k in range(q):
+            tk = torch.full((int(theta.shape[0]), 1), (float(k) + 0.5) / float(q), dtype=theta.dtype, device=theta.device)
+            a = self.a(theta, tk)
+            b = self.b(theta, tk)
+            mu = mu + dt * (a * mu + b)
+            var = var + dt * (2.0 * a * var)
+            var = torch.clamp(var, min=float(solve_jitter))
+        return mu, var + float(solve_jitter)
+
+    def log_prob_normalized(
+        self,
+        x_norm: torch.Tensor,
+        theta: torch.Tensor,
+        *,
+        solve_jitter: float = 1e-6,
+        quadrature_steps: int | None = None,
+    ) -> torch.Tensor:
+        if x_norm.ndim == 1:
+            x_norm = x_norm.unsqueeze(0)
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        if x_norm.shape[0] != theta.shape[0]:
+            raise ValueError("x and theta batch sizes must match.")
+        mu, var = self.endpoint_mean_covariance_diag(
+            theta,
+            solve_jitter=float(solve_jitter),
+            quadrature_steps=quadrature_steps,
+        )
+        d = int(x_norm.shape[1])
+        quad = torch.sum((x_norm - mu) ** 2 / var, dim=1)
+        log_det = torch.sum(torch.log(var), dim=1)
+        return -0.5 * (quad + log_det + float(d) * math.log(2.0 * math.pi))
+
+
+class ConditionalTimeThetaScalarLowRankCorrectionLinearXFlowMLP(ConditionalTimeLowRankCorrectionLinearXFlowMLP):
+    """Theta/time-dependent scalar ``A(t,theta)=a(t,theta)I`` plus low-rank correction."""
+
+    def __init__(
+        self,
+        *,
+        theta_dim: int,
+        x_dim: int,
+        correction_rank: int,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        quadrature_steps: int = 64,
+        divergence_estimator: str = "hutchinson",
+        hutchinson_probes: int = 1,
+        fixed_u: np.ndarray | torch.Tensor | None = None,
+    ) -> None:
+        super().__init__(
+            theta_dim=int(theta_dim),
+            x_dim=int(x_dim),
+            correction_rank=int(correction_rank),
+            hidden_dim=int(hidden_dim),
+            depth=int(depth),
+            quadrature_steps=int(quadrature_steps),
+            divergence_estimator=str(divergence_estimator),
+            hutchinson_probes=int(hutchinson_probes),
+            fixed_u=fixed_u,
+        )
+        self.linear = ConditionalTimeThetaScalarLinearXFlowMLP(
+            theta_dim=int(theta_dim),
+            x_dim=int(x_dim),
+            hidden_dim=int(hidden_dim),
+            depth=int(depth),
+            quadrature_steps=int(quadrature_steps),
+        )
+
+
 class ConditionalTimeThetaDiagonalLinearXFlowMLP(_BaseTimeLinearXFlowMLP):
     """Diagonal drift ``a(t, theta)`` and offset ``b(t, theta)``."""
 
@@ -1562,6 +1823,10 @@ class ConditionalTimeThetaDiagonalLinearXFlowMLP(_BaseTimeLinearXFlowMLP):
 
     def A(self, t: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError("ConditionalTimeThetaDiagonalLinearXFlowMLP needs theta to build A.")
+
+    def a_for_divergence(self, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        a, _ = self.a_b(theta, t)
+        return a
 
     def b(self, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         _, b = self.a_b(theta, t)
@@ -1617,6 +1882,42 @@ class ConditionalTimeThetaDiagonalLinearXFlowMLP(_BaseTimeLinearXFlowMLP):
         quad = torch.sum((x_norm - mu) ** 2 / var, dim=1)
         log_det = torch.sum(torch.log(var), dim=1)
         return -0.5 * (quad + log_det + float(d) * math.log(2.0 * math.pi))
+
+
+class ConditionalTimeThetaDiagonalLowRankCorrectionLinearXFlowMLP(ConditionalTimeLowRankCorrectionLinearXFlowMLP):
+    """Theta/time-dependent diagonal ``A(t,theta)`` plus low-rank correction."""
+
+    def __init__(
+        self,
+        *,
+        theta_dim: int,
+        x_dim: int,
+        correction_rank: int,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        quadrature_steps: int = 64,
+        divergence_estimator: str = "hutchinson",
+        hutchinson_probes: int = 1,
+        fixed_u: np.ndarray | torch.Tensor | None = None,
+    ) -> None:
+        super().__init__(
+            theta_dim=int(theta_dim),
+            x_dim=int(x_dim),
+            correction_rank=int(correction_rank),
+            hidden_dim=int(hidden_dim),
+            depth=int(depth),
+            quadrature_steps=int(quadrature_steps),
+            divergence_estimator=str(divergence_estimator),
+            hutchinson_probes=int(hutchinson_probes),
+            fixed_u=fixed_u,
+        )
+        self.linear = ConditionalTimeThetaDiagonalLinearXFlowMLP(
+            theta_dim=int(theta_dim),
+            x_dim=int(x_dim),
+            hidden_dim=int(hidden_dim),
+            depth=int(depth),
+            quadrature_steps=int(quadrature_steps),
+        )
 
 
 class ConditionalTimeLowRankLinearXFlowMLP(_BaseTimeLinearXFlowMLP):
@@ -2285,7 +2586,12 @@ def train_low_rank_t_warmup_then_full(
     restore_best: bool = True,
     log_name: str = "linear_x_flow_low_rank_t",
 ) -> dict[str, Any]:
-    """Warm up only ``b(t, theta)``, then run the normal scheduled low-rank-t trainer."""
+    """Warm up only the base linear offset path, then run the normal scheduled low-rank-t trainer.
+
+    For :class:`ConditionalTimeDiagonalLinearXFlowMLP` / scalar-time bases, only ``b_net`` is trained.
+    For :class:`ConditionalTimeThetaDiagonalLinearXFlowMLP`, ``a`` and ``b`` share ``ab_net`` (there is
+    no separate ``b_net`` in ``forward``), so warmup enables ``ab_net`` instead.
+    """
     if int(warmup_epochs) < 1:
         raise ValueError("warmup_epochs must be >= 1.")
 
@@ -2293,8 +2599,13 @@ def train_low_rank_t_warmup_then_full(
     try:
         for p in model.parameters():
             p.requires_grad_(False)
-        for p in model.linear.b_net.parameters():
-            p.requires_grad_(True)
+        lin = model.linear
+        if isinstance(lin, ConditionalTimeThetaDiagonalLinearXFlowMLP):
+            for p in lin.ab_net.parameters():
+                p.requires_grad_(True)
+        else:
+            for p in lin.b_net.parameters():
+                p.requires_grad_(True)
 
         warmup_out = train_time_linear_x_flow_schedule(
             model=model,
@@ -2535,5 +2846,3 @@ def compute_ode_time_linear_x_flow_c_matrix(
         )
         c[i0:i1, :] = logp.detach().cpu().numpy().reshape(b, n).astype(np.float64)
     return c
-
-

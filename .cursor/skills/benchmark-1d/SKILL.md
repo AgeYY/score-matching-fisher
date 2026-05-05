@@ -28,7 +28,7 @@ description: >-
 | Nested subset sweep **`--n-list 80,400,1000`** (aligns with [**`lxf-bench-h-decoding-twofig`**](../lxf-bench-h-decoding-twofig/SKILL.md)) | Other `--n-list`; shrink `--n-ref` / `--n-list` if $n_{\mathrm{total}}$ is smaller |
 | **`mamba run -n geo_diffusion`**, **`--device cuda`**, reporting under **`data/...`** | CPU-only runs violate **`AGENTS.md`** unless the user accepts that constraint |
 
-**Theta-field methods are not fixed.** The examples below use **`bin_gaussian`** plus every token in **`_TIME_LXF_METHODS`** in [`bin/study_h_decoding_convergence.py`](bin/study_h_decoding_convergence.py) (`linear_x_flow_t`, `linear_x_flow_scalar_t`, `linear_x_flow_diagonal_t`, `linear_x_flow_diagonal_theta_t`, `linear_x_flow_low_rank_t`, `linear_x_flow_low_rank_randb_t`). For other comparisons, pass your own comma-separated **`--theta-field-rows`** (highest precedence) or **`--theta-field-methods`** / **`--theta-field-method`**. If you include **low-rank** rows, pass **`--lxf-low-rank-dim`** as required by the script.
+**Theta-field methods are not fixed.** The examples below use **`bin_gaussian`** plus every token in **`_TIME_LXF_METHODS`** in [`bin/study_h_decoding_convergence.py`](bin/study_h_decoding_convergence.py) (`linear_x_flow_t`, `linear_x_flow_scalar_t`, `linear_x_flow_diagonal_t`, `linear_x_flow_diagonal_theta_t`, `linear_x_flow_low_rank_t`, `linear_x_flow_low_rank_randb_t`). For other comparisons, pass your own comma-separated **`--theta-field-rows`** (highest precedence) or **`--theta-field-methods`** / **`--theta-field-method`**. Low-rank rows use **`--lxf-low-rank-dim`**, which **defaults to 3** in that script; pass the flag only to override.
 
 ## Scheduled time-dependent LXF (`*_t`) — use `lxfs_*` hyperparameters
 
@@ -58,7 +58,6 @@ CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 mamba run -n geo_diffusion python bin/
   --dataset-npz data/randamp_gaussian_sqrtd_xdim5/randamp_gaussian_sqrtd_xdim5_pr30d.npz \
   --dataset-family randamp_gaussian_sqrtd \
   --theta-field-rows bin_gaussian,linear_x_flow_t,linear_x_flow_scalar_t,linear_x_flow_diagonal_t,linear_x_flow_diagonal_theta_t,linear_x_flow_low_rank_t,linear_x_flow_low_rank_randb_t \
-  --lxf-low-rank-dim 4 \
   --n-list 80,400,1000 \
   --lxfs-path-schedule cosine \
   --lxfs-epochs 50000 \
@@ -75,7 +74,6 @@ CUDA_VISIBLE_DEVICES=1 PYTHONUNBUFFERED=1 mamba run -n geo_diffusion python bin/
   --dataset-npz data/cosine_sqrtd_rand_tune_additive_xdim5_noise2x_alpha8x/cosine_sqrtd_rand_tune_additive_xdim5_noise2x_alpha8x_pr30d.npz \
   --dataset-family cosine_gaussian_sqrtd_rand_tune_additive \
   --theta-field-rows bin_gaussian,linear_x_flow_t,linear_x_flow_scalar_t,linear_x_flow_diagonal_t,linear_x_flow_diagonal_theta_t,linear_x_flow_low_rank_t,linear_x_flow_low_rank_randb_t \
-  --lxf-low-rank-dim 4 \
   --n-list 80,400,1000 \
   --lxfs-path-schedule cosine \
   --lxfs-epochs 50000 \

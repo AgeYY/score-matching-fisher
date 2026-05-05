@@ -50,7 +50,7 @@ Examples:
 - Minimal diagonal baseline (skills **`bin-2d-lin-lxfdiag`**, **`bin-2d-cos-lxfdiag`**): `bin_gaussian,linear_x_flow_diagonal_t` with **`--lxfs-epochs`**, **`--lxfs-early-patience`**.
 - Full scheduled **`_t`** family + baseline (documented run):  
   `bin_gaussian,linear_x_flow_t,linear_x_flow_scalar_t,linear_x_flow_diagonal_t,linear_x_flow_diagonal_theta_t,linear_x_flow_low_rank_t,linear_x_flow_low_rank_randb_t`  
-  with **`--lxfs-path-schedule`**, **`--lxfs-epochs`**, **`--lxfs-early-patience`**, and **`--lxf-low-rank-dim`** for low-rank rows.
+  with **`--lxfs-path-schedule`**, **`--lxfs-epochs`**, **`--lxfs-early-patience`**, and optionally **`--lxf-low-rank-dim`** for low-rank rows (CLI default rank **3**).
 
 **Training-flag routing:** supported LXF rows in `_TIME_LXF_METHODS` in [`bin/study_h_decoding_convergence.py`](../../../bin/study_h_decoding_convergence.py) use the **`lxfs_*`** CLI prefix.
 
@@ -100,7 +100,7 @@ PYTHONUNBUFFERED=1 mamba run -n geo_diffusion python bin/study_h_decoding_twofig
 Example substitutions:
 
 - **`<METHOD_ARGS>`** — e.g. `--theta-field-rows bin_gaussian,linear_x_flow_diagonal_t,...`
-- **`<TRAIN_FLAGS>`** — e.g. `--lxf-epochs 50000 --lxf-early-patience 1000` **or** `--lxfs-epochs 50000 --lxfs-early-patience 1000 --lxfs-path-schedule cosine --lxf-low-rank-dim 4`
+- **`<TRAIN_FLAGS>`** — e.g. `--lxf-epochs 50000 --lxf-early-patience 1000` **or** `--lxfs-epochs 50000 --lxfs-early-patience 1000 --lxfs-path-schedule cosine` (add **`--lxf-low-rank-dim`** only if you want a rank other than the default **3**)
 
 Always set a fresh **`--output-dir`** so runs do not overwrite each other.
 

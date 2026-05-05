@@ -46,6 +46,16 @@ uses the same objective with a diagonal covariance / Cholesky (see ``fisher/gaus
 induced Gaussian with theta-dependent mean and shared covariance.
 ``--theta-field-method linear-x-flow-diagonal-t`` trains ``v(x,t,theta)=diag(a(t))x+b(t,theta)``
 on a scheduled affine probability path and evaluates its quadrature Gaussian likelihood.
+``--theta-field-method xflow-sir-lrank`` uses the scheduled full-``x`` low-rank correction
+linear X-flow, but fixes ``U`` to raw SIR directions fitted on the train split.
+``--theta-field-method xflow-sir-lrank-dia`` uses the same fixed-SIR low-rank correction
+with diagonal ``A(t)``.
+``--theta-field-method xflow-sir-lrank-dia-theta`` uses the same fixed-SIR low-rank
+correction with diagonal ``A(t,\theta)``.
+``--theta-field-method xflow-sir-lrank-scalar`` uses the same fixed-SIR low-rank correction
+with scalar ``A(t)=a(t)I``.
+``--theta-field-method xflow-sir-lrank-scalar-theta`` uses the same fixed-SIR low-rank
+correction with scalar ``A(t,\theta)=a(t,\theta)I``.
 ``--theta-field-method nf-reduction`` learns an invertible x-space flow to ``(z, epsilon)`` and
 computes H from a conditional flow likelihood ``log p(z|theta)``.
 Flow methods use ``--flow-arch``: ``mlp``, ``film`` (FiLM with raw-theta embeddings), or
@@ -107,8 +117,10 @@ import visualize_h_matrix_binned as vhb
 from fisher.cli_shared_fisher import add_estimation_arguments
 from fisher.hellinger_gt import (
     bin_centers_from_edges,
+    estimate_hellinger_sq_grid_centers_analytic,
     estimate_hellinger_sq_one_sided_mc,
     estimate_mean_llr_one_sided_mc,
+    theta_centers_for_analytic_gt,
 )
 from fisher.gaussian_network import (
     ConditionalDiagonalGaussianPrecisionMLP,
@@ -128,12 +140,16 @@ from fisher.gaussian_x_flow import (
     train_gaussian_x_flow,
 )
 from fisher.linear_x_flow import (
+    ConditionalTimeDiagonalLowRankCorrectionLinearXFlowMLP,
     ConditionalTimeDiagonalLinearXFlowMLP,
     ConditionalTimeLinearXFlowMLP,
     ConditionalTimeLowRankCorrectionLinearXFlowMLP,
     ConditionalTimePureConditionalLowRankLinearXFlowMLP,
     ConditionalTimePureLowRankLinearXFlowMLP,
+    ConditionalTimeScalarLowRankCorrectionLinearXFlowMLP,
     ConditionalTimeThetaOnlyBLowRankCorrectionLinearXFlowMLP,
+    ConditionalTimeThetaScalarLowRankCorrectionLinearXFlowMLP,
+    ConditionalTimeThetaDiagonalLowRankCorrectionLinearXFlowMLP,
     ConditionalTimeRandomBasisLowRankLinearXFlowMLP,
     ConditionalTimeScalarLinearXFlowMLP,
     ConditionalTimeThetaDiagonalLinearXFlowMLP,
@@ -180,6 +196,11 @@ _TIME_LXF_METHODS = {
     "linear_x_flow_pure_cond_low_rank_t",
     "linear_x_flow_lr_t_ts",
     "linear_x_flow_low_rank_randb_t",
+    "xflow_sir_lrank",
+    "xflow_sir_lrank_dia",
+    "xflow_sir_lrank_dia_theta",
+    "xflow_sir_lrank_scalar",
+    "xflow_sir_lrank_scalar_theta",
 }
 from fisher.nf_hellinger import (
     ConditionalThetaNF,
@@ -919,11 +940,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--lxf-low-rank-dim",
         type=int,
-        default=4,
+        default=3,
         help=(
-            ""
+            "Default: 3. "
             "linear_x_flow_low_rank_t / linear_x_flow_pure_low_rank_t / linear_x_flow_pure_cond_low_rank_t / "
-            "linear_x_flow_lr_t_ts: rank r of U in U h(U^T x) (pure_low_rank_t: fixed orthonormal U; "
+            "linear_x_flow_lr_t_ts / xflow_sir_lrank / xflow_sir_lrank_dia / xflow_sir_lrank_dia_theta / xflow_sir_lrank_scalar / "
+            "xflow_sir_lrank_scalar_theta: "
+            "rank r of U in U h(U^T x) "
+            "(xflow_sir_lrank variants: "
+            "fixed raw SIR directions from the train split; pure_low_rank_t: fixed orthonormal U; "
             "pure_cond_low_rank_t: U(theta,t) from MLP; pure_low_rank_t velocity is U h(U^T x) only). "
             "linear_x_flow_low_rank_randb_t: rank of the low-rank random-basis A(t) term."
         ),
@@ -935,8 +960,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["hutchinson", "exact"],
         help=(
             "linear_x_flow_low_rank_t / linear_x_flow_pure_low_rank_t / linear_x_flow_pure_cond_low_rank_t / "
-            "linear_x_flow_lr_t_ts: reduced divergence in z=U^T x (pure_low_rank_t / low_rank_t / lr_t_ts: "
+            "linear_x_flow_lr_t_ts / xflow_sir_lrank / xflow_sir_lrank_dia / xflow_sir_lrank_dia_theta / xflow_sir_lrank_scalar / "
+            "xflow_sir_lrank_scalar_theta: "
+            "reduced divergence in z=U^T x "
+            "(pure_low_rank_t / low_rank_t / lr_t_ts: "
             "orthonormal U, trace of dh/dz; pure_cond_low_rank_t: tr((U^T U) dh/dz) with U(theta,t) detached in div). "
+            "xflow_sir_lrank variants use tr((U^T U) dh/dz) for fixed raw SIR U. "
             "linear_x_flow_lr_t_ts: same Hutchinson/exact trace on h as low_rank_t (b is frozen after mean-regression pretrain); "
             ""
             ""
@@ -950,7 +979,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         help=(
             "linear_x_flow_low_rank_t / linear_x_flow_pure_low_rank_t / linear_x_flow_pure_cond_low_rank_t / "
-            "linear_x_flow_lr_t_ts with hutchinson: number of Rademacher probes per divergence."
+            "linear_x_flow_lr_t_ts / xflow_sir_lrank / xflow_sir_lrank_dia / xflow_sir_lrank_dia_theta / xflow_sir_lrank_scalar / "
+            "xflow_sir_lrank_scalar_theta with hutchinson: "
+            "number of Rademacher probes per divergence."
         ),
     )
     p.add_argument("--lxf-randb-lambda-a", type=float, default=1e-4, help="scheduled random-basis LXF only: L2 penalty on diagonal a.")
@@ -1419,6 +1450,16 @@ def _normalize_linear_x_flow_method(tfm: str) -> str | None:
         "linear_x_flow_diagonal_theta_t": "linear_x_flow_diagonal_theta_t",
         "linear-x-flow-low-rank-t": "linear_x_flow_low_rank_t",
         "linear_x_flow_low_rank_t": "linear_x_flow_low_rank_t",
+        "xflow-sir-lrank": "xflow_sir_lrank",
+        "xflow_sir_lrank": "xflow_sir_lrank",
+        "xflow-sir-lrank-dia": "xflow_sir_lrank_dia",
+        "xflow_sir_lrank_dia": "xflow_sir_lrank_dia",
+        "xflow-sir-lrank-dia-theta": "xflow_sir_lrank_dia_theta",
+        "xflow_sir_lrank_dia_theta": "xflow_sir_lrank_dia_theta",
+        "xflow-sir-lrank-scalar": "xflow_sir_lrank_scalar",
+        "xflow_sir_lrank_scalar": "xflow_sir_lrank_scalar",
+        "xflow-sir-lrank-scalar-theta": "xflow_sir_lrank_scalar_theta",
+        "xflow_sir_lrank_scalar_theta": "xflow_sir_lrank_scalar_theta",
         "linear-x-flow-pure-low-rank-t": "linear_x_flow_pure_low_rank_t",
         "linear_x_flow_pure_low_rank_t": "linear_x_flow_pure_low_rank_t",
         "linear-x-flow-pure-cond-low-rank-t": "linear_x_flow_pure_cond_low_rank_t",
@@ -1670,12 +1711,23 @@ def _validate_lxf_cli(args: argparse.Namespace) -> None:
         raise ValueError(f"{label}-depth must be >= 1.")
     if method in (
         "linear_x_flow_low_rank_t",
+        "xflow_sir_lrank",
+        "xflow_sir_lrank_dia",
+        "xflow_sir_lrank_dia_theta",
+        "xflow_sir_lrank_scalar",
+        "xflow_sir_lrank_scalar_theta",
         "linear_x_flow_pure_low_rank_t",
         "linear_x_flow_pure_cond_low_rank_t",
         "linear_x_flow_lr_t_ts",
         "linear_x_flow_low_rank_randb_t",
     ) and int(getattr(args, "lxf_low_rank_dim", 0)) < 1:
         raise ValueError("--lxf-low-rank-dim must be >= 1.")
+    if method in ("xflow_sir_lrank", "xflow_sir_lrank_dia", "xflow_sir_lrank_dia_theta", "xflow_sir_lrank_scalar", "xflow_sir_lrank_scalar_theta"):
+        if int(getattr(args, "sir_num_bins", 0)) < 2:
+            raise ValueError(f"--sir-num-bins must be >= 2 for {method}.")
+        ridge = float(getattr(args, "sir_ridge", 0.0))
+        if not np.isfinite(ridge) or ridge <= 0.0:
+            raise ValueError(f"--sir-ridge must be finite and > 0 for {method}.")
     if method == "linear_x_flow_lr_t_ts" and int(getattr(args, "lxf_low_rank_t_warmup_epochs", 0)) < 1:
         raise ValueError(
             "linear_x_flow_lr_t_ts requires --lxf-low-rank-t-warmup-epochs >= 1 "
@@ -2115,6 +2167,11 @@ def _validate_cli(args: argparse.Namespace) -> None:
         "linear_x_flow_diagonal_theta_t",
         "linear_x_flow_diagonal_t",
         "linear_x_flow_low_rank_t",
+        "xflow_sir_lrank",
+        "xflow_sir_lrank_dia",
+        "xflow_sir_lrank_dia_theta",
+        "xflow_sir_lrank_scalar",
+        "xflow_sir_lrank_scalar_theta",
         "linear_x_flow_pure_low_rank_t",
         "linear_x_flow_pure_cond_low_rank_t",
         "linear_x_flow_lr_t_ts",
@@ -4128,7 +4185,20 @@ def _estimate_one(
         theta_val_model = theta_val
         theta_all_model = theta_all
         x_dim_lxf = int(x_all.shape[1])
-        lxf_rank = int(getattr(args, "lxf_low_rank_dim", 4))
+        lxf_rank = int(getattr(args, "lxf_low_rank_dim", 3))
+        sir_meta_lxf: dict[str, np.ndarray | int | float] | None = None
+        fixed_sir_u: np.ndarray | None = None
+        if method_name in ("xflow_sir_lrank", "xflow_sir_lrank_dia", "xflow_sir_lrank_dia_theta", "xflow_sir_lrank_scalar", "xflow_sir_lrank_scalar_theta"):
+            _, _, _, sir_meta_lxf = _fit_sir_projection(
+                x_train=x_train,
+                theta_train=theta_train,
+                x_val=x_val,
+                x_all=x_all,
+                sir_dim=lxf_rank,
+                num_bins=int(getattr(args, "sir_num_bins", 10)),
+                ridge=float(getattr(args, "sir_ridge", 1e-6)),
+            )
+            fixed_sir_u = np.asarray(sir_meta_lxf["sir_components"], dtype=np.float64)
         common = dict(theta_dim=int(theta_all.shape[1]), x_dim=x_dim_lxf, hidden_dim=int(getattr(args, f"{lxf_prefix}_hidden_dim", 128)), depth=int(getattr(args, f"{lxf_prefix}_depth", 3)))
         if method_name in ("linear_x_flow_t", "linear_x_flow_t_aug", "linear_x_flow_t_noise"):
             drift_type = "full_symmetric_time"
@@ -4146,6 +4216,36 @@ def _estimate_one(
             if lxf_rank > x_dim_lxf: raise ValueError(f"--lxf-low-rank-dim must be <= x_dim={x_dim_lxf}; got {lxf_rank}.")
             drift_type = "low_rank_correction_time"
             model = ConditionalTimeLowRankCorrectionLinearXFlowMLP(**common, correction_rank=lxf_rank, quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)), divergence_estimator=str(getattr(args, "lxf_low_rank_divergence_estimator", "hutchinson")).strip().lower(), hutchinson_probes=int(getattr(args, "lxf_hutchinson_probes", 1))).to(dev)
+        elif method_name == "xflow_sir_lrank":
+            if lxf_rank > x_dim_lxf: raise ValueError(f"--lxf-low-rank-dim must be <= x_dim={x_dim_lxf}; got {lxf_rank}.")
+            if fixed_sir_u is None:
+                raise RuntimeError("xflow_sir_lrank expected a fitted SIR basis.")
+            drift_type = "sir_low_rank_correction_time"
+            model = ConditionalTimeLowRankCorrectionLinearXFlowMLP(**common, correction_rank=lxf_rank, quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)), divergence_estimator=str(getattr(args, "lxf_low_rank_divergence_estimator", "hutchinson")).strip().lower(), hutchinson_probes=int(getattr(args, "lxf_hutchinson_probes", 1),), fixed_u=fixed_sir_u).to(dev)
+        elif method_name == "xflow_sir_lrank_dia":
+            if lxf_rank > x_dim_lxf: raise ValueError(f"--lxf-low-rank-dim must be <= x_dim={x_dim_lxf}; got {lxf_rank}.")
+            if fixed_sir_u is None:
+                raise RuntimeError("xflow_sir_lrank_dia expected a fitted SIR basis.")
+            drift_type = "sir_low_rank_correction_diagonal_time"
+            model = ConditionalTimeDiagonalLowRankCorrectionLinearXFlowMLP(**common, correction_rank=lxf_rank, quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)), divergence_estimator=str(getattr(args, "lxf_low_rank_divergence_estimator", "hutchinson")).strip().lower(), hutchinson_probes=int(getattr(args, "lxf_hutchinson_probes", 1),), fixed_u=fixed_sir_u).to(dev)
+        elif method_name == "xflow_sir_lrank_dia_theta":
+            if lxf_rank > x_dim_lxf: raise ValueError(f"--lxf-low-rank-dim must be <= x_dim={x_dim_lxf}; got {lxf_rank}.")
+            if fixed_sir_u is None:
+                raise RuntimeError("xflow_sir_lrank_dia_theta expected a fitted SIR basis.")
+            drift_type = "sir_low_rank_correction_diagonal_theta_time"
+            model = ConditionalTimeThetaDiagonalLowRankCorrectionLinearXFlowMLP(**common, correction_rank=lxf_rank, quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)), divergence_estimator=str(getattr(args, "lxf_low_rank_divergence_estimator", "hutchinson")).strip().lower(), hutchinson_probes=int(getattr(args, "lxf_hutchinson_probes", 1),), fixed_u=fixed_sir_u).to(dev)
+        elif method_name == "xflow_sir_lrank_scalar":
+            if lxf_rank > x_dim_lxf: raise ValueError(f"--lxf-low-rank-dim must be <= x_dim={x_dim_lxf}; got {lxf_rank}.")
+            if fixed_sir_u is None:
+                raise RuntimeError("xflow_sir_lrank_scalar expected a fitted SIR basis.")
+            drift_type = "sir_low_rank_correction_scalar_time"
+            model = ConditionalTimeScalarLowRankCorrectionLinearXFlowMLP(**common, correction_rank=lxf_rank, quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)), divergence_estimator=str(getattr(args, "lxf_low_rank_divergence_estimator", "hutchinson")).strip().lower(), hutchinson_probes=int(getattr(args, "lxf_hutchinson_probes", 1),), fixed_u=fixed_sir_u).to(dev)
+        elif method_name == "xflow_sir_lrank_scalar_theta":
+            if lxf_rank > x_dim_lxf: raise ValueError(f"--lxf-low-rank-dim must be <= x_dim={x_dim_lxf}; got {lxf_rank}.")
+            if fixed_sir_u is None:
+                raise RuntimeError("xflow_sir_lrank_scalar_theta expected a fitted SIR basis.")
+            drift_type = "sir_low_rank_correction_scalar_theta_time"
+            model = ConditionalTimeThetaScalarLowRankCorrectionLinearXFlowMLP(**common, correction_rank=lxf_rank, quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)), divergence_estimator=str(getattr(args, "lxf_low_rank_divergence_estimator", "hutchinson")).strip().lower(), hutchinson_probes=int(getattr(args, "lxf_hutchinson_probes", 1),), fixed_u=fixed_sir_u).to(dev)
         elif method_name == "linear_x_flow_pure_low_rank_t":
             if lxf_rank > x_dim_lxf: raise ValueError(f"--lxf-low-rank-dim must be <= x_dim={x_dim_lxf}; got {lxf_rank}.")
             drift_type = "pure_low_rank_time"
@@ -4189,7 +4289,7 @@ def _estimate_one(
         warmup_epochs = int(getattr(args, "lxf_low_rank_t_warmup_epochs", 0))
         if method_name == "linear_x_flow_lr_t_ts":
             train_out = train_low_rank_t_theta_only_b_mean_regression_pretrain_then_freeze_b(**train_kwargs, schedule=schedule, warmup_epochs=warmup_epochs, log_name=method_name)
-        elif method_name == "linear_x_flow_low_rank_t" and warmup_epochs > 0:
+        elif method_name in ("linear_x_flow_low_rank_t", "xflow_sir_lrank", "xflow_sir_lrank_dia", "xflow_sir_lrank_dia_theta", "xflow_sir_lrank_scalar", "xflow_sir_lrank_scalar_theta") and warmup_epochs > 0:
             train_out = train_low_rank_t_warmup_then_full(**train_kwargs, schedule=schedule, warmup_epochs=warmup_epochs, log_name=method_name)
         else:
             train_out = train_time_linear_x_flow_schedule(
@@ -4199,6 +4299,11 @@ def _estimate_one(
         x_std = np.asarray(train_out["x_std"], dtype=np.float64)
         correction_methods = {
             "linear_x_flow_low_rank_t",
+            "xflow_sir_lrank",
+            "xflow_sir_lrank_dia",
+            "xflow_sir_lrank_dia_theta",
+            "xflow_sir_lrank_scalar",
+            "xflow_sir_lrank_scalar_theta",
             "linear_x_flow_pure_low_rank_t",
             "linear_x_flow_pure_cond_low_rank_t",
             "linear_x_flow_lr_t_ts",
@@ -4242,6 +4347,26 @@ def _estimate_one(
                 {
                     "lxfs_target_noise_enabled": np.bool_(True),
                     "lxfs_target_noise_std": np.float64(float(getattr(args, "lxfs_target_noise_std", 0.2))),
+                }
+            )
+        if method_name in ("xflow_sir_lrank", "xflow_sir_lrank_dia", "xflow_sir_lrank_dia_theta", "xflow_sir_lrank_scalar", "xflow_sir_lrank_scalar_theta"):
+            if sir_meta_lxf is None:
+                raise RuntimeError(f"{method_name} expected SIR metadata.")
+            lxfs_extra_npz.update(
+                {
+                    "sir_enabled": np.bool_(True),
+                    "sir_dim": np.int64(lxf_rank),
+                    "sir_num_bins": np.int64(int(getattr(args, "sir_num_bins", 10))),
+                    "sir_ridge": np.float64(float(getattr(args, "sir_ridge", 1e-6))),
+                    "sir_theta_dim": np.int64(int(sir_meta_lxf["sir_theta_dim"])),
+                    "sir_x_mean": np.asarray(sir_meta_lxf["sir_x_mean"], dtype=np.float64),
+                    "sir_components": np.asarray(sir_meta_lxf["sir_components"], dtype=np.float64),
+                    "sir_eigenvalues": np.asarray(sir_meta_lxf["sir_eigenvalues"], dtype=np.float64),
+                    "sir_bin_counts": np.asarray(sir_meta_lxf["sir_bin_counts"], dtype=np.int64),
+                    "sir_nonempty_bin_ids": np.asarray(sir_meta_lxf["sir_nonempty_bin_ids"], dtype=np.int64),
+                    "sir_slice_means": np.asarray(sir_meta_lxf["sir_slice_means"], dtype=np.float64),
+                    "sir_theta_edges": np.asarray(sir_meta_lxf["sir_theta_edges"], dtype=np.float64),
+                    "lxf_low_rank_u_source": np.asarray(["raw_sir"], dtype=object),
                 }
             )
         h_payload = dict(
@@ -5393,6 +5518,16 @@ def _model_posterior_log_weights_for_fixed_x(
         return c, r"Linear X-flow diagonal $A(t,\theta)$ log $p(x|\theta)$"
     if method == "linear_x_flow_low_rank_t":
         return c, r"Linear X-flow full $A(t)$ + orthonormal low-rank correction log $p(x|\theta)$"
+    if method == "xflow_sir_lrank":
+        return c, r"X-flow SIR low-rank correction log $p(x|\theta)$"
+    if method == "xflow_sir_lrank_dia":
+        return c, r"X-flow SIR low-rank correction, diagonal $A(t)$ log $p(x|\theta)$"
+    if method == "xflow_sir_lrank_dia_theta":
+        return c, r"X-flow SIR low-rank correction, diagonal $A(t,\theta)$ log $p(x|\theta)$"
+    if method == "xflow_sir_lrank_scalar":
+        return c, r"X-flow SIR low-rank correction, scalar $A(t)$ log $p(x|\theta)$"
+    if method == "xflow_sir_lrank_scalar_theta":
+        return c, r"X-flow SIR low-rank correction, scalar $A(t,\theta)$ log $p(x|\theta)$"
     if method == "linear_x_flow_pure_low_rank_t":
         return c, r"Linear X-flow pure orthonormal low-rank $U h(U^{\mathsf T}x)$ log $p(x|\theta)$"
     if method == "linear_x_flow_pure_cond_low_rank_t":
@@ -6106,6 +6241,16 @@ def _render_training_losses_panel(
             post_lab = "linear-x-flow diagonal-t FM likelihood"
         elif tfm == "linear_x_flow_low_rank_t":
             post_lab = "linear-x-flow full-A(t) + low-rank correction FM likelihood"
+        elif tfm == "xflow_sir_lrank":
+            post_lab = "x-flow SIR low-rank correction FM likelihood"
+        elif tfm == "xflow_sir_lrank_dia":
+            post_lab = "x-flow SIR low-rank correction diagonal-A(t) FM likelihood"
+        elif tfm == "xflow_sir_lrank_dia_theta":
+            post_lab = "x-flow SIR low-rank correction diagonal-A(theta,t) FM likelihood"
+        elif tfm == "xflow_sir_lrank_scalar":
+            post_lab = "x-flow SIR low-rank correction scalar-A(t) FM likelihood"
+        elif tfm == "xflow_sir_lrank_scalar_theta":
+            post_lab = "x-flow SIR low-rank correction scalar-A(theta,t) FM likelihood"
         elif tfm == "linear_x_flow_pure_low_rank_t":
             post_lab = "linear-x-flow pure low-rank U h(U^T x) FM likelihood"
         elif tfm == "linear_x_flow_pure_cond_low_rank_t":
@@ -6559,6 +6704,16 @@ def _save_combined_convergence_figure(
             post_lab = "linear-x-flow diagonal-t FM likelihood"
         elif tfm == "linear_x_flow_low_rank_t":
             post_lab = "linear-x-flow full-A(t) + low-rank correction FM likelihood"
+        elif tfm == "xflow_sir_lrank":
+            post_lab = "x-flow SIR low-rank correction FM likelihood"
+        elif tfm == "xflow_sir_lrank_dia":
+            post_lab = "x-flow SIR low-rank correction diagonal-A(t) FM likelihood"
+        elif tfm == "xflow_sir_lrank_dia_theta":
+            post_lab = "x-flow SIR low-rank correction diagonal-A(theta,t) FM likelihood"
+        elif tfm == "xflow_sir_lrank_scalar":
+            post_lab = "x-flow SIR low-rank correction scalar-A(t) FM likelihood"
+        elif tfm == "xflow_sir_lrank_scalar_theta":
+            post_lab = "x-flow SIR low-rank correction scalar-A(theta,t) FM likelihood"
         elif tfm == "linear_x_flow_pure_low_rank_t":
             post_lab = "linear-x-flow pure low-rank U h(U^T x) FM likelihood"
         elif tfm == "linear_x_flow_pure_cond_low_rank_t":
@@ -7018,19 +7173,24 @@ def _write_summary(
             f.write(f"gxf_pair_batch_size: {int(getattr(args, 'gxf_pair_batch_size', 0))}\n")
             f.write(f"gxf_diagonal_covariance: {_tfm_sum == 'gaussian_x_flow_diagonal'}\n")
         if _tfm_sum in (
-                "linear_x_flow_t",
-                "linear_x_flow_t_aug",
-                "linear_x_flow_t_noise",
-                "linear_x_flow_scalar_t",
-                    "linear_x_flow_diagonal_theta_t",
+            "linear_x_flow_t",
+            "linear_x_flow_t_aug",
+            "linear_x_flow_t_noise",
+            "linear_x_flow_scalar_t",
+            "linear_x_flow_diagonal_theta_t",
             "linear_x_flow_diagonal_t",
-                "linear_x_flow_low_rank_t",
+            "linear_x_flow_low_rank_t",
+            "xflow_sir_lrank",
+            "xflow_sir_lrank_dia",
+            "xflow_sir_lrank_dia_theta",
+            "xflow_sir_lrank_scalar",
+            "xflow_sir_lrank_scalar_theta",
             "linear_x_flow_pure_low_rank_t",
             "linear_x_flow_pure_cond_low_rank_t",
-                "linear_x_flow_lr_t_ts",
-                            "linear_x_flow_low_rank_randb_t",
+            "linear_x_flow_lr_t_ts",
+            "linear_x_flow_low_rank_randb_t",
             "sir_xflow_lrank_t",
-            ):
+        ):
             f.write(f"lxf_epochs: {int(getattr(args, 'lxf_epochs', 0))}\n")
             f.write(f"lxf_batch_size: {int(getattr(args, 'lxf_batch_size', 0))}\n")
             f.write(f"lxf_lr: {float(getattr(args, 'lxf_lr', 0.0))}\n")
@@ -7057,11 +7217,16 @@ def _write_summary(
             f.write(f"lxf_nlpca_ode_steps: {int(getattr(args, 'lxf_nlpca_ode_steps', 0))}\n")
             if _tfm_sum in (
                 "linear_x_flow_low_rank_t",
+                "xflow_sir_lrank",
+                "xflow_sir_lrank_dia",
+                "xflow_sir_lrank_dia_theta",
+                "xflow_sir_lrank_scalar",
+                "xflow_sir_lrank_scalar_theta",
                 "linear_x_flow_pure_low_rank_t",
                 "linear_x_flow_pure_cond_low_rank_t",
-                        "linear_x_flow_lr_t_ts",
+                "linear_x_flow_lr_t_ts",
                 "sir_xflow_lrank_t",
-                                    ):
+            ):
                 f.write(
                     f"lxf_low_rank_divergence_estimator: {str(getattr(args, 'lxf_low_rank_divergence_estimator', 'hutchinson')).strip().lower()}\n"
                 )
@@ -7104,8 +7269,28 @@ def _write_summary(
         if _tfm_sum == "x_flow_pca":
             f.write(f"flow_pca_dim: {int(getattr(args, 'flow_pca_dim', 0))}\n")
             f.write(f"flow_pca_num_bins: {getattr(args, 'flow_pca_num_bins', None)}\n")
-        if _tfm_sum in ("sir_xflow_lrank_t", "sir_xflow", "sir_thetaflow"):
-            f.write(f"sir_dim: {int(getattr(args, 'sir_dim', 0))}\n")
+        if _tfm_sum in (
+            "sir_xflow_lrank_t",
+            "sir_xflow",
+            "sir_thetaflow",
+            "xflow_sir_lrank",
+            "xflow_sir_lrank_dia",
+            "xflow_sir_lrank_dia_theta",
+            "xflow_sir_lrank_scalar",
+            "xflow_sir_lrank_scalar_theta",
+        ):
+            _sir_dim_summary = (
+                int(getattr(args, "lxf_low_rank_dim", 0))
+                if _tfm_sum in (
+                    "xflow_sir_lrank",
+                    "xflow_sir_lrank_dia",
+                    "xflow_sir_lrank_dia_theta",
+                    "xflow_sir_lrank_scalar",
+                    "xflow_sir_lrank_scalar_theta",
+                )
+                else int(getattr(args, "sir_dim", 0))
+            )
+            f.write(f"sir_dim: {_sir_dim_summary}\n")
             f.write(f"sir_num_bins: {int(getattr(args, 'sir_num_bins', 0))}\n")
             f.write(f"sir_ridge: {float(getattr(args, 'sir_ridge', 0.0))}\n")
         if _tfm_sum == "nf_reduction":
@@ -7516,14 +7701,14 @@ def _render_convergence_figures_and_summary(
     with open(summary_path, "a", encoding="utf-8") as sf:
         sf.write("\n# Correlation targets (Pearson r off-diagonal; matrix_corr_offdiag_pearson)\n")
         sf.write(
-            "# corr_h_binned_vs_gt_mc: Pearson r, off-diagonal binned sqrt(H_sym) vs sqrt(generative GT H^2) (MC one-sided Hellinger).\n"
+            "# corr_h_binned_vs_gt_mc: Pearson r, off-diagonal binned sqrt(H_sym) vs sqrt(generative GT H^2).\n"
         )
         sf.write(
             "# corr_clf_vs_ref: Pearson r, off-diagonal pairwise decoding vs n_ref subset decoding matrix (same bin edges).\n"
             "#   NaN off-diagonals in the estimated decoding matrix are filled with the mean of its finite off-diagonals before correlation.\n"
         )
         sf.write(
-            "# h_binned_columns last column: MC GT sqrt(H^2) (not DSM/flow); hellinger_gt_sq_mc key stores sqrt(H^2).\n"
+            "# h_binned_columns last column: GT sqrt(H^2) (not DSM/flow); hellinger_gt_sq_mc key stores sqrt(H^2).\n"
         )
         sf.write(
             "# corr_llr_binned_vs_gt_mc: off-diagonal Pearson r, binned model \\Delta L vs "
@@ -7746,16 +7931,26 @@ def main(argv: list[str] | None = None) -> None:
     centers = bin_centers_from_edges(edges)
     gt_n_mc = int(args.n_ref) // n_bins
     t_gt0 = time.time()
-    h_gt_mc = estimate_hellinger_sq_one_sided_mc(
-        dataset_for_gt,
-        centers,
-        n_mc=gt_n_mc,
-        symmetrize=bool(args.gt_hellinger_symmetrize),
-    )
+    gt_method = "analytic_gaussian_centers"
+    gt_theta_centers = theta_centers_for_analytic_gt(dataset_for_gt, centers)
+    try:
+        h_gt_mc = estimate_hellinger_sq_grid_centers_analytic(
+            dataset_for_gt,
+            gt_theta_centers,
+            symmetrize=bool(args.gt_hellinger_symmetrize),
+        )
+    except TypeError:
+        gt_method = "mc_likelihood"
+        h_gt_mc = estimate_hellinger_sq_one_sided_mc(
+            dataset_for_gt,
+            centers,
+            n_mc=gt_n_mc,
+            symmetrize=bool(args.gt_hellinger_symmetrize),
+        )
     h_gt_sqrt = _sqrt_h_like(h_gt_mc)
     print(
-        f"[convergence] GT Hellinger (MC likelihood) n_bins={n_bins} n_mc={gt_n_mc} "
-        f"(n_bins*n_mc={n_bins * gt_n_mc} <= n_ref={int(args.n_ref)}) wall time: {time.time() - t_gt0:.1f}s "
+        f"[convergence] GT Hellinger ({gt_method}) n_bins={n_bins} center_shape={gt_theta_centers.shape} "
+        f"legacy_n_mc={gt_n_mc} wall time: {time.time() - t_gt0:.1f}s "
         f"(H track uses sqrt(H^2) vs sqrt(binned h_sym))",
         flush=True,
     )
@@ -7882,6 +8077,28 @@ def main(argv: list[str] | None = None) -> None:
         print(
             "[convergence] sir_thetaflow mode fits SIR on train data, projects x to z, "
             "then runs theta-flow Bayes-ratio estimation conditioning on z.",
+            flush=True,
+        )
+    elif tfm in ("xflow_sir_lrank", "xflow_sir_lrank_dia", "xflow_sir_lrank_dia_theta", "xflow_sir_lrank_scalar", "xflow_sir_lrank_scalar_theta"):
+        if tfm == "xflow_sir_lrank_dia":
+            a_desc = "diagonal A(t)"
+        elif tfm == "xflow_sir_lrank_dia_theta":
+            a_desc = "diagonal A(theta,t)"
+        elif tfm == "xflow_sir_lrank_scalar":
+            a_desc = "scalar A(t)"
+        elif tfm == "xflow_sir_lrank_scalar_theta":
+            a_desc = "scalar A(theta,t)"
+        else:
+            a_desc = "full A(t)"
+        print(
+            f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
+            f"(lxf_low_rank_dim={int(getattr(args, 'lxf_low_rank_dim', 3))}; "
+            f"sir_num_bins={int(getattr(args, 'sir_num_bins', 10))}; raw SIR U in full x-space; {a_desc})",
+            flush=True,
+        )
+        print(
+            f"[convergence] {tfm} mode fits SIR on train data, fixes raw SIR components as U, "
+            f"then trains scheduled low-rank correction X-flow with {a_desc} in the original x space.",
             flush=True,
         )
     elif tfm == "linear_theta_flow":
