@@ -88,6 +88,7 @@ from fisher.shared_fisher_est import build_dataset_from_meta, normalize_flow_arc
 #   xflow_sir_lrank_dia_theta (same fixed raw SIR directions, but diagonal A(theta,t)),
 #   xflow_sir_lrank_scalar (same fixed raw SIR directions, but scalar A(t)=a(t)I),
 #   xflow_sir_lrank_scalar_theta (same fixed raw SIR directions, but scalar A(theta,t)=a(theta,t)I),
+#   xflow_sir_pure_lrank (fixed raw SIR directions for U; velocity U h(U^T x) only, no A or b),
 #   linear_x_flow_pure_low_rank_t (velocity U h(U^T x) only; same divergence / ODE likelihood path),
 #   linear_x_flow_pure_cond_low_rank_t (U(theta,t) from MLP; tr((U^T U) dh/dz) divergence; same ODE likelihood path),
 #   linear_x_flow_lr_t_ts (same scheduled low-rank correction but b(theta) only; mean-regression pretrain then freeze b),
@@ -615,7 +616,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Overrides --theta-field-method when non-empty. "
             "Supported values: theta_flow, theta_path_integral, x_flow, ctsm_v, nf, bin_gaussian, "
             "and supported scheduled linear_x_flow variants including linear_x_flow_diagonal_t "
-            "and xflow_sir_lrank / xflow_sir_lrank_dia / xflow_sir_lrank_dia_theta / xflow_sir_lrank_scalar / xflow_sir_lrank_scalar_theta, "
+            "and xflow_sir_lrank / xflow_sir_lrank_dia / xflow_sir_lrank_dia_theta / xflow_sir_lrank_scalar / xflow_sir_lrank_scalar_theta / xflow_sir_pure_lrank, "
             "plus SIR wrappers sir_xflow_lrank_t, sir_xflow, sir_thetaflow."
         ),
     )
@@ -629,7 +630,7 @@ def build_parser() -> argparse.ArgumentParser:
             "theta_flow:mlp,theta_flow:film,x_flow:film_fourier,ctsm_v,bin_gaussian,"
             "linear_x_flow_low_rank_t,linear_x_flow_pure_low_rank_t,linear_x_flow_pure_cond_low_rank_t,linear_x_flow_diagonal_t. "
             "For low-rank linear_x_flow rows use --lxf-low-rank-dim (default 3). "
-            "For xflow_sir_lrank variants, --lxf-low-rank-dim is the raw SIR U rank and "
+            "For xflow_sir_lrank and xflow_sir_pure_lrank variants, --lxf-low-rank-dim is the raw SIR U rank and "
             "--sir-num-bins/--sir-ridge control SIR. "
             "For SIR preprocessing use sir_xflow_lrank_t, sir_xflow, or sir_thetaflow with --sir-dim and --sir-num-bins "
             "(sir_xflow_lrank_t also needs --lxf-low-rank-dim <= --sir-dim)."

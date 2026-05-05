@@ -1010,11 +1010,14 @@ class ConditionalTimeScalarLowRankCorrectionLinearXFlowMLP(ConditionalTimeLowRan
 
 
 class ConditionalTimePureLowRankLinearXFlowMLP(nn.Module):
-    """Scheduled velocity purely in a learnable low-rank subspace (no full-rank ``A(t)x`` or ``b``).
+    """Scheduled velocity purely in a low-rank subspace (no full-rank ``A(t)x`` or ``b``).
 
-    Velocity is ``v(x,t,theta) = U h(U^T x, t, theta)`` with ``U`` in ``R^{D x r}`` having orthonormal
-    columns (``U^T U = I``). Likelihood uses the same reverse-Euler divergence integral and Hutchinson /
-    exact trace on ``\\partial h/\\partial z`` (``z = U^T x``) as :class:`ConditionalTimeLowRankCorrectionLinearXFlowMLP`.
+    Velocity is ``v(x,t,theta) = U h(U^T x, t, theta)``. By default ``U`` is learnable with orthonormal
+    columns (``U^T U = I``). If ``fixed_u`` is supplied (e.g. raw SIR directions), ``U`` is fixed and
+    need not be orthonormal; divergence uses ``\\mathrm{tr}((U^T U) \\partial h/\\partial z)``.
+
+    Likelihood uses the same reverse-Euler divergence integral and Hutchinson / exact trace on the
+    reduced Jacobian as :class:`ConditionalTimeLowRankCorrectionLinearXFlowMLP`'s ``h`` term only.
     """
 
     def __init__(
@@ -1028,6 +1031,7 @@ class ConditionalTimePureLowRankLinearXFlowMLP(nn.Module):
         quadrature_steps: int = 64,
         divergence_estimator: str = "hutchinson",
         hutchinson_probes: int = 1,
+        fixed_u: np.ndarray | torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         if int(correction_rank) < 1:
@@ -1047,9 +1051,24 @@ class ConditionalTimePureLowRankLinearXFlowMLP(nn.Module):
         self.x_dim = int(x_dim)
         self.quadrature_steps = int(quadrature_steps)
         self.correction_rank = int(correction_rank)
-        u_lin = nn.Linear(self.correction_rank, self.x_dim, bias=False)
-        nn.init.orthogonal_(u_lin.weight)
-        self.u_layer = parametrizations.orthogonal(u_lin, "weight", orthogonal_map="householder")
+        self.fixed_u_enabled = fixed_u is not None
+        if fixed_u is None:
+            u_lin = nn.Linear(self.correction_rank, self.x_dim, bias=False)
+            nn.init.orthogonal_(u_lin.weight)
+            self.u_layer = parametrizations.orthogonal(u_lin, "weight", orthogonal_map="householder")
+            self.register_buffer("_fixed_u", torch.empty(0))
+            self.register_buffer("_fixed_u_gram", torch.eye(self.correction_rank))
+        else:
+            u_arr = torch.as_tensor(fixed_u, dtype=torch.float32)
+            if u_arr.ndim != 2 or tuple(u_arr.shape) != (self.x_dim, self.correction_rank):
+                raise ValueError(
+                    f"fixed_u must have shape ({self.x_dim}, {self.correction_rank}); got {tuple(u_arr.shape)}."
+                )
+            if not torch.isfinite(u_arr).all():
+                raise ValueError("fixed_u must contain only finite values.")
+            self.u_layer = None
+            self.register_buffer("_fixed_u", u_arr.contiguous())
+            self.register_buffer("_fixed_u_gram", (u_arr.T @ u_arr).contiguous())
         self.h_net = _make_mlp(
             in_dim=self.correction_rank + 1 + self.theta_dim,
             out_dim=self.correction_rank,
@@ -1061,7 +1080,11 @@ class ConditionalTimePureLowRankLinearXFlowMLP(nn.Module):
 
     @property
     def U(self) -> torch.Tensor:
-        """Orthonormal columns ``[D, r]`` (``nn.Linear(r, D).weight``)."""
+        """Basis columns ``[D, r]`` (learnable orthonormal or fixed raw ``fixed_u``)."""
+        if self.fixed_u_enabled:
+            return self._fixed_u
+        if self.u_layer is None:
+            raise RuntimeError("u_layer is unexpectedly absent for learnable-U model.")
         return self.u_layer.weight
 
     def forward(self, x: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
@@ -1078,8 +1101,13 @@ class ConditionalTimePureLowRankLinearXFlowMLP(nn.Module):
     def regularization_loss(self) -> torch.Tensor | None:
         return None
 
-    def _reduced_trace_exact(self, z: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
-        """``sum_j \\partial h_j / \\partial z_j`` via one autograd per output component."""
+    def _reduced_trace_exact(
+        self,
+        z: torch.Tensor,
+        h: torch.Tensor,
+        gram: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """``tr(G dh/dz)`` via one autograd per output component; ``G=I`` when ``gram`` is None."""
         tr_h = torch.zeros(z.shape[0], dtype=z.dtype, device=z.device)
         for j in range(self.correction_rank):
             grad_j = torch.autograd.grad(
@@ -1088,11 +1116,19 @@ class ConditionalTimePureLowRankLinearXFlowMLP(nn.Module):
                 create_graph=False,
                 retain_graph=j < self.correction_rank - 1,
             )[0]
-            tr_h = tr_h + grad_j[:, j]
+            if gram is None:
+                tr_h = tr_h + grad_j[:, j]
+            else:
+                tr_h = tr_h + torch.sum(grad_j * gram[:, j].reshape(1, -1), dim=1)
         return tr_h
 
-    def _reduced_trace_hutchinson(self, z: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
-        """Hutchinson estimate of ``\\mathrm{tr}\\,\\partial h/\\partial z`` with Rademacher probes."""
+    def _reduced_trace_hutchinson(
+        self,
+        z: torch.Tensor,
+        h: torch.Tensor,
+        gram: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Hutchinson estimate of ``tr(G dh/dz)`` with Rademacher probes."""
         b = int(z.shape[0])
         r = int(self.correction_rank)
         n_probe = int(self.hutchinson_probes)
@@ -1100,7 +1136,8 @@ class ConditionalTimePureLowRankLinearXFlowMLP(nn.Module):
         for pi in range(n_probe):
             probe = torch.empty(b, r, dtype=z.dtype, device=z.device)
             probe.bernoulli_(0.5).mul_(2.0).sub_(1.0)
-            dot = (h * probe).sum(dim=1)
+            h_probe = probe if gram is None else probe @ gram.T
+            dot = (h * h_probe).sum(dim=1)
             vjp = torch.autograd.grad(
                 dot.sum(),
                 z,
@@ -1119,10 +1156,13 @@ class ConditionalTimePureLowRankLinearXFlowMLP(nn.Module):
             z = (x @ u_mat).detach().requires_grad_(True)
             tcol = _as_col_t(t, batch=int(z.shape[0]))
             h = self.h_net(torch.cat([z, tcol, theta], dim=1))
+            gram = None
+            if self.fixed_u_enabled:
+                gram = self._fixed_u_gram.to(dtype=z.dtype, device=z.device)
             if self.divergence_estimator == "exact":
-                tr_h = self._reduced_trace_exact(z, h)
+                tr_h = self._reduced_trace_exact(z, h, gram=gram)
             else:
-                tr_h = self._reduced_trace_hutchinson(z, h)
+                tr_h = self._reduced_trace_hutchinson(z, h, gram=gram)
         return tr_h.detach()
 
     def log_prob_normalized(
