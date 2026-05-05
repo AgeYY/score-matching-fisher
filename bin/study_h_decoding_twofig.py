@@ -9,6 +9,8 @@ but emits only two matrix-figure artifacts:
    shared bottom row for decoding).
 2) ``h_decoding_twofig_gt.svg``: left = approximate GT sqrt(H^2) matrix
    (MC likelihood), right = decoding matrix from the ``n_ref`` subset.
+   For PR-embedded archives, that decoding GT uses native (pre-projection) ``x``
+   from the source NPZ; estimated rows and sweep decoding still use embedded ``x``.
 
 Also writes correlation, normalized-MSE-vs-n, and training-loss SVGs. Pass
 ``--visualization-only`` with the same ``--output-dir`` as a prior full run to
@@ -18,6 +20,9 @@ Off-diagonal Pearson correlations and off-diagonal NMSE use
 ``visualize_h_matrix_binned.impute_offdiag_nan_mean`` on both matrices in each
 pair (sweep vs GT / MC reference, and decoding sweep vs shared reference) before
 the finite-pair mask inside each metric.
+
+For PR-embedded archives, optional decoding correlation/NMSE vs GT compares embedded
+sweep decoding matrices to the native-x GT reference (different feature spaces by design).
 """
 
 from __future__ import annotations
@@ -54,6 +59,7 @@ from fisher.hellinger_gt import (
     estimate_hellinger_sq_one_sided_mc,
     theta_centers_for_analytic_gt,
 )
+from fisher.decoding_native_x import decoding_x_train_all_from_native, load_native_bundle_for_pr_gt_decoding
 from fisher.shared_dataset_io import load_shared_dataset_npz
 from fisher.shared_fisher_est import build_dataset_from_meta, normalize_flow_arch, normalize_theta_field_method
 
@@ -70,8 +76,7 @@ from fisher.shared_fisher_est import build_dataset_from_meta, normalize_flow_arc
 # - ctsm_v
 # - nf
 # - bin_gaussian
-# - linear_x_flow_t, linear_x_flow_t_aug (same scheduled LXF as linear_x_flow_t with noisy-x augmentation),
-#   linear_x_flow_t_noise (same model; training batches perturb normalized x1 with Gaussian noise),
+# - linear_x_flow_t,
 #   linear_x_flow_scalar_t,
 #   linear_x_flow_diagonal_t,
 #   linear_x_flow_diagonal_theta_t,
@@ -109,6 +114,10 @@ class CachedTwofigBundle(TypedDict, total=False):
     decode_sweep: np.ndarray
     corr_h_binned_vs_gt_mc: np.ndarray
     nmse_h_binned_vs_gt_mc: np.ndarray
+    hellinger_acc_lb_sweep: np.ndarray
+    hellinger_acc_ub_sweep: np.ndarray
+    corr_hellinger_lb_vs_decode_shared: np.ndarray
+    corr_hellinger_ub_vs_decode_shared: np.ndarray
     corr_decode_vs_ref_shared: np.ndarray
     nmse_decode_vs_ref_shared: np.ndarray
     wall_seconds: np.ndarray
@@ -211,6 +220,51 @@ def _nmse_decode_vs_ref_shared(decode_sweep: np.ndarray, decode_ref: np.ndarray)
     d_ref_imp = conv.vhb.impute_offdiag_nan_mean(d_ref)
     for j in range(n_cols):
         out[j] = _matrix_nmse_offdiag(conv.vhb.impute_offdiag_nan_mean(np.asarray(d_sw[j], dtype=np.float64)), d_ref_imp)
+    return out
+
+
+def _hellinger_sqrt_to_accuracy_bounds(h_sqrt: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Convert stored sqrt(H^2)-like matrices to Bayes accuracy lower/upper bounds."""
+    h = np.asarray(h_sqrt, dtype=np.float64)
+    h2 = np.clip(h * h, 0.0, 1.0)
+    lb = 0.5 * (1.0 + h2)
+    ub = 0.5 * (1.0 + np.sqrt(np.clip(2.0 * h2 - h2 * h2, 0.0, 1.0)))
+    if h.ndim < 2 or h.shape[-1] != h.shape[-2]:
+        raise ValueError(f"h_sqrt must have square matrix trailing dimensions; got {h.shape}.")
+    diag = np.arange(int(h.shape[-1]))
+    lb = np.asarray(lb, dtype=np.float64).copy()
+    ub = np.asarray(ub, dtype=np.float64).copy()
+    lb[..., diag, diag] = np.nan
+    ub[..., diag, diag] = np.nan
+    return lb, ub
+
+
+def _corr_hellinger_bounds_vs_decode_shared(
+    hellinger_acc_bound_sweep: np.ndarray,
+    decode_sweep: np.ndarray,
+) -> np.ndarray:
+    """Shape (n_methods, n_cols): bound matrix at n correlated with same-n decoding."""
+    b_sw = np.asarray(hellinger_acc_bound_sweep, dtype=np.float64)
+    d_sw = np.asarray(decode_sweep, dtype=np.float64)
+    if b_sw.ndim != 4:
+        raise ValueError(
+            f"hellinger_acc_bound_sweep must be 4D (methods, n_cols, n_bins, n_bins); got {b_sw.shape}."
+        )
+    if d_sw.ndim != 3:
+        raise ValueError(f"decode_sweep must be 3D (n_cols, n_bins, n_bins); got {d_sw.shape}.")
+    n_methods, n_cols, n_bins, n_bins2 = (int(x) for x in b_sw.shape)
+    if n_bins != n_bins2:
+        raise ValueError(f"hellinger_acc_bound_sweep trailing dims must be square; got {b_sw.shape}.")
+    if d_sw.shape != (n_cols, n_bins, n_bins):
+        raise ValueError(f"decode_sweep shape {d_sw.shape} expected ({n_cols}, {n_bins}, {n_bins}).")
+
+    out = np.full((n_methods, n_cols), np.nan, dtype=np.float64)
+    for i in range(n_methods):
+        for j in range(n_cols):
+            out[i, j] = conv.vhb.matrix_corr_offdiag_pearson(
+                conv.vhb.impute_offdiag_nan_mean(np.asarray(b_sw[i, j], dtype=np.float64)),
+                conv.vhb.impute_offdiag_nan_mean(np.asarray(d_sw[j], dtype=np.float64)),
+            )
     return out
 
 
@@ -320,6 +374,33 @@ def _load_cached_twofig_results(output_dir: str) -> CachedTwofigBundle:
 
         bundle = {k: np.asarray(z[k]) for k in z.files}
 
+    if "hellinger_acc_lb_sweep" not in bundle or "hellinger_acc_ub_sweep" not in bundle:
+        lb_sw, ub_sw = _hellinger_sqrt_to_accuracy_bounds(h_sw)
+        bundle["hellinger_acc_lb_sweep"] = lb_sw
+        bundle["hellinger_acc_ub_sweep"] = ub_sw
+    else:
+        lb_sw = np.asarray(bundle["hellinger_acc_lb_sweep"], dtype=np.float64)
+        ub_sw = np.asarray(bundle["hellinger_acc_ub_sweep"], dtype=np.float64)
+    if lb_sw.shape != h_sw.shape:
+        raise ValueError(f"hellinger_acc_lb_sweep shape {lb_sw.shape} expected {h_sw.shape}.")
+    if ub_sw.shape != h_sw.shape:
+        raise ValueError(f"hellinger_acc_ub_sweep shape {ub_sw.shape} expected {h_sw.shape}.")
+
+    if "corr_hellinger_lb_vs_decode_shared" not in bundle:
+        bundle["corr_hellinger_lb_vs_decode_shared"] = _corr_hellinger_bounds_vs_decode_shared(lb_sw, dec_sw)
+    if "corr_hellinger_ub_vs_decode_shared" not in bundle:
+        bundle["corr_hellinger_ub_vs_decode_shared"] = _corr_hellinger_bounds_vs_decode_shared(ub_sw, dec_sw)
+    corr_lb = np.asarray(bundle["corr_hellinger_lb_vs_decode_shared"], dtype=np.float64)
+    corr_ub = np.asarray(bundle["corr_hellinger_ub_vs_decode_shared"], dtype=np.float64)
+    if corr_lb.shape != (n_methods, n_cols):
+        raise ValueError(
+            f"corr_hellinger_lb_vs_decode_shared shape {corr_lb.shape} expected ({n_methods}, {n_cols})."
+        )
+    if corr_ub.shape != (n_methods, n_cols):
+        raise ValueError(
+            f"corr_hellinger_ub_vs_decode_shared shape {corr_ub.shape} expected ({n_methods}, {n_cols})."
+        )
+
     return cast(CachedTwofigBundle, bundle)
 
 
@@ -394,6 +475,10 @@ def _run_twofig_visualization_only(
     clf_ref = np.asarray(cached["decode_ref"], dtype=np.float64)
     corr_h_binned_vs_gt_mc = np.asarray(cached["corr_h_binned_vs_gt_mc"], dtype=np.float64)
     corr_decode_vs_ref_shared = np.asarray(cached["corr_decode_vs_ref_shared"], dtype=np.float64)
+    hellinger_acc_lb_sweep = np.asarray(cached["hellinger_acc_lb_sweep"], dtype=np.float64)
+    hellinger_acc_ub_sweep = np.asarray(cached["hellinger_acc_ub_sweep"], dtype=np.float64)
+    corr_hellinger_lb_vs_decode_shared = np.asarray(cached["corr_hellinger_lb_vs_decode_shared"], dtype=np.float64)
+    corr_hellinger_ub_vs_decode_shared = np.asarray(cached["corr_hellinger_ub_vs_decode_shared"], dtype=np.float64)
     nmse_h_binned_vs_gt_mc = _nmse_h_binned_vs_gt_mc(h_sweep_arr, h_gt_sqrt)
     nmse_decode_vs_ref_shared = _nmse_decode_vs_ref_shared(clf_sweep_arr, clf_ref)
 
@@ -428,6 +513,9 @@ def _run_twofig_visualization_only(
         n_list=ns,
         corr_h=corr_h_binned_vs_gt_mc,
         corr_decode_shared=corr_decode_vs_ref_shared,
+        corr_hellinger_lb=corr_hellinger_lb_vs_decode_shared,
+        corr_hellinger_ub=corr_hellinger_ub_vs_decode_shared,
+        show_hellinger_bounds=bool(getattr(args, "show_hellinger_bound_corr", False)),
         out_svg_path=os.path.join(args.output_dir, "h_decoding_twofig_corr_vs_n.svg"),
     )
     nmse_svg = _render_nmse_vs_n_panel(
@@ -462,8 +550,13 @@ def _run_twofig_visualization_only(
         training_losses_root=os.path.abspath(loss_root),
         h_sweep_shape=tuple(int(x) for x in h_sweep_arr.shape),
         decode_sweep_shape=tuple(int(x) for x in clf_sweep_arr.shape),
+        hellinger_acc_lb_shape=tuple(int(x) for x in hellinger_acc_lb_sweep.shape),
+        hellinger_acc_ub_shape=tuple(int(x) for x in hellinger_acc_ub_sweep.shape),
         corr_h_shape=tuple(int(x) for x in corr_h_binned_vs_gt_mc.shape),
         nmse_h_shape=tuple(int(x) for x in nmse_h_binned_vs_gt_mc.shape),
+        corr_hellinger_lb_shape=tuple(int(x) for x in corr_hellinger_lb_vs_decode_shared.shape),
+        corr_hellinger_ub_shape=tuple(int(x) for x in corr_hellinger_ub_vs_decode_shared.shape),
+        show_hellinger_bound_corr=bool(getattr(args, "show_hellinger_bound_corr", False)),
         corr_decode_shape=tuple(int(x) for x in corr_decode_vs_ref_shared.shape),
         nmse_decode_shape=tuple(int(x) for x in nmse_decode_vs_ref_shared.shape),
         wall_seconds_shape=wall_shape,
@@ -540,6 +633,32 @@ def build_parser() -> argparse.ArgumentParser:
             "--sir-num-bins/--sir-ridge control SIR. "
             "For SIR preprocessing use sir_xflow_lrank_t, sir_xflow, or sir_thetaflow with --sir-dim and --sir-num-bins "
             "(sir_xflow_lrank_t also needs --lxf-low-rank-dim <= --sir-dim)."
+        ),
+    )
+    p.add_argument(
+        "--decode-source-npz",
+        type=str,
+        default="",
+        help=(
+            "Optional path to the low-dimensional (pre-PR) shared dataset .npz. "
+            "When set, overrides meta pr_autoencoder_source_npz for GT decoding only."
+        ),
+    )
+    p.add_argument(
+        "--decode-gt-fallback-embedded",
+        action="store_true",
+        help=(
+            "If PR-embedded but the native source NPZ cannot be resolved, use embedded x for "
+            "GT decoding instead of failing (not recommended)."
+        ),
+    )
+    p.add_argument(
+        "--show-hellinger-bound-corr",
+        action="store_true",
+        help=(
+            "Include optional Hellinger-derived lower/upper accuracy-bound vs decoding "
+            "correlation curves in h_decoding_twofig_corr_vs_n.svg. By default these "
+            "bound comparisons are computed/saved but not plotted."
         ),
     )
     return p
@@ -808,8 +927,13 @@ def _write_summary(
     training_losses_root: str,
     h_sweep_shape: tuple[int, ...],
     decode_sweep_shape: tuple[int, ...],
+    hellinger_acc_lb_shape: tuple[int, ...],
+    hellinger_acc_ub_shape: tuple[int, ...],
     corr_h_shape: tuple[int, ...],
     nmse_h_shape: tuple[int, ...],
+    corr_hellinger_lb_shape: tuple[int, ...],
+    corr_hellinger_ub_shape: tuple[int, ...],
+    show_hellinger_bound_corr: bool,
     corr_decode_shape: tuple[int, ...],
     nmse_decode_shape: tuple[int, ...],
     wall_seconds_shape: tuple[int, ...],
@@ -838,10 +962,16 @@ def _write_summary(
         f.write(f"results_npz: {out_npz}\n")
         f.write(f"h_binned_sweep_shape: {h_sweep_shape}\n")
         f.write(f"decode_sweep_shape: {decode_sweep_shape}\n")
+        f.write(f"hellinger_acc_lb_sweep_shape: {hellinger_acc_lb_shape}\n")
+        f.write(f"hellinger_acc_ub_sweep_shape: {hellinger_acc_ub_shape}\n")
         f.write(f"corr_h_binned_vs_gt_mc_shape: {corr_h_shape}\n")
         f.write(f"nmse_h_binned_vs_gt_mc_shape: {nmse_h_shape}\n")
+        f.write(f"corr_hellinger_lb_vs_decode_shared_shape: {corr_hellinger_lb_shape}\n")
+        f.write(f"corr_hellinger_ub_vs_decode_shared_shape: {corr_hellinger_ub_shape}\n")
+        f.write(f"show_hellinger_bound_corr: {bool(show_hellinger_bound_corr)}\n")
         f.write(f"corr_decode_vs_ref_shared_shape: {corr_decode_shape}\n")
         f.write(f"nmse_decode_vs_ref_shared_shape: {nmse_decode_shape}\n")
+        f.write("hellinger_accuracy_bounds: h2=clip(h_sqrt**2,0,1); lb=0.5*(1+h2); ub=0.5*(1+sqrt(2*h2-h2**2)); diagonal=NaN\n")
         f.write("decode_sweep_semantics: shared_across_methods\n")
         f.write(f"wall_seconds_shape: {wall_seconds_shape}\n")
         f.write(f"figure_sweep_svg: {sweep_svg}\n")
@@ -1005,28 +1135,66 @@ def _render_corr_vs_n_panel(
     n_list: list[int],
     corr_h: np.ndarray,
     corr_decode_shared: np.ndarray,
+    corr_hellinger_lb: np.ndarray,
+    corr_hellinger_ub: np.ndarray,
+    show_hellinger_bounds: bool,
     out_svg_path: str,
 ) -> str:
     corr_h_arr = np.asarray(corr_h, dtype=np.float64)
     corr_decode_arr = np.asarray(corr_decode_shared, dtype=np.float64).ravel()
+    corr_lb_arr = np.asarray(corr_hellinger_lb, dtype=np.float64)
+    corr_ub_arr = np.asarray(corr_hellinger_ub, dtype=np.float64)
     n_arr = np.asarray(n_list, dtype=np.float64).ravel()
     if corr_h_arr.shape != (len(row_labels), len(n_list)):
         raise ValueError(
             f"corr_h shape mismatch: expected {(len(row_labels), len(n_list))}, got {corr_h_arr.shape}."
         )
+    if bool(show_hellinger_bounds):
+        if corr_lb_arr.shape != (len(row_labels), len(n_list)):
+            raise ValueError(
+                f"corr_hellinger_lb shape mismatch: expected {(len(row_labels), len(n_list))}, got {corr_lb_arr.shape}."
+            )
+        if corr_ub_arr.shape != (len(row_labels), len(n_list)):
+            raise ValueError(
+                f"corr_hellinger_ub shape mismatch: expected {(len(row_labels), len(n_list))}, got {corr_ub_arr.shape}."
+            )
     if corr_decode_arr.shape != (len(n_list),):
         raise ValueError(f"corr_decode shape mismatch: expected {(len(n_list),)}, got {corr_decode_arr.shape}.")
 
-    fig, ax = plt.subplots(1, 1, figsize=(3.5, 3.5))
+    fig, ax = plt.subplots(1, 1, figsize=(4.8, 3.8))
+    colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", [])
     for i, label in enumerate(row_labels):
+        color = colors[i % len(colors)] if colors else None
         ax.plot(
             n_arr,
             corr_h_arr[i],
+            color=color,
             marker="o",
             linewidth=1.8,
             markersize=4.0,
             label=f"{label} (H vs GT)",
         )
+        if bool(show_hellinger_bounds):
+            ax.plot(
+                n_arr,
+                corr_lb_arr[i],
+                color=color,
+                linestyle=":",
+                marker="^",
+                linewidth=1.3,
+                markersize=3.2,
+                label=f"{label} (H LB vs decoding)",
+            )
+            ax.plot(
+                n_arr,
+                corr_ub_arr[i],
+                color=color,
+                linestyle="-.",
+                marker="v",
+                linewidth=1.3,
+                markersize=3.2,
+                label=f"{label} (H UB vs decoding)",
+            )
     ax.plot(
         n_arr,
         corr_decode_arr,
@@ -1248,6 +1416,45 @@ def main(argv: list[str] | None = None) -> None:
         bin_idx_all=bin_idx_all,
         theta_state_all=theta_state_all,
     )
+    decode_gt_x_train: np.ndarray | None = None
+    decode_gt_x_all: np.ndarray | None = None
+    if bool(meta.get("pr_autoencoder_embedded")):
+        override_npz = str(getattr(args, "decode_source_npz", "") or "").strip() or None
+        fallback_emb = bool(getattr(args, "decode_gt_fallback_embedded", False))
+        native_gt, tried_gt = load_native_bundle_for_pr_gt_decoding(
+            bundle,
+            meta,
+            args.dataset_npz,
+            override_npz,
+        )
+        if native_gt is not None:
+            decode_gt_x_train, decode_gt_x_all = decoding_x_train_all_from_native(
+                native_gt,
+                perm,
+                int(args.n_ref),
+                meta,
+            )
+            print(
+                "[twofig] GT decoding pairwise logistic regression uses native (pre-PR) x "
+                f"(dim={int(decode_gt_x_all.shape[1])}); sweep decoding uses embedded x.",
+                flush=True,
+            )
+        elif fallback_emb:
+            msg_tried = "\n  ".join(tried_gt) if tried_gt else "(no candidate paths)"
+            print(
+                "[twofig] WARN: native NPZ missing for GT decoding; tried:\n  "
+                f"{msg_tried}\n"
+                "  Using embedded x for GT decoding (--decode-gt-fallback-embedded).",
+                flush=True,
+            )
+        else:
+            msg_tried = "\n  ".join(tried_gt) if tried_gt else "(no candidate paths)"
+            raise FileNotFoundError(
+                "PR-embedded dataset: could not load native source NPZ for GT decoding (pre-projection x). "
+                "Pass --decode-source-npz PATH to the low-dimensional archive, or "
+                "--decode-gt-fallback-embedded to use embedded x. Tried:\n  "
+                f"{msg_tried}"
+            )
     clf_ref = conv._pairwise_clf_from_bundle(
         args=args,
         meta=meta,
@@ -1256,6 +1463,8 @@ def main(argv: list[str] | None = None) -> None:
         n_bins=n_bins,
         clf_min_class_count=int(args.clf_min_class_count),
         clf_random_state=clf_rs,
+        decode_x_train=decode_gt_x_train,
+        decode_x_all=decode_gt_x_all,
     )
 
     h_sweep_by_method: list[np.ndarray] = []
@@ -1385,6 +1594,15 @@ def main(argv: list[str] | None = None) -> None:
             conv.vhb.impute_offdiag_nan_mean(np.asarray(clf_sweep_arr[j], dtype=np.float64)),
             clf_ref_imp,
         )
+    hellinger_acc_lb_sweep, hellinger_acc_ub_sweep = _hellinger_sqrt_to_accuracy_bounds(h_sweep_arr)
+    corr_hellinger_lb_vs_decode_shared = _corr_hellinger_bounds_vs_decode_shared(
+        hellinger_acc_lb_sweep,
+        clf_sweep_arr,
+    )
+    corr_hellinger_ub_vs_decode_shared = _corr_hellinger_bounds_vs_decode_shared(
+        hellinger_acc_ub_sweep,
+        clf_sweep_arr,
+    )
     nmse_h_binned_vs_gt_mc = _nmse_h_binned_vs_gt_mc(h_sweep_arr, h_gt_sqrt)
     nmse_decode_vs_ref_shared = _nmse_decode_vs_ref_shared(clf_sweep_arr, clf_ref)
 
@@ -1411,6 +1629,9 @@ def main(argv: list[str] | None = None) -> None:
         n_list=ns,
         corr_h=corr_h_binned_vs_gt_mc,
         corr_decode_shared=corr_decode_vs_ref_shared,
+        corr_hellinger_lb=corr_hellinger_lb_vs_decode_shared,
+        corr_hellinger_ub=corr_hellinger_ub_vs_decode_shared,
+        show_hellinger_bounds=bool(getattr(args, "show_hellinger_bound_corr", False)),
         out_svg_path=os.path.join(args.output_dir, "h_decoding_twofig_corr_vs_n.svg"),
     )
     nmse_svg = _render_nmse_vs_n_panel(
@@ -1456,8 +1677,12 @@ def main(argv: list[str] | None = None) -> None:
         decode_ref=np.asarray(clf_ref, dtype=np.float64),
         h_binned_sweep=np.asarray(h_sweep_arr, dtype=np.float64),
         decode_sweep=np.asarray(clf_sweep_arr, dtype=np.float64),
+        hellinger_acc_lb_sweep=np.asarray(hellinger_acc_lb_sweep, dtype=np.float64),
+        hellinger_acc_ub_sweep=np.asarray(hellinger_acc_ub_sweep, dtype=np.float64),
         corr_h_binned_vs_gt_mc=np.asarray(corr_h_binned_vs_gt_mc, dtype=np.float64),
         nmse_h_binned_vs_gt_mc=np.asarray(nmse_h_binned_vs_gt_mc, dtype=np.float64),
+        corr_hellinger_lb_vs_decode_shared=np.asarray(corr_hellinger_lb_vs_decode_shared, dtype=np.float64),
+        corr_hellinger_ub_vs_decode_shared=np.asarray(corr_hellinger_ub_vs_decode_shared, dtype=np.float64),
         corr_decode_vs_ref_shared=np.asarray(corr_decode_vs_ref_shared, dtype=np.float64),
         nmse_decode_vs_ref_shared=np.asarray(nmse_decode_vs_ref_shared, dtype=np.float64),
         column_n=np.asarray(ns, dtype=np.int64),
@@ -1486,8 +1711,13 @@ def main(argv: list[str] | None = None) -> None:
         training_losses_root=os.path.abspath(loss_root),
         h_sweep_shape=tuple(int(x) for x in h_sweep_arr.shape),
         decode_sweep_shape=tuple(int(x) for x in clf_sweep_arr.shape),
+        hellinger_acc_lb_shape=tuple(int(x) for x in hellinger_acc_lb_sweep.shape),
+        hellinger_acc_ub_shape=tuple(int(x) for x in hellinger_acc_ub_sweep.shape),
         corr_h_shape=tuple(int(x) for x in corr_h_binned_vs_gt_mc.shape),
         nmse_h_shape=tuple(int(x) for x in nmse_h_binned_vs_gt_mc.shape),
+        corr_hellinger_lb_shape=tuple(int(x) for x in corr_hellinger_lb_vs_decode_shared.shape),
+        corr_hellinger_ub_shape=tuple(int(x) for x in corr_hellinger_ub_vs_decode_shared.shape),
+        show_hellinger_bound_corr=bool(getattr(args, "show_hellinger_bound_corr", False)),
         corr_decode_shape=tuple(int(x) for x in corr_decode_vs_ref_shared.shape),
         nmse_decode_shape=tuple(int(x) for x in nmse_decode_vs_ref_shared.shape),
         wall_seconds_shape=tuple(int(x) for x in wall_s.shape),
