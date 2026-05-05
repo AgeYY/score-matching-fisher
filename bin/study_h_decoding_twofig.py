@@ -76,8 +76,11 @@ from fisher.shared_fisher_est import build_dataset_from_meta, normalize_flow_arc
 #   linear_x_flow_pure_low_rank_t (velocity U h(U^T x) only; same divergence / ODE likelihood path),
 #   linear_x_flow_pure_cond_low_rank_t (U(theta,t) from MLP; tr((U^T U) dh/dz) divergence; same ODE likelihood path),
 #   linear_x_flow_lr_t_ts (same scheduled low-rank correction but b(theta) only; mean-regression pretrain then freeze b),
-#   linear_x_flow_low_rank_randb_t
-_FLOW_BASED_METHODS = {"theta_flow", "theta_path_integral", "x_flow"}
+#   linear_x_flow_low_rank_randb_t,
+#   sir_xflow_lrank_t (SIR preprocessing followed by linear_x_flow_low_rank_t in projected space)
+#   sir_xflow (SIR preprocessing followed by x_flow on projected z)
+#   sir_thetaflow (SIR preprocessing followed by theta_flow conditioning on projected z)
+_FLOW_BASED_METHODS = {"theta_flow", "theta_path_integral", "x_flow", "sir_xflow", "sir_thetaflow"}
 _NO_TRAIN_METHODS = {"bin_gaussian"}
 
 
@@ -474,6 +477,9 @@ def _normalize_theta_field_method_local(method: str) -> str:
         return "bin_gaussian"
     if m == "nf":
         return "nf"
+    sir = conv._normalize_sir_xflow_method(m)
+    if sir is not None:
+        return str(sir)
     lxf = conv._normalize_linear_x_flow_method(m)
     if lxf is not None:
         return str(lxf)
@@ -506,7 +512,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Overrides --theta-field-method when non-empty. "
             "Supported values: theta_flow, theta_path_integral, x_flow, ctsm_v, nf, bin_gaussian, "
             "and supported scheduled linear_x_flow variants including linear_x_flow_diagonal_t "
-            "(see study_h_decoding_convergence._normalize_linear_x_flow_method)."
+            "plus SIR wrappers sir_xflow_lrank_t, sir_xflow, sir_thetaflow."
         ),
     )
     p.add_argument(
@@ -518,7 +524,9 @@ def build_parser() -> argparse.ArgumentParser:
             "--theta-field-method. Tokens are method or method:arch, e.g. "
             "theta_flow:mlp,theta_flow:film,x_flow:film_fourier,ctsm_v,bin_gaussian,"
             "linear_x_flow_low_rank_t,linear_x_flow_pure_low_rank_t,linear_x_flow_pure_cond_low_rank_t,linear_x_flow_diagonal_t. "
-            "For low-rank linear_x_flow rows use --lxf-low-rank-dim."
+            "For low-rank linear_x_flow rows use --lxf-low-rank-dim. "
+            "For SIR preprocessing use sir_xflow_lrank_t, sir_xflow, or sir_thetaflow with --sir-dim and --sir-num-bins "
+            "(sir_xflow_lrank_t also needs --lxf-low-rank-dim <= --sir-dim)."
         ),
     )
     return p

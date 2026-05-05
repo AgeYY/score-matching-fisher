@@ -822,6 +822,24 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="x-flow-pca only: theta bins K for PCA means (default: --num-theta-bins).",
     )
+    p.add_argument(
+        "--sir-dim",
+        type=int,
+        default=5,
+        help="SIR wrapper methods (sir_xflow_lrank_t, sir_xflow, sir_thetaflow): projection dimension.",
+    )
+    p.add_argument(
+        "--sir-num-bins",
+        type=int,
+        default=10,
+        help="SIR wrapper methods: equal-width bins per theta dimension for SIR slices.",
+    )
+    p.add_argument(
+        "--sir-ridge",
+        type=float,
+        default=1e-6,
+        help="SIR wrapper methods: diagonal ridge added to x covariance before SIR whitening.",
+    )
     p.add_argument("--gxf-epochs", type=int, default=2000, help="gaussian-x-flow only: training epochs.")
     p.add_argument("--gxf-batch-size", type=int, default=256, help="gaussian-x-flow only: training batch size.")
     p.add_argument("--gxf-lr", type=float, default=1e-4, help="gaussian-x-flow only: learning rate.")
@@ -1456,6 +1474,41 @@ def _normalize_flow_pca_method(tfm: str) -> str | None:
     return aliases.get(key)
 
 
+# Public SIR wrapper tokens -> inner estimator run after projecting x -> z on train.
+_SIR_WRAPPER_ALIASES: dict[str, str] = {
+    "sir-xflow-lrank-t": "sir_xflow_lrank_t",
+    "sir_xflow_lrank_t": "sir_xflow_lrank_t",
+    "sir-xflow": "sir_xflow",
+    "sir_xflow": "sir_xflow",
+    "sir-thetaflow": "sir_thetaflow",
+    "sir_thetaflow": "sir_thetaflow",
+}
+
+SIR_WRAPPER_INNER_METHOD: dict[str, str] = {
+    "sir_xflow_lrank_t": "linear_x_flow_low_rank_t",
+    "sir_xflow": "x_flow",
+    "sir_thetaflow": "theta_flow",
+}
+
+
+def _normalize_sir_wrapper_method(tfm: str) -> str | None:
+    key = str(tfm).strip().lower()
+    return _SIR_WRAPPER_ALIASES.get(key)
+
+
+def _normalize_sir_xflow_method(tfm: str) -> str | None:
+    """Backward-compatible alias: any SIR wrapper public token."""
+    return _normalize_sir_wrapper_method(tfm)
+
+
+def _sir_inner_theta_field_method(public_sir: str) -> str:
+    pub = str(public_sir).strip().lower()
+    inner = SIR_WRAPPER_INNER_METHOD.get(pub)
+    if inner is None:
+        raise ValueError(f"Unknown SIR wrapper method: {public_sir!r}")
+    return inner
+
+
 def _base_flow_method_for_autoencoder(tfm: str) -> str:
     method = str(tfm).strip().lower()
     if method == "theta_flow_autoencoder":
@@ -1499,6 +1552,31 @@ def _validate_flow_pca_cli(args: argparse.Namespace) -> None:
     base_args = argparse.Namespace(**vars(args).copy())
     setattr(base_args, "theta_field_method", "x_flow")
     validate_estimation_args(base_args)
+
+
+def _validate_sir_wrapper_cli(args: argparse.Namespace) -> None:
+    sir_dim = int(getattr(args, "sir_dim", 0))
+    if sir_dim < 1:
+        raise ValueError("--sir-dim must be >= 1.")
+    if int(getattr(args, "sir_num_bins", 0)) < 2:
+        raise ValueError("--sir-num-bins must be >= 2.")
+    ridge = float(getattr(args, "sir_ridge", 0.0))
+    if not np.isfinite(ridge) or ridge <= 0.0:
+        raise ValueError("--sir-ridge must be finite and > 0.")
+    pub = str(getattr(args, "theta_field_method", "")).strip().lower()
+    inner = _sir_inner_theta_field_method(pub)
+    base_args = argparse.Namespace(**vars(args).copy())
+    setattr(base_args, "theta_field_method", inner)
+    if inner == "linear_x_flow_low_rank_t":
+        _validate_lxf_cli(base_args)
+        if int(getattr(args, "lxf_low_rank_dim", 0)) > sir_dim:
+            raise ValueError("--lxf-low-rank-dim must be <= --sir-dim for sir_xflow_lrank_t.")
+    elif inner == "x_flow":
+        validate_estimation_args(base_args)
+    elif inner == "theta_flow":
+        validate_estimation_args(base_args)
+    else:
+        raise ValueError(f"SIR wrapper inner method not handled in CLI validation: {inner!r}")
 
 
 def _validate_gxf_cli(args: argparse.Namespace) -> None:
@@ -1851,9 +1929,11 @@ def _validate_cli(args: argparse.Namespace) -> None:
         or nfr_norm is not None
         or pinf_norm is not None
         or contrastive_norm is not None
+        or _normalize_sir_xflow_method(tfm) is not None
     ) else _normalize_gaussian_network_method(tfm)
     flow_ae_norm = _normalize_flow_autoencoder_method(tfm)
     flow_pca_norm = _normalize_flow_pca_method(tfm)
+    sir_xflow_norm = _normalize_sir_xflow_method(tfm)
     if contrastive_norm is not None:
         setattr(args, "theta_field_method", contrastive_norm)
         _validate_contrastive_cli(args)
@@ -1927,6 +2007,10 @@ def _validate_cli(args: argparse.Namespace) -> None:
         setattr(args, "theta_field_method", flow_pca_norm)
         _validate_flow_pca_cli(args)
         tfm = flow_pca_norm
+    elif sir_xflow_norm is not None:
+        setattr(args, "theta_field_method", sir_xflow_norm)
+        _validate_sir_wrapper_cli(args)
+        tfm = sir_xflow_norm
     if tfm == "nf":
         setattr(args, "theta_field_method", "nf")
         require_zuko_for_nf()
@@ -1985,6 +2069,9 @@ def _validate_cli(args: argparse.Namespace) -> None:
         "theta_flow_autoencoder",
         "x_flow_autoencoder",
         "x_flow_pca",
+        "sir_xflow_lrank_t",
+        "sir_xflow",
+        "sir_thetaflow",
         "gaussian_x_flow",
         "gaussian_x_flow_diagonal",
         "linear_x_flow_t",
@@ -2724,6 +2811,113 @@ def _fit_binned_mean_pca_projection(
         "pca_theta_bin_centers": theta_centers,
         "pca_binned_train_means": means,
         "pca_nonempty_bins": nonempty_idx.astype(np.int64, copy=False),
+    }
+    return z_train, z_val, z_all, meta
+
+
+def _fit_sir_projection(
+    *,
+    x_train: np.ndarray,
+    theta_train: np.ndarray,
+    x_val: np.ndarray,
+    x_all: np.ndarray,
+    sir_dim: int,
+    num_bins: int,
+    ridge: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray | int | float]]:
+    """Fit SIR on train data and project train/val/all observations."""
+    x_tr = np.asarray(x_train, dtype=np.float64)
+    th_tr = np.asarray(theta_train, dtype=np.float64)
+    x_va = np.asarray(x_val, dtype=np.float64)
+    x_full = np.asarray(x_all, dtype=np.float64)
+    if th_tr.ndim == 1:
+        th_tr = th_tr.reshape(-1, 1)
+    if x_tr.ndim != 2 or x_va.ndim != 2 or x_full.ndim != 2:
+        raise ValueError("SIR expects x_train, x_val, and x_all to be 2D.")
+    if th_tr.ndim != 2:
+        raise ValueError("SIR expects theta_train to be 1D or 2D.")
+    if x_tr.shape[0] != th_tr.shape[0]:
+        raise ValueError("SIR theta_train length must match x_train rows.")
+    if x_tr.shape[1] != x_va.shape[1] or x_tr.shape[1] != x_full.shape[1]:
+        raise ValueError("SIR x dimension mismatch.")
+    m = int(sir_dim)
+    nb = int(num_bins)
+    lam = float(ridge)
+    if m < 1:
+        raise ValueError("--sir-dim must be >= 1.")
+    if nb < 2:
+        raise ValueError("--sir-num-bins must be >= 2.")
+    if not np.isfinite(lam) or lam <= 0.0:
+        raise ValueError("--sir-ridge must be finite and > 0.")
+    x_dim = int(x_tr.shape[1])
+    if m > x_dim:
+        raise ValueError(f"--sir-dim must be <= x_dim={x_dim}; got {m}.")
+
+    theta_dim = int(th_tr.shape[1])
+    per_dim_bins = np.zeros((int(th_tr.shape[0]), theta_dim), dtype=np.int64)
+    theta_edges = np.zeros((theta_dim, nb + 1), dtype=np.float64)
+    for j in range(theta_dim):
+        col = np.asarray(th_tr[:, j], dtype=np.float64)
+        if not np.all(np.isfinite(col)):
+            raise ValueError("SIR theta_train contains non-finite values.")
+        lo = float(np.min(col))
+        hi = float(np.max(col))
+        if hi <= lo:
+            raise ValueError(f"SIR theta dimension {j} is constant; cannot form equal-width bins.")
+        edges = np.linspace(lo, hi, nb + 1, dtype=np.float64)
+        theta_edges[j] = edges
+        idx = np.searchsorted(edges, col, side="right") - 1
+        per_dim_bins[:, j] = np.clip(idx, 0, nb - 1).astype(np.int64, copy=False)
+
+    multipliers = (nb ** np.arange(theta_dim, dtype=np.int64)).astype(np.int64, copy=False)
+    joint_ids = np.sum(per_dim_bins * multipliers.reshape(1, -1), axis=1, dtype=np.int64)
+    nonempty_ids, inverse, counts = np.unique(joint_ids, return_inverse=True, return_counts=True)
+    n_slices = int(nonempty_ids.size)
+    if n_slices < 2:
+        raise ValueError("SIR projection requires at least two non-empty theta bins in the train split.")
+    max_rank = min(x_dim, n_slices - 1)
+    if m > max_rank:
+        raise ValueError(
+            f"--sir-dim={m} exceeds available SIR rank {max_rank} "
+            f"(non_empty_bins={n_slices}, x_dim={x_dim})."
+        )
+
+    x_mean = np.mean(x_tr, axis=0, dtype=np.float64)
+    centered = x_tr - x_mean
+    cov = (centered.T @ centered) / max(1, int(x_tr.shape[0]) - 1)
+    cov_reg = cov + lam * np.eye(x_dim, dtype=np.float64)
+    slice_means = np.zeros((n_slices, x_dim), dtype=np.float64)
+    for h in range(n_slices):
+        slice_means[h] = np.mean(x_tr[inverse == h], axis=0, dtype=np.float64)
+    probs = counts.astype(np.float64) / float(x_tr.shape[0])
+    mean_diff = slice_means - x_mean.reshape(1, -1)
+    between = (mean_diff.T * probs.reshape(1, -1)) @ mean_diff
+
+    chol = np.linalg.cholesky(cov_reg)
+    whitened = np.linalg.solve(chol, between)
+    whitened = np.linalg.solve(chol, whitened.T).T
+    whitened = 0.5 * (whitened + whitened.T)
+    eigvals, eigvecs = np.linalg.eigh(whitened)
+    order = np.argsort(eigvals)[::-1]
+    eigvals = np.asarray(eigvals[order], dtype=np.float64)
+    eigvecs = np.asarray(eigvecs[:, order], dtype=np.float64)
+    components = np.linalg.solve(chol.T, eigvecs[:, :m]).astype(np.float64, copy=False)
+
+    z_train = centered @ components
+    z_val = (x_va - x_mean) @ components
+    z_all = (x_full - x_mean) @ components
+    meta: dict[str, np.ndarray | int | float] = {
+        "sir_dim": np.int64(m),
+        "sir_num_bins": np.int64(nb),
+        "sir_ridge": np.float64(lam),
+        "sir_theta_dim": np.int64(theta_dim),
+        "sir_x_mean": x_mean.astype(np.float64, copy=False),
+        "sir_components": components,
+        "sir_eigenvalues": np.asarray(eigvals[:m], dtype=np.float64),
+        "sir_bin_counts": np.asarray(counts, dtype=np.int64),
+        "sir_nonempty_bin_ids": np.asarray(nonempty_ids, dtype=np.int64),
+        "sir_slice_means": slice_means,
+        "sir_theta_edges": theta_edges,
     }
     return z_train, z_val, z_all, meta
 
@@ -3687,6 +3881,121 @@ def _estimate_one(
             theta_used=np.asarray(theta_used, dtype=np.float64),
         )
         return loaded_gxf, np.asarray(x_all, dtype=np.float64), dev
+
+    sir_pub = _normalize_sir_wrapper_method(tfm)
+    if sir_pub is not None:
+        inner = _sir_inner_theta_field_method(sir_pub)
+        dev = require_device(str(getattr(args, "device", "cuda")))
+        os.makedirs(output_dir, exist_ok=True)
+        theta_train = np.asarray(bundle.theta_train, dtype=np.float64)
+        theta_val = np.asarray(bundle.theta_validation, dtype=np.float64)
+        theta_all = np.asarray(bundle.theta_all, dtype=np.float64)
+        x_train = np.asarray(bundle.x_train, dtype=np.float64)
+        x_val = np.asarray(bundle.x_validation, dtype=np.float64)
+        x_all = np.asarray(bundle.x_all, dtype=np.float64)
+        if theta_train.ndim == 1:
+            theta_train = theta_train.reshape(-1, 1)
+        if theta_val.ndim == 1:
+            theta_val = theta_val.reshape(-1, 1)
+        if theta_all.ndim == 1:
+            theta_all = theta_all.reshape(-1, 1)
+        sir_dim = int(getattr(args, "sir_dim", 5))
+        z_train, z_val, z_all, sir_meta = _fit_sir_projection(
+            x_train=x_train,
+            theta_train=theta_train,
+            x_val=x_val,
+            x_all=x_all,
+            sir_dim=sir_dim,
+            num_bins=int(getattr(args, "sir_num_bins", 10)),
+            ridge=float(getattr(args, "sir_ridge", 1e-6)),
+        )
+        encoded_bundle = SharedDatasetBundle(
+            meta=bundle.meta,
+            theta_all=theta_all,
+            x_all=z_all,
+            train_idx=bundle.train_idx,
+            validation_idx=bundle.validation_idx,
+            theta_train=theta_train,
+            x_train=z_train,
+            theta_validation=theta_val,
+            x_validation=z_val,
+        )
+        d = vars(args).copy()
+        d.setdefault("h_matrix_npz", None)
+        d.setdefault("h_only", False)
+
+        if inner == "linear_x_flow_low_rank_t":
+            args_lxf = argparse.Namespace(**d)
+            args_lxf.theta_field_method = "linear_x_flow_low_rank_t"
+            args_lxf.output_dir = output_dir
+            loaded, _, _ = _estimate_one(
+                args=args_lxf,
+                meta=meta,
+                bundle=encoded_bundle,
+                output_dir=output_dir,
+                n_bins=n_bins,
+                bin_train=bin_train,
+                bin_validation=bin_validation,
+                bin_all=bin_all,
+            )
+        else:
+            args_flow = argparse.Namespace(**d)
+            args_flow.theta_field_method = inner
+            args_flow.output_dir = output_dir
+            full_args = _make_full_args(args_flow, meta)
+            setattr(full_args, "theta_field_method", inner)
+            setattr(full_args, "x_dim", int(sir_dim))
+            ctx = _run_ctx_for_bundle(args_flow, meta, encoded_bundle, full_args, n_bins)
+            vhb.run_h_estimation_if_needed(ctx)
+            loaded = vhb.load_h_matrix(ctx)
+
+        if sir_pub == "sir_xflow_lrank_t":
+            h_eval_name = "sir_xflow_lrank_t_log_p_z_given_theta"
+        elif sir_pub == "sir_xflow":
+            h_eval_name = "sir_xflow_log_p_z_given_theta"
+        elif sir_pub == "sir_thetaflow":
+            h_eval_name = "sir_thetaflow_log_p_theta_given_z"
+        else:
+            h_eval_name = f"{sir_pub}_h_eval_scalar"
+
+        h_path = os.path.join(output_dir, _h_matrix_results_npz_basename(dataset_family=str(meta.get("dataset_family", ""))))
+        if not os.path.exists(h_path):
+            h_path = os.path.join(output_dir, "h_matrix_results_theta_cov.npz")
+        _rewrite_npz_fields(
+            h_path,
+            h_field_method=np.asarray([sir_pub], dtype=object),
+            theta_field_method=np.asarray([sir_pub], dtype=object),
+            h_eval_scalar_name=np.asarray([h_eval_name], dtype=object),
+            sir_enabled=np.bool_(True),
+            sir_dim=np.int64(sir_dim),
+            sir_num_bins=np.int64(int(getattr(args, "sir_num_bins", 10))),
+            sir_ridge=np.float64(float(getattr(args, "sir_ridge", 1e-6))),
+            sir_theta_dim=np.int64(int(sir_meta["sir_theta_dim"])),
+            sir_x_mean=np.asarray(sir_meta["sir_x_mean"], dtype=np.float64),
+            sir_components=np.asarray(sir_meta["sir_components"], dtype=np.float64),
+            sir_eigenvalues=np.asarray(sir_meta["sir_eigenvalues"], dtype=np.float64),
+            sir_bin_counts=np.asarray(sir_meta["sir_bin_counts"], dtype=np.int64),
+            sir_nonempty_bin_ids=np.asarray(sir_meta["sir_nonempty_bin_ids"], dtype=np.int64),
+            sir_slice_means=np.asarray(sir_meta["sir_slice_means"], dtype=np.float64),
+            sir_theta_edges=np.asarray(sir_meta["sir_theta_edges"], dtype=np.float64),
+        )
+        loss_path = os.path.join(output_dir, "score_prior_training_losses.npz")
+        _rewrite_npz_fields(
+            loss_path,
+            theta_field_method=np.asarray([sir_pub], dtype=object),
+            sir_enabled=np.bool_(True),
+            sir_dim=np.int64(sir_dim),
+            sir_num_bins=np.int64(int(getattr(args, "sir_num_bins", 10))),
+            sir_ridge=np.float64(float(getattr(args, "sir_ridge", 1e-6))),
+        )
+        full_args_chk = merge_meta_into_args(meta, args)
+        theta_chk = vhb.theta_for_h_matrix_alignment(bundle, full_args_chk)
+        _validate_theta_used_matches_bundle(
+            theta_chk,
+            loaded.theta_used,
+            err_suffix=str(sir_pub),
+        )
+        return loaded, np.asarray(bundle.x_all, dtype=np.float64), dev
 
     lxf_norm = _normalize_linear_x_flow_method(tfm)
     if lxf_norm is not None:
@@ -4854,6 +5163,12 @@ def _model_posterior_log_weights_for_fixed_x(
         return c, r"Gaussian-network diagonal AE log $p(z|\theta)$"
     if method == "x_flow_pca":
         return c, r"X-flow PCA log $p(z|\theta)$"
+    if method == "sir_xflow_lrank_t":
+        return c, r"SIR + linear X-flow low-rank log $p(z|\theta)$"
+    if method == "sir_xflow":
+        return c, r"SIR + X-flow log $p(z|\theta)$"
+    if method == "sir_thetaflow":
+        return c, r"SIR + theta-flow Bayes ratio on $z$"
     if method == "gaussian_x_flow":
         return c, r"Gaussian X-flow log $p(x|\theta)$"
     if method == "gaussian_x_flow_diagonal":
@@ -5535,6 +5850,12 @@ def _render_training_losses_panel(
             post_lab = "x-flow AE likelihood"
         elif tfm == "x_flow_pca":
             post_lab = "x-flow PCA likelihood"
+        elif tfm == "sir_xflow_lrank_t":
+            post_lab = "SIR + linear-x-flow low-rank likelihood"
+        elif tfm == "sir_xflow":
+            post_lab = "SIR + x-flow likelihood"
+        elif tfm == "sir_thetaflow":
+            post_lab = "SIR + theta-flow likelihood"
         elif tfm == "ctsm_v":
             post_lab = "pair-conditioned CTSM-v"
         elif tfm == "nf":
@@ -5978,6 +6299,12 @@ def _save_combined_convergence_figure(
             post_lab = "x-flow AE likelihood"
         elif tfm == "x_flow_pca":
             post_lab = "x-flow PCA likelihood"
+        elif tfm == "sir_xflow_lrank_t":
+            post_lab = "SIR + linear-x-flow low-rank likelihood"
+        elif tfm == "sir_xflow":
+            post_lab = "SIR + x-flow likelihood"
+        elif tfm == "sir_thetaflow":
+            post_lab = "SIR + theta-flow likelihood"
         elif tfm == "ctsm_v":
             post_lab = "pair-conditioned CTSM-v"
         elif tfm == "nf":
@@ -6482,6 +6809,7 @@ def _write_summary(
             "linear_x_flow_pure_cond_low_rank_t",
                 "linear_x_flow_lr_t_ts",
                             "linear_x_flow_low_rank_randb_t",
+            "sir_xflow_lrank_t",
             ):
             f.write(f"lxf_epochs: {int(getattr(args, 'lxf_epochs', 0))}\n")
             f.write(f"lxf_batch_size: {int(getattr(args, 'lxf_batch_size', 0))}\n")
@@ -6512,6 +6840,7 @@ def _write_summary(
                 "linear_x_flow_pure_low_rank_t",
                 "linear_x_flow_pure_cond_low_rank_t",
                         "linear_x_flow_lr_t_ts",
+                "sir_xflow_lrank_t",
                                     ):
                 f.write(
                     f"lxf_low_rank_divergence_estimator: {str(getattr(args, 'lxf_low_rank_divergence_estimator', 'hutchinson')).strip().lower()}\n"
@@ -6532,7 +6861,7 @@ def _write_summary(
             f.write(f"ltf_pair_batch_size: {int(getattr(args, 'ltf_pair_batch_size', 0))}\n")
             f.write(f"lxfs_early_patience: {int(getattr(args, 'lxfs_early_patience', 0))}\n")
             f.write(f"lxfs_pair_batch_size: {int(getattr(args, 'lxfs_pair_batch_size', 0))}\n")
-        if _tfm_sum in _TIME_LXF_METHODS:
+        if _tfm_sum in _TIME_LXF_METHODS or _tfm_sum == "sir_xflow_lrank_t":
             f.write(f"lxfs_path_schedule: {getattr(args, 'lxfs_path_schedule', '')}\n")
             f.write(f"lxfs_epochs: {int(getattr(args, 'lxfs_epochs', 0))}\n")
             f.write(f"lxfs_batch_size: {int(getattr(args, 'lxfs_batch_size', 0))}\n")
@@ -6549,6 +6878,10 @@ def _write_summary(
         if _tfm_sum == "x_flow_pca":
             f.write(f"flow_pca_dim: {int(getattr(args, 'flow_pca_dim', 0))}\n")
             f.write(f"flow_pca_num_bins: {getattr(args, 'flow_pca_num_bins', None)}\n")
+        if _tfm_sum in ("sir_xflow_lrank_t", "sir_xflow", "sir_thetaflow"):
+            f.write(f"sir_dim: {int(getattr(args, 'sir_dim', 0))}\n")
+            f.write(f"sir_num_bins: {int(getattr(args, 'sir_num_bins', 0))}\n")
+            f.write(f"sir_ridge: {float(getattr(args, 'sir_ridge', 0.0))}\n")
         if _tfm_sum == "nf_reduction":
             f.write(f"nfr_latent_dim: {int(getattr(args, 'nfr_latent_dim', 0))}\n")
             f.write(f"nfr_epochs: {int(getattr(args, 'nfr_epochs', 0))}\n")
@@ -7289,6 +7622,42 @@ def main(argv: list[str] | None = None) -> None:
             "uses ODE likelihood log p(z|theta), then DeltaL=C-diag(C), and H via 1-sech(DeltaL/2).",
             flush=True,
         )
+    elif tfm == "sir_xflow_lrank_t":
+        print(
+            f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
+            f"(sir_dim={int(getattr(args, 'sir_dim', 5))}; sir_num_bins={int(getattr(args, 'sir_num_bins', 10))}; "
+            "linear_x_flow_low_rank_t in SIR z-space)",
+            flush=True,
+        )
+        print(
+            "[convergence] sir_xflow_lrank_t mode fits SIR on train data, projects x to z, "
+            "then uses the scheduled linear_x_flow_low_rank_t bin likelihood in projected space.",
+            flush=True,
+        )
+    elif tfm == "sir_xflow":
+        print(
+            f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
+            f"(sir_dim={int(getattr(args, 'sir_dim', 5))}; sir_num_bins={int(getattr(args, 'sir_num_bins', 10))}; "
+            "x_flow on SIR z)",
+            flush=True,
+        )
+        print(
+            "[convergence] sir_xflow mode fits SIR on train data, projects x to z, "
+            "then runs conditional x-flow ODE likelihood on z.",
+            flush=True,
+        )
+    elif tfm == "sir_thetaflow":
+        print(
+            f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
+            f"(sir_dim={int(getattr(args, 'sir_dim', 5))}; sir_num_bins={int(getattr(args, 'sir_num_bins', 10))}; "
+            "theta_flow on SIR z)",
+            flush=True,
+        )
+        print(
+            "[convergence] sir_thetaflow mode fits SIR on train data, projects x to z, "
+            "then runs theta-flow Bayes-ratio estimation conditioning on z.",
+            flush=True,
+        )
     elif tfm == "linear_theta_flow":
         print(
             f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
@@ -7446,4 +7815,3 @@ def main(argv: list[str] | None = None) -> None:
             "then uses C[i,j]=log p(z_i|theta_j), DeltaL=C-diag(C), and H via 1-sech(DeltaL/2).",
             flush=True,
         )
-
