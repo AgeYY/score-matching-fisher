@@ -110,6 +110,7 @@ from fisher.hellinger_gt import (
     estimate_hellinger_sq_one_sided_mc,
     estimate_mean_llr_one_sided_mc,
 )
+from fisher.h_matrix import HMatrixEstimator
 from fisher.gaussian_network import (
     ConditionalDiagonalGaussianPrecisionMLP,
     ConditionalGaussianPrecisionMLP,
@@ -148,6 +149,29 @@ from fisher.linear_theta_flow import (
     ConditionalLinearThetaFlowMixtureMLP,
     compute_linear_theta_flow_c_matrix,
     train_linear_theta_flow,
+)
+from fisher.binned_theta_flow import (
+    BinPairBinaryClassifierMLP,
+    BinPosteriorClassifierMLP,
+    assemble_log_pi_pairwise_ls,
+    assign_theta_bins,
+    compute_h_from_c_matrix,
+    empirical_bin_priors,
+    local_flow_log_prob_matrix,
+    make_equal_width_theta_bins,
+    make_soft_theta_bins,
+    mixture_log_density_matrix,
+    multiclass_metrics_from_log_pi,
+    normalize_theta_in_bins,
+    predict_bin_log_probs,
+    predict_bin_pair_logit,
+    soft_theta_responsibilities,
+    train_bin_pair_binary_classifier,
+    train_bin_posterior_classifier,
+    train_local_flows,
+    train_smooth_weighted_local_flows,
+    train_soft_label_classifier,
+    unordered_bin_pairs,
 )
 from fisher.contrastive_llr import (
     ContrastiveAdditiveIndependentScorer,
@@ -523,6 +547,60 @@ def build_parser() -> argparse.ArgumentParser:
             "theta_flow only: estimate H using equal-width theta segments "
             "(orchestration in visualize_h_matrix_binned)."
         ),
+    )
+    p.add_argument("--binned-theta-flow-bins", type=int, default=2, help="binned_theta_flow only: number of theta mixture bins.")
+    p.add_argument("--binned-theta-flow-normalize-local", action="store_true", default=True, help="binned_theta_flow only: train local flows on u=(theta-a_k)/(b_k-a_k).")
+    p.add_argument("--no-binned-theta-flow-normalize-local", action="store_false", dest="binned_theta_flow_normalize_local")
+    p.add_argument("--binned-theta-flow-min-bin-count", type=int, default=2, help="binned_theta_flow only: minimum training rows required in every local bin.")
+    p.add_argument("--btf-cls-epochs", type=int, default=1000, help="binned_theta_flow classifier epochs.")
+    p.add_argument("--btf-cls-batch-size", type=int, default=256, help="binned_theta_flow classifier batch size.")
+    p.add_argument("--btf-cls-lr", type=float, default=1e-3, help="binned_theta_flow classifier learning rate.")
+    p.add_argument("--btf-cls-hidden-dim", type=int, default=128, help="binned_theta_flow classifier hidden width.")
+    p.add_argument("--btf-cls-depth", type=int, default=2, help="binned_theta_flow classifier depth.")
+    p.add_argument("--btf-cls-early-patience", type=int, default=100, help="binned_theta_flow classifier early-stop patience; <=0 disables early stop.")
+    p.add_argument("--btf-cls-early-min-delta", type=float, default=1e-4, help="binned_theta_flow classifier early-stop min delta.")
+    p.add_argument("--btf-cls-early-ema-alpha", type=float, default=0.05, help="binned_theta_flow classifier validation EMA alpha.")
+    p.add_argument(
+        "--binary-btf-balance-pairs",
+        action="store_true",
+        default=True,
+        help="binary_binned_theta_flow only: balanced WeightedRandomSampler per pairwise classifier.",
+    )
+    p.add_argument(
+        "--no-binary-btf-balance-pairs",
+        action="store_false",
+        dest="binary_btf_balance_pairs",
+        help="binary_binned_theta_flow only: disable class balancing for pairwise binaries.",
+    )
+    p.add_argument(
+        "--binary-btf-ls-ridge",
+        type=float,
+        default=1e-4,
+        help="binary_binned_theta_flow only: ridge λ on LSQ assembly of multinomial logits from pairwise log-ratios.",
+    )
+    p.add_argument(
+        "--binary-btf-min-pair-train",
+        type=int,
+        default=2,
+        help="binary_binned_theta_flow only: require at least this many training samples in each bin of a pair.",
+    )
+    p.add_argument(
+        "--smooth-binned-theta-flow-bins",
+        type=int,
+        default=2,
+        help="smooth_binned_theta_flow only: number of overlapping RBF mixture experts.",
+    )
+    p.add_argument(
+        "--smooth-binned-theta-flow-sigma",
+        type=float,
+        default=-1.0,
+        help="smooth_binned_theta_flow only: RBF bandwidth σ; <=0 auto-sets σ = (mean adjacent center spacing) / 4.",
+    )
+    p.add_argument(
+        "--smooth-binned-theta-flow-center-mode",
+        type=str,
+        default="uniform",
+        help="smooth_binned_theta_flow only: RBF center placement {uniform, quantile}.",
     )
     p.add_argument(
         "--clf-min-class-count",
@@ -1854,7 +1932,95 @@ def _validate_cli(args: argparse.Namespace) -> None:
     ) else _normalize_gaussian_network_method(tfm)
     flow_ae_norm = _normalize_flow_autoencoder_method(tfm)
     flow_pca_norm = _normalize_flow_pca_method(tfm)
-    if contrastive_norm is not None:
+    if tfm in {"binned_theta_flow", "binned-theta-flow", "btf"}:
+        setattr(args, "theta_field_method", "binned_theta_flow")
+        tfm = "binned_theta_flow"
+        if int(getattr(args, "binned_theta_flow_bins", 2)) < 2:
+            raise ValueError("--binned-theta-flow-bins must be >= 2.")
+        if int(getattr(args, "binned_theta_flow_min_bin_count", 2)) < 1:
+            raise ValueError("--binned-theta-flow-min-bin-count must be >= 1.")
+        if str(getattr(args, "flow_arch", "mlp")).strip().lower() != "mlp":
+            raise ValueError("binned_theta_flow v1 supports --flow-arch mlp only.")
+        if int(getattr(args, "btf_cls_epochs", 0)) < 1:
+            raise ValueError("--btf-cls-epochs must be >= 1.")
+        if int(getattr(args, "btf_cls_batch_size", 0)) < 1:
+            raise ValueError("--btf-cls-batch-size must be >= 1.")
+        if float(getattr(args, "btf_cls_lr", 0.0)) <= 0.0:
+            raise ValueError("--btf-cls-lr must be > 0.")
+        if int(getattr(args, "btf_cls_hidden_dim", 0)) < 1:
+            raise ValueError("--btf-cls-hidden-dim must be >= 1.")
+        if int(getattr(args, "btf_cls_depth", 0)) < 1:
+            raise ValueError("--btf-cls-depth must be >= 1.")
+        if int(getattr(args, "btf_cls_early_patience", 0)) < 0:
+            raise ValueError("--btf-cls-early-patience must be >= 0.")
+        if float(getattr(args, "btf_cls_early_min_delta", 0.0)) < 0.0:
+            raise ValueError("--btf-cls-early-min-delta must be >= 0.")
+        alpha_btf = float(getattr(args, "btf_cls_early_ema_alpha", 0.0))
+        if not np.isfinite(alpha_btf) or alpha_btf <= 0.0 or alpha_btf > 1.0:
+            raise ValueError("--btf-cls-early-ema-alpha must be in (0, 1].")
+    elif tfm in {"binary_binned_theta_flow", "binary-binned-theta-flow", "bbin"}:
+        setattr(args, "theta_field_method", "binary_binned_theta_flow")
+        tfm = "binary_binned_theta_flow"
+        if int(getattr(args, "binned_theta_flow_bins", 2)) < 2:
+            raise ValueError("--binned-theta-flow-bins must be >= 2.")
+        if int(getattr(args, "binned_theta_flow_min_bin_count", 2)) < 1:
+            raise ValueError("--binned-theta-flow-min-bin-count must be >= 1.")
+        if str(getattr(args, "flow_arch", "mlp")).strip().lower() != "mlp":
+            raise ValueError("binary_binned_theta_flow v1 supports --flow-arch mlp only.")
+        if int(getattr(args, "btf_cls_epochs", 0)) < 1:
+            raise ValueError("--btf-cls-epochs must be >= 1.")
+        if int(getattr(args, "btf_cls_batch_size", 0)) < 1:
+            raise ValueError("--btf-cls-batch-size must be >= 1.")
+        if float(getattr(args, "btf_cls_lr", 0.0)) <= 0.0:
+            raise ValueError("--btf-cls-lr must be > 0.")
+        if int(getattr(args, "btf_cls_hidden_dim", 0)) < 1:
+            raise ValueError("--btf-cls-hidden-dim must be >= 1.")
+        if int(getattr(args, "btf_cls_depth", 0)) < 1:
+            raise ValueError("--btf-cls-depth must be >= 1.")
+        if int(getattr(args, "btf_cls_early_patience", 0)) < 0:
+            raise ValueError("--btf-cls-early-patience must be >= 0.")
+        if float(getattr(args, "btf_cls_early_min_delta", 0.0)) < 0.0:
+            raise ValueError("--btf-cls-early-min-delta must be >= 0.")
+        alpha_bbin = float(getattr(args, "btf_cls_early_ema_alpha", 0.0))
+        if not np.isfinite(alpha_bbin) or alpha_bbin <= 0.0 or alpha_bbin > 1.0:
+            raise ValueError("--btf-cls-early-ema-alpha must be in (0, 1].")
+        ridge_bb = float(getattr(args, "binary_btf_ls_ridge", 0.0))
+        if not np.isfinite(ridge_bb) or ridge_bb < 0.0:
+            raise ValueError("--binary-btf-ls-ridge must be finite and >= 0.")
+        if int(getattr(args, "binary_btf_min_pair_train", 0)) < 1:
+            raise ValueError("--binary-btf-min-pair-train must be >= 1.")
+    elif tfm in {"smooth_binned_theta_flow", "smooth-binned-theta-flow", "sbtf"}:
+        setattr(args, "theta_field_method", "smooth_binned_theta_flow")
+        tfm = "smooth_binned_theta_flow"
+        if int(getattr(args, "smooth_binned_theta_flow_bins", 2)) < 2:
+            raise ValueError("--smooth-binned-theta-flow-bins must be >= 2.")
+        if str(getattr(args, "flow_arch", "mlp")).strip().lower() != "mlp":
+            raise ValueError("smooth_binned_theta_flow v1 supports --flow-arch mlp only.")
+        if int(getattr(args, "btf_cls_epochs", 0)) < 1:
+            raise ValueError("--btf-cls-epochs must be >= 1.")
+        if int(getattr(args, "btf_cls_batch_size", 0)) < 1:
+            raise ValueError("--btf-cls-batch-size must be >= 1.")
+        if float(getattr(args, "btf_cls_lr", 0.0)) <= 0.0:
+            raise ValueError("--btf-cls-lr must be > 0.")
+        if int(getattr(args, "btf_cls_hidden_dim", 0)) < 1:
+            raise ValueError("--btf-cls-hidden-dim must be >= 1.")
+        if int(getattr(args, "btf_cls_depth", 0)) < 1:
+            raise ValueError("--btf-cls-depth must be >= 1.")
+        if int(getattr(args, "btf_cls_early_patience", 0)) < 0:
+            raise ValueError("--btf-cls-early-patience must be >= 0.")
+        if float(getattr(args, "btf_cls_early_min_delta", 0.0)) < 0.0:
+            raise ValueError("--btf-cls-early-min-delta must be >= 0.")
+        alpha_sbtf = float(getattr(args, "btf_cls_early_ema_alpha", 0.0))
+        if not np.isfinite(alpha_sbtf) or alpha_sbtf <= 0.0 or alpha_sbtf > 1.0:
+            raise ValueError("--btf-cls-early-ema-alpha must be in (0, 1].")
+        cm = str(getattr(args, "smooth_binned_theta_flow_center_mode", "uniform")).strip().lower()
+        if cm not in ("uniform", "quantile"):
+            raise ValueError("--smooth-binned-theta-flow-center-mode must be one of: uniform, quantile.")
+        setattr(args, "smooth_binned_theta_flow_center_mode", cm)
+        sig_s = float(getattr(args, "smooth_binned_theta_flow_sigma", -1.0))
+        if np.isfinite(sig_s) and sig_s > 0.0 and sig_s < 1e-12:
+            raise ValueError("--smooth-binned-theta-flow-sigma must be <=0 (auto) or sufficiently positive.")
+    elif contrastive_norm is not None:
         setattr(args, "theta_field_method", contrastive_norm)
         _validate_contrastive_cli(args)
         tfm = contrastive_norm
@@ -2004,6 +2170,9 @@ def _validate_cli(args: argparse.Namespace) -> None:
         "bidir_contrastive_soft",
         "contrastive_soft_gaussian_net",
         "contrastive_soft_gaussian_net_no_finetune",
+        "binned_theta_flow",
+        "binary_binned_theta_flow",
+        "smooth_binned_theta_flow",
     ):
         validate_estimation_args(args)
     if int(args.num_theta_bins) < 1:
@@ -2268,6 +2437,31 @@ class SweepSubset(NamedTuple):
     bin_validation: np.ndarray
 
 
+def _subset_bundle_train_prefix_length(n: int, meta: dict) -> int:
+    """Train prefix length for the first ``n`` samples in perm order (matches ``make_dataset`` / ``_subset_bundle``)."""
+    n = int(n)
+    tf = float(meta["train_frac"])
+    if tf >= 1.0:
+        return n
+    n_train = int(tf * n)
+    return min(max(n_train, 1), n - 1)
+
+
+def _subset_x_train_all_from_bundle(
+    bundle: SharedDatasetBundle,
+    perm: np.ndarray,
+    n: int,
+    meta: dict,
+) -> tuple[np.ndarray, np.ndarray]:
+    """``x_train``, ``x_all`` on the first ``n`` permuted rows; split matches ``_subset_bundle``."""
+    n = int(n)
+    sub_perm = perm[:n]
+    x_all = np.asarray(bundle.x_all[sub_perm], dtype=np.float64)
+    n_train = _subset_bundle_train_prefix_length(n, meta)
+    x_train = x_all[:n_train]
+    return x_train, x_all
+
+
 def _subset_bundle(
     bundle: SharedDatasetBundle,
     perm: np.ndarray,
@@ -2290,12 +2484,7 @@ def _subset_bundle(
     bin_all = np.asarray(bin_idx_all[sub_perm], dtype=np.int64).reshape(-1)
     if bin_all.shape[0] != n:
         raise ValueError("bin_idx_all subset length mismatch.")
-    tf = float(meta["train_frac"])
-    if tf >= 1.0:
-        n_train = n
-    else:
-        n_train = int(tf * n)
-        n_train = min(max(n_train, 1), n - 1)
+    n_train = _subset_bundle_train_prefix_length(n, meta)
     theta_train = theta_all[:n_train]
     x_train = x_all[:n_train]
     theta_validation = theta_all[n_train:]
@@ -2737,12 +2926,28 @@ def _pairwise_clf_from_bundle(
     n_bins: int,
     clf_min_class_count: int,
     clf_random_state: int,
+    decode_x_train: np.ndarray | None = None,
+    decode_x_all: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Pairwise bin decoding: train on NPZ train rows, accuracy on NPZ full pool."""
+    """Pairwise bin decoding: train on NPZ train rows, accuracy on NPZ full pool.
+
+    Optional ``decode_x_train`` / ``decode_x_all`` override features (e.g. native z_dim x while
+    ``subset.bundle`` still carries embedded x for score training).
+    """
+    x_tr = (
+        np.asarray(decode_x_train, dtype=np.float64)
+        if decode_x_train is not None
+        else np.asarray(subset.bundle.x_train, dtype=np.float64)
+    )
+    x_ev = (
+        np.asarray(decode_x_all, dtype=np.float64)
+        if decode_x_all is not None
+        else np.asarray(subset.bundle.x_all, dtype=np.float64)
+    )
     clf_acc, _, _, _ = vhb.pairwise_bin_logistic_accuracy_train_val(
-        subset.bundle.x_train,
+        x_tr,
         subset.bin_train,
-        subset.bundle.x_all,
+        x_ev,
         subset.bin_all,
         n_bins,
         min_class_count=int(clf_min_class_count),
@@ -2764,6 +2969,602 @@ def _estimate_one(
 ) -> tuple[vhb.LoadedHMatrix, np.ndarray, torch.device]:
     """Train (unless h-only), load H, return loaded H, x_aligned, and device."""
     tfm = str(getattr(args, "theta_field_method", "theta_flow")).strip().lower()
+    if tfm in {"smooth_binned_theta_flow", "smooth-binned-theta-flow", "sbtf"}:
+        method_name = "smooth_binned_theta_flow"
+        dev = require_device(str(getattr(args, "device", "cuda")))
+        os.makedirs(output_dir, exist_ok=True)
+        theta_train = np.asarray(bundle.theta_train, dtype=np.float64)
+        theta_val = np.asarray(bundle.theta_validation, dtype=np.float64)
+        theta_all = np.asarray(bundle.theta_all, dtype=np.float64)
+        x_train = np.asarray(bundle.x_train, dtype=np.float64)
+        x_val = np.asarray(bundle.x_validation, dtype=np.float64)
+        x_all = np.asarray(bundle.x_all, dtype=np.float64)
+        if theta_train.ndim == 1:
+            theta_train = theta_train.reshape(-1, 1)
+        if theta_val.ndim == 1:
+            theta_val = theta_val.reshape(-1, 1)
+        if theta_all.ndim == 1:
+            theta_all = theta_all.reshape(-1, 1)
+        if theta_train.ndim != 2 or theta_val.ndim != 2 or theta_all.ndim != 2:
+            raise ValueError("smooth_binned_theta_flow expects theta arrays to be 1D or 2D.")
+        if int(theta_train.shape[1]) != 1 or int(theta_all.shape[1]) != 1:
+            raise ValueError("smooth_binned_theta_flow v1 supports scalar theta only.")
+        if x_train.ndim != 2 or x_val.ndim != 2 or x_all.ndim != 2:
+            raise ValueError("smooth_binned_theta_flow expects x arrays to be 2D.")
+
+        k_mix = int(getattr(args, "smooth_binned_theta_flow_bins", 2))
+        sigma_cli = float(getattr(args, "smooth_binned_theta_flow_sigma", -1.0))
+        cm = str(getattr(args, "smooth_binned_theta_flow_center_mode", "uniform"))
+        soft_spec = make_soft_theta_bins(
+            theta_all[:, 0],
+            k_mix,
+            center_mode=cm,
+            sigma=None if sigma_cli <= 0.0 else sigma_cli,
+        )
+        print(
+            "[smooth_binned_theta_flow] "
+            f"K={k_mix} center_mode={soft_spec.center_mode} sigma={soft_spec.sigma:.6g} "
+            f"centers={np.array2string(soft_spec.centers, precision=4)}",
+            flush=True,
+        )
+
+        r_train = soft_theta_responsibilities(theta_train[:, 0], soft_spec.centers, soft_spec.sigma)
+        r_val = soft_theta_responsibilities(theta_val[:, 0], soft_spec.centers, soft_spec.sigma)
+
+        cls_model = BinPosteriorClassifierMLP(
+            x_dim=int(x_all.shape[1]),
+            n_bins=k_mix,
+            hidden_dim=int(getattr(args, "btf_cls_hidden_dim", 128)),
+            depth=int(getattr(args, "btf_cls_depth", 2)),
+        ).to(dev)
+        cls_out = train_soft_label_classifier(
+            model=cls_model,
+            x_train=x_train,
+            r_train=r_train,
+            x_val=x_val,
+            r_val=r_val,
+            device=dev,
+            epochs=int(getattr(args, "btf_cls_epochs", 1000)),
+            batch_size=int(getattr(args, "btf_cls_batch_size", 256)),
+            lr=float(getattr(args, "btf_cls_lr", 1e-3)),
+            early_patience=int(getattr(args, "btf_cls_early_patience", 100)),
+            early_min_delta=float(getattr(args, "btf_cls_early_min_delta", 1e-4)),
+            early_ema_alpha=float(getattr(args, "btf_cls_early_ema_alpha", 0.05)),
+            log_every=max(1, int(getattr(args, "log_every", 50))),
+        )
+        local_models, local_outs, mass_train, mass_val = train_smooth_weighted_local_flows(
+            theta_train=theta_train[:, 0],
+            x_train=x_train,
+            r_train=r_train,
+            theta_val=theta_val[:, 0],
+            x_val=x_val,
+            r_val=r_val,
+            device=dev,
+            x_dim=int(x_all.shape[1]),
+            hidden_dim=int(getattr(args, "flow_hidden_dim", 128)),
+            depth=int(getattr(args, "flow_depth", 3)),
+            epochs=int(getattr(args, "flow_epochs", 10000)),
+            batch_size=int(getattr(args, "flow_batch_size", 256)),
+            lr=float(getattr(args, "flow_lr", 1e-3)),
+            log_every=max(1, int(getattr(args, "log_every", 50))),
+            early_patience=int(getattr(args, "flow_early_patience", 1000)),
+            early_min_delta=float(getattr(args, "flow_early_min_delta", 1e-4)),
+            early_ema_alpha=float(getattr(args, "flow_early_ema_alpha", 0.05)),
+            restore_best=bool(getattr(args, "flow_restore_best", True)),
+            scheduler_name=str(getattr(args, "flow_scheduler", "cosine")),
+            endpoint_loss_weight=float(getattr(args, "flow_endpoint_loss_weight", 0.0)),
+            endpoint_ode_steps=int(getattr(args, "flow_endpoint_steps", 20)),
+            fm_t_eps=float(getattr(args, "flow_fm_t_eps", 0.05)),
+        )
+
+        log_pi = predict_bin_log_probs(
+            model=cls_model,
+            x=x_all,
+            device=dev,
+            batch_size=int(getattr(args, "btf_cls_batch_size", 256)),
+        )
+        theta_eval_cols = np.asarray(theta_all[:, 0], dtype=np.float32)
+        flow_ode_steps = int(getattr(args, "flow_ode_steps", 64))
+        exact_div = bool(getattr(args, "flow_likelihood_exact_divergence", False))
+        pair_batch = int(getattr(args, "h_batch_size", 65536))
+        log_q_list: list[np.ndarray] = []
+        for model_k in local_models:
+            log_q_list.append(
+                local_flow_log_prob_matrix(
+                    model=model_k,
+                    theta_eval=theta_eval_cols,
+                    x_all=x_all,
+                    device=dev,
+                    pair_batch_size=pair_batch,
+                    ode_steps=flow_ode_steps,
+                    exact_divergence=exact_div,
+                )
+            )
+        c_matrix = mixture_log_density_matrix(log_pi=log_pi, log_q_experts=log_q_list)
+        if not np.all(np.isfinite(c_matrix)):
+            raise RuntimeError("smooth_binned_theta_flow produced non-finite entries in c_matrix.")
+        delta_l, h_sym = compute_h_from_c_matrix(c_matrix)
+        h_directed = HMatrixEstimator.compute_h_directed(delta_l)
+
+        empty = np.asarray([], dtype=np.float64)
+        np.savez_compressed(
+            os.path.join(output_dir, "h_matrix_results_theta_cov.npz"),
+            theta_used=np.asarray(theta_all.reshape(-1), dtype=np.float64),
+            h_sym=np.asarray(h_sym, dtype=np.float64),
+            c_matrix=np.asarray(c_matrix, dtype=np.float64),
+            delta_l_matrix=np.asarray(delta_l, dtype=np.float64),
+            h_directed=np.asarray(h_directed, dtype=np.float64),
+            h_field_method=np.asarray([method_name], dtype=object),
+            theta_field_method=np.asarray([method_name], dtype=object),
+            smooth_binned_theta_flow_centers=np.asarray(soft_spec.centers, dtype=np.float64),
+            smooth_binned_theta_flow_sigma=np.float64(soft_spec.sigma),
+            smooth_binned_theta_flow_center_mode=np.asarray([soft_spec.center_mode], dtype=object),
+            smooth_binned_theta_flow_r_mass_train=np.asarray(mass_train, dtype=np.float64),
+            smooth_binned_theta_flow_r_mass_val=np.asarray(mass_val, dtype=np.float64),
+            smooth_binned_theta_flow_classifier_val_soft_ce=np.float64(cls_out["val_soft_cross_entropy"]),
+            smooth_binned_theta_flow_classifier_val_soft_brier=np.float64(cls_out["val_soft_brier"]),
+        )
+        np.savez_compressed(
+            os.path.join(output_dir, "score_prior_training_losses.npz"),
+            theta_field_method=np.asarray([method_name], dtype=object),
+            prior_enable=np.bool_(False),
+            score_train_losses=np.asarray(cls_out["train_losses"], dtype=np.float64),
+            score_val_losses=np.asarray(cls_out["val_losses"], dtype=np.float64),
+            score_val_monitor_losses=np.asarray(cls_out["val_monitor_losses"], dtype=np.float64),
+            score_best_epoch=np.int64(cls_out["best_epoch"]),
+            score_stopped_epoch=np.int64(cls_out["stopped_epoch"]),
+            score_stopped_early=np.bool_(cls_out["stopped_early"]),
+            score_best_val_smooth=np.float64(cls_out["best_val_loss"]),
+            score_likelihood_finetune_train_losses=empty,
+            score_likelihood_finetune_val_losses=empty,
+            score_likelihood_finetune_val_monitor_losses=empty,
+            prior_train_losses=empty,
+            prior_val_losses=empty,
+            prior_val_monitor_losses=empty,
+            prior_likelihood_finetune_train_losses=empty,
+            prior_likelihood_finetune_val_losses=empty,
+            prior_likelihood_finetune_val_monitor_losses=empty,
+            smooth_binned_theta_flow_local_train_losses=np.asarray([o["train_losses"] for o in local_outs], dtype=object),
+            smooth_binned_theta_flow_local_val_losses=np.asarray([o["val_losses"] for o in local_outs], dtype=object),
+            smooth_binned_theta_flow_local_train_fm_losses=np.asarray([o["train_fm_losses"] for o in local_outs], dtype=object),
+            smooth_binned_theta_flow_local_val_fm_losses=np.asarray([o["val_fm_losses"] for o in local_outs], dtype=object),
+            smooth_binned_theta_flow_classifier_val_soft_ce=np.float64(cls_out["val_soft_cross_entropy"]),
+            smooth_binned_theta_flow_classifier_val_soft_brier=np.float64(cls_out["val_soft_brier"]),
+        )
+        loaded = SimpleNamespace(
+            h_sym=np.asarray(h_sym, dtype=np.float64),
+            c_matrix=np.asarray(c_matrix, dtype=np.float64),
+            delta_l_matrix=np.asarray(delta_l, dtype=np.float64),
+            theta_used=np.asarray(theta_all.reshape(-1), dtype=np.float64),
+        )
+        return cast(vhb.LoadedHMatrix, loaded), x_all, dev
+
+    if tfm in {"binned_theta_flow", "binned-theta-flow", "btf"}:
+        method_name = "binned_theta_flow"
+        dev = require_device(str(getattr(args, "device", "cuda")))
+        os.makedirs(output_dir, exist_ok=True)
+        theta_train = np.asarray(bundle.theta_train, dtype=np.float64)
+        theta_val = np.asarray(bundle.theta_validation, dtype=np.float64)
+        theta_all = np.asarray(bundle.theta_all, dtype=np.float64)
+        x_train = np.asarray(bundle.x_train, dtype=np.float64)
+        x_val = np.asarray(bundle.x_validation, dtype=np.float64)
+        x_all = np.asarray(bundle.x_all, dtype=np.float64)
+        if theta_train.ndim == 1:
+            theta_train = theta_train.reshape(-1, 1)
+        if theta_val.ndim == 1:
+            theta_val = theta_val.reshape(-1, 1)
+        if theta_all.ndim == 1:
+            theta_all = theta_all.reshape(-1, 1)
+        if theta_train.ndim != 2 or theta_val.ndim != 2 or theta_all.ndim != 2:
+            raise ValueError("binned_theta_flow expects theta arrays to be 1D or 2D.")
+        if int(theta_train.shape[1]) != 1 or int(theta_all.shape[1]) != 1:
+            raise ValueError("binned_theta_flow v1 supports scalar theta only.")
+        if x_train.ndim != 2 or x_val.ndim != 2 or x_all.ndim != 2:
+            raise ValueError("binned_theta_flow expects x arrays to be 2D.")
+
+        k_mix = int(getattr(args, "binned_theta_flow_bins", 2))
+        spec = make_equal_width_theta_bins(theta_all[:, 0], k_mix)
+        labels_train = assign_theta_bins(theta_train[:, 0], spec)
+        labels_val = assign_theta_bins(theta_val[:, 0], spec)
+        labels_all = assign_theta_bins(theta_all[:, 0], spec)
+        normalize_local = bool(getattr(args, "binned_theta_flow_normalize_local", True))
+        min_bin_count = int(getattr(args, "binned_theta_flow_min_bin_count", 2))
+        print(
+            "[binned_theta_flow] "
+            f"K={k_mix} normalize_local={normalize_local} min_bin_count={min_bin_count} "
+            f"edges={np.array2string(spec.edges, precision=4)}",
+            flush=True,
+        )
+
+        cls_model = BinPosteriorClassifierMLP(
+            x_dim=int(x_all.shape[1]),
+            n_bins=k_mix,
+            hidden_dim=int(getattr(args, "btf_cls_hidden_dim", 128)),
+            depth=int(getattr(args, "btf_cls_depth", 2)),
+        ).to(dev)
+        cls_out = train_bin_posterior_classifier(
+            model=cls_model,
+            x_train=x_train,
+            y_train=labels_train,
+            x_val=x_val,
+            y_val=labels_val,
+            device=dev,
+            epochs=int(getattr(args, "btf_cls_epochs", 1000)),
+            batch_size=int(getattr(args, "btf_cls_batch_size", 256)),
+            lr=float(getattr(args, "btf_cls_lr", 1e-3)),
+            early_patience=int(getattr(args, "btf_cls_early_patience", 100)),
+            early_min_delta=float(getattr(args, "btf_cls_early_min_delta", 1e-4)),
+            early_ema_alpha=float(getattr(args, "btf_cls_early_ema_alpha", 0.05)),
+            log_every=max(1, int(getattr(args, "log_every", 50))),
+        )
+        local_models, local_outs, counts_train, counts_val = train_local_flows(
+            spec=spec,
+            theta_train=theta_train[:, 0],
+            x_train=x_train,
+            labels_train=labels_train,
+            theta_val=theta_val[:, 0],
+            x_val=x_val,
+            labels_val=labels_val,
+            device=dev,
+            normalize_local=normalize_local,
+            min_bin_count=min_bin_count,
+            x_dim=int(x_all.shape[1]),
+            hidden_dim=int(getattr(args, "flow_hidden_dim", 128)),
+            depth=int(getattr(args, "flow_depth", 3)),
+            epochs=int(getattr(args, "flow_epochs", 10000)),
+            batch_size=int(getattr(args, "flow_batch_size", 256)),
+            lr=float(getattr(args, "flow_lr", 1e-3)),
+            log_every=max(1, int(getattr(args, "log_every", 50))),
+            early_patience=int(getattr(args, "flow_early_patience", 1000)),
+            early_min_delta=float(getattr(args, "flow_early_min_delta", 1e-4)),
+            early_ema_alpha=float(getattr(args, "flow_early_ema_alpha", 0.05)),
+            restore_best=bool(getattr(args, "flow_restore_best", True)),
+            scheduler_name=str(getattr(args, "flow_scheduler", "cosine")),
+            endpoint_loss_weight=float(getattr(args, "flow_endpoint_loss_weight", 0.0)),
+            endpoint_ode_steps=int(getattr(args, "flow_endpoint_steps", 20)),
+            fm_t_eps=float(getattr(args, "flow_fm_t_eps", 0.05)),
+        )
+
+        log_pi = predict_bin_log_probs(
+            model=cls_model,
+            x=x_all,
+            device=dev,
+            batch_size=int(getattr(args, "btf_cls_batch_size", 256)),
+        )
+        c_matrix = np.full((int(x_all.shape[0]), int(theta_all.shape[0])), np.nan, dtype=np.float64)
+        flow_ode_steps = int(getattr(args, "flow_ode_steps", 64))
+        exact_div = bool(getattr(args, "flow_likelihood_exact_divergence", False))
+        pair_batch = int(getattr(args, "h_batch_size", 65536))
+        for k, model_k in enumerate(local_models):
+            col_mask = labels_all == k
+            if not np.any(col_mask):
+                continue
+            theta_eval = (
+                normalize_theta_in_bins(theta_all[col_mask, 0], labels_all[col_mask], spec).reshape(-1)
+                if normalize_local
+                else theta_all[col_mask, 0]
+            )
+            log_q = local_flow_log_prob_matrix(
+                model=model_k,
+                theta_eval=theta_eval,
+                x_all=x_all,
+                device=dev,
+                pair_batch_size=pair_batch,
+                ode_steps=flow_ode_steps,
+                exact_divergence=exact_div,
+            )
+            if normalize_local:
+                log_q = log_q - float(np.log(spec.widths[k]))
+            c_matrix[:, col_mask] = log_q + log_pi[:, [k]]
+        if not np.all(np.isfinite(c_matrix)):
+            raise RuntimeError("binned_theta_flow produced non-finite entries in c_matrix.")
+        delta_l, h_sym = compute_h_from_c_matrix(c_matrix)
+        h_directed = HMatrixEstimator.compute_h_directed(delta_l)
+
+        empty = np.asarray([], dtype=np.float64)
+        np.savez_compressed(
+            os.path.join(output_dir, "h_matrix_results_theta_cov.npz"),
+            theta_used=np.asarray(theta_all.reshape(-1), dtype=np.float64),
+            h_sym=np.asarray(h_sym, dtype=np.float64),
+            c_matrix=np.asarray(c_matrix, dtype=np.float64),
+            delta_l_matrix=np.asarray(delta_l, dtype=np.float64),
+            h_directed=np.asarray(h_directed, dtype=np.float64),
+            h_field_method=np.asarray([method_name], dtype=object),
+            theta_field_method=np.asarray([method_name], dtype=object),
+            binned_theta_flow_edges=np.asarray(spec.edges, dtype=np.float64),
+            binned_theta_flow_widths=np.asarray(spec.widths, dtype=np.float64),
+            binned_theta_flow_centers=np.asarray(spec.centers, dtype=np.float64),
+            binned_theta_flow_labels_all=np.asarray(labels_all, dtype=np.int64),
+            binned_theta_flow_counts_train=np.asarray(counts_train, dtype=np.int64),
+            binned_theta_flow_counts_val=np.asarray(counts_val, dtype=np.int64),
+            binned_theta_flow_normalize_local=np.bool_(normalize_local),
+            binned_theta_flow_classifier_val_nll=np.float64(cls_out["val_nll"]),
+            binned_theta_flow_classifier_val_brier=np.float64(cls_out["val_brier"]),
+            binned_theta_flow_classifier_val_accuracy=np.float64(cls_out["val_accuracy"]),
+            binned_theta_flow_classifier_val_ece=np.float64(cls_out["val_ece"]),
+        )
+        np.savez_compressed(
+            os.path.join(output_dir, "score_prior_training_losses.npz"),
+            theta_field_method=np.asarray([method_name], dtype=object),
+            prior_enable=np.bool_(False),
+            score_train_losses=np.asarray(cls_out["train_losses"], dtype=np.float64),
+            score_val_losses=np.asarray(cls_out["val_losses"], dtype=np.float64),
+            score_val_monitor_losses=np.asarray(cls_out["val_monitor_losses"], dtype=np.float64),
+            score_best_epoch=np.int64(cls_out["best_epoch"]),
+            score_stopped_epoch=np.int64(cls_out["stopped_epoch"]),
+            score_stopped_early=np.bool_(cls_out["stopped_early"]),
+            score_best_val_smooth=np.float64(cls_out["best_val_loss"]),
+            score_likelihood_finetune_train_losses=empty,
+            score_likelihood_finetune_val_losses=empty,
+            score_likelihood_finetune_val_monitor_losses=empty,
+            prior_train_losses=empty,
+            prior_val_losses=empty,
+            prior_val_monitor_losses=empty,
+            prior_likelihood_finetune_train_losses=empty,
+            prior_likelihood_finetune_val_losses=empty,
+            prior_likelihood_finetune_val_monitor_losses=empty,
+            binned_theta_flow_local_train_losses=np.asarray([o["train_losses"] for o in local_outs], dtype=object),
+            binned_theta_flow_local_val_losses=np.asarray([o["val_losses"] for o in local_outs], dtype=object),
+            binned_theta_flow_counts_train=np.asarray(counts_train, dtype=np.int64),
+            binned_theta_flow_counts_val=np.asarray(counts_val, dtype=np.int64),
+            binned_theta_flow_classifier_val_nll=np.float64(cls_out["val_nll"]),
+            binned_theta_flow_classifier_val_brier=np.float64(cls_out["val_brier"]),
+            binned_theta_flow_classifier_val_accuracy=np.float64(cls_out["val_accuracy"]),
+            binned_theta_flow_classifier_val_ece=np.float64(cls_out["val_ece"]),
+        )
+        loaded = SimpleNamespace(
+            h_sym=np.asarray(h_sym, dtype=np.float64),
+            c_matrix=np.asarray(c_matrix, dtype=np.float64),
+            delta_l_matrix=np.asarray(delta_l, dtype=np.float64),
+            theta_used=np.asarray(theta_all.reshape(-1), dtype=np.float64),
+        )
+        return cast(vhb.LoadedHMatrix, loaded), x_all, dev
+
+    if tfm in {"binary_binned_theta_flow", "binary-binned-theta-flow", "bbin"}:
+        method_name = "binary_binned_theta_flow"
+        dev = require_device(str(getattr(args, "device", "cuda")))
+        os.makedirs(output_dir, exist_ok=True)
+        theta_train = np.asarray(bundle.theta_train, dtype=np.float64)
+        theta_val = np.asarray(bundle.theta_validation, dtype=np.float64)
+        theta_all = np.asarray(bundle.theta_all, dtype=np.float64)
+        x_train = np.asarray(bundle.x_train, dtype=np.float64)
+        x_val = np.asarray(bundle.x_validation, dtype=np.float64)
+        x_all = np.asarray(bundle.x_all, dtype=np.float64)
+        if theta_train.ndim == 1:
+            theta_train = theta_train.reshape(-1, 1)
+        if theta_val.ndim == 1:
+            theta_val = theta_val.reshape(-1, 1)
+        if theta_all.ndim == 1:
+            theta_all = theta_all.reshape(-1, 1)
+        if theta_train.ndim != 2 or theta_val.ndim != 2 or theta_all.ndim != 2:
+            raise ValueError("binary_binned_theta_flow expects theta arrays to be 1D or 2D.")
+        if int(theta_train.shape[1]) != 1 or int(theta_all.shape[1]) != 1:
+            raise ValueError("binary_binned_theta_flow v1 supports scalar theta only.")
+        if x_train.ndim != 2 or x_val.ndim != 2 or x_all.ndim != 2:
+            raise ValueError("binary_binned_theta_flow expects x arrays to be 2D.")
+
+        k_mix = int(getattr(args, "binned_theta_flow_bins", 2))
+        spec = make_equal_width_theta_bins(theta_all[:, 0], k_mix)
+        labels_train = assign_theta_bins(theta_train[:, 0], spec)
+        labels_val = assign_theta_bins(theta_val[:, 0], spec)
+        labels_all = assign_theta_bins(theta_all[:, 0], spec)
+        normalize_local = bool(getattr(args, "binned_theta_flow_normalize_local", True))
+        min_bin_count = int(getattr(args, "binned_theta_flow_min_bin_count", 2))
+        min_pair = int(getattr(args, "binary_btf_min_pair_train", 2))
+        ridge_ls = float(getattr(args, "binary_btf_ls_ridge", 1e-4))
+        balance_pairs = bool(getattr(args, "binary_btf_balance_pairs", True))
+        print(
+            "[binary_binned_theta_flow] "
+            f"K={k_mix} normalize_local={normalize_local} min_bin_count={min_bin_count} "
+            f"min_pair_train={min_pair} balance_pairs={balance_pairs} ls_ridge={ridge_ls} "
+            f"edges={np.array2string(spec.edges, precision=4)}",
+            flush=True,
+        )
+
+        priors = empirical_bin_priors(labels_train, k_mix)
+        pairs = unordered_bin_pairs(k_mix)
+        P = len(pairs)
+        pair_sample_counts = np.zeros((k_mix, k_mix), dtype=np.int64)
+        pair_models: list[BinPairBinaryClassifierMLP] = []
+        pair_cls_outs: list[dict[str, Any]] = []
+        bsz_cls = int(getattr(args, "btf_cls_batch_size", 256))
+        for _, (a, b) in enumerate(pairs):
+            mask_tr = (labels_train == a) | (labels_train == b)
+            n_a = int(np.sum(labels_train[mask_tr] == a))
+            n_b = int(np.sum(labels_train[mask_tr] == b))
+            pair_sample_counts[a, b] = n_a
+            pair_sample_counts[b, a] = n_b
+            if n_a < min_pair or n_b < min_pair:
+                raise ValueError(
+                    f"binary_binned_theta_flow pair ({a},{b}): need >= {min_pair} training points per bin; "
+                    f"got n_{a}={n_a}, n_{b}={n_b}."
+                )
+            x_tr_p = np.asarray(x_train[mask_tr], dtype=np.float64)
+            y_tr_p = (labels_train[mask_tr] == a).astype(np.float64)
+            mask_va = (labels_val == a) | (labels_val == b)
+            if not np.any(mask_va):
+                mask_va = mask_tr
+                x_va_p = x_tr_p
+                y_va_p = y_tr_p
+            else:
+                x_va_p = np.asarray(x_val[mask_va], dtype=np.float64)
+                y_va_p = (labels_val[mask_va] == a).astype(np.float64)
+            pm = BinPairBinaryClassifierMLP(
+                x_dim=int(x_all.shape[1]),
+                hidden_dim=int(getattr(args, "btf_cls_hidden_dim", 128)),
+                depth=int(getattr(args, "btf_cls_depth", 2)),
+            ).to(dev)
+            tag = f"pair({a},{b})"
+            pout = train_bin_pair_binary_classifier(
+                model=pm,
+                x_train=x_tr_p,
+                y_train=y_tr_p,
+                x_val=x_va_p,
+                y_val=y_va_p,
+                device=dev,
+                epochs=int(getattr(args, "btf_cls_epochs", 1000)),
+                batch_size=bsz_cls,
+                lr=float(getattr(args, "btf_cls_lr", 1e-3)),
+                early_patience=int(getattr(args, "btf_cls_early_patience", 100)),
+                early_min_delta=float(getattr(args, "btf_cls_early_min_delta", 1e-4)),
+                early_ema_alpha=float(getattr(args, "btf_cls_early_ema_alpha", 0.05)),
+                log_every=max(1, int(getattr(args, "log_every", 50))),
+                balance_classes=balance_pairs,
+                pair_tag=tag,
+            )
+            pair_models.append(pm)
+            pair_cls_outs.append(pout)
+
+        log_p_cols = np.zeros((int(x_all.shape[0]), P), dtype=np.float64)
+        log_p_val_cols = np.zeros((int(x_val.shape[0]), P), dtype=np.float64)
+        for pi, (a, b) in enumerate(pairs):
+            raw_all = predict_bin_pair_logit(model=pair_models[pi], x=x_all, device=dev, batch_size=bsz_cls)
+            raw_va = predict_bin_pair_logit(model=pair_models[pi], x=x_val, device=dev, batch_size=bsz_cls)
+            corr = float(np.log(priors[a] / max(priors[b], 1e-300)))
+            log_p_cols[:, pi] = raw_all + corr
+            log_p_val_cols[:, pi] = raw_va + corr
+
+        log_pi = assemble_log_pi_pairwise_ls(log_p_cols, K=k_mix, ridge=ridge_ls, pair_weights=None)
+        log_pi_val = assemble_log_pi_pairwise_ls(log_p_val_cols, K=k_mix, ridge=ridge_ls, pair_weights=None)
+        mc_val = multiclass_metrics_from_log_pi(log_pi_val, labels_val)
+        cls_out = {
+            "train_losses": pair_cls_outs[0]["train_losses"],
+            "val_losses": pair_cls_outs[0]["val_losses"],
+            "val_monitor_losses": pair_cls_outs[0]["val_monitor_losses"],
+            "best_val_loss": float(pair_cls_outs[0]["best_val_loss"]),
+            "best_epoch": int(pair_cls_outs[0]["best_epoch"]),
+            "stopped_epoch": int(pair_cls_outs[0]["stopped_epoch"]),
+            "stopped_early": bool(pair_cls_outs[0]["stopped_early"]),
+            "val_nll": mc_val["val_nll"],
+            "val_brier": mc_val["val_brier"],
+            "val_accuracy": mc_val["val_accuracy"],
+            "val_ece": mc_val["val_ece"],
+        }
+
+        local_models, local_outs, counts_train, counts_val = train_local_flows(
+            spec=spec,
+            theta_train=theta_train[:, 0],
+            x_train=x_train,
+            labels_train=labels_train,
+            theta_val=theta_val[:, 0],
+            x_val=x_val,
+            labels_val=labels_val,
+            device=dev,
+            normalize_local=normalize_local,
+            min_bin_count=min_bin_count,
+            x_dim=int(x_all.shape[1]),
+            hidden_dim=int(getattr(args, "flow_hidden_dim", 128)),
+            depth=int(getattr(args, "flow_depth", 3)),
+            epochs=int(getattr(args, "flow_epochs", 10000)),
+            batch_size=int(getattr(args, "flow_batch_size", 256)),
+            lr=float(getattr(args, "flow_lr", 1e-3)),
+            log_every=max(1, int(getattr(args, "log_every", 50))),
+            early_patience=int(getattr(args, "flow_early_patience", 1000)),
+            early_min_delta=float(getattr(args, "flow_early_min_delta", 1e-4)),
+            early_ema_alpha=float(getattr(args, "flow_early_ema_alpha", 0.05)),
+            restore_best=bool(getattr(args, "flow_restore_best", True)),
+            scheduler_name=str(getattr(args, "flow_scheduler", "cosine")),
+            endpoint_loss_weight=float(getattr(args, "flow_endpoint_loss_weight", 0.0)),
+            endpoint_ode_steps=int(getattr(args, "flow_endpoint_steps", 20)),
+            fm_t_eps=float(getattr(args, "flow_fm_t_eps", 0.05)),
+        )
+
+        c_matrix = np.full((int(x_all.shape[0]), int(theta_all.shape[0])), np.nan, dtype=np.float64)
+        flow_ode_steps = int(getattr(args, "flow_ode_steps", 64))
+        exact_div = bool(getattr(args, "flow_likelihood_exact_divergence", False))
+        pair_batch = int(getattr(args, "h_batch_size", 65536))
+        for k, model_k in enumerate(local_models):
+            col_mask = labels_all == k
+            if not np.any(col_mask):
+                continue
+            theta_eval = (
+                normalize_theta_in_bins(theta_all[col_mask, 0], labels_all[col_mask], spec).reshape(-1)
+                if normalize_local
+                else theta_all[col_mask, 0]
+            )
+            log_q = local_flow_log_prob_matrix(
+                model=model_k,
+                theta_eval=theta_eval,
+                x_all=x_all,
+                device=dev,
+                pair_batch_size=pair_batch,
+                ode_steps=flow_ode_steps,
+                exact_divergence=exact_div,
+            )
+            if normalize_local:
+                log_q = log_q - float(np.log(spec.widths[k]))
+            c_matrix[:, col_mask] = log_q + log_pi[:, [k]]
+        if not np.all(np.isfinite(c_matrix)):
+            raise RuntimeError("binary_binned_theta_flow produced non-finite entries in c_matrix.")
+        delta_l, h_sym = compute_h_from_c_matrix(c_matrix)
+        h_directed = HMatrixEstimator.compute_h_directed(delta_l)
+
+        empty = np.asarray([], dtype=np.float64)
+        pair_train_losses_obj = np.asarray([o["train_losses"] for o in pair_cls_outs], dtype=object)
+        pair_val_losses_obj = np.asarray([o["val_losses"] for o in pair_cls_outs], dtype=object)
+        np.savez_compressed(
+            os.path.join(output_dir, "h_matrix_results_theta_cov.npz"),
+            theta_used=np.asarray(theta_all.reshape(-1), dtype=np.float64),
+            h_sym=np.asarray(h_sym, dtype=np.float64),
+            c_matrix=np.asarray(c_matrix, dtype=np.float64),
+            delta_l_matrix=np.asarray(delta_l, dtype=np.float64),
+            h_directed=np.asarray(h_directed, dtype=np.float64),
+            h_field_method=np.asarray([method_name], dtype=object),
+            theta_field_method=np.asarray([method_name], dtype=object),
+            binned_theta_flow_edges=np.asarray(spec.edges, dtype=np.float64),
+            binned_theta_flow_widths=np.asarray(spec.widths, dtype=np.float64),
+            binned_theta_flow_centers=np.asarray(spec.centers, dtype=np.float64),
+            binned_theta_flow_labels_all=np.asarray(labels_all, dtype=np.int64),
+            binned_theta_flow_counts_train=np.asarray(counts_train, dtype=np.int64),
+            binned_theta_flow_counts_val=np.asarray(counts_val, dtype=np.int64),
+            binned_theta_flow_normalize_local=np.bool_(normalize_local),
+            binary_btf_ls_ridge=np.float64(ridge_ls),
+            binary_btf_pair_sample_counts=np.asarray(pair_sample_counts, dtype=np.int64),
+            binary_btf_empirical_priors=np.asarray(priors, dtype=np.float64),
+            binary_btf_classifier_val_nll=np.float64(cls_out["val_nll"]),
+            binary_btf_classifier_val_brier=np.float64(cls_out["val_brier"]),
+            binary_btf_classifier_val_accuracy=np.float64(cls_out["val_accuracy"]),
+            binary_btf_classifier_val_ece=np.float64(cls_out["val_ece"]),
+        )
+        np.savez_compressed(
+            os.path.join(output_dir, "score_prior_training_losses.npz"),
+            theta_field_method=np.asarray([method_name], dtype=object),
+            prior_enable=np.bool_(False),
+            score_train_losses=np.asarray(cls_out["train_losses"], dtype=np.float64),
+            score_val_losses=np.asarray(cls_out["val_losses"], dtype=np.float64),
+            score_val_monitor_losses=np.asarray(cls_out["val_monitor_losses"], dtype=np.float64),
+            score_best_epoch=np.int64(cls_out["best_epoch"]),
+            score_stopped_epoch=np.int64(cls_out["stopped_epoch"]),
+            score_stopped_early=np.bool_(cls_out["stopped_early"]),
+            score_best_val_smooth=np.float64(cls_out["best_val_loss"]),
+            score_likelihood_finetune_train_losses=empty,
+            score_likelihood_finetune_val_losses=empty,
+            score_likelihood_finetune_val_monitor_losses=empty,
+            prior_train_losses=empty,
+            prior_val_losses=empty,
+            prior_val_monitor_losses=empty,
+            prior_likelihood_finetune_train_losses=empty,
+            prior_likelihood_finetune_val_losses=empty,
+            prior_likelihood_finetune_val_monitor_losses=empty,
+            binned_theta_flow_local_train_losses=np.asarray([o["train_losses"] for o in local_outs], dtype=object),
+            binned_theta_flow_local_val_losses=np.asarray([o["val_losses"] for o in local_outs], dtype=object),
+            binned_theta_flow_counts_train=np.asarray(counts_train, dtype=np.int64),
+            binned_theta_flow_counts_val=np.asarray(counts_val, dtype=np.int64),
+            binned_theta_flow_classifier_val_nll=np.float64(cls_out["val_nll"]),
+            binned_theta_flow_classifier_val_brier=np.float64(cls_out["val_brier"]),
+            binned_theta_flow_classifier_val_accuracy=np.float64(cls_out["val_accuracy"]),
+            binned_theta_flow_classifier_val_ece=np.float64(cls_out["val_ece"]),
+            binary_btf_pair_cls_train_losses=pair_train_losses_obj,
+            binary_btf_pair_cls_val_losses=pair_val_losses_obj,
+        )
+        loaded = SimpleNamespace(
+            h_sym=np.asarray(h_sym, dtype=np.float64),
+            c_matrix=np.asarray(c_matrix, dtype=np.float64),
+            delta_l_matrix=np.asarray(delta_l, dtype=np.float64),
+            theta_used=np.asarray(theta_all.reshape(-1), dtype=np.float64),
+        )
+        return cast(vhb.LoadedHMatrix, loaded), x_all, dev
+
     contrastive_norm = _normalize_contrastive_method(tfm)
     if contrastive_norm in ("contrastive_soft_gaussian_net", "contrastive_soft_gaussian_net_no_finetune"):
         method_name = contrastive_norm

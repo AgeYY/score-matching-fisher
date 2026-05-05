@@ -6,9 +6,11 @@ but emits only two matrix-figure artifacts:
 
 1) ``h_decoding_twofig_sweep.svg``: columns over ``--n-list`` only
    (one row per method for estimated sqrt(H)-like binned matrices, plus one
-   shared bottom row for decoding).
+   shared bottom row for pairwise logistic decoding).
 2) ``h_decoding_twofig_gt.svg``: left = approximate GT sqrt(H^2) matrix
-   (MC likelihood), right = decoding matrix from the ``n_ref`` subset.
+   (MC likelihood), right = pairwise decoding matrix from the ``n_ref`` subset
+   (feature space set by ``--decode-clf-x-space``, defaulting to native z_dim x
+   when the dataset NPZ is PR-embedded).
 
 Also writes correlation, normalized-MSE-vs-n, and training-loss SVGs. Pass
 ``--visualization-only`` with the same ``--output-dir`` as a prior full run to
@@ -23,6 +25,7 @@ the finite-pair mask inside each metric.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import re
 import shutil
@@ -52,7 +55,7 @@ from fisher.hellinger_gt import (
     estimate_hellinger_sq_grid_centers_mc,
     estimate_hellinger_sq_one_sided_mc,
 )
-from fisher.shared_dataset_io import load_shared_dataset_npz
+from fisher.shared_dataset_io import SharedDatasetBundle, load_shared_dataset_npz
 from fisher.shared_fisher_est import build_dataset_from_meta, normalize_flow_arch, normalize_theta_field_method
 
 # Valid row choices for --theta-field-rows:
@@ -79,6 +82,99 @@ from fisher.shared_fisher_est import build_dataset_from_meta, normalize_flow_arc
 #   linear_x_flow_low_rank_randb_t
 _FLOW_BASED_METHODS = {"theta_flow", "theta_path_integral", "x_flow"}
 _NO_TRAIN_METHODS = {"bin_gaussian"}
+
+
+def _resolve_decode_clf_x_space(args: argparse.Namespace, meta: dict[str, Any]) -> str:
+    raw = str(getattr(args, "decode_clf_x_space", "auto"))
+    if raw == "auto":
+        return "pr_z" if meta.get("pr_autoencoder_embedded") else "embedded"
+    return raw
+
+
+def _file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fp:
+        for chunk in iter(lambda: fp.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _resolve_pr_source_npz_path(embedded_npz_path: str, meta: dict[str, Any]) -> Path:
+    raw = meta.get("pr_autoencoder_source_npz")
+    if not raw:
+        raise ValueError(
+            "Pairwise decoding with --decode-clf-x-space pr_z requires meta key "
+            "pr_autoencoder_source_npz on the embedded dataset NPZ."
+        )
+    src = Path(str(raw))
+    tried: list[str] = []
+    if src.is_file():
+        return src.resolve()
+    tried.append(str(src.resolve()))
+    emb_parent = Path(embedded_npz_path).resolve().parent
+    cand = emb_parent / src.name
+    if cand.is_file():
+        return cand.resolve()
+    tried.append(str(cand))
+    cand2 = Path(DATA_DIR) / src.name
+    if cand2.is_file():
+        return cand2.resolve()
+    tried.append(str(cand2))
+    cand3 = Path.cwd() / src
+    if cand3.is_file():
+        return cand3.resolve()
+    tried.append(str(cand3))
+    raise FileNotFoundError(
+        "Could not locate pr_autoencoder_source_npz for pairwise decoding (pr_z). Tried:\n  "
+        + "\n  ".join(tried)
+    )
+
+
+def load_pr_source_bundle_for_pairwise_decode(
+    embedded_npz_path: str,
+    embedded_bundle: SharedDatasetBundle,
+    meta: dict[str, Any],
+) -> SharedDatasetBundle:
+    """Load the low-dimensional source NPZ referenced by PR projection meta (same row order as embedded)."""
+    path = _resolve_pr_source_npz_path(embedded_npz_path, meta)
+    expected_sha = meta.get("pr_autoencoder_source_sha256")
+    if expected_sha:
+        got = _file_sha256(path)
+        if str(got) != str(expected_sha):
+            raise ValueError(
+                f"PR source NPZ SHA256 mismatch for {path}: expected {expected_sha}, got {got}."
+            )
+    src = load_shared_dataset_npz(path)
+    n_emb = int(embedded_bundle.theta_all.shape[0])
+    n_src = int(src.theta_all.shape[0])
+    if n_emb != n_src:
+        raise ValueError(
+            f"Embedded NPZ n_total={n_emb} does not match source NPZ n_total={n_src} ({path})."
+        )
+    z_dim = int(meta.get("pr_autoencoder_z_dim", -1))
+    src_xdim = int(src.meta.get("x_dim", -1))
+    if z_dim >= 0 and src_xdim != z_dim:
+        raise ValueError(
+            f"Source NPZ x_dim={src_xdim} does not match pr_autoencoder_z_dim={z_dim} ({path})."
+        )
+    th_e = np.asarray(embedded_bundle.theta_all, dtype=np.float64).reshape(n_emb, -1)
+    th_s = np.asarray(src.theta_all, dtype=np.float64).reshape(n_src, -1)
+    if th_e.shape != th_s.shape or not np.allclose(th_e, th_s, rtol=0.0, atol=1e-5):
+        raise ValueError(f"theta_all mismatch between embedded dataset and source NPZ {path}.")
+    return src
+
+
+def _pairwise_decode_xy_optional(
+    bundle_pr_z: SharedDatasetBundle | None,
+    perm: np.ndarray,
+    n: int,
+    meta: dict[str, Any],
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Train/full-pool x features for pairwise decoding; None uses embedded ``subset.bundle`` x."""
+    if bundle_pr_z is None:
+        return None, None
+    x_tr, x_all = conv._subset_x_train_all_from_bundle(bundle_pr_z, perm, int(n), meta)
+    return x_tr, x_all
 
 
 class CachedTwofigBundle(TypedDict, total=False):
@@ -316,6 +412,7 @@ def _validate_cached_twofig_cli(
     ns: list[int],
     row_labels_cached: list[str],
     row_labels_cli: list[str],
+    meta: dict[str, Any],
 ) -> None:
     n_arr = np.asarray(cached["n"], dtype=np.int64).ravel()
     if n_arr.size != len(ns) or not np.array_equal(n_arr, np.asarray(ns, dtype=np.int64)):
@@ -348,6 +445,7 @@ def _validate_cached_twofig_cli(
         ds_cached = _npz_str_field(z2, "dataset_npz")
         fam_cached = _npz_str_field(z2, "dataset_family")
         mode_cached = _npz_str_field(z2, "theta_binning_mode")
+        cached_decode = _npz_str_field(z2, "decode_clf_x_space")
     if ds_cached is not None and os.path.abspath(str(args.dataset_npz)) != os.path.abspath(ds_cached):
         raise ValueError(
             f"--dataset-npz {args.dataset_npz!r} does not match cached dataset_npz={ds_cached!r}. "
@@ -360,6 +458,13 @@ def _validate_cached_twofig_cli(
     if mode_cached is not None and _theta_binning_mode(args) != str(mode_cached):
         raise ValueError(
             f"--theta-binning-mode {_theta_binning_mode(args)!r} does not match cached theta_binning_mode={mode_cached!r}."
+        )
+
+    resolved_decode = _resolve_decode_clf_x_space(args, meta)
+    if cached_decode is not None and str(cached_decode) != str(resolved_decode):
+        raise ValueError(
+            f"Cached decode_clf_x_space={cached_decode!r} does not match resolved {resolved_decode!r} "
+            "from --decode-clf-x-space and dataset meta. Use the same decoding feature setting as the prior run."
         )
 
 
@@ -387,6 +492,11 @@ def _run_twofig_visualization_only(
     z_path = os.path.join(args.output_dir, "h_decoding_twofig_results.npz")
     with np.load(z_path, allow_pickle=True) as z_meta:
         loss_root_str = _npz_str_field(z_meta, "training_losses_root")
+        cached_dec_space = _npz_str_field(z_meta, "decode_clf_x_space") or "embedded"
+        if "decode_native_x_dim" in z_meta.files:
+            decode_ndim = int(np.asarray(z_meta["decode_native_x_dim"]).reshape(-1)[0])
+        else:
+            decode_ndim = -1
     loss_root = (
         loss_root_str
         if loss_root_str and os.path.isdir(loss_root_str)
@@ -409,6 +519,9 @@ def _run_twofig_visualization_only(
         n_bins=n_bins,
         theta_centers=centers,
         out_svg_path=os.path.join(args.output_dir, "h_decoding_twofig_gt.svg"),
+        decode_clf_x_space_resolved=str(cached_dec_space),
+        decode_native_x_dim=int(decode_ndim) if decode_ndim > 0 else None,
+        dataset_x_dim=int(meta.get("x_dim", -1)) if int(meta.get("x_dim", -1)) >= 0 else None,
     )
     corr_svg = _render_corr_vs_n_panel(
         row_labels=row_labels,
@@ -455,6 +568,7 @@ def _run_twofig_visualization_only(
         nmse_decode_shape=tuple(int(x) for x in nmse_decode_vs_ref_shared.shape),
         wall_seconds_shape=wall_shape,
         visualization_only=True,
+        decode_clf_x_space=str(cached_dec_space),
     )
 
     print("[twofig] Saved (visualization-only):", flush=True)
@@ -472,6 +586,12 @@ def _normalize_theta_field_method_local(method: str) -> str:
     m = str(method).strip().lower()
     if m in {"bin_gaussian", "binned_gaussian", "binned-gaussian", "bin-gaussian"}:
         return "bin_gaussian"
+    if m in {"binned_theta_flow", "binned-theta-flow", "btf"}:
+        return "binned_theta_flow"
+    if m in {"binary_binned_theta_flow", "binary-binned-theta-flow", "bbin"}:
+        return "binary_binned_theta_flow"
+    if m in {"smooth_binned_theta_flow", "smooth-binned-theta-flow", "sbtf"}:
+        return "smooth_binned_theta_flow"
     if m == "nf":
         return "nf"
     lxf = conv._normalize_linear_x_flow_method(m)
@@ -504,7 +624,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Comma-separated theta-field methods to sweep in one run. "
             "Overrides --theta-field-method when non-empty. "
-            "Supported values: theta_flow, theta_path_integral, x_flow, ctsm_v, nf, bin_gaussian, "
+            "Supported values: theta_flow, binned_theta_flow, binary_binned_theta_flow, smooth_binned_theta_flow, theta_path_integral, x_flow, ctsm_v, nf, bin_gaussian, "
             "and supported scheduled linear_x_flow variants including linear_x_flow_diagonal_t "
             "(see study_h_decoding_convergence._normalize_linear_x_flow_method)."
         ),
@@ -516,9 +636,20 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Comma-separated theta-field row specs, highest precedence over --theta-field-methods and "
             "--theta-field-method. Tokens are method or method:arch, e.g. "
-            "theta_flow:mlp,theta_flow:film,x_flow:film_fourier,ctsm_v,bin_gaussian,"
+            "theta_flow:mlp,binned_theta_flow,binary_binned_theta_flow,smooth_binned_theta_flow,theta_flow:film,x_flow:film_fourier,ctsm_v,bin_gaussian,"
             "linear_x_flow_low_rank_t,linear_x_flow_pure_low_rank_t,linear_x_flow_pure_cond_low_rank_t,linear_x_flow_diagonal_t. "
             "For low-rank linear_x_flow rows use --lxf-low-rank-dim."
+        ),
+    )
+    p.add_argument(
+        "--decode-clf-x-space",
+        choices=("auto", "embedded", "pr_z"),
+        default="auto",
+        help=(
+            "Feature space for the shared pairwise logistic decoding row (sweep bottom row, GT panel right). "
+            "auto: use native z_dim x from pr_autoencoder_source_npz when pr_autoencoder_embedded, else embedded x. "
+            "embedded: x from --dataset-npz (PR projection). "
+            "pr_z: load source NPZ (meta pr_autoencoder_source_npz); requires PR-embedded dataset."
         ),
     )
     return p
@@ -739,6 +870,9 @@ def _render_gt_panel(
     n_bins: int,
     theta_centers: np.ndarray,
     out_svg_path: str,
+    decode_clf_x_space_resolved: str = "embedded",
+    decode_native_x_dim: int | None = None,
+    dataset_x_dim: int | None = None,
 ) -> str:
     fig, axes = plt.subplots(1, 2, figsize=(6.2, 3.2), squeeze=False)
     ax_h = axes[0, 0]
@@ -756,12 +890,19 @@ def _render_gt_panel(
     vmin_c, vmax_c = conv._finite_min_max([clf_ref])
     if vmin_c >= vmax_c:
         vmax_c = vmin_c + 1e-12
+    dx = int(dataset_x_dim) if dataset_x_dim is not None else None
+    if str(decode_clf_x_space_resolved) == "pr_z" and decode_native_x_dim is not None:
+        dec_title = f"Approx GT decoding (n_ref={int(n_ref)}, native x_dim={int(decode_native_x_dim)})"
+    elif dx is not None:
+        dec_title = f"Approx GT decoding (n_ref={int(n_ref)}, x_dim={dx})"
+    else:
+        dec_title = f"Approx GT decoding (n_ref={int(n_ref)})"
     _draw_single_heatmap(
         ax_c,
         clf_ref,
         n_bins=n_bins,
         theta_centers=theta_centers,
-        title=f"Approx GT decoding (n_ref={int(n_ref)})",
+        title=dec_title,
         vmin=vmin_c,
         vmax=vmax_c,
     )
@@ -793,6 +934,7 @@ def _write_summary(
     nmse_decode_shape: tuple[int, ...],
     wall_seconds_shape: tuple[int, ...],
     visualization_only: bool = False,
+    decode_clf_x_space: str | None = None,
 ) -> None:
     with open(path, "w", encoding="utf-8") as f:
         f.write("study_h_decoding_twofig\n")
@@ -813,6 +955,8 @@ def _write_summary(
             f.write(f"total_theta_bins: {_total_theta_bins_from_args(args)}\n")
         f.write(f"dataset_pool_size: {int(n_pool)}\n")
         f.write(f"dataset_meta_seed: {int(meta.get('seed', 0))}\n")
+        if decode_clf_x_space is not None:
+            f.write(f"decode_clf_x_space: {decode_clf_x_space}\n")
         f.write(f"perm_seed: {int(perm_seed)}\n")
         f.write(f"results_npz: {out_npz}\n")
         f.write(f"h_binned_sweep_shape: {h_sweep_shape}\n")
@@ -1060,7 +1204,7 @@ def main(argv: list[str] | None = None) -> None:
         os.makedirs(args.output_dir, exist_ok=True)
         cached = _load_cached_twofig_results(args.output_dir)
         row_labels_cached = _theta_field_row_labels_from_array(np.asarray(cached["theta_field_rows"]))
-        _validate_cached_twofig_cli(args, cached, ns, row_labels_cached, row_labels)
+        _validate_cached_twofig_cli(args, cached, ns, row_labels_cached, row_labels, meta)
         bundle = load_shared_dataset_npz(args.dataset_npz)
         meta = bundle.meta
         meta_family = str(meta.get("dataset_family", ""))
@@ -1113,6 +1257,22 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError(
             f"Require max(n-list) <= n-ref for nested subsets; got max(n_list)={max(ns)} n_ref={args.n_ref}."
         )
+
+    decode_space_resolved = _resolve_decode_clf_x_space(args, meta)
+    bundle_pr_z: SharedDatasetBundle | None = None
+    if decode_space_resolved == "pr_z":
+        if not meta.get("pr_autoencoder_embedded"):
+            raise ValueError(
+                "Resolved pairwise decoding uses pr_z but dataset NPZ lacks pr_autoencoder_embedded in meta."
+            )
+        bundle_pr_z = load_pr_source_bundle_for_pairwise_decode(str(args.dataset_npz), bundle, meta)
+        print(
+            f"[twofig] Pairwise decoding uses native x (z_dim={int(bundle_pr_z.meta.get('x_dim', -1))}) "
+            f"from {_resolve_pr_source_npz_path(str(args.dataset_npz), meta)}",
+            flush=True,
+        )
+    elif decode_space_resolved != "embedded":
+        raise ValueError(f"Unknown decode_clf_x_space resolution: {decode_space_resolved!r}")
 
     theta_binning_mode = _theta_binning_mode(args)
     n_bins_x = int(args.num_theta_bins)
@@ -1217,6 +1377,7 @@ def main(argv: list[str] | None = None) -> None:
         bin_idx_all=bin_idx_all,
         theta_state_all=theta_state_all,
     )
+    dx_ref_tr, dx_ref_all = _pairwise_decode_xy_optional(bundle_pr_z, perm, int(args.n_ref), meta)
     clf_ref = conv._pairwise_clf_from_bundle(
         args=args,
         meta=meta,
@@ -1225,6 +1386,8 @@ def main(argv: list[str] | None = None) -> None:
         n_bins=n_bins,
         clf_min_class_count=int(args.clf_min_class_count),
         clf_random_state=clf_rs,
+        decode_x_train=dx_ref_tr,
+        decode_x_all=dx_ref_all,
     )
 
     h_sweep_by_method: list[np.ndarray] = []
@@ -1248,6 +1411,7 @@ def main(argv: list[str] | None = None) -> None:
             bin_idx_all=bin_idx_all,
             theta_state_all=theta_state_all,
         )
+        dx_tr, dx_all = _pairwise_decode_xy_optional(bundle_pr_z, perm, int(n), meta)
         clf_n = conv._pairwise_clf_from_bundle(
             args=args,
             meta=meta,
@@ -1256,6 +1420,8 @@ def main(argv: list[str] | None = None) -> None:
             n_bins=n_bins,
             clf_min_class_count=int(args.clf_min_class_count),
             clf_random_state=clf_rs,
+            decode_x_train=dx_tr,
+            decode_x_all=dx_all,
         )
         clf_sweep_shared.append(np.asarray(clf_n, dtype=np.float64))
 
@@ -1374,6 +1540,9 @@ def main(argv: list[str] | None = None) -> None:
         n_bins=n_bins,
         theta_centers=centers,
         out_svg_path=os.path.join(args.output_dir, "h_decoding_twofig_gt.svg"),
+        decode_clf_x_space_resolved=str(decode_space_resolved),
+        decode_native_x_dim=int(bundle_pr_z.meta["x_dim"]) if bundle_pr_z is not None else None,
+        dataset_x_dim=int(meta.get("x_dim", -1)) if int(meta.get("x_dim", -1)) >= 0 else None,
     )
     corr_svg = _render_corr_vs_n_panel(
         row_labels=row_labels,
@@ -1435,6 +1604,8 @@ def main(argv: list[str] | None = None) -> None:
         dataset_npz=np.asarray(os.path.abspath(str(args.dataset_npz)), dtype=np.str_),
         dataset_family=np.asarray(str(meta.get("dataset_family", "")), dtype=np.str_),
         dataset_pool_size=np.int64(n_pool),
+        decode_clf_x_space=np.asarray(str(decode_space_resolved), dtype=np.str_),
+        decode_native_x_dim=np.int64(int(bundle_pr_z.meta["x_dim"])) if bundle_pr_z is not None else np.int64(-1),
     )
 
     summary_path = os.path.join(args.output_dir, "h_decoding_twofig_summary.txt")
@@ -1458,6 +1629,7 @@ def main(argv: list[str] | None = None) -> None:
         corr_decode_shape=tuple(int(x) for x in corr_decode_vs_ref_shared.shape),
         nmse_decode_shape=tuple(int(x) for x in nmse_decode_vs_ref_shared.shape),
         wall_seconds_shape=tuple(int(x) for x in wall_s.shape),
+        decode_clf_x_space=str(decode_space_resolved),
     )
 
     print("[twofig] Saved:", flush=True)
