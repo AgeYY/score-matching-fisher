@@ -16,6 +16,8 @@ Collected markdown notes in `journal/notes/`: long-form chapters (moved from the
 
 ## 2026-05
 
+- [2026-05-05 Benchmark-1D PR30 twofig: math (`theta_path_integral`, `theta_flow`, `x_flow`, `linear_x_flow_t`, `contrastive`, `bin_gaussian`), log-likelihood → $\Delta L$ → Hellinger panel, Gaussian/Hellinger formulas + repro + figures](notes/2026-05-05-pr30d-bench1d-six-methods-math-and-repro.md)
+
 - [2026-05-03 PR30D benchmark-1D twofig: `linear_x_flow_lr_t_ts_atheta` vs `linear_x_flow` vs `bin_gaussian` (linearbench + cosinebench, `lxfs` 50k cap, metrics + embedded corr figures + commands)](notes/2026-05-03-pr30d-bench1d-twofig-lr-atheta-lxf-bin.md)
 
 - [2026-05-04 Theta-dependent symmetric $A(t,\theta)$ low-rank scheduled X-flow (`linear_x_flow_lr_t_ts_atheta`): math, training, divergence, repro commands + figure](notes/2026-05-04-theta-dependent-a-low-rank-scheduled-x-flow-lr-t-ts-atheta.md)

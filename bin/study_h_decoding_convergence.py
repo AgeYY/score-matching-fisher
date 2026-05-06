@@ -15,8 +15,9 @@ _repo_root = Path(__file__).resolve().parent.parent
 if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 
-from fisher.h_decoding_convergence import *  # noqa: F401,F403
-from fisher.h_decoding_convergence import main
+from fisher import h_decoding_convergence as _impl
+
+globals().update({name: value for name, value in vars(_impl).items() if not name.startswith("__")})
 
 
 if __name__ == "__main__":

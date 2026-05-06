@@ -60,7 +60,8 @@ from fisher.hellinger_gt import (
     theta_centers_for_analytic_gt,
 )
 from fisher.decoding_native_x import decoding_x_train_all_from_native, load_native_bundle_for_pr_gt_decoding
-from fisher.shared_dataset_io import load_shared_dataset_npz
+from fisher.shared_dataset_io import SharedDatasetBundle, load_shared_dataset_npz
+from fisher.h_decoding_convergence_methods import SweepSubset, _fit_sir_projection
 from fisher.shared_fisher_est import build_dataset_from_meta, normalize_flow_arch, normalize_theta_field_method
 
 # Valid row choices for --theta-field-rows:
@@ -133,6 +134,9 @@ class CachedTwofigBundle(TypedDict, total=False):
     dataset_npz: np.ndarray
     dataset_family: np.ndarray
     dataset_pool_size: np.ndarray
+
+
+SIR_FIRST_DEFAULT_ROWS = "theta_path_integral,theta_flow,x_flow,linear_x_flow_t,contrastive,bin_gaussian"
 
 
 def _matrix_nmse_offdiag(est: np.ndarray, gt: np.ndarray) -> float:
@@ -674,6 +678,44 @@ def build_parser() -> argparse.ArgumentParser:
             "bound comparisons are computed/saved but not plotted."
         ),
     )
+    p.add_argument(
+        "--sir-first",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    return p
+
+
+def build_sir_first_parser() -> argparse.ArgumentParser:
+    p = build_parser()
+    p.description = (
+        "SIR-first variant of study_h_decoding_twofig.py. For each n in --n-list, "
+        "Sliced Inverse Regression is fit only on that nested subset's training split, "
+        "then train/validation/all x arrays are projected before any estimator or sweep "
+        "decoder sees the data. The n_ref GT decoding panel keeps the native/pre-PR "
+        "twofig convention."
+    )
+    p.epilog = (
+        "Benchmark-1D PR-30D examples:\n"
+        "  mamba run -n geo_diffusion python bin/study_h_decoding_twofig_sir.py "
+        "--dataset-npz data/randamp_gaussian_sqrtd_xdim5/randamp_gaussian_sqrtd_xdim5_pr30d.npz "
+        "--dataset-family randamp_gaussian_sqrtd "
+        f"--theta-field-rows {SIR_FIRST_DEFAULT_ROWS} --n-list 80,200,400,600 "
+        "--device cuda --output-dir data/experiments/h_decoding_twofig_sir_pr30d_linearbench_<TAG>\n"
+        "  mamba run -n geo_diffusion python bin/study_h_decoding_twofig_sir.py "
+        "--dataset-npz data/cosine_sqrtd_rand_tune_additive_xdim5_noise2x_alpha4x/"
+        "cosine_sqrtd_rand_tune_additive_xdim5_noise2x_alpha4x_pr30d.npz "
+        "--dataset-family cosine_gaussian_sqrtd_rand_tune_additive "
+        f"--theta-field-rows {SIR_FIRST_DEFAULT_ROWS} --n-list 80,200,400,600 "
+        "--device cuda --output-dir data/experiments/h_decoding_twofig_sir_pr30d_cosinebench_noise2x_alpha4x_<TAG>"
+    )
+    p.formatter_class = argparse.RawDescriptionHelpFormatter
+    p.set_defaults(
+        output_dir=str(Path(DATA_DIR) / "h_decoding_twofig_sir"),
+        theta_field_rows=SIR_FIRST_DEFAULT_ROWS,
+        n_list="80,200,400,600",
+        sir_first=True,
+    )
     return p
 
 
@@ -757,6 +799,91 @@ def _validate_cli_for_rows(args: argparse.Namespace, rows: list[ThetaFieldRowSpe
             conv._validate_cli(args_r)
         except Exception as exc:
             raise ValueError(f"row={row.label}: {exc}") from exc
+
+
+def _project_sir_first_subset(
+    *,
+    subset: SweepSubset,
+    theta_fit_subset: SweepSubset,
+    args: argparse.Namespace,
+    n: int,
+    sir_projection_root: str,
+) -> tuple[SweepSubset, dict[str, np.ndarray | int | float], str]:
+    z_train, z_val, z_all, sir_meta = _fit_sir_projection(
+        x_train=subset.bundle.x_train,
+        theta_train=theta_fit_subset.bundle.theta_train,
+        x_val=subset.bundle.x_validation,
+        x_all=subset.bundle.x_all,
+        sir_dim=int(args.sir_dim),
+        num_bins=int(args.sir_num_bins),
+        ridge=float(args.sir_ridge),
+    )
+    meta_proj = dict(subset.bundle.meta)
+    meta_proj["x_dim"] = int(args.sir_dim)
+    meta_proj["sir_enabled"] = True
+    meta_proj["sir_dim"] = int(args.sir_dim)
+    meta_proj["sir_num_bins"] = int(args.sir_num_bins)
+    meta_proj["sir_ridge"] = float(args.sir_ridge)
+    bundle_proj = SharedDatasetBundle(
+        meta=meta_proj,
+        theta_all=subset.bundle.theta_all,
+        x_all=np.asarray(z_all, dtype=np.float64),
+        train_idx=subset.bundle.train_idx,
+        validation_idx=subset.bundle.validation_idx,
+        theta_train=subset.bundle.theta_train,
+        x_train=np.asarray(z_train, dtype=np.float64),
+        theta_validation=subset.bundle.theta_validation,
+        x_validation=np.asarray(z_val, dtype=np.float64),
+    )
+    projected = SweepSubset(
+        bundle=bundle_proj,
+        bin_all=subset.bin_all,
+        bin_train=subset.bin_train,
+        bin_validation=subset.bin_validation,
+    )
+    os.makedirs(sir_projection_root, exist_ok=True)
+    sir_path = os.path.abspath(os.path.join(sir_projection_root, f"n_{int(n):06d}.npz"))
+    np.savez_compressed(
+        sir_path,
+        n=np.int64(n),
+        sir_enabled=np.bool_(True),
+        sir_dim=np.int64(args.sir_dim),
+        sir_num_bins=np.int64(args.sir_num_bins),
+        sir_ridge=np.float64(args.sir_ridge),
+        sir_components=np.asarray(sir_meta["sir_components"], dtype=np.float64),
+        sir_x_mean=np.asarray(sir_meta["sir_x_mean"], dtype=np.float64),
+        sir_eigenvalues=np.asarray(sir_meta["sir_eigenvalues"], dtype=np.float64),
+        sir_bin_counts=np.asarray(sir_meta["sir_bin_counts"], dtype=np.int64),
+        sir_nonempty_bin_ids=np.asarray(sir_meta["sir_nonempty_bin_ids"], dtype=np.int64),
+        sir_slice_means=np.asarray(sir_meta["sir_slice_means"], dtype=np.float64),
+        sir_theta_edges=np.asarray(sir_meta["sir_theta_edges"], dtype=np.float64),
+        train_idx=np.asarray(subset.bundle.train_idx, dtype=np.int64),
+        validation_idx=np.asarray(subset.bundle.validation_idx, dtype=np.int64),
+        bin_train=np.asarray(subset.bin_train, dtype=np.int64),
+        bin_validation=np.asarray(subset.bin_validation, dtype=np.int64),
+        bin_all=np.asarray(subset.bin_all, dtype=np.int64),
+    )
+    return projected, sir_meta, sir_path
+
+
+def _annotate_npz_with_sir(path: str, sir_meta: dict[str, np.ndarray | int | float], sir_path: str) -> None:
+    if not os.path.isfile(path):
+        return
+    with np.load(path, allow_pickle=True) as data:
+        payload = {k: np.asarray(data[k]) for k in data.files}
+    payload.update(
+        sir_enabled=np.bool_(True),
+        sir_projection_npz=np.asarray(os.path.abspath(sir_path), dtype=np.str_),
+        sir_dim=np.asarray(sir_meta["sir_dim"]),
+        sir_num_bins=np.asarray(sir_meta["sir_num_bins"]),
+        sir_ridge=np.asarray(sir_meta["sir_ridge"]),
+        sir_components=np.asarray(sir_meta["sir_components"], dtype=np.float64),
+        sir_x_mean=np.asarray(sir_meta["sir_x_mean"], dtype=np.float64),
+        sir_eigenvalues=np.asarray(sir_meta["sir_eigenvalues"], dtype=np.float64),
+        sir_bin_counts=np.asarray(sir_meta["sir_bin_counts"], dtype=np.int64),
+        sir_theta_edges=np.asarray(sir_meta["sir_theta_edges"], dtype=np.float64),
+    )
+    np.savez_compressed(path, **payload)
 
 
 def _render_method_sweep_panel(
@@ -973,6 +1100,13 @@ def _write_summary(
         f.write(f"dataset_pool_size: {int(n_pool)}\n")
         f.write(f"dataset_meta_seed: {int(meta.get('seed', 0))}\n")
         f.write(f"perm_seed: {int(perm_seed)}\n")
+        sir_enabled = bool(getattr(args, "sir_first", False))
+        f.write(f"sir_enabled: {sir_enabled}\n")
+        if sir_enabled:
+            f.write(f"sir_dim: {int(args.sir_dim)}\n")
+            f.write(f"sir_num_bins: {int(args.sir_num_bins)}\n")
+            f.write(f"sir_ridge: {float(args.sir_ridge):.17g}\n")
+            f.write(f"sir_projection_root: {os.path.abspath(os.path.join(args.output_dir, 'sir_projections'))}\n")
         f.write(f"results_npz: {out_npz}\n")
         f.write(f"h_binned_sweep_shape: {h_sweep_shape}\n")
         f.write(f"decode_sweep_shape: {decode_sweep_shape}\n")
@@ -1230,15 +1364,17 @@ def _render_corr_vs_n_panel(
     return svg
 
 
-def main(argv: list[str] | None = None) -> None:
+def main(argv: list[str] | None = None, *, sir_first_default: bool = False) -> None:
     if hasattr(sys.stdout, "reconfigure"):
         try:
             sys.stdout.reconfigure(line_buffering=True)
         except Exception:
             pass
 
-    p = build_parser()
+    p = build_sir_first_parser() if sir_first_default else build_parser()
     args = p.parse_args(argv)
+    if sir_first_default:
+        args.sir_first = True
     args.output_dir = os.path.abspath(str(args.output_dir))
     args.dataset_npz = os.path.abspath(str(args.dataset_npz))
 
@@ -1493,6 +1629,11 @@ def main(argv: list[str] | None = None) -> None:
 
     decode_dir = os.path.join(args.output_dir, "decode_shared")
     os.makedirs(decode_dir, exist_ok=True)
+    sir_first = bool(getattr(args, "sir_first", False))
+    sir_projection_root = os.path.abspath(os.path.join(args.output_dir, "sir_projections"))
+    sir_subset_cache: dict[int, SweepSubset] = {}
+    sir_meta_cache: dict[int, dict[str, np.ndarray | int | float]] = {}
+    sir_path_cache: dict[int, str] = {}
     for n in ns:
         subset_n = conv._subset_bundle(
             bundle,
@@ -1502,9 +1643,28 @@ def main(argv: list[str] | None = None) -> None:
             bin_idx_all=bin_idx_all,
             theta_state_all=theta_state_all,
         )
+        if sir_first:
+            theta_fit_subset_n = conv._subset_bundle(
+                bundle,
+                perm,
+                int(n),
+                meta,
+                bin_idx_all=bin_idx_all,
+                theta_state_all=None,
+            )
+            subset_n, sir_meta_n, sir_path_n = _project_sir_first_subset(
+                subset=subset_n,
+                theta_fit_subset=theta_fit_subset_n,
+                args=args,
+                n=int(n),
+                sir_projection_root=sir_projection_root,
+            )
+            sir_subset_cache[int(n)] = subset_n
+            sir_meta_cache[int(n)] = sir_meta_n
+            sir_path_cache[int(n)] = sir_path_n
         clf_n = conv._pairwise_clf_from_bundle(
             args=args,
-            meta=meta,
+            meta=subset_n.bundle.meta if sir_first else meta,
             subset=subset_n,
             output_dir=os.path.join(decode_dir, f"n_{int(n):06d}"),
             n_bins=n_bins,
@@ -1524,14 +1684,21 @@ def main(argv: list[str] | None = None) -> None:
             if row.arch is not None:
                 args_method.flow_arch = row.arch
             try:
-                subset_n = conv._subset_bundle(
-                    bundle,
-                    perm,
-                    int(n),
-                    meta,
-                    bin_idx_all=bin_idx_all,
-                    theta_state_all=theta_state_all,
-                )
+                if sir_first:
+                    subset_n = sir_subset_cache[int(n)]
+                    sir_meta_n = sir_meta_cache[int(n)]
+                    sir_path_n = sir_path_cache[int(n)]
+                else:
+                    subset_n = conv._subset_bundle(
+                        bundle,
+                        perm,
+                        int(n),
+                        meta,
+                        bin_idx_all=bin_idx_all,
+                        theta_state_all=theta_state_all,
+                    )
+                    sir_meta_n = {}
+                    sir_path_n = ""
                 if row.method == "bin_gaussian":
                     variance_floor = float(
                         getattr(args, "flow_theta_reg_variance_floor", getattr(args, "flow_x_reg_variance_floor", 1e-6))
@@ -1561,7 +1728,7 @@ def main(argv: list[str] | None = None) -> None:
 
                 loaded_n, _, _ = conv._estimate_one(
                     args=args_method,
-                    meta=meta,
+                    meta=subset_n.bundle.meta if sir_first else meta,
                     bundle=subset_n.bundle,
                     output_dir=run_dir,
                     n_bins=n_bins,
@@ -1578,6 +1745,10 @@ def main(argv: list[str] | None = None) -> None:
                 os.makedirs(row_loss_dir, exist_ok=True)
                 dst_loss_npz = os.path.abspath(os.path.join(row_loss_dir, f"n_{int(n):06d}.npz"))
                 shutil.copy2(src_loss_npz, dst_loss_npz)
+                if sir_first:
+                    _annotate_npz_with_sir(dst_loss_npz, sir_meta_n, sir_path_n)
+                    for h_name in ("h_matrix_results.npz", "h_matrix_results_theta_cov.npz"):
+                        _annotate_npz_with_sir(os.path.abspath(os.path.join(run_dir, h_name)), sir_meta_n, sir_path_n)
                 if loaded_n.h_sym.shape[0] != subset_n.bin_all.shape[0]:
                     raise ValueError(
                         f"h_sym rows {loaded_n.h_sym.shape[0]} do not match subset bins length {subset_n.bin_all.shape[0]}."
@@ -1707,6 +1878,12 @@ def main(argv: list[str] | None = None) -> None:
         dataset_npz=np.asarray(os.path.abspath(str(args.dataset_npz)), dtype=np.str_),
         dataset_family=np.asarray(str(meta.get("dataset_family", "")), dtype=np.str_),
         dataset_pool_size=np.int64(n_pool),
+        sir_enabled=np.bool_(sir_first),
+        sir_dim=np.int64(getattr(args, "sir_dim", 0) if sir_first else 0),
+        sir_num_bins=np.int64(getattr(args, "sir_num_bins", 0) if sir_first else 0),
+        sir_ridge=np.float64(getattr(args, "sir_ridge", np.nan) if sir_first else np.nan),
+        sir_projection_root=np.asarray(os.path.abspath(sir_projection_root) if sir_first else "", dtype=np.str_),
+        sir_projection_npz_by_n=np.asarray([sir_path_cache.get(int(n), "") for n in ns], dtype=np.str_),
     )
 
     summary_path = os.path.join(args.output_dir, "h_decoding_twofig_summary.txt")

@@ -166,6 +166,7 @@ def main(argv: list[str] | None = None) -> None:
         max_grad_norm=float(args.contrastive_max_grad_norm),
         log_every=max(1, int(args.log_every)),
         restore_best=True,
+        contrastive_theta_fourier_k=0,
     )
 
     x_mean = np.asarray(train_out["x_mean"], dtype=np.float64)

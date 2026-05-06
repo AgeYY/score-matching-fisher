@@ -139,6 +139,7 @@ class ContrastiveNormalizedDotScorer(nn.Module):
         return F.normalize(self.g_net(x), p=2.0, dim=-1, eps=float(self.eps))
 
     def encode_theta(self, theta: torch.Tensor) -> torch.Tensor:
+        """Theta features (optionally Fourier-augmented by the training caller)."""
         if theta.ndim == 1:
             theta = theta.unsqueeze(-1)
         return F.normalize(self.a_net(theta), p=2.0, dim=-1, eps=float(self.eps))
@@ -249,6 +250,7 @@ class ContrastiveAdditiveIndependentScorer(nn.Module):
         return torch.stack(pieces, dim=1)
 
     def encode_theta(self, theta: torch.Tensor) -> torch.Tensor:
+        """``theta`` features may be Fourier-augmented by the caller (contrastive-soft)."""
         if theta.ndim == 1:
             theta = theta.unsqueeze(-1)
         return self.a_net(theta)
@@ -401,6 +403,7 @@ class ContrastiveIndependentDotProductScorer(nn.Module):
         return self.h_net(h_in).reshape(bsz, self.x_dim, self.feature_dim)
 
     def encode_theta(self, theta: torch.Tensor) -> torch.Tensor:
+        """``theta`` features may be Fourier-augmented by the caller (contrastive-soft)."""
         if theta.ndim == 1:
             theta = theta.unsqueeze(-1)
         return self.a_net(theta)
@@ -463,6 +466,91 @@ class ContrastiveGaussianNetworkScorer(nn.Module):
         x_rep = x.repeat_interleave(bt, dim=0)
         theta_rep = theta.repeat(bx, 1)
         return self.forward(x_rep, theta_rep).reshape(bx, bt)
+
+
+def dot_scorer_augmented_theta_dim(*, fourier_k: int, fourier_include_linear: bool) -> int:
+    """Input width for contrastive dot-family theta branch: z-scored scalar plus optional Fourier block."""
+    k = int(fourier_k)
+    if k <= 0:
+        return 1
+    fourier_width = (1 if bool(fourier_include_linear) else 0) + 2 * k
+    return 1 + fourier_width
+
+
+def theta_scalar_fourier_columns(
+    theta_values: np.ndarray,
+    theta_ref: np.ndarray,
+    k: int,
+    period_mult: float,
+    include_linear: bool,
+) -> np.ndarray:
+    """Sin/cos harmonics (and optional scaled linear) matching ``_build_theta_fourier_state`` scalar branch."""
+    k = int(k)
+    if k < 1:
+        return np.zeros((int(np.asarray(theta_values).size), 0), dtype=np.float64)
+    theta_all = np.asarray(theta_values, dtype=np.float64).reshape(-1)
+    theta_ref_vec = np.asarray(theta_ref, dtype=np.float64).reshape(-1)
+    if theta_all.size < 1 or theta_ref_vec.size < 1:
+        raise ValueError("theta_scalar_fourier_columns requires non-empty theta and theta_ref.")
+    ref_min = float(np.min(theta_ref_vec))
+    ref_max = float(np.max(theta_ref_vec))
+    ref_range = float(ref_max - ref_min)
+    range_safe = max(ref_range, 1e-12)
+    period = float(period_mult) * range_safe
+    w0 = 2.0 * np.pi / period
+    theta_center = 0.5 * (ref_min + ref_max)
+    theta_shift = theta_all - theta_center
+    cols: list[np.ndarray] = []
+    if include_linear:
+        cols.append((theta_shift / range_safe).reshape(-1, 1))
+    for kk in range(1, k + 1):
+        phase = (float(kk) * w0) * theta_shift
+        cols.append(np.sin(phase).reshape(-1, 1))
+        cols.append(np.cos(phase).reshape(-1, 1))
+    return np.concatenate(cols, axis=1).astype(np.float64, copy=False)
+
+
+def augment_scalar_theta_for_dot_scorer(
+    th_norm: np.ndarray,
+    th_raw: np.ndarray,
+    theta_ref: np.ndarray,
+    fourier_k: int,
+    period_mult: float,
+    fourier_include_linear: bool,
+) -> np.ndarray:
+    """Concatenate z-scored scalar θ with Fourier features of raw θ (train-ref period)."""
+    th_norm = _as_2d_float64(th_norm, name="th_norm")
+    th_raw = _as_2d_float64(th_raw, name="th_raw")
+    fk = int(fourier_k)
+    if fk <= 0:
+        if int(th_norm.shape[1]) != 1:
+            raise ValueError("Expected scalar normalized theta (N,1) when fourier_k<=0.")
+        return th_norm.astype(np.float64, copy=False)
+    if th_norm.shape[0] != th_raw.shape[0] or int(th_norm.shape[1]) != 1 or int(th_raw.shape[1]) != 1:
+        raise ValueError("th_norm and th_raw must be (N,1) with matching N.")
+    fou = theta_scalar_fourier_columns(
+        th_raw.reshape(-1),
+        theta_ref,
+        fk,
+        float(period_mult),
+        bool(fourier_include_linear),
+    )
+    if fou.shape[0] != th_norm.shape[0]:
+        raise ValueError("Fourier row count mismatch.")
+    return np.concatenate([th_norm, fou], axis=1).astype(np.float64, copy=False)
+
+
+def contrastive_soft_theta_fourier_supported(model: nn.Module) -> bool:
+    """Architectures whose theta MLP branch accepts Fourier-augmented coordinates."""
+    return isinstance(
+        model,
+        (
+            ContrastiveNormalizedDotScorer,
+            ContrastiveNormalizedDotBiasScorer,
+            ContrastiveAdditiveIndependentScorer,
+            ContrastiveIndependentDotProductScorer,
+        ),
+    )
 
 
 def one_hot_bins(bin_idx: torch.Tensor, n_bins: int) -> torch.Tensor:
@@ -569,8 +657,9 @@ def _theta_pair_distance(
 def _soft_contrastive_loss(
     model: ContrastiveLLRMLP,
     x: torch.Tensor,
-    theta: torch.Tensor,
+    theta_score: torch.Tensor,
     *,
+    theta_kernel: torch.Tensor | None = None,
     bandwidth: float,
     periodic: bool,
     period: float,
@@ -580,8 +669,9 @@ def _soft_contrastive_loss(
     h = float(bandwidth)
     if not math.isfinite(h) or h <= 0.0:
         raise ValueError("soft contrastive bandwidth must be finite and > 0.")
-    logits = model.score_matrix(x, theta)
-    dist = _theta_pair_distance(theta, theta, periodic=bool(periodic), period=float(period))
+    tk = theta_score if theta_kernel is None else theta_kernel
+    logits = model.score_matrix(x, theta_score)
+    dist = _theta_pair_distance(tk, tk, periodic=bool(periodic), period=float(period))
     log_w = -0.5 * (dist / h).pow(2)
     weights = torch.softmax(log_w, dim=1)
     log_probs = torch.log_softmax(logits, dim=1)
@@ -591,8 +681,9 @@ def _soft_contrastive_loss(
 def _bidir_soft_contrastive_loss_parts(
     model: ContrastiveLLRMLP,
     x: torch.Tensor,
-    theta: torch.Tensor,
+    theta_score: torch.Tensor,
     *,
+    theta_kernel: torch.Tensor | None = None,
     bandwidth: float,
     periodic: bool,
     period: float,
@@ -602,8 +693,9 @@ def _bidir_soft_contrastive_loss_parts(
     h = float(bandwidth)
     if not math.isfinite(h) or h <= 0.0:
         raise ValueError("bidirectional soft contrastive bandwidth must be finite and > 0.")
-    logits = model.score_matrix(x, theta)
-    dist = _theta_pair_distance(theta, theta, periodic=bool(periodic), period=float(period))
+    tk = theta_score if theta_kernel is None else theta_kernel
+    logits = model.score_matrix(x, theta_score)
+    dist = _theta_pair_distance(tk, tk, periodic=bool(periodic), period=float(period))
     log_w = -0.5 * (dist / h).pow(2)
     row_weights = torch.softmax(log_w, dim=1)
     col_weights = torch.softmax(log_w, dim=0)
@@ -623,8 +715,9 @@ def _bidir_soft_contrastive_loss_parts(
 def _bidir_soft_contrastive_loss(
     model: ContrastiveLLRMLP,
     x: torch.Tensor,
-    theta: torch.Tensor,
+    theta_score: torch.Tensor,
     *,
+    theta_kernel: torch.Tensor | None = None,
     bandwidth: float,
     periodic: bool,
     period: float,
@@ -632,7 +725,8 @@ def _bidir_soft_contrastive_loss(
     loss, _, _ = _bidir_soft_contrastive_loss_parts(
         model,
         x,
-        theta,
+        theta_score,
+        theta_kernel=theta_kernel,
         bandwidth=float(bandwidth),
         periodic=bool(periodic),
         period=float(period),
@@ -800,14 +894,20 @@ def contrastive_soft_metadata_without_training(
         "n_clipped_steps": 0,
         "n_total_steps": 0,
         "effective_batch_size": 0,
+        "contrastive_theta_fourier_k": 0,
+        "contrastive_theta_fourier_period_mult": 2.0,
+        "contrastive_theta_fourier_include_linear": False,
+        "theta_fourier_ref_min": float(np.min(th_tr)),
+        "theta_fourier_ref_max": float(np.max(th_tr)),
     }
 
 
 def _eval_soft_contrastive_loss(
     model: ContrastiveLLRMLP,
     x: torch.Tensor,
-    theta: torch.Tensor,
+    theta_score: torch.Tensor,
     *,
+    theta_kernel: torch.Tensor | None = None,
     batch_size: int,
     bandwidth: float,
     periodic: bool,
@@ -829,7 +929,8 @@ def _eval_soft_contrastive_loss(
             loss = _soft_contrastive_loss(
                 model,
                 x[i0:i1],
-                theta[i0:i1],
+                theta_score[i0:i1],
+                theta_kernel=None if theta_kernel is None else theta_kernel[i0:i1],
                 bandwidth=float(bandwidth),
                 periodic=bool(periodic),
                 period=float(period),
@@ -841,8 +942,9 @@ def _eval_soft_contrastive_loss(
 def _eval_bidir_soft_contrastive_loss(
     model: ContrastiveLLRMLP,
     x: torch.Tensor,
-    theta: torch.Tensor,
+    theta_score: torch.Tensor,
     *,
+    theta_kernel: torch.Tensor | None = None,
     batch_size: int,
     bandwidth: float,
     periodic: bool,
@@ -866,7 +968,8 @@ def _eval_bidir_soft_contrastive_loss(
             loss, row_loss, col_loss = _bidir_soft_contrastive_loss_parts(
                 model,
                 x[i0:i1],
-                theta[i0:i1],
+                theta_score[i0:i1],
+                theta_kernel=None if theta_kernel is None else theta_kernel[i0:i1],
                 bandwidth=float(bandwidth),
                 periodic=bool(periodic),
                 period=float(period),
@@ -1094,6 +1197,9 @@ def train_contrastive_soft_llr(
     max_grad_norm: float = 10.0,
     log_every: int = 50,
     restore_best: bool = True,
+    contrastive_theta_fourier_k: int = 4,
+    contrastive_theta_fourier_period_mult: float = 2.0,
+    contrastive_theta_fourier_include_linear: bool = False,
 ) -> dict[str, Any]:
     if int(epochs) < 1:
         raise ValueError("epochs must be >= 1.")
@@ -1124,8 +1230,29 @@ def train_contrastive_soft_llr(
         raise ValueError("theta/x row count mismatch.")
     if int(x_tr.shape[1]) != model.x_dim or int(x_va.shape[1]) != model.x_dim:
         raise ValueError("x dimension does not match ContrastiveLLRMLP.x_dim.")
-    if int(model.theta_dim) != 1:
-        raise ValueError("contrastive-soft requires ContrastiveLLRMLP.theta_dim == 1.")
+    fk = int(contrastive_theta_fourier_k)
+    pm = float(contrastive_theta_fourier_period_mult)
+    inc_lin = bool(contrastive_theta_fourier_include_linear)
+    if fk < 0:
+        raise ValueError("contrastive_theta_fourier_k must be >= 0.")
+    if fk > 0:
+        if not math.isfinite(pm) or pm <= 0.0:
+            raise ValueError("contrastive_theta_fourier_period_mult must be finite and > 0 when fourier_k > 0.")
+        if not contrastive_soft_theta_fourier_supported(model):
+            raise ValueError(
+                "Fourier theta features (contrastive_theta_fourier_k > 0) are only supported for "
+                "ContrastiveNormalizedDotScorer, ContrastiveNormalizedDotBiasScorer, "
+                "ContrastiveAdditiveIndependentScorer, and ContrastiveIndependentDotProductScorer; "
+                f"got {type(model).__name__}."
+            )
+    aug_dim = dot_scorer_augmented_theta_dim(fourier_k=fk, fourier_include_linear=inc_lin)
+    if int(model.theta_dim) != int(aug_dim):
+        raise ValueError(
+            f"model.theta_dim={int(model.theta_dim)} does not match expected augmented width {aug_dim} "
+            f"(fourier_k={fk}, fourier_include_linear={inc_lin})."
+        )
+    ref_min = float(np.min(th_tr))
+    ref_max = float(np.max(th_tr))
 
     nb = contrastive_soft_normalization_and_bandwidth_from_train(
         th_tr=th_tr,
@@ -1152,9 +1279,31 @@ def train_contrastive_soft_llr(
     th_va_n = (th_va - theta_mean) / theta_std
 
     x_tr_t = torch.from_numpy(x_tr_n.astype(np.float32)).to(device)
-    th_tr_t = torch.from_numpy(th_tr_n.astype(np.float32)).to(device)
     x_va_t = torch.from_numpy(x_va_n.astype(np.float32)).to(device)
-    th_va_t = torch.from_numpy(th_va_n.astype(np.float32)).to(device)
+    th_tr_kernel_t = torch.from_numpy(th_tr_n.astype(np.float32)).to(device)
+    th_va_kernel_t = torch.from_numpy(th_va_n.astype(np.float32)).to(device)
+    if fk > 0:
+        th_tr_aug = augment_scalar_theta_for_dot_scorer(
+            th_tr_n,
+            th_tr,
+            th_tr,
+            fk,
+            pm,
+            inc_lin,
+        )
+        th_va_aug = augment_scalar_theta_for_dot_scorer(
+            th_va_n,
+            th_va,
+            th_tr,
+            fk,
+            pm,
+            inc_lin,
+        )
+        th_tr_t = torch.from_numpy(th_tr_aug.astype(np.float32)).to(device)
+        th_va_t = torch.from_numpy(th_va_aug.astype(np.float32)).to(device)
+    else:
+        th_tr_t = th_tr_kernel_t
+        th_va_t = th_va_kernel_t
     ntr = int(x_tr_t.shape[0])
     nva = int(x_va_t.shape[0])
     effective_batch_size = min(int(batch_size), ntr, nva)
@@ -1187,6 +1336,7 @@ def train_contrastive_soft_llr(
             model,
             x_tr_t[idx],
             th_tr_t[idx],
+            theta_kernel=th_tr_kernel_t[idx],
             bandwidth=float(h),
             periodic=bool(periodic),
             period=float(period_eff),
@@ -1206,6 +1356,7 @@ def train_contrastive_soft_llr(
             model,
             x_va_t,
             th_va_t,
+            theta_kernel=th_va_kernel_t,
             batch_size=effective_batch_size,
             bandwidth=float(h),
             periodic=bool(periodic),
@@ -1271,6 +1422,11 @@ def train_contrastive_soft_llr(
         "n_clipped_steps": n_clipped,
         "n_total_steps": n_total_steps,
         "effective_batch_size": int(effective_batch_size),
+        "contrastive_theta_fourier_k": fk,
+        "contrastive_theta_fourier_period_mult": pm,
+        "contrastive_theta_fourier_include_linear": inc_lin,
+        "theta_fourier_ref_min": ref_min,
+        "theta_fourier_ref_max": ref_max,
     }
 
 
@@ -1298,6 +1454,9 @@ def train_bidir_contrastive_soft_llr(
     max_grad_norm: float = 10.0,
     log_every: int = 50,
     restore_best: bool = True,
+    contrastive_theta_fourier_k: int = 4,
+    contrastive_theta_fourier_period_mult: float = 2.0,
+    contrastive_theta_fourier_include_linear: bool = False,
 ) -> dict[str, Any]:
     if int(epochs) < 1:
         raise ValueError("epochs must be >= 1.")
@@ -1328,8 +1487,29 @@ def train_bidir_contrastive_soft_llr(
         raise ValueError("theta/x row count mismatch.")
     if int(x_tr.shape[1]) != model.x_dim or int(x_va.shape[1]) != model.x_dim:
         raise ValueError("x dimension does not match model.x_dim.")
-    if int(model.theta_dim) != 1:
-        raise ValueError("bidir-contrastive-soft requires model.theta_dim == 1.")
+    fk = int(contrastive_theta_fourier_k)
+    pm = float(contrastive_theta_fourier_period_mult)
+    inc_lin = bool(contrastive_theta_fourier_include_linear)
+    if fk < 0:
+        raise ValueError("contrastive_theta_fourier_k must be >= 0.")
+    if fk > 0:
+        if not math.isfinite(pm) or pm <= 0.0:
+            raise ValueError("contrastive_theta_fourier_period_mult must be finite and > 0 when fourier_k > 0.")
+        if not contrastive_soft_theta_fourier_supported(model):
+            raise ValueError(
+                "Fourier theta features (contrastive_theta_fourier_k > 0) are only supported for "
+                "ContrastiveNormalizedDotScorer, ContrastiveNormalizedDotBiasScorer, "
+                "ContrastiveAdditiveIndependentScorer, and ContrastiveIndependentDotProductScorer; "
+                f"got {type(model).__name__}."
+            )
+    aug_dim = dot_scorer_augmented_theta_dim(fourier_k=fk, fourier_include_linear=inc_lin)
+    if int(model.theta_dim) != int(aug_dim):
+        raise ValueError(
+            f"model.theta_dim={int(model.theta_dim)} does not match expected augmented width {aug_dim} "
+            f"(fourier_k={fk}, fourier_include_linear={inc_lin})."
+        )
+    ref_min = float(np.min(th_tr))
+    ref_max = float(np.max(th_tr))
 
     nb = contrastive_soft_normalization_and_bandwidth_from_train(
         th_tr=th_tr,
@@ -1356,9 +1536,31 @@ def train_bidir_contrastive_soft_llr(
     th_va_n = (th_va - theta_mean) / theta_std
 
     x_tr_t = torch.from_numpy(x_tr_n.astype(np.float32)).to(device)
-    th_tr_t = torch.from_numpy(th_tr_n.astype(np.float32)).to(device)
     x_va_t = torch.from_numpy(x_va_n.astype(np.float32)).to(device)
-    th_va_t = torch.from_numpy(th_va_n.astype(np.float32)).to(device)
+    th_tr_kernel_t = torch.from_numpy(th_tr_n.astype(np.float32)).to(device)
+    th_va_kernel_t = torch.from_numpy(th_va_n.astype(np.float32)).to(device)
+    if fk > 0:
+        th_tr_aug = augment_scalar_theta_for_dot_scorer(
+            th_tr_n,
+            th_tr,
+            th_tr,
+            fk,
+            pm,
+            inc_lin,
+        )
+        th_va_aug = augment_scalar_theta_for_dot_scorer(
+            th_va_n,
+            th_va,
+            th_tr,
+            fk,
+            pm,
+            inc_lin,
+        )
+        th_tr_t = torch.from_numpy(th_tr_aug.astype(np.float32)).to(device)
+        th_va_t = torch.from_numpy(th_va_aug.astype(np.float32)).to(device)
+    else:
+        th_tr_t = th_tr_kernel_t
+        th_va_t = th_va_kernel_t
     ntr = int(x_tr_t.shape[0])
     nva = int(x_va_t.shape[0])
     effective_batch_size = min(int(batch_size), ntr, nva)
@@ -1395,6 +1597,7 @@ def train_bidir_contrastive_soft_llr(
             model,
             x_tr_t[idx],
             th_tr_t[idx],
+            theta_kernel=th_tr_kernel_t[idx],
             bandwidth=float(h),
             periodic=bool(periodic),
             period=float(period_eff),
@@ -1418,6 +1621,7 @@ def train_bidir_contrastive_soft_llr(
             model,
             x_va_t,
             th_va_t,
+            theta_kernel=th_va_kernel_t,
             batch_size=effective_batch_size,
             bandwidth=float(h),
             periodic=bool(periodic),
@@ -1491,6 +1695,11 @@ def train_bidir_contrastive_soft_llr(
         "n_clipped_steps": n_clipped,
         "n_total_steps": n_total_steps,
         "effective_batch_size": int(effective_batch_size),
+        "contrastive_theta_fourier_k": fk,
+        "contrastive_theta_fourier_period_mult": pm,
+        "contrastive_theta_fourier_include_linear": inc_lin,
+        "theta_fourier_ref_min": ref_min,
+        "theta_fourier_ref_max": ref_max,
     }
 
 
@@ -1556,6 +1765,10 @@ def compute_contrastive_soft_c_matrix(
     theta_mean: np.ndarray,
     theta_std: np.ndarray,
     pair_batch_size: int = 65536,
+    contrastive_theta_fourier_k: int = 0,
+    contrastive_theta_fourier_period_mult: float = 2.0,
+    contrastive_theta_fourier_include_linear: bool = False,
+    theta_fourier_ref: np.ndarray | None = None,
 ) -> np.ndarray:
     theta = _as_2d_float64(theta_all, name="theta_all")
     x = _as_2d_float64(x_all, name="x_all")
@@ -1565,8 +1778,22 @@ def compute_contrastive_soft_c_matrix(
         raise ValueError("contrastive-soft v1 requires scalar theta.")
     if int(x.shape[1]) != model.x_dim:
         raise ValueError("x dimension does not match ContrastiveLLRMLP.x_dim.")
-    if int(model.theta_dim) != 1:
-        raise ValueError("contrastive-soft requires ContrastiveLLRMLP.theta_dim == 1.")
+    fk = int(contrastive_theta_fourier_k)
+    pm = float(contrastive_theta_fourier_period_mult)
+    inc_lin = bool(contrastive_theta_fourier_include_linear)
+    aug_dim = dot_scorer_augmented_theta_dim(fourier_k=fk, fourier_include_linear=inc_lin)
+    if int(model.theta_dim) != int(aug_dim):
+        raise ValueError(
+            f"model.theta_dim={int(model.theta_dim)} does not match expected augmented theta width {aug_dim} "
+            f"(fourier_k={fk}, fourier_include_linear={inc_lin})."
+        )
+    if fk > 0:
+        if theta_fourier_ref is None:
+            raise ValueError(
+                "compute_contrastive_soft_c_matrix requires theta_fourier_ref (training theta) when fourier_k > 0."
+            )
+        if not math.isfinite(pm) or pm <= 0.0:
+            raise ValueError("contrastive_theta_fourier_period_mult must be finite and > 0 when fourier_k > 0.")
     n = int(x.shape[0])
     if n < 1:
         raise ValueError("Need at least one row to compute contrastive-soft C matrix.")
@@ -1574,8 +1801,19 @@ def compute_contrastive_soft_c_matrix(
     row_bs = max(1, min(n, pb // n))
     x_n = (x - np.asarray(x_mean, dtype=np.float64).reshape(1, -1)) / np.asarray(x_std, dtype=np.float64).reshape(1, -1)
     th_n = (theta - np.asarray(theta_mean, dtype=np.float64).reshape(1, -1)) / np.asarray(theta_std, dtype=np.float64).reshape(1, -1)
+    if fk > 0:
+        th_feat = augment_scalar_theta_for_dot_scorer(
+            th_n,
+            theta,
+            _as_2d_float64(theta_fourier_ref, name="theta_fourier_ref"),
+            fk,
+            pm,
+            inc_lin,
+        )
+    else:
+        th_feat = th_n.astype(np.float64, copy=False)
     x_t = torch.from_numpy(x_n.astype(np.float32))
-    th_t = torch.from_numpy(th_n.astype(np.float32))
+    th_t = torch.from_numpy(th_feat.astype(np.float32))
     c = np.empty((n, n), dtype=np.float64)
     model.eval()
     with torch.no_grad():
