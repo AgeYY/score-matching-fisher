@@ -413,19 +413,29 @@ def main(argv: list[str] | None = None) -> None:
             flush=True,
         )
     elif bool(getattr(args, "theta_flow_fourier_state", False)):
+        th_phys, theta_fourier_ref_phys = theta_phys_rows_and_ref_for_fourier(
+            theta_raw_all,
+            perm,
+            int(args.n_ref),
+        )
         theta_state_all, theta_fourier_ref_range, theta_fourier_period, theta_fourier_center = _build_theta_fourier_state(
-            theta_scalar_all,
-            theta_ref=theta_ref,
+            th_phys,
+            theta_ref=theta_fourier_ref_phys,
             k=int(args.theta_flow_fourier_k),
             period_mult=float(args.theta_flow_fourier_period_mult),
             include_linear=bool(args.theta_flow_fourier_include_linear),
         )
         print(
-            "[convergence] theta_flow Fourier state enabled: "
-            f"dim={theta_state_all.shape[1]} K={int(args.theta_flow_fourier_k)} "
-            f"period={theta_fourier_period:.6g} "
-            f"(mult={float(args.theta_flow_fourier_period_mult):.3g}, ref_range={theta_fourier_ref_range:.6g}, "
-            f"center={theta_fourier_center:.6g}, include_linear={bool(args.theta_flow_fourier_include_linear)})",
+            format_theta_fourier_state_log_message(
+                tag="[convergence]",
+                state_dim=int(theta_state_all.shape[1]),
+                k=int(args.theta_flow_fourier_k),
+                ref_range_vec=theta_fourier_ref_range,
+                period_vec=theta_fourier_period,
+                center_vec=theta_fourier_center,
+                period_mult=float(args.theta_flow_fourier_period_mult),
+                include_linear=bool(args.theta_flow_fourier_include_linear),
+            ),
             flush=True,
         )
 
@@ -691,16 +701,17 @@ def main(argv: list[str] | None = None) -> None:
             f"{float(getattr(args, 'contrastive_soft_gaussian_logvar_max', 5.0)):g}]; "
             f"hidden_dim={int(getattr(args, 'contrastive_hidden_dim', 128))}; "
             f"depth={int(getattr(args, 'contrastive_depth', 3))}; "
-            f"bandwidth={float(getattr(args, 'contrastive_soft_bandwidth', 0.2)):g}; "
+            f"bandwidth_bins={int(getattr(args, 'contrastive_soft_bandwidth_bins', 10))}; "
+            f"(raw h = train_theta_range / (2 * bandwidth_bins) when annealing off); "
             f"bandwidth_start={float(getattr(args, 'contrastive_soft_bandwidth_start', 0.0)):g}; "
             f"bandwidth_end={float(getattr(args, 'contrastive_soft_bandwidth_end', 0.0)):g}; "
-            f"bandwidth_k={int(getattr(args, 'contrastive_soft_bandwidth_k', 5))}; "
             f"periodic={bool(getattr(args, 'contrastive_soft_periodic', False))}; identity x embedding)",
             flush=True,
         )
         print(
-            "[convergence] contrastive_soft mode trains scalar S(x,theta) with Gaussian-kernel soft positives "
-            "over shuffled minibatch theta candidates, then uses C[i,j]=S(x_i,theta_j), DeltaL=C-diag(C), "
+            "[convergence] contrastive_soft mode trains a scalar score S(x,theta) with Gaussian-kernel soft positives "
+            "over shuffled minibatch theta candidates (Euclidean on z-scored theta when d_theta>1), "
+            "then uses C[i,j]=S(x_i,theta_j), DeltaL=C-diag(C), "
             "and one-sided H^2 from exp(DeltaL/2).",
             flush=True,
         )
@@ -711,10 +722,10 @@ def main(argv: list[str] | None = None) -> None:
             f"(score_arch={_bidir_sa}; dot_dim={int(getattr(args, 'contrastive_soft_dot_dim', 10))}; "
             f"hidden_dim={int(getattr(args, 'contrastive_hidden_dim', 128))}; "
             f"depth={int(getattr(args, 'contrastive_depth', 3))}; "
-            f"bandwidth={float(getattr(args, 'contrastive_soft_bandwidth', 0.2)):g}; "
+            f"bandwidth_bins={int(getattr(args, 'contrastive_soft_bandwidth_bins', 10))}; "
+            f"(raw h = train_theta_range / (2 * bandwidth_bins) when annealing off); "
             f"bandwidth_start={float(getattr(args, 'contrastive_soft_bandwidth_start', 0.0)):g}; "
             f"bandwidth_end={float(getattr(args, 'contrastive_soft_bandwidth_end', 0.0)):g}; "
-            f"bandwidth_k={int(getattr(args, 'contrastive_soft_bandwidth_k', 5))}; "
             f"periodic={bool(getattr(args, 'contrastive_soft_periodic', False))})",
             flush=True,
         )
@@ -737,10 +748,10 @@ def main(argv: list[str] | None = None) -> None:
             f"gn_depth={int(getattr(args, 'gn_depth', 3))}; "
             f"gn_diag_floor={float(getattr(args, 'gn_diag_floor', 1e-4)):g}; "
             f"contrastive_hidden_dim={int(getattr(args, 'contrastive_hidden_dim', 128))}; "
-            f"bandwidth={float(getattr(args, 'contrastive_soft_bandwidth', 0.2)):g}; "
+            f"bandwidth_bins={int(getattr(args, 'contrastive_soft_bandwidth_bins', 10))}; "
+            f"(raw h = train_theta_range / (2 * bandwidth_bins) when annealing off); "
             f"bandwidth_start={float(getattr(args, 'contrastive_soft_bandwidth_start', 0.0)):g}; "
             f"bandwidth_end={float(getattr(args, 'contrastive_soft_bandwidth_end', 0.0)):g}; "
-            f"bandwidth_k={int(getattr(args, 'contrastive_soft_bandwidth_k', 5))}; "
             f"periodic={bool(getattr(args, 'contrastive_soft_periodic', False))}; identity x embedding)",
             flush=True,
         )
@@ -756,10 +767,10 @@ def main(argv: list[str] | None = None) -> None:
             f"(gn_hidden_dim={int(getattr(args, 'gn_hidden_dim', 128))}; "
             f"gn_depth={int(getattr(args, 'gn_depth', 3))}; "
             f"gn_diag_floor={float(getattr(args, 'gn_diag_floor', 1e-4)):g}; "
-            f"bandwidth={float(getattr(args, 'contrastive_soft_bandwidth', 0.2)):g}; "
+            f"bandwidth_bins={int(getattr(args, 'contrastive_soft_bandwidth_bins', 10))}; "
+            f"(raw h = train_theta_range / (2 * bandwidth_bins) when annealing off); "
             f"bandwidth_start={float(getattr(args, 'contrastive_soft_bandwidth_start', 0.0)):g}; "
             f"bandwidth_end={float(getattr(args, 'contrastive_soft_bandwidth_end', 0.0)):g}; "
-            f"bandwidth_k={int(getattr(args, 'contrastive_soft_bandwidth_k', 5))}; "
             f"periodic={bool(getattr(args, 'contrastive_soft_periodic', False))})",
             flush=True,
         )

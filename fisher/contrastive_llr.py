@@ -484,7 +484,7 @@ def theta_scalar_fourier_columns(
     period_mult: float,
     include_linear: bool,
 ) -> np.ndarray:
-    """Sin/cos harmonics (and optional scaled linear) matching ``_build_theta_fourier_state`` scalar branch."""
+    """Sin/cos harmonics (and optional scaled linear) matching ``_build_theta_fourier_state`` for scalar θ (``d==1``)."""
     k = int(k)
     if k < 1:
         return np.zeros((int(np.asarray(theta_values).size), 0), dtype=np.float64)
@@ -644,14 +644,34 @@ def _theta_pair_distance(
     periodic: bool,
     period: float,
 ) -> torch.Tensor:
-    d = torch.abs(theta_a.reshape(-1, 1) - theta_b.reshape(1, -1))
+    """Pairwise distance for soft targets on **z-scored** θ rows.
+
+    Scalar ``(N, 1)`` with ``periodic=False`` matches legacy ``abs`` distance.
+    Multi-dimensional θ uses Euclidean distance on the (whitened) coordinate vectors.
+    Periodic wrapping is **scalar-only** (``d_theta == 1``).
+    """
+    if int(theta_a.shape[1]) != int(theta_b.shape[1]):
+        raise ValueError("theta_a and theta_b must have the same theta feature dimension.")
+    d_theta = int(theta_a.shape[1])
     if bool(periodic):
+        if d_theta != 1:
+            raise ValueError(
+                "periodic contrastive-soft distance supports scalar theta only (d_theta=1); "
+                "disable --contrastive-soft-periodic for multi-dimensional theta."
+            )
+        da = theta_a.reshape(-1, 1)
+        db = theta_b.reshape(1, -1)
+        d = torch.abs(da - db)
         p = float(period)
         if not math.isfinite(p) or p <= 0.0:
             raise ValueError("period must be finite and > 0 for periodic theta distance.")
         d = torch.remainder(d, p)
         d = torch.minimum(d, torch.as_tensor(p, dtype=d.dtype, device=d.device) - d)
-    return d
+        return d
+    if d_theta == 1:
+        return torch.abs(theta_a.reshape(-1, 1) - theta_b.reshape(1, -1))
+    diff = theta_a.unsqueeze(1) - theta_b.unsqueeze(0)
+    return torch.linalg.vector_norm(diff, dim=-1)
 
 
 def _soft_contrastive_loss(
@@ -734,76 +754,64 @@ def _bidir_soft_contrastive_loss(
     return loss
 
 
-def auto_soft_bandwidth(
-    theta: np.ndarray,
-    *,
-    k: int = 5,
-    periodic: bool = False,
-    period: float = 2.0 * math.pi,
-) -> float:
-    th = _as_2d_float64(theta, name="theta").reshape(-1)
-    n = int(th.size)
-    if n < 2:
-        raise ValueError("auto bandwidth requires at least two theta samples.")
-    kk = min(max(1, int(k)), n - 1)
-    diff = np.abs(th.reshape(-1, 1) - th.reshape(1, -1))
-    if bool(periodic):
-        p = float(period)
-        if not np.isfinite(p) or p <= 0.0:
-            raise ValueError("period must be finite and > 0 for periodic theta distance.")
-        diff = np.mod(diff, p)
-        diff = np.minimum(diff, p - diff)
-    sorted_dist = np.sort(diff, axis=1)
-    h = float(np.median(sorted_dist[:, kk]))
-    if not np.isfinite(h) or h <= 0.0:
-        positive = diff[diff > 0.0]
-        h = float(np.median(positive)) if positive.size else 1.0
-    return max(h, 1e-8)
-
-
 def contrastive_soft_normalization_and_bandwidth_from_train(
     *,
     th_tr: np.ndarray,
     x_tr: np.ndarray,
-    bandwidth: float,
+    bandwidth_bins: int,
     bandwidth_start: float,
     bandwidth_end: float,
-    bandwidth_k: int,
     periodic: bool,
     period: float,
 ) -> dict[str, Any]:
-    """Train-set normalization and soft-contrastive bandwidth scale (matches ``train_contrastive_soft_llr``)."""
+    """Train-set normalization and soft-contrastive bandwidth scale (matches ``train_contrastive_soft_llr``).
+
+    When bandwidth annealing is disabled, a scalar raw scale is
+    ``theta_range / (2 * bandwidth_bins)`` where ``theta_range`` is the train per-coordinate span
+    (scalar: ``max-min`` on training θ; multi-dim: ``max_j (max θ_j - min θ_j)``).
+    That scale is converted to normalized space using ``mean(theta_std)`` so the Gaussian
+    kernel applies to Euclidean distance on z-scored θ.
+
+    ``--contrastive-soft-periodic`` is only allowed for scalar θ (``d_theta == 1``).
+    """
     x_mean = np.mean(x_tr, axis=0, dtype=np.float64)
     x_std = np.maximum(np.std(x_tr, axis=0, dtype=np.float64), 1e-6)
     theta_mean = np.mean(th_tr, axis=0, dtype=np.float64)
     theta_std = np.maximum(np.std(th_tr, axis=0, dtype=np.float64), 1e-6)
+    th2 = _as_2d_float64(th_tr, name="th_tr")
+    d_theta = int(th2.shape[1])
+    if bool(periodic) and d_theta != 1:
+        raise ValueError(
+            "contrastive-soft periodic bandwidth/distance supports scalar theta only (d_theta=1)."
+        )
 
     bw_start = float(bandwidth_start)
     bw_end = float(bandwidth_end)
-    if not math.isfinite(float(bandwidth)):
-        raise ValueError("contrastive-soft bandwidth must be finite.")
+    if int(bandwidth_bins) < 1:
+        raise ValueError("contrastive-soft bandwidth_bins must be >= 1.")
     if not math.isfinite(bw_start) or not math.isfinite(bw_end):
         raise ValueError("contrastive-soft bandwidth start/end must be finite.")
     bandwidth_anneal_enabled = bool(bw_start > 0.0 or bw_end > 0.0)
     if bandwidth_anneal_enabled and not (bw_start > 0.0 and bw_end > 0.0):
         raise ValueError("contrastive-soft bandwidth annealing requires both start and end > 0.")
 
-    theta_scale = float(theta_std.reshape(-1)[0])
-    bandwidth_auto = not bandwidth_anneal_enabled and not (float(bandwidth) > 0.0)
+    theta_scale = float(np.mean(theta_std))
     if bandwidth_anneal_enabled:
         h_start = bw_start / theta_scale
         h_end = bw_end / theta_scale
-    elif bandwidth_auto:
-        h_raw = auto_soft_bandwidth(
-            th_tr,
-            k=int(bandwidth_k),
-            periodic=bool(periodic),
-            period=float(period),
-        )
-        h_start = h_raw / theta_scale
-        h_end = h_start
     else:
-        h_start = float(bandwidth) / theta_scale
+        if d_theta == 1:
+            th_flat = th2.reshape(-1)
+            theta_range = float(np.max(th_flat) - np.min(th_flat))
+        else:
+            theta_range = float(np.max(np.ptp(th2, axis=0)))
+        if not math.isfinite(theta_range) or theta_range <= 0.0:
+            raise ValueError(
+                "contrastive-soft bandwidth from bins requires a positive train theta span "
+                "(per-coordinate range for multi-dimensional theta)."
+            )
+        h_raw = float(theta_range) / float(int(bandwidth_bins)) / 2.0
+        h_start = h_raw / theta_scale
         h_end = h_start
     if (
         not math.isfinite(float(h_start))
@@ -819,10 +827,10 @@ def contrastive_soft_normalization_and_bandwidth_from_train(
         "theta_mean": theta_mean,
         "theta_std": theta_std,
         "theta_scale": theta_scale,
-        "bandwidth_auto": bool(bandwidth_auto),
         "bandwidth_anneal_enabled": bandwidth_anneal_enabled,
         "h_start_norm": float(h_start),
         "h_end_norm": float(h_end),
+        "bandwidth_bins": int(bandwidth_bins),
     }
 
 
@@ -830,18 +838,17 @@ def contrastive_soft_metadata_without_training(
     *,
     theta_train: np.ndarray,
     x_train: np.ndarray,
-    bandwidth: float,
+    bandwidth_bins: int = 10,
     bandwidth_start: float = 0.0,
     bandwidth_end: float = 0.0,
-    bandwidth_k: int = 5,
     periodic: bool = False,
     period: float = 2.0 * math.pi,
 ) -> dict[str, Any]:
     """Same keys as ``train_contrastive_soft_llr`` return dict, with empty loss traces (no fine-tuning)."""
     th_tr = _as_2d_float64(theta_train, name="theta_train")
     x_tr = _as_2d_float64(x_train, name="x_train")
-    if int(th_tr.shape[1]) != 1:
-        raise ValueError("contrastive-soft v1 requires scalar theta.")
+    if int(th_tr.shape[1]) < 1:
+        raise ValueError("contrastive-soft expects theta_train with shape (N, d_theta), d_theta >= 1.")
     if th_tr.shape[0] < 2:
         raise ValueError("contrastive-soft requires at least two training rows.")
     if th_tr.shape[0] != x_tr.shape[0]:
@@ -850,10 +857,9 @@ def contrastive_soft_metadata_without_training(
     nb = contrastive_soft_normalization_and_bandwidth_from_train(
         th_tr=th_tr,
         x_tr=x_tr,
-        bandwidth=float(bandwidth),
+        bandwidth_bins=int(bandwidth_bins),
         bandwidth_start=float(bandwidth_start),
         bandwidth_end=float(bandwidth_end),
-        bandwidth_k=int(bandwidth_k),
         periodic=bool(periodic),
         period=float(period),
     )
@@ -862,11 +868,11 @@ def contrastive_soft_metadata_without_training(
     theta_mean = nb["theta_mean"]
     theta_std = nb["theta_std"]
     theta_scale = float(nb["theta_scale"])
-    bandwidth_auto = bool(nb["bandwidth_auto"])
     bandwidth_anneal_enabled = bool(nb["bandwidth_anneal_enabled"])
     h_start = float(nb["h_start_norm"])
     h_end = float(nb["h_end_norm"])
     h_final_norm = float(h_end)
+    bw_bins = int(nb["bandwidth_bins"])
 
     return {
         "train_losses": [],
@@ -882,8 +888,9 @@ def contrastive_soft_metadata_without_training(
         "theta_std": theta_std,
         "bandwidth_raw": float(h_final_norm * theta_scale),
         "bandwidth_normalized": float(h_final_norm),
-        "bandwidth_auto": bandwidth_auto,
+        "bandwidth_auto": False,
         "bandwidth_anneal_enabled": bandwidth_anneal_enabled,
+        "bandwidth_bins": bw_bins,
         "bandwidth_start_raw": float(h_start * theta_scale),
         "bandwidth_end_raw": float(h_end * theta_scale),
         "bandwidth_start_normalized": float(h_start),
@@ -1184,10 +1191,9 @@ def train_contrastive_soft_llr(
     epochs: int,
     batch_size: int,
     lr: float,
-    bandwidth: float,
+    bandwidth_bins: int = 10,
     bandwidth_start: float = 0.0,
     bandwidth_end: float = 0.0,
-    bandwidth_k: int = 5,
     periodic: bool = False,
     period: float = 2.0 * math.pi,
     weight_decay: float = 0.0,
@@ -1222,8 +1228,9 @@ def train_contrastive_soft_llr(
     th_va = _as_2d_float64(theta_val, name="theta_val")
     x_tr = _as_2d_float64(x_train, name="x_train")
     x_va = _as_2d_float64(x_val, name="x_val")
-    if int(th_tr.shape[1]) != 1 or int(th_va.shape[1]) != 1:
-        raise ValueError("contrastive-soft v1 requires scalar theta.")
+    d_theta = int(th_tr.shape[1])
+    if int(th_va.shape[1]) != d_theta:
+        raise ValueError("theta_train and theta_val must have the same d_theta.")
     if th_tr.shape[0] < 2 or th_va.shape[0] < 2:
         raise ValueError("contrastive-soft requires at least two train and two validation rows.")
     if th_tr.shape[0] != x_tr.shape[0] or th_va.shape[0] != x_va.shape[0]:
@@ -1236,6 +1243,10 @@ def train_contrastive_soft_llr(
     if fk < 0:
         raise ValueError("contrastive_theta_fourier_k must be >= 0.")
     if fk > 0:
+        if d_theta != 1:
+            raise ValueError(
+                "contrastive-soft Fourier theta features (--theta-flow-fourier-state) require scalar theta (d_theta=1)."
+            )
         if not math.isfinite(pm) or pm <= 0.0:
             raise ValueError("contrastive_theta_fourier_period_mult must be finite and > 0 when fourier_k > 0.")
         if not contrastive_soft_theta_fourier_supported(model):
@@ -1245,11 +1256,14 @@ def train_contrastive_soft_llr(
                 "ContrastiveAdditiveIndependentScorer, and ContrastiveIndependentDotProductScorer; "
                 f"got {type(model).__name__}."
             )
-    aug_dim = dot_scorer_augmented_theta_dim(fourier_k=fk, fourier_include_linear=inc_lin)
-    if int(model.theta_dim) != int(aug_dim):
+    if fk > 0:
+        expected_theta_dim = int(dot_scorer_augmented_theta_dim(fourier_k=fk, fourier_include_linear=inc_lin))
+    else:
+        expected_theta_dim = int(d_theta)
+    if int(model.theta_dim) != int(expected_theta_dim):
         raise ValueError(
-            f"model.theta_dim={int(model.theta_dim)} does not match expected augmented width {aug_dim} "
-            f"(fourier_k={fk}, fourier_include_linear={inc_lin})."
+            f"model.theta_dim={int(model.theta_dim)} does not match expected theta width {expected_theta_dim} "
+            f"(d_theta={d_theta}, fourier_k={fk}, fourier_include_linear={inc_lin})."
         )
     ref_min = float(np.min(th_tr))
     ref_max = float(np.max(th_tr))
@@ -1257,10 +1271,9 @@ def train_contrastive_soft_llr(
     nb = contrastive_soft_normalization_and_bandwidth_from_train(
         th_tr=th_tr,
         x_tr=x_tr,
-        bandwidth=float(bandwidth),
+        bandwidth_bins=int(bandwidth_bins),
         bandwidth_start=float(bandwidth_start),
         bandwidth_end=float(bandwidth_end),
-        bandwidth_k=int(bandwidth_k),
         periodic=bool(periodic),
         period=float(period),
     )
@@ -1269,8 +1282,8 @@ def train_contrastive_soft_llr(
     theta_mean = nb["theta_mean"]
     theta_std = nb["theta_std"]
     theta_scale = float(nb["theta_scale"])
-    bandwidth_auto = bool(nb["bandwidth_auto"])
     bandwidth_anneal_enabled = bool(nb["bandwidth_anneal_enabled"])
+    bw_bins = int(nb["bandwidth_bins"])
     h_start = float(nb["h_start_norm"])
     h_end = float(nb["h_end_norm"])
     x_tr_n = (x_tr - x_mean) / x_std
@@ -1410,8 +1423,9 @@ def train_contrastive_soft_llr(
         "theta_std": theta_std,
         "bandwidth_raw": float(bandwidth_schedule[-1] * theta_scale),
         "bandwidth_normalized": float(bandwidth_schedule[-1]),
-        "bandwidth_auto": bool(bandwidth_auto),
+        "bandwidth_auto": False,
         "bandwidth_anneal_enabled": bool(bandwidth_anneal_enabled),
+        "bandwidth_bins": int(bw_bins),
         "bandwidth_start_raw": float(h_start * theta_scale),
         "bandwidth_end_raw": float(h_end * theta_scale),
         "bandwidth_start_normalized": float(h_start),
@@ -1441,10 +1455,9 @@ def train_bidir_contrastive_soft_llr(
     epochs: int,
     batch_size: int,
     lr: float,
-    bandwidth: float,
+    bandwidth_bins: int = 10,
     bandwidth_start: float = 0.0,
     bandwidth_end: float = 0.0,
-    bandwidth_k: int = 5,
     periodic: bool = False,
     period: float = 2.0 * math.pi,
     weight_decay: float = 0.0,
@@ -1514,10 +1527,9 @@ def train_bidir_contrastive_soft_llr(
     nb = contrastive_soft_normalization_and_bandwidth_from_train(
         th_tr=th_tr,
         x_tr=x_tr,
-        bandwidth=float(bandwidth),
+        bandwidth_bins=int(bandwidth_bins),
         bandwidth_start=float(bandwidth_start),
         bandwidth_end=float(bandwidth_end),
-        bandwidth_k=int(bandwidth_k),
         periodic=bool(periodic),
         period=float(period),
     )
@@ -1526,8 +1538,8 @@ def train_bidir_contrastive_soft_llr(
     theta_mean = nb["theta_mean"]
     theta_std = nb["theta_std"]
     theta_scale = float(nb["theta_scale"])
-    bandwidth_auto = bool(nb["bandwidth_auto"])
     bandwidth_anneal_enabled = bool(nb["bandwidth_anneal_enabled"])
+    bw_bins = int(nb["bandwidth_bins"])
     h_start = float(nb["h_start_norm"])
     h_end = float(nb["h_end_norm"])
     x_tr_n = (x_tr - x_mean) / x_std
@@ -1683,8 +1695,9 @@ def train_bidir_contrastive_soft_llr(
         "theta_std": theta_std,
         "bandwidth_raw": float(bandwidth_schedule[-1] * theta_scale),
         "bandwidth_normalized": float(bandwidth_schedule[-1]),
-        "bandwidth_auto": bool(bandwidth_auto),
+        "bandwidth_auto": False,
         "bandwidth_anneal_enabled": bool(bandwidth_anneal_enabled),
+        "bandwidth_bins": int(bw_bins),
         "bandwidth_start_raw": float(h_start * theta_scale),
         "bandwidth_end_raw": float(h_end * theta_scale),
         "bandwidth_start_normalized": float(h_start),
@@ -1774,18 +1787,24 @@ def compute_contrastive_soft_c_matrix(
     x = _as_2d_float64(x_all, name="x_all")
     if theta.shape[0] != x.shape[0]:
         raise ValueError("theta_all and x_all row counts must match.")
-    if int(theta.shape[1]) != 1:
-        raise ValueError("contrastive-soft v1 requires scalar theta.")
+    d_theta = int(theta.shape[1])
     if int(x.shape[1]) != model.x_dim:
         raise ValueError("x dimension does not match ContrastiveLLRMLP.x_dim.")
     fk = int(contrastive_theta_fourier_k)
     pm = float(contrastive_theta_fourier_period_mult)
     inc_lin = bool(contrastive_theta_fourier_include_linear)
-    aug_dim = dot_scorer_augmented_theta_dim(fourier_k=fk, fourier_include_linear=inc_lin)
-    if int(model.theta_dim) != int(aug_dim):
+    if fk > 0:
+        if d_theta != 1:
+            raise ValueError(
+                "compute_contrastive_soft_c_matrix with Fourier features requires scalar theta (d_theta=1)."
+            )
+        expected_theta_dim = int(dot_scorer_augmented_theta_dim(fourier_k=fk, fourier_include_linear=inc_lin))
+    else:
+        expected_theta_dim = int(d_theta)
+    if int(model.theta_dim) != int(expected_theta_dim):
         raise ValueError(
-            f"model.theta_dim={int(model.theta_dim)} does not match expected augmented theta width {aug_dim} "
-            f"(fourier_k={fk}, fourier_include_linear={inc_lin})."
+            f"model.theta_dim={int(model.theta_dim)} does not match expected theta width {expected_theta_dim} "
+            f"(d_theta={d_theta}, fourier_k={fk}, fourier_include_linear={inc_lin})."
         )
     if fk > 0:
         if theta_fourier_ref is None:

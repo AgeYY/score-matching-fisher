@@ -107,10 +107,9 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--contrastive-early-ema-alpha", type=float, default=0.05)
     p.add_argument("--contrastive-max-grad-norm", type=float, default=10.0)
     p.add_argument("--log-every", type=int, default=50)
-    p.add_argument("--contrastive-soft-bandwidth", type=float, default=0.2)
+    p.add_argument("--contrastive-soft-bandwidth-bins", type=int, default=10)
     p.add_argument("--contrastive-soft-bandwidth-start", type=float, default=0.0)
     p.add_argument("--contrastive-soft-bandwidth-end", type=float, default=0.0)
-    p.add_argument("--contrastive-soft-bandwidth-k", type=int, default=5)
     p.add_argument("--contrastive-soft-periodic", action="store_true")
     p.add_argument("--contrastive-soft-period", type=float, default=2.0 * np.pi)
     args = p.parse_args(argv)
@@ -153,10 +152,9 @@ def main(argv: list[str] | None = None) -> None:
         epochs=int(args.contrastive_epochs),
         batch_size=int(args.contrastive_batch_size),
         lr=float(args.contrastive_lr),
-        bandwidth=float(args.contrastive_soft_bandwidth),
+        bandwidth_bins=int(args.contrastive_soft_bandwidth_bins),
         bandwidth_start=float(args.contrastive_soft_bandwidth_start),
         bandwidth_end=float(args.contrastive_soft_bandwidth_end),
-        bandwidth_k=int(args.contrastive_soft_bandwidth_k),
         periodic=bool(args.contrastive_soft_periodic),
         period=float(args.contrastive_soft_period),
         weight_decay=float(args.contrastive_weight_decay),

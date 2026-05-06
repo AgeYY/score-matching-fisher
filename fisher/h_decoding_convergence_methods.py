@@ -175,35 +175,147 @@ def theta_segment_ids_equal_width(
     return vhb.theta_segment_ids_equal_width(theta, n_segments)
 
 def _build_theta_fourier_state(
-    theta_scalar: np.ndarray,
+    theta_all_in: np.ndarray,
     *,
     theta_ref: np.ndarray,
     k: int,
     period_mult: float,
     include_linear: bool,
-) -> tuple[np.ndarray, float, float, float]:
-    """Build deterministic Fourier theta-state vectors from scalar theta."""
-    theta_all = np.asarray(theta_scalar, dtype=np.float64).reshape(-1)
-    theta_ref_vec = np.asarray(theta_ref, dtype=np.float64).reshape(-1)
-    if theta_all.size < 1 or theta_ref_vec.size < 1:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Build deterministic Fourier theta-state vectors from scalar or multi-dimensional theta.
+
+    Accepts ``theta`` as 1D ``(N,)``, ``(N, 1)``, or ``(N, d_theta)``. Reference slice ``theta_ref``
+    must have the same width ``d_theta``. For each coordinate independently (dimension-major order):
+
+    - Optional scaled linear term ``(theta - center) / max(range, 1e-12)`` when ``include_linear``.
+    - Harmonics ``sin(k * omega * shift)``, ``cos(...)`` for ``k = 1..K`` with
+      ``omega = 2*pi / (period_mult * max(range, 1e-12))``.
+
+    Output width is ``d_theta * ((1 if include_linear else 0) + 2*K)``. For ``d_theta == 1`` this
+    matches the legacy scalar construction exactly.
+
+    Returns ``(state, ref_range_vec, period_vec, center_vec)`` each of shape ``(d_theta,)`` for the
+    metadata vectors (train-reference ranges, periods, centers per coordinate).
+    """
+    th = np.asarray(theta_all_in, dtype=np.float64)
+    if th.ndim == 1:
+        th = th.reshape(-1, 1)
+    elif th.ndim != 2:
+        raise ValueError(f"_build_theta_fourier_state expects theta of shape (N,), (N,1), or (N,d); got {th.shape}")
+
+    tr = np.asarray(theta_ref, dtype=np.float64)
+    if tr.ndim == 1:
+        tr = tr.reshape(-1, 1)
+    elif tr.ndim != 2:
+        raise ValueError(f"_build_theta_fourier_state expects theta_ref 1D or 2D; got {tr.shape}")
+
+    if int(th.shape[1]) != int(tr.shape[1]):
+        raise ValueError(f"theta width {th.shape[1]} != theta_ref width {tr.shape[1]}.")
+    if th.shape[0] < 1 or tr.shape[0] < 1:
         raise ValueError("Fourier theta state requires non-empty theta arrays.")
-    ref_min = float(np.min(theta_ref_vec))
-    ref_max = float(np.max(theta_ref_vec))
-    ref_range = float(ref_max - ref_min)
-    range_safe = max(ref_range, 1e-12)
-    period = float(period_mult) * range_safe
-    w0 = 2.0 * np.pi / period
-    theta_center = 0.5 * (ref_min + ref_max)
-    theta_shift = theta_all - theta_center
+
+    kk = int(k)
+    if kk < 1:
+        raise ValueError("Fourier theta state requires K >= 1 harmonic pairs.")
+    pm = float(period_mult)
+
+    d_theta = int(th.shape[1])
     cols: list[np.ndarray] = []
-    if include_linear:
-        cols.append((theta_shift / range_safe).reshape(-1, 1))
-    for kk in range(1, int(k) + 1):
-        phase = (float(kk) * w0) * theta_shift
-        cols.append(np.sin(phase).reshape(-1, 1))
-        cols.append(np.cos(phase).reshape(-1, 1))
+    ref_ranges: list[float] = []
+    periods: list[float] = []
+    centers: list[float] = []
+
+    for j in range(d_theta):
+        ref_min = float(np.min(tr[:, j]))
+        ref_max = float(np.max(tr[:, j]))
+        ref_range = max(ref_max - ref_min, 1e-12)
+        period = pm * ref_range
+        center = 0.5 * (ref_min + ref_max)
+        shift = th[:, j] - center
+        w0 = 2.0 * np.pi / period
+
+        ref_ranges.append(ref_range)
+        periods.append(period)
+        centers.append(center)
+
+        if include_linear:
+            cols.append((shift / ref_range).reshape(-1, 1))
+        for h in range(1, kk + 1):
+            phase = float(h) * w0 * shift
+            cols.append(np.sin(phase).reshape(-1, 1))
+            cols.append(np.cos(phase).reshape(-1, 1))
+
     out = np.concatenate(cols, axis=1).astype(np.float64, copy=False)
-    return out, ref_range, period, theta_center
+    ref_arr = np.asarray(ref_ranges, dtype=np.float64)
+    per_arr = np.asarray(periods, dtype=np.float64)
+    cen_arr = np.asarray(centers, dtype=np.float64)
+    return out, ref_arr, per_arr, cen_arr
+
+
+def theta_phys_rows_and_ref_for_fourier(
+    theta_raw_all: np.ndarray,
+    perm: np.ndarray,
+    n_ref: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Reshape raw dataset theta to ``(N, d)`` and take the same n_ref prefix as binning (phys coords for Fourier)."""
+    th = np.asarray(theta_raw_all, dtype=np.float64)
+    if th.ndim == 1:
+        th = th.reshape(-1, 1)
+    elif th.ndim != 2:
+        raise ValueError(
+            "Fourier theta state requires theta_all as 1D, (N,1), or (N,d); " f"got shape {th.shape}."
+        )
+    nref = int(n_ref)
+    if nref < 1:
+        raise ValueError("Fourier reference slice requires n_ref >= 1.")
+    pref = th[np.asarray(perm, dtype=np.int64)[:nref]]
+    return th, pref
+
+
+def format_theta_fourier_state_log_message(
+    *,
+    tag: str,
+    state_dim: int,
+    k: int,
+    ref_range_vec: np.ndarray,
+    period_vec: np.ndarray,
+    center_vec: np.ndarray,
+    period_mult: float,
+    include_linear: bool,
+) -> str:
+    """One-line log for multi-coordinate Fourier state (scalars when ``d==1``)."""
+    rr = np.asarray(ref_range_vec, dtype=np.float64).reshape(-1)
+    pp = np.asarray(period_vec, dtype=np.float64).reshape(-1)
+    cc = np.asarray(center_vec, dtype=np.float64).reshape(-1)
+
+    def _fmt(name: str, v: np.ndarray) -> str:
+        if v.size == 1:
+            return f"{name}={float(v[0]):.6g}"
+        inner = ", ".join(f"{float(x):.6g}" for x in v.tolist())
+        return f"{name}=[{inner}]"
+
+    return (
+        f"{tag} theta_flow Fourier state enabled: "
+        f"dim={int(state_dim)} K={int(k)} "
+        f"{_fmt('period', pp)} "
+        f"(mult={float(period_mult):.3g}, {_fmt('ref_range', rr)}, {_fmt('center', cc)}, "
+        f"include_linear={bool(include_linear)})"
+    )
+
+
+def contrastive_soft_fourier_settings_from_theta_flow_args(args: Any) -> tuple[int, float, bool]:
+    """Map canonical ``--theta-flow-fourier-*`` CLI to contrastive-soft Fourier hyperparameters.
+
+    When ``theta_flow_fourier_state`` is false, returns ``(0, period_mult, False)`` so the dot-family
+    theta branch uses scalar coordinates only (``k=0`` disables harmonics in ``contrastive_llr``).
+    """
+    if not bool(getattr(args, "theta_flow_fourier_state", False)):
+        return 0, float(getattr(args, "theta_flow_fourier_period_mult", 2.0)), False
+    return (
+        int(getattr(args, "theta_flow_fourier_k", 4)),
+        float(getattr(args, "theta_flow_fourier_period_mult", 2.0)),
+        bool(getattr(args, "theta_flow_fourier_include_linear", False)),
+    )
 
 
 def _build_lxf_theta_fourier_features(
@@ -611,10 +723,8 @@ def _train_contrastive_soft_and_encode_bundle(
         raise ValueError("--contrastive-soft-dot-dim must be >= 1 for contrastive+flow.")
     hidden_dim = int(getattr(args, "contrastive_hidden_dim", 128))
     depth = int(getattr(args, "contrastive_depth", 3))
-    theta_in_dim = dot_scorer_augmented_theta_dim(
-        fourier_k=int(getattr(args, "contrastive_theta_fourier_k", 4)),
-        fourier_include_linear=bool(getattr(args, "contrastive_theta_fourier_include_linear", False)),
-    )
+    _fk, _pm, _inc = contrastive_soft_fourier_settings_from_theta_flow_args(args)
+    theta_in_dim = dot_scorer_augmented_theta_dim(fourier_k=int(_fk), fourier_include_linear=bool(_inc))
     model = ContrastiveNormalizedDotScorer(
         x_dim=int(x_all.shape[1]),
         theta_dim=int(theta_in_dim),
@@ -637,10 +747,9 @@ def _train_contrastive_soft_and_encode_bundle(
         epochs=int(getattr(args, "contrastive_epochs", 2000)),
         batch_size=int(getattr(args, "contrastive_batch_size", 256)),
         lr=float(getattr(args, "contrastive_lr", 1e-3)),
-        bandwidth=float(getattr(args, "contrastive_soft_bandwidth", 0.2)),
+        bandwidth_bins=int(getattr(args, "contrastive_soft_bandwidth_bins", 10)),
         bandwidth_start=float(getattr(args, "contrastive_soft_bandwidth_start", 0.0)),
         bandwidth_end=float(getattr(args, "contrastive_soft_bandwidth_end", 0.0)),
-        bandwidth_k=int(getattr(args, "contrastive_soft_bandwidth_k", 5)),
         periodic=bool(getattr(args, "contrastive_soft_periodic", False)),
         period=float(getattr(args, "contrastive_soft_period", 2.0 * np.pi)),
         weight_decay=float(getattr(args, "contrastive_weight_decay", 0.0)),
@@ -650,11 +759,9 @@ def _train_contrastive_soft_and_encode_bundle(
         max_grad_norm=float(getattr(args, "contrastive_max_grad_norm", 10.0)),
         log_every=max(1, int(getattr(args, "log_every", 50))),
         restore_best=True,
-        contrastive_theta_fourier_k=int(getattr(args, "contrastive_theta_fourier_k", 4)),
-        contrastive_theta_fourier_period_mult=float(getattr(args, "contrastive_theta_fourier_period_mult", 2.0)),
-        contrastive_theta_fourier_include_linear=bool(
-            getattr(args, "contrastive_theta_fourier_include_linear", False)
-        ),
+        contrastive_theta_fourier_k=int(_fk),
+        contrastive_theta_fourier_period_mult=float(_pm),
+        contrastive_theta_fourier_include_linear=bool(_inc),
     )
     x_mean = np.asarray(train_out["x_mean"], dtype=np.float64)
     x_std = np.asarray(train_out["x_std"], dtype=np.float64)
@@ -1124,20 +1231,19 @@ def _estimate_one(
             restore_best=True,
         )
         model = ContrastiveGaussianNetworkScorer(gaussian_model).to(dev)
-        bw_arg = float(getattr(args, "contrastive_soft_bandwidth", 0.2))
+        bw_bins = int(getattr(args, "contrastive_soft_bandwidth_bins", 10))
         bw_start = float(getattr(args, "contrastive_soft_bandwidth_start", 0.0))
         bw_end = float(getattr(args, "contrastive_soft_bandwidth_end", 0.0))
-        bw_k = int(getattr(args, "contrastive_soft_bandwidth_k", 5))
         periodic = bool(getattr(args, "contrastive_soft_periodic", False))
         period = float(getattr(args, "contrastive_soft_period", 2.0 * np.pi))
+        _fk_gn, _pm_gn, _inc_gn = contrastive_soft_fourier_settings_from_theta_flow_args(args)
         if contrastive_norm == "contrastive_soft_gaussian_net_no_finetune":
             train_out = contrastive_soft_metadata_without_training(
                 theta_train=theta_train,
                 x_train=x_train,
-                bandwidth=bw_arg,
+                bandwidth_bins=bw_bins,
                 bandwidth_start=bw_start,
                 bandwidth_end=bw_end,
-                bandwidth_k=bw_k,
                 periodic=periodic,
                 period=period,
             )
@@ -1152,10 +1258,9 @@ def _estimate_one(
                 epochs=int(getattr(args, "contrastive_epochs", 2000)),
                 batch_size=int(getattr(args, "contrastive_batch_size", 256)),
                 lr=float(getattr(args, "contrastive_lr", 1e-3)),
-                bandwidth=bw_arg,
+                bandwidth_bins=bw_bins,
                 bandwidth_start=bw_start,
                 bandwidth_end=bw_end,
-                bandwidth_k=bw_k,
                 periodic=periodic,
                 period=period,
                 weight_decay=float(getattr(args, "contrastive_weight_decay", 0.0)),
@@ -1165,11 +1270,9 @@ def _estimate_one(
                 max_grad_norm=float(getattr(args, "contrastive_max_grad_norm", 10.0)),
                 log_every=max(1, int(getattr(args, "log_every", 50))),
                 restore_best=True,
-                contrastive_theta_fourier_k=int(getattr(args, "contrastive_theta_fourier_k", 4)),
-                contrastive_theta_fourier_period_mult=float(getattr(args, "contrastive_theta_fourier_period_mult", 2.0)),
-                contrastive_theta_fourier_include_linear=bool(
-                    getattr(args, "contrastive_theta_fourier_include_linear", False)
-                ),
+                contrastive_theta_fourier_k=int(_fk_gn),
+                contrastive_theta_fourier_period_mult=float(_pm_gn),
+                contrastive_theta_fourier_include_linear=bool(_inc_gn),
             )
         x_mean = np.asarray(train_out["x_mean"], dtype=np.float64)
         x_std = np.asarray(train_out["x_std"], dtype=np.float64)
@@ -1234,7 +1337,7 @@ def _estimate_one(
                 train_out["bandwidth_normalized_schedule"],
                 dtype=np.float64,
             ),
-            contrastive_soft_bandwidth_k=np.int64(bw_k),
+            contrastive_soft_bandwidth_bins=np.int64(train_out["bandwidth_bins"]),
             contrastive_soft_periodic=np.bool_(periodic),
             contrastive_soft_period=np.float64(period),
             contrastive_x_mean=x_mean,
@@ -1328,9 +1431,10 @@ def _estimate_one(
         depth = int(getattr(args, "contrastive_depth", 3))
         dot_dim = int(getattr(args, "contrastive_soft_dot_dim", 10))
         soft_arch = str(getattr(args, "contrastive_soft_score_arch", "normalized_dot")).strip().lower().replace("-", "_")
+        _fk_bidir, _pm_bidir, _inc_bidir = contrastive_soft_fourier_settings_from_theta_flow_args(args)
         theta_in_dim = dot_scorer_augmented_theta_dim(
-            fourier_k=int(getattr(args, "contrastive_theta_fourier_k", 4)),
-            fourier_include_linear=bool(getattr(args, "contrastive_theta_fourier_include_linear", False)),
+            fourier_k=int(_fk_bidir),
+            fourier_include_linear=bool(_inc_bidir),
         )
         if soft_arch == "mlp":
             model = ContrastiveLLRMLP(
@@ -1347,10 +1451,9 @@ def _estimate_one(
                 hidden_dim=hidden_dim,
                 depth=depth,
             ).to(dev)
-        bw_arg = float(getattr(args, "contrastive_soft_bandwidth", 0.2))
+        bw_bins = int(getattr(args, "contrastive_soft_bandwidth_bins", 10))
         bw_start = float(getattr(args, "contrastive_soft_bandwidth_start", 0.0))
         bw_end = float(getattr(args, "contrastive_soft_bandwidth_end", 0.0))
-        bw_k = int(getattr(args, "contrastive_soft_bandwidth_k", 5))
         periodic = bool(getattr(args, "contrastive_soft_periodic", False))
         period = float(getattr(args, "contrastive_soft_period", 2.0 * np.pi))
         train_out = train_bidir_contrastive_soft_llr(
@@ -1363,10 +1466,9 @@ def _estimate_one(
             epochs=int(getattr(args, "contrastive_epochs", 2000)),
             batch_size=int(getattr(args, "contrastive_batch_size", 256)),
             lr=float(getattr(args, "contrastive_lr", 1e-3)),
-            bandwidth=bw_arg,
+            bandwidth_bins=bw_bins,
             bandwidth_start=bw_start,
             bandwidth_end=bw_end,
-            bandwidth_k=bw_k,
             periodic=periodic,
             period=period,
             weight_decay=float(getattr(args, "contrastive_weight_decay", 0.0)),
@@ -1376,11 +1478,9 @@ def _estimate_one(
             max_grad_norm=float(getattr(args, "contrastive_max_grad_norm", 10.0)),
             log_every=max(1, int(getattr(args, "log_every", 50))),
             restore_best=True,
-            contrastive_theta_fourier_k=int(getattr(args, "contrastive_theta_fourier_k", 4)),
-            contrastive_theta_fourier_period_mult=float(getattr(args, "contrastive_theta_fourier_period_mult", 2.0)),
-            contrastive_theta_fourier_include_linear=bool(
-                getattr(args, "contrastive_theta_fourier_include_linear", False)
-            ),
+            contrastive_theta_fourier_k=int(_fk_bidir),
+            contrastive_theta_fourier_period_mult=float(_pm_bidir),
+            contrastive_theta_fourier_include_linear=bool(_inc_bidir),
         )
         x_mean = np.asarray(train_out["x_mean"], dtype=np.float64)
         x_std = np.asarray(train_out["x_std"], dtype=np.float64)
@@ -1450,7 +1550,7 @@ def _estimate_one(
                 train_out["bandwidth_normalized_schedule"],
                 dtype=np.float64,
             ),
-            contrastive_soft_bandwidth_k=np.int64(bw_k),
+            contrastive_soft_bandwidth_bins=np.int64(train_out["bandwidth_bins"]),
             contrastive_soft_periodic=np.bool_(periodic),
             contrastive_soft_period=np.float64(period),
             contrastive_x_mean=x_mean,
@@ -1535,8 +1635,9 @@ def _estimate_one(
             theta_all = theta_all.reshape(-1, 1)
         if theta_train.ndim != 2 or theta_val.ndim != 2 or theta_all.ndim != 2:
             raise ValueError("contrastive-soft expects theta arrays to be 1D or 2D.")
-        if int(theta_train.shape[1]) != 1 or int(theta_all.shape[1]) != 1:
-            raise ValueError("contrastive-soft v1 requires scalar theta.")
+        d_theta = int(theta_train.shape[1])
+        if int(theta_val.shape[1]) != d_theta or int(theta_all.shape[1]) != d_theta:
+            raise ValueError("contrastive-soft requires matching theta width across train, validation, and all splits.")
         if x_train.ndim != 2 or x_val.ndim != 2 or x_all.ndim != 2:
             raise ValueError("contrastive-soft expects x arrays to be 2D.")
         if theta_train.shape[0] < 2 or theta_val.shape[0] < 2:
@@ -1551,10 +1652,21 @@ def _estimate_one(
         coord_embed_dim = int(getattr(args, "contrastive_soft_coordinate_embed_dim", 16))
         gaussian_logvar_min = float(getattr(args, "contrastive_soft_gaussian_logvar_min", -8.0))
         gaussian_logvar_max = float(getattr(args, "contrastive_soft_gaussian_logvar_max", 5.0))
-        theta_in_dim = dot_scorer_augmented_theta_dim(
-            fourier_k=int(getattr(args, "contrastive_theta_fourier_k", 4)),
-            fourier_include_linear=bool(getattr(args, "contrastive_theta_fourier_include_linear", False)),
-        )
+        _fk_soft, _pm_soft, _inc_soft = contrastive_soft_fourier_settings_from_theta_flow_args(args)
+        # Bundled Fourier θ from twofig/convergence (--theta-flow-fourier-state): θ rows are already the
+        # Fourier feature vector; do not append harmonics again inside contrastive-soft training.
+        bundled_fourier_theta = bool(getattr(args, "theta_flow_fourier_state", False)) and int(d_theta) > 1
+        if bundled_fourier_theta:
+            train_fourier_k = 0
+            theta_in_dim = int(d_theta)
+        elif int(_fk_soft) > 0:
+            train_fourier_k = int(_fk_soft)
+            theta_in_dim = int(
+                dot_scorer_augmented_theta_dim(fourier_k=int(_fk_soft), fourier_include_linear=bool(_inc_soft))
+            )
+        else:
+            train_fourier_k = 0
+            theta_in_dim = int(d_theta)
         if soft_arch == "normalized_dot":
             model = ContrastiveNormalizedDotScorer(
                 x_dim=int(x_all.shape[1]),
@@ -1574,7 +1686,7 @@ def _estimate_one(
         elif soft_arch == "independent_gaussian":
             model = ContrastiveIndependentGaussianScorer(
                 x_dim=int(x_all.shape[1]),
-                theta_dim=1,
+                theta_dim=int(theta_in_dim),
                 hidden_dim=hidden_dim,
                 depth=depth,
                 logvar_min=gaussian_logvar_min,
@@ -1592,7 +1704,7 @@ def _estimate_one(
         elif soft_arch == "mlp":
             model = ContrastiveLLRMLP(
                 x_dim=int(x_all.shape[1]),
-                theta_dim=1,
+                theta_dim=int(theta_in_dim),
                 hidden_dim=hidden_dim,
                 depth=depth,
             ).to(dev)
@@ -1601,10 +1713,9 @@ def _estimate_one(
                 "--contrastive-soft-score-arch must be one of "
                 "{'normalized_dot','additive_independent','independent_gaussian','independent_dot_product','mlp'}."
             )
-        bw_arg = float(getattr(args, "contrastive_soft_bandwidth", 0.2))
+        bw_bins = int(getattr(args, "contrastive_soft_bandwidth_bins", 10))
         bw_start = float(getattr(args, "contrastive_soft_bandwidth_start", 0.0))
         bw_end = float(getattr(args, "contrastive_soft_bandwidth_end", 0.0))
-        bw_k = int(getattr(args, "contrastive_soft_bandwidth_k", 5))
         periodic = bool(getattr(args, "contrastive_soft_periodic", False))
         period = float(getattr(args, "contrastive_soft_period", 2.0 * np.pi))
         train_out = train_contrastive_soft_llr(
@@ -1617,10 +1728,9 @@ def _estimate_one(
             epochs=int(getattr(args, "contrastive_epochs", 2000)),
             batch_size=int(getattr(args, "contrastive_batch_size", 256)),
             lr=float(getattr(args, "contrastive_lr", 1e-3)),
-            bandwidth=bw_arg,
+            bandwidth_bins=bw_bins,
             bandwidth_start=bw_start,
             bandwidth_end=bw_end,
-            bandwidth_k=bw_k,
             periodic=periodic,
             period=period,
             weight_decay=float(getattr(args, "contrastive_weight_decay", 0.0)),
@@ -1630,11 +1740,9 @@ def _estimate_one(
             max_grad_norm=float(getattr(args, "contrastive_max_grad_norm", 10.0)),
             log_every=max(1, int(getattr(args, "log_every", 50))),
             restore_best=True,
-            contrastive_theta_fourier_k=int(getattr(args, "contrastive_theta_fourier_k", 4)),
-            contrastive_theta_fourier_period_mult=float(getattr(args, "contrastive_theta_fourier_period_mult", 2.0)),
-            contrastive_theta_fourier_include_linear=bool(
-                getattr(args, "contrastive_theta_fourier_include_linear", False)
-            ),
+            contrastive_theta_fourier_k=int(train_fourier_k),
+            contrastive_theta_fourier_period_mult=float(_pm_soft),
+            contrastive_theta_fourier_include_linear=bool(_inc_soft),
         )
         x_mean = np.asarray(train_out["x_mean"], dtype=np.float64)
         x_std = np.asarray(train_out["x_std"], dtype=np.float64)
@@ -1670,7 +1778,7 @@ def _estimate_one(
         delta_l = compute_delta_l_nf(c_matrix)
         bin_h_payload = contrastive_bin_likelihood_h_payload(method_name, c_matrix)
         h_sym = bin_h_payload["h_sym_bin_likelihood"]
-        theta_used = theta_all.reshape(-1)
+        theta_used = theta_all.reshape(-1) if d_theta == 1 else np.asarray(theta_all, dtype=np.float64)
 
         np.savez_compressed(
             os.path.join(output_dir, "h_matrix_results_theta_cov.npz"),
@@ -1706,7 +1814,8 @@ def _estimate_one(
                 train_out["bandwidth_normalized_schedule"],
                 dtype=np.float64,
             ),
-            contrastive_soft_bandwidth_k=np.int64(bw_k),
+            contrastive_soft_bandwidth_bins=np.int64(train_out["bandwidth_bins"]),
+            contrastive_theta_dim=np.int64(d_theta),
             contrastive_soft_periodic=np.bool_(periodic),
             contrastive_soft_period=np.float64(period),
             contrastive_x_mean=x_mean,
@@ -3366,7 +3475,6 @@ def _estimate_one(
             eval_name = "contrastive_theta_flow_log_ratio_theta_given_z"
         else:
             eval_name = "contrastive_x_flow_log_p_z_given_theta"
-        bw_k = int(getattr(args, "contrastive_soft_bandwidth_k", 5))
         periodic = bool(getattr(args, "contrastive_soft_periodic", False))
         period = float(getattr(args, "contrastive_soft_period", 2.0 * np.pi))
         _rewrite_npz_fields(
@@ -3390,7 +3498,7 @@ def _estimate_one(
                 ctr_train_out["bandwidth_normalized_schedule"],
                 dtype=np.float64,
             ),
-            contrastive_soft_bandwidth_k=np.int64(bw_k),
+            contrastive_soft_bandwidth_bins=np.int64(ctr_train_out["bandwidth_bins"]),
             contrastive_soft_periodic=np.bool_(periodic),
             contrastive_soft_period=np.float64(period),
             contrastive_x_mean=np.asarray(ctr_train_out["x_mean"], dtype=np.float64),

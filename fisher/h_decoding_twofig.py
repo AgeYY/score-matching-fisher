@@ -494,6 +494,11 @@ def _run_twofig_visualization_only(
     z_path = os.path.join(args.output_dir, "h_decoding_twofig_results.npz")
     with np.load(z_path, allow_pickle=True) as z_meta:
         loss_root_str = _npz_str_field(z_meta, "training_losses_root")
+        fourier_on = bool(np.asarray(z_meta.get("theta_flow_fourier_state", False)).reshape(-1)[0])
+        _tf_d = z_meta.get("theta_fourier_state_dim")
+        theta_fourier_feature_dim_viz = (
+            int(np.asarray(_tf_d).reshape(-1)[0]) if fourier_on and _tf_d is not None else None
+        )
     loss_root = (
         loss_root_str
         if loss_root_str and os.path.isdir(loss_root_str)
@@ -570,6 +575,7 @@ def _run_twofig_visualization_only(
         nmse_decode_shape=tuple(int(x) for x in nmse_decode_vs_ref_shared.shape),
         wall_seconds_shape=wall_shape,
         visualization_only=True,
+        theta_fourier_feature_dim=theta_fourier_feature_dim_viz,
     )
 
     print("[twofig] Saved (visualization-only):", flush=True)
@@ -645,6 +651,8 @@ def build_parser() -> argparse.ArgumentParser:
             "--theta-field-method. Tokens are method or method:arch, e.g. "
             "theta_flow:mlp,theta_flow:film,x_flow:film_fourier,ctsm_v,bin_gaussian,"
             "linear_x_flow_low_rank_t,linear_x_flow_pure_low_rank_t,linear_x_flow_pure_cond_low_rank_t,linear_x_flow_diagonal_t. "
+            "For linear_x_flow_t and xflow_sir_lrank, --theta-flow-fourier-state can replace scalar theta "
+            "with the shared Fourier theta state. "
             "For low-rank linear_x_flow rows use --lxf-low-rank-dim (default 3). "
             "For xflow_sir_lrank and xflow_sir_pure_lrank variants, --lxf-low-rank-dim is the raw SIR U rank and "
             "--sir-num-bins/--sir-ridge control SIR. "
@@ -1079,6 +1087,7 @@ def _write_summary(
     nmse_decode_shape: tuple[int, ...],
     wall_seconds_shape: tuple[int, ...],
     visualization_only: bool = False,
+    theta_fourier_feature_dim: int | None = None,
 ) -> None:
     with open(path, "w", encoding="utf-8") as f:
         f.write("study_h_decoding_twofig\n")
@@ -1097,6 +1106,18 @@ def _write_summary(
         if _theta_binning_mode(args) == "theta2_grid":
             f.write(f"num_theta_bins_y: {_num_theta_bins_y(args)}\n")
             f.write(f"total_theta_bins: {_total_theta_bins_from_args(args)}\n")
+        theta_fourier_enabled = bool(getattr(args, "theta_flow_fourier_state", False))
+        f.write(f"theta_flow_fourier_state: {theta_fourier_enabled}\n")
+        if theta_fourier_enabled:
+            k_fourier = int(getattr(args, "theta_flow_fourier_k", 0))
+            include_linear = bool(getattr(args, "theta_flow_fourier_include_linear", False))
+            f.write(f"theta_flow_fourier_k: {k_fourier}\n")
+            f.write(f"theta_flow_fourier_period_mult: {float(getattr(args, 'theta_flow_fourier_period_mult', float('nan'))):.17g}\n")
+            f.write(f"theta_flow_fourier_include_linear: {include_linear}\n")
+            if theta_fourier_feature_dim is not None:
+                f.write(f"theta_fourier_state_dim: {int(theta_fourier_feature_dim)}\n")
+            else:
+                f.write(f"theta_fourier_state_dim: {2 * k_fourier + (1 if include_linear else 0)}\n")
         f.write(f"dataset_pool_size: {int(n_pool)}\n")
         f.write(f"dataset_meta_seed: {int(meta.get('seed', 0))}\n")
         f.write(f"perm_seed: {int(perm_seed)}\n")
@@ -1391,8 +1412,6 @@ def main(argv: list[str] | None = None, *, sir_first_default: bool = False) -> N
         args.flow_arch = validation_row.arch
     conv._validate_cli(args)
     _validate_cli_for_rows(args, row_specs)
-    if _theta_binning_mode(args) == "theta2_grid" and bool(getattr(args, "theta_flow_fourier_state", False)):
-        raise ValueError("--theta-binning-mode theta2_grid does not support --theta-flow-fourier-state.")
     ns = conv._parse_n_list(args.n_list)
 
     if bool(getattr(args, "visualization_only", False)):
@@ -1493,6 +1512,9 @@ def main(argv: list[str] | None = None, *, sir_first_default: bool = False) -> N
         centers = bin_centers_from_edges(edges)
 
     theta_state_all: np.ndarray | None = None
+    theta_fourier_ref_range: np.ndarray | float = float("nan")
+    theta_fourier_period: np.ndarray | float = float("nan")
+    theta_fourier_center: np.ndarray | float = float("nan")
     if bool(getattr(args, "theta_flow_onehot_state", False)):
         theta_state_all = np.eye(n_bins, dtype=np.float64)[bin_idx_all]
         print(
@@ -1500,19 +1522,33 @@ def main(argv: list[str] | None = None, *, sir_first_default: bool = False) -> N
             flush=True,
         )
     elif bool(getattr(args, "theta_flow_fourier_state", False)):
+        if theta_binning_mode == "theta2_grid":
+            theta_fourier_src = theta_raw_all
+            theta_fourier_ref_rows = theta_ref
+        else:
+            theta_fourier_src, theta_fourier_ref_rows = conv.theta_phys_rows_and_ref_for_fourier(
+                theta_raw_all,
+                perm,
+                int(args.n_ref),
+            )
         theta_state_all, theta_fourier_ref_range, theta_fourier_period, theta_fourier_center = conv._build_theta_fourier_state(
-            theta_scalar_all,
-            theta_ref=theta_ref,
+            theta_fourier_src,
+            theta_ref=theta_fourier_ref_rows,
             k=int(args.theta_flow_fourier_k),
             period_mult=float(args.theta_flow_fourier_period_mult),
             include_linear=bool(args.theta_flow_fourier_include_linear),
         )
         print(
-            "[twofig] theta_flow Fourier state enabled: "
-            f"dim={theta_state_all.shape[1]} K={int(args.theta_flow_fourier_k)} "
-            f"period={theta_fourier_period:.6g} "
-            f"(mult={float(args.theta_flow_fourier_period_mult):.3g}, ref_range={theta_fourier_ref_range:.6g}, "
-            f"center={theta_fourier_center:.6g}, include_linear={bool(args.theta_flow_fourier_include_linear)})",
+            conv.format_theta_fourier_state_log_message(
+                tag="[twofig]",
+                state_dim=int(theta_state_all.shape[1]),
+                k=int(args.theta_flow_fourier_k),
+                ref_range_vec=np.asarray(theta_fourier_ref_range, dtype=np.float64),
+                period_vec=np.asarray(theta_fourier_period, dtype=np.float64),
+                center_vec=np.asarray(theta_fourier_center, dtype=np.float64),
+                period_mult=float(args.theta_flow_fourier_period_mult),
+                include_linear=bool(args.theta_flow_fourier_include_linear),
+            ),
             flush=True,
         )
 
@@ -1833,6 +1869,15 @@ def main(argv: list[str] | None = None, *, sir_first_default: bool = False) -> N
         out_svg_path=os.path.join(args.output_dir, "h_decoding_twofig_training_losses_panel.svg"),
     )
 
+    if theta_state_all is None:
+        tf_rr_save = np.float64(np.nan)
+        tf_per_save = np.float64(np.nan)
+        tf_cen_save = np.float64(np.nan)
+    else:
+        tf_rr_save = np.asarray(theta_fourier_ref_range, dtype=np.float64)
+        tf_per_save = np.asarray(theta_fourier_period, dtype=np.float64)
+        tf_cen_save = np.asarray(theta_fourier_center, dtype=np.float64)
+
     out_npz = os.path.join(args.output_dir, "h_decoding_twofig_results.npz")
     np.savez_compressed(
         out_npz,
@@ -1846,6 +1891,14 @@ def main(argv: list[str] | None = None, *, sir_first_default: bool = False) -> N
         perm_seed=np.int64(perm_seed),
         convergence_base_seed=np.int64(base_seed),
         dataset_meta_seed=np.int64(meta["seed"]),
+        theta_flow_fourier_state=np.bool_(bool(getattr(args, "theta_flow_fourier_state", False))),
+        theta_flow_fourier_k=np.int64(getattr(args, "theta_flow_fourier_k", 0)),
+        theta_flow_fourier_period_mult=np.float64(getattr(args, "theta_flow_fourier_period_mult", np.nan)),
+        theta_flow_fourier_include_linear=np.bool_(bool(getattr(args, "theta_flow_fourier_include_linear", False))),
+        theta_fourier_state_dim=np.int64(0 if theta_state_all is None else int(theta_state_all.shape[1])),
+        theta_fourier_ref_range=tf_rr_save,
+        theta_fourier_period=tf_per_save,
+        theta_fourier_center=tf_cen_save,
         theta_binning_mode=np.asarray([theta_binning_mode], dtype=object),
         theta_grid_shape=np.asarray(theta_grid_shape, dtype=np.int64),
         theta_bin_edges=np.asarray(edges, dtype=np.float64),
@@ -1912,6 +1965,7 @@ def main(argv: list[str] | None = None, *, sir_first_default: bool = False) -> N
         corr_decode_shape=tuple(int(x) for x in corr_decode_vs_ref_shared.shape),
         nmse_decode_shape=tuple(int(x) for x in nmse_decode_vs_ref_shared.shape),
         wall_seconds_shape=tuple(int(x) for x in wall_s.shape),
+        theta_fourier_feature_dim=(None if theta_state_all is None else int(theta_state_all.shape[1])),
     )
 
     print("[twofig] Saved:", flush=True)

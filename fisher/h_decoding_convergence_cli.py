@@ -277,9 +277,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--theta-flow-fourier-state",
         action="store_true",
         help=(
-            "theta_flow only: replace scalar theta state with Fourier features built from "
-            "theta range on the n_ref permutation prefix. Base period is "
-            "theta_flow_fourier_period_mult * (theta_max - theta_min), then harmonics k=1..K."
+            "Replace scalar / native θ coordinates with Fourier features built per coordinate from reference ranges "
+            "on the n_ref permutation prefix (theta_flow / theta_flow_autoencoder / linear_x_flow_t / xflow_sir_lrank), "
+            "or enable contrastive-soft dot-family Fourier augmentation (contrastive_soft / bidir_contrastive_soft). "
+            "With d θ coordinates, flow state width is d*(2*K + optional linear channel). Base period per coordinate is "
+            "theta_flow_fourier_period_mult * (theta_max - theta_min) on that coordinate's ref slice, "
+            "then harmonics k=1..K."
         ),
     )
     p.add_argument(
@@ -287,8 +290,9 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=4,
         help=(
-            "Number of Fourier harmonics K for --theta-flow-fourier-state. "
-            "State dim = 2*K (+1 when --theta-flow-fourier-include-linear)."
+            "Number of Fourier harmonics K per θ coordinate when --theta-flow-fourier-state is set "
+            "(flow state dim = d_theta*(2*K + optional linear); contrastive-soft dot branch uses the same K "
+            "for sin/cos on raw θ after the z-scored θ channel when harmonics are applied inside training)."
         ),
     )
     p.add_argument(
@@ -296,8 +300,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=2.0,
         help=(
-            "Base-period multiplier for Fourier theta state: "
-            "period = multiplier * (theta_max - theta_min) from n_ref subset."
+            "Base-period multiplier for Fourier theta state (per coordinate): "
+            "period_j = multiplier * (max(theta_j)-min(theta_j)) on the n_ref subset for coordinate j."
         ),
     )
     p.add_argument(
@@ -1023,12 +1027,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
-        "--contrastive-soft-bandwidth",
-        type=float,
-        default=0.2,
+        "--contrastive-soft-bandwidth-bins",
+        type=int,
+        default=10,
         help=(
-            "contrastive-soft only: Gaussian theta-kernel bandwidth in raw theta units "
-            "(default 0.2); <=0 uses auto kth-neighbor bandwidth (--contrastive-soft-bandwidth-k)."
+            "contrastive-soft only: Gaussian theta-kernel bandwidth (raw θ units) when bandwidth "
+            "annealing is disabled is train_theta_span / (2 * K), where K is this bin count."
         ),
     )
     p.add_argument(
@@ -1104,47 +1108,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
-        "--contrastive-soft-bandwidth-k",
-        type=int,
-        default=5,
-        help="contrastive-soft only: kth nearest theta neighbor used for auto bandwidth.",
-    )
-    p.add_argument(
         "--contrastive-soft-periodic",
         action="store_true",
-        help="contrastive-soft only: use circular theta distance in the soft target kernel.",
+        help="contrastive-soft only: use circular theta distance in the soft target kernel (scalar θ only).",
     )
     p.add_argument(
         "--contrastive-soft-period",
         type=float,
         default=2.0 * np.pi,
         help="contrastive-soft only: period for circular theta distance when --contrastive-soft-periodic is set.",
-    )
-    p.add_argument(
-        "--contrastive-theta-fourier-k",
-        type=int,
-        default=4,
-        help=(
-            "contrastive-soft dot-family only: sin/cos harmonic pairs on raw scalar θ appended after z-scored θ; "
-            "0 disables Fourier features for the theta branch."
-        ),
-    )
-    p.add_argument(
-        "--contrastive-theta-fourier-period-mult",
-        type=float,
-        default=2.0,
-        help=(
-            "contrastive-soft Fourier only: period = mult * (max(train θ) − min(train θ)), "
-            "matching theta_flow Fourier construction."
-        ),
-    )
-    p.add_argument(
-        "--contrastive-theta-fourier-include-linear",
-        action="store_true",
-        help=(
-            "contrastive-soft Fourier only: include scaled linear (θ−center)/range inside the Fourier block "
-            "(default off; z-scored θ remains the leading coordinate)."
-        ),
     )
     add_estimation_arguments(p)
     p.set_defaults(
@@ -1687,9 +1659,8 @@ def _validate_contrastive_soft_gaussian_net_no_finetune_cli(args: argparse.Names
         raise ValueError("--gn-pair-batch-size must be >= 1.")
     if int(getattr(args, "contrastive_pair_batch_size", 0)) < 1:
         raise ValueError("--contrastive-pair-batch-size must be >= 1.")
-    bw = float(getattr(args, "contrastive_soft_bandwidth", 0.2))
-    if not np.isfinite(bw):
-        raise ValueError("--contrastive-soft-bandwidth must be finite.")
+    if int(getattr(args, "contrastive_soft_bandwidth_bins", 0)) < 1:
+        raise ValueError("--contrastive-soft-bandwidth-bins must be >= 1.")
     bw_start = float(getattr(args, "contrastive_soft_bandwidth_start", 0.0))
     bw_end = float(getattr(args, "contrastive_soft_bandwidth_end", 0.0))
     if not np.isfinite(bw_start) or not np.isfinite(bw_end):
@@ -1699,27 +1670,31 @@ def _validate_contrastive_soft_gaussian_net_no_finetune_cli(args: argparse.Names
             "--contrastive-soft-bandwidth-start and --contrastive-soft-bandwidth-end must both be > 0 "
             "to enable annealing."
         )
-    if int(getattr(args, "contrastive_soft_bandwidth_k", 0)) < 1:
-        raise ValueError("--contrastive-soft-bandwidth-k must be >= 1.")
     period = float(getattr(args, "contrastive_soft_period", 2.0 * np.pi))
     if not np.isfinite(period) or period <= 0.0:
         raise ValueError("--contrastive-soft-period must be finite and > 0.")
 
 
 def _validate_contrastive_cli(args: argparse.Namespace) -> None:
+    from fisher.h_decoding_convergence_methods import contrastive_soft_fourier_settings_from_theta_flow_args
+
     tfm = str(getattr(args, "theta_field_method", "")).strip().lower()
-    fk = int(getattr(args, "contrastive_theta_fourier_k", 4))
-    if fk < 0:
-        raise ValueError("--contrastive-theta-fourier-k must be >= 0.")
-    pm = float(getattr(args, "contrastive_theta_fourier_period_mult", 2.0))
+    cnorm = _normalize_contrastive_method(tfm)
+    if cnorm == "contrastive" and bool(getattr(args, "theta_flow_fourier_state", False)):
+        raise ValueError(
+            "--theta-flow-fourier-state is not supported for hard contrastive (binned theta encoding); "
+            "use contrastive_soft or bidir_contrastive_soft."
+        )
+    fk, pm, inc_lin = contrastive_soft_fourier_settings_from_theta_flow_args(args)
     if fk > 0 and (not np.isfinite(pm) or pm <= 0.0):
         raise ValueError(
-            "--contrastive-theta-fourier-period-mult must be finite and > 0 when --contrastive-theta-fourier-k > 0."
+            "--theta-flow-fourier-period-mult must be finite and > 0 when --theta-flow-fourier-state is set "
+            f"(effective Fourier harmonics K={fk})."
         )
     if tfm == "contrastive_soft_gaussian_net_no_finetune":
         if fk > 0:
             raise ValueError(
-                "--contrastive-theta-fourier-k > 0 is incompatible with contrastive_soft_gaussian_net_no_finetune "
+                "--theta-flow-fourier-state is incompatible with contrastive_soft_gaussian_net_no_finetune "
                 "(Gaussian likelihood scorer uses scalar θ only)."
             )
         _validate_contrastive_soft_gaussian_net_no_finetune_cli(args)
@@ -1774,12 +1749,12 @@ def _validate_contrastive_cli(args: argparse.Namespace) -> None:
     setattr(args, "contrastive_soft_score_arch", soft_arch_aliases[soft_arch])
     if fk > 0 and getattr(args, "contrastive_soft_score_arch") in ("mlp", "independent_gaussian"):
         raise ValueError(
-            "--contrastive-theta-fourier-k > 0 is incompatible with "
+            "--theta-flow-fourier-state (with K >= 1) is incompatible with "
             f"--contrastive-soft-score-arch={getattr(args, 'contrastive_soft_score_arch')!r}."
         )
     if fk > 0 and tfm == "contrastive_soft_gaussian_net":
         raise ValueError(
-            "--contrastive-theta-fourier-k > 0 is incompatible with contrastive_soft_gaussian_net "
+            "--theta-flow-fourier-state is incompatible with contrastive_soft_gaussian_net "
             "(Gaussian likelihood scorer uses scalar θ only)."
         )
     if int(getattr(args, "contrastive_soft_dot_dim", 0)) < 1:
@@ -1790,17 +1765,14 @@ def _validate_contrastive_cli(args: argparse.Namespace) -> None:
     logvar_max = float(getattr(args, "contrastive_soft_gaussian_logvar_max", 5.0))
     if not np.isfinite(logvar_min) or not np.isfinite(logvar_max) or logvar_min >= logvar_max:
         raise ValueError("--contrastive-soft-gaussian-logvar-min/max must be finite with min < max.")
-    bw = float(getattr(args, "contrastive_soft_bandwidth", 0.2))
-    if not np.isfinite(bw):
-        raise ValueError("--contrastive-soft-bandwidth must be finite.")
+    if int(getattr(args, "contrastive_soft_bandwidth_bins", 0)) < 1:
+        raise ValueError("--contrastive-soft-bandwidth-bins must be >= 1.")
     bw_start = float(getattr(args, "contrastive_soft_bandwidth_start", 0.0))
     bw_end = float(getattr(args, "contrastive_soft_bandwidth_end", 0.0))
     if not np.isfinite(bw_start) or not np.isfinite(bw_end):
         raise ValueError("--contrastive-soft-bandwidth-start/end must be finite.")
     if (bw_start > 0.0) != (bw_end > 0.0):
         raise ValueError("--contrastive-soft-bandwidth-start and --contrastive-soft-bandwidth-end must both be > 0 to enable annealing.")
-    if int(getattr(args, "contrastive_soft_bandwidth_k", 0)) < 1:
-        raise ValueError("--contrastive-soft-bandwidth-k must be >= 1.")
     period = float(getattr(args, "contrastive_soft_period", 2.0 * np.pi))
     if not np.isfinite(period) or period <= 0.0:
         raise ValueError("--contrastive-soft-period must be finite and > 0.")
@@ -2045,14 +2017,22 @@ def _validate_cli(args: argparse.Namespace) -> None:
                 f"(got {getattr(args, 'flow_arch', None)!r})."
             )
     if use_fourier:
-        tfm = str(getattr(args, "theta_field_method", "theta_flow")).strip().lower()
+        raw_tfm = str(getattr(args, "theta_field_method", "theta_flow")).strip().lower()
+        cnorm = _normalize_contrastive_method(raw_tfm)
+        lxf_norm = _normalize_linear_x_flow_method(raw_tfm)
         arch = str(getattr(args, "flow_arch", "mlp")).strip().lower()
-        if tfm not in ("theta_flow", "theta_flow_autoencoder"):
+        fourier_ok = (
+            raw_tfm in ("theta_flow", "theta_flow_autoencoder")
+            or lxf_norm in ("linear_x_flow_t", "xflow_sir_lrank")
+            or cnorm in ("contrastive_soft", "bidir_contrastive_soft")
+        )
+        if not fourier_ok:
             raise ValueError(
-                "--theta-flow-fourier-state requires --theta-field-method theta_flow or theta-flow-autoencoder "
+                "--theta-flow-fourier-state requires --theta-field-method theta_flow, theta-flow-autoencoder, "
+                "linear_x_flow_t, xflow_sir_lrank, contrastive_soft, or bidir_contrastive_soft "
                 f"(got {getattr(args, 'theta_field_method', None)!r})."
             )
-        if arch != "mlp":
+        if raw_tfm in ("theta_flow", "theta_flow_autoencoder") and arch != "mlp":
             raise ValueError(
                 "--theta-flow-fourier-state currently supports --flow-arch mlp only "
                 f"(got {getattr(args, 'flow_arch', None)!r})."
@@ -2070,4 +2050,3 @@ def _validate_cli(args: argparse.Namespace) -> None:
                 f"(got {getattr(args, 'theta_field_method', None)!r})."
             )
     _parse_n_list(args.n_list)  # syntax check only; pool size checked in main
-
