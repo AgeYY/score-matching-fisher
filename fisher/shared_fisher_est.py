@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 import math
 import os
 from types import SimpleNamespace
@@ -30,6 +31,7 @@ from fisher.data import (
 )
 from fisher.evaluation import evaluate_score_fisher, evaluate_score_fisher_with_prior, parse_sigma_alpha_list
 from fisher.h_matrix import HMatrixEstimator, HMatrixResult
+from fisher.lxf_bin_likelihood_hellinger import lxf_bin_likelihood_hellinger
 from fisher.models import (
     ConditionalScore1D,
     ConditionalScore1DFiLMPerLayer,
@@ -2193,6 +2195,32 @@ def run_shared_fisher_estimation(
             x=x_h_matrix,
             restore_original_order=bool(getattr(args, "h_restore_original_order", False)),
         )
+
+        if bool(getattr(args, "sir_xflow_bin_likelihood_h", False)):
+            bin_arr = np.asarray(getattr(args, "convergence_bin_all"), dtype=np.int64).reshape(-1)
+            nb_conv = int(getattr(args, "convergence_n_bins"))
+            c_mat = np.asarray(h_result.c_matrix, dtype=np.float64)
+            if c_mat.ndim != 2 or c_mat.shape[0] != c_mat.shape[1]:
+                raise ValueError("sir_xflow bin-likelihood H expects a square c_matrix from x_flow H estimation.")
+            if int(bin_arr.shape[0]) != int(c_mat.shape[0]):
+                raise ValueError(
+                    f"sir_xflow: convergence_bin_all length {bin_arr.shape[0]} != c_matrix size {c_mat.shape[0]}."
+                )
+            lxf_out = lxf_bin_likelihood_hellinger(c_mat, bin_arr, nb_conv)
+            h_sym_b = np.asarray(lxf_out["h_sym"], dtype=np.float64)
+            delta_diag_max_abs = 0.0
+            h_sym_max_asym_abs = float(np.max(np.abs(h_sym_b - h_sym_b.T)))
+            h_result = replace(
+                h_result,
+                h_sym=h_sym_b,
+                delta_diag_max_abs=delta_diag_max_abs,
+                h_sym_max_asym_abs=h_sym_max_asym_abs,
+            )
+            print(
+                "[h_matrix] sir_xflow: replaced h_sym with bin-marginal likelihood Hellinger "
+                f"(same construction as xflow_sir_lrank), n_bins={nb_conv}",
+                flush=True,
+            )
 
         suffix = "_non_gauss" if args.dataset_family == "cosine_gmm" else "_theta_cov"
         h_npz_path, h_summary_path, h_fig_path, h_delta_fig_path = _save_h_matrix_dsm_artifacts(
