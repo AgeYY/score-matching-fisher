@@ -213,6 +213,21 @@ def family_recipe_dict(family: str) -> dict[str, Any]:
             "cosine_tune_amp_high": 2.0,
             "cosine_sqrtd_obs_var_mu_law": "additive_abs_mu",
         }
+    if fam == "random_mog_categorical":
+        return {
+            **base,
+            "theta_low": 0.0,
+            "theta_high": 4.0,
+            "sigma_x1": 0.15,
+            "sigma_x2": 0.15,
+            "cov_theta_amp1": 0.1,
+            "cov_theta_amp2": 0.1,
+            "mog_a_low": 0.2,
+            "mog_a_high": 2.0,
+            "mog_sigma_base": 0.15,
+            "mog_alpha": 0.15,
+            "mog_eps": 1e-5,
+        }
     if fam == "cosine_gmm":
         return {**base, "sigma_x1": 0.30, "sigma_x2": 0.30}
     if fam == "cos_sin_piecewise":
@@ -240,6 +255,21 @@ def apply_family_recipe_to_namespace(ns: Any) -> None:
     if amp_scale != 1.0:
         setattr(ns, "cov_theta_amp1", float(getattr(ns, "cov_theta_amp1")) * amp_scale)
         setattr(ns, "cov_theta_amp2", float(getattr(ns, "cov_theta_amp2")) * amp_scale)
+    if fam == "random_mog_categorical":
+        k = int(getattr(ns, "num_categories", 5))
+        setattr(ns, "theta_low", 0.0)
+        setattr(ns, "theta_high", float(k - 1))
+        if scale != 1.0:
+            setattr(ns, "mog_sigma_base", float(getattr(ns, "mog_sigma_base")) * scale)
+        if amp_scale != 1.0:
+            setattr(ns, "mog_alpha", float(getattr(ns, "mog_alpha")) * amp_scale)
+        xd = int(getattr(ns, "x_dim", 2))
+        mmd = getattr(ns, "mog_mean_min_dist", None)
+        if mmd is None or float(mmd) < 0.0:
+            setattr(ns, "mog_mean_min_dist", 0.5 * math.sqrt(float(xd)))
+        else:
+            setattr(ns, "mog_mean_min_dist", float(mmd))
+        setattr(ns, "mog_mean_max_attempts", int(getattr(ns, "mog_mean_max_attempts", 10_000)))
 
 
 def assert_no_legacy_dataset_cli_flags(argv: list[str]) -> None:
@@ -326,5 +356,18 @@ def format_resolved_family_summary(ns: Any) -> str:
         lines.append(
             f"  linear_piecewise: linear_k={r['linear_k']}, "
             f"linear_sigma_schedule={r['linear_sigma_schedule']!r}"
+        )
+    if fam == "random_mog_categorical":
+        xd = int(getattr(ns, "x_dim", 2))
+        mmd = getattr(ns, "mog_mean_min_dist", None)
+        if mmd is None or float(mmd) < 0.0:
+            mmd_show = 0.5 * math.sqrt(float(xd))
+        else:
+            mmd_show = float(mmd)
+        mma = int(getattr(ns, "mog_mean_max_attempts", 10_000))
+        lines.append(
+            f"  categorical MoG mean separation: mog_mean_min_dist={mmd_show}, "
+            f"mog_mean_max_attempts={mma} (pairwise Euclidean minimum for sampled means; "
+            f"meta means override sampling)"
         )
     return "\n".join(lines)

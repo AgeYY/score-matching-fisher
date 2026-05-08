@@ -70,10 +70,20 @@ def meta_dict_from_args(ns: Any) -> dict[str, Any]:
         "seed": int(ns.seed),
         "theta_low": float(ns.theta_low),
         "theta_high": float(ns.theta_high),
-        "theta_dim": 2 if str(ns.dataset_family) in (
-            "randamp_gaussian2d_sqrtd",
-            "gridcos_gaussian2d_sqrtd_rand_tune_additive",
-        ) else 1,
+        "theta_dim": (
+            int(getattr(ns, "num_categories", 5))
+            if str(ns.dataset_family) == "random_mog_categorical"
+            else 2
+            if str(ns.dataset_family)
+            in (
+                "randamp_gaussian2d_sqrtd",
+                "gridcos_gaussian2d_sqrtd_rand_tune_additive",
+            )
+            else 1
+        ),
+        "theta_type": "categorical" if str(ns.dataset_family) == "random_mog_categorical" else "continuous",
+        "theta_encoding": "one_hot" if str(ns.dataset_family) == "random_mog_categorical" else "native",
+        "num_categories": int(getattr(ns, "num_categories", 5)),
         "x_dim": int(ns.x_dim),
         "sigma_x1": float(ns.sigma_x1),
         "sigma_x2": float(ns.sigma_x2),
@@ -102,6 +112,19 @@ def meta_dict_from_args(ns: Any) -> dict[str, Any]:
         "linear_sigma_sigmoid_center": float(getattr(ns, "linear_sigma_sigmoid_center", 0.0)),
         "linear_sigma_sigmoid_steepness": float(getattr(ns, "linear_sigma_sigmoid_steepness", 2.0)),
         "theta_zero_to_low": bool(ns.theta_zero_to_low),
+        "mog_a_low": float(getattr(ns, "mog_a_low", 0.2)),
+        "mog_a_high": float(getattr(ns, "mog_a_high", 2.0)),
+        "mog_sigma_base": float(getattr(ns, "mog_sigma_base", 0.15)),
+        "mog_alpha": float(getattr(ns, "mog_alpha", 0.15)),
+        "mog_eps": float(getattr(ns, "mog_eps", 1e-5)),
+        "mog_mean_min_dist": (
+            float(getattr(ns, "mog_mean_min_dist")) if str(ns.dataset_family) == "random_mog_categorical" else None
+        ),
+        "mog_mean_max_attempts": (
+            int(getattr(ns, "mog_mean_max_attempts", 10_000))
+            if str(ns.dataset_family) == "random_mog_categorical"
+            else None
+        ),
         "n_total": int(ns.n_total),
         "train_frac": float(ns.train_frac),
     }
@@ -149,6 +172,9 @@ def meta_dict_from_args(ns: Any) -> dict[str, Any]:
     else:
         out["cosine_sqrtd_obs_var_mu_law"] = None
     for key in ("gridcos_orientation_per_dim", "gridcos_phase_per_dim", "gridcos_omega_per_dim"):
+        raw = getattr(ns, key, None)
+        out[key] = None if raw is None else np.asarray(raw, dtype=np.float64).tolist()
+    for key in ("mog_component_gains", "mog_component_means", "mog_component_variances"):
         raw = getattr(ns, key, None)
         out[key] = None if raw is None else np.asarray(raw, dtype=np.float64).tolist()
     if int(out["theta_dim"]) == 2:
@@ -200,16 +226,17 @@ def save_shared_dataset_npz(
     meta["version"] = int(SHARED_DATASET_NPZ_VERSION)
     meta_json = json.dumps(meta, sort_keys=True)
     meta_utf8 = meta_json.encode("utf-8")
+    theta_dtype = np.float64
     np.savez_compressed(
         path,
         meta_json_utf8=np.frombuffer(meta_utf8, dtype=np.uint8),
-        theta_all=theta_all.astype(np.float64, copy=False),
+        theta_all=theta_all.astype(theta_dtype, copy=False),
         x_all=x_all.astype(np.float64, copy=False),
         train_idx=train_idx.astype(np.int64, copy=False),
         validation_idx=validation_idx.astype(np.int64, copy=False),
-        theta_train=theta_train.astype(np.float64, copy=False),
+        theta_train=theta_train.astype(theta_dtype, copy=False),
         x_train=x_train.astype(np.float64, copy=False),
-        theta_validation=theta_validation.astype(np.float64, copy=False),
+        theta_validation=theta_validation.astype(theta_dtype, copy=False),
         x_validation=x_validation.astype(np.float64, copy=False),
     )
 
@@ -222,13 +249,15 @@ def load_shared_dataset_npz(path: str | Path) -> SharedDatasetBundle:
         meta = json.loads(meta_json)
         ver = int(meta.get("version", 0))
 
+        theta_encoding = str(meta.get("theta_encoding", "integer" if str(meta.get("theta_type", "")) == "categorical" else "native"))
+        theta_dtype = np.int64 if str(meta.get("theta_type", "")) == "categorical" and theta_encoding != "one_hot" else np.float64
         if ver == 2:
             vidx = np.asarray(data["validation_idx"], dtype=np.int64)
-            th_val = np.asarray(data["theta_validation"], dtype=np.float64)
+            th_val = np.asarray(data["theta_validation"], dtype=theta_dtype)
             x_val = np.asarray(data["x_validation"], dtype=np.float64)
         elif ver == 1:
             vidx = np.asarray(data["eval_idx"], dtype=np.int64)
-            th_val = np.asarray(data["theta_eval"], dtype=np.float64)
+            th_val = np.asarray(data["theta_eval"], dtype=theta_dtype)
             x_val = np.asarray(data["x_eval"], dtype=np.float64)
         else:
             raise ValueError(
@@ -238,11 +267,11 @@ def load_shared_dataset_npz(path: str | Path) -> SharedDatasetBundle:
 
         bundle = SharedDatasetBundle(
             meta=meta,
-            theta_all=np.asarray(data["theta_all"], dtype=np.float64),
+            theta_all=np.asarray(data["theta_all"], dtype=theta_dtype),
             x_all=np.asarray(data["x_all"], dtype=np.float64),
             train_idx=np.asarray(data["train_idx"], dtype=np.int64),
             validation_idx=vidx,
-            theta_train=np.asarray(data["theta_train"], dtype=np.float64),
+            theta_train=np.asarray(data["theta_train"], dtype=theta_dtype),
             x_train=np.asarray(data["x_train"], dtype=np.float64),
             theta_validation=th_val,
             x_validation=x_val,

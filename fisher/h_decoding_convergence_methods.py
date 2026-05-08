@@ -402,6 +402,46 @@ def prepare_theta_binning_for_convergence(
     return theta_scalar_all, theta_ref, edges, float(edge_lo), float(edge_hi), bin_idx_all
 
 
+def prepare_categorical_binning_for_convergence(
+    theta_raw_all: np.ndarray,
+    num_categories: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float, np.ndarray]:
+    """Use category IDs directly as H/decoding bins.
+
+    Accepts current one-hot theta rows ``(N, K)`` and legacy scalar integer labels
+    ``(N, 1)`` / ``(N,)``.
+    """
+    k = int(num_categories)
+    if k < 2:
+        raise ValueError("Categorical binning requires num_categories >= 2.")
+    theta_arr = np.asarray(theta_raw_all, dtype=np.float64)
+    if theta_arr.ndim == 2 and int(theta_arr.shape[1]) == k:
+        row_sums = theta_arr.sum(axis=1)
+        is_binary = np.all((np.abs(theta_arr) <= 1e-6) | (np.abs(theta_arr - 1.0) <= 1e-6), axis=1)
+        if np.any(np.abs(row_sums - 1.0) > 1e-6) or not bool(np.all(is_binary)):
+            raise ValueError("Categorical one-hot theta rows must contain one 1 and otherwise 0s.")
+        labels = np.argmax(theta_arr, axis=1).astype(np.int64)
+        label_desc = "one-hot labels"
+    else:
+        if theta_arr.ndim == 2 and int(theta_arr.shape[1]) != 1:
+            raise ValueError(
+                f"Categorical theta must have shape (N, 1) or one-hot shape (N, {k}); got {theta_arr.shape}."
+            )
+        flat = theta_arr.reshape(-1)
+        labels = np.rint(flat).astype(np.int64)
+        if np.any(np.abs(flat - labels.astype(np.float64)) > 1e-6):
+            raise ValueError("Categorical theta labels must be integer-valued.")
+        label_desc = "integer labels"
+    if np.any((labels < 0) | (labels >= k)):
+        raise ValueError(f"Categorical theta labels must be in [0, {k - 1}].")
+    edges = np.arange(k + 1, dtype=np.float64) - 0.5
+    print(
+        f"[convergence] categorical theta: using {label_desc} as {k} category bins.",
+        flush=True,
+    )
+    return labels.astype(np.float64), labels.astype(np.float64), edges, float(edges[0]), float(edges[-1]), labels
+
+
 class Theta2GridBinning(NamedTuple):
     theta_scalar_all: np.ndarray
     theta_ref: np.ndarray

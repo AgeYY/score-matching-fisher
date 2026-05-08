@@ -6,10 +6,13 @@ Typical workflow:
 1. ``python bin/make_dataset.py --dataset-family randamp_gaussian_sqrtd --x-dim 2 ...``
 2. ``python bin/project_dataset_pr_autoencoder.py --input-npz <low.npz> --output-npz <high.npz> --h-dim 10``
 
-The output archive keeps ``dataset_family='randamp_gaussian_sqrtd'`` (generative recipe), sets
-``meta['x_dim']`` to the embedded dimension ``h_dim``, and sets ``pr_autoencoder_embedded=True``
-with ``pr_autoencoder_z_dim`` equal to the source latent dimension. Ground-truth helpers that need
-the low-dimensional generative model use :func:`fisher.shared_fisher_est.build_dataset_from_meta`.
+For ``random_mog_categorical`` (or any non-``randamp_gaussian_sqrtd`` family), add
+``--allow-non-randamp-sqrtd``. The embedded NPZ keeps one-hot ``theta`` unchanged; only ``x`` is lifted.
+
+The output archive keeps the source ``dataset_family`` and ``theta`` arrays, sets ``meta['x_dim']``
+to the embedded dimension ``h_dim``, and sets ``pr_autoencoder_embedded=True`` with
+``pr_autoencoder_z_dim`` equal to the source latent dimension. Ground-truth helpers that need the
+low-dimensional generative model use :func:`fisher.shared_fisher_est.build_dataset_from_meta`.
 
 Unless ``--skip-viz``, writes ``pr_projection_summary.{png,svg}`` next to ``--output-npz``:
 same two-panel native layout as ``make_dataset.py`` (tuning curves, binned empirical mean of
@@ -134,6 +137,11 @@ def _save_projection_summary_figure(
     The manifold curve is the binned empirical mean of embedded samples (not ``AE(mu_z(theta))``).
     """
     th_raw = np.asarray(theta_all, dtype=np.float64)
+    if getattr(base_dataset, "theta_type", "") == "categorical":
+        if th_raw.ndim == 2 and int(th_raw.shape[1]) > 1:
+            th_raw = np.argmax(th_raw, axis=1).astype(np.float64).reshape(-1, 1)
+        elif th_raw.ndim == 1:
+            th_raw = th_raw.reshape(-1, 1)
     th_all = th_raw.reshape(-1, 1) if not (th_raw.ndim == 2 and int(th_raw.shape[1]) == 2) else th_raw
     x_all = np.asarray(x_embed, dtype=np.float64)
     n = int(th_raw.shape[0])
@@ -337,7 +345,7 @@ def main() -> None:
     if not args.allow_non_randamp_sqrtd and fam != "randamp_gaussian_sqrtd":
         raise ValueError(
             f"Expected dataset_family='randamp_gaussian_sqrtd' in input meta (got {fam!r}). "
-            "Use --allow-non-randamp-sqrtd to override."
+            "Pass --allow-non-randamp-sqrtd for other native NPZs (e.g. random_mog_categorical)."
         )
     if bool(meta.get("pr_autoencoder_embedded", False)):
         raise ValueError(

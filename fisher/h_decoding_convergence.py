@@ -399,12 +399,23 @@ def main(argv: list[str] | None = None) -> None:
         )
 
     theta_raw_all = np.asarray(bundle.theta_all, dtype=np.float64)
-    theta_scalar_all, theta_ref, edges, edge_lo, edge_hi, bin_idx_all = prepare_theta_binning_for_convergence(
-        theta_raw_all,
-        perm,
-        int(args.n_ref),
-        n_bins,
-    )
+    if str(meta.get("theta_type", "")) == "categorical":
+        k_cat = int(meta.get("num_categories", n_bins))
+        if n_bins != k_cat:
+            raise ValueError(
+                f"Categorical dataset requires --num-theta-bins == num_categories ({k_cat}); got {n_bins}."
+            )
+        theta_scalar_all, theta_ref, edges, edge_lo, edge_hi, bin_idx_all = prepare_categorical_binning_for_convergence(
+            theta_raw_all,
+            k_cat,
+        )
+    else:
+        theta_scalar_all, theta_ref, edges, edge_lo, edge_hi, bin_idx_all = prepare_theta_binning_for_convergence(
+            theta_raw_all,
+            perm,
+            int(args.n_ref),
+            n_bins,
+        )
     theta_state_all: np.ndarray | None = None
     if bool(getattr(args, "theta_flow_onehot_state", False)):
         theta_state_all = np.eye(n_bins, dtype=np.float64)[bin_idx_all]

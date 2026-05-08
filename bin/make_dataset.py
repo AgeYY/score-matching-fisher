@@ -34,6 +34,12 @@ Run ``python bin/make_dataset.py --help`` for argparse defaults and exact wordin
       default ``0.2/sqrt(2)`` with stronger ``cov_theta`` amps in the fixed recipe. For high-dimensional
       observation space via a PR-autoencoder, generate this
       family at low ``--x-dim``, then run ``bin/project_dataset_pr_autoencoder.py``.
+    - ``random_mog_categorical`` — Uniform categorical diagonal Gaussian mixture with one-hot
+      labels ``theta`` over categories ``{0, ..., K-1}``; set ``K`` via ``--num-categories`` (default 5).
+      Component means are rejection-sampled sequentially so every pair of mean vectors is at least
+      ``--mog-mean-min-dist`` apart in Euclidean distance (default ``0.5 * sqrt(x_dim)`` when omitted
+      or negative); override with ``--mog-mean-max-attempts`` (default 10000). Stored means in NPZ
+      meta are authoritative and skip resampling.
     - ``cosine_gmm`` — Cosine-like mean branch inside a theta-dependent two-component mixture (see
       ``ToyConditionalGMMNonGaussianDataset``).
     - ``cos_sin_piecewise`` — Means ``(cos θ, sin θ)``; scalar observation std piecewise in ``θ``
@@ -186,6 +192,10 @@ def main() -> None:
         meta["gridcos_orientation_per_dim"] = dataset._gridcos_orientation.tolist()
         meta["gridcos_phase_per_dim"] = dataset._gridcos_phase.tolist()
         meta["gridcos_omega_per_dim"] = dataset._gridcos_omega.tolist()
+    if str(args.dataset_family) == "random_mog_categorical":
+        meta["mog_component_gains"] = dataset._mog_gains.tolist()
+        meta["mog_component_means"] = dataset._mog_means.tolist()
+        meta["mog_component_variances"] = dataset._mog_variances.tolist()
     save_shared_dataset_npz(
         args.output_npz,
         meta=meta,

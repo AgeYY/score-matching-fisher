@@ -22,6 +22,13 @@ from fisher.data import (
 )
 
 
+def _categorical_labels(theta: np.ndarray, k: int) -> np.ndarray:
+    arr = np.asarray(theta)
+    if arr.ndim == 2 and int(arr.shape[1]) == int(k):
+        return np.argmax(np.asarray(arr, dtype=np.float64), axis=1).astype(np.int64)
+    return np.asarray(arr).reshape(-1).astype(np.int64)
+
+
 def pca_project(x: np.ndarray, n_components: int = 2) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return PCA projection and PCA basis for centered x."""
     x0 = x - x.mean(axis=0, keepdims=True)
@@ -80,6 +87,22 @@ def summarize_dataset(
     if hasattr(dataset, "_mix_weight"):
         pi, _ = dataset._mix_weight(theta)
         print(f"  mixture weight pi(theta) range: [{pi.min():.4f}, {pi.max():.4f}]")
+
+    if str(getattr(dataset, "theta_type", "")) == "categorical":
+        k = int(getattr(dataset, "num_categories", theta.shape[1] if np.asarray(theta).ndim == 2 else 1))
+        labels = _categorical_labels(theta, k)
+        counts = np.bincount(np.clip(labels, 0, k - 1), minlength=k)
+        empirical = np.zeros((k, x.shape[1]), dtype=np.float64)
+        for c in range(k):
+            mask = labels == c
+            if np.any(mask):
+                empirical[c] = x[mask].mean(axis=0)
+        model_mean = dataset.tuning_curve(np.eye(k, dtype=np.float64))
+        used = counts > 0
+        mae = np.mean(np.abs(empirical[used] - model_mean[used])) if used.any() else np.nan
+        print(f"  category counts: {counts.tolist()}")
+        print(f"  empirical E[x|category] vs component mean MAE (all dims): {mae:.4f}")
+        return
 
     theta_arr = np.asarray(theta, dtype=np.float64)
     theta_dim = int(theta_arr.shape[1]) if theta_arr.ndim == 2 else 1
@@ -338,11 +361,52 @@ def plot_joint_and_tuning(
         theta_plot = theta_plot[pick]
         x_plot = x_plot[pick]
 
-    if theta_plot.ndim == 2 and int(theta_plot.shape[1]) == 2:
+    # Native (theta_1, theta_2) grids only: K-way one-hot rows also have width 2 when K=2.
+    if (
+        theta_plot.ndim == 2
+        and int(theta_plot.shape[1]) == 2
+        and str(getattr(dataset, "theta_type", "")) != "categorical"
+    ):
         _plot_joint_and_tuning_2d(theta_plot, x_plot, dataset, out_path)
         return
 
     fig, (ax_tune, ax_manifold) = plt.subplots(1, 2, figsize=(9.0, 3.2), layout="constrained")
+    if str(getattr(dataset, "theta_type", "")) == "categorical":
+        k = int(getattr(dataset, "num_categories", theta_plot.shape[1] if np.asarray(theta_plot).ndim == 2 else 1))
+        labels = _categorical_labels(theta_plot, k)
+        cats = np.eye(k, dtype=np.float64)
+        mu = np.asarray(dataset.tuning_curve(cats), dtype=np.float64)
+        for j in range(mu.shape[1]):
+            ax_tune.plot(np.arange(k), mu[:, j], color="black", linewidth=1.5, alpha=0.8)
+        ax_tune.set_xlabel("category")
+        ax_tune.set_ylabel(r"Mean of $x|category$")
+        if x_plot.shape[1] >= 2:
+            proj_x, _, _ = pca_project(x_plot, n_components=2)
+            sc = ax_manifold.scatter(
+                proj_x[:, 0],
+                proj_x[:, 1],
+                c=labels,
+                s=8,
+                alpha=0.45,
+                cmap="tab10",
+                vmin=-0.5,
+                vmax=float(k) - 0.5,
+            )
+            ax_manifold.set_aspect("equal", adjustable="datalim")
+            ax_manifold.set_axis_off()
+            fig.colorbar(sc, ax=ax_manifold, fraction=0.035, pad=0.02).set_label("category")
+        else:
+            ax_manifold.scatter(labels, x_plot[:, 0], c=labels, s=10, alpha=0.45, cmap="tab10")
+            ax_manifold.set_xlabel("category")
+            ax_manifold.set_ylabel(r"$x_1$")
+        ax_tune.set_box_aspect(1)
+        ax_manifold.set_box_aspect(1)
+        fig.savefig(out_path, dpi=180, bbox_inches="tight")
+        svg_path = str(Path(out_path).with_suffix(".svg"))
+        fig.savefig(svg_path, bbox_inches="tight")
+        plt.close(fig)
+        return
+
     plot_joint_and_tuning_on_axes(
         fig,
         ax_tune,

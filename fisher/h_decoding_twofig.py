@@ -809,6 +809,25 @@ def _validate_cli_for_rows(args: argparse.Namespace, rows: list[ThetaFieldRowSpe
             raise ValueError(f"row={row.label}: {exc}") from exc
 
 
+def _validate_categorical_rows(meta: dict, rows: list[ThetaFieldRowSpec]) -> None:
+    if str(meta.get("theta_type", "")) != "categorical":
+        return
+    unsupported = {
+        "theta_flow",
+        "theta_path_integral",
+        "ctsm_v",
+        "nf",
+        "linear_theta_flow",
+        "sir_thetaflow",
+    }
+    bad = [row.label for row in rows if row.method in unsupported]
+    if bad:
+        raise ValueError(
+            "Categorical datasets do not support continuous theta-density rows: "
+            f"{', '.join(bad)}. Use category-native rows such as bin_gaussian or x_flow/linear_x_flow variants."
+        )
+
+
 def _project_sir_first_subset(
     *,
     subset: SweepSubset,
@@ -1454,6 +1473,7 @@ def main(argv: list[str] | None = None, *, sir_first_default: bool = False) -> N
             f"NPZ meta dataset_family={meta_family!r} does not match --dataset-family={str(args.dataset_family)!r}. "
             "Regenerate with matching make_dataset.py --dataset-family, or pass --dataset-family to match the NPZ."
         )
+    _validate_categorical_rows(meta, row_specs)
 
     n_pool = int(bundle.theta_all.shape[0])
     need = max(int(args.n_ref), max(ns))
@@ -1485,7 +1505,21 @@ def main(argv: list[str] | None = None, *, sir_first_default: bool = False) -> N
     theta_grid_edges0 = np.asarray([], dtype=np.float64)
     theta_grid_edges1 = np.asarray([], dtype=np.float64)
     theta_grid_shape = np.asarray([], dtype=np.int64)
-    if theta_binning_mode == "theta2_grid":
+    if str(meta.get("theta_type", "")) == "categorical":
+        if theta_binning_mode != "theta1":
+            raise ValueError("Categorical datasets require --theta-binning-mode theta1.")
+        k_cat = int(meta.get("num_categories", n_bins_x))
+        if n_bins_x != k_cat:
+            raise ValueError(
+                f"Categorical dataset requires --num-theta-bins == num_categories ({k_cat}); got {n_bins_x}."
+            )
+        theta_scalar_all, theta_ref, edges, _, _, bin_idx_all = conv.prepare_categorical_binning_for_convergence(
+            theta_raw_all,
+            k_cat,
+        )
+        centers = bin_centers_from_edges(edges)
+        n_bins = k_cat
+    elif theta_binning_mode == "theta2_grid":
         grid = conv.prepare_theta2_grid_binning_for_convergence(
             theta_raw_all,
             perm,

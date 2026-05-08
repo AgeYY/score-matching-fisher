@@ -28,6 +28,7 @@ def log_p_gaussian_mvnormal_from_cov(
 
 
 from fisher.data import (
+    ToyCategoricalRandomMoGDataset,
     ToyConditionalGMMNonGaussianDataset,
     ToyConditionalGaussianDataset,
     ToyConditionalGaussianCosineRandampSqrtdDataset,
@@ -63,6 +64,7 @@ def log_p_x_given_theta(
     | ToyConditionalGaussianCosineRandampSqrtdDataset
     | ToyConditionalGaussianRandampDataset
     | ToyConditionalGaussianRandampSqrtdDataset
+    | ToyCategoricalRandomMoGDataset
     | ToyCosSinPiecewiseNoiseDataset
     | ToyLinearPiecewiseNoiseDataset,
 ) -> np.ndarray:

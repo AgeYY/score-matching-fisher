@@ -878,6 +878,201 @@ class ToyLinearPiecewiseNoiseDataset:
 
 
 @dataclass
+class ToyCategoricalRandomMoGDataset:
+    """Uniform categorical Gaussian mixture with fixed random diagonal components.
+
+    Component means use ``mu[k,j] = G[k,j] * Z[k,j]`` with ``G`` uniform on
+    ``[mog_a_low, mog_a_high]`` and ``Z`` independent ``Uniform(0, 1)`` (not Gaussian).
+    When ``mog_component_means`` is not provided, means are sampled **sequentially** with a
+    hard Euclidean constraint: each new mean must lie at least ``mog_mean_min_dist`` (default
+    ``0.5 * sqrt(x_dim)`` when unset or negative) from all previously accepted means.
+    """
+
+    x_dim: int = 2
+    num_categories: int = 5
+    mog_a_low: float = 0.2
+    mog_a_high: float = 2.0
+    mog_sigma_base: float = 0.15
+    mog_alpha: float = 0.15
+    mog_eps: float = 1e-5
+    mog_mean_min_dist: float | None = None
+    mog_mean_max_attempts: int = 10_000
+    mog_component_gains: np.ndarray | None = field(default=None)
+    mog_component_means: np.ndarray | None = field(default=None)
+    mog_component_variances: np.ndarray | None = field(default=None)
+    seed: int = 42
+    theta_dim: int = 1
+    theta_type: str = "categorical"
+    diagonal_gaussian_observation_noise: ClassVar[bool] = True
+
+    def __post_init__(self) -> None:
+        if int(self.x_dim) < 1:
+            raise ValueError("x_dim must be >= 1.")
+        if int(self.num_categories) < 2:
+            raise ValueError("num_categories must be >= 2.")
+        if not (float(self.mog_a_low) < float(self.mog_a_high)):
+            raise ValueError("mog_a_low must be < mog_a_high.")
+        if float(self.mog_sigma_base) <= 0.0:
+            raise ValueError("mog_sigma_base must be positive.")
+        if float(self.mog_alpha) < 0.0:
+            raise ValueError("mog_alpha must be non-negative.")
+        if float(self.mog_eps) <= 0.0:
+            raise ValueError("mog_eps must be positive.")
+        self.x_dim = int(self.x_dim)
+        self.num_categories = int(self.num_categories)
+        if int(self.theta_dim) not in (1, self.num_categories):
+            raise ValueError(
+                "ToyCategoricalRandomMoGDataset theta_dim must be 1 for legacy scalar labels "
+                f"or num_categories={self.num_categories} for one-hot labels."
+            )
+        self.theta_dim = self.num_categories
+        self.rng = np.random.default_rng(self.seed)
+
+        min_dist_raw = self.mog_mean_min_dist
+        if min_dist_raw is None or float(min_dist_raw) < 0.0:
+            min_dist = 0.5 * math.sqrt(float(self.x_dim))
+        else:
+            min_dist = float(min_dist_raw)
+        max_attempts = int(self.mog_mean_max_attempts)
+        if max_attempts < 1:
+            raise ValueError("mog_mean_max_attempts must be >= 1.")
+
+        if self.mog_component_means is not None:
+            means = np.asarray(self.mog_component_means, dtype=np.float64).reshape(
+                self.num_categories, self.x_dim
+            )
+            if self.mog_component_gains is not None:
+                gains = np.asarray(self.mog_component_gains, dtype=np.float64).reshape(
+                    self.num_categories, self.x_dim
+                )
+            else:
+                gains = np.ones((self.num_categories, self.x_dim), dtype=np.float64)
+        else:
+            gains = np.empty((self.num_categories, self.x_dim), dtype=np.float64)
+            means = np.empty((self.num_categories, self.x_dim), dtype=np.float64)
+            for k in range(self.num_categories):
+                placed = False
+                for _ in range(max_attempts):
+                    g_row = self.rng.uniform(
+                        float(self.mog_a_low),
+                        float(self.mog_a_high),
+                        size=(self.x_dim,),
+                    ).astype(np.float64)
+                    z_row = self.rng.uniform(0.0, 1.0, size=(self.x_dim,)).astype(np.float64)
+                    mu_row = g_row * z_row
+                    if k == 0:
+                        placed = True
+                    else:
+                        placed = True
+                        for i in range(k):
+                            if float(np.linalg.norm(mu_row - means[i])) < min_dist:
+                                placed = False
+                                break
+                    if placed:
+                        gains[k] = g_row
+                        means[k] = mu_row
+                        break
+                if not placed:
+                    raise ValueError(
+                        "ToyCategoricalRandomMoGDataset: could not sample a component mean satisfying "
+                        f"pairwise Euclidean separation after {max_attempts} candidate draws for category {k}. "
+                        "Lower mog_mean_min_dist, widen [mog_a_low, mog_a_high], increase x_dim or K spacing "
+                        "feasibility, or raise mog_mean_max_attempts. "
+                        f"(num_categories={self.num_categories}, x_dim={self.x_dim}, "
+                        f"mog_mean_min_dist={min_dist}, mog_mean_max_attempts={max_attempts})"
+                    )
+        if self.mog_component_variances is None:
+            variances = (
+                float(self.x_dim) * float(self.mog_sigma_base) ** 2
+                + float(self.mog_alpha) * np.abs(means)
+                + float(self.mog_eps)
+            ).astype(np.float64)
+        else:
+            variances = np.asarray(self.mog_component_variances, dtype=np.float64).reshape(
+                self.num_categories, self.x_dim
+            )
+        if np.any(variances <= 0.0):
+            raise ValueError("mog_component_variances must be strictly positive.")
+
+        self._mog_gains = gains
+        self._mog_means = means
+        self._mog_variances = variances
+        self.theta_low = 0.0
+        self.theta_high = float(self.num_categories - 1)
+
+    def _labels(self, theta: np.ndarray) -> np.ndarray:
+        raw = np.asarray(theta)
+        arr = np.asarray(raw, dtype=np.float64)
+        if arr.ndim == 2 and int(arr.shape[1]) == self.num_categories:
+            row_sums = arr.sum(axis=1)
+            is_binary = np.all((np.abs(arr) <= 1e-6) | (np.abs(arr - 1.0) <= 1e-6), axis=1)
+            if np.any(np.abs(row_sums - 1.0) > 1e-6) or not bool(np.all(is_binary)):
+                raise ValueError("Categorical one-hot theta rows must contain one 1 and otherwise 0s.")
+            return np.argmax(arr, axis=1).astype(np.int64)
+        if arr.ndim == 2 and int(arr.shape[1]) != 1:
+            raise ValueError(
+                "Categorical theta must be legacy integer labels with shape (N, 1) "
+                f"or one-hot labels with shape (N, {self.num_categories})."
+            )
+        flat = arr.reshape(-1)
+        lab = np.rint(flat).astype(np.int64)
+        if np.any(np.abs(flat - lab.astype(np.float64)) > 1e-6):
+            raise ValueError("Categorical theta labels must be integer-valued.")
+        if np.any((lab < 0) | (lab >= self.num_categories)):
+            raise ValueError(f"Categorical theta labels must be in [0, {self.num_categories - 1}].")
+        return lab
+
+    def sample_theta(self, n: int) -> np.ndarray:
+        labels = self.rng.integers(0, self.num_categories, size=(int(n),), dtype=np.int64)
+        return np.eye(self.num_categories, dtype=np.float64)[labels]
+
+    def tuning_curve(self, theta: np.ndarray) -> np.ndarray:
+        return self._mog_means[self._labels(theta)]
+
+    def _variance_diag_from_mu(self, mu: np.ndarray) -> np.ndarray:
+        mu_arr = np.asarray(mu, dtype=np.float64)
+        return (
+            float(self.x_dim) * float(self.mog_sigma_base) ** 2
+            + float(self.mog_alpha) * np.abs(mu_arr)
+            + float(self.mog_eps)
+        )
+
+    def covariance_scales(self, theta: np.ndarray) -> np.ndarray:
+        return np.sqrt(self._mog_variances[self._labels(theta)])
+
+    def covariance(self, theta: np.ndarray) -> np.ndarray:
+        v = self._mog_variances[self._labels(theta)]
+        n = int(v.shape[0])
+        cov = np.zeros((n, self.x_dim, self.x_dim), dtype=np.float64)
+        for j in range(self.x_dim):
+            cov[:, j, j] = v[:, j]
+        return cov
+
+    def sample_x(self, theta: np.ndarray) -> np.ndarray:
+        labels = self._labels(theta)
+        mu = self._mog_means[labels]
+        sd = np.sqrt(self._mog_variances[labels])
+        return (mu + sd * self.rng.standard_normal(size=mu.shape)).astype(np.float64)
+
+    def sample_joint(self, n: int) -> tuple[np.ndarray, np.ndarray]:
+        theta = self.sample_theta(n)
+        return theta, self.sample_x(theta)
+
+    def log_p_x_given_theta(self, x: np.ndarray, theta: np.ndarray) -> np.ndarray:
+        x_arr = np.asarray(x, dtype=np.float64).reshape(-1, self.x_dim)
+        labels = self._labels(theta)
+        if int(labels.shape[0]) != int(x_arr.shape[0]):
+            raise ValueError("x and theta must have the same number of rows.")
+        mu = self._mog_means[labels]
+        v = self._mog_variances[labels]
+        delta = x_arr - mu
+        quad = np.sum((delta**2) / v, axis=1)
+        logdet = np.sum(np.log(v), axis=1)
+        d = float(self.x_dim)
+        return -0.5 * (d * np.log(2.0 * np.pi) + logdet + quad)
+
+
+@dataclass
 class ToyConditionalGMMNonGaussianDataset:
     theta_low: float = -6.0
     theta_high: float = 6.0

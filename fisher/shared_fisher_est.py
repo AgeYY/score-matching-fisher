@@ -18,6 +18,7 @@ from global_setting import SCORE_VAL_FRACTION
 from fisher.data import (
     RANDAMP_SQRTD_VAR_MU_LAW_ADDITIVE,
     RANDAMP_SQRTD_VAR_MU_LAW_LEGACY,
+    ToyCategoricalRandomMoGDataset,
     ToyConditionalGMMNonGaussianDataset,
     ToyConditionalGaussianDataset,
     ToyConditionalGaussianCosineRandampSqrtdDataset,
@@ -714,6 +715,7 @@ def build_dataset_from_meta(
     | ToyConditionalGaussianGridcos2DSqrtdDataset
     | ToyConditionalGaussianRandampDataset
     | ToyConditionalGaussianRandampSqrtdDataset
+    | ToyCategoricalRandomMoGDataset
     | ToyCosSinPiecewiseNoiseDataset
     | ToyLinearPiecewiseNoiseDataset
     | ToyConditionalGMMNonGaussianDataset
@@ -983,6 +985,32 @@ def build_dataset_from_meta(
             theta_dim=2,
             seed=seed,
         )
+    if family == "random_mog_categorical":
+        raw_mmd = meta.get("mog_mean_min_dist", None)
+        mog_mean_min_kw: float | None = None if raw_mmd is None else float(raw_mmd)
+        return ToyCategoricalRandomMoGDataset(
+            x_dim=generative_x_dim_from_meta(meta),
+            num_categories=int(meta.get("num_categories", 5)),
+            mog_a_low=float(meta.get("mog_a_low", 0.2)),
+            mog_a_high=float(meta.get("mog_a_high", 2.0)),
+            mog_sigma_base=float(meta.get("mog_sigma_base", 0.15)),
+            mog_alpha=float(meta.get("mog_alpha", 0.15)),
+            mog_eps=float(meta.get("mog_eps", 1e-5)),
+            mog_mean_min_dist=mog_mean_min_kw,
+            mog_mean_max_attempts=int(meta.get("mog_mean_max_attempts", 10_000)),
+            mog_component_gains=(
+                None if meta.get("mog_component_gains") is None else np.asarray(meta["mog_component_gains"], dtype=np.float64)
+            ),
+            mog_component_means=(
+                None if meta.get("mog_component_means") is None else np.asarray(meta["mog_component_means"], dtype=np.float64)
+            ),
+            mog_component_variances=(
+                None
+                if meta.get("mog_component_variances") is None
+                else np.asarray(meta["mog_component_variances"], dtype=np.float64)
+            ),
+            seed=seed,
+        )
     if family == "cosine_gmm":
         return ToyConditionalGMMNonGaussianDataset(
             theta_low=float(meta["theta_low"]),
@@ -1044,6 +1072,7 @@ def build_dataset_from_args(
     | ToyConditionalGaussianGridcos2DSqrtdDataset
     | ToyConditionalGaussianRandampDataset
     | ToyConditionalGaussianRandampSqrtdDataset
+    | ToyCategoricalRandomMoGDataset
     | ToyCosSinPiecewiseNoiseDataset
     | ToyLinearPiecewiseNoiseDataset
     | ToyConditionalGMMNonGaussianDataset
@@ -1065,6 +1094,11 @@ def validate_dataset_sample_args(args: Any) -> None:
         raise ValueError("--cov-theta-amp-scale must be a finite positive number.")
     if args.x_dim < 1:
         raise ValueError("--x-dim must be >= 1.")
+    if str(getattr(args, "dataset_family", "")) == "random_mog_categorical":
+        if int(getattr(args, "num_categories", 5)) < 2:
+            raise ValueError("--num-categories must be >= 2 for random_mog_categorical.")
+        if int(getattr(args, "mog_mean_max_attempts", 10_000)) < 1:
+            raise ValueError("--mog-mean-max-attempts must be >= 1 for random_mog_categorical.")
     if str(getattr(args, "dataset_family", "")) in (
         "cos_sin_piecewise",
         "linear_piecewise",

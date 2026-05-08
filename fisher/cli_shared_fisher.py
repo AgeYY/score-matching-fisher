@@ -13,6 +13,14 @@ if str(_repo_root) not in sys.path:
 from global_setting import DATA_DIR
 
 
+def _parse_mog_mean_min_dist_cli(s: str) -> float | None:
+    """Negative values mean 'use default 0.5*sqrt(x_dim)' after ``--x-dim`` is known."""
+    v = float(s)
+    if v < 0.0:
+        return None
+    return v
+
+
 def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
     """Public dataset CLI: only `--dataset-family` plus generic sampling/shape controls.
 
@@ -39,6 +47,7 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
             "randamp_gaussian_sqrtd",
             "randamp_gaussian2d_sqrtd",
             "gridcos_gaussian2d_sqrtd_rand_tune_additive",
+            "random_mog_categorical",
             "cosine_gmm",
             "cos_sin_piecewise",
             "linear_piecewise",
@@ -59,6 +68,9 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
             "'randamp_gaussian2d_sqrtd' (2D theta Gaussian bumps with per-dim centers in [-6,6]^2); "
             "'gridcos_gaussian2d_sqrtd_rand_tune_additive' (2D theta three-orientation grid cosine means; "
             "diag variance d*sigma^2 + alpha*|mu|); "
+            "'random_mog_categorical' (uniform categorical random diagonal Gaussian mixture; "
+            "one-hot theta labels over categories 0..K-1; component means rejection-sampled with a "
+            "hard pairwise Euclidean minimum distance unless means are supplied in NPZ meta); "
             "For PR-autoencoder embedding into higher-dimensional x, generate this family first, then run "
             "`bin/project_dataset_pr_autoencoder.py`; "
             "'cosine_gmm' (theta-dependent 2-component mixture); "
@@ -127,6 +139,35 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
             "Multiplies the family-fixed cov_theta_amp1 and cov_theta_amp2 after --dataset-family "
             "(default 1.0). Mean activity alpha in summaries is 0.5*(amp1+amp2) after this scale. "
             "Example: 2.0 doubles |mu|-driven variance coupling vs the recipe defaults."
+        ),
+    )
+    p.add_argument(
+        "--num-categories",
+        type=int,
+        default=5,
+        help=(
+            "random_mog_categorical only: number of uniform mixture categories K. "
+            "Generated theta labels are one-hot vectors. Default 5."
+        ),
+    )
+    p.add_argument(
+        "--mog-mean-min-dist",
+        type=_parse_mog_mean_min_dist_cli,
+        default=None,
+        help=(
+            "random_mog_categorical only: minimum Euclidean distance between sampled component mean "
+            "vectors. Omitted or a negative value selects default 0.5*sqrt(x_dim). Ignored when "
+            "component means are loaded from NPZ meta."
+        ),
+    )
+    p.add_argument(
+        "--mog-mean-max-attempts",
+        type=int,
+        default=10_000,
+        metavar="M",
+        help=(
+            "random_mog_categorical only: maximum candidate draws per category when sampling means "
+            "under the L2 minimum-distance constraint (default 10000)."
         ),
     )
 
