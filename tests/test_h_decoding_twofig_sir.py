@@ -16,6 +16,7 @@ from fisher.h_decoding_twofig import (
     build_parser,
     build_sir_first_parser,
 )
+from fisher.twofig_exp import _pairwise_decode_accuracy_and_hellinger_train_val
 from fisher.shared_dataset_io import SharedDatasetBundle
 
 
@@ -101,6 +102,36 @@ def test_project_sir_first_subset_is_per_n_and_preserves_bins(tmp_path) -> None:
         assert data["sir_theta_edges"].shape == (1, 5)
     with np.load(path_10, allow_pickle=False) as data:
         assert data["sir_components"].shape == (4, 2)
+
+
+def test_pairwise_decoder_hellinger_matrix_shape_bounds_and_missing_pairs() -> None:
+    rng = np.random.default_rng(3)
+    x0 = rng.normal(loc=-2.0, scale=0.2, size=(8, 2))
+    x1 = rng.normal(loc=2.0, scale=0.2, size=(8, 2))
+    x2 = rng.normal(loc=0.0, scale=0.2, size=(1, 2))
+    x = np.vstack([x0, x1, x2]).astype(np.float64)
+    bins = np.asarray([0] * len(x0) + [1] * len(x1) + [2] * len(x2), dtype=np.int64)
+
+    acc, h = _pairwise_decode_accuracy_and_hellinger_train_val(
+        x,
+        bins,
+        x,
+        bins,
+        3,
+        min_class_count=2,
+        random_state=0,
+    )
+
+    assert acc.shape == (3, 3)
+    assert h.shape == (3, 3)
+    assert np.all(np.isnan(np.diag(acc)))
+    assert np.all(np.isnan(np.diag(h)))
+    assert np.isfinite(acc[0, 1])
+    assert np.isfinite(h[0, 1])
+    assert 0.0 <= h[0, 1] <= 1.0
+    assert h[0, 1] == pytest.approx(h[1, 0])
+    assert np.isnan(h[0, 2])
+    assert np.isnan(acc[1, 2])
 
 
 def _parse_twofig_args(extra: list[str]) -> argparse.Namespace:
