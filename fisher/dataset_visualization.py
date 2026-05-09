@@ -265,8 +265,18 @@ def plot_joint_and_tuning_on_axes(
 
     if n_plot >= 2:
         mu_pc, mean_mu, basis_mu = pca_project(mu, n_components=2)
+        if int(mu_pc.shape[1]) < 2:
+            pad = 2 - int(mu_pc.shape[1])
+            mu_pc = np.concatenate(
+                [mu_pc, np.zeros((int(mu_pc.shape[0]), pad), dtype=np.float64)], axis=1
+            )
         x0 = x_plot - mean_mu
         proj_x = x0 @ basis_mu
+        if int(proj_x.shape[1]) < 2:
+            pad = 2 - int(proj_x.shape[1])
+            proj_x = np.concatenate(
+                [proj_x, np.zeros((int(proj_x.shape[0]), pad), dtype=np.float64)], axis=1
+            )
         th_line = np.asarray(t, dtype=np.float64).ravel()
         t_mu = int(mu_pc.shape[0])
         if t_mu >= 2:
