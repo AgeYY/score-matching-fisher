@@ -43,6 +43,7 @@ from fisher.decoding_native_x import decoding_x_train_all_from_native, load_nati
 from fisher.hellinger_gt import hellinger_sq_gaussian_diag
 from fisher.h_decoding_convergence_methods import prepare_categorical_binning_for_convergence
 from fisher.h_decoding_twofig import (
+    _decode_accuracy_color_limits,
     _matrix_nmse_offdiag,
     _render_corr_vs_n_panel,
     _render_method_sweep_panel,
@@ -238,6 +239,33 @@ def h_sq_category_from_sample_directed(
     )
 
 
+def binary_classifier_hellinger_sqrt(
+    args: argparse.Namespace,
+    *,
+    x_train: np.ndarray,
+    bins_train: np.ndarray,
+    x_all: np.ndarray,
+    bins_all: np.ndarray,
+    k_cat: int,
+) -> np.ndarray:
+    """Category-level ``sqrt(H^2)`` from pairwise binary-classifier LLR estimates."""
+    dbg = _debug_categorical_module()
+    result = dbg._train_binary_classifier_delta(
+        args,
+        x_train=np.asarray(x_train, dtype=np.float64),
+        bins_train=np.asarray(bins_train, dtype=np.int64),
+        x_all=np.asarray(x_all, dtype=np.float64),
+        bins_all=np.asarray(bins_all, dtype=np.int64),
+        k_cat=int(k_cat),
+    )
+    delta = np.asarray(result["delta_l"], dtype=np.float64)
+    h_dir = h_sq_directed_from_delta_l(delta)
+    h_cat_sq = h_sq_category_from_sample_directed(h_dir, np.asarray(bins_all, dtype=np.int64), k_cat=int(k_cat))
+    h_sqrt = np.sqrt(np.clip(h_cat_sq, 0.0, 1.0))
+    np.fill_diagonal(h_sqrt, 0.0)
+    return h_sqrt
+
+
 def _as_2d(a: np.ndarray) -> np.ndarray:
     arr = np.asarray(a, dtype=np.float64)
     if arr.ndim == 1:
@@ -284,12 +312,15 @@ def _render_cat_gt_panel(
     *,
     h_gt_sqrt: np.ndarray,
     decode_ref: np.ndarray,
+    decode_hellinger_ref_sqrt: np.ndarray | None,
     n_ref: int,
     k_cat: int,
     theta_centers: np.ndarray,
     out_svg_path: str,
+    decode_sweep_for_decode_limits: np.ndarray | None = None,
 ) -> str:
-    fig, axes = plt.subplots(1, 2, figsize=(6.2, 3.2), squeeze=False)
+    n_cols = 3 if decode_hellinger_ref_sqrt is not None else 2
+    fig, axes = plt.subplots(1, n_cols, figsize=(3.1 * n_cols, 3.2), squeeze=False)
     tick_pos, tick_labs, axis_label = _theta_axis_tick_labels(theta_centers, int(k_cat))
     x_rot = 45 if len(tick_pos) > 6 else 0
 
@@ -312,12 +343,18 @@ def _render_cat_gt_panel(
         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04).ax.tick_params(labelsize=11)
 
     ax_h = axes[0, 0]
-    ax_c = axes[0, 1]
     _one(ax_h, h_gt_sqrt, r"Analytic GT $\sqrt{H^2}$ (category)", 0.0, 1.0)
     ax_h.set_ylabel("category", fontsize=11)
-    vmin_c, vmax_c = conv._finite_min_max([decode_ref])
-    if vmin_c >= vmax_c:
-        vmax_c = vmin_c + 1e-12
+    if decode_hellinger_ref_sqrt is not None:
+        ax_ch = axes[0, 1]
+        _one(ax_ch, decode_hellinger_ref_sqrt, r"Classifier LLR $\sqrt{H^2}$", 0.0, 1.0)
+    ax_c = axes[0, n_cols - 1]
+    lim_arrays: list[np.ndarray] = [np.asarray(decode_ref, dtype=np.float64)]
+    if decode_sweep_for_decode_limits is not None:
+        dsw = np.asarray(decode_sweep_for_decode_limits, dtype=np.float64)
+        for j in range(int(dsw.shape[0])):
+            lim_arrays.append(np.asarray(dsw[j], dtype=np.float64))
+    vmin_c, vmax_c = _decode_accuracy_color_limits(*lim_arrays)
     _one(ax_c, decode_ref, f"Pairwise decoding (n_ref={int(n_ref)})", vmin_c, vmax_c)
     fig.tight_layout()
     svg = _save_figure_svg(fig, out_svg_path)
@@ -400,35 +437,60 @@ def _run_visualization_only(args: argparse.Namespace, methods: list[str], ns: li
     theta_centers = np.asarray(cached["theta_bin_centers"], dtype=np.float64)
     h_gt_sqrt = np.asarray(cached["h_gt_sqrt"], dtype=np.float64)
     decode_ref = np.asarray(cached["decode_ref"], dtype=np.float64)
+    decode_h_ref = (
+        np.asarray(cached["decode_hellinger_ref_sqrt"], dtype=np.float64)
+        if "decode_hellinger_ref_sqrt" in cached
+        else None
+    )
     h_sw = np.asarray(cached["h_sqrt_sweep"], dtype=np.float64)
     dec_sw = np.asarray(cached["decode_sweep"], dtype=np.float64)
+    dec_h_sw = (
+        np.asarray(cached["decode_hellinger_sweep_sqrt"], dtype=np.float64)
+        if "decode_hellinger_sweep_sqrt" in cached
+        else None
+    )
     corr_h = np.asarray(cached["corr_h_vs_gt"], dtype=np.float64)
     corr_d = np.asarray(cached["corr_decode_vs_ref"], dtype=np.float64).ravel()
+    corr_dh = (
+        np.asarray(cached["corr_decode_hellinger_vs_gt"], dtype=np.float64).ravel()
+        if "corr_decode_hellinger_vs_gt" in cached
+        else None
+    )
     nmse_h = np.asarray(cached["nmse_h_vs_gt"], dtype=np.float64)
     nmse_d = np.asarray(cached["nmse_decode_vs_ref"], dtype=np.float64).ravel()
+    nmse_dh = (
+        np.asarray(cached["nmse_decode_hellinger_vs_gt"], dtype=np.float64).ravel()
+        if "nmse_decode_hellinger_vs_gt" in cached
+        else None
+    )
     zdummy = np.zeros_like(corr_h)
     sweep_svg = _render_method_sweep_panel(
         row_labels=methods,
         h_sweep=h_sw,
         clf_sweep_shared=dec_sw,
+        clf_hellinger_sweep_shared=dec_h_sw,
         n_list=ns,
         out_svg_path=os.path.join(args.output_dir, "h_decoding_categorical_twofig_sweep.svg"),
         n_bins=k_cat,
         theta_centers=theta_centers,
+        clf_ref_decode_limits=np.asarray(decode_ref, dtype=np.float64),
     )
     gt_svg = _render_cat_gt_panel(
         h_gt_sqrt=h_gt_sqrt,
         decode_ref=decode_ref,
+        decode_hellinger_ref_sqrt=decode_h_ref,
         n_ref=int(args.n_ref),
         k_cat=k_cat,
         theta_centers=theta_centers,
         out_svg_path=os.path.join(args.output_dir, "h_decoding_categorical_twofig_gt.svg"),
+        decode_sweep_for_decode_limits=dec_sw,
     )
     corr_svg = _render_corr_vs_n_panel(
         row_labels=methods,
         n_list=ns,
         corr_h=corr_h,
         corr_decode_shared=corr_d,
+        corr_decode_hellinger_shared=corr_dh,
         corr_hellinger_lb=zdummy,
         corr_hellinger_ub=zdummy,
         show_hellinger_bounds=False,
@@ -439,6 +501,7 @@ def _run_visualization_only(args: argparse.Namespace, methods: list[str], ns: li
         n_list=ns,
         nmse_h=nmse_h,
         nmse_decode_shared=nmse_d,
+        nmse_decode_hellinger_shared=nmse_dh,
         out_svg_path=os.path.join(args.output_dir, "h_decoding_categorical_twofig_nmse_vs_n.svg"),
     )
     out_npz = os.path.join(args.output_dir, "h_decoding_categorical_twofig_results.npz")
@@ -748,6 +811,16 @@ def main(argv: list[str] | None = None) -> None:
         decode_x_train=decode_gt_x_train,
         decode_x_all=decode_gt_x_all,
     )
+    decode_h_x_train = subset_ref.bundle.x_train if decode_gt_x_train is None else decode_gt_x_train
+    decode_h_x_all = subset_ref.bundle.x_all if decode_gt_x_all is None else decode_gt_x_all
+    decode_hellinger_ref_sqrt = binary_classifier_hellinger_sqrt(
+        args,
+        x_train=decode_h_x_train,
+        bins_train=subset_ref.bin_train,
+        x_all=decode_h_x_all,
+        bins_all=subset_ref.bin_all,
+        k_cat=k_cat,
+    )
 
     n_m = len(methods)
     n_cols = len(ns)
@@ -758,6 +831,7 @@ def main(argv: list[str] | None = None) -> None:
     llr_pearson_offdiag = np.full((n_m, n_cols), np.nan, dtype=np.float64)
     hellinger_pearson_offdiag_cat = np.full((n_m, n_cols), np.nan, dtype=np.float64)
     decode_sweep_list: list[np.ndarray] = []
+    decode_hellinger_sweep_list: list[np.ndarray] = []
 
     dev = require_device(str(args.device))
     torch.manual_seed(int(args.run_seed))
@@ -795,6 +869,15 @@ def main(argv: list[str] | None = None) -> None:
             clf_random_state=clf_rs,
         )
         decode_sweep_list.append(np.asarray(clf_n, dtype=np.float64))
+        clf_h_n = binary_classifier_hellinger_sqrt(
+            args,
+            x_train=x_train,
+            bins_train=bins_train,
+            x_all=x_all,
+            bins_all=bins_n,
+            k_cat=k_cat,
+        )
+        decode_hellinger_sweep_list.append(np.asarray(clf_h_n, dtype=np.float64))
 
         for i, method_name in enumerate(methods):
             t0 = time.time()
@@ -839,13 +922,25 @@ def main(argv: list[str] | None = None) -> None:
                 scatter_bins = bins_n.copy()
 
     decode_sweep = np.stack(decode_sweep_list, axis=0)
+    decode_hellinger_sweep = np.stack(decode_hellinger_sweep_list, axis=0)
     corr_decode = np.full((n_cols,), np.nan, dtype=np.float64)
     nmse_decode = np.full((n_cols,), np.nan, dtype=np.float64)
+    corr_decode_hellinger = np.full((n_cols,), np.nan, dtype=np.float64)
+    nmse_decode_hellinger = np.full((n_cols,), np.nan, dtype=np.float64)
     decode_ref_imp = vhb.impute_offdiag_nan_mean(np.asarray(decode_ref, dtype=np.float64))
+    h_gt_imp = vhb.impute_offdiag_nan_mean(np.asarray(h_gt_sqrt, dtype=np.float64))
     for j in range(n_cols):
         corr_decode[j] = vhb.matrix_corr_offdiag_pearson(
             vhb.impute_offdiag_nan_mean(np.asarray(decode_sweep[j], dtype=np.float64)),
             decode_ref_imp,
+        )
+        corr_decode_hellinger[j] = vhb.matrix_corr_offdiag_pearson(
+            vhb.impute_offdiag_nan_mean(np.asarray(decode_hellinger_sweep[j], dtype=np.float64)),
+            h_gt_imp,
+        )
+        nmse_decode_hellinger[j] = _matrix_nmse_offdiag(
+            vhb.impute_offdiag_nan_mean(np.asarray(decode_hellinger_sweep[j], dtype=np.float64)),
+            h_gt_imp,
         )
     nmse_decode = _nmse_decode_vs_ref(decode_sweep, np.asarray(decode_ref, dtype=np.float64))
 
@@ -854,18 +949,22 @@ def main(argv: list[str] | None = None) -> None:
         row_labels=methods,
         h_sweep=h_sqrt_sweep,
         clf_sweep_shared=decode_sweep,
+        clf_hellinger_sweep_shared=decode_hellinger_sweep,
         n_list=ns,
         out_svg_path=os.path.join(out_dir, "h_decoding_categorical_twofig_sweep.svg"),
         n_bins=k_cat,
         theta_centers=theta_centers,
+        clf_ref_decode_limits=np.asarray(decode_ref, dtype=np.float64),
     )
     gt_svg = _render_cat_gt_panel(
         h_gt_sqrt=h_gt_sqrt,
         decode_ref=decode_ref,
+        decode_hellinger_ref_sqrt=decode_hellinger_ref_sqrt,
         n_ref=int(args.n_ref),
         k_cat=k_cat,
         theta_centers=theta_centers,
         out_svg_path=os.path.join(out_dir, "h_decoding_categorical_twofig_gt.svg"),
+        decode_sweep_for_decode_limits=decode_sweep,
     )
     zdummy = np.zeros_like(corr_h)
     corr_svg = _render_corr_vs_n_panel(
@@ -873,6 +972,7 @@ def main(argv: list[str] | None = None) -> None:
         n_list=ns,
         corr_h=corr_h,
         corr_decode_shared=corr_decode,
+        corr_decode_hellinger_shared=corr_decode_hellinger,
         corr_hellinger_lb=zdummy,
         corr_hellinger_ub=zdummy,
         show_hellinger_bounds=False,
@@ -883,6 +983,7 @@ def main(argv: list[str] | None = None) -> None:
         n_list=ns,
         nmse_h=nmse_h,
         nmse_decode_shared=nmse_decode,
+        nmse_decode_hellinger_shared=nmse_decode_hellinger,
         out_svg_path=os.path.join(out_dir, "h_decoding_categorical_twofig_nmse_vs_n.svg"),
     )
 
@@ -923,11 +1024,15 @@ def main(argv: list[str] | None = None) -> None:
         hellinger_gt_sq_category=np.asarray(hellinger_gt_sq, dtype=np.float64),
         decode_ref=np.asarray(decode_ref, dtype=np.float64),
         decode_sweep=np.asarray(decode_sweep, dtype=np.float64),
+        decode_hellinger_ref_sqrt=np.asarray(decode_hellinger_ref_sqrt, dtype=np.float64),
+        decode_hellinger_sweep_sqrt=np.asarray(decode_hellinger_sweep, dtype=np.float64),
         h_sqrt_sweep=np.asarray(h_sqrt_sweep, dtype=np.float64),
         corr_h_vs_gt=np.asarray(corr_h, dtype=np.float64),
         nmse_h_vs_gt=np.asarray(nmse_h, dtype=np.float64),
         corr_decode_vs_ref=np.asarray(corr_decode, dtype=np.float64),
         nmse_decode_vs_ref=np.asarray(nmse_decode, dtype=np.float64),
+        corr_decode_hellinger_vs_gt=np.asarray(corr_decode_hellinger, dtype=np.float64),
+        nmse_decode_hellinger_vs_gt=np.asarray(nmse_decode_hellinger, dtype=np.float64),
         llr_pearson_offdiag=np.asarray(llr_pearson_offdiag, dtype=np.float64),
         hellinger_pearson_offdiag_cat=np.asarray(hellinger_pearson_offdiag_cat, dtype=np.float64),
         wall_seconds=np.asarray(wall_s, dtype=np.float64),

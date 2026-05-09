@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from pathlib import Path
 
 import numpy as np
@@ -9,6 +10,7 @@ import pytest
 
 from fisher.data import ToyCategoricalRandomMoGDataset
 from fisher.h_decoding_categorical_twofig import (
+    binary_classifier_hellinger_sqrt,
     build_parser,
     h_sq_category_from_sample_directed,
     h_sq_directed_from_delta_l,
@@ -23,6 +25,17 @@ def test_parse_methods_aliases_and_dedup() -> None:
     assert parse_methods("x-flow, X_FLOW, binary-classifier") == ["x_flow", "binary_classifier"]
     with pytest.raises(ValueError, match="Unknown method"):
         parse_methods("theta_flow")
+
+
+def test_decode_accuracy_color_limits() -> None:
+    from fisher.h_decoding_twofig import _decode_accuracy_color_limits
+
+    a = np.array([[np.nan, 0.55], [0.55, np.nan]])
+    vmin, vmax = _decode_accuracy_color_limits(a)
+    assert vmin == pytest.approx(0.5) and vmax == 1.0
+    b = np.array([[np.nan, 0.35], [0.35, np.nan]])
+    vmin2, vmax2 = _decode_accuracy_color_limits(b)
+    assert vmin2 == pytest.approx(0.35) and vmax2 == 1.0
 
 
 def test_hellinger_gt_sq_category_matrix_shape_diag_bounds() -> None:
@@ -46,6 +59,28 @@ def test_category_aggregation_small_delta_l() -> None:
     assert h_cat.shape == (k, k)
     assert np.allclose(np.diag(h_cat), 0.0)
     assert np.all(h_cat >= 0.0)
+
+
+def test_binary_classifier_hellinger_sqrt_shape_diag_bounds() -> None:
+    rng = np.random.default_rng(0)
+    x0 = rng.normal(loc=-1.0, scale=0.1, size=(8, 2))
+    x1 = rng.normal(loc=1.0, scale=0.1, size=(8, 2))
+    x_all = np.vstack([x0, x1]).astype(np.float64)
+    bins = np.array([0] * 8 + [1] * 8, dtype=np.int64)
+    args = SimpleNamespace(clf_random_state=0, run_seed=0, clf_min_class_count=2, clf_max_iter=200)
+
+    h = binary_classifier_hellinger_sqrt(
+        args,
+        x_train=x_all,
+        bins_train=bins,
+        x_all=x_all,
+        bins_all=bins,
+        k_cat=2,
+    )
+    assert h.shape == (2, 2)
+    assert np.allclose(np.diag(h), 0.0)
+    assert float(np.min(h)) >= 0.0
+    assert float(np.max(h)) <= 1.0
 
 
 def test_cli_defaults_from_parser() -> None:
