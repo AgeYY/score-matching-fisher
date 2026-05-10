@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Nested-n sweep for categorical random MoG: LLR-based category Hellinger vs analytic GT.
 
-Mirrors :mod:`fisher.h_decoding_twofig` layout (sweep / GT / corr / NMSE SVGs + NPZ + summary)
-while using the categorical estimators and directed-then-symmetrized category aggregation from
+Mirrors :mod:`fisher.h_decoding_twofig` layout (sweep / GT / corr / NMSE / **training-loss panel** SVGs
++ NPZ + summary) while using the categorical estimators and directed-then-symmetrized category aggregation from
 ``bin/debug_categorical_xflow_llr.py``. Specialized to ``random_mog_categorical`` only.
+
+Use ``--hellinger-eval-split validation`` to evaluate learned H (and matching GT LLR scatter metrics) on the
+held-out validation rows of each nested ``n`` subset only; decoding rows still use the full nested subset.
+The convenience wrapper ``bin/study_h_decoding_categorical_twofig_val_hellinger.py`` defaults to that split.
 """
 
 from __future__ import annotations
@@ -41,13 +45,16 @@ from fisher import h_binned_visualization as vhb
 from fisher import h_decoding_convergence as conv
 from fisher.decoding_native_x import decoding_x_train_all_from_native, load_native_bundle_for_pr_gt_decoding
 from fisher.hellinger_gt import hellinger_sq_gaussian_diag
-from fisher.h_decoding_convergence_methods import prepare_categorical_binning_for_convergence
+from fisher.h_decoding_convergence_methods import SweepSubset, prepare_categorical_binning_for_convergence
+from fisher.shared_dataset_io import SharedDatasetBundle
 from fisher.h_decoding_twofig import (
     _decode_accuracy_color_limits,
     _matrix_nmse_offdiag,
     _render_corr_vs_n_panel,
     _render_method_sweep_panel,
     _render_nmse_vs_n_panel,
+    _render_row_n_training_losses_panel,
+    _sanitize_row_label,
     _save_figure_svg,
     _theta_axis_tick_labels,
 )
@@ -68,8 +75,13 @@ _METHOD_ALIASES: dict[str, str] = {
     "linear_x_flow_t": "linear_x_flow_t",
     "xflow-sir-lrank": "xflow_sir_lrank",
     "xflow_sir_lrank": "xflow_sir_lrank",
+    "bin_gaussian": "bin_gaussian",
+    "bin-gaussian": "bin_gaussian",
+    "binned_gaussian": "bin_gaussian",
+    "binned-gaussian": "bin_gaussian",
 }
 _DEFAULT_METHODS = ("x_flow", "binary_classifier", "linear_x_flow_t", "xflow_sir_lrank")
+_SUPPORTED_METHODS_HELP = ", ".join(_DEFAULT_METHODS + ("bin_gaussian",))
 
 
 @functools.lru_cache(maxsize=1)
@@ -93,7 +105,7 @@ def parse_methods(methods: str) -> list[str]:
         key = tok.strip().lower()
         norm = _METHOD_ALIASES.get(key)
         if norm is None:
-            raise ValueError(f"Unknown method {tok!r}; valid methods: {', '.join(_DEFAULT_METHODS)}")
+            raise ValueError(f"Unknown method {tok!r}; valid methods: {_SUPPORTED_METHODS_HELP}")
         if norm not in out:
             out.append(norm)
     return out
@@ -187,6 +199,42 @@ def _ensure_pr_projected_npz(args: argparse.Namespace, *, native_npz: Path, pr_o
         cmd.extend(["--pr-eps", str(float(args.pr_eps))])
     print("[cat-twofig] running PR projection: " + " ".join(cmd), flush=True)
     subprocess.run(cmd, cwd=str(_repo_root), check=True)
+
+
+def _validation_only_work_sweep_subset(subset_w: SweepSubset) -> SweepSubset:
+    """Build a :class:`SweepSubset` whose ``bundle.x_all`` / ``bin_all`` are validation rows only.
+
+    Used for ``--hellinger-eval-split validation`` with :func:`conv._binned_gaussian_hellinger_sq`,
+    which reads ``subset.bundle.x_all`` and ``subset.bin_all``.
+    """
+    b = subset_w.bundle
+    tv = np.asarray(b.theta_validation, dtype=np.float64)
+    xv = np.asarray(b.x_validation, dtype=np.float64)
+    binv = np.asarray(subset_w.bin_validation, dtype=np.int64).reshape(-1)
+    if tv.ndim == 1:
+        tv = tv.reshape(-1, 1)
+    elif tv.ndim != 2:
+        raise ValueError("theta_validation must be 1D or 2D.")
+    n = int(xv.shape[0])
+    if n < 1:
+        raise ValueError("validation split is empty.")
+    if int(binv.shape[0]) != n:
+        raise ValueError("bin_validation length must match x_validation.")
+    idx = np.arange(n, dtype=np.int64)
+    empty = np.arange(0, dtype=np.int64)
+    meta = dict(b.meta)
+    new_b = SharedDatasetBundle(
+        meta=meta,
+        theta_all=tv,
+        x_all=xv,
+        train_idx=empty,
+        validation_idx=idx,
+        theta_train=np.empty((0, tv.shape[1]), dtype=np.float64),
+        x_train=np.empty((0, xv.shape[1]), dtype=np.float64),
+        theta_validation=tv,
+        x_validation=xv,
+    )
+    return SweepSubset(bundle=new_b, bin_all=binv, bin_train=binv, bin_validation=binv)
 
 
 def compute_true_conditional_loglik_matrix(x_all: np.ndarray, theta_all: np.ndarray, meta: dict) -> np.ndarray:
@@ -428,6 +476,18 @@ def _validate_cached_cli(
                 raise ValueError(
                     f"--dataset-npz {args.dataset_npz!r} does not match cached native_dataset_npz={ds_cached!r}."
                 )
+    want_h = str(getattr(args, "hellinger_eval_split", "all")).strip().lower()
+    if "hellinger_eval_split" in cached:
+        got_h = str(np.asarray(cached["hellinger_eval_split"], dtype=object).reshape(-1)[0])
+        if got_h != want_h:
+            raise ValueError(
+                f"--hellinger-eval-split {want_h!r} does not match cached hellinger_eval_split={got_h!r}."
+            )
+    elif want_h != "all":
+        raise ValueError(
+            "Cached results NPZ has no hellinger_eval_split (older run). "
+            "Use --hellinger-eval-split all with --visualization-only, or re-run the study."
+        )
 
 
 def _run_visualization_only(args: argparse.Namespace, methods: list[str], ns: list[int]) -> None:
@@ -504,6 +564,18 @@ def _run_visualization_only(args: argparse.Namespace, methods: list[str], ns: li
         nmse_decode_hellinger_shared=nmse_dh,
         out_svg_path=os.path.join(args.output_dir, "h_decoding_categorical_twofig_nmse_vs_n.svg"),
     )
+    loss_root = os.path.join(str(args.output_dir), "training_losses")
+    if not os.path.isdir(loss_root):
+        raise FileNotFoundError(
+            "visualization-only requires per-(method, n) curves under training_losses/ "
+            f"(missing {os.path.abspath(loss_root)}). Re-run without --visualization-only first."
+        )
+    loss_panel_svg = _render_row_n_training_losses_panel(
+        row_labels=methods,
+        n_list=ns,
+        loss_root=loss_root,
+        out_svg_path=os.path.join(args.output_dir, "h_decoding_categorical_twofig_training_losses_panel.svg"),
+    )
     out_npz = os.path.join(args.output_dir, "h_decoding_categorical_twofig_results.npz")
     summary_path = os.path.join(args.output_dir, "h_decoding_categorical_twofig_summary.txt")
     _write_summary(
@@ -515,9 +587,11 @@ def _run_visualization_only(args: argparse.Namespace, methods: list[str], ns: li
         corr_svg=os.path.abspath(corr_svg),
         nmse_svg=os.path.abspath(nmse_svg),
         visualization_only=True,
+        loss_panel_svg=os.path.abspath(loss_panel_svg),
+        training_losses_root=os.path.abspath(loss_root),
     )
     print("[cat-twofig] Saved (visualization-only):", flush=True)
-    for p in (sweep_svg, gt_svg, corr_svg, nmse_svg, summary_path):
+    for p in (sweep_svg, gt_svg, corr_svg, nmse_svg, loss_panel_svg, summary_path):
         print(f"  - {os.path.abspath(p)}", flush=True)
 
 
@@ -531,6 +605,8 @@ def _write_summary(
     corr_svg: str,
     nmse_svg: str,
     visualization_only: bool,
+    loss_panel_svg: str | None = None,
+    training_losses_root: str | None = None,
 ) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
@@ -549,6 +625,11 @@ def _write_summary(
         f.write(f"h_decoding_categorical_twofig_gt.svg: {gt_svg}\n")
         f.write(f"h_decoding_categorical_twofig_corr_vs_n.svg: {corr_svg}\n")
         f.write(f"h_decoding_categorical_twofig_nmse_vs_n.svg: {nmse_svg}\n")
+        if loss_panel_svg:
+            f.write(f"h_decoding_categorical_twofig_training_losses_panel.svg: {loss_panel_svg}\n")
+        if training_losses_root:
+            f.write(f"training_losses_root: {training_losses_root}\n")
+        f.write(f"hellinger_eval_split: {str(getattr(args, 'hellinger_eval_split', 'all'))}\n")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -569,6 +650,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--methods", type=str, default=",".join(_DEFAULT_METHODS))
     p.add_argument("--visualization-only", action="store_true")
+    p.add_argument(
+        "--hellinger-eval-split",
+        type=str,
+        default="all",
+        choices=("all", "validation"),
+        help="For learned H and GT-LLR diagnostics: use all nested-n rows (default) or validation split only.",
+    )
     p.add_argument(
         "--no-scatter-diagnostics",
         action="store_true",
@@ -641,6 +729,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional override for native NPZ when PR-embedded (GT decoding on native 2D x).",
     )
     return p
+
+
+def _save_method_training_loss_npz(out_path: str | Path, *, method_name: str, result: dict[str, Any]) -> None:
+    """Write per-(method, n) curves compatible with :func:`conv._load_per_n_training_loss_npz`."""
+    p = Path(out_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    train_out = result.get("train_out")
+    if train_out:
+        tr = np.asarray(train_out.get("train_losses", []), dtype=np.float64).ravel()
+        va = np.asarray(train_out.get("val_losses", []), dtype=np.float64).ravel()
+        em = np.asarray(train_out.get("val_monitor_losses", []), dtype=np.float64).ravel()
+    else:
+        tr = np.asarray([], dtype=np.float64)
+        va = np.asarray([], dtype=np.float64)
+        em = np.asarray([], dtype=np.float64)
+    np.savez_compressed(
+        str(p),
+        theta_field_method=np.asarray([str(method_name)], dtype=object),
+        prior_enable=np.bool_(False),
+        score_train_losses=tr,
+        score_val_losses=va,
+        score_val_monitor_losses=em,
+    )
 
 
 def _train_one_method(
@@ -764,6 +875,15 @@ def main(argv: list[str] | None = None) -> None:
     if n_pool < need:
         raise ValueError(f"Dataset n_total={n_pool} < max(n_ref, max(n_list))={need}.")
 
+    he_split = str(getattr(args, "hellinger_eval_split", "all")).strip().lower()
+    if he_split not in ("all", "validation"):
+        raise ValueError("--hellinger-eval-split must be 'all' or 'validation'.")
+    if he_split == "validation" and float(meta_work.get("train_frac", 0.7)) >= 1.0:
+        raise ValueError(
+            "--hellinger-eval-split validation requires train_frac < 1 in dataset meta; "
+            f"got train_frac={meta_work.get('train_frac')!r}."
+        )
+
     k_cat = int(native_meta.get("num_categories", int(args.num_categories)))
     _, _, _, _, _, bin_idx_all = prepare_categorical_binning_for_convergence(native_bundle.theta_all, k_cat)
     theta_centers = np.arange(k_cat, dtype=np.float64).reshape(-1, 1)
@@ -839,16 +959,17 @@ def main(argv: list[str] | None = None) -> None:
 
     dbg = _debug_categorical_module()
     scatter_deltas: dict[str, np.ndarray] = {}
+    scatter_cat_h2: dict[str, np.ndarray] = {}
     scatter_true_delta: np.ndarray | None = None
-    scatter_bins: np.ndarray | None = None
     n_scatter = max(ns)
+    out_dir = str(args.output_dir)
+    loss_root = os.path.join(out_dir, "training_losses")
 
     for j, n in enumerate(ns):
         subset_w = conv._subset_bundle(work_bundle, perm, int(n), meta_work, bin_idx_all=bin_idx_all)
         subset_n = conv._subset_bundle(native_bundle, perm, int(n), meta_work, bin_idx_all=bin_idx_all)
         bins_n = np.asarray(subset_w.bin_all, dtype=np.int64).reshape(-1)
         x_native_all = np.asarray(subset_n.bundle.x_all, dtype=np.float64)
-        theta_all = _as_2d(subset_w.bundle.theta_all)
         train_theta = _as_2d(subset_w.bundle.theta_train)
         val_theta = _as_2d(subset_w.bundle.theta_validation)
         x_train = np.asarray(subset_w.bundle.x_train, dtype=np.float64)
@@ -856,7 +977,22 @@ def main(argv: list[str] | None = None) -> None:
         x_all = np.asarray(subset_w.bundle.x_all, dtype=np.float64)
         bins_train = np.asarray(bins_n[: int(subset_w.bundle.theta_train.shape[0])], dtype=np.int64)
 
-        true_c = compute_true_conditional_loglik_matrix(x_native_all, theta_all, native_meta)
+        val_h = str(getattr(args, "hellinger_eval_split", "all")).strip().lower() == "validation"
+        if val_h:
+            n_val = int(subset_w.bundle.x_validation.shape[0])
+            if n_val < 1:
+                raise ValueError(f"n={int(n)}: empty validation split; cannot use --hellinger-eval-split validation.")
+            theta_h = val_theta
+            x_h = x_val
+            x_native_h = np.asarray(subset_n.bundle.x_validation, dtype=np.float64)
+            bins_h = np.asarray(subset_w.bin_validation, dtype=np.int64).reshape(-1)
+        else:
+            theta_h = _as_2d(subset_w.bundle.theta_all)
+            x_h = x_all
+            x_native_h = x_native_all
+            bins_h = bins_n
+
+        true_c = compute_true_conditional_loglik_matrix(x_native_h, theta_h, native_meta)
         true_delta_l = HMatrixEstimator.compute_delta_l(true_c)
 
         clf_n = conv._pairwise_clf_from_bundle(
@@ -881,31 +1017,57 @@ def main(argv: list[str] | None = None) -> None:
 
         for i, method_name in enumerate(methods):
             t0 = time.time()
-            result = _train_one_method(
-                args,
-                dev=dev,
-                method_name=method_name,
-                theta_train=train_theta,
-                x_train=x_train,
-                theta_val=val_theta,
-                x_val=x_val,
-                theta_all=theta_all,
-                x_all=x_all,
-                bins_train=bins_train,
-                bins_all=bins_n,
-                k_cat=k_cat,
-            )
-            delta = np.asarray(result["delta_l"], dtype=np.float64)
-            h_dir = h_sq_directed_from_delta_l(delta)
-            h_cat_sq = h_sq_category_from_sample_directed(h_dir, bins_n, k_cat=k_cat)
-            h_sqrt_sweep[i, j] = np.sqrt(np.clip(h_cat_sq, 0.0, 1.0))
-            np.fill_diagonal(h_sqrt_sweep[i, j], 0.0)
-            wall_s[i, j] = time.time() - t0
+            row_loss_dir = os.path.join(loss_root, _sanitize_row_label(method_name))
+            os.makedirs(row_loss_dir, exist_ok=True)
+            loss_npz_path = os.path.join(row_loss_dir, f"n_{int(n):06d}.npz")
 
-            m_llr = dbg._llr_comparison_metrics(delta, true_delta_l)
-            llr_pearson_offdiag[i, j] = float(m_llr["llr_pearson_r_offdiag"])
-            m_h = dbg._hellinger_comparison_metrics_cat(h_cat_sq, hellinger_gt_sq)
-            hellinger_pearson_offdiag_cat[i, j] = float(m_h["hellinger_pearson_r_offdiag_cat"])
+            if method_name == "bin_gaussian":
+                vf = float(
+                    getattr(
+                        args,
+                        "flow_theta_reg_variance_floor",
+                        getattr(args, "flow_x_reg_variance_floor", 1e-6),
+                    )
+                )
+                subset_bg = _validation_only_work_sweep_subset(subset_w) if val_h else subset_w
+                bg_h2 = conv._binned_gaussian_hellinger_sq(subset_bg, k_cat, variance_floor=vf)
+                h_sqrt_sweep[i, j] = np.asarray(conv._sqrt_h_like(np.asarray(bg_h2, dtype=np.float64)), dtype=np.float64)
+                np.fill_diagonal(h_sqrt_sweep[i, j], 0.0)
+                wall_s[i, j] = time.time() - t0
+                result = {"train_out": None}
+                nan_delta = np.full(np.asarray(true_delta_l, dtype=np.float64).shape, np.nan, dtype=np.float64)
+                m_llr = dbg._llr_comparison_metrics(nan_delta, true_delta_l)
+                llr_pearson_offdiag[i, j] = float(m_llr["llr_pearson_r_offdiag"])
+                m_h = dbg._hellinger_comparison_metrics_cat(bg_h2, hellinger_gt_sq)
+                hellinger_pearson_offdiag_cat[i, j] = float(m_h["hellinger_pearson_r_offdiag_cat"])
+                _save_method_training_loss_npz(loss_npz_path, method_name=method_name, result=result)
+            else:
+                result = _train_one_method(
+                    args,
+                    dev=dev,
+                    method_name=method_name,
+                    theta_train=train_theta,
+                    x_train=x_train,
+                    theta_val=val_theta,
+                    x_val=x_val,
+                    theta_all=theta_h,
+                    x_all=x_h,
+                    bins_train=bins_train,
+                    bins_all=bins_h,
+                    k_cat=k_cat,
+                )
+                _save_method_training_loss_npz(loss_npz_path, method_name=method_name, result=result)
+                delta = np.asarray(result["delta_l"], dtype=np.float64)
+                h_dir = h_sq_directed_from_delta_l(delta)
+                h_cat_sq = h_sq_category_from_sample_directed(h_dir, bins_h, k_cat=k_cat)
+                h_sqrt_sweep[i, j] = np.sqrt(np.clip(h_cat_sq, 0.0, 1.0))
+                np.fill_diagonal(h_sqrt_sweep[i, j], 0.0)
+                wall_s[i, j] = time.time() - t0
+
+                m_llr = dbg._llr_comparison_metrics(delta, true_delta_l)
+                llr_pearson_offdiag[i, j] = float(m_llr["llr_pearson_r_offdiag"])
+                m_h = dbg._hellinger_comparison_metrics_cat(h_cat_sq, hellinger_gt_sq)
+                hellinger_pearson_offdiag_cat[i, j] = float(m_h["hellinger_pearson_r_offdiag_cat"])
 
             corr_h[i, j] = vhb.matrix_corr_offdiag_pearson(
                 vhb.impute_offdiag_nan_mean(h_sqrt_sweep[i, j]),
@@ -917,9 +1079,12 @@ def main(argv: list[str] | None = None) -> None:
             )
 
             if int(n) == int(n_scatter):
-                scatter_deltas[method_name] = np.asarray(delta, dtype=np.float64).copy()
                 scatter_true_delta = np.asarray(true_delta_l, dtype=np.float64).copy()
-                scatter_bins = bins_n.copy()
+                if method_name == "bin_gaussian":
+                    scatter_cat_h2[method_name] = np.asarray(bg_h2, dtype=np.float64).copy()
+                else:
+                    scatter_deltas[method_name] = np.asarray(delta, dtype=np.float64).copy()
+                    scatter_cat_h2[method_name] = np.asarray(h_cat_sq, dtype=np.float64).copy()
 
     decode_sweep = np.stack(decode_sweep_list, axis=0)
     decode_hellinger_sweep = np.stack(decode_hellinger_sweep_list, axis=0)
@@ -944,7 +1109,6 @@ def main(argv: list[str] | None = None) -> None:
         )
     nmse_decode = _nmse_decode_vs_ref(decode_sweep, np.asarray(decode_ref, dtype=np.float64))
 
-    out_dir = str(args.output_dir)
     sweep_svg = _render_method_sweep_panel(
         row_labels=methods,
         h_sweep=h_sqrt_sweep,
@@ -986,17 +1150,29 @@ def main(argv: list[str] | None = None) -> None:
         nmse_decode_hellinger_shared=nmse_decode_hellinger,
         out_svg_path=os.path.join(out_dir, "h_decoding_categorical_twofig_nmse_vs_n.svg"),
     )
+    loss_panel_svg = _render_row_n_training_losses_panel(
+        row_labels=methods,
+        n_list=ns,
+        loss_root=loss_root,
+        out_svg_path=os.path.join(out_dir, "h_decoding_categorical_twofig_training_losses_panel.svg"),
+    )
 
-    if not bool(args.no_scatter_diagnostics) and scatter_true_delta is not None and scatter_deltas:
+    if not bool(args.no_scatter_diagnostics) and scatter_true_delta is not None and scatter_cat_h2:
         metrics_by_method: dict[str, dict[str, float]] = {}
         hell_cat: dict[str, np.ndarray] = {}
         for name in methods:
-            dlt = scatter_deltas[name]
-            metrics_by_method[name] = dbg._llr_comparison_metrics(dlt, scatter_true_delta)
-            h_dir = h_sq_directed_from_delta_l(dlt)
-            hc = h_sq_category_from_sample_directed(h_dir, scatter_bins, k_cat=k_cat)
-            hell_cat[name] = hc
-            metrics_by_method[name].update(dbg._hellinger_comparison_metrics_cat(hc, hellinger_gt_sq))
+            if name not in scatter_cat_h2:
+                continue
+            hell_cat[name] = scatter_cat_h2[name]
+            if name == "bin_gaussian":
+                nan_d = np.full_like(scatter_true_delta, np.nan, dtype=np.float64)
+                metrics_by_method[name] = dbg._llr_comparison_metrics(nan_d, scatter_true_delta)
+            else:
+                dlt = scatter_deltas[name]
+                metrics_by_method[name] = dbg._llr_comparison_metrics(dlt, scatter_true_delta)
+            metrics_by_method[name].update(
+                dbg._hellinger_comparison_metrics_cat(scatter_cat_h2[name], hellinger_gt_sq)
+            )
         dbg._save_llr_est_vs_true_figure(
             scatter_deltas,
             scatter_true_delta,
@@ -1043,6 +1219,8 @@ def main(argv: list[str] | None = None) -> None:
         ),
         pr_projected=np.bool_(pr_project),
         pr_dim=np.int64(int(args.pr_dim) if pr_project else native_x_dim),
+        training_losses_root=np.asarray([os.path.abspath(loss_root)], dtype=object),
+        hellinger_eval_split=np.asarray([str(getattr(args, "hellinger_eval_split", "all"))], dtype=object),
     )
 
     summary_path = os.path.join(out_dir, "h_decoding_categorical_twofig_summary.txt")
@@ -1055,6 +1233,8 @@ def main(argv: list[str] | None = None) -> None:
         corr_svg=os.path.abspath(corr_svg),
         nmse_svg=os.path.abspath(nmse_svg),
         visualization_only=False,
+        loss_panel_svg=os.path.abspath(loss_panel_svg),
+        training_losses_root=os.path.abspath(loss_root),
     )
 
     print("[cat-twofig] Saved:", flush=True)
@@ -1063,6 +1243,7 @@ def main(argv: list[str] | None = None) -> None:
     print(f"  - {os.path.abspath(gt_svg)}", flush=True)
     print(f"  - {os.path.abspath(corr_svg)}", flush=True)
     print(f"  - {os.path.abspath(nmse_svg)}", flush=True)
+    print(f"  - {os.path.abspath(loss_panel_svg)}", flush=True)
     print(f"  - {os.path.abspath(summary_path)}", flush=True)
 
 

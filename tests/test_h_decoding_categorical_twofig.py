@@ -17,12 +17,18 @@ from fisher.h_decoding_categorical_twofig import (
     hellinger_gt_sq_category_matrix,
     main,
     parse_methods,
+    _save_method_training_loss_npz,
+    _validation_only_work_sweep_subset,
 )
 from fisher.h_matrix import HMatrixEstimator
+from fisher import h_decoding_convergence as conv
+from fisher.h_decoding_convergence_methods import prepare_categorical_binning_for_convergence
+from fisher.shared_dataset_io import load_shared_dataset_npz
 
 
 def test_parse_methods_aliases_and_dedup() -> None:
     assert parse_methods("x-flow, X_FLOW, binary-classifier") == ["x_flow", "binary_classifier"]
+    assert parse_methods("bin-gaussian, bin_gaussian, x_flow") == ["bin_gaussian", "x_flow"]
     with pytest.raises(ValueError, match="Unknown method"):
         parse_methods("theta_flow")
 
@@ -130,10 +136,19 @@ def test_visualization_only_cached_shapes(tmp_path: Path) -> None:
         corr_decode_vs_ref=corr_d,
         nmse_decode_vs_ref=nmse_d,
         native_dataset_npz=np.asarray([str(fake_ds.resolve())], dtype=object),
+        hellinger_eval_split=np.asarray(["all"], dtype=object),
     )
     out_dir = tmp_path / "out"
     out_dir.mkdir()
     npz_path.rename(out_dir / "h_decoding_categorical_twofig_results.npz")
+    loss_root = out_dir / "training_losses" / "binary_classifier"
+    loss_root.mkdir(parents=True)
+    for n in ns:
+        _save_method_training_loss_npz(
+            loss_root / f"n_{int(n):06d}.npz",
+            method_name="binary_classifier",
+            result={},
+        )
     argv = [
         "--visualization-only",
         "--output-dir",
@@ -154,3 +169,26 @@ def test_visualization_only_cached_shapes(tmp_path: Path) -> None:
     main(argv)
     assert (out_dir / "h_decoding_categorical_twofig_sweep.svg").is_file()
     assert (out_dir / "h_decoding_categorical_twofig_gt.svg").is_file()
+    assert (out_dir / "h_decoding_categorical_twofig_training_losses_panel.svg").is_file()
+
+
+def test_build_parser_hellinger_eval_split() -> None:
+    p = build_parser()
+    assert p.parse_args([]).hellinger_eval_split == "all"
+    assert p.parse_args(["--hellinger-eval-split", "validation", "--device", "cpu"]).hellinger_eval_split == "validation"
+
+
+def test_validation_only_work_sweep_subset_aligns_with_bundle_validation() -> None:
+    repo = Path(__file__).resolve().parent.parent
+    npz = repo / "data" / "random_mog_categorical_xdim2_default" / "random_mog_categorical.npz"
+    if not npz.is_file():
+        pytest.skip("benchmark-cate native NPZ not in checkout")
+    bundle = load_shared_dataset_npz(npz)
+    meta = dict(bundle.meta)
+    k_cat = int(meta.get("num_categories", 5))
+    _, _, _, _, _, bin_idx_all = prepare_categorical_binning_for_convergence(bundle.theta_all, k_cat)
+    perm = np.arange(int(bundle.theta_all.shape[0]), dtype=np.int64)
+    subset_w = conv._subset_bundle(bundle, perm, 200, meta, bin_idx_all=bin_idx_all)
+    vs = _validation_only_work_sweep_subset(subset_w)
+    assert int(vs.bundle.x_all.shape[0]) == int(subset_w.bundle.x_validation.shape[0])
+    assert np.array_equal(vs.bin_all, subset_w.bin_validation)

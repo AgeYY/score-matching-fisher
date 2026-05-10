@@ -1,0 +1,33 @@
+---
+name: score-matching-fisher-note-repo
+description: >-
+  Points the agent at the sibling score-matching-fisher-note repository (notes and prose,
+  separate from the coding repo). Use when the user invokes this skill, says notes repo,
+  sibling note folder, ../score-matching-fisher-note, or wants reads/writes outside the
+  code tree in the dedicated notes clone.
+disable-model-invocation: true
+---
+
+# score-matching-fisher-note-repo
+
+## What this is
+
+The **coding** project is `score-matching-fisher` (this workspace). Long-form notes, journals, and non-code artifacts the user keeps elsewhere live in a **sibling** Git repo:
+
+| Role | Typical path |
+|------|----------------|
+| Notes repo (read/write here when this skill applies) | **`/grad/zeyuan/score-matching-fisher-note/`** |
+| Same place, relative from code repo root | **`../score-matching-fisher-note/`** |
+
+Resolve the notes root as: parent directory of the `score-matching-fisher` clone + `score-matching-fisher-note`. If the clone lives elsewhere on disk, substitute that parent; the folder name stays `score-matching-fisher-note`.
+
+## Agent behavior when this skill is active
+
+1. **Treat the notes repo as in-scope** for Read, Write, StrReplace, Grep, Glob, and terminal commands—same as the code repo unless the user restricts a task to one side only.
+2. **Prefer absolute paths** under `/grad/zeyuan/score-matching-fisher-note/` when running tools, so paths do not depend on the shell cwd.
+3. **Git**: commits and branches in the notes repo are separate from the code repo; run `git` with `working_directory` (or `cd`) set to the notes root when the user asks for version control there.
+4. **Do not** assume a fixed internal layout inside the notes repo; discover files with Glob/Grep after landing in that root.
+
+## Relationship to in-repo notes
+
+The code repo may still contain `journal/notes/` and `report/notes/`. This skill does **not** replace those; it adds the **external** sibling clone. When the user names this skill, default to the sibling path above for new or relocated note material they want outside the coding tree.
