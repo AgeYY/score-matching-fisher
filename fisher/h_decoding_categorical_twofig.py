@@ -57,6 +57,7 @@ from fisher.h_decoding_twofig import (
 from fisher.h_matrix import HMatrixEstimator
 from fisher.shared_dataset_io import SharedDatasetBundle, load_shared_dataset_npz
 from fisher.shared_fisher_est import build_dataset_from_meta, require_device
+from fisher.svg_utils import concatenate_svgs_horizontally_to_png
 from fisher.models import (
     ConditionalThetaFlowVelocity,
     ConditionalThetaFlowVelocityFiLMPerLayer,
@@ -94,6 +95,7 @@ _METHOD_ALIASES: dict[str, str] = {
 }
 _DEFAULT_METHODS = ("x_flow", "binary_classifier", "linear_x_flow_t", "xflow_sir_lrank")
 _SUPPORTED_METHODS_HELP = ", ".join(_DEFAULT_METHODS + ("theta_flow_cate", "bin_gaussian"))
+_ALL_COLUMNS_PNG_NAME = "h_decoding_categorical_twofig_all_columns.png"
 
 
 @functools.lru_cache(maxsize=1)
@@ -121,6 +123,24 @@ def parse_methods(methods: str) -> list[str]:
         if norm not in out:
             out.append(norm)
     return out
+
+
+def _write_all_columns_png(
+    output_dir: str | os.PathLike[str],
+    *,
+    sweep_svg: str,
+    corr_nmse_svg: str,
+    loss_panel_svg: str,
+) -> str:
+    """Compose categorical twofig SVG outputs in a documented left-to-right order."""
+    out_dir = Path(output_dir)
+    optional_diagnostics = [
+        out_dir / "llr_est_vs_true_all.svg",
+        out_dir / "hellinger_est_vs_gt_all.svg",
+    ]
+    source_paths: list[str | Path] = [sweep_svg, corr_nmse_svg, loss_panel_svg]
+    source_paths.extend(p for p in optional_diagnostics if p.is_file())
+    return concatenate_svgs_horizontally_to_png(source_paths, out_dir / _ALL_COLUMNS_PNG_NAME, dpi=300)
 
 
 def _default_dataset_npz(num_categories: int) -> Path:
@@ -730,6 +750,12 @@ def _run_visualization_only(args: argparse.Namespace, methods: list[str], ns: li
         loss_root=loss_root,
         out_svg_path=os.path.join(args.output_dir, "h_decoding_categorical_twofig_training_losses_panel.svg"),
     )
+    all_columns_png = _write_all_columns_png(
+        args.output_dir,
+        sweep_svg=sweep_svg,
+        corr_nmse_svg=corr_nmse_svg,
+        loss_panel_svg=loss_panel_svg,
+    )
     out_npz = os.path.join(args.output_dir, "h_decoding_categorical_twofig_results.npz")
     summary_path = os.path.join(args.output_dir, "h_decoding_categorical_twofig_summary.txt")
     _write_summary(
@@ -740,10 +766,11 @@ def _run_visualization_only(args: argparse.Namespace, methods: list[str], ns: li
         corr_nmse_svg=os.path.abspath(corr_nmse_svg),
         visualization_only=True,
         loss_panel_svg=os.path.abspath(loss_panel_svg),
+        all_columns_png=os.path.abspath(all_columns_png),
         training_losses_root=os.path.abspath(loss_root),
     )
     print("[cat-twofig] Saved (visualization-only):", flush=True)
-    for p in (sweep_svg, corr_nmse_svg, loss_panel_svg, summary_path):
+    for p in (sweep_svg, corr_nmse_svg, loss_panel_svg, all_columns_png, summary_path):
         print(f"  - {os.path.abspath(p)}", flush=True)
 
 
@@ -756,6 +783,7 @@ def _write_summary(
     corr_nmse_svg: str,
     visualization_only: bool,
     loss_panel_svg: str | None = None,
+    all_columns_png: str | None = None,
     training_losses_root: str | None = None,
 ) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -775,6 +803,8 @@ def _write_summary(
         f.write(f"h_decoding_categorical_twofig_corr_nmse.svg: {corr_nmse_svg}\n")
         if loss_panel_svg:
             f.write(f"h_decoding_categorical_twofig_training_losses_panel.svg: {loss_panel_svg}\n")
+        if all_columns_png:
+            f.write(f"{_ALL_COLUMNS_PNG_NAME}: {all_columns_png}\n")
         if training_losses_root:
             f.write(f"training_losses_root: {training_losses_root}\n")
         f.write(f"eval_split: {_selected_eval_split(args)}\n")
@@ -1364,6 +1394,12 @@ def main(argv: list[str] | None = None) -> None:
             out_base=Path(out_dir) / "hellinger_est_vs_gt_all",
             metrics_by_method=metrics_by_method,
         )
+    all_columns_png = _write_all_columns_png(
+        out_dir,
+        sweep_svg=sweep_svg,
+        corr_nmse_svg=corr_nmse_svg,
+        loss_panel_svg=loss_panel_svg,
+    )
 
     source_indices = np.asarray(perm[: int(args.n_ref)], dtype=np.int64)
     out_npz = os.path.join(out_dir, "h_decoding_categorical_twofig_results.npz")
@@ -1411,6 +1447,7 @@ def main(argv: list[str] | None = None) -> None:
         corr_nmse_svg=os.path.abspath(corr_nmse_svg),
         visualization_only=False,
         loss_panel_svg=os.path.abspath(loss_panel_svg),
+        all_columns_png=os.path.abspath(all_columns_png),
         training_losses_root=os.path.abspath(loss_root),
     )
 
@@ -1419,6 +1456,7 @@ def main(argv: list[str] | None = None) -> None:
     print(f"  - {os.path.abspath(sweep_svg)}", flush=True)
     print(f"  - {os.path.abspath(corr_nmse_svg)}", flush=True)
     print(f"  - {os.path.abspath(loss_panel_svg)}", flush=True)
+    print(f"  - {os.path.abspath(all_columns_png)}", flush=True)
     print(f"  - {os.path.abspath(summary_path)}", flush=True)
 
 

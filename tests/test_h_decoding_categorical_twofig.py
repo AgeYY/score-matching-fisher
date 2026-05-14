@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from pathlib import Path
+import xml.etree.ElementTree as ET
 
 import numpy as np
 import pytest
@@ -25,6 +26,62 @@ from fisher.h_matrix import HMatrixEstimator
 from fisher import h_decoding_convergence as conv
 from fisher.h_decoding_convergence_methods import prepare_categorical_binning_for_convergence
 from fisher.shared_dataset_io import SharedDatasetBundle, load_shared_dataset_npz
+from fisher.svg_utils import concatenate_svgs_horizontally, concatenate_svgs_horizontally_to_png
+
+
+def _write_tiny_svg(path: Path, *, width: int = 10, height: int = 8) -> str:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}"></svg>',
+        encoding="utf-8",
+    )
+    return str(path)
+
+
+def test_concatenate_svgs_horizontally_viewbox_order(tmp_path: Path) -> None:
+    a = tmp_path / "a.svg"
+    b = tmp_path / "b.svg"
+    out = tmp_path / "out.svg"
+    a.write_text(
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 20"><rect id="a" width="10" height="20"/></svg>',
+        encoding="utf-8",
+    )
+    b.write_text(
+        '<svg xmlns="http://www.w3.org/2000/svg" width="30pt" height="15pt"><circle id="b" cx="5" cy="5" r="5"/></svg>',
+        encoding="utf-8",
+    )
+
+    got = concatenate_svgs_horizontally([a, b], out, spacing=5.0)
+
+    assert got == str(out)
+    root = ET.parse(out).getroot()
+    assert root.attrib["viewBox"] == "0 0 45 20"
+    cols = [child for child in list(root) if child.tag.endswith("svg")]
+    assert [col.attrib["x"] for col in cols] == ["0", "15"]
+    assert [col.attrib["viewBox"] for col in cols] == ["0 0 10 20", "0 0 30 15"]
+
+
+def test_concatenate_svgs_horizontally_to_png_uses_dpi(tmp_path: Path) -> None:
+    from PIL import Image
+
+    a = tmp_path / "a.svg"
+    b = tmp_path / "b.svg"
+    out = tmp_path / "out.png"
+    a.write_text(
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 72 36"><rect width="72" height="36"/></svg>',
+        encoding="utf-8",
+    )
+    b.write_text(
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 72 72"><circle cx="36" cy="36" r="20"/></svg>',
+        encoding="utf-8",
+    )
+
+    got = concatenate_svgs_horizontally_to_png([a, b], out, spacing=0.0, dpi=300)
+
+    assert got == str(out)
+    with Image.open(out) as im:
+        assert im.format == "PNG"
+        assert im.size == (600, 300)
 
 
 def test_parse_methods_aliases_and_dedup() -> None:
@@ -243,6 +300,10 @@ def test_visualization_only_cached_shapes(tmp_path: Path) -> None:
     assert (out_dir / "h_decoding_categorical_twofig_sweep.svg").is_file()
     assert (out_dir / "h_decoding_categorical_twofig_corr_nmse.svg").is_file()
     assert (out_dir / "h_decoding_categorical_twofig_training_losses_panel.svg").is_file()
+    all_columns = out_dir / "h_decoding_categorical_twofig_all_columns.png"
+    assert all_columns.is_file()
+    summary = (out_dir / "h_decoding_categorical_twofig_summary.txt").read_text(encoding="utf-8")
+    assert f"h_decoding_categorical_twofig_all_columns.png: {all_columns.resolve()}" in summary
 
 
 def test_build_parser_eval_split() -> None:
@@ -385,9 +446,9 @@ def test_eval_split_validation_controls_classifier_and_decoding_rows(
         return np.array([[np.nan, 0.5], [0.5, np.nan]])
 
     monkeypatch.setattr(cat.conv, "_pairwise_clf_from_bundle", fake_pairwise)
-    monkeypatch.setattr(cat, "_render_method_sweep_panel", lambda **kwargs: str(tmp_path / "sweep.svg"))
-    monkeypatch.setattr(cat, "_render_corr_nmse_two_panel", lambda **kwargs: str(tmp_path / "corr.svg"))
-    monkeypatch.setattr(cat, "_render_row_n_training_losses_panel", lambda **kwargs: str(tmp_path / "loss.svg"))
+    monkeypatch.setattr(cat, "_render_method_sweep_panel", lambda **kwargs: _write_tiny_svg(tmp_path / "sweep.svg"))
+    monkeypatch.setattr(cat, "_render_corr_nmse_two_panel", lambda **kwargs: _write_tiny_svg(tmp_path / "corr.svg"))
+    monkeypatch.setattr(cat, "_render_row_n_training_losses_panel", lambda **kwargs: _write_tiny_svg(tmp_path / "loss.svg"))
 
     def fake_train_one_method(*args, **kwargs):
         seen["method"].append((len(kwargs["x_all"]), tuple(kwargs["bins_all"].tolist())))
@@ -472,9 +533,9 @@ def test_eval_split_all_controls_classifier_and_decoding_rows(
     monkeypatch.setattr(cat, "hellinger_gt_sq_category_matrix", lambda gen_ds: np.array([[0.0, 0.25], [0.25, 0.0]]))
     monkeypatch.setattr(cat, "build_dataset_from_meta", lambda meta: object())
     monkeypatch.setattr(cat, "compute_true_conditional_loglik_matrix", lambda x_all, theta_all, meta: np.zeros((len(x_all), len(x_all))))
-    monkeypatch.setattr(cat, "_render_method_sweep_panel", lambda **kwargs: str(tmp_path / "sweep.svg"))
-    monkeypatch.setattr(cat, "_render_corr_nmse_two_panel", lambda **kwargs: str(tmp_path / "corr.svg"))
-    monkeypatch.setattr(cat, "_render_row_n_training_losses_panel", lambda **kwargs: str(tmp_path / "loss.svg"))
+    monkeypatch.setattr(cat, "_render_method_sweep_panel", lambda **kwargs: _write_tiny_svg(tmp_path / "sweep.svg"))
+    monkeypatch.setattr(cat, "_render_corr_nmse_two_panel", lambda **kwargs: _write_tiny_svg(tmp_path / "corr.svg"))
+    monkeypatch.setattr(cat, "_render_row_n_training_losses_panel", lambda **kwargs: _write_tiny_svg(tmp_path / "loss.svg"))
     def fake_pairwise(**kwargs):
         x_eval = kwargs.get("decode_x_all")
         bins_eval = kwargs.get("decode_bin_all")
@@ -590,9 +651,9 @@ def test_pr_project_classifier_rows_use_work_features(
     monkeypatch.setattr(cat, "compute_true_conditional_loglik_matrix", lambda x_all, theta_all, meta: np.zeros((len(x_all), len(x_all))))
     monkeypatch.setattr(cat.conv, "_pairwise_clf_from_bundle", fake_pairwise)
     monkeypatch.setattr(cat, "_train_one_method", fake_train_one_method)
-    monkeypatch.setattr(cat, "_render_method_sweep_panel", lambda **kwargs: str(tmp_path / "sweep.svg"))
-    monkeypatch.setattr(cat, "_render_corr_nmse_two_panel", lambda **kwargs: str(tmp_path / "corr.svg"))
-    monkeypatch.setattr(cat, "_render_row_n_training_losses_panel", lambda **kwargs: str(tmp_path / "loss.svg"))
+    monkeypatch.setattr(cat, "_render_method_sweep_panel", lambda **kwargs: _write_tiny_svg(tmp_path / "sweep.svg"))
+    monkeypatch.setattr(cat, "_render_corr_nmse_two_panel", lambda **kwargs: _write_tiny_svg(tmp_path / "corr.svg"))
+    monkeypatch.setattr(cat, "_render_row_n_training_losses_panel", lambda **kwargs: _write_tiny_svg(tmp_path / "loss.svg"))
 
     cat.main(
         [
@@ -659,9 +720,9 @@ def test_binary_classifier_method_still_writes_method_row_on_disk(
     monkeypatch.setattr(cat, "hellinger_gt_sq_category_matrix", lambda gen_ds: np.array([[0.0, 0.25], [0.25, 0.0]]))
     monkeypatch.setattr(cat, "build_dataset_from_meta", lambda meta: object())
     monkeypatch.setattr(cat, "compute_true_conditional_loglik_matrix", lambda x_all, theta_all, meta: np.zeros((len(x_all), len(x_all))))
-    monkeypatch.setattr(cat, "_render_method_sweep_panel", lambda **kwargs: str(tmp_path / "sweep.svg"))
-    monkeypatch.setattr(cat, "_render_corr_nmse_two_panel", lambda **kwargs: str(tmp_path / "corr.svg"))
-    monkeypatch.setattr(cat, "_render_row_n_training_losses_panel", lambda **kwargs: str(tmp_path / "loss.svg"))
+    monkeypatch.setattr(cat, "_render_method_sweep_panel", lambda **kwargs: _write_tiny_svg(tmp_path / "sweep.svg"))
+    monkeypatch.setattr(cat, "_render_corr_nmse_two_panel", lambda **kwargs: _write_tiny_svg(tmp_path / "corr.svg"))
+    monkeypatch.setattr(cat, "_render_row_n_training_losses_panel", lambda **kwargs: _write_tiny_svg(tmp_path / "loss.svg"))
 
     cat.main(
         [
@@ -692,6 +753,9 @@ def test_binary_classifier_method_still_writes_method_row_on_disk(
         assert h.shape == (2, 2)
         assert np.allclose(np.diag(h), 0.0)
         assert np.isfinite(h[np.triu_indices(2, 1)]).all()
+        assert "h_sq_lr_affinity_sweep" not in z.files
+        assert "corr_h_lr_affinity_vs_gt" not in z.files
+        assert "nmse_h_lr_affinity_vs_gt" not in z.files
         assert "decode_hellinger_ref_sqrt" not in z.files
         assert "decode_hellinger_sweep_sqrt" not in z.files
         assert "corr_decode_hellinger_vs_gt" not in z.files
