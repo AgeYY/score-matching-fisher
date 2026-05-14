@@ -856,6 +856,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--flow-lr", type=float, default=1e-3)
     p.add_argument("--flow-hidden-dim", type=int, default=128)
     p.add_argument("--flow-depth", type=int, default=3)
+    p.add_argument(
+        "--flow-cond-embed-dim",
+        type=int,
+        default=16,
+        help="x_flow + --flow-arch film: per-channel width for theta and time FiLM cond MLPs. Default: 16.",
+    )
+    p.add_argument(
+        "--flow-cond-embed-depth",
+        type=int,
+        default=1,
+        help="x_flow + --flow-arch film: linear layers in each theta/time cond MLP. Default: 1.",
+    )
+    p.add_argument(
+        "--flow-cond-embed-act",
+        type=str,
+        default="silu",
+        choices=["silu", "relu", "tanh"],
+        help="x_flow + --flow-arch film: activation between cond MLP layers (not after last). Default: silu.",
+    )
     p.add_argument("--flow-scheduler", type=str, default="cosine")
     p.add_argument("--flow-fm-t-eps", type=float, default=0.05)
     p.add_argument("--flow-early-patience", type=int, default=1000)

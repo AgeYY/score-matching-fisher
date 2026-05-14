@@ -1831,6 +1831,7 @@ def build_conditional_x_velocity_model(
             cond_embed_dim=int(getattr(args, "flow_cond_embed_dim", 16)),
             cond_embed_depth=int(getattr(args, "flow_cond_embed_depth", 1)),
             cond_embed_act=str(getattr(args, "flow_cond_embed_act", "silu")),
+            theta_dim=td,
         ).to(device)
     if arch == "film_fourier":
         om_eff, _ = effective_flow_x_theta_fourier_omega(args)

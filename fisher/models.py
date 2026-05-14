@@ -17,16 +17,25 @@ def _activation_from_str(name: str) -> type[nn.Module]:
 
 def _scalar_embedding_mlp(out_dim: int, depth: int, act: str = "silu") -> nn.Sequential:
     """Map scalar (B, 1) to (B, out_dim) with ``depth`` linear layers and SiLU between (except last)."""
+    return _vector_embedding_mlp(1, out_dim, depth, act)
+
+
+def _vector_embedding_mlp(
+    in_dim: int, out_dim: int, depth: int, act: str = "silu"
+) -> nn.Sequential:
+    """Map (B, in_dim) to (B, out_dim) with ``depth`` linear layers and activation between (except last)."""
+    if in_dim < 1:
+        raise ValueError("in_dim must be >= 1.")
     if out_dim < 1:
         raise ValueError("out_dim must be >= 1.")
     if depth < 1:
         raise ValueError("depth must be >= 1.")
     act_cls = _activation_from_str(act)
     layers: list[nn.Module] = []
-    in_dim = 1
+    d_in = int(in_dim)
     for i in range(depth):
-        layers.append(nn.Linear(in_dim, out_dim))
-        in_dim = out_dim
+        layers.append(nn.Linear(d_in, out_dim))
+        d_in = out_dim
         if i < depth - 1:
             layers.append(act_cls())
     return nn.Sequential(*layers)
@@ -1304,11 +1313,16 @@ class ConditionalXFlowVelocityFiLMPerLayer(nn.Module):
         cond_embed_dim: int = 16,
         cond_embed_depth: int = 1,
         cond_embed_act: str = "silu",
+        theta_dim: int = 1,
     ) -> None:
         super().__init__()
         if x_dim < 1:
             raise ValueError("x_dim must be >= 1.")
+        td = int(theta_dim)
+        if td < 1:
+            raise ValueError("theta_dim must be >= 1.")
         self.x_dim = int(x_dim)
+        self.theta_dim = td
         self.hidden_dim = int(hidden_dim)
         self.depth = int(depth)
         self.use_logit_time = bool(use_logit_time)
@@ -1316,7 +1330,9 @@ class ConditionalXFlowVelocityFiLMPerLayer(nn.Module):
         self.cond_embed_dim = int(cond_embed_dim)
         self.cond_embed_depth = int(cond_embed_depth)
         self.cond_embed_act = str(cond_embed_act)
-        self.theta_embed = _scalar_embedding_mlp(self.cond_embed_dim, self.cond_embed_depth, self.cond_embed_act)
+        self.theta_embed = _vector_embedding_mlp(
+            self.theta_dim, self.cond_embed_dim, self.cond_embed_depth, self.cond_embed_act
+        )
         self.time_embed = _scalar_embedding_mlp(self.cond_embed_dim, self.cond_embed_depth, self.cond_embed_act)
         cond_dim = 2 * self.cond_embed_dim
         self.in_proj = nn.Linear(int(x_dim), int(hidden_dim))
