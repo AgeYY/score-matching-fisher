@@ -400,6 +400,11 @@ def _save_hellinger_est_vs_gt_figure(
     plt.close(fig)
 
 
+# Ground-truth ΔL band for auxiliary off-diagonal LLR metrics (scatter legends / NPZ).
+LLR_GT_METRIC_BAND_LO = -8.0
+LLR_GT_METRIC_BAND_HI = 8.0
+
+
 def _llr_comparison_metrics(est_delta: np.ndarray, true_delta: np.ndarray) -> dict[str, float]:
     """RMSE/MAE/bias/std and Pearson for all entries and off-diagonal only."""
     est = np.asarray(est_delta, dtype=np.float64)
@@ -423,12 +428,24 @@ def _llr_comparison_metrics(est_delta: np.ndarray, true_delta: np.ndarray) -> di
         out["llr_bias_offdiag"] = float(np.mean(d_off))
         out["llr_std_err_offdiag"] = float(np.std(d_off, ddof=0))
         out["llr_pearson_r_offdiag"] = _pearson_r(e_off, t_off)
+        band_m = (t_off >= LLR_GT_METRIC_BAND_LO) & (t_off <= LLR_GT_METRIC_BAND_HI)
+        e_b = e_off[band_m]
+        t_b = t_off[band_m]
+        if int(e_b.size) == 0:
+            out["llr_rmse_offdiag_true_in_m8_p8"] = float("nan")
+            out["llr_pearson_r_offdiag_true_in_m8_p8"] = float("nan")
+        else:
+            d_b = e_b - t_b
+            out["llr_rmse_offdiag_true_in_m8_p8"] = float(np.sqrt(np.mean(d_b**2)))
+            out["llr_pearson_r_offdiag_true_in_m8_p8"] = _pearson_r(e_b, t_b)
     else:
         out["llr_mae_offdiag"] = float("nan")
         out["llr_rmse_offdiag"] = float("nan")
         out["llr_bias_offdiag"] = float("nan")
         out["llr_std_err_offdiag"] = float("nan")
         out["llr_pearson_r_offdiag"] = float("nan")
+        out["llr_rmse_offdiag_true_in_m8_p8"] = float("nan")
+        out["llr_pearson_r_offdiag_true_in_m8_p8"] = float("nan")
     return out
 
 
@@ -484,7 +501,10 @@ def _save_llr_est_vs_true_figure(
             label = (
                 f"{method_name} "
                 f"(RMSE={m.get('llr_rmse_offdiag', float('nan')):.3g}, "
-                f"r={m.get('llr_pearson_r_offdiag', float('nan')):.3g})"
+                f"r={m.get('llr_pearson_r_offdiag', float('nan')):.3g}; "
+                f"GT∈[{LLR_GT_METRIC_BAND_LO:g},{LLR_GT_METRIC_BAND_HI:g}]: "
+                f"RMSE={m.get('llr_rmse_offdiag_true_in_m8_p8', float('nan')):.3g}, "
+                f"r={m.get('llr_pearson_r_offdiag_true_in_m8_p8', float('nan')):.3g})"
             )
             ax.scatter(x, y, s=8, alpha=0.28, linewidths=0, label=label)
         y_all = np.concatenate(ys) if ys else x
@@ -1149,6 +1169,12 @@ def main() -> None:
         llr_bias_offdiag_by_method=np.asarray([metrics_by_method[m]["llr_bias_offdiag"] for m in method_names], dtype=np.float64),
         llr_std_err_offdiag_by_method=np.asarray([metrics_by_method[m]["llr_std_err_offdiag"] for m in method_names], dtype=np.float64),
         llr_pearson_r_offdiag_by_method=np.asarray([metrics_by_method[m]["llr_pearson_r_offdiag"] for m in method_names], dtype=np.float64),
+        llr_rmse_offdiag_true_in_m8_p8_by_method=np.asarray(
+            [metrics_by_method[m]["llr_rmse_offdiag_true_in_m8_p8"] for m in method_names], dtype=np.float64
+        ),
+        llr_pearson_r_offdiag_true_in_m8_p8_by_method=np.asarray(
+            [metrics_by_method[m]["llr_pearson_r_offdiag_true_in_m8_p8"] for m in method_names], dtype=np.float64
+        ),
         hellinger_gt_sq_category=np.asarray(hellinger_gt_sq_category, dtype=np.float64),
         hellinger_est_sq_category_by_method=np.stack(
             [np.asarray(hellinger_cat_by_method[str(m)], dtype=np.float64) for m in method_names], axis=0
@@ -1208,6 +1234,8 @@ def main() -> None:
             llr_bias_offdiag=np.float64(m["llr_bias_offdiag"]),
             llr_std_err_offdiag=np.float64(m["llr_std_err_offdiag"]),
             llr_pearson_r_offdiag=np.float64(m["llr_pearson_r_offdiag"]),
+            llr_rmse_offdiag_true_in_m8_p8=np.float64(m["llr_rmse_offdiag_true_in_m8_p8"]),
+            llr_pearson_r_offdiag_true_in_m8_p8=np.float64(m["llr_pearson_r_offdiag_true_in_m8_p8"]),
         )
     if "binary_classifier" in results:
         clf_res = results["binary_classifier"]
