@@ -13,14 +13,11 @@ nested training slice.
 from __future__ import annotations
 
 import argparse
-import functools
-import importlib.util
 import os
 import subprocess
 import sys
 import time
 from pathlib import Path
-from types import ModuleType
 from typing import Any
 
 _repo_root = Path(__file__).resolve().parent.parent
@@ -38,13 +35,19 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from sklearn.linear_model import LogisticRegression
 
 from global_setting import DATA_DIR
 
 from fisher import h_binned_visualization as vhb
 from fisher import h_decoding_convergence as conv
+from fisher.gaussian_x_flow import path_schedule_from_name
 from fisher.hellinger_gt import hellinger_sq_gaussian_diag
-from fisher.h_decoding_convergence_methods import SweepSubset, prepare_categorical_binning_for_convergence
+from fisher.h_decoding_convergence_methods import (
+    SweepSubset,
+    _fit_sir_projection,
+    prepare_categorical_binning_for_convergence,
+)
 from fisher.shared_dataset_io import SharedDatasetBundle
 from fisher.h_decoding_twofig import (
     _matrix_nmse_offdiag,
@@ -56,7 +59,20 @@ from fisher.h_decoding_twofig import (
 )
 from fisher.h_matrix import HMatrixEstimator
 from fisher.shared_dataset_io import SharedDatasetBundle, load_shared_dataset_npz
-from fisher.shared_fisher_est import build_dataset_from_meta, require_device
+from fisher.ctsm_models import ToyPairConditionedTimeScoreNet, ToyPairConditionedTimeScoreNetFiLM
+from fisher.linear_x_flow import (
+    ConditionalTimeLinearXFlowMLP,
+    ConditionalTimeLowRankCorrectionLinearXFlowMLP,
+    compute_ode_time_linear_x_flow_c_matrix,
+    compute_time_linear_x_flow_c_matrix,
+    train_time_linear_x_flow_schedule,
+)
+from fisher.shared_fisher_est import (
+    build_conditional_x_velocity_model,
+    build_dataset_from_meta,
+    require_device,
+    train_pair_conditioned_ctsm_v_model,
+)
 from fisher.svg_utils import concatenate_svgs_horizontally_to_png
 from fisher.models import (
     ConditionalThetaFlowVelocity,
@@ -65,6 +81,7 @@ from fisher.models import (
     PriorThetaFlowVelocityFiLMPerLayer,
 )
 from fisher.trainers import (
+    train_conditional_x_flow_model,
     train_conditional_theta_flow_likelihood_finetune,
     train_conditional_theta_flow_model,
     train_prior_theta_flow_likelihood_finetune,
@@ -92,22 +109,18 @@ _METHOD_ALIASES: dict[str, str] = {
     "bin-gaussian": "bin_gaussian",
     "binned_gaussian": "bin_gaussian",
     "binned-gaussian": "bin_gaussian",
+    "ctsm-v": "ctsm_v",
+    "ctsm_v": "ctsm_v",
+    "ctsm": "ctsm_v",
 }
 _DEFAULT_METHODS = ("x_flow", "binary_classifier", "linear_x_flow_t", "xflow_sir_lrank")
-_SUPPORTED_METHODS_HELP = ", ".join(_DEFAULT_METHODS + ("theta_flow_cate", "bin_gaussian"))
+_SUPPORTED_METHODS_HELP = ", ".join(_DEFAULT_METHODS + ("theta_flow_cate", "bin_gaussian", "ctsm_v"))
 _ALL_COLUMNS_PNG_NAME = "h_decoding_categorical_twofig_all_columns.png"
 
 
-@functools.lru_cache(maxsize=1)
-def _debug_categorical_module() -> ModuleType:
-    """Load ``bin/debug_categorical_xflow_llr.py`` for shared training / figure helpers."""
-    path = _repo_root / "bin" / "debug_categorical_xflow_llr.py"
-    spec = importlib.util.spec_from_file_location("_dbg_cat_xflow_llr", str(path))
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Cannot load helper module from {path}")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+def _debug_categorical_module() -> Any:
+    """Compatibility shim for tests/older call sites that patched the removed bin helper module."""
+    return sys.modules[__name__]
 
 
 def parse_methods(methods: str) -> list[str]:
@@ -296,6 +309,19 @@ def hellinger_gt_sq_category_matrix(gen_ds: object) -> np.ndarray:
     return h2
 
 
+def _pearson_r(a: np.ndarray, b: np.ndarray) -> float:
+    a = np.asarray(a, dtype=np.float64).ravel()
+    b = np.asarray(b, dtype=np.float64).ravel()
+    finite = np.isfinite(a) & np.isfinite(b)
+    a = a[finite]
+    b = b[finite]
+    if a.size < 2:
+        return float("nan")
+    if float(np.std(a)) < 1e-15 or float(np.std(b)) < 1e-15:
+        return float("nan")
+    return float(np.corrcoef(a, b)[0, 1])
+
+
 def h_sq_directed_from_delta_l(delta_l: np.ndarray) -> np.ndarray:
     return HMatrixEstimator.compute_h_directed(np.asarray(delta_l, dtype=np.float64))
 
@@ -312,11 +338,212 @@ def h_sq_category_from_sample_directed(
     k_cat: int,
 ) -> np.ndarray:
     """Aggregate directed $H^2$ to categories, symmetrize, zero diagonal (debug script recipe)."""
-    dbg = _debug_categorical_module()
-    return np.asarray(
-        dbg._h_sq_category_from_sample_directed(h_directed, category_labels, k_cat=int(k_cat)),
-        dtype=np.float64,
-    )
+    h = np.asarray(h_directed, dtype=np.float64)
+    n = int(h.shape[0])
+    labs = np.asarray(category_labels, dtype=np.int64).reshape(-1)
+    if int(labs.shape[0]) != n:
+        raise ValueError("category_labels length must match h_directed.shape[0].")
+    col_sum = np.zeros((n, int(k_cat)), dtype=np.float64)
+    col_cnt = np.zeros((n, int(k_cat)), dtype=np.float64)
+    for j in range(n):
+        b = int(labs[j])
+        if 0 <= b < int(k_cat):
+            col_sum[:, b] += h[:, j]
+            col_cnt[:, b] += 1.0
+    tilde = col_sum / np.maximum(col_cnt, 1.0)
+    row_sum = np.zeros((int(k_cat), int(k_cat)), dtype=np.float64)
+    row_cnt = np.zeros((int(k_cat), int(k_cat)), dtype=np.float64)
+    for i in range(n):
+        a = int(labs[i])
+        if 0 <= a < int(k_cat):
+            row_sum[a, :] += tilde[i, :]
+            row_cnt[a, :] += 1.0
+    h_dir_cat = row_sum / np.maximum(row_cnt, 1.0)
+    h_sym = 0.5 * (h_dir_cat + h_dir_cat.T)
+    np.fill_diagonal(h_sym, 0.0)
+    return h_sym
+
+
+_h_sq_category_from_sample_directed = h_sq_category_from_sample_directed
+
+
+def _hellinger_cat_offdiag_mask(k: int) -> np.ndarray:
+    return np.triu(np.ones((int(k), int(k)), dtype=bool), k=1)
+
+
+def _hellinger_comparison_metrics_cat(est: np.ndarray, gt: np.ndarray) -> dict[str, float]:
+    e = np.asarray(est, dtype=np.float64)
+    g = np.asarray(gt, dtype=np.float64)
+    k = int(e.shape[0]) if e.ndim == 2 else 0
+    if g.shape != e.shape or e.ndim != 2 or k < 2:
+        return {
+            "hellinger_mae_offdiag_cat": float("nan"),
+            "hellinger_rmse_offdiag_cat": float("nan"),
+            "hellinger_bias_offdiag_cat": float("nan"),
+            "hellinger_pearson_r_offdiag_cat": float("nan"),
+        }
+    m = _hellinger_cat_offdiag_mask(k)
+    d = (e - g)[m]
+    return {
+        "hellinger_mae_offdiag_cat": float(np.nanmean(np.abs(d))),
+        "hellinger_rmse_offdiag_cat": float(np.sqrt(np.nanmean(d**2))),
+        "hellinger_bias_offdiag_cat": float(np.nanmean(d)),
+        "hellinger_pearson_r_offdiag_cat": _pearson_r(e[m], g[m]),
+    }
+
+
+LLR_GT_METRIC_BAND_LO = -8.0
+LLR_GT_METRIC_BAND_HI = 8.0
+
+
+def _llr_comparison_metrics(est_delta: np.ndarray, true_delta: np.ndarray) -> dict[str, float]:
+    est = np.asarray(est_delta, dtype=np.float64)
+    true_m = np.asarray(true_delta, dtype=np.float64)
+    diff = est - true_m
+    finite = np.isfinite(diff)
+    if np.any(finite):
+        all_abs = float(np.nanmean(np.abs(diff)))
+        all_rmse = float(np.sqrt(np.nanmean(diff**2)))
+        all_bias = float(np.nanmean(diff))
+        all_std = float(np.nanstd(diff, ddof=0))
+    else:
+        all_abs = all_rmse = all_bias = all_std = float("nan")
+    out: dict[str, float] = {
+        "llr_mae_all": all_abs,
+        "llr_rmse_all": all_rmse,
+        "llr_bias_all": all_bias,
+        "llr_std_err_all": all_std,
+        "llr_pearson_r_all": _pearson_r(est, true_m),
+    }
+    n = int(est.shape[0]) if est.ndim == 2 else 0
+    if n > 1 and true_m.shape == est.shape:
+        mask = ~np.eye(n, dtype=bool)
+        d_off = diff[mask]
+        e_off = est[mask]
+        t_off = true_m[mask]
+        finite_off = np.isfinite(d_off)
+        if np.any(finite_off):
+            out["llr_mae_offdiag"] = float(np.nanmean(np.abs(d_off)))
+            out["llr_rmse_offdiag"] = float(np.sqrt(np.nanmean(d_off**2)))
+            out["llr_bias_offdiag"] = float(np.nanmean(d_off))
+            out["llr_std_err_offdiag"] = float(np.nanstd(d_off, ddof=0))
+        else:
+            out["llr_mae_offdiag"] = float("nan")
+            out["llr_rmse_offdiag"] = float("nan")
+            out["llr_bias_offdiag"] = float("nan")
+            out["llr_std_err_offdiag"] = float("nan")
+        out["llr_pearson_r_offdiag"] = _pearson_r(e_off, t_off)
+        band_m = (t_off >= LLR_GT_METRIC_BAND_LO) & (t_off <= LLR_GT_METRIC_BAND_HI)
+        e_b = e_off[band_m]
+        t_b = t_off[band_m]
+        if int(e_b.size) == 0 or not np.any(np.isfinite(e_b - t_b)):
+            out["llr_rmse_offdiag_true_in_m8_p8"] = float("nan")
+            out["llr_pearson_r_offdiag_true_in_m8_p8"] = float("nan")
+        else:
+            d_b = e_b - t_b
+            out["llr_rmse_offdiag_true_in_m8_p8"] = float(np.sqrt(np.nanmean(d_b**2)))
+            out["llr_pearson_r_offdiag_true_in_m8_p8"] = _pearson_r(e_b, t_b)
+    else:
+        out["llr_mae_offdiag"] = float("nan")
+        out["llr_rmse_offdiag"] = float("nan")
+        out["llr_bias_offdiag"] = float("nan")
+        out["llr_std_err_offdiag"] = float("nan")
+        out["llr_pearson_r_offdiag"] = float("nan")
+        out["llr_rmse_offdiag_true_in_m8_p8"] = float("nan")
+        out["llr_pearson_r_offdiag_true_in_m8_p8"] = float("nan")
+    return out
+
+
+def _save_llr_est_vs_true_figure(
+    method_deltas: dict[str, np.ndarray],
+    true_delta: np.ndarray,
+    *,
+    out_base: Path,
+    metrics_by_method: dict[str, dict[str, float]],
+) -> None:
+    n = int(true_delta.shape[0])
+    mask = ~np.eye(n, dtype=bool) if n > 1 else np.zeros_like(true_delta, dtype=bool)
+    x = np.asarray(true_delta, dtype=np.float64)[mask].ravel()
+    fig, ax = plt.subplots(figsize=(6.2, 5.8), layout="constrained")
+    if x.size == 0:
+        ax.text(0.5, 0.5, "No off-diagonal LLR pairs", ha="center", va="center", transform=ax.transAxes)
+    else:
+        ys: list[np.ndarray] = []
+        for method_name, est_delta in method_deltas.items():
+            y = np.asarray(est_delta, dtype=np.float64)[mask].ravel()
+            ys.append(y)
+            m = metrics_by_method.get(method_name, {})
+            label = (
+                f"{method_name} "
+                f"(RMSE={m.get('llr_rmse_offdiag', float('nan')):.3g}, "
+                f"r={m.get('llr_pearson_r_offdiag', float('nan')):.3g})"
+            )
+            ax.scatter(x, y, s=8, alpha=0.28, linewidths=0, label=label)
+        vals = np.concatenate([x] + ys) if ys else x
+        vals = vals[np.isfinite(vals)]
+        lo = float(np.min(vals)) if vals.size else -1.0
+        hi = float(np.max(vals)) if vals.size else 1.0
+        pad = 0.05 * (hi - lo) if hi > lo else 1.0
+        ax.plot([lo - pad, hi + pad], [lo - pad, hi + pad], "k--", lw=1.0, alpha=0.7)
+        ax.set_aspect("equal", adjustable="box")
+        ax.legend(loc="best", fontsize=8, framealpha=0.9)
+    ax.set_xlabel(r"true $\Delta L$")
+    ax.set_ylabel(r"estimated $\Delta L$")
+    ax.set_title(r"LLR: estimated vs ground truth")
+    ax.grid(True, alpha=0.25)
+    out_base = Path(out_base)
+    out_base.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_base.with_suffix(".svg"), bbox_inches="tight")
+    fig.savefig(out_base.with_suffix(".png"), dpi=160, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _save_hellinger_est_vs_gt_figure(
+    est_cat_by_method: dict[str, np.ndarray],
+    hellinger_gt_sq_category: np.ndarray,
+    *,
+    out_base: Path,
+    metrics_by_method: dict[str, dict[str, float]],
+) -> None:
+    gt = np.asarray(hellinger_gt_sq_category, dtype=np.float64)
+    k = int(gt.shape[0])
+    mask = _hellinger_cat_offdiag_mask(k) if k > 1 else np.zeros_like(gt, dtype=bool)
+    x = gt[mask].ravel()
+    fig, ax = plt.subplots(figsize=(6.2, 5.8), layout="constrained")
+    if x.size == 0:
+        ax.text(0.5, 0.5, "No category off-diagonal pairs", ha="center", va="center", transform=ax.transAxes)
+    else:
+        cmap = plt.get_cmap("tab10")
+        ys: list[np.ndarray] = []
+        for idx, (method_name, est) in enumerate(est_cat_by_method.items()):
+            y = np.asarray(est, dtype=np.float64)[mask].ravel()
+            ys.append(y)
+            m = metrics_by_method.get(method_name, {})
+            label = (
+                f"{method_name} "
+                f"(RMSE={m.get('hellinger_rmse_offdiag_cat', float('nan')):.3g}, "
+                f"r={m.get('hellinger_pearson_r_offdiag_cat', float('nan')):.3g})"
+            )
+            ax.scatter(x, y, s=22, alpha=0.55, linewidths=0, color=cmap(idx % 10), label=label)
+        vals = np.concatenate([x] + ys) if ys else x
+        vals = vals[np.isfinite(vals)]
+        lo = float(np.min(vals)) if vals.size else 0.0
+        hi = float(np.max(vals)) if vals.size else 1.0
+        pad = 0.05 * (hi - lo) if hi > lo else 0.05
+        ax.plot([lo - pad, hi + pad], [lo - pad, hi + pad], "k--", lw=1.0, alpha=0.7)
+        ax.set_xlim(max(0.0, lo - pad), min(1.0, hi + pad))
+        ax.set_ylim(max(0.0, lo - pad), min(1.0, hi + pad))
+        ax.set_aspect("equal", adjustable="box")
+        ax.legend(loc="best", fontsize=7, framealpha=0.9)
+    ax.set_xlabel(r"analytic GT $H^2$ (category)")
+    ax.set_ylabel(r"LLR-derived est. $H^2$ (category)")
+    ax.set_title(r"$H^2$: category-level LLR map vs analytic GT")
+    ax.grid(True, alpha=0.25)
+    out_base = Path(out_base)
+    out_base.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_base.with_suffix(".svg"), bbox_inches="tight")
+    fig.savefig(out_base.with_suffix(".png"), dpi=160, bbox_inches="tight")
+    plt.close(fig)
 
 
 def _build_theta_flow_post_model(args: argparse.Namespace, *, x_dim: int, dev: torch.device) -> torch.nn.Module:
@@ -903,6 +1130,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-prior-restore-best", dest="prior_restore_best", action="store_false")
     p.set_defaults(prior_restore_best=True)
     p.add_argument("--h-batch-size", type=int, default=65536)
+    p.add_argument("--ctsm-epochs", type=int, default=8000)
+    p.add_argument("--ctsm-batch-size", type=int, default=512)
+    p.add_argument("--ctsm-lr", type=float, default=2e-3)
+    p.add_argument("--ctsm-hidden-dim", type=int, default=256)
+    p.add_argument("--ctsm-two-sb-var", type=float, default=2.0)
+    p.add_argument("--ctsm-path-schedule", type=str, default="linear", choices=["linear", "cosine"])
+    p.add_argument("--ctsm-path-eps", type=float, default=1e-12)
+    p.add_argument("--ctsm-factor", type=float, default=1.0)
+    p.add_argument("--ctsm-t-eps", type=float, default=1e-5)
+    p.add_argument("--ctsm-int-n-time", type=int, default=300)
+    p.add_argument("--ctsm-m-scale", type=float, default=1.0)
+    p.add_argument("--ctsm-delta-scale", type=float, default=0.5)
+    p.add_argument("--ctsm-arch", type=str, default="film", choices=["mlp", "film"])
+    p.add_argument("--ctsm-film-depth", type=int, default=3)
+    p.add_argument("--ctsm-gated-film", action="store_true", default=False)
+    p.add_argument("--ctsm-raw-time", action="store_true", default=False)
+    p.add_argument("--ctsm-weight-decay", type=float, default=0.0)
     p.add_argument("--clf-min-class-count", type=int, default=5)
     p.add_argument("--clf-random-state", type=int, default=-1)
     p.add_argument("--clf-max-iter", type=int, default=1000)
@@ -993,6 +1237,326 @@ def _save_method_training_loss_npz(out_path: str | Path, *, method_name: str, re
     )
 
 
+def _train_x_flow_delta(
+    args: argparse.Namespace,
+    *,
+    dev: torch.device,
+    theta_train: np.ndarray,
+    x_train: np.ndarray,
+    theta_val: np.ndarray,
+    x_val: np.ndarray,
+    theta_all: np.ndarray,
+    x_all: np.ndarray,
+) -> dict[str, Any]:
+    model_args = argparse.Namespace(
+        x_dim=int(x_all.shape[1]),
+        flow_hidden_dim=int(args.flow_hidden_dim),
+        flow_depth=int(args.flow_depth),
+        flow_use_layer_norm=False,
+        flow_gated_film=False,
+        flow_zero_out_init=False,
+        flow_cond_embed_dim=int(getattr(args, "flow_cond_embed_dim", 16)),
+        flow_cond_embed_depth=int(getattr(args, "flow_cond_embed_depth", 1)),
+        flow_cond_embed_act=str(getattr(args, "flow_cond_embed_act", "silu")),
+        flow_x_theta_fourier_k=4,
+        flow_x_theta_fourier_omega=1.0,
+        flow_x_theta_fourier_omega_mode="fixed",
+        flow_x_theta_fourier_no_linear=False,
+        flow_x_theta_fourier_no_bias=False,
+        theta_low=0.0,
+        theta_high=1.0,
+    )
+    print(
+        f"[cat-twofig] training x_flow: train={x_train.shape[0]} val={x_val.shape[0]} "
+        f"x_dim={x_all.shape[1]} theta_dim={theta_all.shape[1]}",
+        flush=True,
+    )
+    model = build_conditional_x_velocity_model(
+        flow_arch=str(args.flow_arch),
+        args=model_args,
+        device=dev,
+        theta_dim=int(theta_all.shape[1]),
+    )
+    train_out = train_conditional_x_flow_model(
+        model=model,
+        theta_train=theta_train,
+        x_train=x_train,
+        theta_val=theta_val,
+        x_val=x_val,
+        epochs=int(args.flow_epochs),
+        batch_size=int(args.flow_batch_size),
+        lr=float(args.flow_lr),
+        device=dev,
+        log_every=max(1, int(args.log_every)),
+        early_stopping_patience=int(args.flow_early_patience),
+        early_stopping_min_delta=float(args.flow_early_min_delta),
+        early_stopping_ema_alpha=float(args.flow_early_ema_alpha),
+        restore_best=bool(args.flow_restore_best),
+        scheduler_name=str(args.flow_scheduler),
+        fm_t_eps=float(args.flow_fm_t_eps),
+    )
+    estimator = HMatrixEstimator(
+        model_post=model,
+        model_prior=None,
+        sigma_eval=1.0,
+        device=dev,
+        pair_batch_size=int(args.h_batch_size),
+        field_method="flow_x_likelihood",
+        flow_scheduler=str(args.flow_scheduler),
+        flow_ode_steps=int(args.flow_ode_steps),
+        flow_likelihood_exact_divergence=bool(args.flow_likelihood_exact_divergence),
+    )
+    c_matrix = estimator.compute_x_conditional_loglik_matrix(theta_all, x_all)
+    return {"c_matrix": c_matrix, "delta_l": HMatrixEstimator.compute_delta_l(c_matrix), "train_out": train_out}
+
+
+def _train_binary_classifier_delta(
+    args: argparse.Namespace,
+    *,
+    x_train: np.ndarray,
+    bins_train: np.ndarray,
+    x_all: np.ndarray,
+    bins_all: np.ndarray,
+    k_cat: int,
+) -> dict[str, Any]:
+    print("[cat-twofig] training binary_classifier pairwise logistic LLRs", flush=True)
+    bins_train = np.asarray(bins_train, dtype=np.int64).reshape(-1)
+    bins_all = np.asarray(bins_all, dtype=np.int64).reshape(-1)
+    n = int(x_all.shape[0])
+    delta = np.zeros((n, n), dtype=np.float64)
+    valid_pairs = np.zeros((k_cat, k_cat), dtype=bool)
+    stats = {"ok_pairs": 0, "insufficient_counts": 0, "fit_fail": 0}
+    rs = int(args.clf_random_state)
+    if rs < 0:
+        rs = int(args.run_seed)
+    for a in range(int(k_cat)):
+        for b in range(a + 1, int(k_cat)):
+            ia = np.flatnonzero(bins_train == a)
+            ib = np.flatnonzero(bins_train == b)
+            if ia.size < int(args.clf_min_class_count) or ib.size < int(args.clf_min_class_count):
+                stats["insufficient_counts"] += 1
+                continue
+            x_pair = np.vstack([x_train[ia], x_train[ib]])
+            y_pair = np.concatenate([np.zeros(ia.size, dtype=np.int64), np.ones(ib.size, dtype=np.int64)])
+            try:
+                clf = LogisticRegression(solver="lbfgs", random_state=rs, max_iter=int(args.clf_max_iter))
+                clf.fit(x_pair, y_pair)
+                prior_log_odds = float(np.log(float(ib.size) / float(ia.size)))
+                llr_b_minus_a = np.asarray(clf.decision_function(x_all), dtype=np.float64) - prior_log_odds
+            except Exception:
+                stats["fit_fail"] += 1
+                continue
+            row_a = np.flatnonzero(bins_all == a)
+            row_b = np.flatnonzero(bins_all == b)
+            if row_a.size and row_b.size:
+                delta[np.ix_(row_a, row_b)] = llr_b_minus_a[row_a].reshape(-1, 1)
+                delta[np.ix_(row_b, row_a)] = -llr_b_minus_a[row_b].reshape(-1, 1)
+            valid_pairs[a, b] = True
+            valid_pairs[b, a] = True
+            stats["ok_pairs"] += 1
+    return {"c_matrix": None, "delta_l": delta, "classifier_valid_pairs": valid_pairs, "classifier_stats": stats}
+
+
+def _train_linear_x_flow_delta(
+    args: argparse.Namespace,
+    *,
+    method_name: str,
+    dev: torch.device,
+    theta_train: np.ndarray,
+    x_train: np.ndarray,
+    theta_val: np.ndarray,
+    x_val: np.ndarray,
+    theta_all: np.ndarray,
+    x_all: np.ndarray,
+) -> dict[str, Any]:
+    print(f"[cat-twofig] training {method_name}", flush=True)
+    rank = int(args.lxf_low_rank_dim)
+    common = dict(
+        theta_dim=int(theta_all.shape[1]),
+        x_dim=int(x_all.shape[1]),
+        hidden_dim=int(args.lxfs_hidden_dim),
+        depth=int(args.lxfs_depth),
+    )
+    sir_meta: dict[str, Any] = {}
+    if method_name == "linear_x_flow_t":
+        model = ConditionalTimeLinearXFlowMLP(
+            **common,
+            quadrature_steps=int(args.lxfs_quadrature_steps),
+        ).to(dev)
+        ode_likelihood = False
+    elif method_name == "xflow_sir_lrank":
+        if rank > int(x_all.shape[1]):
+            raise ValueError(f"--lxf-low-rank-dim must be <= x_dim={x_all.shape[1]}; got {rank}.")
+        _, _, _, fitted = _fit_sir_projection(
+            x_train=x_train,
+            theta_train=theta_train,
+            x_val=x_val,
+            x_all=x_all,
+            sir_dim=rank,
+            num_bins=int(args.sir_num_bins),
+            ridge=float(args.sir_ridge),
+        )
+        sir_meta = dict(fitted)
+        model = ConditionalTimeLowRankCorrectionLinearXFlowMLP(
+            **common,
+            correction_rank=rank,
+            quadrature_steps=int(args.lxfs_quadrature_steps),
+            divergence_estimator=str(args.lxf_low_rank_divergence_estimator).strip().lower(),
+            hutchinson_probes=int(args.lxf_hutchinson_probes),
+            fixed_u=np.asarray(sir_meta["sir_components"], dtype=np.float64),
+        ).to(dev)
+        ode_likelihood = True
+    else:
+        raise ValueError(f"Unsupported linear x-flow method {method_name!r}.")
+
+    train_out = train_time_linear_x_flow_schedule(
+        model=model,
+        theta_train=theta_train,
+        x_train=x_train,
+        theta_val=theta_val,
+        x_val=x_val,
+        device=dev,
+        schedule=path_schedule_from_name(str(args.lxfs_path_schedule)),
+        epochs=int(args.lxfs_epochs),
+        batch_size=int(args.lxfs_batch_size),
+        lr=float(args.lxfs_lr),
+        weight_decay=float(args.lxfs_weight_decay),
+        t_eps=float(args.lxfs_t_eps),
+        patience=int(args.lxfs_early_patience),
+        min_delta=float(args.lxfs_early_min_delta),
+        ema_alpha=float(args.lxfs_early_ema_alpha),
+        weight_ema_decay=float(args.lxfs_weight_ema_decay),
+        max_grad_norm=float(args.lxfs_max_grad_norm),
+        log_every=max(1, int(args.log_every)),
+        restore_best=bool(args.lxf_restore_best),
+        log_name=method_name,
+    )
+    x_mean = np.asarray(train_out["x_mean"], dtype=np.float64)
+    x_std = np.asarray(train_out["x_std"], dtype=np.float64)
+    if ode_likelihood:
+        c_matrix = compute_ode_time_linear_x_flow_c_matrix(
+            model=model,
+            theta_all=theta_all,
+            x_all=x_all,
+            device=dev,
+            x_mean=x_mean,
+            x_std=x_std,
+            solve_jitter=float(args.lxfs_solve_jitter),
+            quadrature_steps=int(args.lxfs_quadrature_steps),
+            ode_steps=int(args.lxf_nlpca_ode_steps),
+            pair_batch_size=int(args.lxfs_pair_batch_size),
+        )
+    else:
+        c_matrix = compute_time_linear_x_flow_c_matrix(
+            model=model,
+            theta_all=theta_all,
+            x_all=x_all,
+            device=dev,
+            x_mean=x_mean,
+            x_std=x_std,
+            solve_jitter=float(args.lxfs_solve_jitter),
+            quadrature_steps=int(args.lxfs_quadrature_steps),
+            pair_batch_size=int(args.lxfs_pair_batch_size),
+        )
+    return {
+        "c_matrix": c_matrix,
+        "delta_l": HMatrixEstimator.compute_delta_l(c_matrix),
+        "train_out": train_out,
+        "sir_meta": sir_meta,
+    }
+
+
+def _build_ctsm_v_model(args: argparse.Namespace, *, x_dim: int, theta_dim: int, dev: torch.device) -> torch.nn.Module:
+    arch = str(getattr(args, "ctsm_arch", "film")).strip().lower()
+    if arch == "film":
+        return ToyPairConditionedTimeScoreNetFiLM(
+            dim=int(x_dim),
+            hidden_dim=int(getattr(args, "ctsm_hidden_dim", 256)),
+            depth=int(getattr(args, "ctsm_film_depth", 3)),
+            theta_dim=int(theta_dim),
+            m_scale=float(getattr(args, "ctsm_m_scale", 1.0)),
+            delta_scale=float(getattr(args, "ctsm_delta_scale", 0.5)),
+            use_logit_time=not bool(getattr(args, "ctsm_raw_time", False)),
+            gated_film=bool(getattr(args, "ctsm_gated_film", False)),
+        ).to(dev)
+    if arch == "mlp":
+        return ToyPairConditionedTimeScoreNet(
+            dim=int(x_dim),
+            hidden_dim=int(getattr(args, "ctsm_hidden_dim", 256)),
+            theta_dim=int(theta_dim),
+            m_scale=float(getattr(args, "ctsm_m_scale", 1.0)),
+            delta_scale=float(getattr(args, "ctsm_delta_scale", 0.5)),
+        ).to(dev)
+    raise ValueError("--ctsm-arch must be one of {'mlp','film'}.")
+
+
+def _train_ctsm_v_delta(
+    args: argparse.Namespace,
+    *,
+    dev: torch.device,
+    theta_train: np.ndarray,
+    x_train: np.ndarray,
+    theta_val: np.ndarray,
+    x_val: np.ndarray,
+    theta_all: np.ndarray,
+    x_all: np.ndarray,
+) -> dict[str, Any]:
+    theta_train = _as_2d(theta_train)
+    theta_val = _as_2d(theta_val)
+    theta_all = _as_2d(theta_all)
+    theta_dim = int(theta_all.shape[1])
+    if theta_train.shape[1] != theta_dim or theta_val.shape[1] != theta_dim:
+        raise ValueError("ctsm_v categorical theta dimensions must match across train/validation/eval.")
+    print(
+        f"[cat-twofig] training ctsm_v: train={x_train.shape[0]} val={x_val.shape[0]} "
+        f"eval={x_all.shape[0]} x_dim={x_all.shape[1]} theta_dim={theta_dim} "
+        f"arch={getattr(args, 'ctsm_arch', 'film')}",
+        flush=True,
+    )
+    model = _build_ctsm_v_model(args, x_dim=int(x_all.shape[1]), theta_dim=theta_dim, dev=dev)
+    train_out = train_pair_conditioned_ctsm_v_model(
+        model=model,
+        theta_train=theta_train,
+        x_train=x_train,
+        epochs=int(getattr(args, "ctsm_epochs", 8000)),
+        batch_size=int(getattr(args, "ctsm_batch_size", 512)),
+        lr=float(getattr(args, "ctsm_lr", 2e-3)),
+        weight_decay=float(getattr(args, "ctsm_weight_decay", 0.0)),
+        device=dev,
+        log_every=max(1, int(getattr(args, "log_every", 50))),
+        two_sb_var=float(getattr(args, "ctsm_two_sb_var", 2.0)),
+        path_schedule=str(getattr(args, "ctsm_path_schedule", "linear")),
+        path_eps=float(getattr(args, "ctsm_path_eps", 1e-12)),
+        factor=float(getattr(args, "ctsm_factor", 1.0)),
+        t_eps=float(getattr(args, "ctsm_t_eps", 1e-5)),
+        theta_val=theta_val,
+        x_val=x_val,
+        early_stopping_patience=int(getattr(args, "flow_early_patience", 1000)),
+        early_stopping_min_delta=float(getattr(args, "flow_early_min_delta", 1e-4)),
+        early_stopping_ema_alpha=float(getattr(args, "flow_early_ema_alpha", 0.05)),
+        restore_best=bool(getattr(args, "flow_restore_best", True)),
+    )
+    estimator = HMatrixEstimator(
+        model_post=model,
+        model_prior=None,
+        sigma_eval=float(getattr(args, "ctsm_t_eps", 1e-5)),
+        device=dev,
+        pair_batch_size=int(getattr(args, "h_batch_size", 65536)),
+        field_method="ctsm_v",
+        ctsm_int_n_time=int(getattr(args, "ctsm_int_n_time", 300)),
+        ctsm_t_eps=float(getattr(args, "ctsm_t_eps", 1e-5)),
+    )
+    h_res = estimator.run(theta_all, x_all, restore_original_order=True)
+    return {
+        "c_matrix": h_res.c_matrix,
+        "delta_l": h_res.delta_l_matrix,
+        "h_directed": h_res.h_directed,
+        "h_sym": h_res.h_sym,
+        "train_out": train_out,
+        "ctsm_theta_encoding": np.asarray(["one_hot"], dtype=object),
+    }
+
+
 def _train_one_method(
     args: argparse.Namespace,
     *,
@@ -1009,9 +1573,8 @@ def _train_one_method(
     bins_all: np.ndarray,
     k_cat: int,
 ) -> dict[str, Any]:
-    dbg = _debug_categorical_module()
     if method_name == "x_flow":
-        return dbg._train_x_flow_delta(
+        return _train_x_flow_delta(
             args,
             dev=dev,
             theta_train=theta_train,
@@ -1022,7 +1585,7 @@ def _train_one_method(
             x_all=x_all,
         )
     if method_name == "binary_classifier":
-        return dbg._train_binary_classifier_delta(
+        return _train_binary_classifier_delta(
             args,
             x_train=x_train,
             bins_train=bins_train,
@@ -1031,7 +1594,7 @@ def _train_one_method(
             k_cat=k_cat,
         )
     if method_name in ("linear_x_flow_t", "xflow_sir_lrank"):
-        return dbg._train_linear_x_flow_delta(
+        return _train_linear_x_flow_delta(
             args,
             method_name=method_name,
             dev=dev,
@@ -1053,6 +1616,17 @@ def _train_one_method(
             x_all=x_all,
             bins_all=bins_all,
             k_cat=k_cat,
+        )
+    if method_name == "ctsm_v":
+        return _train_ctsm_v_delta(
+            args,
+            dev=dev,
+            theta_train=theta_train,
+            x_train=x_train,
+            theta_val=theta_val,
+            x_val=x_val,
+            theta_all=theta_all,
+            x_all=x_all,
         )
     raise RuntimeError(f"Unhandled method {method_name!r}")
 

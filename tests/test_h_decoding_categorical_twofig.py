@@ -8,6 +8,7 @@ import xml.etree.ElementTree as ET
 
 import numpy as np
 import pytest
+import torch
 
 from fisher.data import ToyCategoricalRandomMoGDataset
 from fisher.h_decoding_categorical_twofig import (
@@ -89,6 +90,7 @@ def test_parse_methods_aliases_and_dedup() -> None:
     assert parse_methods("bin-gaussian, bin_gaussian, x_flow") == ["bin_gaussian", "x_flow"]
     assert parse_methods("bin_gaussian_cate") == ["bin_gaussian"]
     assert parse_methods("theta-flow-cate, theta_flow_cate, thetaflow-cate") == ["theta_flow_cate"]
+    assert parse_methods("ctsm-v, ctsm_v, ctsm") == ["ctsm_v"]
     with pytest.raises(ValueError, match="Unknown method"):
         parse_methods("theta_flow")
 
@@ -125,6 +127,44 @@ def test_category_aggregation_small_delta_l() -> None:
     assert h_cat.shape == (k, k)
     assert np.allclose(np.diag(h_cat), 0.0)
     assert np.all(h_cat >= 0.0)
+
+
+def test_ctsm_pair_models_accept_one_hot_theta() -> None:
+    from fisher.ctsm_models import ToyPairConditionedTimeScoreNet, ToyPairConditionedTimeScoreNetFiLM
+
+    x = np.zeros((4, 2), dtype=np.float32)
+    t = np.full((4, 1), 0.5, dtype=np.float32)
+    m = np.eye(3, dtype=np.float32)[[0, 1, 2, 0]]
+    d = np.eye(3, dtype=np.float32)[[1, 2, 0, 1]] - m
+    for cls in (ToyPairConditionedTimeScoreNet, ToyPairConditionedTimeScoreNetFiLM):
+        model = cls(dim=2, hidden_dim=8, theta_dim=3)
+        y = model.forward_full(
+            torch.from_numpy(x),
+            torch.from_numpy(t),
+            torch.from_numpy(m),
+            torch.from_numpy(d),
+        )
+        assert tuple(y.shape) == (4, 2)
+
+
+def test_h_matrix_ctsm_accepts_one_hot_theta() -> None:
+    from fisher.ctsm_models import ToyPairConditionedTimeScoreNet
+
+    theta = np.eye(3, dtype=np.float64)
+    x = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], dtype=np.float64)
+    model = ToyPairConditionedTimeScoreNet(dim=2, hidden_dim=8, theta_dim=3)
+    est = HMatrixEstimator(
+        model_post=model,
+        model_prior=None,
+        sigma_eval=1e-5,
+        field_method="ctsm_v",
+        device=torch.device("cpu"),
+        pair_batch_size=64,
+        ctsm_int_n_time=3,
+    )
+    got = est.compute_ctsm_delta_l_matrix(theta, x)
+    assert got.shape == (3, 3)
+    assert np.allclose(np.diag(got), 0.0)
 
 
 def test_theta_flow_categorical_helper_shape_symmetry_zero_diag(monkeypatch: pytest.MonkeyPatch) -> None:

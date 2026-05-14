@@ -12,6 +12,7 @@ class PairConditionedTimeScoreNetBase(nn.Module):
     """Shared interface for pair-conditioned CTSM-v score networks (H-matrix / objectives)."""
 
     dim: int
+    theta_dim: int
 
 
 class ToyFullTimeScoreNet(nn.Module):
@@ -59,32 +60,38 @@ class ToyPairConditionedTimeScoreNet(PairConditionedTimeScoreNetBase):
         dim: int = 2,
         hidden_dim: int = 128,
         *,
+        theta_dim: int = 1,
         m_scale: float = 1.0,
         delta_scale: float = 0.5,
     ):
         super().__init__()
-        self.dim = dim
+        self.dim = int(dim)
+        self.theta_dim = int(theta_dim)
+        if self.theta_dim < 1:
+            raise ValueError("theta_dim must be >= 1.")
         self.m_scale = float(m_scale)
         self.delta_scale = float(delta_scale)
-        # x (dim) + t + m + delta
+        # x (dim) + t + m (theta_dim) + delta (theta_dim)
         self.net = nn.Sequential(
-            nn.Linear(dim + 3, hidden_dim),
+            nn.Linear(self.dim + 1 + 2 * self.theta_dim, hidden_dim),
             nn.ELU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ELU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ELU(),
-            nn.Linear(hidden_dim, dim),
+            nn.Linear(hidden_dim, self.dim),
         )
 
     def forward_full(self, x, t, m, delta):
-        """x,t,m,delta: (B, dim) and (B,1) each for the scalar channels."""
+        """x,t,m,delta: x is (B, dim), t is (B,1), m/delta are (B, theta_dim)."""
         if m.dim() == 1:
             m = m.unsqueeze(-1)
         if delta.dim() == 1:
             delta = delta.unsqueeze(-1)
         if t.dim() == 1:
             t = t.unsqueeze(-1)
+        if m.shape[-1] != self.theta_dim or delta.shape[-1] != self.theta_dim:
+            raise ValueError(f"Expected m/delta last dim {self.theta_dim}, got {m.shape[-1]} and {delta.shape[-1]}.")
         m = m * self.m_scale
         delta = delta * self.delta_scale
         xt = torch.cat([x, t, m, delta], dim=-1)
@@ -109,6 +116,7 @@ class ToyPairConditionedTimeScoreNetFiLM(PairConditionedTimeScoreNetBase):
         hidden_dim: int = 128,
         depth: int = 3,
         *,
+        theta_dim: int = 1,
         m_scale: float = 1.0,
         delta_scale: float = 0.5,
         use_logit_time: bool = True,
@@ -116,13 +124,16 @@ class ToyPairConditionedTimeScoreNetFiLM(PairConditionedTimeScoreNetBase):
     ) -> None:
         super().__init__()
         self.dim = int(dim)
+        self.theta_dim = int(theta_dim)
+        if self.theta_dim < 1:
+            raise ValueError("theta_dim must be >= 1.")
         self.hidden_dim = int(hidden_dim)
         self.depth = int(depth)
         self.m_scale = float(m_scale)
         self.delta_scale = float(delta_scale)
         self.use_logit_time = bool(use_logit_time)
         self.gated_film = bool(gated_film)
-        cond_dim = 3  # t_feat, m, delta
+        cond_dim = 1 + 2 * self.theta_dim  # t_feat, m, delta
         self.in_proj = nn.Linear(self.dim, self.hidden_dim)
         self.blocks = nn.ModuleList()
         for _ in range(self.depth):
@@ -152,6 +163,8 @@ class ToyPairConditionedTimeScoreNetFiLM(PairConditionedTimeScoreNetBase):
             delta = delta.unsqueeze(-1)
         if t.dim() == 1:
             t = t.unsqueeze(-1)
+        if m.shape[-1] != self.theta_dim or delta.shape[-1] != self.theta_dim:
+            raise ValueError(f"Expected m/delta last dim {self.theta_dim}, got {m.shape[-1]} and {delta.shape[-1]}.")
         m = m * self.m_scale
         delta = delta * self.delta_scale
         t_feat = self._t_feat(t)

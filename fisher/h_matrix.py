@@ -471,8 +471,6 @@ class HMatrixEstimator:
     def compute_ctsm_delta_l_matrix(self, theta_sorted: np.ndarray, x_sorted: np.ndarray) -> np.ndarray:
         """Estimate direct DeltaL_ij = log p(x_i|theta_j) - log p(x_i|theta_i) via pair-conditioned CTSM-v."""
         theta_grid_col = self._theta_as_matrix(theta_sorted)
-        if theta_grid_col.shape[1] != 1:
-            raise ValueError("compute_ctsm_delta_l_matrix requires scalar theta (shape (N,1)).")
         n = int(theta_grid_col.shape[0])
         if n < 1:
             raise ValueError("Need at least one sample to compute H-matrix.")
@@ -484,14 +482,14 @@ class HMatrixEstimator:
             for i0 in range(0, n, row_block):
                 i1 = min(n, i0 + row_block)
                 xb = np.asarray(x_sorted[i0:i1], dtype=np.float32)
-                theta_i = np.asarray(theta_sorted[i0:i1], dtype=np.float32).reshape(-1, 1)
+                theta_i = np.asarray(theta_grid_col[i0:i1], dtype=np.float32)
                 b = int(i1 - i0)
                 x_rep = np.repeat(xb, repeats=n, axis=0)
                 a_rep = np.repeat(theta_i, repeats=n, axis=0)
                 b_rep = np.tile(theta_grid_col, (b, 1))
                 x_t = torch.from_numpy(x_rep).to(self.device)
-                a_t = torch.from_numpy(a_rep.reshape(-1)).to(self.device)
-                b_t = torch.from_numpy(b_rep.reshape(-1)).to(self.device)
+                a_t = torch.from_numpy(a_rep).to(self.device)
+                b_t = torch.from_numpy(b_rep).to(self.device)
                 delta_block = estimate_log_ratio_trapz_pair(
                     self.model_post,
                     x_t,
