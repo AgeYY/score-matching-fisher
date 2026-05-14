@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Nested-n sweep for categorical random MoG: LLR-based category Hellinger vs analytic GT.
 
-Mirrors :mod:`fisher.h_decoding_twofig` layout (sweep / GT / corr / NMSE / **training-loss panel** SVGs
-+ NPZ + summary) while using the categorical estimators and directed-then-symmetrized category aggregation from
-``bin/debug_categorical_xflow_llr.py``. Specialized to ``random_mog_categorical`` only.
+Mirrors :mod:`fisher.h_decoding_twofig` layout (merged **sweep+GT** matrix figure, **corr+NMSE** two-panel figure,
+**training-loss panel** SVG, NPZ, summary) while using the categorical estimators and directed-then-symmetrized
+category aggregation from ``bin/debug_categorical_xflow_llr.py``. Specialized to ``random_mog_categorical`` only.
 
-Use ``--hellinger-eval-split validation`` to evaluate learned H (and matching GT LLR scatter metrics) on the
-held-out validation rows of each nested ``n`` subset only; decoding rows still use the full nested subset.
-The convenience wrapper ``bin/study_h_decoding_categorical_twofig_val_hellinger.py`` defaults to that split.
+Use ``--eval-split validation`` to evaluate learned H, GT LLR diagnostics, and pairwise decoding accuracy
+on the held-out validation rows of each nested ``n`` subset only. Pairwise classifiers still train on the
+nested training slice.
 """
 
 from __future__ import annotations
@@ -43,24 +43,32 @@ from global_setting import DATA_DIR
 
 from fisher import h_binned_visualization as vhb
 from fisher import h_decoding_convergence as conv
-from fisher.decoding_native_x import decoding_x_train_all_from_native, load_native_bundle_for_pr_gt_decoding
 from fisher.hellinger_gt import hellinger_sq_gaussian_diag
 from fisher.h_decoding_convergence_methods import SweepSubset, prepare_categorical_binning_for_convergence
 from fisher.shared_dataset_io import SharedDatasetBundle
 from fisher.h_decoding_twofig import (
-    _decode_accuracy_color_limits,
     _matrix_nmse_offdiag,
-    _render_corr_vs_n_panel,
+    _render_corr_nmse_two_panel,
     _render_method_sweep_panel,
-    _render_nmse_vs_n_panel,
     _render_row_n_training_losses_panel,
     _sanitize_row_label,
-    _save_figure_svg,
     _theta_axis_tick_labels,
 )
 from fisher.h_matrix import HMatrixEstimator
 from fisher.shared_dataset_io import SharedDatasetBundle, load_shared_dataset_npz
 from fisher.shared_fisher_est import build_dataset_from_meta, require_device
+from fisher.models import (
+    ConditionalThetaFlowVelocity,
+    ConditionalThetaFlowVelocityFiLMPerLayer,
+    PriorThetaFlowVelocity,
+    PriorThetaFlowVelocityFiLMPerLayer,
+)
+from fisher.trainers import (
+    train_conditional_theta_flow_likelihood_finetune,
+    train_conditional_theta_flow_model,
+    train_prior_theta_flow_likelihood_finetune,
+    train_prior_theta_flow_model,
+)
 
 _METHOD_ALIASES: dict[str, str] = {
     "x-flow": "x_flow",
@@ -75,13 +83,17 @@ _METHOD_ALIASES: dict[str, str] = {
     "linear_x_flow_t": "linear_x_flow_t",
     "xflow-sir-lrank": "xflow_sir_lrank",
     "xflow_sir_lrank": "xflow_sir_lrank",
+    "theta-flow-cate": "theta_flow_cate",
+    "theta_flow_cate": "theta_flow_cate",
+    "thetaflow-cate": "theta_flow_cate",
     "bin_gaussian": "bin_gaussian",
+    "bin_gaussian_cate": "bin_gaussian",
     "bin-gaussian": "bin_gaussian",
     "binned_gaussian": "bin_gaussian",
     "binned-gaussian": "bin_gaussian",
 }
 _DEFAULT_METHODS = ("x_flow", "binary_classifier", "linear_x_flow_t", "xflow_sir_lrank")
-_SUPPORTED_METHODS_HELP = ", ".join(_DEFAULT_METHODS + ("bin_gaussian",))
+_SUPPORTED_METHODS_HELP = ", ".join(_DEFAULT_METHODS + ("theta_flow_cate", "bin_gaussian"))
 
 
 @functools.lru_cache(maxsize=1)
@@ -204,7 +216,7 @@ def _ensure_pr_projected_npz(args: argparse.Namespace, *, native_npz: Path, pr_o
 def _validation_only_work_sweep_subset(subset_w: SweepSubset) -> SweepSubset:
     """Build a :class:`SweepSubset` whose ``bundle.x_all`` / ``bin_all`` are validation rows only.
 
-    Used for ``--hellinger-eval-split validation`` with :func:`conv._binned_gaussian_hellinger_sq`,
+    Used for ``--eval-split validation`` with :func:`conv._binned_gaussian_hellinger_sq`,
     which reads ``subset.bundle.x_all`` and ``subset.bin_all``.
     """
     b = subset_w.bundle
@@ -287,31 +299,241 @@ def h_sq_category_from_sample_directed(
     )
 
 
-def binary_classifier_hellinger_sqrt(
+def _build_theta_flow_post_model(args: argparse.Namespace, *, x_dim: int, dev: torch.device) -> torch.nn.Module:
+    arch = str(getattr(args, "flow_arch", "mlp")).strip().lower()
+    if arch == "mlp":
+        return ConditionalThetaFlowVelocity(
+            x_dim=int(x_dim),
+            hidden_dim=int(getattr(args, "flow_hidden_dim", 128)),
+            depth=int(getattr(args, "flow_depth", 3)),
+            use_logit_time=True,
+            theta_dim=1,
+        ).to(dev)
+    if arch == "film":
+        return ConditionalThetaFlowVelocityFiLMPerLayer(
+            x_dim=int(x_dim),
+            hidden_dim=int(getattr(args, "flow_hidden_dim", 128)),
+            depth=int(getattr(args, "flow_depth", 3)),
+            use_logit_time=True,
+            use_layer_norm=False,
+            gated_film=False,
+            zero_out_init=False,
+            cond_embed_dim=16,
+            cond_embed_depth=1,
+            cond_embed_act="silu",
+        ).to(dev)
+    raise ValueError("theta_flow_cate currently supports --flow-arch mlp or film.")
+
+
+def _build_theta_flow_prior_model(args: argparse.Namespace, *, dev: torch.device) -> torch.nn.Module:
+    arch = str(getattr(args, "flow_arch", "mlp")).strip().lower()
+    if arch == "mlp":
+        return PriorThetaFlowVelocity(
+            hidden_dim=int(getattr(args, "prior_hidden_dim", getattr(args, "flow_hidden_dim", 128))),
+            depth=int(getattr(args, "prior_depth", getattr(args, "flow_depth", 3))),
+            use_logit_time=True,
+            theta_dim=1,
+        ).to(dev)
+    if arch == "film":
+        return PriorThetaFlowVelocityFiLMPerLayer(
+            hidden_dim=int(getattr(args, "prior_hidden_dim", getattr(args, "flow_hidden_dim", 128))),
+            depth=int(getattr(args, "prior_depth", getattr(args, "flow_depth", 3))),
+            use_logit_time=True,
+            use_layer_norm=False,
+            gated_film=False,
+            zero_out_init=False,
+            cond_embed_dim=16,
+            cond_embed_depth=1,
+            cond_embed_act="silu",
+        ).to(dev)
+    raise ValueError("theta_flow_cate currently supports --flow-arch mlp or film.")
+
+
+def _mean_padded_curves(curves: list[np.ndarray]) -> np.ndarray:
+    nonempty = [np.asarray(c, dtype=np.float64).ravel() for c in curves if np.asarray(c).size > 0]
+    if not nonempty:
+        return np.asarray([], dtype=np.float64)
+    width = max(int(c.size) for c in nonempty)
+    arr = np.full((len(nonempty), width), np.nan, dtype=np.float64)
+    for i, c in enumerate(nonempty):
+        arr[i, : c.size] = c
+    return np.nanmean(arr, axis=0)
+
+
+def theta_flow_categorical_hellinger_sqrt(
     args: argparse.Namespace,
     *,
+    dev: torch.device,
     x_train: np.ndarray,
     bins_train: np.ndarray,
+    x_val: np.ndarray,
+    bins_val: np.ndarray,
     x_all: np.ndarray,
     bins_all: np.ndarray,
     k_cat: int,
-) -> np.ndarray:
-    """Category-level ``sqrt(H^2)`` from pairwise binary-classifier LLR estimates."""
-    dbg = _debug_categorical_module()
-    result = dbg._train_binary_classifier_delta(
-        args,
-        x_train=np.asarray(x_train, dtype=np.float64),
-        bins_train=np.asarray(bins_train, dtype=np.int64),
-        x_all=np.asarray(x_all, dtype=np.float64),
-        bins_all=np.asarray(bins_all, dtype=np.int64),
-        k_cat=int(k_cat),
-    )
-    delta = np.asarray(result["delta_l"], dtype=np.float64)
-    h_dir = h_sq_directed_from_delta_l(delta)
-    h_cat_sq = h_sq_category_from_sample_directed(h_dir, np.asarray(bins_all, dtype=np.int64), k_cat=int(k_cat))
-    h_sqrt = np.sqrt(np.clip(h_cat_sq, 0.0, 1.0))
+) -> dict[str, Any]:
+    """Pairwise binary theta-flow category estimator returning categorical ``sqrt(H^2)``."""
+    x_train = np.asarray(x_train, dtype=np.float64)
+    x_val = np.asarray(x_val, dtype=np.float64)
+    x_all = np.asarray(x_all, dtype=np.float64)
+    bins_train = np.asarray(bins_train, dtype=np.int64).reshape(-1)
+    bins_val = np.asarray(bins_val, dtype=np.int64).reshape(-1)
+    bins_all = np.asarray(bins_all, dtype=np.int64).reshape(-1)
+    min_count = int(getattr(args, "clf_min_class_count", 5))
+    h_sqrt = np.full((int(k_cat), int(k_cat)), np.nan, dtype=np.float64)
     np.fill_diagonal(h_sqrt, 0.0)
-    return h_sqrt
+    valid_pairs: list[tuple[int, int]] = []
+    skipped_pairs: list[tuple[int, int, str]] = []
+    train_counts = np.zeros((int(k_cat), int(k_cat), 2), dtype=np.int64)
+    val_counts = np.zeros((int(k_cat), int(k_cat), 2), dtype=np.int64)
+    pair_train_outs: list[dict[str, Any]] = []
+
+    for a in range(int(k_cat)):
+        for b in range(a + 1, int(k_cat)):
+            tr_mask = (bins_train == a) | (bins_train == b)
+            va_mask = (bins_val == a) | (bins_val == b)
+            ev_mask = (bins_all == a) | (bins_all == b)
+            tr_y = (bins_train[tr_mask] == b).astype(np.float64).reshape(-1, 1)
+            va_y = (bins_val[va_mask] == b).astype(np.float64).reshape(-1, 1)
+            ev_y = (bins_all[ev_mask] == b).astype(np.float64).reshape(-1, 1)
+            tr_counts_pair = np.bincount(tr_y.reshape(-1).astype(np.int64), minlength=2)[:2]
+            va_counts_pair = np.bincount(va_y.reshape(-1).astype(np.int64), minlength=2)[:2]
+            train_counts[a, b] = train_counts[b, a] = tr_counts_pair
+            val_counts[a, b] = val_counts[b, a] = va_counts_pair
+            if np.any(tr_counts_pair < min_count):
+                skipped_pairs.append((a, b, "min_train_count"))
+                continue
+            if np.any(va_counts_pair < 1):
+                skipped_pairs.append((a, b, "min_validation_count"))
+                continue
+            if int(ev_y.shape[0]) < 2 or len(np.unique(ev_y.reshape(-1))) < 2:
+                skipped_pairs.append((a, b, "missing_eval_class"))
+                continue
+
+            print(
+                f"[theta_flow_cate] pair=({a},{b}) train_counts={tr_counts_pair.tolist()} "
+                f"val_counts={va_counts_pair.tolist()} eval={int(ev_y.shape[0])}",
+                flush=True,
+            )
+            post_model = _build_theta_flow_post_model(args, x_dim=int(x_train.shape[1]), dev=dev)
+            post_train_out = train_conditional_theta_flow_model(
+                model=post_model,
+                theta_train=tr_y,
+                x_train=x_train[tr_mask],
+                epochs=int(getattr(args, "flow_epochs", 10000)),
+                batch_size=int(getattr(args, "flow_batch_size", 256)),
+                lr=float(getattr(args, "flow_lr", 1e-3)),
+                device=dev,
+                log_every=max(1, int(getattr(args, "log_every", 50))),
+                theta_val=va_y,
+                x_val=x_val[va_mask],
+                early_stopping_patience=int(getattr(args, "flow_early_patience", 1000)),
+                early_stopping_min_delta=float(getattr(args, "flow_early_min_delta", 1e-4)),
+                early_stopping_ema_alpha=float(getattr(args, "flow_early_ema_alpha", 0.05)),
+                restore_best=bool(getattr(args, "flow_restore_best", True)),
+                scheduler_name=str(getattr(args, "flow_scheduler", "cosine")),
+                fm_t_eps=float(getattr(args, "flow_fm_t_eps", 0.05)),
+            )
+            pair_out: dict[str, Any] = {"pair": (a, b), "post_train_out": post_train_out}
+            ft_epochs = int(getattr(args, "flow_likelihood_finetune_epochs", 0))
+            ft_batch = int(getattr(args, "flow_likelihood_finetune_batch_size", 0))
+            if ft_batch <= 0:
+                ft_batch = int(getattr(args, "flow_batch_size", 256))
+            if ft_epochs > 0:
+                pair_out["post_likelihood_finetune_out"] = train_conditional_theta_flow_likelihood_finetune(
+                    model=post_model,
+                    theta_train=tr_y,
+                    x_train=x_train[tr_mask],
+                    epochs=ft_epochs,
+                    batch_size=ft_batch,
+                    lr=float(getattr(args, "flow_likelihood_finetune_lr", 1e-4)),
+                    device=dev,
+                    log_every=max(1, int(getattr(args, "log_every", 50))),
+                    theta_val=va_y,
+                    x_val=x_val[va_mask],
+                    early_stopping_patience=int(getattr(args, "flow_likelihood_finetune_patience", 100)),
+                    early_stopping_min_delta=float(getattr(args, "flow_likelihood_finetune_min_delta", 1e-4)),
+                    early_stopping_ema_alpha=float(getattr(args, "flow_likelihood_finetune_ema_alpha", 0.05)),
+                    restore_best=bool(getattr(args, "flow_restore_best", True)),
+                    ode_steps=int(getattr(args, "flow_likelihood_finetune_ode_steps", 64)),
+                )
+
+            posterior_only = bool(getattr(args, "theta_flow_posterior_only_likelihood", False))
+            prior_model = None
+            if not posterior_only:
+                prior_model = _build_theta_flow_prior_model(args, dev=dev)
+                prior_train_out = train_prior_theta_flow_model(
+                    model=prior_model,
+                    theta_train=tr_y,
+                    epochs=int(getattr(args, "prior_epochs", 10000)),
+                    batch_size=int(getattr(args, "prior_batch_size", getattr(args, "flow_batch_size", 256))),
+                    lr=float(getattr(args, "prior_lr", 1e-3)),
+                    device=dev,
+                    log_every=max(1, int(getattr(args, "log_every", 50))),
+                    theta_val=va_y,
+                    early_stopping_patience=int(getattr(args, "prior_early_patience", 1000)),
+                    early_stopping_min_delta=float(getattr(args, "prior_early_min_delta", 1e-4)),
+                    early_stopping_ema_alpha=float(getattr(args, "prior_early_ema_alpha", 0.05)),
+                    restore_best=bool(getattr(args, "prior_restore_best", True)),
+                    scheduler_name=str(getattr(args, "flow_scheduler", "cosine")),
+                    fm_t_eps=float(getattr(args, "flow_fm_t_eps", 0.05)),
+                )
+                pair_out["prior_train_out"] = prior_train_out
+                if ft_epochs > 0:
+                    pair_out["prior_likelihood_finetune_out"] = train_prior_theta_flow_likelihood_finetune(
+                        model=prior_model,
+                        theta_train=tr_y,
+                        epochs=ft_epochs,
+                        batch_size=ft_batch,
+                        lr=float(getattr(args, "flow_likelihood_finetune_lr", 1e-4)),
+                        device=dev,
+                        log_every=max(1, int(getattr(args, "log_every", 50))),
+                        theta_val=va_y,
+                        early_stopping_patience=int(getattr(args, "flow_likelihood_finetune_patience", 100)),
+                        early_stopping_min_delta=float(getattr(args, "flow_likelihood_finetune_min_delta", 1e-4)),
+                        early_stopping_ema_alpha=float(getattr(args, "flow_likelihood_finetune_ema_alpha", 0.05)),
+                        restore_best=bool(getattr(args, "prior_restore_best", True)),
+                        ode_steps=int(getattr(args, "flow_likelihood_finetune_ode_steps", 64)),
+                    )
+
+            est = HMatrixEstimator(
+                model_post=post_model,
+                model_prior=prior_model,
+                sigma_eval=1.0,
+                device=dev,
+                pair_batch_size=int(getattr(args, "h_batch_size", 65536)),
+                field_method="theta_flow",
+                flow_scheduler=str(getattr(args, "flow_scheduler", "cosine")),
+                flow_ode_steps=int(getattr(args, "flow_ode_steps", 64)),
+                flow_likelihood_exact_divergence=bool(getattr(args, "flow_likelihood_exact_divergence", False)),
+                theta_flow_posterior_only_likelihood=posterior_only,
+            )
+            h_res = est.run(ev_y, x_all[ev_mask], restore_original_order=True)
+            h_pair_sq = h_sq_category_from_sample_directed(h_res.h_directed, ev_y.reshape(-1).astype(np.int64), k_cat=2)
+            val = float(np.sqrt(np.clip(h_pair_sq[0, 1], 0.0, 1.0)))
+            h_sqrt[a, b] = h_sqrt[b, a] = val
+            valid_pairs.append((a, b))
+            pair_train_outs.append(pair_out)
+
+    post_train_curves = [np.asarray(p["post_train_out"].get("train_losses", []), dtype=np.float64) for p in pair_train_outs]
+    post_val_curves = [np.asarray(p["post_train_out"].get("val_losses", []), dtype=np.float64) for p in pair_train_outs]
+    post_mon_curves = [np.asarray(p["post_train_out"].get("val_monitor_losses", []), dtype=np.float64) for p in pair_train_outs]
+    return {
+        "h_sqrt": h_sqrt,
+        "h_cat_sq": np.square(h_sqrt),
+        "train_out": {
+            "train_losses": _mean_padded_curves(post_train_curves),
+            "val_losses": _mean_padded_curves(post_val_curves),
+            "val_monitor_losses": _mean_padded_curves(post_mon_curves),
+        },
+        "theta_flow_cate_valid_pairs": np.asarray(valid_pairs, dtype=np.int64).reshape(-1, 2),
+        "theta_flow_cate_skipped_pairs": np.asarray(skipped_pairs, dtype=object),
+        "theta_flow_cate_train_counts": train_counts,
+        "theta_flow_cate_val_counts": val_counts,
+        "theta_flow_cate_num_valid_pairs": np.int64(len(valid_pairs)),
+        "theta_flow_cate_num_skipped_pairs": np.int64(len(skipped_pairs)),
+        "pair_train_outs": pair_train_outs,
+    }
 
 
 def _as_2d(a: np.ndarray) -> np.ndarray:
@@ -356,58 +578,11 @@ def _nmse_decode_vs_ref(decode_sweep: np.ndarray, decode_ref: np.ndarray) -> np.
     return out
 
 
-def _render_cat_gt_panel(
-    *,
-    h_gt_sqrt: np.ndarray,
-    decode_ref: np.ndarray,
-    decode_hellinger_ref_sqrt: np.ndarray | None,
-    n_ref: int,
-    k_cat: int,
-    theta_centers: np.ndarray,
-    out_svg_path: str,
-    decode_sweep_for_decode_limits: np.ndarray | None = None,
-) -> str:
-    n_cols = 3 if decode_hellinger_ref_sqrt is not None else 2
-    fig, axes = plt.subplots(1, n_cols, figsize=(3.1 * n_cols, 3.2), squeeze=False)
-    tick_pos, tick_labs, axis_label = _theta_axis_tick_labels(theta_centers, int(k_cat))
-    x_rot = 45 if len(tick_pos) > 6 else 0
-
-    def _one(ax: Any, mat: np.ndarray, title: str, vmin: float, vmax: float) -> None:
-        im = ax.imshow(
-            np.asarray(mat, dtype=np.float64),
-            vmin=float(vmin),
-            vmax=float(vmax),
-            cmap="viridis",
-            aspect="equal",
-            origin="lower",
-        )
-        ax.set_title(title, fontsize=10)
-        ax.set_xticks(tick_pos)
-        ax.set_xticklabels(tick_labs, rotation=x_rot, ha="right" if x_rot else "center", fontsize=11)
-        ax.set_yticks(tick_pos)
-        ax.set_yticklabels(tick_labs, fontsize=11)
-        ax.set_xlabel(axis_label, fontsize=11)
-        conv._matrix_axes_show_top_right_spines(ax)
-        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04).ax.tick_params(labelsize=11)
-
-    ax_h = axes[0, 0]
-    _one(ax_h, h_gt_sqrt, r"Analytic GT $\sqrt{H^2}$ (category)", 0.0, 1.0)
-    ax_h.set_ylabel("category", fontsize=11)
-    if decode_hellinger_ref_sqrt is not None:
-        ax_ch = axes[0, 1]
-        _one(ax_ch, decode_hellinger_ref_sqrt, r"Classifier LLR $\sqrt{H^2}$", 0.0, 1.0)
-    ax_c = axes[0, n_cols - 1]
-    lim_arrays: list[np.ndarray] = [np.asarray(decode_ref, dtype=np.float64)]
-    if decode_sweep_for_decode_limits is not None:
-        dsw = np.asarray(decode_sweep_for_decode_limits, dtype=np.float64)
-        for j in range(int(dsw.shape[0])):
-            lim_arrays.append(np.asarray(dsw[j], dtype=np.float64))
-    vmin_c, vmax_c = _decode_accuracy_color_limits(*lim_arrays)
-    _one(ax_c, decode_ref, f"Pairwise decoding (n_ref={int(n_ref)})", vmin_c, vmax_c)
-    fig.tight_layout()
-    svg = _save_figure_svg(fig, out_svg_path)
-    plt.close(fig)
-    return svg
+def _selected_eval_split(args: argparse.Namespace) -> str:
+    split = str(getattr(args, "eval_split", "all")).strip().lower()
+    if split not in ("all", "validation"):
+        raise ValueError("--eval-split must be 'all' or 'validation'.")
+    return split
 
 
 def _load_cached_results(output_dir: str) -> dict[str, Any]:
@@ -476,17 +651,24 @@ def _validate_cached_cli(
                 raise ValueError(
                     f"--dataset-npz {args.dataset_npz!r} does not match cached native_dataset_npz={ds_cached!r}."
                 )
-    want_h = str(getattr(args, "hellinger_eval_split", "all")).strip().lower()
-    if "hellinger_eval_split" in cached:
-        got_h = str(np.asarray(cached["hellinger_eval_split"], dtype=object).reshape(-1)[0])
-        if got_h != want_h:
+    want_split = _selected_eval_split(args)
+    if "eval_split" in cached:
+        got_split = str(np.asarray(cached["eval_split"], dtype=object).reshape(-1)[0]).strip().lower()
+        if got_split != want_split:
             raise ValueError(
-                f"--hellinger-eval-split {want_h!r} does not match cached hellinger_eval_split={got_h!r}."
+                f"--eval-split {want_split!r} does not match cached eval_split={got_split!r}."
             )
-    elif want_h != "all":
+    elif "hellinger_eval_split" in cached:
+        legacy_split = str(np.asarray(cached["hellinger_eval_split"], dtype=object).reshape(-1)[0]).strip().lower()
+        if want_split != "all" or legacy_split != "all":
+            raise ValueError(
+                "Cached results NPZ uses legacy hellinger_eval_split metadata and may have old all-pool "
+                "decoding semantics. Re-run the study with --eval-split for validation caches."
+            )
+    elif want_split != "all":
         raise ValueError(
-            "Cached results NPZ has no hellinger_eval_split (older run). "
-            "Use --hellinger-eval-split all with --visualization-only, or re-run the study."
+            "Cached results NPZ has no eval_split metadata (older run). "
+            "Use --eval-split all with --visualization-only, or re-run the study."
         )
 
 
@@ -497,72 +679,44 @@ def _run_visualization_only(args: argparse.Namespace, methods: list[str], ns: li
     theta_centers = np.asarray(cached["theta_bin_centers"], dtype=np.float64)
     h_gt_sqrt = np.asarray(cached["h_gt_sqrt"], dtype=np.float64)
     decode_ref = np.asarray(cached["decode_ref"], dtype=np.float64)
-    decode_h_ref = (
-        np.asarray(cached["decode_hellinger_ref_sqrt"], dtype=np.float64)
-        if "decode_hellinger_ref_sqrt" in cached
-        else None
-    )
     h_sw = np.asarray(cached["h_sqrt_sweep"], dtype=np.float64)
     dec_sw = np.asarray(cached["decode_sweep"], dtype=np.float64)
-    dec_h_sw = (
-        np.asarray(cached["decode_hellinger_sweep_sqrt"], dtype=np.float64)
-        if "decode_hellinger_sweep_sqrt" in cached
-        else None
-    )
     corr_h = np.asarray(cached["corr_h_vs_gt"], dtype=np.float64)
     corr_d = np.asarray(cached["corr_decode_vs_ref"], dtype=np.float64).ravel()
-    corr_dh = (
-        np.asarray(cached["corr_decode_hellinger_vs_gt"], dtype=np.float64).ravel()
-        if "corr_decode_hellinger_vs_gt" in cached
-        else None
-    )
     nmse_h = np.asarray(cached["nmse_h_vs_gt"], dtype=np.float64)
     nmse_d = np.asarray(cached["nmse_decode_vs_ref"], dtype=np.float64).ravel()
-    nmse_dh = (
-        np.asarray(cached["nmse_decode_hellinger_vs_gt"], dtype=np.float64).ravel()
-        if "nmse_decode_hellinger_vs_gt" in cached
-        else None
-    )
     zdummy = np.zeros_like(corr_h)
+    cat_footer = {
+        "h_gt_sqrt": h_gt_sqrt,
+        "decode_ref": decode_ref,
+        "n_ref": int(args.n_ref),
+        "decode_sweep_for_decode_limits": dec_sw,
+    }
     sweep_svg = _render_method_sweep_panel(
         row_labels=methods,
         h_sweep=h_sw,
         clf_sweep_shared=dec_sw,
-        clf_hellinger_sweep_shared=dec_h_sw,
+        clf_hellinger_sweep_shared=None,
         n_list=ns,
         out_svg_path=os.path.join(args.output_dir, "h_decoding_categorical_twofig_sweep.svg"),
         n_bins=k_cat,
         theta_centers=theta_centers,
         clf_ref_decode_limits=np.asarray(decode_ref, dtype=np.float64),
+        category_gt_footer=cat_footer,
     )
-    gt_svg = _render_cat_gt_panel(
-        h_gt_sqrt=h_gt_sqrt,
-        decode_ref=decode_ref,
-        decode_hellinger_ref_sqrt=decode_h_ref,
-        n_ref=int(args.n_ref),
-        k_cat=k_cat,
-        theta_centers=theta_centers,
-        out_svg_path=os.path.join(args.output_dir, "h_decoding_categorical_twofig_gt.svg"),
-        decode_sweep_for_decode_limits=dec_sw,
-    )
-    corr_svg = _render_corr_vs_n_panel(
+    corr_nmse_svg = _render_corr_nmse_two_panel(
         row_labels=methods,
         n_list=ns,
         corr_h=corr_h,
         corr_decode_shared=corr_d,
-        corr_decode_hellinger_shared=corr_dh,
+        corr_decode_hellinger_shared=None,
         corr_hellinger_lb=zdummy,
         corr_hellinger_ub=zdummy,
         show_hellinger_bounds=False,
-        out_svg_path=os.path.join(args.output_dir, "h_decoding_categorical_twofig_corr_vs_n.svg"),
-    )
-    nmse_svg = _render_nmse_vs_n_panel(
-        row_labels=methods,
-        n_list=ns,
         nmse_h=nmse_h,
         nmse_decode_shared=nmse_d,
-        nmse_decode_hellinger_shared=nmse_dh,
-        out_svg_path=os.path.join(args.output_dir, "h_decoding_categorical_twofig_nmse_vs_n.svg"),
+        nmse_decode_hellinger_shared=None,
+        out_svg_path=os.path.join(args.output_dir, "h_decoding_categorical_twofig_corr_nmse.svg"),
     )
     loss_root = os.path.join(str(args.output_dir), "training_losses")
     if not os.path.isdir(loss_root):
@@ -583,15 +737,13 @@ def _run_visualization_only(args: argparse.Namespace, methods: list[str], ns: li
         args=args,
         out_npz=os.path.abspath(out_npz),
         sweep_svg=os.path.abspath(sweep_svg),
-        gt_svg=os.path.abspath(gt_svg),
-        corr_svg=os.path.abspath(corr_svg),
-        nmse_svg=os.path.abspath(nmse_svg),
+        corr_nmse_svg=os.path.abspath(corr_nmse_svg),
         visualization_only=True,
         loss_panel_svg=os.path.abspath(loss_panel_svg),
         training_losses_root=os.path.abspath(loss_root),
     )
     print("[cat-twofig] Saved (visualization-only):", flush=True)
-    for p in (sweep_svg, gt_svg, corr_svg, nmse_svg, loss_panel_svg, summary_path):
+    for p in (sweep_svg, corr_nmse_svg, loss_panel_svg, summary_path):
         print(f"  - {os.path.abspath(p)}", flush=True)
 
 
@@ -601,9 +753,7 @@ def _write_summary(
     args: argparse.Namespace,
     out_npz: str,
     sweep_svg: str,
-    gt_svg: str,
-    corr_svg: str,
-    nmse_svg: str,
+    corr_nmse_svg: str,
     visualization_only: bool,
     loss_panel_svg: str | None = None,
     training_losses_root: str | None = None,
@@ -622,14 +772,12 @@ def _write_summary(
         f.write(f"device: {args.device}\n")
         f.write(f"results_npz: {out_npz}\n")
         f.write(f"h_decoding_categorical_twofig_sweep.svg: {sweep_svg}\n")
-        f.write(f"h_decoding_categorical_twofig_gt.svg: {gt_svg}\n")
-        f.write(f"h_decoding_categorical_twofig_corr_vs_n.svg: {corr_svg}\n")
-        f.write(f"h_decoding_categorical_twofig_nmse_vs_n.svg: {nmse_svg}\n")
+        f.write(f"h_decoding_categorical_twofig_corr_nmse.svg: {corr_nmse_svg}\n")
         if loss_panel_svg:
             f.write(f"h_decoding_categorical_twofig_training_losses_panel.svg: {loss_panel_svg}\n")
         if training_losses_root:
             f.write(f"training_losses_root: {training_losses_root}\n")
-        f.write(f"hellinger_eval_split: {str(getattr(args, 'hellinger_eval_split', 'all'))}\n")
+        f.write(f"eval_split: {_selected_eval_split(args)}\n")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -645,24 +793,33 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--force-regenerate", action="store_true")
     p.add_argument("--n-total", type=int, default=50000)
     p.add_argument("--n-list", type=str, default="80,200,400,600")
-    p.add_argument("--n-ref", type=int, default=600)
+    p.add_argument("--n-ref", type=int, default=10000)
     p.add_argument("--run-seed", type=int, default=7)
     p.add_argument("--device", type=str, default="cuda")
-    p.add_argument("--methods", type=str, default=",".join(_DEFAULT_METHODS))
+    p.add_argument(
+        "--methods",
+        type=str,
+        default=",".join(_DEFAULT_METHODS),
+        help=f"Comma-separated methods. Supported: {_SUPPORTED_METHODS_HELP}. "
+        "--clf-min-class-count also gates theta_flow_cate pair training.",
+    )
     p.add_argument("--visualization-only", action="store_true")
     p.add_argument(
-        "--hellinger-eval-split",
+        "--eval-split",
         type=str,
         default="all",
         choices=("all", "validation"),
-        help="For learned H and GT-LLR diagnostics: use all nested-n rows (default) or validation split only.",
+        help=(
+            "For learned H, GT-LLR diagnostics, reference decoding, and sweep decoding: "
+            "use all nested rows (default) or validation rows only. Pairwise classifiers still train on "
+            "the nested training slice."
+        ),
     )
     p.add_argument(
         "--no-scatter-diagnostics",
         action="store_true",
         help="Skip LLR and H^2 scatter figures (llr_est_vs_true_all, hellinger_est_vs_gt_all).",
     )
-
     p.add_argument("--flow-arch", type=str, default="mlp", choices=["mlp", "film", "film_fourier"])
     p.add_argument("--flow-epochs", type=int, default=10000)
     p.add_argument("--flow-batch-size", type=int, default=256)
@@ -678,6 +835,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(flow_restore_best=True)
     p.add_argument("--flow-ode-steps", type=int, default=64)
     p.add_argument("--flow-likelihood-exact-divergence", action="store_true")
+    p.add_argument("--flow-likelihood-finetune-epochs", type=int, default=0)
+    p.add_argument("--flow-likelihood-finetune-lr", type=float, default=1e-4)
+    p.add_argument("--flow-likelihood-finetune-batch-size", type=int, default=0)
+    p.add_argument("--flow-likelihood-finetune-ode-steps", type=int, default=64)
+    p.add_argument("--flow-likelihood-finetune-patience", type=int, default=100)
+    p.add_argument("--flow-likelihood-finetune-min-delta", type=float, default=1e-4)
+    p.add_argument("--flow-likelihood-finetune-ema-alpha", type=float, default=0.05)
+    p.add_argument("--theta-flow-posterior-only-likelihood", action="store_true", default=False)
+    p.add_argument("--prior-epochs", type=int, default=10000)
+    p.add_argument("--prior-batch-size", type=int, default=256)
+    p.add_argument("--prior-lr", type=float, default=1e-3)
+    p.add_argument("--prior-hidden-dim", type=int, default=128)
+    p.add_argument("--prior-depth", type=int, default=3)
+    p.add_argument("--prior-early-patience", type=int, default=1000)
+    p.add_argument("--prior-early-min-delta", type=float, default=1e-4)
+    p.add_argument("--prior-early-ema-alpha", type=float, default=0.05)
+    p.add_argument("--no-prior-restore-best", dest="prior_restore_best", action="store_false")
+    p.set_defaults(prior_restore_best=True)
     p.add_argument("--h-batch-size", type=int, default=65536)
     p.add_argument("--clf-min-class-count", type=int, default=5)
     p.add_argument("--clf-random-state", type=int, default=-1)
@@ -726,7 +901,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--decode-source-npz",
         type=str,
         default="",
-        help="Optional override for native NPZ when PR-embedded (GT decoding on native 2D x).",
+        help=(
+            "Deprecated compatibility option. Categorical twofig classifier/decoding paths now use the "
+            "working feature space, including PR-embedded features when --pr-project is active."
+        ),
     )
     return p
 
@@ -744,6 +922,17 @@ def _save_method_training_loss_npz(out_path: str | Path, *, method_name: str, re
         tr = np.asarray([], dtype=np.float64)
         va = np.asarray([], dtype=np.float64)
         em = np.asarray([], dtype=np.float64)
+    extra: dict[str, Any] = {}
+    for key in (
+        "theta_flow_cate_valid_pairs",
+        "theta_flow_cate_skipped_pairs",
+        "theta_flow_cate_train_counts",
+        "theta_flow_cate_val_counts",
+        "theta_flow_cate_num_valid_pairs",
+        "theta_flow_cate_num_skipped_pairs",
+    ):
+        if key in result:
+            extra[key] = result[key]
     np.savez_compressed(
         str(p),
         theta_field_method=np.asarray([str(method_name)], dtype=object),
@@ -751,6 +940,7 @@ def _save_method_training_loss_npz(out_path: str | Path, *, method_name: str, re
         score_train_losses=tr,
         score_val_losses=va,
         score_val_monitor_losses=em,
+        **extra,
     )
 
 
@@ -766,6 +956,7 @@ def _train_one_method(
     theta_all: np.ndarray,
     x_all: np.ndarray,
     bins_train: np.ndarray,
+    bins_val: np.ndarray,
     bins_all: np.ndarray,
     k_cat: int,
 ) -> dict[str, Any]:
@@ -801,6 +992,18 @@ def _train_one_method(
             x_val=x_val,
             theta_all=theta_all,
             x_all=x_all,
+        )
+    if method_name == "theta_flow_cate":
+        return theta_flow_categorical_hellinger_sqrt(
+            args,
+            dev=dev,
+            x_train=x_train,
+            bins_train=bins_train,
+            x_val=x_val,
+            bins_val=bins_val,
+            x_all=x_all,
+            bins_all=bins_all,
+            k_cat=k_cat,
         )
     raise RuntimeError(f"Unhandled method {method_name!r}")
 
@@ -875,12 +1078,10 @@ def main(argv: list[str] | None = None) -> None:
     if n_pool < need:
         raise ValueError(f"Dataset n_total={n_pool} < max(n_ref, max(n_list))={need}.")
 
-    he_split = str(getattr(args, "hellinger_eval_split", "all")).strip().lower()
-    if he_split not in ("all", "validation"):
-        raise ValueError("--hellinger-eval-split must be 'all' or 'validation'.")
-    if he_split == "validation" and float(meta_work.get("train_frac", 0.7)) >= 1.0:
+    eval_split = _selected_eval_split(args)
+    if eval_split == "validation" and float(meta_work.get("train_frac", 0.7)) >= 1.0:
         raise ValueError(
-            "--hellinger-eval-split validation requires train_frac < 1 in dataset meta; "
+            "--eval-split validation requires train_frac < 1 in dataset meta; "
             f"got train_frac={meta_work.get('train_frac')!r}."
         )
 
@@ -898,28 +1099,12 @@ def main(argv: list[str] | None = None) -> None:
 
     clf_rs = int(args.run_seed) if int(args.clf_random_state) < 0 else int(args.clf_random_state)
     subset_ref = conv._subset_bundle(work_bundle, perm, int(args.n_ref), meta_work, bin_idx_all=bin_idx_all)
-    decode_gt_x_train: np.ndarray | None = None
-    decode_gt_x_all: np.ndarray | None = None
-    if bool(meta_work.get("pr_autoencoder_embedded")):
-        override_npz = str(getattr(args, "decode_source_npz", "") or "").strip() or None
-        native_gt, tried_gt = load_native_bundle_for_pr_gt_decoding(
-            work_bundle,
-            meta_work,
-            str(pr_out_resolved if pr_out_resolved is not None else native_npz),
-            override_npz,
-        )
-        if native_gt is None:
-            msg = "\n  ".join(tried_gt) if tried_gt else "(no candidates)"
-            raise FileNotFoundError(
-                "PR-embedded dataset: could not load native NPZ for GT decoding. "
-                f"Pass --decode-source-npz. Tried:\n  {msg}"
-            )
-        decode_gt_x_train, decode_gt_x_all = decoding_x_train_all_from_native(
-            native_gt,
-            perm,
-            int(args.n_ref),
-            meta_work,
-        )
+    decode_ref_x_train = np.asarray(subset_ref.bundle.x_train, dtype=np.float64)
+    decode_ref_x_all = np.asarray(subset_ref.bundle.x_all, dtype=np.float64)
+    decode_ref_bin_all = subset_ref.bin_all
+    if eval_split == "validation":
+        decode_ref_bin_all = subset_ref.bin_validation
+        decode_ref_x_all = np.asarray(subset_ref.bundle.x_validation, dtype=np.float64)
     decode_ref = conv._pairwise_clf_from_bundle(
         args=args,
         meta=meta_work,
@@ -928,20 +1113,10 @@ def main(argv: list[str] | None = None) -> None:
         n_bins=k_cat,
         clf_min_class_count=int(args.clf_min_class_count),
         clf_random_state=clf_rs,
-        decode_x_train=decode_gt_x_train,
-        decode_x_all=decode_gt_x_all,
+        decode_x_train=decode_ref_x_train,
+        decode_x_all=decode_ref_x_all,
+        decode_bin_all=decode_ref_bin_all,
     )
-    decode_h_x_train = subset_ref.bundle.x_train if decode_gt_x_train is None else decode_gt_x_train
-    decode_h_x_all = subset_ref.bundle.x_all if decode_gt_x_all is None else decode_gt_x_all
-    decode_hellinger_ref_sqrt = binary_classifier_hellinger_sqrt(
-        args,
-        x_train=decode_h_x_train,
-        bins_train=subset_ref.bin_train,
-        x_all=decode_h_x_all,
-        bins_all=subset_ref.bin_all,
-        k_cat=k_cat,
-    )
-
     n_m = len(methods)
     n_cols = len(ns)
     h_sqrt_sweep = np.full((n_m, n_cols, k_cat, k_cat), np.nan, dtype=np.float64)
@@ -950,8 +1125,11 @@ def main(argv: list[str] | None = None) -> None:
     nmse_h = np.full((n_m, n_cols), np.nan, dtype=np.float64)
     llr_pearson_offdiag = np.full((n_m, n_cols), np.nan, dtype=np.float64)
     hellinger_pearson_offdiag_cat = np.full((n_m, n_cols), np.nan, dtype=np.float64)
+    theta_flow_cate_num_valid_pairs = np.full((n_m, n_cols), -1, dtype=np.int64)
+    theta_flow_cate_num_skipped_pairs = np.full((n_m, n_cols), -1, dtype=np.int64)
+    theta_flow_cate_train_counts = np.full((n_m, n_cols, k_cat, k_cat, 2), -1, dtype=np.int64)
+    theta_flow_cate_val_counts = np.full((n_m, n_cols, k_cat, k_cat, 2), -1, dtype=np.int64)
     decode_sweep_list: list[np.ndarray] = []
-    decode_hellinger_sweep_list: list[np.ndarray] = []
 
     dev = require_device(str(args.device))
     torch.manual_seed(int(args.run_seed))
@@ -975,13 +1153,14 @@ def main(argv: list[str] | None = None) -> None:
         x_train = np.asarray(subset_w.bundle.x_train, dtype=np.float64)
         x_val = np.asarray(subset_w.bundle.x_validation, dtype=np.float64)
         x_all = np.asarray(subset_w.bundle.x_all, dtype=np.float64)
-        bins_train = np.asarray(bins_n[: int(subset_w.bundle.theta_train.shape[0])], dtype=np.int64)
+        bins_train = np.asarray(subset_w.bin_train, dtype=np.int64).reshape(-1)
+        bins_val = np.asarray(subset_w.bin_validation, dtype=np.int64).reshape(-1)
 
-        val_h = str(getattr(args, "hellinger_eval_split", "all")).strip().lower() == "validation"
+        val_h = eval_split == "validation"
         if val_h:
             n_val = int(subset_w.bundle.x_validation.shape[0])
             if n_val < 1:
-                raise ValueError(f"n={int(n)}: empty validation split; cannot use --hellinger-eval-split validation.")
+                raise ValueError(f"n={int(n)}: empty validation split; cannot use --eval-split validation.")
             theta_h = val_theta
             x_h = x_val
             x_native_h = np.asarray(subset_n.bundle.x_validation, dtype=np.float64)
@@ -995,6 +1174,8 @@ def main(argv: list[str] | None = None) -> None:
         true_c = compute_true_conditional_loglik_matrix(x_native_h, theta_h, native_meta)
         true_delta_l = HMatrixEstimator.compute_delta_l(true_c)
 
+        decode_eval_x_all = x_h
+        decode_eval_bins_all = bins_h
         clf_n = conv._pairwise_clf_from_bundle(
             args=args,
             meta=meta_work,
@@ -1003,17 +1184,11 @@ def main(argv: list[str] | None = None) -> None:
             n_bins=k_cat,
             clf_min_class_count=int(args.clf_min_class_count),
             clf_random_state=clf_rs,
+            decode_x_train=x_train,
+            decode_x_all=decode_eval_x_all,
+            decode_bin_all=decode_eval_bins_all,
         )
         decode_sweep_list.append(np.asarray(clf_n, dtype=np.float64))
-        clf_h_n = binary_classifier_hellinger_sqrt(
-            args,
-            x_train=x_train,
-            bins_train=bins_train,
-            x_all=x_all,
-            bins_all=bins_n,
-            k_cat=k_cat,
-        )
-        decode_hellinger_sweep_list.append(np.asarray(clf_h_n, dtype=np.float64))
 
         for i, method_name in enumerate(methods):
             t0 = time.time()
@@ -1042,6 +1217,8 @@ def main(argv: list[str] | None = None) -> None:
                 hellinger_pearson_offdiag_cat[i, j] = float(m_h["hellinger_pearson_r_offdiag_cat"])
                 _save_method_training_loss_npz(loss_npz_path, method_name=method_name, result=result)
             else:
+                call_x_all = x_h
+                call_bins_all = bins_h
                 result = _train_one_method(
                     args,
                     dev=dev,
@@ -1051,17 +1228,34 @@ def main(argv: list[str] | None = None) -> None:
                     theta_val=val_theta,
                     x_val=x_val,
                     theta_all=theta_h,
-                    x_all=x_h,
+                    x_all=call_x_all,
                     bins_train=bins_train,
-                    bins_all=bins_h,
+                    bins_val=bins_val,
+                    bins_all=call_bins_all,
                     k_cat=k_cat,
                 )
                 _save_method_training_loss_npz(loss_npz_path, method_name=method_name, result=result)
-                delta = np.asarray(result["delta_l"], dtype=np.float64)
-                h_dir = h_sq_directed_from_delta_l(delta)
-                h_cat_sq = h_sq_category_from_sample_directed(h_dir, bins_h, k_cat=k_cat)
-                h_sqrt_sweep[i, j] = np.sqrt(np.clip(h_cat_sq, 0.0, 1.0))
-                np.fill_diagonal(h_sqrt_sweep[i, j], 0.0)
+                if "h_sqrt" in result:
+                    h_sqrt_sweep[i, j] = np.asarray(result["h_sqrt"], dtype=np.float64)
+                    np.fill_diagonal(h_sqrt_sweep[i, j], 0.0)
+                    h_cat_sq = np.asarray(result.get("h_cat_sq", np.square(h_sqrt_sweep[i, j])), dtype=np.float64)
+                    delta = np.full(np.asarray(true_delta_l, dtype=np.float64).shape, np.nan, dtype=np.float64)
+                    theta_flow_cate_num_valid_pairs[i, j] = int(result.get("theta_flow_cate_num_valid_pairs", -1))
+                    theta_flow_cate_num_skipped_pairs[i, j] = int(result.get("theta_flow_cate_num_skipped_pairs", -1))
+                    if "theta_flow_cate_train_counts" in result:
+                        theta_flow_cate_train_counts[i, j] = np.asarray(
+                            result["theta_flow_cate_train_counts"], dtype=np.int64
+                        )
+                    if "theta_flow_cate_val_counts" in result:
+                        theta_flow_cate_val_counts[i, j] = np.asarray(
+                            result["theta_flow_cate_val_counts"], dtype=np.int64
+                        )
+                else:
+                    delta = np.asarray(result["delta_l"], dtype=np.float64)
+                    h_dir = h_sq_directed_from_delta_l(delta)
+                    h_cat_sq = h_sq_category_from_sample_directed(h_dir, bins_h, k_cat=k_cat)
+                    h_sqrt_sweep[i, j] = np.sqrt(np.clip(h_cat_sq, 0.0, 1.0))
+                    np.fill_diagonal(h_sqrt_sweep[i, j], 0.0)
                 wall_s[i, j] = time.time() - t0
 
                 m_llr = dbg._llr_comparison_metrics(delta, true_delta_l)
@@ -1082,73 +1276,55 @@ def main(argv: list[str] | None = None) -> None:
                 scatter_true_delta = np.asarray(true_delta_l, dtype=np.float64).copy()
                 if method_name == "bin_gaussian":
                     scatter_cat_h2[method_name] = np.asarray(bg_h2, dtype=np.float64).copy()
+                elif "h_sqrt" in result:
+                    scatter_cat_h2[method_name] = np.asarray(h_cat_sq, dtype=np.float64).copy()
                 else:
-                    scatter_deltas[method_name] = np.asarray(delta, dtype=np.float64).copy()
+                    scatter_deltas[method_name] = np.asarray(delta, dtype=np.float64)
                     scatter_cat_h2[method_name] = np.asarray(h_cat_sq, dtype=np.float64).copy()
 
     decode_sweep = np.stack(decode_sweep_list, axis=0)
-    decode_hellinger_sweep = np.stack(decode_hellinger_sweep_list, axis=0)
     corr_decode = np.full((n_cols,), np.nan, dtype=np.float64)
     nmse_decode = np.full((n_cols,), np.nan, dtype=np.float64)
-    corr_decode_hellinger = np.full((n_cols,), np.nan, dtype=np.float64)
-    nmse_decode_hellinger = np.full((n_cols,), np.nan, dtype=np.float64)
     decode_ref_imp = vhb.impute_offdiag_nan_mean(np.asarray(decode_ref, dtype=np.float64))
-    h_gt_imp = vhb.impute_offdiag_nan_mean(np.asarray(h_gt_sqrt, dtype=np.float64))
     for j in range(n_cols):
         corr_decode[j] = vhb.matrix_corr_offdiag_pearson(
             vhb.impute_offdiag_nan_mean(np.asarray(decode_sweep[j], dtype=np.float64)),
             decode_ref_imp,
         )
-        corr_decode_hellinger[j] = vhb.matrix_corr_offdiag_pearson(
-            vhb.impute_offdiag_nan_mean(np.asarray(decode_hellinger_sweep[j], dtype=np.float64)),
-            h_gt_imp,
-        )
-        nmse_decode_hellinger[j] = _matrix_nmse_offdiag(
-            vhb.impute_offdiag_nan_mean(np.asarray(decode_hellinger_sweep[j], dtype=np.float64)),
-            h_gt_imp,
-        )
     nmse_decode = _nmse_decode_vs_ref(decode_sweep, np.asarray(decode_ref, dtype=np.float64))
 
+    cat_footer = {
+        "h_gt_sqrt": h_gt_sqrt,
+        "decode_ref": decode_ref,
+        "n_ref": int(args.n_ref),
+        "decode_sweep_for_decode_limits": decode_sweep,
+    }
     sweep_svg = _render_method_sweep_panel(
         row_labels=methods,
         h_sweep=h_sqrt_sweep,
         clf_sweep_shared=decode_sweep,
-        clf_hellinger_sweep_shared=decode_hellinger_sweep,
+        clf_hellinger_sweep_shared=None,
         n_list=ns,
         out_svg_path=os.path.join(out_dir, "h_decoding_categorical_twofig_sweep.svg"),
         n_bins=k_cat,
         theta_centers=theta_centers,
         clf_ref_decode_limits=np.asarray(decode_ref, dtype=np.float64),
-    )
-    gt_svg = _render_cat_gt_panel(
-        h_gt_sqrt=h_gt_sqrt,
-        decode_ref=decode_ref,
-        decode_hellinger_ref_sqrt=decode_hellinger_ref_sqrt,
-        n_ref=int(args.n_ref),
-        k_cat=k_cat,
-        theta_centers=theta_centers,
-        out_svg_path=os.path.join(out_dir, "h_decoding_categorical_twofig_gt.svg"),
-        decode_sweep_for_decode_limits=decode_sweep,
+        category_gt_footer=cat_footer,
     )
     zdummy = np.zeros_like(corr_h)
-    corr_svg = _render_corr_vs_n_panel(
+    corr_nmse_svg = _render_corr_nmse_two_panel(
         row_labels=methods,
         n_list=ns,
         corr_h=corr_h,
         corr_decode_shared=corr_decode,
-        corr_decode_hellinger_shared=corr_decode_hellinger,
+        corr_decode_hellinger_shared=None,
         corr_hellinger_lb=zdummy,
         corr_hellinger_ub=zdummy,
         show_hellinger_bounds=False,
-        out_svg_path=os.path.join(out_dir, "h_decoding_categorical_twofig_corr_vs_n.svg"),
-    )
-    nmse_svg = _render_nmse_vs_n_panel(
-        row_labels=methods,
-        n_list=ns,
         nmse_h=nmse_h,
         nmse_decode_shared=nmse_decode,
-        nmse_decode_hellinger_shared=nmse_decode_hellinger,
-        out_svg_path=os.path.join(out_dir, "h_decoding_categorical_twofig_nmse_vs_n.svg"),
+        nmse_decode_hellinger_shared=None,
+        out_svg_path=os.path.join(out_dir, "h_decoding_categorical_twofig_corr_nmse.svg"),
     )
     loss_panel_svg = _render_row_n_training_losses_panel(
         row_labels=methods,
@@ -1165,6 +1341,9 @@ def main(argv: list[str] | None = None) -> None:
                 continue
             hell_cat[name] = scatter_cat_h2[name]
             if name == "bin_gaussian":
+                nan_d = np.full_like(scatter_true_delta, np.nan, dtype=np.float64)
+                metrics_by_method[name] = dbg._llr_comparison_metrics(nan_d, scatter_true_delta)
+            elif name not in scatter_deltas:
                 nan_d = np.full_like(scatter_true_delta, np.nan, dtype=np.float64)
                 metrics_by_method[name] = dbg._llr_comparison_metrics(nan_d, scatter_true_delta)
             else:
@@ -1200,17 +1379,17 @@ def main(argv: list[str] | None = None) -> None:
         hellinger_gt_sq_category=np.asarray(hellinger_gt_sq, dtype=np.float64),
         decode_ref=np.asarray(decode_ref, dtype=np.float64),
         decode_sweep=np.asarray(decode_sweep, dtype=np.float64),
-        decode_hellinger_ref_sqrt=np.asarray(decode_hellinger_ref_sqrt, dtype=np.float64),
-        decode_hellinger_sweep_sqrt=np.asarray(decode_hellinger_sweep, dtype=np.float64),
         h_sqrt_sweep=np.asarray(h_sqrt_sweep, dtype=np.float64),
         corr_h_vs_gt=np.asarray(corr_h, dtype=np.float64),
         nmse_h_vs_gt=np.asarray(nmse_h, dtype=np.float64),
         corr_decode_vs_ref=np.asarray(corr_decode, dtype=np.float64),
         nmse_decode_vs_ref=np.asarray(nmse_decode, dtype=np.float64),
-        corr_decode_hellinger_vs_gt=np.asarray(corr_decode_hellinger, dtype=np.float64),
-        nmse_decode_hellinger_vs_gt=np.asarray(nmse_decode_hellinger, dtype=np.float64),
         llr_pearson_offdiag=np.asarray(llr_pearson_offdiag, dtype=np.float64),
         hellinger_pearson_offdiag_cat=np.asarray(hellinger_pearson_offdiag_cat, dtype=np.float64),
+        theta_flow_cate_num_valid_pairs=np.asarray(theta_flow_cate_num_valid_pairs, dtype=np.int64),
+        theta_flow_cate_num_skipped_pairs=np.asarray(theta_flow_cate_num_skipped_pairs, dtype=np.int64),
+        theta_flow_cate_train_counts=np.asarray(theta_flow_cate_train_counts, dtype=np.int64),
+        theta_flow_cate_val_counts=np.asarray(theta_flow_cate_val_counts, dtype=np.int64),
         wall_seconds=np.asarray(wall_s, dtype=np.float64),
         source_indices=source_indices,
         native_dataset_npz=np.asarray([str(native_npz)], dtype=object),
@@ -1220,7 +1399,7 @@ def main(argv: list[str] | None = None) -> None:
         pr_projected=np.bool_(pr_project),
         pr_dim=np.int64(int(args.pr_dim) if pr_project else native_x_dim),
         training_losses_root=np.asarray([os.path.abspath(loss_root)], dtype=object),
-        hellinger_eval_split=np.asarray([str(getattr(args, "hellinger_eval_split", "all"))], dtype=object),
+        eval_split=np.asarray([eval_split], dtype=object),
     )
 
     summary_path = os.path.join(out_dir, "h_decoding_categorical_twofig_summary.txt")
@@ -1229,9 +1408,7 @@ def main(argv: list[str] | None = None) -> None:
         args=args,
         out_npz=os.path.abspath(out_npz),
         sweep_svg=os.path.abspath(sweep_svg),
-        gt_svg=os.path.abspath(gt_svg),
-        corr_svg=os.path.abspath(corr_svg),
-        nmse_svg=os.path.abspath(nmse_svg),
+        corr_nmse_svg=os.path.abspath(corr_nmse_svg),
         visualization_only=False,
         loss_panel_svg=os.path.abspath(loss_panel_svg),
         training_losses_root=os.path.abspath(loss_root),
@@ -1240,9 +1417,7 @@ def main(argv: list[str] | None = None) -> None:
     print("[cat-twofig] Saved:", flush=True)
     print(f"  - {os.path.abspath(out_npz)}", flush=True)
     print(f"  - {os.path.abspath(sweep_svg)}", flush=True)
-    print(f"  - {os.path.abspath(gt_svg)}", flush=True)
-    print(f"  - {os.path.abspath(corr_svg)}", flush=True)
-    print(f"  - {os.path.abspath(nmse_svg)}", flush=True)
+    print(f"  - {os.path.abspath(corr_nmse_svg)}", flush=True)
     print(f"  - {os.path.abspath(loss_panel_svg)}", flush=True)
     print(f"  - {os.path.abspath(summary_path)}", flush=True)
 

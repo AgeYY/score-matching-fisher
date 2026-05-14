@@ -36,6 +36,7 @@ mamba run -n geo_diffusion python run_fisher.py decoder ... --device cuda
 
 ## Markdown math (`journal/notes/`, AGENTS-facing docs)
 
+- Research journal Markdown under `journal/notes/` lives in the **sibling notes workspace** (see `.cursor/skills/write-md-journal/SKILL.md` for `{NOTES_ROOT}`), not in this repo’s tree by default.
 - Use **dollar delimiters** so math renders consistently in Markdown viewers (e.g. GitHub, many IDEs):
   - **Inline:** `$...$` (e.g. `$\mu(\theta)$`, `$\sqrt{d}$`).
   - **Display (own line):** `$$` on a line, equation, then `$$` on a line.

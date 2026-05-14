@@ -1148,27 +1148,32 @@ def _pairwise_clf_from_bundle(
     clf_random_state: int,
     decode_x_train: np.ndarray | None = None,
     decode_x_all: np.ndarray | None = None,
+    decode_bin_all: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Pairwise bin decoding: train on NPZ train rows, accuracy on NPZ full pool.
+    """Pairwise bin decoding: train on NPZ train rows, accuracy on selected eval rows.
 
     Optional ``decode_x_train`` / ``decode_x_all`` override observation features (e.g. native
-    pre-PR ``x`` for GT decoding while flows still train on embedded ``x``).
+    pre-PR ``x`` for GT decoding while flows still train on embedded ``x``). Optional
+    ``decode_bin_all`` overrides the evaluation labels when ``decode_x_all`` is not aligned
+    with ``subset.bin_all``.
     """
     x_tr = subset.bundle.x_train if decode_x_train is None else decode_x_train
     x_ev = subset.bundle.x_all if decode_x_all is None else decode_x_all
+    bin_ev = subset.bin_all if decode_bin_all is None else decode_bin_all
     x_tr = np.asarray(x_tr, dtype=np.float64)
     x_ev = np.asarray(x_ev, dtype=np.float64)
+    bin_ev = np.asarray(bin_ev, dtype=np.int64).reshape(-1)
     if int(x_tr.shape[0]) != int(subset.bin_train.shape[0]):
         raise ValueError(
             f"decode_x_train rows {x_tr.shape[0]} != bin_train {subset.bin_train.shape[0]}."
         )
-    if int(x_ev.shape[0]) != int(subset.bin_all.shape[0]):
-        raise ValueError(f"decode_x_all rows {x_ev.shape[0]} != bin_all {subset.bin_all.shape[0]}.")
+    if int(x_ev.shape[0]) != int(bin_ev.shape[0]):
+        raise ValueError(f"decode_x_all rows {x_ev.shape[0]} != decode_bin_all {bin_ev.shape[0]}.")
     clf_acc, _, _, _ = vhb.pairwise_bin_logistic_accuracy_train_val(
         x_tr,
         subset.bin_train,
         x_ev,
-        subset.bin_all,
+        bin_ev,
         n_bins,
         min_class_count=int(clf_min_class_count),
         random_state=int(clf_random_state),

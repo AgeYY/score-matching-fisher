@@ -2,17 +2,20 @@
 """Two-figure H/decoding convergence study.
 
 Reuses the full-compute pipeline from ``bin/study_h_decoding_convergence.py``
-but emits only two matrix-figure artifacts:
+but emits compact figure artifacts:
 
 1) ``h_decoding_twofig_sweep.svg``: columns over ``--n-list`` only
    (one row per method for estimated sqrt(H)-like binned matrices, plus one
-   shared bottom row for decoding).
-2) ``h_decoding_twofig_gt.svg``: left = approximate GT sqrt(H^2) matrix
-   (MC likelihood), right = decoding matrix from the ``n_ref`` subset.
+   shared bottom row for decoding) plus a footer row with GT matrices.
+2) ``h_decoding_twofig_corr_nmse.svg``: correlation and normalized-MSE curves
+   stacked vertically.
+
+The sweep footer shows left = approximate GT sqrt(H^2) matrix (MC likelihood),
+right = decoding matrix from the ``n_ref`` subset.
    For PR-embedded archives, that decoding GT uses native (pre-projection) ``x``
    from the source NPZ; estimated rows and sweep decoding still use embedded ``x``.
 
-Also writes correlation, normalized-MSE-vs-n, and training-loss SVGs. Pass
+Also writes a training-loss SVG. Pass
 ``--visualization-only`` with the same ``--output-dir`` as a prior full run to
 regenerate figures from ``h_decoding_twofig_results.npz`` without retraining.
 
@@ -526,6 +529,12 @@ def _run_twofig_visualization_only(
         if loss_root_str and os.path.isdir(loss_root_str)
         else os.path.join(args.output_dir, "training_losses")
     )
+    continuous_footer = {
+        "h_gt_sqrt": h_gt_sqrt,
+        "decode_ref": clf_ref,
+        "n_ref": int(args.n_ref),
+        "decode_sweep_for_decode_limits": clf_sweep_arr,
+    }
 
     sweep_svg = _render_method_sweep_panel(
         row_labels=row_labels,
@@ -536,17 +545,9 @@ def _run_twofig_visualization_only(
         n_bins=n_bins,
         theta_centers=centers,
         clf_ref_decode_limits=np.asarray(clf_ref, dtype=np.float64),
+        continuous_gt_footer=continuous_footer,
     )
-    gt_svg = _render_gt_panel(
-        h_gt_sqrt=h_gt_sqrt,
-        clf_ref=clf_ref,
-        n_ref=int(args.n_ref),
-        n_bins=n_bins,
-        theta_centers=centers,
-        out_svg_path=os.path.join(args.output_dir, "h_decoding_twofig_gt.svg"),
-        clf_sweep_shared_for_decode_limits=np.asarray(clf_sweep_arr, dtype=np.float64),
-    )
-    corr_svg = _render_corr_vs_n_panel(
+    corr_nmse_svg = _render_corr_nmse_two_panel(
         row_labels=row_labels,
         n_list=ns,
         corr_h=corr_h_binned_vs_gt_mc,
@@ -554,14 +555,11 @@ def _run_twofig_visualization_only(
         corr_hellinger_lb=corr_hellinger_lb_vs_decode_shared,
         corr_hellinger_ub=corr_hellinger_ub_vs_decode_shared,
         show_hellinger_bounds=bool(getattr(args, "show_hellinger_bound_corr", False)),
-        out_svg_path=os.path.join(args.output_dir, "h_decoding_twofig_corr_vs_n.svg"),
-    )
-    nmse_svg = _render_nmse_vs_n_panel(
-        row_labels=row_labels,
-        n_list=ns,
+        corr_decode_hellinger_shared=None,
         nmse_h=nmse_h_binned_vs_gt_mc,
         nmse_decode_shared=nmse_decode_vs_ref_shared,
-        out_svg_path=os.path.join(args.output_dir, "h_decoding_twofig_nmse_vs_n.svg"),
+        nmse_decode_hellinger_shared=None,
+        out_svg_path=os.path.join(args.output_dir, "h_decoding_twofig_corr_nmse.svg"),
     )
     loss_panel_svg = _render_row_n_training_losses_panel(
         row_labels=row_labels,
@@ -581,9 +579,7 @@ def _run_twofig_visualization_only(
         perm_seed=int(np.asarray(cached.get("perm_seed", 0)).reshape(-1)[0]),
         out_npz=os.path.abspath(out_npz),
         sweep_svg=os.path.abspath(sweep_svg),
-        gt_svg=os.path.abspath(gt_svg),
-        corr_svg=os.path.abspath(corr_svg),
-        nmse_svg=os.path.abspath(nmse_svg),
+        corr_nmse_svg=os.path.abspath(corr_nmse_svg),
         loss_panel_svg=os.path.abspath(loss_panel_svg),
         training_losses_root=os.path.abspath(loss_root),
         h_sweep_shape=tuple(int(x) for x in h_sweep_arr.shape),
@@ -604,9 +600,7 @@ def _run_twofig_visualization_only(
 
     print("[twofig] Saved (visualization-only):", flush=True)
     print(f"  - {os.path.abspath(sweep_svg)}", flush=True)
-    print(f"  - {os.path.abspath(gt_svg)}", flush=True)
-    print(f"  - {os.path.abspath(corr_svg)}", flush=True)
-    print(f"  - {os.path.abspath(nmse_svg)}", flush=True)
+    print(f"  - {os.path.abspath(corr_nmse_svg)}", flush=True)
     print(f"  - {os.path.abspath(loss_panel_svg)}", flush=True)
     print(f"  - {os.path.abspath(loss_root)}/", flush=True)
     print(f"  - {os.path.abspath(out_npz)} (unchanged)", flush=True)
@@ -706,7 +700,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Include optional Hellinger-derived lower/upper accuracy-bound vs decoding "
-            "correlation curves in h_decoding_twofig_corr_vs_n.svg. By default these "
+            "correlation curves in h_decoding_twofig_corr_nmse.svg. By default these "
             "bound comparisons are computed/saved but not plotted."
         ),
     )
@@ -937,6 +931,89 @@ def _annotate_npz_with_sir(path: str, sir_meta: dict[str, np.ndarray | int | flo
     np.savez_compressed(path, **payload)
 
 
+def _draw_categorical_gt_footer_row(
+    ax_gt: Any,
+    ax_dec: Any,
+    *,
+    h_gt_sqrt: np.ndarray,
+    decode_ref: np.ndarray,
+    n_ref: int,
+    n_bins: int,
+    theta_centers: np.ndarray,
+    decode_sweep_for_decode_limits: np.ndarray | None,
+) -> None:
+    """Left/right heatmaps matching categorical GT panel (analytic + pairwise decoding at n_ref)."""
+    tick_pos, tick_labs, axis_label = _theta_axis_tick_labels(theta_centers, int(n_bins))
+    x_rot = 45 if len(tick_pos) > 6 else 0
+
+    def _one(ax: Any, mat: np.ndarray, title: str, vmin: float, vmax: float) -> None:
+        im = ax.imshow(
+            np.asarray(mat, dtype=np.float64),
+            vmin=float(vmin),
+            vmax=float(vmax),
+            cmap="viridis",
+            aspect="equal",
+            origin="lower",
+        )
+        ax.set_title(title, fontsize=10)
+        ax.set_xticks(tick_pos)
+        ax.set_xticklabels(tick_labs, rotation=x_rot, ha="right" if x_rot else "center", fontsize=11)
+        ax.set_yticks(tick_pos)
+        ax.set_yticklabels(tick_labs, fontsize=11)
+        ax.set_xlabel(axis_label, fontsize=11)
+        conv._matrix_axes_show_top_right_spines(ax)
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04).ax.tick_params(labelsize=11)
+
+    _one(ax_gt, h_gt_sqrt, r"Analytic GT $\sqrt{H^2}$ (category)", 0.0, 1.0)
+    ax_gt.set_ylabel("category", fontsize=11)
+    lim_arrays: list[np.ndarray] = [np.asarray(decode_ref, dtype=np.float64)]
+    if decode_sweep_for_decode_limits is not None:
+        dsw = np.asarray(decode_sweep_for_decode_limits, dtype=np.float64)
+        for j in range(int(dsw.shape[0])):
+            lim_arrays.append(np.asarray(dsw[j], dtype=np.float64))
+    vmin_c, vmax_c = _decode_accuracy_color_limits(*lim_arrays)
+    _one(ax_dec, decode_ref, f"Pairwise decoding (n_ref={int(n_ref)})", vmin_c, vmax_c)
+
+
+def _draw_continuous_gt_footer_row(
+    ax_gt: Any,
+    ax_dec: Any,
+    *,
+    h_gt_sqrt: np.ndarray,
+    decode_ref: np.ndarray,
+    n_ref: int,
+    n_bins: int,
+    theta_centers: np.ndarray,
+    decode_sweep_for_decode_limits: np.ndarray | None,
+) -> None:
+    """Left/right heatmaps matching continuous GT panel (MC Hellinger + n_ref decoding)."""
+    _draw_single_heatmap(
+        ax_gt,
+        h_gt_sqrt,
+        n_bins=n_bins,
+        theta_centers=theta_centers,
+        title="Approx GT H matrix",
+        vmin=0.0,
+        vmax=1.0,
+    )
+    ax_gt.set_ylabel(r"$\theta$", fontsize=11)
+    lim_parts: list[np.ndarray] = [np.asarray(decode_ref, dtype=np.float64)]
+    if decode_sweep_for_decode_limits is not None:
+        dsw = np.asarray(decode_sweep_for_decode_limits, dtype=np.float64)
+        for j in range(int(dsw.shape[0])):
+            lim_parts.append(np.asarray(dsw[j], dtype=np.float64))
+    vmin_c, vmax_c = _decode_accuracy_color_limits(*lim_parts)
+    _draw_single_heatmap(
+        ax_dec,
+        decode_ref,
+        n_bins=n_bins,
+        theta_centers=theta_centers,
+        title=f"Approx GT decoding (n_ref={int(n_ref)})",
+        vmin=vmin_c,
+        vmax=vmax_c,
+    )
+
+
 def _render_method_sweep_panel(
     *,
     row_labels: list[str],
@@ -948,7 +1025,11 @@ def _render_method_sweep_panel(
     theta_centers: np.ndarray,
     clf_hellinger_sweep_shared: np.ndarray | None = None,
     clf_ref_decode_limits: np.ndarray | None = None,
+    category_gt_footer: dict[str, Any] | None = None,
+    continuous_gt_footer: dict[str, Any] | None = None,
 ) -> str:
+    if category_gt_footer is not None and continuous_gt_footer is not None:
+        raise ValueError("Pass at most one of category_gt_footer or continuous_gt_footer.")
     n_methods = len(row_labels)
     n_cols = len(n_list)
     if h_sweep.shape[:2] != (n_methods, n_cols):
@@ -971,7 +1052,7 @@ def _render_method_sweep_panel(
 
     n_extra = 2 if clf_h_shared is not None else 1
     n_rows = n_methods + n_extra
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(2.8 * n_cols, 2.5 * n_rows), squeeze=False)
+    decode_row = n_methods + (1 if clf_h_shared is not None else 0)
 
     tick_pos, tick_labs, axis_label = _theta_axis_tick_labels(theta_centers, n_bins)
     x_rot = 45 if len(tick_pos) > 6 else 0
@@ -984,81 +1065,135 @@ def _render_method_sweep_panel(
         decode_lim_parts.append(np.asarray(clf_ref_decode_limits, dtype=np.float64))
     vmin_c, vmax_c = _decode_accuracy_color_limits(*decode_lim_parts)
 
-    for m_idx, label in enumerate(row_labels):
+    def _draw_sweep_cells(axes: np.ndarray) -> None:
+        for m_idx, label in enumerate(row_labels):
+            for c_idx, n in enumerate(n_list):
+                ax_h = axes[m_idx, c_idx]
+                im_h = ax_h.imshow(
+                    np.asarray(h_sweep[m_idx, c_idx], dtype=np.float64),
+                    vmin=vmin_h,
+                    vmax=vmax_h,
+                    cmap="viridis",
+                    aspect="equal",
+                    origin="lower",
+                )
+                if m_idx == 0:
+                    ax_h.set_title(f"n={int(n)}", fontsize=10)
+                ax_h.set_xticks(tick_pos)
+                ax_h.set_xticklabels(tick_labs, rotation=x_rot, ha="right" if x_rot else "center", fontsize=11)
+                ax_h.set_yticks(tick_pos)
+                ax_h.set_yticklabels(tick_labs, fontsize=11)
+                conv._matrix_axes_show_top_right_spines(ax_h)
+                if c_idx == 0:
+                    ax_h.set_ylabel(f"{label} | sqrt(H^2)", fontsize=11)
+                if m_idx == (n_methods - 1):
+                    ax_h.set_xlabel(axis_label, fontsize=11)
+                if c_idx == (n_cols - 1):
+                    cb_h = plt.colorbar(im_h, ax=ax_h, fraction=0.046, pad=0.04)
+                    cb_h.ax.tick_params(labelsize=11)
+
+        if clf_h_shared is not None:
+            clf_h_row = n_methods
+            for c_idx, n in enumerate(n_list):
+                ax_ch = axes[clf_h_row, c_idx]
+                im_ch = ax_ch.imshow(
+                    np.asarray(clf_h_shared[c_idx], dtype=np.float64),
+                    vmin=vmin_h,
+                    vmax=vmax_h,
+                    cmap="viridis",
+                    aspect="equal",
+                    origin="lower",
+                )
+                ax_ch.set_xticks(tick_pos)
+                ax_ch.set_xticklabels(tick_labs, rotation=x_rot, ha="right" if x_rot else "center", fontsize=11)
+                ax_ch.set_yticks(tick_pos)
+                ax_ch.set_yticklabels(tick_labs, fontsize=11)
+                conv._matrix_axes_show_top_right_spines(ax_ch)
+                if c_idx == 0:
+                    ax_ch.set_ylabel("classifier LLR | sqrt(H^2)", fontsize=11)
+                ax_ch.set_xlabel(axis_label, fontsize=11)
+                if c_idx == (n_cols - 1):
+                    cb_ch = plt.colorbar(im_ch, ax=ax_ch, fraction=0.046, pad=0.04)
+                    cb_ch.ax.tick_params(labelsize=11)
+
         for c_idx, n in enumerate(n_list):
-            ax_h = axes[m_idx, c_idx]
-            im_h = ax_h.imshow(
-                np.asarray(h_sweep[m_idx, c_idx], dtype=np.float64),
-                vmin=vmin_h,
-                vmax=vmax_h,
+            ax_c = axes[decode_row, c_idx]
+            im_c = ax_c.imshow(
+                np.asarray(clf_sweep_shared[c_idx], dtype=np.float64),
+                vmin=vmin_c,
+                vmax=vmax_c,
                 cmap="viridis",
                 aspect="equal",
                 origin="lower",
             )
-            if m_idx == 0:
-                ax_h.set_title(f"n={int(n)}", fontsize=10)
-            ax_h.set_xticks(tick_pos)
-            ax_h.set_xticklabels(tick_labs, rotation=x_rot, ha="right" if x_rot else "center", fontsize=11)
-            ax_h.set_yticks(tick_pos)
-            ax_h.set_yticklabels(tick_labs, fontsize=11)
-            conv._matrix_axes_show_top_right_spines(ax_h)
+            ax_c.set_xticks(tick_pos)
+            ax_c.set_xticklabels(tick_labs, rotation=x_rot, ha="right" if x_rot else "center", fontsize=11)
+            ax_c.set_yticks(tick_pos)
+            ax_c.set_yticklabels(tick_labs, fontsize=11)
+            conv._matrix_axes_show_top_right_spines(ax_c)
             if c_idx == 0:
-                ax_h.set_ylabel(f"{label} | sqrt(H^2)", fontsize=11)
-            if m_idx == (n_methods - 1):
-                ax_h.set_xlabel(axis_label, fontsize=11)
+                ax_c.set_ylabel("decoding", fontsize=11)
+            ax_c.set_xlabel(axis_label, fontsize=11)
             if c_idx == (n_cols - 1):
-                cb_h = plt.colorbar(im_h, ax=ax_h, fraction=0.046, pad=0.04)
-                cb_h.ax.tick_params(labelsize=11)
+                cb_c = plt.colorbar(im_c, ax=ax_c, fraction=0.046, pad=0.04)
+                cb_c.ax.tick_params(labelsize=11)
 
-    if clf_h_shared is not None:
-        clf_h_row = n_methods
-        for c_idx, n in enumerate(n_list):
-            ax_ch = axes[clf_h_row, c_idx]
-            im_ch = ax_ch.imshow(
-                np.asarray(clf_h_shared[c_idx], dtype=np.float64),
-                vmin=vmin_h,
-                vmax=vmax_h,
-                cmap="viridis",
-                aspect="equal",
-                origin="lower",
-            )
-            ax_ch.set_xticks(tick_pos)
-            ax_ch.set_xticklabels(tick_labs, rotation=x_rot, ha="right" if x_rot else "center", fontsize=11)
-            ax_ch.set_yticks(tick_pos)
-            ax_ch.set_yticklabels(tick_labs, fontsize=11)
-            conv._matrix_axes_show_top_right_spines(ax_ch)
-            if c_idx == 0:
-                ax_ch.set_ylabel("classifier LLR | sqrt(H^2)", fontsize=11)
-            ax_ch.set_xlabel(axis_label, fontsize=11)
-            if c_idx == (n_cols - 1):
-                cb_ch = plt.colorbar(im_ch, ax=ax_ch, fraction=0.046, pad=0.04)
-                cb_ch.ax.tick_params(labelsize=11)
-
-    decode_row = n_methods + (1 if clf_h_shared is not None else 0)
-    for c_idx, n in enumerate(n_list):
-        ax_c = axes[decode_row, c_idx]
-        im_c = ax_c.imshow(
-            np.asarray(clf_sweep_shared[c_idx], dtype=np.float64),
-            vmin=vmin_c,
-            vmax=vmax_c,
-            cmap="viridis",
-            aspect="equal",
-            origin="lower",
+    footer = category_gt_footer if category_gt_footer is not None else continuous_gt_footer
+    if footer is None:
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(2.8 * n_cols, 2.5 * n_rows), squeeze=False)
+        _draw_sweep_cells(np.asarray(axes, dtype=object))
+        fig.tight_layout()
+        fig.subplots_adjust(hspace=0.12)
+    else:
+        foot = dict(footer)
+        need = ("h_gt_sqrt", "decode_ref", "n_ref")
+        for k in need:
+            if k not in foot:
+                footer_name = "category_gt_footer" if category_gt_footer is not None else "continuous_gt_footer"
+                raise ValueError(f"{footer_name} missing required key {k!r}")
+        fig_h = 2.5 * (n_rows + 1)
+        fig = plt.figure(figsize=(2.8 * n_cols, fig_h))
+        gs = fig.add_gridspec(
+            n_rows + 1,
+            n_cols,
+            height_ratios=[1.0] * n_rows + [1.0],
+            hspace=0.12,
         )
-        ax_c.set_xticks(tick_pos)
-        ax_c.set_xticklabels(tick_labs, rotation=x_rot, ha="right" if x_rot else "center", fontsize=11)
-        ax_c.set_yticks(tick_pos)
-        ax_c.set_yticklabels(tick_labs, fontsize=11)
-        conv._matrix_axes_show_top_right_spines(ax_c)
-        if c_idx == 0:
-            ax_c.set_ylabel("decoding", fontsize=11)
-        ax_c.set_xlabel(axis_label, fontsize=11)
-        if c_idx == (n_cols - 1):
-            cb_c = plt.colorbar(im_c, ax=ax_c, fraction=0.046, pad=0.04)
-            cb_c.ax.tick_params(labelsize=11)
+        axes = np.empty((n_rows, n_cols), dtype=object)
+        for i in range(n_rows):
+            for j in range(n_cols):
+                axes[i, j] = fig.add_subplot(gs[i, j])
+        _draw_sweep_cells(axes)
+        # n_cols==1: footer still uses two panels side-by-side spanning the full width.
+        sub_gs = gs[n_rows, :].subgridspec(1, 2, wspace=0.35)
+        ax_gt = fig.add_subplot(sub_gs[0, 0])
+        ax_dec = fig.add_subplot(sub_gs[0, 1])
+        dlim = foot.get("decode_sweep_for_decode_limits")
+        dlim_arr = None if dlim is None else np.asarray(dlim, dtype=np.float64)
+        if category_gt_footer is not None:
+            _draw_categorical_gt_footer_row(
+                ax_gt,
+                ax_dec,
+                h_gt_sqrt=np.asarray(foot["h_gt_sqrt"], dtype=np.float64),
+                decode_ref=np.asarray(foot["decode_ref"], dtype=np.float64),
+                n_ref=int(foot["n_ref"]),
+                n_bins=int(n_bins),
+                theta_centers=theta_centers,
+                decode_sweep_for_decode_limits=dlim_arr,
+            )
+        else:
+            _draw_continuous_gt_footer_row(
+                ax_gt,
+                ax_dec,
+                h_gt_sqrt=np.asarray(foot["h_gt_sqrt"], dtype=np.float64),
+                decode_ref=np.asarray(foot["decode_ref"], dtype=np.float64),
+                n_ref=int(foot["n_ref"]),
+                n_bins=int(n_bins),
+                theta_centers=theta_centers,
+                decode_sweep_for_decode_limits=dlim_arr,
+            )
+        fig.subplots_adjust(hspace=0.12)
 
-    fig.tight_layout()
-    fig.subplots_adjust(hspace=0.12)
     svg = _save_figure_svg(fig, out_svg_path)
     plt.close(fig)
     return svg
@@ -1112,32 +1247,15 @@ def _render_gt_panel(
     clf_sweep_shared_for_decode_limits: np.ndarray | None = None,
 ) -> str:
     fig, axes = plt.subplots(1, 2, figsize=(6.2, 3.2), squeeze=False)
-    ax_h = axes[0, 0]
-    ax_c = axes[0, 1]
-    _draw_single_heatmap(
-        ax_h,
-        h_gt_sqrt,
+    _draw_continuous_gt_footer_row(
+        axes[0, 0],
+        axes[0, 1],
+        h_gt_sqrt=h_gt_sqrt,
+        decode_ref=clf_ref,
+        n_ref=n_ref,
         n_bins=n_bins,
         theta_centers=theta_centers,
-        title="Approx GT H matrix",
-        vmin=0.0,
-        vmax=1.0,
-    )
-    ax_h.set_ylabel(r"$\theta$", fontsize=11)
-    lim_parts: list[np.ndarray] = [np.asarray(clf_ref, dtype=np.float64)]
-    if clf_sweep_shared_for_decode_limits is not None:
-        sw = np.asarray(clf_sweep_shared_for_decode_limits, dtype=np.float64)
-        for j in range(int(sw.shape[0])):
-            lim_parts.append(np.asarray(sw[j], dtype=np.float64))
-    vmin_c, vmax_c = _decode_accuracy_color_limits(*lim_parts)
-    _draw_single_heatmap(
-        ax_c,
-        clf_ref,
-        n_bins=n_bins,
-        theta_centers=theta_centers,
-        title=f"Approx GT decoding (n_ref={int(n_ref)})",
-        vmin=vmin_c,
-        vmax=vmax_c,
+        decode_sweep_for_decode_limits=clf_sweep_shared_for_decode_limits,
     )
     fig.tight_layout()
     svg = _save_figure_svg(fig, out_svg_path)
@@ -1154,9 +1272,7 @@ def _write_summary(
     perm_seed: int,
     out_npz: str,
     sweep_svg: str,
-    gt_svg: str,
-    corr_svg: str,
-    nmse_svg: str,
+    corr_nmse_svg: str,
     loss_panel_svg: str,
     training_losses_root: str,
     h_sweep_shape: tuple[int, ...],
@@ -1229,9 +1345,7 @@ def _write_summary(
         f.write("decode_sweep_semantics: shared_across_methods\n")
         f.write(f"wall_seconds_shape: {wall_seconds_shape}\n")
         f.write(f"figure_sweep_svg: {sweep_svg}\n")
-        f.write(f"figure_gt_svg: {gt_svg}\n")
-        f.write(f"figure_corr_vs_n_svg: {corr_svg}\n")
-        f.write(f"figure_nmse_vs_n_svg: {nmse_svg}\n")
+        f.write(f"figure_corr_nmse_svg: {corr_nmse_svg}\n")
         f.write(f"figure_training_losses_panel_svg: {loss_panel_svg}\n")
         f.write(f"training_losses_root: {training_losses_root}\n")
 
@@ -1327,15 +1441,15 @@ def _render_row_n_training_losses_panel(
     return svg
 
 
-def _render_nmse_vs_n_panel(
+def _plot_nmse_vs_n_on_ax(
+    ax: Any,
     *,
     row_labels: list[str],
     n_list: list[int],
     nmse_h: np.ndarray,
     nmse_decode_shared: np.ndarray,
-    out_svg_path: str,
-    nmse_decode_hellinger_shared: np.ndarray | None = None,
-) -> str:
+    nmse_decode_hellinger_shared: np.ndarray | None,
+) -> None:
     nmse_arr = np.asarray(nmse_h, dtype=np.float64)
     nmse_decode_arr = np.asarray(nmse_decode_shared, dtype=np.float64).ravel()
     nmse_decode_h_arr = None
@@ -1356,7 +1470,6 @@ def _render_nmse_vs_n_panel(
             f"got {nmse_decode_h_arr.shape}."
         )
 
-    fig, ax = plt.subplots(1, 1, figsize=(3.5, 3.5))
     for i, label in enumerate(row_labels):
         ax.plot(
             n_arr,
@@ -1385,7 +1498,7 @@ def _render_nmse_vs_n_panel(
             marker="D",
             linewidth=1.6,
             markersize=3.5,
-            label="classifier LLR H (shared)",
+            label="classifier LLR sqrt(H^2) vs analytic GT (shared)",
         )
     finite_h = nmse_arr[np.isfinite(nmse_arr)]
     finite_d = nmse_decode_arr[np.isfinite(nmse_decode_arr)]
@@ -1400,13 +1513,34 @@ def _render_nmse_vs_n_panel(
     ax.set_title("NMSE vs n", fontsize=11)
     ax.grid(True, alpha=0.35)
     ax.legend(loc="best", fontsize=8)
+
+
+def _render_nmse_vs_n_panel(
+    *,
+    row_labels: list[str],
+    n_list: list[int],
+    nmse_h: np.ndarray,
+    nmse_decode_shared: np.ndarray,
+    out_svg_path: str,
+    nmse_decode_hellinger_shared: np.ndarray | None = None,
+) -> str:
+    fig, ax = plt.subplots(1, 1, figsize=(3.5, 3.5))
+    _plot_nmse_vs_n_on_ax(
+        ax,
+        row_labels=row_labels,
+        n_list=n_list,
+        nmse_h=nmse_h,
+        nmse_decode_shared=nmse_decode_shared,
+        nmse_decode_hellinger_shared=nmse_decode_hellinger_shared,
+    )
     fig.tight_layout()
     svg = _save_figure_svg(fig, out_svg_path)
     plt.close(fig)
     return svg
 
 
-def _render_corr_vs_n_panel(
+def _plot_corr_vs_n_on_ax(
+    ax: Any,
     *,
     row_labels: list[str],
     n_list: list[int],
@@ -1415,9 +1549,9 @@ def _render_corr_vs_n_panel(
     corr_hellinger_lb: np.ndarray,
     corr_hellinger_ub: np.ndarray,
     show_hellinger_bounds: bool,
-    out_svg_path: str,
-    corr_decode_hellinger_shared: np.ndarray | None = None,
-) -> str:
+    corr_decode_hellinger_shared: np.ndarray | None,
+    with_xlabel: bool = True,
+) -> None:
     corr_h_arr = np.asarray(corr_h, dtype=np.float64)
     corr_decode_arr = np.asarray(corr_decode_shared, dtype=np.float64).ravel()
     corr_decode_h_arr = None
@@ -1446,7 +1580,6 @@ def _render_corr_vs_n_panel(
             f"corr_decode_hellinger shape mismatch: expected {(len(n_list),)}, got {corr_decode_h_arr.shape}."
         )
 
-    fig, ax = plt.subplots(1, 1, figsize=(4.8, 3.8))
     colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", [])
     for i, label in enumerate(row_labels):
         color = colors[i % len(colors)] if colors else None
@@ -1499,14 +1632,85 @@ def _render_corr_vs_n_panel(
             marker="D",
             linewidth=1.6,
             markersize=3.5,
-            label="classifier LLR H vs GT (shared)",
+            label="classifier LLR sqrt(H^2) vs analytic GT (shared)",
         )
-    ax.set_xlabel("dataset size n", fontsize=10)
+    if with_xlabel:
+        ax.set_xlabel("dataset size n", fontsize=10)
     ax.set_ylabel("correlation (off-diagonal Pearson r)", fontsize=10)
     ax.set_title("Correlation vs n", fontsize=11)
     ax.grid(True, alpha=0.35)
     ax.legend(loc="best", fontsize=8)
+
+
+def _render_corr_vs_n_panel(
+    *,
+    row_labels: list[str],
+    n_list: list[int],
+    corr_h: np.ndarray,
+    corr_decode_shared: np.ndarray,
+    corr_hellinger_lb: np.ndarray,
+    corr_hellinger_ub: np.ndarray,
+    show_hellinger_bounds: bool,
+    out_svg_path: str,
+    corr_decode_hellinger_shared: np.ndarray | None = None,
+) -> str:
+    fig, ax = plt.subplots(1, 1, figsize=(4.8, 3.8))
+    _plot_corr_vs_n_on_ax(
+        ax,
+        row_labels=row_labels,
+        n_list=n_list,
+        corr_h=corr_h,
+        corr_decode_shared=corr_decode_shared,
+        corr_hellinger_lb=corr_hellinger_lb,
+        corr_hellinger_ub=corr_hellinger_ub,
+        show_hellinger_bounds=show_hellinger_bounds,
+        corr_decode_hellinger_shared=corr_decode_hellinger_shared,
+        with_xlabel=True,
+    )
     fig.tight_layout()
+    svg = _save_figure_svg(fig, out_svg_path)
+    plt.close(fig)
+    return svg
+
+
+def _render_corr_nmse_two_panel(
+    *,
+    row_labels: list[str],
+    n_list: list[int],
+    corr_h: np.ndarray,
+    corr_decode_shared: np.ndarray,
+    corr_hellinger_lb: np.ndarray,
+    corr_hellinger_ub: np.ndarray,
+    show_hellinger_bounds: bool,
+    corr_decode_hellinger_shared: np.ndarray | None,
+    nmse_h: np.ndarray,
+    nmse_decode_shared: np.ndarray,
+    nmse_decode_hellinger_shared: np.ndarray | None,
+    out_svg_path: str,
+) -> str:
+    fig, axes2 = plt.subplots(2, 1, figsize=(4.8, 6.8), sharex=True, squeeze=False, layout="constrained")
+    ax_corr = axes2[0, 0]
+    ax_nmse = axes2[1, 0]
+    _plot_corr_vs_n_on_ax(
+        ax_corr,
+        row_labels=row_labels,
+        n_list=n_list,
+        corr_h=corr_h,
+        corr_decode_shared=corr_decode_shared,
+        corr_hellinger_lb=corr_hellinger_lb,
+        corr_hellinger_ub=corr_hellinger_ub,
+        show_hellinger_bounds=show_hellinger_bounds,
+        corr_decode_hellinger_shared=corr_decode_hellinger_shared,
+        with_xlabel=False,
+    )
+    _plot_nmse_vs_n_on_ax(
+        ax_nmse,
+        row_labels=row_labels,
+        n_list=n_list,
+        nmse_h=nmse_h,
+        nmse_decode_shared=nmse_decode_shared,
+        nmse_decode_hellinger_shared=nmse_decode_hellinger_shared,
+    )
     svg = _save_figure_svg(fig, out_svg_path)
     plt.close(fig)
     return svg
@@ -1968,6 +2172,12 @@ def main(argv: list[str] | None = None, *, sir_first_default: bool = False) -> N
     )
     nmse_h_binned_vs_gt_mc = _nmse_h_binned_vs_gt_mc(h_sweep_arr, h_gt_sqrt)
     nmse_decode_vs_ref_shared = _nmse_decode_vs_ref_shared(clf_sweep_arr, clf_ref)
+    continuous_footer = {
+        "h_gt_sqrt": h_gt_sqrt,
+        "decode_ref": clf_ref,
+        "n_ref": int(args.n_ref),
+        "decode_sweep_for_decode_limits": clf_sweep_arr,
+    }
 
     sweep_svg = _render_method_sweep_panel(
         row_labels=row_labels,
@@ -1978,18 +2188,9 @@ def main(argv: list[str] | None = None, *, sir_first_default: bool = False) -> N
         n_bins=n_bins,
         theta_centers=centers,
         clf_ref_decode_limits=np.asarray(clf_ref, dtype=np.float64),
+        continuous_gt_footer=continuous_footer,
     )
-
-    gt_svg = _render_gt_panel(
-        h_gt_sqrt=h_gt_sqrt,
-        clf_ref=clf_ref,
-        n_ref=int(args.n_ref),
-        n_bins=n_bins,
-        theta_centers=centers,
-        out_svg_path=os.path.join(args.output_dir, "h_decoding_twofig_gt.svg"),
-        clf_sweep_shared_for_decode_limits=np.asarray(clf_sweep_arr, dtype=np.float64),
-    )
-    corr_svg = _render_corr_vs_n_panel(
+    corr_nmse_svg = _render_corr_nmse_two_panel(
         row_labels=row_labels,
         n_list=ns,
         corr_h=corr_h_binned_vs_gt_mc,
@@ -1997,14 +2198,11 @@ def main(argv: list[str] | None = None, *, sir_first_default: bool = False) -> N
         corr_hellinger_lb=corr_hellinger_lb_vs_decode_shared,
         corr_hellinger_ub=corr_hellinger_ub_vs_decode_shared,
         show_hellinger_bounds=bool(getattr(args, "show_hellinger_bound_corr", False)),
-        out_svg_path=os.path.join(args.output_dir, "h_decoding_twofig_corr_vs_n.svg"),
-    )
-    nmse_svg = _render_nmse_vs_n_panel(
-        row_labels=row_labels,
-        n_list=ns,
+        corr_decode_hellinger_shared=None,
         nmse_h=nmse_h_binned_vs_gt_mc,
         nmse_decode_shared=nmse_decode_vs_ref_shared,
-        out_svg_path=os.path.join(args.output_dir, "h_decoding_twofig_nmse_vs_n.svg"),
+        nmse_decode_hellinger_shared=None,
+        out_svg_path=os.path.join(args.output_dir, "h_decoding_twofig_corr_nmse.svg"),
     )
     loss_panel_svg = _render_row_n_training_losses_panel(
         row_labels=row_labels,
@@ -2068,8 +2266,9 @@ def main(argv: list[str] | None = None, *, sir_first_default: bool = False) -> N
         corr_decode_vs_ref_shared=np.asarray(corr_decode_vs_ref_shared, dtype=np.float64),
         nmse_decode_vs_ref_shared=np.asarray(nmse_decode_vs_ref_shared, dtype=np.float64),
         column_n=np.asarray(ns, dtype=np.int64),
-        corr_curve_svg=np.asarray(os.path.abspath(corr_svg), dtype=np.str_),
-        nmse_curve_svg=np.asarray(os.path.abspath(nmse_svg), dtype=np.str_),
+        corr_curve_svg=np.asarray(os.path.abspath(corr_nmse_svg), dtype=np.str_),
+        nmse_curve_svg=np.asarray(os.path.abspath(corr_nmse_svg), dtype=np.str_),
+        corr_nmse_curve_svg=np.asarray(os.path.abspath(corr_nmse_svg), dtype=np.str_),
         training_losses_root=np.asarray(os.path.abspath(loss_root), dtype=np.str_),
         training_losses_panel_svg=np.asarray(os.path.abspath(loss_panel_svg), dtype=np.str_),
         dataset_npz=np.asarray(os.path.abspath(str(args.dataset_npz)), dtype=np.str_),
@@ -2092,9 +2291,7 @@ def main(argv: list[str] | None = None, *, sir_first_default: bool = False) -> N
         perm_seed=perm_seed,
         out_npz=os.path.abspath(out_npz),
         sweep_svg=os.path.abspath(sweep_svg),
-        gt_svg=os.path.abspath(gt_svg),
-        corr_svg=os.path.abspath(corr_svg),
-        nmse_svg=os.path.abspath(nmse_svg),
+        corr_nmse_svg=os.path.abspath(corr_nmse_svg),
         loss_panel_svg=os.path.abspath(loss_panel_svg),
         training_losses_root=os.path.abspath(loss_root),
         h_sweep_shape=tuple(int(x) for x in h_sweep_arr.shape),
@@ -2114,9 +2311,7 @@ def main(argv: list[str] | None = None, *, sir_first_default: bool = False) -> N
 
     print("[twofig] Saved:", flush=True)
     print(f"  - {os.path.abspath(sweep_svg)}", flush=True)
-    print(f"  - {os.path.abspath(gt_svg)}", flush=True)
-    print(f"  - {os.path.abspath(corr_svg)}", flush=True)
-    print(f"  - {os.path.abspath(nmse_svg)}", flush=True)
+    print(f"  - {os.path.abspath(corr_nmse_svg)}", flush=True)
     print(f"  - {os.path.abspath(loss_panel_svg)}", flush=True)
     print(f"  - {os.path.abspath(loss_root)}/", flush=True)
     print(f"  - {os.path.abspath(out_npz)}", flush=True)
