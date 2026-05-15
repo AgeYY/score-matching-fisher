@@ -22,6 +22,9 @@ from fisher.h_decoding_categorical_twofig import (
     _validate_cached_cli,
     _save_method_training_loss_npz,
     _validation_only_work_sweep_subset,
+    _fit_lda_weighted_projection,
+    _fit_pca_weighted_projection,
+    _fit_pls_weighted_projection,
 )
 from fisher.h_matrix import HMatrixEstimator
 from fisher import h_decoding_convergence as conv
@@ -91,8 +94,123 @@ def test_parse_methods_aliases_and_dedup() -> None:
     assert parse_methods("bin_gaussian_cate") == ["bin_gaussian"]
     assert parse_methods("theta-flow-cate, theta_flow_cate, thetaflow-cate") == ["theta_flow_cate"]
     assert parse_methods("ctsm-v, ctsm_v, ctsm") == ["ctsm_v"]
+    assert parse_methods("lda-ctsm-v, lda_ctsm_v, ldactsm-v") == ["lda_ctsm_v"]
+    assert parse_methods("pls-ctsm-v, pls_ctsm_v, plsctsm-v") == ["pls_ctsm_v"]
+    assert parse_methods("pca-ctsm-v, pca_ctsm_v, pcactsm-v") == ["pca_ctsm_v"]
     with pytest.raises(ValueError, match="Unknown method"):
         parse_methods("theta_flow")
+
+
+def test_fit_lda_weighted_projection_shapes_weights_and_order() -> None:
+    x_train = np.array(
+        [
+            [-2.0, 0.0, 0.1],
+            [-1.0, 0.2, -0.1],
+            [1.0, 0.0, 0.0],
+            [2.0, -0.1, 0.2],
+        ],
+        dtype=np.float64,
+    )
+    bins_train = np.array([0, 0, 1, 1], dtype=np.int64)
+    x_val = x_train[:2] + 0.5
+    x_all = x_train.copy()
+
+    z_train, z_val, z_all, meta = _fit_lda_weighted_projection(
+        x_train=x_train,
+        bins_train=bins_train,
+        x_val=x_val,
+        x_all=x_all,
+        shrinkage=1e-2,
+        eps=1e-6,
+        max_dim=2,
+    )
+
+    assert z_train.shape == (4, 2)
+    assert z_val.shape == (2, 2)
+    assert z_all.shape == (4, 2)
+    weights = np.asarray(meta["lda_ctsm_weights"], dtype=np.float64)
+    eigvals = np.asarray(meta["lda_ctsm_eigenvalues"], dtype=np.float64)
+    assert np.all(np.isfinite(weights))
+    assert np.all(weights > 0.0)
+    assert float(np.sum(weights)) == pytest.approx(2.0)
+    assert np.all(eigvals[:-1] >= eigvals[1:] - 1e-12)
+    assert np.asarray(meta["lda_ctsm_transform"]).shape == (2, 3)
+
+
+def test_fit_pls_weighted_projection_shapes_weights_and_metadata() -> None:
+    x_train = np.array(
+        [
+            [-2.0, 0.0, 0.1],
+            [-1.0, 0.2, -0.1],
+            [1.0, 0.0, 0.0],
+            [2.0, -0.1, 0.2],
+            [2.5, 0.1, -0.2],
+        ],
+        dtype=np.float64,
+    )
+    bins_train = np.array([0, 0, 1, 1, 1], dtype=np.int64)
+    x_val = x_train[:2] + 0.25
+    x_all = x_train.copy()
+
+    z_train, z_val, z_all, meta = _fit_pls_weighted_projection(
+        x_train=x_train,
+        bins_train=bins_train,
+        x_val=x_val,
+        x_all=x_all,
+        eps=1e-6,
+        max_dim=2,
+        scale_x=True,
+        max_iter=100,
+        tol=1e-7,
+    )
+
+    assert z_train.shape == (5, 2)
+    assert z_val.shape == (2, 2)
+    assert z_all.shape == (5, 2)
+    weights = np.asarray(meta["pls_ctsm_weights"], dtype=np.float64)
+    scores = np.asarray(meta["pls_ctsm_covariance_scores"], dtype=np.float64)
+    assert np.all(np.isfinite(weights))
+    assert np.all(weights > 0.0)
+    assert float(np.sum(weights)) == pytest.approx(2.0)
+    assert np.all(scores >= -1e-12)
+    assert np.asarray(meta["pls_ctsm_transform"]).shape == (2, 3)
+    assert bool(meta["pls_ctsm_scale_x"])
+
+
+def test_fit_pca_weighted_projection_shapes_weights_and_metadata() -> None:
+    x_train = np.array(
+        [
+            [-2.0, 0.0, 0.1],
+            [-1.0, 0.2, -0.1],
+            [1.0, 0.0, 0.0],
+            [2.0, -0.1, 0.2],
+        ],
+        dtype=np.float64,
+    )
+    x_val = x_train[:2] + 0.25
+    x_all = x_train.copy()
+
+    z_train, z_val, z_all, meta = _fit_pca_weighted_projection(
+        x_train=x_train,
+        x_val=x_val,
+        x_all=x_all,
+        eps=1e-6,
+        max_dim=2,
+        scale_x=True,
+    )
+
+    assert z_train.shape == (4, 2)
+    assert z_val.shape == (2, 2)
+    assert z_all.shape == (4, 2)
+    weights = np.asarray(meta["pca_ctsm_weights"], dtype=np.float64)
+    explained = np.asarray(meta["pca_ctsm_explained_variance"], dtype=np.float64)
+    assert np.all(np.isfinite(weights))
+    assert np.all(weights > 0.0)
+    assert float(np.sum(weights)) == pytest.approx(2.0)
+    assert np.all(explained[:-1] >= explained[1:] - 1e-12)
+    assert np.asarray(meta["pca_ctsm_components"]).shape == (3, 2)
+    assert np.asarray(meta["pca_ctsm_transform"]).shape == (2, 3)
+    assert bool(meta["pca_ctsm_scale_x"])
 
 
 def test_decode_accuracy_color_limits() -> None:
@@ -165,6 +283,158 @@ def test_h_matrix_ctsm_accepts_one_hot_theta() -> None:
     got = est.compute_ctsm_delta_l_matrix(theta, x)
     assert got.shape == (3, 3)
     assert np.allclose(np.diag(got), 0.0)
+
+
+def test_lda_ctsm_v_dispatch_transforms_x_before_ctsm(monkeypatch: pytest.MonkeyPatch) -> None:
+    import fisher.h_decoding_categorical_twofig as cat
+
+    seen: dict[str, np.ndarray] = {}
+
+    def fake_ctsm(*args, **kwargs):
+        seen["x_train"] = np.asarray(kwargs["x_train"], dtype=np.float64)
+        seen["x_val"] = np.asarray(kwargs["x_val"], dtype=np.float64)
+        seen["x_all"] = np.asarray(kwargs["x_all"], dtype=np.float64)
+        n = int(seen["x_all"].shape[0])
+        return {"delta_l": np.zeros((n, n), dtype=np.float64), "train_out": None}
+
+    monkeypatch.setattr(cat, "_train_ctsm_v_delta", fake_ctsm)
+    args = SimpleNamespace(lda_ctsm_shrinkage=1e-2, lda_ctsm_eps=1e-6, lda_ctsm_max_dim=1)
+    theta = np.eye(2, dtype=np.float64)[[0, 0, 1, 1]]
+    x = np.array(
+        [
+            [-2.0, 0.0],
+            [-1.0, 0.2],
+            [1.0, -0.1],
+            [2.0, 0.1],
+        ],
+        dtype=np.float64,
+    )
+    result = cat._train_one_method(
+        args,
+        dev=torch.device("cpu"),
+        method_name="lda_ctsm_v",
+        theta_train=theta,
+        x_train=x,
+        theta_val=theta[:2],
+        x_val=x[:2],
+        theta_all=theta,
+        x_all=x,
+        bins_train=np.array([0, 0, 1, 1], dtype=np.int64),
+        bins_val=np.array([0, 0], dtype=np.int64),
+        bins_all=np.array([0, 0, 1, 1], dtype=np.int64),
+        k_cat=2,
+    )
+
+    assert seen["x_train"].shape == (4, 1)
+    assert seen["x_val"].shape == (2, 1)
+    assert seen["x_all"].shape == (4, 1)
+    assert "lda_ctsm_weights" in result
+    assert str(result["ctsm_theta_encoding"][0]) == "one_hot_lda_weighted_x"
+
+
+def test_pls_ctsm_v_dispatch_transforms_x_before_ctsm(monkeypatch: pytest.MonkeyPatch) -> None:
+    import fisher.h_decoding_categorical_twofig as cat
+
+    seen: dict[str, np.ndarray] = {}
+
+    def fake_ctsm(*args, **kwargs):
+        seen["x_train"] = np.asarray(kwargs["x_train"], dtype=np.float64)
+        seen["x_val"] = np.asarray(kwargs["x_val"], dtype=np.float64)
+        seen["x_all"] = np.asarray(kwargs["x_all"], dtype=np.float64)
+        n = int(seen["x_all"].shape[0])
+        return {"delta_l": np.zeros((n, n), dtype=np.float64), "train_out": None}
+
+    monkeypatch.setattr(cat, "_train_ctsm_v_delta", fake_ctsm)
+    args = SimpleNamespace(
+        pls_ctsm_eps=1e-6,
+        pls_ctsm_max_dim=1,
+        pls_ctsm_scale_x=False,
+        pls_ctsm_max_iter=100,
+        pls_ctsm_tol=1e-6,
+    )
+    theta = np.eye(2, dtype=np.float64)[[0, 0, 1, 1, 1]]
+    x = np.array(
+        [
+            [-2.0, 0.0],
+            [-1.0, 0.2],
+            [1.0, -0.1],
+            [2.0, 0.1],
+            [2.4, -0.2],
+        ],
+        dtype=np.float64,
+    )
+    result = cat._train_one_method(
+        args,
+        dev=torch.device("cpu"),
+        method_name="pls_ctsm_v",
+        theta_train=theta,
+        x_train=x,
+        theta_val=theta[:2],
+        x_val=x[:2],
+        theta_all=theta,
+        x_all=x,
+        bins_train=np.array([0, 0, 1, 1, 1], dtype=np.int64),
+        bins_val=np.array([0, 0], dtype=np.int64),
+        bins_all=np.array([0, 0, 1, 1, 1], dtype=np.int64),
+        k_cat=2,
+    )
+
+    assert seen["x_train"].shape == (5, 1)
+    assert seen["x_val"].shape == (2, 1)
+    assert seen["x_all"].shape == (5, 1)
+    assert "pls_ctsm_weights" in result
+    assert str(result["ctsm_theta_encoding"][0]) == "one_hot_pls_weighted_x"
+
+
+def test_pca_ctsm_v_dispatch_transforms_x_before_ctsm(monkeypatch: pytest.MonkeyPatch) -> None:
+    import fisher.h_decoding_categorical_twofig as cat
+
+    seen: dict[str, np.ndarray] = {}
+
+    def fake_ctsm(*args, **kwargs):
+        seen["x_train"] = np.asarray(kwargs["x_train"], dtype=np.float64)
+        seen["x_val"] = np.asarray(kwargs["x_val"], dtype=np.float64)
+        seen["x_all"] = np.asarray(kwargs["x_all"], dtype=np.float64)
+        n = int(seen["x_all"].shape[0])
+        return {"delta_l": np.zeros((n, n), dtype=np.float64), "train_out": None}
+
+    monkeypatch.setattr(cat, "_train_ctsm_v_delta", fake_ctsm)
+    args = SimpleNamespace(
+        pca_ctsm_eps=1e-6,
+        pca_ctsm_max_dim=1,
+        pca_ctsm_scale_x=False,
+    )
+    theta = np.eye(2, dtype=np.float64)[[0, 0, 1, 1]]
+    x = np.array(
+        [
+            [-2.0, 0.0],
+            [-1.0, 0.2],
+            [1.0, -0.1],
+            [2.0, 0.1],
+        ],
+        dtype=np.float64,
+    )
+    result = cat._train_one_method(
+        args,
+        dev=torch.device("cpu"),
+        method_name="pca_ctsm_v",
+        theta_train=theta,
+        x_train=x,
+        theta_val=theta[:2],
+        x_val=x[:2],
+        theta_all=theta,
+        x_all=x,
+        bins_train=np.array([0, 0, 1, 1], dtype=np.int64),
+        bins_val=np.array([0, 0], dtype=np.int64),
+        bins_all=np.array([0, 0, 1, 1], dtype=np.int64),
+        k_cat=2,
+    )
+
+    assert seen["x_train"].shape == (4, 1)
+    assert seen["x_val"].shape == (2, 1)
+    assert seen["x_all"].shape == (4, 1)
+    assert "pca_ctsm_weights" in result
+    assert str(result["ctsm_theta_encoding"][0]) == "one_hot_pca_weighted_x"
 
 
 def test_theta_flow_categorical_helper_shape_symmetry_zero_diag(monkeypatch: pytest.MonkeyPatch) -> None:

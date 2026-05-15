@@ -35,6 +35,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from sklearn.cross_decomposition import PLSRegression
 from sklearn.linear_model import LogisticRegression
 
 from global_setting import DATA_DIR
@@ -112,9 +113,21 @@ _METHOD_ALIASES: dict[str, str] = {
     "ctsm-v": "ctsm_v",
     "ctsm_v": "ctsm_v",
     "ctsm": "ctsm_v",
+    "lda-ctsm-v": "lda_ctsm_v",
+    "lda_ctsm_v": "lda_ctsm_v",
+    "ldactsm-v": "lda_ctsm_v",
+    "pls-ctsm-v": "pls_ctsm_v",
+    "pls_ctsm_v": "pls_ctsm_v",
+    "plsctsm-v": "pls_ctsm_v",
+    "pca-ctsm-v": "pca_ctsm_v",
+    "pca_ctsm_v": "pca_ctsm_v",
+    "pcactsm-v": "pca_ctsm_v",
 }
 _DEFAULT_METHODS = ("x_flow", "binary_classifier", "linear_x_flow_t", "xflow_sir_lrank")
-_SUPPORTED_METHODS_HELP = ", ".join(_DEFAULT_METHODS + ("theta_flow_cate", "bin_gaussian", "ctsm_v"))
+_SUPPORTED_METHODS_HELP = ", ".join(
+    _DEFAULT_METHODS
+    + ("theta_flow_cate", "bin_gaussian", "ctsm_v", "lda_ctsm_v", "pls_ctsm_v", "pca_ctsm_v")
+)
 _ALL_COLUMNS_PNG_NAME = "h_decoding_categorical_twofig_all_columns.png"
 
 
@@ -1147,6 +1160,32 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ctsm-gated-film", action="store_true", default=False)
     p.add_argument("--ctsm-raw-time", action="store_true", default=False)
     p.add_argument("--ctsm-weight-decay", type=float, default=0.0)
+    p.add_argument("--lda-ctsm-shrinkage", type=float, default=1e-3)
+    p.add_argument("--lda-ctsm-eps", type=float, default=1e-6)
+    p.add_argument(
+        "--lda-ctsm-max-dim",
+        type=int,
+        default=0,
+        help="Retained LDA coordinate dimension for lda_ctsm_v; 0 keeps the full x dimension.",
+    )
+    p.add_argument(
+        "--pls-ctsm-max-dim",
+        type=int,
+        default=0,
+        help="Retained PLS component dimension for pls_ctsm_v; 0 uses the largest feasible component count.",
+    )
+    p.add_argument("--pls-ctsm-eps", type=float, default=1e-6)
+    p.add_argument("--pls-ctsm-scale-x", action="store_true", default=False)
+    p.add_argument("--pls-ctsm-max-iter", type=int, default=500)
+    p.add_argument("--pls-ctsm-tol", type=float, default=1e-6)
+    p.add_argument(
+        "--pca-ctsm-max-dim",
+        type=int,
+        default=0,
+        help="Retained PCA component dimension for pca_ctsm_v; 0 uses min(x_dim, n_train - 1).",
+    )
+    p.add_argument("--pca-ctsm-eps", type=float, default=1e-6)
+    p.add_argument("--pca-ctsm-scale-x", action="store_true", default=False)
     p.add_argument("--clf-min-class-count", type=int, default=5)
     p.add_argument("--clf-random-state", type=int, default=-1)
     p.add_argument("--clf-max-iter", type=int, default=1000)
@@ -1557,6 +1596,412 @@ def _train_ctsm_v_delta(
     }
 
 
+def _fit_lda_weighted_projection(
+    *,
+    x_train: np.ndarray,
+    bins_train: np.ndarray,
+    x_val: np.ndarray,
+    x_all: np.ndarray,
+    shrinkage: float,
+    eps: float,
+    max_dim: int = 0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
+    """Fit train-only LDA coordinates and apply q_j = sqrt(w_j) v_j^T x."""
+    x_tr = np.asarray(x_train, dtype=np.float64)
+    x_va = np.asarray(x_val, dtype=np.float64)
+    x_ev = np.asarray(x_all, dtype=np.float64)
+    y = np.asarray(bins_train, dtype=np.int64).reshape(-1)
+    if x_tr.ndim != 2 or x_va.ndim != 2 or x_ev.ndim != 2:
+        raise ValueError("lda_ctsm_v expects x_train, x_val, and x_all to be 2D.")
+    if x_tr.shape[0] != y.size:
+        raise ValueError("lda_ctsm_v bins_train length must match x_train rows.")
+    if x_tr.shape[0] < 2:
+        raise ValueError("lda_ctsm_v requires at least two training samples.")
+    if x_tr.shape[1] != x_va.shape[1] or x_tr.shape[1] != x_ev.shape[1]:
+        raise ValueError("lda_ctsm_v x dimension mismatch across train/validation/eval.")
+    if not np.all(np.isfinite(x_tr)) or not np.all(np.isfinite(x_va)) or not np.all(np.isfinite(x_ev)):
+        raise ValueError("lda_ctsm_v input features contain non-finite values.")
+    if not np.isfinite(float(shrinkage)) or not (0.0 <= float(shrinkage) <= 1.0):
+        raise ValueError("--lda-ctsm-shrinkage must be finite and in [0, 1].")
+    if not np.isfinite(float(eps)) or float(eps) <= 0.0:
+        raise ValueError("--lda-ctsm-eps must be finite and > 0.")
+
+    x_dim = int(x_tr.shape[1])
+    m = x_dim if int(max_dim) <= 0 else int(max_dim)
+    if m < 1 or m > x_dim:
+        raise ValueError(f"--lda-ctsm-max-dim must be 0 or in [1, x_dim={x_dim}]; got {max_dim}.")
+
+    classes, counts = np.unique(y, return_counts=True)
+    if classes.size < 2:
+        raise ValueError("lda_ctsm_v requires at least two non-empty training classes.")
+    n = float(x_tr.shape[0])
+    global_mean = np.mean(x_tr, axis=0, dtype=np.float64)
+    sw = np.zeros((x_dim, x_dim), dtype=np.float64)
+    sb = np.zeros((x_dim, x_dim), dtype=np.float64)
+    class_means = np.zeros((classes.size, x_dim), dtype=np.float64)
+    for i, cls in enumerate(classes):
+        xk = x_tr[y == int(cls)]
+        class_means[i] = np.mean(xk, axis=0, dtype=np.float64)
+        centered = xk - class_means[i].reshape(1, -1)
+        sw += (centered.T @ centered) / n
+        diff = (class_means[i] - global_mean).reshape(-1, 1)
+        sb += (float(xk.shape[0]) / n) * (diff @ diff.T)
+
+    tau = float(np.trace(sw) / max(1, x_dim))
+    if not np.isfinite(tau) or tau <= 0.0:
+        tau = 1.0
+    gamma = float(shrinkage)
+    sw_reg = (1.0 - gamma) * sw + gamma * tau * np.eye(x_dim, dtype=np.float64)
+    sw_reg = 0.5 * (sw_reg + sw_reg.T)
+    sb = 0.5 * (sb + sb.T)
+    jitter = max(float(eps), 1e-12) * tau
+    chol = None
+    for attempt in range(6):
+        try:
+            chol = np.linalg.cholesky(sw_reg + (10.0**attempt) * jitter * np.eye(x_dim, dtype=np.float64))
+            break
+        except np.linalg.LinAlgError:
+            continue
+    if chol is None:
+        raise ValueError("lda_ctsm_v could not Cholesky-factor the shrinkage within-class scatter.")
+
+    whitened = np.linalg.solve(chol, sb)
+    whitened = np.linalg.solve(chol, whitened.T).T
+    whitened = 0.5 * (whitened + whitened.T)
+    eigvals, eigvecs = np.linalg.eigh(whitened)
+    order = np.argsort(eigvals)[::-1]
+    eigvals = np.asarray(eigvals[order], dtype=np.float64)
+    eigvecs = np.asarray(eigvecs[:, order], dtype=np.float64)
+    components_full = np.linalg.solve(chol.T, eigvecs).astype(np.float64, copy=False)
+    components = components_full[:, :m]
+    eigvals_m = eigvals[:m]
+    lam_tilde = np.maximum(eigvals_m, 0.0) + float(eps)
+    weights = float(m) * lam_tilde / float(np.sum(lam_tilde))
+    scale = np.sqrt(weights).reshape(1, -1)
+
+    z_train = (x_tr @ components) * scale
+    z_val = (x_va @ components) * scale
+    z_all = (x_ev @ components) * scale
+    meta: dict[str, Any] = {
+        "lda_ctsm_dim": np.int64(m),
+        "lda_ctsm_original_dim": np.int64(x_dim),
+        "lda_ctsm_shrinkage": np.float64(gamma),
+        "lda_ctsm_eps": np.float64(float(eps)),
+        "lda_ctsm_classes": np.asarray(classes, dtype=np.int64),
+        "lda_ctsm_class_counts": np.asarray(counts, dtype=np.int64),
+        "lda_ctsm_global_mean": global_mean.astype(np.float64, copy=False),
+        "lda_ctsm_class_means": class_means.astype(np.float64, copy=False),
+        "lda_ctsm_sw_trace": np.float64(float(np.trace(sw))),
+        "lda_ctsm_tau": np.float64(tau),
+        "lda_ctsm_eigenvalues": eigvals_m.astype(np.float64, copy=False),
+        "lda_ctsm_weights": weights.astype(np.float64, copy=False),
+        "lda_ctsm_components": components.astype(np.float64, copy=False),
+        "lda_ctsm_transform": (components * np.sqrt(weights).reshape(1, -1)).T.astype(np.float64, copy=False),
+    }
+    return z_train, z_val, z_all, meta
+
+
+def _train_lda_ctsm_v_delta(
+    args: argparse.Namespace,
+    *,
+    dev: torch.device,
+    theta_train: np.ndarray,
+    x_train: np.ndarray,
+    theta_val: np.ndarray,
+    x_val: np.ndarray,
+    theta_all: np.ndarray,
+    x_all: np.ndarray,
+    bins_train: np.ndarray,
+) -> dict[str, Any]:
+    z_train, z_val, z_all, lda_meta = _fit_lda_weighted_projection(
+        x_train=x_train,
+        bins_train=bins_train,
+        x_val=x_val,
+        x_all=x_all,
+        shrinkage=float(getattr(args, "lda_ctsm_shrinkage", 1e-3)),
+        eps=float(getattr(args, "lda_ctsm_eps", 1e-6)),
+        max_dim=int(getattr(args, "lda_ctsm_max_dim", 0)),
+    )
+    print(
+        f"[cat-twofig] training lda_ctsm_v: x_dim={np.asarray(x_train).shape[1]} "
+        f"lda_dim={z_train.shape[1]} shrinkage={float(getattr(args, 'lda_ctsm_shrinkage', 1e-3)):.6g} "
+        f"eps={float(getattr(args, 'lda_ctsm_eps', 1e-6)):.6g}",
+        flush=True,
+    )
+    result = _train_ctsm_v_delta(
+        args,
+        dev=dev,
+        theta_train=theta_train,
+        x_train=z_train,
+        theta_val=theta_val,
+        x_val=z_val,
+        theta_all=theta_all,
+        x_all=z_all,
+    )
+    result.update(lda_meta)
+    result["ctsm_theta_encoding"] = np.asarray(["one_hot_lda_weighted_x"], dtype=object)
+    return result
+
+
+def _fit_pls_weighted_projection(
+    *,
+    x_train: np.ndarray,
+    bins_train: np.ndarray,
+    x_val: np.ndarray,
+    x_all: np.ndarray,
+    eps: float,
+    max_dim: int = 0,
+    scale_x: bool = False,
+    max_iter: int = 500,
+    tol: float = 1e-6,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
+    """Fit train-only PLS-DA coordinates and apply q_j = sqrt(w_j) u_j^T (x - xbar)."""
+    x_tr = np.asarray(x_train, dtype=np.float64)
+    x_va = np.asarray(x_val, dtype=np.float64)
+    x_ev = np.asarray(x_all, dtype=np.float64)
+    y = np.asarray(bins_train, dtype=np.int64).reshape(-1)
+    if x_tr.ndim != 2 or x_va.ndim != 2 or x_ev.ndim != 2:
+        raise ValueError("pls_ctsm_v expects x_train, x_val, and x_all to be 2D.")
+    if x_tr.shape[0] != y.size:
+        raise ValueError("pls_ctsm_v bins_train length must match x_train rows.")
+    if x_tr.shape[0] < 2:
+        raise ValueError("pls_ctsm_v requires at least two training samples.")
+    if x_tr.shape[1] != x_va.shape[1] or x_tr.shape[1] != x_ev.shape[1]:
+        raise ValueError("pls_ctsm_v x dimension mismatch across train/validation/eval.")
+    if not np.all(np.isfinite(x_tr)) or not np.all(np.isfinite(x_va)) or not np.all(np.isfinite(x_ev)):
+        raise ValueError("pls_ctsm_v input features contain non-finite values.")
+    if not np.isfinite(float(eps)) or float(eps) <= 0.0:
+        raise ValueError("--pls-ctsm-eps must be finite and > 0.")
+    if int(max_iter) < 1:
+        raise ValueError("--pls-ctsm-max-iter must be >= 1.")
+    if not np.isfinite(float(tol)) or float(tol) <= 0.0:
+        raise ValueError("--pls-ctsm-tol must be finite and > 0.")
+
+    x_dim = int(x_tr.shape[1])
+    classes, inverse, counts = np.unique(y, return_inverse=True, return_counts=True)
+    if classes.size < 2:
+        raise ValueError("pls_ctsm_v requires at least two non-empty training classes.")
+    feasible_dim = min(x_dim, int(x_tr.shape[0]) - 1)
+    p = feasible_dim if int(max_dim) <= 0 else int(max_dim)
+    if p < 1 or p > feasible_dim:
+        raise ValueError(
+            f"--pls-ctsm-max-dim must be 0 or in [1, feasible_dim={feasible_dim}]; got {max_dim}."
+        )
+
+    y_onehot = np.eye(int(classes.size), dtype=np.float64)[inverse]
+    x_mean = np.mean(x_tr, axis=0, dtype=np.float64)
+    x_scale = np.ones(x_dim, dtype=np.float64)
+    if bool(scale_x):
+        x_scale = np.std(x_tr, axis=0, dtype=np.float64)
+        x_scale = np.where(np.isfinite(x_scale) & (x_scale > 0.0), x_scale, 1.0)
+
+    def _prep(x: np.ndarray) -> np.ndarray:
+        return (np.asarray(x, dtype=np.float64) - x_mean.reshape(1, -1)) / x_scale.reshape(1, -1)
+
+    x_tr_pre = _prep(x_tr)
+    x_va_pre = _prep(x_va)
+    x_ev_pre = _prep(x_ev)
+    y_mean = np.mean(y_onehot, axis=0, dtype=np.float64)
+    y_centered = y_onehot - y_mean.reshape(1, -1)
+
+    pls = PLSRegression(
+        n_components=p,
+        scale=False,
+        max_iter=int(max_iter),
+        tol=float(tol),
+        copy=True,
+    )
+    pls.fit(x_tr_pre, y_centered)
+    rotations = np.asarray(pls.x_rotations_[:, :p], dtype=np.float64)
+    scores = x_tr_pre @ rotations
+    denom = max(1, int(x_tr_pre.shape[0]) - 1)
+    cov_zy = (scores.T @ y_centered) / float(denom)
+    importance = np.sum(np.square(cov_zy), axis=1)
+    importance_tilde = np.maximum(importance, 0.0) + float(eps)
+    weights = float(p) * importance_tilde / float(np.sum(importance_tilde))
+    scale = np.sqrt(weights).reshape(1, -1)
+
+    z_train = scores * scale
+    z_val = (x_va_pre @ rotations) * scale
+    z_all = (x_ev_pre @ rotations) * scale
+    transform = (rotations / x_scale.reshape(-1, 1)) * np.sqrt(weights).reshape(1, -1)
+    meta: dict[str, Any] = {
+        "pls_ctsm_dim": np.int64(p),
+        "pls_ctsm_original_dim": np.int64(x_dim),
+        "pls_ctsm_eps": np.float64(float(eps)),
+        "pls_ctsm_scale_x": np.bool_(bool(scale_x)),
+        "pls_ctsm_max_iter": np.int64(int(max_iter)),
+        "pls_ctsm_tol": np.float64(float(tol)),
+        "pls_ctsm_classes": np.asarray(classes, dtype=np.int64),
+        "pls_ctsm_class_counts": np.asarray(counts, dtype=np.int64),
+        "pls_ctsm_x_mean": x_mean.astype(np.float64, copy=False),
+        "pls_ctsm_x_scale": x_scale.astype(np.float64, copy=False),
+        "pls_ctsm_y_mean": y_mean.astype(np.float64, copy=False),
+        "pls_ctsm_rotations": rotations.astype(np.float64, copy=False),
+        "pls_ctsm_covariance_scores": importance.astype(np.float64, copy=False),
+        "pls_ctsm_weights": weights.astype(np.float64, copy=False),
+        "pls_ctsm_transform": transform.T.astype(np.float64, copy=False),
+    }
+    return z_train, z_val, z_all, meta
+
+
+def _train_pls_ctsm_v_delta(
+    args: argparse.Namespace,
+    *,
+    dev: torch.device,
+    theta_train: np.ndarray,
+    x_train: np.ndarray,
+    theta_val: np.ndarray,
+    x_val: np.ndarray,
+    theta_all: np.ndarray,
+    x_all: np.ndarray,
+    bins_train: np.ndarray,
+) -> dict[str, Any]:
+    z_train, z_val, z_all, pls_meta = _fit_pls_weighted_projection(
+        x_train=x_train,
+        bins_train=bins_train,
+        x_val=x_val,
+        x_all=x_all,
+        eps=float(getattr(args, "pls_ctsm_eps", 1e-6)),
+        max_dim=int(getattr(args, "pls_ctsm_max_dim", 0)),
+        scale_x=bool(getattr(args, "pls_ctsm_scale_x", False)),
+        max_iter=int(getattr(args, "pls_ctsm_max_iter", 500)),
+        tol=float(getattr(args, "pls_ctsm_tol", 1e-6)),
+    )
+    print(
+        f"[cat-twofig] training pls_ctsm_v: x_dim={np.asarray(x_train).shape[1]} "
+        f"pls_dim={z_train.shape[1]} scale_x={bool(getattr(args, 'pls_ctsm_scale_x', False))} "
+        f"eps={float(getattr(args, 'pls_ctsm_eps', 1e-6)):.6g}",
+        flush=True,
+    )
+    result = _train_ctsm_v_delta(
+        args,
+        dev=dev,
+        theta_train=theta_train,
+        x_train=z_train,
+        theta_val=theta_val,
+        x_val=z_val,
+        theta_all=theta_all,
+        x_all=z_all,
+    )
+    result.update(pls_meta)
+    result["ctsm_theta_encoding"] = np.asarray(["one_hot_pls_weighted_x"], dtype=object)
+    return result
+
+
+def _fit_pca_weighted_projection(
+    *,
+    x_train: np.ndarray,
+    x_val: np.ndarray,
+    x_all: np.ndarray,
+    eps: float,
+    max_dim: int = 0,
+    scale_x: bool = False,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
+    """Fit train-only PCA coordinates and apply q_j = sqrt(w_j) u_j^T (x - xbar)."""
+    x_tr = np.asarray(x_train, dtype=np.float64)
+    x_va = np.asarray(x_val, dtype=np.float64)
+    x_ev = np.asarray(x_all, dtype=np.float64)
+    if x_tr.ndim != 2 or x_va.ndim != 2 or x_ev.ndim != 2:
+        raise ValueError("pca_ctsm_v expects x_train, x_val, and x_all to be 2D.")
+    if x_tr.shape[0] < 2:
+        raise ValueError("pca_ctsm_v requires at least two training samples.")
+    if x_tr.shape[1] != x_va.shape[1] or x_tr.shape[1] != x_ev.shape[1]:
+        raise ValueError("pca_ctsm_v x dimension mismatch across train/validation/eval.")
+    if not np.all(np.isfinite(x_tr)) or not np.all(np.isfinite(x_va)) or not np.all(np.isfinite(x_ev)):
+        raise ValueError("pca_ctsm_v input features contain non-finite values.")
+    if not np.isfinite(float(eps)) or float(eps) <= 0.0:
+        raise ValueError("--pca-ctsm-eps must be finite and > 0.")
+
+    x_dim = int(x_tr.shape[1])
+    n_train = int(x_tr.shape[0])
+    feasible_dim = min(x_dim, n_train - 1)
+    p = feasible_dim if int(max_dim) <= 0 else int(max_dim)
+    if p < 1 or p > feasible_dim:
+        raise ValueError(
+            f"--pca-ctsm-max-dim must be 0 or in [1, feasible_dim={feasible_dim}]; got {max_dim}."
+        )
+
+    x_mean = np.mean(x_tr, axis=0, dtype=np.float64)
+    x_scale = np.ones(x_dim, dtype=np.float64)
+    if bool(scale_x):
+        x_scale = np.std(x_tr, axis=0, dtype=np.float64)
+        x_scale = np.where(np.isfinite(x_scale) & (x_scale > 0.0), x_scale, 1.0)
+
+    def _prep(x: np.ndarray) -> np.ndarray:
+        return (np.asarray(x, dtype=np.float64) - x_mean.reshape(1, -1)) / x_scale.reshape(1, -1)
+
+    x_tr_pre = _prep(x_tr)
+    x_va_pre = _prep(x_va)
+    x_ev_pre = _prep(x_ev)
+    _, singular_values, vt = np.linalg.svd(x_tr_pre, full_matrices=False)
+    components = np.asarray(vt[:p].T, dtype=np.float64)
+    denom = max(1, n_train - 1)
+    explained_full = np.square(np.asarray(singular_values, dtype=np.float64)) / float(denom)
+    explained = explained_full[:p]
+    importance = np.maximum(explained, 0.0) + float(eps)
+    weights = float(p) * importance / float(np.sum(importance))
+    scale = np.sqrt(weights).reshape(1, -1)
+
+    z_train = (x_tr_pre @ components) * scale
+    z_val = (x_va_pre @ components) * scale
+    z_all = (x_ev_pre @ components) * scale
+    transform = (components / x_scale.reshape(-1, 1)) * np.sqrt(weights).reshape(1, -1)
+    meta: dict[str, Any] = {
+        "pca_ctsm_dim": np.int64(p),
+        "pca_ctsm_original_dim": np.int64(x_dim),
+        "pca_ctsm_eps": np.float64(float(eps)),
+        "pca_ctsm_scale_x": np.bool_(bool(scale_x)),
+        "pca_ctsm_x_mean": x_mean.astype(np.float64, copy=False),
+        "pca_ctsm_x_scale": x_scale.astype(np.float64, copy=False),
+        "pca_ctsm_components": components.astype(np.float64, copy=False),
+        "pca_ctsm_explained_variance": explained.astype(np.float64, copy=False),
+        "pca_ctsm_weights": weights.astype(np.float64, copy=False),
+        "pca_ctsm_transform": transform.T.astype(np.float64, copy=False),
+    }
+    return z_train, z_val, z_all, meta
+
+
+def _train_pca_ctsm_v_delta(
+    args: argparse.Namespace,
+    *,
+    dev: torch.device,
+    theta_train: np.ndarray,
+    x_train: np.ndarray,
+    theta_val: np.ndarray,
+    x_val: np.ndarray,
+    theta_all: np.ndarray,
+    x_all: np.ndarray,
+) -> dict[str, Any]:
+    z_train, z_val, z_all, pca_meta = _fit_pca_weighted_projection(
+        x_train=x_train,
+        x_val=x_val,
+        x_all=x_all,
+        eps=float(getattr(args, "pca_ctsm_eps", 1e-6)),
+        max_dim=int(getattr(args, "pca_ctsm_max_dim", 0)),
+        scale_x=bool(getattr(args, "pca_ctsm_scale_x", False)),
+    )
+    print(
+        f"[cat-twofig] training pca_ctsm_v: x_dim={np.asarray(x_train).shape[1]} "
+        f"pca_dim={z_train.shape[1]} scale_x={bool(getattr(args, 'pca_ctsm_scale_x', False))} "
+        f"eps={float(getattr(args, 'pca_ctsm_eps', 1e-6)):.6g}",
+        flush=True,
+    )
+    result = _train_ctsm_v_delta(
+        args,
+        dev=dev,
+        theta_train=theta_train,
+        x_train=z_train,
+        theta_val=theta_val,
+        x_val=z_val,
+        theta_all=theta_all,
+        x_all=z_all,
+    )
+    result.update(pca_meta)
+    result["ctsm_theta_encoding"] = np.asarray(["one_hot_pca_weighted_x"], dtype=object)
+    return result
+
+
 def _train_one_method(
     args: argparse.Namespace,
     *,
@@ -1619,6 +2064,41 @@ def _train_one_method(
         )
     if method_name == "ctsm_v":
         return _train_ctsm_v_delta(
+            args,
+            dev=dev,
+            theta_train=theta_train,
+            x_train=x_train,
+            theta_val=theta_val,
+            x_val=x_val,
+            theta_all=theta_all,
+            x_all=x_all,
+        )
+    if method_name == "lda_ctsm_v":
+        return _train_lda_ctsm_v_delta(
+            args,
+            dev=dev,
+            theta_train=theta_train,
+            x_train=x_train,
+            theta_val=theta_val,
+            x_val=x_val,
+            theta_all=theta_all,
+            x_all=x_all,
+            bins_train=bins_train,
+        )
+    if method_name == "pls_ctsm_v":
+        return _train_pls_ctsm_v_delta(
+            args,
+            dev=dev,
+            theta_train=theta_train,
+            x_train=x_train,
+            theta_val=theta_val,
+            x_val=x_val,
+            theta_all=theta_all,
+            x_all=x_all,
+            bins_train=bins_train,
+        )
+    if method_name == "pca_ctsm_v":
+        return _train_pca_ctsm_v_delta(
             args,
             dev=dev,
             theta_train=theta_train,
