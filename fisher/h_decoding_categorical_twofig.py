@@ -158,14 +158,14 @@ def _write_all_columns_png(
     corr_nmse_svg: str,
     loss_panel_svg: str,
 ) -> str:
-    """Compose categorical twofig SVG outputs in a documented left-to-right order."""
+    """Rasterize sweep, corr/NMSE, and training-loss SVGs into one wide PNG.
+
+    Optional per-method diagnostic SVGs (e.g. ``llr_est_vs_true_all.svg``) are **not** included:
+    for larger $K$ and many methods they can contain millions of SVG primitives and make
+    ``rsvg-convert`` fail (librsvg element limits); those files remain available standalone.
+    """
     out_dir = Path(output_dir)
-    optional_diagnostics = [
-        out_dir / "llr_est_vs_true_all.svg",
-        out_dir / "hellinger_est_vs_gt_all.svg",
-    ]
     source_paths: list[str | Path] = [sweep_svg, corr_nmse_svg, loss_panel_svg]
-    source_paths.extend(p for p in optional_diagnostics if p.is_file())
     return concatenate_svgs_horizontally_to_png(source_paths, out_dir / _ALL_COLUMNS_PNG_NAME, dpi=300)
 
 
@@ -2467,12 +2467,6 @@ def main(argv: list[str] | None = None) -> None:
             out_base=Path(out_dir) / "hellinger_est_vs_gt_all",
             metrics_by_method=metrics_by_method,
         )
-    all_columns_png = _write_all_columns_png(
-        out_dir,
-        sweep_svg=sweep_svg,
-        corr_nmse_svg=corr_nmse_svg,
-        loss_panel_svg=loss_panel_svg,
-    )
 
     source_indices = np.asarray(perm[: int(args.n_ref)], dtype=np.int64)
     out_npz = os.path.join(out_dir, "h_decoding_categorical_twofig_results.npz")
@@ -2512,6 +2506,21 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     summary_path = os.path.join(out_dir, "h_decoding_categorical_twofig_summary.txt")
+    all_columns_png: str | None = None
+    try:
+        all_columns_png = _write_all_columns_png(
+            out_dir,
+            sweep_svg=sweep_svg,
+            corr_nmse_svg=corr_nmse_svg,
+            loss_panel_svg=loss_panel_svg,
+        )
+    except Exception as exc:
+        print(
+            f"[cat-twofig] WARNING: all-columns PNG failed ({type(exc).__name__}: {exc}); "
+            "sweep / corr_nmse / loss SVGs and results NPZ are still saved.",
+            flush=True,
+        )
+
     _write_summary(
         summary_path,
         args=args,
@@ -2520,7 +2529,7 @@ def main(argv: list[str] | None = None) -> None:
         corr_nmse_svg=os.path.abspath(corr_nmse_svg),
         visualization_only=False,
         loss_panel_svg=os.path.abspath(loss_panel_svg),
-        all_columns_png=os.path.abspath(all_columns_png),
+        all_columns_png=os.path.abspath(all_columns_png) if all_columns_png else None,
         training_losses_root=os.path.abspath(loss_root),
     )
 
@@ -2529,7 +2538,8 @@ def main(argv: list[str] | None = None) -> None:
     print(f"  - {os.path.abspath(sweep_svg)}", flush=True)
     print(f"  - {os.path.abspath(corr_nmse_svg)}", flush=True)
     print(f"  - {os.path.abspath(loss_panel_svg)}", flush=True)
-    print(f"  - {os.path.abspath(all_columns_png)}", flush=True)
+    if all_columns_png:
+        print(f"  - {os.path.abspath(all_columns_png)}", flush=True)
     print(f"  - {os.path.abspath(summary_path)}", flush=True)
 
 
