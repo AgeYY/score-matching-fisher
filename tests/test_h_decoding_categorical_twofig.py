@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from pathlib import Path
+import xml.etree.ElementTree as ET
 
 import numpy as np
 import pytest
+import torch
 
 from fisher.data import ToyCategoricalRandomMoGDataset
 from fisher.h_decoding_categorical_twofig import (
@@ -20,11 +22,70 @@ from fisher.h_decoding_categorical_twofig import (
     _validate_cached_cli,
     _save_method_training_loss_npz,
     _validation_only_work_sweep_subset,
+    _fit_lda_weighted_projection,
+    _fit_pca_weighted_projection,
+    _fit_pls_weighted_projection,
 )
 from fisher.h_matrix import HMatrixEstimator
 from fisher import h_decoding_convergence as conv
 from fisher.h_decoding_convergence_methods import prepare_categorical_binning_for_convergence
 from fisher.shared_dataset_io import SharedDatasetBundle, load_shared_dataset_npz
+from fisher.svg_utils import concatenate_svgs_horizontally, concatenate_svgs_horizontally_to_png
+
+
+def _write_tiny_svg(path: Path, *, width: int = 10, height: int = 8) -> str:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}"></svg>',
+        encoding="utf-8",
+    )
+    return str(path)
+
+
+def test_concatenate_svgs_horizontally_viewbox_order(tmp_path: Path) -> None:
+    a = tmp_path / "a.svg"
+    b = tmp_path / "b.svg"
+    out = tmp_path / "out.svg"
+    a.write_text(
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 20"><rect id="a" width="10" height="20"/></svg>',
+        encoding="utf-8",
+    )
+    b.write_text(
+        '<svg xmlns="http://www.w3.org/2000/svg" width="30pt" height="15pt"><circle id="b" cx="5" cy="5" r="5"/></svg>',
+        encoding="utf-8",
+    )
+
+    got = concatenate_svgs_horizontally([a, b], out, spacing=5.0)
+
+    assert got == str(out)
+    root = ET.parse(out).getroot()
+    assert root.attrib["viewBox"] == "0 0 45 20"
+    cols = [child for child in list(root) if child.tag.endswith("svg")]
+    assert [col.attrib["x"] for col in cols] == ["0", "15"]
+    assert [col.attrib["viewBox"] for col in cols] == ["0 0 10 20", "0 0 30 15"]
+
+
+def test_concatenate_svgs_horizontally_to_png_uses_dpi(tmp_path: Path) -> None:
+    from PIL import Image
+
+    a = tmp_path / "a.svg"
+    b = tmp_path / "b.svg"
+    out = tmp_path / "out.png"
+    a.write_text(
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 72 36"><rect width="72" height="36"/></svg>',
+        encoding="utf-8",
+    )
+    b.write_text(
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 72 72"><circle cx="36" cy="36" r="20"/></svg>',
+        encoding="utf-8",
+    )
+
+    got = concatenate_svgs_horizontally_to_png([a, b], out, spacing=0.0, dpi=300)
+
+    assert got == str(out)
+    with Image.open(out) as im:
+        assert im.format == "PNG"
+        assert im.size == (600, 300)
 
 
 def test_parse_methods_aliases_and_dedup() -> None:
@@ -32,8 +93,124 @@ def test_parse_methods_aliases_and_dedup() -> None:
     assert parse_methods("bin-gaussian, bin_gaussian, x_flow") == ["bin_gaussian", "x_flow"]
     assert parse_methods("bin_gaussian_cate") == ["bin_gaussian"]
     assert parse_methods("theta-flow-cate, theta_flow_cate, thetaflow-cate") == ["theta_flow_cate"]
+    assert parse_methods("ctsm-v, ctsm_v, ctsm") == ["ctsm_v"]
+    assert parse_methods("lda-ctsm-v, lda_ctsm_v, ldactsm-v") == ["lda_ctsm_v"]
+    assert parse_methods("pls-ctsm-v, pls_ctsm_v, plsctsm-v") == ["pls_ctsm_v"]
+    assert parse_methods("pca-ctsm-v, pca_ctsm_v, pcactsm-v") == ["pca_ctsm_v"]
     with pytest.raises(ValueError, match="Unknown method"):
         parse_methods("theta_flow")
+
+
+def test_fit_lda_weighted_projection_shapes_weights_and_order() -> None:
+    x_train = np.array(
+        [
+            [-2.0, 0.0, 0.1],
+            [-1.0, 0.2, -0.1],
+            [1.0, 0.0, 0.0],
+            [2.0, -0.1, 0.2],
+        ],
+        dtype=np.float64,
+    )
+    bins_train = np.array([0, 0, 1, 1], dtype=np.int64)
+    x_val = x_train[:2] + 0.5
+    x_all = x_train.copy()
+
+    z_train, z_val, z_all, meta = _fit_lda_weighted_projection(
+        x_train=x_train,
+        bins_train=bins_train,
+        x_val=x_val,
+        x_all=x_all,
+        shrinkage=1e-2,
+        eps=1e-6,
+        max_dim=2,
+    )
+
+    assert z_train.shape == (4, 2)
+    assert z_val.shape == (2, 2)
+    assert z_all.shape == (4, 2)
+    weights = np.asarray(meta["lda_ctsm_weights"], dtype=np.float64)
+    eigvals = np.asarray(meta["lda_ctsm_eigenvalues"], dtype=np.float64)
+    assert np.all(np.isfinite(weights))
+    assert np.all(weights > 0.0)
+    assert float(np.sum(weights)) == pytest.approx(2.0)
+    assert np.all(eigvals[:-1] >= eigvals[1:] - 1e-12)
+    assert np.asarray(meta["lda_ctsm_transform"]).shape == (2, 3)
+
+
+def test_fit_pls_weighted_projection_shapes_weights_and_metadata() -> None:
+    x_train = np.array(
+        [
+            [-2.0, 0.0, 0.1],
+            [-1.0, 0.2, -0.1],
+            [1.0, 0.0, 0.0],
+            [2.0, -0.1, 0.2],
+            [2.5, 0.1, -0.2],
+        ],
+        dtype=np.float64,
+    )
+    bins_train = np.array([0, 0, 1, 1, 1], dtype=np.int64)
+    x_val = x_train[:2] + 0.25
+    x_all = x_train.copy()
+
+    z_train, z_val, z_all, meta = _fit_pls_weighted_projection(
+        x_train=x_train,
+        bins_train=bins_train,
+        x_val=x_val,
+        x_all=x_all,
+        eps=1e-6,
+        max_dim=2,
+        scale_x=True,
+        max_iter=100,
+        tol=1e-7,
+    )
+
+    assert z_train.shape == (5, 2)
+    assert z_val.shape == (2, 2)
+    assert z_all.shape == (5, 2)
+    weights = np.asarray(meta["pls_ctsm_weights"], dtype=np.float64)
+    scores = np.asarray(meta["pls_ctsm_covariance_scores"], dtype=np.float64)
+    assert np.all(np.isfinite(weights))
+    assert np.all(weights > 0.0)
+    assert float(np.sum(weights)) == pytest.approx(2.0)
+    assert np.all(scores >= -1e-12)
+    assert np.asarray(meta["pls_ctsm_transform"]).shape == (2, 3)
+    assert bool(meta["pls_ctsm_scale_x"])
+
+
+def test_fit_pca_weighted_projection_shapes_weights_and_metadata() -> None:
+    x_train = np.array(
+        [
+            [-2.0, 0.0, 0.1],
+            [-1.0, 0.2, -0.1],
+            [1.0, 0.0, 0.0],
+            [2.0, -0.1, 0.2],
+        ],
+        dtype=np.float64,
+    )
+    x_val = x_train[:2] + 0.25
+    x_all = x_train.copy()
+
+    z_train, z_val, z_all, meta = _fit_pca_weighted_projection(
+        x_train=x_train,
+        x_val=x_val,
+        x_all=x_all,
+        eps=1e-6,
+        max_dim=2,
+        scale_x=True,
+    )
+
+    assert z_train.shape == (4, 2)
+    assert z_val.shape == (2, 2)
+    assert z_all.shape == (4, 2)
+    weights = np.asarray(meta["pca_ctsm_weights"], dtype=np.float64)
+    explained = np.asarray(meta["pca_ctsm_explained_variance"], dtype=np.float64)
+    assert np.all(np.isfinite(weights))
+    assert np.all(weights > 0.0)
+    assert float(np.sum(weights)) == pytest.approx(2.0)
+    assert np.all(explained[:-1] >= explained[1:] - 1e-12)
+    assert np.asarray(meta["pca_ctsm_components"]).shape == (3, 2)
+    assert np.asarray(meta["pca_ctsm_transform"]).shape == (2, 3)
+    assert bool(meta["pca_ctsm_scale_x"])
 
 
 def test_decode_accuracy_color_limits() -> None:
@@ -68,6 +245,196 @@ def test_category_aggregation_small_delta_l() -> None:
     assert h_cat.shape == (k, k)
     assert np.allclose(np.diag(h_cat), 0.0)
     assert np.all(h_cat >= 0.0)
+
+
+def test_ctsm_pair_models_accept_one_hot_theta() -> None:
+    from fisher.ctsm_models import ToyPairConditionedTimeScoreNet, ToyPairConditionedTimeScoreNetFiLM
+
+    x = np.zeros((4, 2), dtype=np.float32)
+    t = np.full((4, 1), 0.5, dtype=np.float32)
+    m = np.eye(3, dtype=np.float32)[[0, 1, 2, 0]]
+    d = np.eye(3, dtype=np.float32)[[1, 2, 0, 1]] - m
+    for cls in (ToyPairConditionedTimeScoreNet, ToyPairConditionedTimeScoreNetFiLM):
+        model = cls(dim=2, hidden_dim=8, theta_dim=3)
+        y = model.forward_full(
+            torch.from_numpy(x),
+            torch.from_numpy(t),
+            torch.from_numpy(m),
+            torch.from_numpy(d),
+        )
+        assert tuple(y.shape) == (4, 2)
+
+
+def test_h_matrix_ctsm_accepts_one_hot_theta() -> None:
+    from fisher.ctsm_models import ToyPairConditionedTimeScoreNet
+
+    theta = np.eye(3, dtype=np.float64)
+    x = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], dtype=np.float64)
+    model = ToyPairConditionedTimeScoreNet(dim=2, hidden_dim=8, theta_dim=3)
+    est = HMatrixEstimator(
+        model_post=model,
+        model_prior=None,
+        sigma_eval=1e-5,
+        field_method="ctsm_v",
+        device=torch.device("cpu"),
+        pair_batch_size=64,
+        ctsm_int_n_time=3,
+    )
+    got = est.compute_ctsm_delta_l_matrix(theta, x)
+    assert got.shape == (3, 3)
+    assert np.allclose(np.diag(got), 0.0)
+
+
+def test_lda_ctsm_v_dispatch_transforms_x_before_ctsm(monkeypatch: pytest.MonkeyPatch) -> None:
+    import fisher.h_decoding_categorical_twofig as cat
+
+    seen: dict[str, np.ndarray] = {}
+
+    def fake_ctsm(*args, **kwargs):
+        seen["x_train"] = np.asarray(kwargs["x_train"], dtype=np.float64)
+        seen["x_val"] = np.asarray(kwargs["x_val"], dtype=np.float64)
+        seen["x_all"] = np.asarray(kwargs["x_all"], dtype=np.float64)
+        n = int(seen["x_all"].shape[0])
+        return {"delta_l": np.zeros((n, n), dtype=np.float64), "train_out": None}
+
+    monkeypatch.setattr(cat, "_train_ctsm_v_delta", fake_ctsm)
+    args = SimpleNamespace(lda_ctsm_shrinkage=1e-2, lda_ctsm_eps=1e-6, lda_ctsm_max_dim=1)
+    theta = np.eye(2, dtype=np.float64)[[0, 0, 1, 1]]
+    x = np.array(
+        [
+            [-2.0, 0.0],
+            [-1.0, 0.2],
+            [1.0, -0.1],
+            [2.0, 0.1],
+        ],
+        dtype=np.float64,
+    )
+    result = cat._train_one_method(
+        args,
+        dev=torch.device("cpu"),
+        method_name="lda_ctsm_v",
+        theta_train=theta,
+        x_train=x,
+        theta_val=theta[:2],
+        x_val=x[:2],
+        theta_all=theta,
+        x_all=x,
+        bins_train=np.array([0, 0, 1, 1], dtype=np.int64),
+        bins_val=np.array([0, 0], dtype=np.int64),
+        bins_all=np.array([0, 0, 1, 1], dtype=np.int64),
+        k_cat=2,
+    )
+
+    assert seen["x_train"].shape == (4, 1)
+    assert seen["x_val"].shape == (2, 1)
+    assert seen["x_all"].shape == (4, 1)
+    assert "lda_ctsm_weights" in result
+    assert str(result["ctsm_theta_encoding"][0]) == "one_hot_lda_weighted_x"
+
+
+def test_pls_ctsm_v_dispatch_transforms_x_before_ctsm(monkeypatch: pytest.MonkeyPatch) -> None:
+    import fisher.h_decoding_categorical_twofig as cat
+
+    seen: dict[str, np.ndarray] = {}
+
+    def fake_ctsm(*args, **kwargs):
+        seen["x_train"] = np.asarray(kwargs["x_train"], dtype=np.float64)
+        seen["x_val"] = np.asarray(kwargs["x_val"], dtype=np.float64)
+        seen["x_all"] = np.asarray(kwargs["x_all"], dtype=np.float64)
+        n = int(seen["x_all"].shape[0])
+        return {"delta_l": np.zeros((n, n), dtype=np.float64), "train_out": None}
+
+    monkeypatch.setattr(cat, "_train_ctsm_v_delta", fake_ctsm)
+    args = SimpleNamespace(
+        pls_ctsm_eps=1e-6,
+        pls_ctsm_max_dim=1,
+        pls_ctsm_scale_x=False,
+        pls_ctsm_max_iter=100,
+        pls_ctsm_tol=1e-6,
+    )
+    theta = np.eye(2, dtype=np.float64)[[0, 0, 1, 1, 1]]
+    x = np.array(
+        [
+            [-2.0, 0.0],
+            [-1.0, 0.2],
+            [1.0, -0.1],
+            [2.0, 0.1],
+            [2.4, -0.2],
+        ],
+        dtype=np.float64,
+    )
+    result = cat._train_one_method(
+        args,
+        dev=torch.device("cpu"),
+        method_name="pls_ctsm_v",
+        theta_train=theta,
+        x_train=x,
+        theta_val=theta[:2],
+        x_val=x[:2],
+        theta_all=theta,
+        x_all=x,
+        bins_train=np.array([0, 0, 1, 1, 1], dtype=np.int64),
+        bins_val=np.array([0, 0], dtype=np.int64),
+        bins_all=np.array([0, 0, 1, 1, 1], dtype=np.int64),
+        k_cat=2,
+    )
+
+    assert seen["x_train"].shape == (5, 1)
+    assert seen["x_val"].shape == (2, 1)
+    assert seen["x_all"].shape == (5, 1)
+    assert "pls_ctsm_weights" in result
+    assert str(result["ctsm_theta_encoding"][0]) == "one_hot_pls_weighted_x"
+
+
+def test_pca_ctsm_v_dispatch_transforms_x_before_ctsm(monkeypatch: pytest.MonkeyPatch) -> None:
+    import fisher.h_decoding_categorical_twofig as cat
+
+    seen: dict[str, np.ndarray] = {}
+
+    def fake_ctsm(*args, **kwargs):
+        seen["x_train"] = np.asarray(kwargs["x_train"], dtype=np.float64)
+        seen["x_val"] = np.asarray(kwargs["x_val"], dtype=np.float64)
+        seen["x_all"] = np.asarray(kwargs["x_all"], dtype=np.float64)
+        n = int(seen["x_all"].shape[0])
+        return {"delta_l": np.zeros((n, n), dtype=np.float64), "train_out": None}
+
+    monkeypatch.setattr(cat, "_train_ctsm_v_delta", fake_ctsm)
+    args = SimpleNamespace(
+        pca_ctsm_eps=1e-6,
+        pca_ctsm_max_dim=1,
+        pca_ctsm_scale_x=False,
+    )
+    theta = np.eye(2, dtype=np.float64)[[0, 0, 1, 1]]
+    x = np.array(
+        [
+            [-2.0, 0.0],
+            [-1.0, 0.2],
+            [1.0, -0.1],
+            [2.0, 0.1],
+        ],
+        dtype=np.float64,
+    )
+    result = cat._train_one_method(
+        args,
+        dev=torch.device("cpu"),
+        method_name="pca_ctsm_v",
+        theta_train=theta,
+        x_train=x,
+        theta_val=theta[:2],
+        x_val=x[:2],
+        theta_all=theta,
+        x_all=x,
+        bins_train=np.array([0, 0, 1, 1], dtype=np.int64),
+        bins_val=np.array([0, 0], dtype=np.int64),
+        bins_all=np.array([0, 0, 1, 1], dtype=np.int64),
+        k_cat=2,
+    )
+
+    assert seen["x_train"].shape == (4, 1)
+    assert seen["x_val"].shape == (2, 1)
+    assert seen["x_all"].shape == (4, 1)
+    assert "pca_ctsm_weights" in result
+    assert str(result["ctsm_theta_encoding"][0]) == "one_hot_pca_weighted_x"
 
 
 def test_theta_flow_categorical_helper_shape_symmetry_zero_diag(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -243,6 +610,10 @@ def test_visualization_only_cached_shapes(tmp_path: Path) -> None:
     assert (out_dir / "h_decoding_categorical_twofig_sweep.svg").is_file()
     assert (out_dir / "h_decoding_categorical_twofig_corr_nmse.svg").is_file()
     assert (out_dir / "h_decoding_categorical_twofig_training_losses_panel.svg").is_file()
+    all_columns = out_dir / "h_decoding_categorical_twofig_all_columns.png"
+    assert all_columns.is_file()
+    summary = (out_dir / "h_decoding_categorical_twofig_summary.txt").read_text(encoding="utf-8")
+    assert f"h_decoding_categorical_twofig_all_columns.png: {all_columns.resolve()}" in summary
 
 
 def test_build_parser_eval_split() -> None:
@@ -385,9 +756,9 @@ def test_eval_split_validation_controls_classifier_and_decoding_rows(
         return np.array([[np.nan, 0.5], [0.5, np.nan]])
 
     monkeypatch.setattr(cat.conv, "_pairwise_clf_from_bundle", fake_pairwise)
-    monkeypatch.setattr(cat, "_render_method_sweep_panel", lambda **kwargs: str(tmp_path / "sweep.svg"))
-    monkeypatch.setattr(cat, "_render_corr_nmse_two_panel", lambda **kwargs: str(tmp_path / "corr.svg"))
-    monkeypatch.setattr(cat, "_render_row_n_training_losses_panel", lambda **kwargs: str(tmp_path / "loss.svg"))
+    monkeypatch.setattr(cat, "_render_method_sweep_panel", lambda **kwargs: _write_tiny_svg(tmp_path / "sweep.svg"))
+    monkeypatch.setattr(cat, "_render_corr_nmse_two_panel", lambda **kwargs: _write_tiny_svg(tmp_path / "corr.svg"))
+    monkeypatch.setattr(cat, "_render_row_n_training_losses_panel", lambda **kwargs: _write_tiny_svg(tmp_path / "loss.svg"))
 
     def fake_train_one_method(*args, **kwargs):
         seen["method"].append((len(kwargs["x_all"]), tuple(kwargs["bins_all"].tolist())))
@@ -472,9 +843,9 @@ def test_eval_split_all_controls_classifier_and_decoding_rows(
     monkeypatch.setattr(cat, "hellinger_gt_sq_category_matrix", lambda gen_ds: np.array([[0.0, 0.25], [0.25, 0.0]]))
     monkeypatch.setattr(cat, "build_dataset_from_meta", lambda meta: object())
     monkeypatch.setattr(cat, "compute_true_conditional_loglik_matrix", lambda x_all, theta_all, meta: np.zeros((len(x_all), len(x_all))))
-    monkeypatch.setattr(cat, "_render_method_sweep_panel", lambda **kwargs: str(tmp_path / "sweep.svg"))
-    monkeypatch.setattr(cat, "_render_corr_nmse_two_panel", lambda **kwargs: str(tmp_path / "corr.svg"))
-    monkeypatch.setattr(cat, "_render_row_n_training_losses_panel", lambda **kwargs: str(tmp_path / "loss.svg"))
+    monkeypatch.setattr(cat, "_render_method_sweep_panel", lambda **kwargs: _write_tiny_svg(tmp_path / "sweep.svg"))
+    monkeypatch.setattr(cat, "_render_corr_nmse_two_panel", lambda **kwargs: _write_tiny_svg(tmp_path / "corr.svg"))
+    monkeypatch.setattr(cat, "_render_row_n_training_losses_panel", lambda **kwargs: _write_tiny_svg(tmp_path / "loss.svg"))
     def fake_pairwise(**kwargs):
         x_eval = kwargs.get("decode_x_all")
         bins_eval = kwargs.get("decode_bin_all")
@@ -590,9 +961,9 @@ def test_pr_project_classifier_rows_use_work_features(
     monkeypatch.setattr(cat, "compute_true_conditional_loglik_matrix", lambda x_all, theta_all, meta: np.zeros((len(x_all), len(x_all))))
     monkeypatch.setattr(cat.conv, "_pairwise_clf_from_bundle", fake_pairwise)
     monkeypatch.setattr(cat, "_train_one_method", fake_train_one_method)
-    monkeypatch.setattr(cat, "_render_method_sweep_panel", lambda **kwargs: str(tmp_path / "sweep.svg"))
-    monkeypatch.setattr(cat, "_render_corr_nmse_two_panel", lambda **kwargs: str(tmp_path / "corr.svg"))
-    monkeypatch.setattr(cat, "_render_row_n_training_losses_panel", lambda **kwargs: str(tmp_path / "loss.svg"))
+    monkeypatch.setattr(cat, "_render_method_sweep_panel", lambda **kwargs: _write_tiny_svg(tmp_path / "sweep.svg"))
+    monkeypatch.setattr(cat, "_render_corr_nmse_two_panel", lambda **kwargs: _write_tiny_svg(tmp_path / "corr.svg"))
+    monkeypatch.setattr(cat, "_render_row_n_training_losses_panel", lambda **kwargs: _write_tiny_svg(tmp_path / "loss.svg"))
 
     cat.main(
         [
@@ -659,9 +1030,9 @@ def test_binary_classifier_method_still_writes_method_row_on_disk(
     monkeypatch.setattr(cat, "hellinger_gt_sq_category_matrix", lambda gen_ds: np.array([[0.0, 0.25], [0.25, 0.0]]))
     monkeypatch.setattr(cat, "build_dataset_from_meta", lambda meta: object())
     monkeypatch.setattr(cat, "compute_true_conditional_loglik_matrix", lambda x_all, theta_all, meta: np.zeros((len(x_all), len(x_all))))
-    monkeypatch.setattr(cat, "_render_method_sweep_panel", lambda **kwargs: str(tmp_path / "sweep.svg"))
-    monkeypatch.setattr(cat, "_render_corr_nmse_two_panel", lambda **kwargs: str(tmp_path / "corr.svg"))
-    monkeypatch.setattr(cat, "_render_row_n_training_losses_panel", lambda **kwargs: str(tmp_path / "loss.svg"))
+    monkeypatch.setattr(cat, "_render_method_sweep_panel", lambda **kwargs: _write_tiny_svg(tmp_path / "sweep.svg"))
+    monkeypatch.setattr(cat, "_render_corr_nmse_two_panel", lambda **kwargs: _write_tiny_svg(tmp_path / "corr.svg"))
+    monkeypatch.setattr(cat, "_render_row_n_training_losses_panel", lambda **kwargs: _write_tiny_svg(tmp_path / "loss.svg"))
 
     cat.main(
         [
@@ -692,6 +1063,9 @@ def test_binary_classifier_method_still_writes_method_row_on_disk(
         assert h.shape == (2, 2)
         assert np.allclose(np.diag(h), 0.0)
         assert np.isfinite(h[np.triu_indices(2, 1)]).all()
+        assert "h_sq_lr_affinity_sweep" not in z.files
+        assert "corr_h_lr_affinity_vs_gt" not in z.files
+        assert "nmse_h_lr_affinity_vs_gt" not in z.files
         assert "decode_hellinger_ref_sqrt" not in z.files
         assert "decode_hellinger_sweep_sqrt" not in z.files
         assert "corr_decode_hellinger_vs_gt" not in z.files

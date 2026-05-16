@@ -310,6 +310,7 @@ def _save_h_matrix_dsm_artifacts(
 ) -> tuple[str, str, str, str]:
     """Write h_matrix_results*.npz, summary txt, symmetric heatmap, optional DeltaL heatmap."""
     h_npz_path = os.path.join(args.output_dir, f"h_matrix_results{suffix}.npz")
+    h_n_samples = int(np.asarray(h_result.theta_used).shape[0])
     h_payload: dict[str, Any] = {
         "theta_used": h_result.theta_used,
         "theta_sorted": h_result.theta_sorted,
@@ -320,7 +321,7 @@ def _save_h_matrix_dsm_artifacts(
         "sigma_eval": np.asarray([h_result.sigma_eval], dtype=np.float64),
         "h_field_method": np.asarray([h_result.field_method], dtype=object),
         "h_eval_scalar_name": np.asarray([h_result.eval_scalar_name], dtype=object),
-        "n_samples": np.asarray([h_result.theta_used.size], dtype=np.int32),
+        "n_samples": np.asarray([h_n_samples], dtype=np.int32),
         "order_mode": np.asarray([h_result.order_mode], dtype=object),
         "delta_diag_max_abs": np.asarray([h_result.delta_diag_max_abs], dtype=np.float64),
         "h_sym_max_asym_abs": np.asarray([h_result.h_sym_max_asym_abs], dtype=np.float64),
@@ -346,7 +347,7 @@ def _save_h_matrix_dsm_artifacts(
         hf.write(f"field_method: {h_result.field_method}\n")
         hf.write(f"eval_scalar_name: {h_result.eval_scalar_name}\n")
         hf.write(f"eval_scalar_value: {h_result.sigma_eval}\n")
-        hf.write(f"n_samples: {h_result.theta_used.size}\n")
+        hf.write(f"n_samples: {h_n_samples}\n")
         hf.write(f"order_mode: {h_result.order_mode}\n")
         hf.write(f"h_shape: {h_result.h_sym.shape}\n")
         hf.write(f"h_sym_min: {float(np.min(h_result.h_sym))}\n")
@@ -1616,20 +1617,30 @@ def train_pair_conditioned_ctsm_v_model(
     restore_best: bool = True,
     val_batches_per_epoch: int = 8,
 ) -> dict[str, Any]:
-    theta_fit_np = np.asarray(theta_train, dtype=np.float32).reshape(-1, 1)
+    theta_fit_np = np.asarray(theta_train, dtype=np.float32)
+    if theta_fit_np.ndim == 1:
+        theta_fit_np = theta_fit_np.reshape(-1, 1)
+    elif theta_fit_np.ndim != 2:
+        raise ValueError("CTSM-v training expects theta_train shape (N,) or (N,theta_dim).")
     x_fit_np = np.asarray(x_train, dtype=np.float32)
     if x_fit_np.ndim != 2 or x_fit_np.shape[0] != theta_fit_np.shape[0]:
-        raise ValueError("CTSM-v training expects x_train shape (N,d) and theta_train length N.")
+        raise ValueError("CTSM-v training expects x_train shape (N,d) and theta_train rows N.")
     if theta_fit_np.shape[0] < 2:
         raise ValueError("CTSM-v training requires at least 2 samples.")
 
     theta_val_np = None
     x_val_np = None
     if theta_val is not None and x_val is not None:
-        theta_val_np = np.asarray(theta_val, dtype=np.float32).reshape(-1, 1)
+        theta_val_np = np.asarray(theta_val, dtype=np.float32)
+        if theta_val_np.ndim == 1:
+            theta_val_np = theta_val_np.reshape(-1, 1)
+        elif theta_val_np.ndim != 2:
+            raise ValueError("CTSM-v validation expects theta_val shape (N,) or (N,theta_dim).")
+        if theta_val_np.shape[1] != theta_fit_np.shape[1]:
+            raise ValueError("CTSM-v validation theta_dim must match training theta_dim.")
         x_val_np = np.asarray(x_val, dtype=np.float32)
         if x_val_np.ndim != 2 or x_val_np.shape[0] != theta_val_np.shape[0]:
-            raise ValueError("CTSM-v validation expects x_val shape (N,d) and theta_val length N.")
+            raise ValueError("CTSM-v validation expects x_val shape (N,d) and theta_val rows N.")
         if theta_val_np.shape[0] < 2:
             theta_val_np = None
             x_val_np = None
@@ -1831,6 +1842,7 @@ def build_conditional_x_velocity_model(
             cond_embed_dim=int(getattr(args, "flow_cond_embed_dim", 16)),
             cond_embed_depth=int(getattr(args, "flow_cond_embed_depth", 1)),
             cond_embed_act=str(getattr(args, "flow_cond_embed_act", "silu")),
+            theta_dim=td,
         ).to(device)
     if arch == "film_fourier":
         om_eff, _ = effective_flow_x_theta_fourier_omega(args)
@@ -1913,6 +1925,7 @@ def run_shared_fisher_estimation(
                 dim=int(args.x_dim),
                 hidden_dim=int(getattr(args, "ctsm_hidden_dim", 256)),
                 depth=int(getattr(args, "ctsm_film_depth", 3)),
+                theta_dim=int(np.asarray(theta_score_fit).reshape(theta_score_fit.shape[0], -1).shape[1]),
                 m_scale=float(getattr(args, "ctsm_m_scale", 1.0)),
                 delta_scale=float(getattr(args, "ctsm_delta_scale", 0.5)),
                 use_logit_time=not bool(getattr(args, "ctsm_raw_time", False)),
@@ -1922,6 +1935,7 @@ def run_shared_fisher_estimation(
             ctsm_model = ToyPairConditionedTimeScoreNet(
                 dim=int(args.x_dim),
                 hidden_dim=int(getattr(args, "ctsm_hidden_dim", 256)),
+                theta_dim=int(np.asarray(theta_score_fit).reshape(theta_score_fit.shape[0], -1).shape[1]),
                 m_scale=float(getattr(args, "ctsm_m_scale", 1.0)),
                 delta_scale=float(getattr(args, "ctsm_delta_scale", 0.5)),
             ).to(device)
@@ -3350,7 +3364,7 @@ def run_shared_fisher_estimation(
             )
             print(
                 "[h_matrix] "
-                f"done n={h_result_skip.theta_used.size} "
+                f"done n={int(np.asarray(h_result_skip.theta_used).shape[0])} "
                 f"delta_diag_max_abs={h_result_skip.delta_diag_max_abs:.3e} "
                 f"h_sym_max_asym_abs={h_result_skip.h_sym_max_asym_abs:.3e}"
             )
@@ -3433,7 +3447,7 @@ def run_shared_fisher_estimation(
         )
         print(
             "[h_matrix] "
-            f"done n={h_result.theta_used.size} "
+            f"done n={int(np.asarray(h_result.theta_used).shape[0])} "
             f"delta_diag_max_abs={h_result.delta_diag_max_abs:.3e} "
             f"h_sym_max_asym_abs={h_result.h_sym_max_asym_abs:.3e}"
         )
@@ -3855,7 +3869,7 @@ def run_shared_fisher_estimation(
             f.write(f"h_matrix_enabled: True\n")
             f.write(f"h_sigma_eval: {h_result.sigma_eval}\n")
             f.write(f"h_order_mode: {h_result.order_mode}\n")
-            f.write(f"h_n_samples: {h_result.theta_used.size}\n")
+            f.write(f"h_n_samples: {int(np.asarray(h_result.theta_used).shape[0])}\n")
             f.write(f"h_delta_diag_max_abs: {h_result.delta_diag_max_abs}\n")
             f.write(f"h_sym_max_asym_abs: {h_result.h_sym_max_asym_abs}\n")
             f.write(f"h_matrix_npz: {h_npz_path}\n")

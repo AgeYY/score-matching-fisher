@@ -390,23 +390,34 @@ def plot_joint_and_tuning(
             ax_tune.plot(np.arange(k), mu[:, j], color="black", linewidth=1.5, alpha=0.8)
         ax_tune.set_xlabel("category")
         ax_tune.set_ylabel(r"Mean of $x|category$")
+        cat_norm = Normalize(
+            vmin=float(dataset.theta_low),
+            vmax=float(dataset.theta_high),
+        )
         if x_plot.shape[1] >= 2:
             proj_x, _, _ = pca_project(x_plot, n_components=2)
             sc = ax_manifold.scatter(
                 proj_x[:, 0],
                 proj_x[:, 1],
-                c=labels,
+                c=labels.astype(np.float64),
                 s=8,
                 alpha=0.45,
-                cmap="tab10",
-                vmin=-0.5,
-                vmax=float(k) - 0.5,
+                cmap="viridis",
+                norm=cat_norm,
             )
             ax_manifold.set_aspect("equal", adjustable="datalim")
             ax_manifold.set_axis_off()
             fig.colorbar(sc, ax=ax_manifold, fraction=0.035, pad=0.02).set_label("category")
         else:
-            ax_manifold.scatter(labels, x_plot[:, 0], c=labels, s=10, alpha=0.45, cmap="tab10")
+            ax_manifold.scatter(
+                labels,
+                x_plot[:, 0],
+                c=labels.astype(np.float64),
+                s=10,
+                alpha=0.45,
+                cmap="viridis",
+                norm=cat_norm,
+            )
             ax_manifold.set_xlabel("category")
             ax_manifold.set_ylabel(r"$x_1$")
         ax_tune.set_box_aspect(1)
