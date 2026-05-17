@@ -92,6 +92,9 @@ def test_parse_methods_aliases_and_dedup() -> None:
     assert parse_methods("x-flow, X_FLOW, binary-classifier") == ["x_flow", "binary_classifier"]
     assert parse_methods("bin-gaussian, bin_gaussian, x_flow") == ["bin_gaussian", "x_flow"]
     assert parse_methods("bin_gaussian_cate") == ["bin_gaussian"]
+    assert parse_methods("contrastive-soft-categorical, contrastive_soft_categorical") == [
+        "contrastive_soft_categorical"
+    ]
     assert parse_methods("theta-flow-cate, theta_flow_cate, thetaflow-cate") == ["theta_flow_cate"]
     assert parse_methods("ctsm-v, ctsm_v, ctsm") == ["ctsm_v"]
     assert parse_methods("lda-ctsm-v, lda_ctsm_v, ldactsm-v") == ["lda_ctsm_v"]

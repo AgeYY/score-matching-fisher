@@ -80,8 +80,7 @@ from fisher.shared_fisher_est import build_dataset_from_meta, normalize_flow_arc
 # - ctsm_v
 # - nf
 # - bin_gaussian
-# - contrastive / contrastive_soft / bidir_contrastive_soft / contrastive_soft_gaussian_net (aliases per convergence)
-# - contrastive_theta_flow / contrastive_x_flow (soft normalized_dot encoder then theta_flow / x_flow on z)
+# - contrastive_soft / contrastive_soft_categorical (aliases per convergence)
 # - linear_x_flow_t,
 #   linear_x_flow_scalar_t,
 #   linear_x_flow_diagonal_t,
@@ -104,7 +103,7 @@ from fisher.shared_fisher_est import build_dataset_from_meta, normalize_flow_arc
 #   sir_thetaflow (SIR preprocessing followed by theta_flow conditioning on projected z)
 _FLOW_BASED_METHODS = {"theta_flow", "theta_path_integral", "x_flow", "sir_xflow", "sir_thetaflow"}
 # Row specs allow ``method:arch`` when the trained estimator ultimately uses ``--flow-arch`` (includes staged embeddings).
-_FLOW_ROW_ARCH_METHODS = _FLOW_BASED_METHODS | {"contrastive_theta_flow", "contrastive_x_flow"}
+_FLOW_ROW_ARCH_METHODS = _FLOW_BASED_METHODS
 _NO_TRAIN_METHODS = {"bin_gaussian"}
 
 
@@ -139,7 +138,7 @@ class CachedTwofigBundle(TypedDict, total=False):
     dataset_pool_size: np.ndarray
 
 
-SIR_FIRST_DEFAULT_ROWS = "theta_path_integral,theta_flow,x_flow,linear_x_flow_t,contrastive,bin_gaussian"
+SIR_FIRST_DEFAULT_ROWS = "theta_path_integral,theta_flow,x_flow,linear_x_flow_t,contrastive_soft,bin_gaussian"
 
 
 def _matrix_nmse_offdiag(est: np.ndarray, gt: np.ndarray) -> float:
@@ -622,9 +621,6 @@ def _normalize_theta_field_method_local(method: str) -> str:
     ctr = conv._normalize_contrastive_method(m)
     if ctr is not None:
         return str(ctr)
-    cf = conv._normalize_contrastive_flow_method(m)
-    if cf is not None:
-        return str(cf)
     return normalize_theta_field_method(m)
 
 
@@ -653,7 +649,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Comma-separated theta-field methods to sweep in one run. "
             "Overrides --theta-field-method when non-empty. "
             "Supported values: theta_flow, theta_path_integral, x_flow, ctsm_v, nf, bin_gaussian, "
-            "contrastive / contrastive_soft / bidir_contrastive_soft / contrastive_soft_gaussian_net "
+            "contrastive_soft / contrastive_soft_categorical "
             "(same aliases as study_h_decoding_convergence.py), "
             "and supported scheduled linear_x_flow variants including linear_x_flow_diagonal_t "
             "and xflow_sir_lrank / xflow_sir_lrank_dia / xflow_sir_lrank_dia_theta / xflow_sir_lrank_scalar / xflow_sir_lrank_scalar_theta / xflow_sir_pure_lrank, "
@@ -800,8 +796,7 @@ def _parse_theta_field_rows(args: argparse.Namespace) -> list[ThetaFieldRowSpec]
             if method not in _FLOW_ROW_ARCH_METHODS:
                 raise ValueError(
                     f"Invalid --theta-field-rows token {tok!r}; arch suffix is only allowed for "
-                    "flow-based rows (theta_flow, theta_path_integral, x_flow, SIR flow wrappers, "
-                    "contrastive_theta_flow, contrastive_x_flow)."
+                    "flow-based rows (theta_flow, theta_path_integral, x_flow, SIR flow wrappers)."
                 )
         key = (method, arch)
         if key in seen:

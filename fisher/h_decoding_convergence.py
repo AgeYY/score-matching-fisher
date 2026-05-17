@@ -169,21 +169,10 @@ from fisher.linear_theta_flow import (
 )
 from fisher.contrastive_llr import (
     ContrastiveAdditiveIndependentScorer,
-    ContrastiveGaussianNetworkScorer,
-    ContrastiveIndependentDotProductScorer,
-    ContrastiveIndependentGaussianScorer,
-    ContrastiveLLRMLP,
-    ContrastiveNormalizedDotBiasScorer,
     ContrastiveNormalizedDotScorer,
-    compute_contrastive_c_matrix,
     compute_contrastive_soft_c_matrix,
-    contrastive_soft_metadata_without_training,
     dot_scorer_augmented_theta_dim,
     h_directed_from_delta_l as compute_h_directed_contrastive,
-    normalize_theta_encoding as normalize_contrastive_theta_encoding,
-    theta_dim_for_encoding as contrastive_theta_dim_for_encoding,
-    train_bidir_contrastive_soft_llr,
-    train_contrastive_llr,
     train_contrastive_soft_llr,
 )
 
@@ -573,18 +562,6 @@ def main(argv: list[str] | None = None) -> None:
             "uses ODE likelihood log p(z|theta), then DeltaL=C-diag(C), and H via 1-sech(DeltaL/2).",
             flush=True,
         )
-    elif tfm in ("contrastive_theta_flow", "contrastive_x_flow"):
-        print(
-            f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
-            f"(contrastive_soft normalized_dot -> z; inner flow_arch={getattr(args, 'flow_arch', 'mlp')}; "
-            f"dot_dim={int(getattr(args, 'contrastive_soft_dot_dim', 10))})",
-            flush=True,
-        )
-        print(
-            "[convergence] contrastive_theta_flow / contrastive_x_flow train ContrastiveNormalizedDotScorer on x, "
-            "replace bundle observations by encoded z, then run theta_flow or x_flow on z.",
-            flush=True,
-        )
     elif tfm == "sir_xflow_lrank_t":
         print(
             f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
@@ -688,34 +665,15 @@ def main(argv: list[str] | None = None) -> None:
             "forms R=C_post-log p(theta_j), then DeltaL=R-diag(R), and H via 1-sech(DeltaL/2).",
             flush=True,
         )
-    elif tfm == "contrastive":
-        print(
-            f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
-            f"(hidden_dim={int(getattr(args, 'contrastive_hidden_dim', 128))}; "
-            f"depth={int(getattr(args, 'contrastive_depth', 3))}; "
-            f"theta_encoding={str(getattr(args, 'contrastive_theta_encoding', 'one_hot_bin'))}; "
-            f"theta bins={int(args.num_theta_bins)}; identity x embedding)",
-            flush=True,
-        )
-        print(
-            "[convergence] contrastive mode trains scalar S(x,encode(bin(theta))) with row-wise shuffled-batch cross entropy, "
-            "then uses C[i,j]=S(x_i,theta_j), DeltaL=C-diag(C), and one-sided H^2 from exp(DeltaL/2).",
-            flush=True,
-        )
     elif tfm == "contrastive_soft":
         print(
             f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
             f"(score_arch={str(getattr(args, 'contrastive_soft_score_arch', 'normalized_dot'))}; "
             f"dot_dim={int(getattr(args, 'contrastive_soft_dot_dim', 10))}; "
-            f"coord_embed_dim={int(getattr(args, 'contrastive_soft_coordinate_embed_dim', 16))}; "
-            f"gaussian_logvar=[{float(getattr(args, 'contrastive_soft_gaussian_logvar_min', -8.0)):g},"
-            f"{float(getattr(args, 'contrastive_soft_gaussian_logvar_max', 5.0)):g}]; "
             f"hidden_dim={int(getattr(args, 'contrastive_hidden_dim', 128))}; "
             f"depth={int(getattr(args, 'contrastive_depth', 3))}; "
             f"bandwidth_bins={int(getattr(args, 'contrastive_soft_bandwidth_bins', 10))}; "
-            f"(raw h = train_theta_range / (2 * bandwidth_bins) when annealing off); "
-            f"bandwidth_start={float(getattr(args, 'contrastive_soft_bandwidth_start', 0.0)):g}; "
-            f"bandwidth_end={float(getattr(args, 'contrastive_soft_bandwidth_end', 0.0)):g}; "
+            f"(raw h = train_theta_range / (2 * bandwidth_bins)); "
             f"periodic={bool(getattr(args, 'contrastive_soft_periodic', False))}; identity x embedding)",
             flush=True,
         )
@@ -726,68 +684,21 @@ def main(argv: list[str] | None = None) -> None:
             "and one-sided H^2 from exp(DeltaL/2).",
             flush=True,
         )
-    elif tfm == "bidir_contrastive_soft":
-        _bidir_sa = str(getattr(args, "contrastive_soft_score_arch", "normalized_dot"))
+    elif tfm == "contrastive_soft_categorical":
         print(
             f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
-            f"(score_arch={_bidir_sa}; dot_dim={int(getattr(args, 'contrastive_soft_dot_dim', 10))}; "
+            f"(score_arch={str(getattr(args, 'contrastive_soft_score_arch', 'normalized_dot'))}; "
+            f"dot_dim={int(getattr(args, 'contrastive_soft_dot_dim', 10))}; "
             f"hidden_dim={int(getattr(args, 'contrastive_hidden_dim', 128))}; "
             f"depth={int(getattr(args, 'contrastive_depth', 3))}; "
-            f"bandwidth_bins={int(getattr(args, 'contrastive_soft_bandwidth_bins', 10))}; "
-            f"(raw h = train_theta_range / (2 * bandwidth_bins) when annealing off); "
-            f"bandwidth_start={float(getattr(args, 'contrastive_soft_bandwidth_start', 0.0)):g}; "
-            f"bandwidth_end={float(getattr(args, 'contrastive_soft_bandwidth_end', 0.0)):g}; "
-            f"periodic={bool(getattr(args, 'contrastive_soft_periodic', False))})",
-            flush=True,
-        )
-        if _bidir_sa == "mlp":
-            print(
-                "[convergence] bidir_contrastive_soft mode trains joint MLP S(x,theta) "
-                "with 0.5 row soft CE + 0.5 column soft CE over Gaussian-kernel theta targets.",
-                flush=True,
-            )
-        else:
-            print(
-                "[convergence] bidir_contrastive_soft mode trains S(x,theta)=alpha cos(g(x),a(theta))+b(theta) "
-                "with 0.5 row soft CE + 0.5 column soft CE over Gaussian-kernel theta targets.",
-                flush=True,
-            )
-    elif tfm == "contrastive_soft_gaussian_net":
-        print(
-            f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
-            f"(gn_hidden_dim={int(getattr(args, 'gn_hidden_dim', 128))}; "
-            f"gn_depth={int(getattr(args, 'gn_depth', 3))}; "
-            f"gn_diag_floor={float(getattr(args, 'gn_diag_floor', 1e-4)):g}; "
-            f"contrastive_hidden_dim={int(getattr(args, 'contrastive_hidden_dim', 128))}; "
-            f"bandwidth_bins={int(getattr(args, 'contrastive_soft_bandwidth_bins', 10))}; "
-            f"(raw h = train_theta_range / (2 * bandwidth_bins) when annealing off); "
-            f"bandwidth_start={float(getattr(args, 'contrastive_soft_bandwidth_start', 0.0)):g}; "
-            f"bandwidth_end={float(getattr(args, 'contrastive_soft_bandwidth_end', 0.0)):g}; "
-            f"periodic={bool(getattr(args, 'contrastive_soft_periodic', False))}; identity x embedding)",
+            f"beta={float(getattr(args, 'contrastive_soft_categorical_beta', 0.0))}; "
+            f"theta classes={int(args.num_theta_bins)} one-hot; identity x embedding)",
             flush=True,
         )
         print(
-            "[convergence] contrastive_soft_gaussian_net mode first trains a diagonal Gaussian "
-            "log p(x|theta) by MLE, then fine-tunes the same scalar Gaussian score with "
-            "Gaussian-kernel soft contrastive positives over shuffled minibatch theta candidates.",
-            flush=True,
-        )
-    elif tfm == "contrastive_soft_gaussian_net_no_finetune":
-        print(
-            f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
-            f"(gn_hidden_dim={int(getattr(args, 'gn_hidden_dim', 128))}; "
-            f"gn_depth={int(getattr(args, 'gn_depth', 3))}; "
-            f"gn_diag_floor={float(getattr(args, 'gn_diag_floor', 1e-4)):g}; "
-            f"bandwidth_bins={int(getattr(args, 'contrastive_soft_bandwidth_bins', 10))}; "
-            f"(raw h = train_theta_range / (2 * bandwidth_bins) when annealing off); "
-            f"bandwidth_start={float(getattr(args, 'contrastive_soft_bandwidth_start', 0.0)):g}; "
-            f"bandwidth_end={float(getattr(args, 'contrastive_soft_bandwidth_end', 0.0)):g}; "
-            f"periodic={bool(getattr(args, 'contrastive_soft_periodic', False))})",
-            flush=True,
-        )
-        print(
-            "[convergence] contrastive_soft_gaussian_net_no_finetune mode trains a diagonal Gaussian "
-            "log p(x|theta) by MLE only, then evaluates C[i,j]=log p(x_i|theta_j) without soft-contrastive fine-tuning.",
+            "[convergence] contrastive_soft_categorical mode trains class-level S(x,e_k) with categorical "
+            "soft targets, then expands C[i,j]=S(x_i,e_{y_j}), DeltaL=C-diag(C), "
+            "and one-sided H^2 from exp(DeltaL/2).",
             flush=True,
         )
     elif tfm == "nf_reduction":

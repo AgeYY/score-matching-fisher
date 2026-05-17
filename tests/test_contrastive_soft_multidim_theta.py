@@ -9,8 +9,11 @@ import torch
 from fisher.contrastive_llr import (
     ContrastiveNormalizedDotScorer,
     _theta_pair_distance,
+    categorical_soft_targets,
     compute_contrastive_soft_c_matrix,
+    compute_contrastive_soft_categorical_c_matrix,
     contrastive_soft_normalization_and_bandwidth_from_train,
+    train_contrastive_soft_categorical_llr,
     train_contrastive_soft_llr,
 )
 
@@ -44,8 +47,6 @@ def test_normalization_rejects_periodic_multidim() -> None:
             th_tr=th,
             x_tr=x,
             bandwidth_bins=10,
-            bandwidth_start=0.0,
-            bandwidth_end=0.0,
             periodic=True,
             period=float(np.pi),
         )
@@ -145,3 +146,72 @@ def test_train_contrastive_soft_llr_smoke_2d_cpu() -> None:
     )
     assert len(out["train_losses"]) == 2
     assert out["bandwidth_bins"] == 4
+
+
+def test_categorical_soft_targets_beta() -> None:
+    labels = torch.tensor([0, 2], dtype=torch.long)
+    hard = categorical_soft_targets(labels, 3, beta=0.0)
+    assert torch.allclose(hard, torch.tensor([[1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]))
+    soft = categorical_soft_targets(labels, 3, beta=0.5)
+    assert torch.allclose(
+        soft,
+        torch.tensor([[0.5, 0.25, 0.25], [0.25, 0.25, 0.5]]),
+    )
+
+
+def test_train_contrastive_soft_categorical_llr_smoke_cpu() -> None:
+    rng = np.random.default_rng(3)
+    x_tr = rng.standard_normal((18, 4))
+    x_va = rng.standard_normal((12, 4))
+    y_tr = np.tile(np.arange(3), 6)
+    y_va = np.tile(np.arange(3), 4)
+    model = ContrastiveNormalizedDotScorer(
+        x_dim=4,
+        theta_dim=3,
+        feature_dim=4,
+        hidden_dim=12,
+        depth=2,
+    )
+    out = train_contrastive_soft_categorical_llr(
+        model=model,
+        x_train=x_tr,
+        y_train=y_tr,
+        x_val=x_va,
+        y_val=y_va,
+        n_classes=3,
+        device=torch.device("cpu"),
+        epochs=2,
+        batch_size=6,
+        lr=1e-2,
+        beta=0.0,
+        log_every=1,
+        patience=0,
+    )
+    assert len(out["train_losses"]) == 2
+    assert out["n_classes"] == 3
+
+
+def test_compute_contrastive_soft_categorical_c_matrix_duplicates_class_columns() -> None:
+    rng = np.random.default_rng(4)
+    x = rng.standard_normal((5, 3))
+    labels = np.array([0, 1, 0, 2, 1], dtype=np.int64)
+    model = ContrastiveNormalizedDotScorer(
+        x_dim=3,
+        theta_dim=3,
+        feature_dim=4,
+        hidden_dim=8,
+        depth=2,
+    )
+    c = compute_contrastive_soft_categorical_c_matrix(
+        model=model,
+        x_all=x,
+        y_all=labels,
+        n_classes=3,
+        device=torch.device("cpu"),
+        x_mean=np.zeros(3, dtype=np.float64),
+        x_std=np.ones(3, dtype=np.float64),
+        pair_batch_size=32,
+    )
+    assert c.shape == (5, 5)
+    assert np.allclose(c[:, 0], c[:, 2])
+    assert np.allclose(c[:, 1], c[:, 4])

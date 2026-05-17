@@ -87,21 +87,10 @@ from fisher.linear_theta_flow import (
 )
 from fisher.contrastive_llr import (
     ContrastiveAdditiveIndependentScorer,
-    ContrastiveGaussianNetworkScorer,
-    ContrastiveIndependentDotProductScorer,
-    ContrastiveIndependentGaussianScorer,
-    ContrastiveLLRMLP,
-    ContrastiveNormalizedDotBiasScorer,
     ContrastiveNormalizedDotScorer,
-    compute_contrastive_c_matrix,
     compute_contrastive_soft_c_matrix,
-    contrastive_soft_metadata_without_training,
     dot_scorer_augmented_theta_dim,
     h_directed_from_delta_l as compute_h_directed_contrastive,
-    normalize_theta_encoding as normalize_contrastive_theta_encoding,
-    theta_dim_for_encoding as contrastive_theta_dim_for_encoding,
-    train_bidir_contrastive_soft_llr,
-    train_contrastive_llr,
     train_contrastive_soft_llr,
 )
 
@@ -2647,4 +2636,3 @@ def _render_convergence_figures_and_summary(
         print(f"  - {gn_pretrain_panel_svg}")
     print(f"  - {loss_dir}/ (per-n training loss .npz + manifest.txt)")
     print(f"  - {summary_path}")
-

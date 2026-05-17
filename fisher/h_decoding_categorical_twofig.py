@@ -58,6 +58,12 @@ from fisher.h_decoding_twofig import (
     _sanitize_row_label,
     _theta_axis_tick_labels,
 )
+from fisher.contrastive_llr import (
+    ContrastiveAdditiveIndependentScorer,
+    ContrastiveNormalizedDotScorer,
+    compute_contrastive_soft_categorical_c_matrix,
+    train_contrastive_soft_categorical_llr,
+)
 from fisher.h_matrix import HMatrixEstimator
 from fisher.shared_dataset_io import SharedDatasetBundle, load_shared_dataset_npz
 from fisher.ctsm_models import ToyPairConditionedTimeScoreNet, ToyPairConditionedTimeScoreNetFiLM
@@ -102,6 +108,8 @@ _METHOD_ALIASES: dict[str, str] = {
     "linear_x_flow_t": "linear_x_flow_t",
     "xflow-sir-lrank": "xflow_sir_lrank",
     "xflow_sir_lrank": "xflow_sir_lrank",
+    "contrastive-soft-categorical": "contrastive_soft_categorical",
+    "contrastive_soft_categorical": "contrastive_soft_categorical",
     "theta-flow-cate": "theta_flow_cate",
     "theta_flow_cate": "theta_flow_cate",
     "thetaflow-cate": "theta_flow_cate",
@@ -126,7 +134,15 @@ _METHOD_ALIASES: dict[str, str] = {
 _DEFAULT_METHODS = ("x_flow", "binary_classifier", "linear_x_flow_t", "xflow_sir_lrank")
 _SUPPORTED_METHODS_HELP = ", ".join(
     _DEFAULT_METHODS
-    + ("theta_flow_cate", "bin_gaussian", "ctsm_v", "lda_ctsm_v", "pls_ctsm_v", "pca_ctsm_v")
+    + (
+        "contrastive_soft_categorical",
+        "theta_flow_cate",
+        "bin_gaussian",
+        "ctsm_v",
+        "lda_ctsm_v",
+        "pls_ctsm_v",
+        "pca_ctsm_v",
+    )
 )
 _ALL_COLUMNS_PNG_NAME = "h_decoding_categorical_twofig_all_columns.png"
 
@@ -1143,6 +1159,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-prior-restore-best", dest="prior_restore_best", action="store_false")
     p.set_defaults(prior_restore_best=True)
     p.add_argument("--h-batch-size", type=int, default=65536)
+    p.add_argument("--contrastive-epochs", type=int, default=2000)
+    p.add_argument("--contrastive-batch-size", type=int, default=256)
+    p.add_argument("--contrastive-lr", type=float, default=1e-3)
+    p.add_argument("--contrastive-hidden-dim", type=int, default=128)
+    p.add_argument("--contrastive-depth", type=int, default=3)
+    p.add_argument("--contrastive-weight-decay", type=float, default=0.0)
+    p.add_argument("--contrastive-early-patience", type=int, default=300)
+    p.add_argument("--contrastive-early-min-delta", type=float, default=1e-4)
+    p.add_argument("--contrastive-early-ema-alpha", type=float, default=0.05)
+    p.add_argument("--contrastive-max-grad-norm", type=float, default=10.0)
+    p.add_argument("--contrastive-pair-batch-size", type=int, default=65536)
+    p.add_argument(
+        "--contrastive-soft-score-arch",
+        type=str,
+        default="normalized_dot",
+        choices=["normalized_dot", "additive_independent"],
+    )
+    p.add_argument("--contrastive-soft-dot-dim", type=int, default=10)
+    p.add_argument("--contrastive-soft-categorical-beta", type=float, default=0.0)
     p.add_argument("--ctsm-epochs", type=int, default=8000)
     p.add_argument("--ctsm-batch-size", type=int, default=512)
     p.add_argument("--ctsm-lr", type=float, default=2e-3)
@@ -2002,6 +2037,85 @@ def _train_pca_ctsm_v_delta(
     return result
 
 
+def _train_contrastive_soft_categorical_delta(
+    args: argparse.Namespace,
+    *,
+    dev: torch.device,
+    x_train: np.ndarray,
+    bins_train: np.ndarray,
+    x_val: np.ndarray,
+    bins_val: np.ndarray,
+    x_all: np.ndarray,
+    bins_all: np.ndarray,
+    k_cat: int,
+) -> dict[str, Any]:
+    x_train = np.asarray(x_train, dtype=np.float64)
+    x_val = np.asarray(x_val, dtype=np.float64)
+    x_all = np.asarray(x_all, dtype=np.float64)
+    bins_train = np.asarray(bins_train, dtype=np.int64).reshape(-1)
+    bins_val = np.asarray(bins_val, dtype=np.int64).reshape(-1)
+    bins_all = np.asarray(bins_all, dtype=np.int64).reshape(-1)
+    hidden_dim = int(getattr(args, "contrastive_hidden_dim", 128))
+    depth = int(getattr(args, "contrastive_depth", 3))
+    soft_arch = str(getattr(args, "contrastive_soft_score_arch", "normalized_dot")).strip().lower().replace("-", "_")
+    dot_dim = int(getattr(args, "contrastive_soft_dot_dim", 10))
+    if soft_arch == "normalized_dot":
+        model = ContrastiveNormalizedDotScorer(
+            x_dim=int(x_all.shape[1]),
+            theta_dim=int(k_cat),
+            feature_dim=dot_dim,
+            hidden_dim=hidden_dim,
+            depth=depth,
+        ).to(dev)
+    elif soft_arch == "additive_independent":
+        model = ContrastiveAdditiveIndependentScorer(
+            x_dim=int(x_all.shape[1]),
+            theta_dim=int(k_cat),
+            feature_dim=dot_dim,
+            hidden_dim=hidden_dim,
+            depth=depth,
+        ).to(dev)
+    else:
+        raise ValueError("--contrastive-soft-score-arch must be one of {'normalized_dot','additive_independent'}.")
+    train_out = train_contrastive_soft_categorical_llr(
+        model=model,
+        x_train=x_train,
+        y_train=bins_train,
+        x_val=x_val,
+        y_val=bins_val,
+        n_classes=int(k_cat),
+        device=dev,
+        epochs=int(getattr(args, "contrastive_epochs", 2000)),
+        batch_size=int(getattr(args, "contrastive_batch_size", 256)),
+        lr=float(getattr(args, "contrastive_lr", 1e-3)),
+        beta=float(getattr(args, "contrastive_soft_categorical_beta", 0.0)),
+        weight_decay=float(getattr(args, "contrastive_weight_decay", 0.0)),
+        patience=int(getattr(args, "contrastive_early_patience", 300)),
+        min_delta=float(getattr(args, "contrastive_early_min_delta", 1e-4)),
+        ema_alpha=float(getattr(args, "contrastive_early_ema_alpha", 0.05)),
+        max_grad_norm=float(getattr(args, "contrastive_max_grad_norm", 10.0)),
+        log_every=max(1, int(getattr(args, "log_every", 50))),
+        restore_best=True,
+    )
+    c_matrix = compute_contrastive_soft_categorical_c_matrix(
+        model=model,
+        x_all=x_all,
+        y_all=bins_all,
+        n_classes=int(k_cat),
+        device=dev,
+        x_mean=np.asarray(train_out["x_mean"], dtype=np.float64),
+        x_std=np.asarray(train_out["x_std"], dtype=np.float64),
+        pair_batch_size=int(getattr(args, "contrastive_pair_batch_size", 65536)),
+    )
+    return {
+        "c_matrix": c_matrix,
+        "delta_l": HMatrixEstimator.compute_delta_l(c_matrix),
+        "train_out": train_out,
+        "contrastive_soft_categorical_beta": np.float64(train_out["beta"]),
+        "contrastive_class_priors": np.asarray(train_out["class_priors"], dtype=np.float64),
+    }
+
+
 def _train_one_method(
     args: argparse.Namespace,
     *,
@@ -2034,6 +2148,18 @@ def _train_one_method(
             args,
             x_train=x_train,
             bins_train=bins_train,
+            x_all=x_all,
+            bins_all=bins_all,
+            k_cat=k_cat,
+        )
+    if method_name == "contrastive_soft_categorical":
+        return _train_contrastive_soft_categorical_delta(
+            args,
+            dev=dev,
+            x_train=x_train,
+            bins_train=bins_train,
+            x_val=x_val,
+            bins_val=bins_val,
             x_all=x_all,
             bins_all=bins_all,
             k_cat=k_cat,

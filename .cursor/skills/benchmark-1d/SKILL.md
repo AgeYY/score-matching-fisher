@@ -25,7 +25,7 @@ description: >-
 | Fixed by this skill | User may override |
 |---------------------|-------------------|
 | Dataset NPZ + `--dataset-family`: linearbench per **`linearbench`**; cosine PR30 under **`data/cosine_sqrtd_rand_tune_additive_xdim5_noise2x_alpha4x/`** (`--cov-theta-amp-scale 4`) | Any other `--dataset-npz` / family (then this skill does not apply) |
-| Nested subset sweep **`--n-list 80,400,1000`** (aligns with [**`lxf-bench-h-decoding-twofig`**](../lxf-bench-h-decoding-twofig/SKILL.md)) | Other `--n-list`; shrink `--n-ref` / `--n-list` if $n_{\mathrm{total}}$ is smaller |
+| Nested subset sweep **`--n-list 80,400,1000`** (scheduled LXF twofigs often pair with **`--lxfs-early-patience 1000`**) | Other `--n-list`; shrink `--n-ref` / `--n-list` if $n_{\mathrm{total}}$ is smaller |
 | **`mamba run -n geo_diffusion`**, **`--device cuda`**, reporting under **`data/...`** | CPU-only runs violate **`AGENTS.md`** unless the user accepts that constraint |
 
 **Theta-field methods are not fixed.** The examples below use **`bin_gaussian`** plus every token in **`_TIME_LXF_METHODS`** in [`bin/study_h_decoding_convergence.py`](bin/study_h_decoding_convergence.py) (`linear_x_flow_t`, `linear_x_flow_scalar_t`, `linear_x_flow_diagonal_t`, `linear_x_flow_diagonal_theta_t`, `linear_x_flow_low_rank_t`, `linear_x_flow_low_rank_randb_t`). For other comparisons, pass your own comma-separated **`--theta-field-rows`** (highest precedence) or **`--theta-field-methods`** / **`--theta-field-method`**. Low-rank rows use **`--lxf-low-rank-dim`**, which **defaults to 3** in that script; pass the flag only to override.

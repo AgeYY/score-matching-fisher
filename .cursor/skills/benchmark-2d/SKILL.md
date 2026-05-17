@@ -47,7 +47,7 @@ Pass **`--theta-field-rows tok1,tok2,...`** (highest precedence) or **`--theta-f
 
 Examples:
 
-- Minimal diagonal baseline (skills **`bin-2d-lin-lxfdiag`**, **`bin-2d-cos-lxfdiag`**): `bin_gaussian,linear_x_flow_diagonal_t` with **`--lxfs-epochs`**, **`--lxfs-early-patience`**.
+- Minimal diagonal baseline (randamp vs gridcos 2D PR30): `bin_gaussian,linear_x_flow_diagonal_t` with **`--lxfs-epochs`**, **`--lxfs-early-patience`**.
 - Full scheduled **`_t`** family + baseline (documented run):  
   `bin_gaussian,linear_x_flow_t,linear_x_flow_scalar_t,linear_x_flow_diagonal_t,linear_x_flow_diagonal_theta_t,linear_x_flow_low_rank_t,linear_x_flow_low_rank_randb_t`  
   with **`--lxfs-path-schedule`**, **`--lxfs-epochs`**, **`--lxfs-early-patience`**, and optionally **`--lxf-low-rank-dim`** for low-rank rows (CLI default rank **3**).

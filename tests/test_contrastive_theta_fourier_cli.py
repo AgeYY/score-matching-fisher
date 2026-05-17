@@ -37,49 +37,75 @@ def test_helper_maps_theta_flow_fourier_state() -> None:
     assert inc is True
 
 
-def test_hard_contrastive_rejects_theta_flow_fourier_state() -> None:
-    args = argparse.Namespace(
-        theta_field_method="contrastive",
-        theta_flow_fourier_state=True,
-        theta_flow_fourier_k=2,
-        theta_flow_fourier_period_mult=2.0,
-        theta_flow_fourier_include_linear=False,
+@pytest.mark.parametrize("arch", ["normalized_dot", "additive_independent"])
+def test_contrastive_soft_supported_arches_allow_fourier_state(arch: str) -> None:
+    p = build_parser()
+    args = p.parse_args(
+        [
+            "--dataset-npz",
+            "dummy.npz",
+            "--theta-field-method",
+            "contrastive_soft",
+            "--theta-flow-fourier-state",
+            "--contrastive-soft-score-arch",
+            arch,
+        ]
     )
-    with pytest.raises(ValueError, match="hard contrastive"):
-        _validate_contrastive_cli(args)
+    _validate_cli(args)
 
 
-def test_contrastive_soft_mlp_arch_rejects_fourier_state() -> None:
-    args = argparse.Namespace(
-        theta_field_method="contrastive_soft",
-        theta_flow_fourier_state=True,
-        theta_flow_fourier_k=2,
-        theta_flow_fourier_period_mult=2.0,
-        theta_flow_fourier_include_linear=False,
-        contrastive_epochs=100,
-        contrastive_batch_size=64,
-        contrastive_lr=1e-3,
-        contrastive_hidden_dim=32,
-        contrastive_depth=2,
-        contrastive_weight_decay=0.0,
-        contrastive_early_patience=10,
-        contrastive_early_min_delta=1e-4,
-        contrastive_early_ema_alpha=0.05,
-        contrastive_max_grad_norm=10.0,
-        contrastive_pair_batch_size=1024,
-        contrastive_theta_encoding="one_hot_bin",
-        contrastive_soft_score_arch="mlp",
-        contrastive_soft_dot_dim=8,
-        contrastive_soft_coordinate_embed_dim=16,
-        contrastive_soft_gaussian_logvar_min=-8.0,
-        contrastive_soft_gaussian_logvar_max=5.0,
-        contrastive_soft_bandwidth_bins=10,
-        contrastive_soft_bandwidth_start=0.0,
-        contrastive_soft_bandwidth_end=0.0,
-        contrastive_soft_period=6.28318,
-    )
-    with pytest.raises(ValueError, match="theta-flow-fourier-state"):
-        _validate_contrastive_cli(args)
+@pytest.mark.parametrize(
+    "arch",
+    [
+        "mlp",
+        "independent" + "_gaussian",
+        "gaussian",
+        "independent" + "_dot" + "_product",
+        "independent" + "_dot",
+        "dot" + "_independent",
+        "norm" + "_dot",
+        "dot",
+        "additive",
+        "additive" + "_independent" + "_feature",
+        "independent",
+    ],
+)
+def test_removed_contrastive_soft_score_arches_rejected(arch: str) -> None:
+    p = build_parser()
+    with pytest.raises(SystemExit):
+        p.parse_args(
+            [
+                "--dataset-npz",
+                "dummy.npz",
+                "--theta-field-method",
+                "contrastive_soft",
+                "--contrastive-soft-score-arch",
+                arch,
+            ]
+        )
+
+
+@pytest.mark.parametrize(
+    "flag,value",
+    [
+        ("--contrastive-soft-coordinate" + "-embed-dim", "16"),
+        ("--contrastive-soft-gaussian" + "-logvar-min", "-8.0"),
+        ("--contrastive-soft-gaussian" + "-logvar-max", "5.0"),
+    ],
+)
+def test_removed_contrastive_soft_arch_specific_flags_rejected(flag: str, value: str) -> None:
+    p = build_parser()
+    with pytest.raises(SystemExit):
+        p.parse_args(
+            [
+                "--dataset-npz",
+                "dummy.npz",
+                "--theta-field-method",
+                "contrastive_soft",
+                flag,
+                value,
+            ]
+        )
 
 
 @pytest.mark.parametrize(
@@ -118,6 +144,91 @@ def test_validate_cli_allows_contrastive_soft_with_theta_flow_fourier_state() ->
     _validate_cli(args)
 
 
+def test_validate_cli_allows_contrastive_soft_categorical_alias() -> None:
+    p = build_parser()
+    args = p.parse_args(
+        [
+            "--dataset-npz",
+            "dummy.npz",
+            "--theta-field-method",
+            "contrastive-soft-categorical",
+        ]
+    )
+    _validate_cli(args)
+    assert args.theta_field_method == "contrastive_soft_categorical"
+
+
+def test_validate_cli_rejects_negative_contrastive_soft_categorical_beta() -> None:
+    p = build_parser()
+    args = p.parse_args(
+        [
+            "--dataset-npz",
+            "dummy.npz",
+            "--theta-field-method",
+            "contrastive_soft_categorical",
+            "--contrastive-soft-categorical-beta",
+            "-0.1",
+        ]
+    )
+    with pytest.raises(ValueError, match="categorical-beta"):
+        _validate_cli(args)
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        "bidir" + "_contrastive_soft",
+        "bidir" + "-contrastive-soft",
+        "bidirectional" + "-contrastive-soft",
+        "bidirectional" + "_contrastive_soft",
+        "bidir" + "-contrasive-soft",
+        "contrastive_soft" + "_gaussian_net",
+        "contrastive-soft" + "-gaussian-net",
+        "contrasive-soft" + "-gaussian-net",
+        "contrastive_soft" + "_gaussian_net_no_finetune",
+        "contrastive-soft" + "-gaussian-net-no-finetune",
+        "contrasive-soft" + "-gaussian-net-no-finetune",
+        "contrastive" + "_theta" + "_flow",
+        "contrastive" + "-thetaflow",
+        "contrastive" + "_thetaflow",
+        "contrastive" + "_x" + "_flow",
+        "contrastive" + "-xflow",
+        "contrastive" + "_xflow",
+        "contrastive",
+        "contrasive",
+        "shuffled-contrastive",
+        "shuffled_contrastive",
+    ],
+)
+def test_removed_contrastive_method_aliases_rejected(method: str) -> None:
+    p = build_parser()
+    args = p.parse_args(
+        [
+            "--dataset-npz",
+            "dummy.npz",
+            "--theta-field-method",
+            method,
+        ]
+    )
+    with pytest.raises(ValueError):
+        _validate_cli(args)
+
+
+def test_removed_hard_contrastive_encoding_flag_rejected() -> None:
+    p = build_parser()
+    with pytest.raises(SystemExit):
+        p.parse_args(
+            [
+                "--dataset-npz",
+                "dummy.npz",
+                "--theta-field-method",
+                "contrastive",
+                "--contrastive" + "-theta" + "-encoding",
+                "integer" + "_bin",
+            ]
+        )
+
+
 def test_removed_contrastive_soft_bandwidth_k_rejected() -> None:
     p = build_parser()
     with pytest.raises(SystemExit):
@@ -142,12 +253,10 @@ def test_contrastive_soft_bandwidth_from_train_bins() -> None:
         th_tr=th_tr,
         x_tr=x_tr,
         bandwidth_bins=10,
-        bandwidth_start=0.0,
-        bandwidth_end=0.0,
         periodic=False,
         period=2.0 * np.pi,
     )
     theta_scale = float(nb["theta_scale"])
-    h_norm = float(nb["h_start_norm"])
-    assert abs(float(2.0 / 10.0) / theta_scale - h_norm) < 1e-12
-    assert abs(h_norm * theta_scale - 0.2) < 1e-12
+    h_norm = float(nb["h_norm"])
+    assert abs(float(2.0 / (2.0 * 10.0)) / theta_scale - h_norm) < 1e-12
+    assert abs(h_norm * theta_scale - 0.1) < 1e-12

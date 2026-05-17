@@ -87,21 +87,12 @@ from fisher.linear_theta_flow import (
 )
 from fisher.contrastive_llr import (
     ContrastiveAdditiveIndependentScorer,
-    ContrastiveGaussianNetworkScorer,
-    ContrastiveIndependentDotProductScorer,
-    ContrastiveIndependentGaussianScorer,
-    ContrastiveLLRMLP,
-    ContrastiveNormalizedDotBiasScorer,
     ContrastiveNormalizedDotScorer,
-    compute_contrastive_c_matrix,
     compute_contrastive_soft_c_matrix,
-    contrastive_soft_metadata_without_training,
+    compute_contrastive_soft_categorical_c_matrix,
     dot_scorer_augmented_theta_dim,
     h_directed_from_delta_l as compute_h_directed_contrastive,
-    normalize_theta_encoding as normalize_contrastive_theta_encoding,
-    theta_dim_for_encoding as contrastive_theta_dim_for_encoding,
-    train_bidir_contrastive_soft_llr,
-    train_contrastive_llr,
+    train_contrastive_soft_categorical_llr,
     train_contrastive_soft_llr,
 )
 
@@ -151,7 +142,6 @@ from fisher.shared_fisher_est import (
     validate_estimation_args,
 )
 from fisher.h_decoding_convergence_cli import (
-    _normalize_contrastive_flow_method,
     _normalize_contrastive_method,
     _normalize_flow_autoencoder_method,
     _normalize_flow_pca_method,
@@ -706,132 +696,6 @@ def _train_autoencoder_and_encode_bundle(
     return encoded_bundle, ae_train_out, ae_latent_dim
 
 
-def _encode_x_contrastive_normalized_dot(
-    model: ContrastiveNormalizedDotScorer,
-    x_norm: np.ndarray,
-    *,
-    device: torch.device,
-    batch_size: int,
-) -> np.ndarray:
-    """Apply encode_x in batches (x already standardized like contrastive training)."""
-    model.eval()
-    x_norm = np.asarray(x_norm, dtype=np.float64)
-    if x_norm.ndim != 2:
-        raise ValueError("x_norm must be 2D.")
-    out: list[np.ndarray] = []
-    n = int(x_norm.shape[0])
-    bs = max(1, int(batch_size))
-    with torch.no_grad():
-        for i0 in range(0, n, bs):
-            i1 = min(n, i0 + bs)
-            xt = torch.from_numpy(x_norm[i0:i1].astype(np.float32)).to(device)
-            z = model.encode_x(xt).detach().cpu().numpy().astype(np.float64, copy=False)
-            out.append(z)
-    return np.concatenate(out, axis=0)
-
-
-def _train_contrastive_soft_and_encode_bundle(
-    *,
-    args: argparse.Namespace,
-    bundle: SharedDatasetBundle,
-    device: torch.device,
-    theta_binning_mode: str,
-) -> tuple[SharedDatasetBundle, dict[str, Any], int]:
-    """Train normalized-dot contrastive-soft encoder; replace bundle x with L2-normalized z."""
-    if str(theta_binning_mode).strip().lower() == "theta2_grid":
-        raise ValueError("contrastive_theta_flow / contrastive_x_flow v1 require theta1 (--theta-binning-mode theta1).")
-    theta_train = np.asarray(bundle.theta_train, dtype=np.float64)
-    theta_val = np.asarray(bundle.theta_validation, dtype=np.float64)
-    theta_all = np.asarray(bundle.theta_all, dtype=np.float64)
-    x_train = np.asarray(bundle.x_train, dtype=np.float64)
-    x_val = np.asarray(bundle.x_validation, dtype=np.float64)
-    x_all = np.asarray(bundle.x_all, dtype=np.float64)
-    if theta_train.ndim == 1:
-        theta_train = theta_train.reshape(-1, 1)
-    if theta_val.ndim == 1:
-        theta_val = theta_val.reshape(-1, 1)
-    if theta_all.ndim == 1:
-        theta_all = theta_all.reshape(-1, 1)
-    if int(theta_train.shape[1]) != 1 or int(theta_all.shape[1]) != 1:
-        raise ValueError("contrastive+flow v1 requires scalar theta (shape (N,1)).")
-    if x_train.ndim != 2 or x_val.ndim != 2 or x_all.ndim != 2:
-        raise ValueError("contrastive+flow expects x arrays to be 2D.")
-    if theta_train.shape[0] < 2 or theta_val.shape[0] < 2:
-        raise ValueError("contrastive+flow requires at least two train and two validation rows.")
-    embed_dim = int(getattr(args, "contrastive_soft_dot_dim", 10))
-    if embed_dim < 1:
-        raise ValueError("--contrastive-soft-dot-dim must be >= 1 for contrastive+flow.")
-    hidden_dim = int(getattr(args, "contrastive_hidden_dim", 128))
-    depth = int(getattr(args, "contrastive_depth", 3))
-    _fk, _pm, _inc = contrastive_soft_fourier_settings_from_theta_flow_args(args)
-    theta_in_dim = dot_scorer_augmented_theta_dim(fourier_k=int(_fk), fourier_include_linear=bool(_inc))
-    model = ContrastiveNormalizedDotScorer(
-        x_dim=int(x_all.shape[1]),
-        theta_dim=int(theta_in_dim),
-        feature_dim=embed_dim,
-        hidden_dim=hidden_dim,
-        depth=depth,
-    ).to(device)
-    print(
-        f"[contrastive+flow] contrastive-soft normalized_dot encoder: x_dim={int(x_all.shape[1])} "
-        f"z_dim={embed_dim} theta_in_dim={int(theta_in_dim)}",
-        flush=True,
-    )
-    train_out = train_contrastive_soft_llr(
-        model=model,
-        theta_train=theta_train,
-        x_train=x_train,
-        theta_val=theta_val,
-        x_val=x_val,
-        device=device,
-        epochs=int(getattr(args, "contrastive_epochs", 2000)),
-        batch_size=int(getattr(args, "contrastive_batch_size", 256)),
-        lr=float(getattr(args, "contrastive_lr", 1e-3)),
-        bandwidth_bins=int(getattr(args, "contrastive_soft_bandwidth_bins", 10)),
-        bandwidth_start=float(getattr(args, "contrastive_soft_bandwidth_start", 0.0)),
-        bandwidth_end=float(getattr(args, "contrastive_soft_bandwidth_end", 0.0)),
-        periodic=bool(getattr(args, "contrastive_soft_periodic", False)),
-        period=float(getattr(args, "contrastive_soft_period", 2.0 * np.pi)),
-        weight_decay=float(getattr(args, "contrastive_weight_decay", 0.0)),
-        patience=int(getattr(args, "contrastive_early_patience", 300)),
-        min_delta=float(getattr(args, "contrastive_early_min_delta", 1e-4)),
-        ema_alpha=float(getattr(args, "contrastive_early_ema_alpha", 0.05)),
-        max_grad_norm=float(getattr(args, "contrastive_max_grad_norm", 10.0)),
-        log_every=max(1, int(getattr(args, "log_every", 50))),
-        restore_best=True,
-        contrastive_theta_fourier_k=int(_fk),
-        contrastive_theta_fourier_period_mult=float(_pm),
-        contrastive_theta_fourier_include_linear=bool(_inc),
-    )
-    x_mean = np.asarray(train_out["x_mean"], dtype=np.float64)
-    x_std = np.asarray(train_out["x_std"], dtype=np.float64)
-    x_train_n = (x_train - x_mean.reshape(1, -1)) / x_std.reshape(1, -1)
-    x_val_n = (x_val - x_mean.reshape(1, -1)) / x_std.reshape(1, -1)
-    x_all_n = (x_all - x_mean.reshape(1, -1)) / x_std.reshape(1, -1)
-    enc_bs = max(int(getattr(args, "contrastive_batch_size", 256)), 1)
-    z_train = _encode_x_contrastive_normalized_dot(
-        model, x_train_n, device=device, batch_size=enc_bs
-    )
-    z_val = _encode_x_contrastive_normalized_dot(
-        model, x_val_n, device=device, batch_size=enc_bs
-    )
-    z_all = _encode_x_contrastive_normalized_dot(
-        model, x_all_n, device=device, batch_size=enc_bs
-    )
-    encoded_bundle = SharedDatasetBundle(
-        meta=bundle.meta,
-        theta_all=theta_all,
-        x_all=z_all,
-        train_idx=bundle.train_idx,
-        validation_idx=bundle.validation_idx,
-        theta_train=theta_train,
-        x_train=z_train,
-        theta_validation=theta_val,
-        x_validation=z_val,
-    )
-    return encoded_bundle, train_out, embed_dim
-
-
 def _metrics_fixed_edges(
     loaded: vhb.LoadedHMatrix,
     subset: SweepSubset,
@@ -1214,308 +1078,59 @@ def _estimate_one(
 
     tfm = str(getattr(args, "theta_field_method", "theta_flow")).strip().lower()
     contrastive_norm = _normalize_contrastive_method(tfm)
-    if contrastive_norm in ("contrastive_soft_gaussian_net", "contrastive_soft_gaussian_net_no_finetune"):
+    if contrastive_norm == "contrastive_soft_categorical":
         method_name = contrastive_norm
         dev = require_device(str(getattr(args, "device", "cuda")))
         os.makedirs(output_dir, exist_ok=True)
-        theta_train = np.asarray(bundle.theta_train, dtype=np.float64)
-        theta_val = np.asarray(bundle.theta_validation, dtype=np.float64)
-        theta_all = np.asarray(bundle.theta_all, dtype=np.float64)
         x_train = np.asarray(bundle.x_train, dtype=np.float64)
         x_val = np.asarray(bundle.x_validation, dtype=np.float64)
         x_all = np.asarray(bundle.x_all, dtype=np.float64)
-        if theta_train.ndim == 1:
-            theta_train = theta_train.reshape(-1, 1)
-        if theta_val.ndim == 1:
-            theta_val = theta_val.reshape(-1, 1)
-        if theta_all.ndim == 1:
-            theta_all = theta_all.reshape(-1, 1)
-        if theta_train.ndim != 2 or theta_val.ndim != 2 or theta_all.ndim != 2:
-            raise ValueError("contrastive-soft-gaussian-net expects theta arrays to be 1D or 2D.")
-        if int(theta_train.shape[1]) != 1 or int(theta_all.shape[1]) != 1:
-            raise ValueError("contrastive-soft-gaussian-net v1 requires scalar theta.")
-        if x_train.ndim != 2 or x_val.ndim != 2 or x_all.ndim != 2:
-            raise ValueError("contrastive-soft-gaussian-net expects x arrays to be 2D.")
-        if theta_train.shape[0] < 2 or theta_val.shape[0] < 2:
-            raise ValueError("contrastive-soft-gaussian-net requires at least two train and two validation rows.")
-        if bin_all is None:
-            raise ValueError("contrastive-soft-gaussian-net requires theta bin labels from the convergence subset.")
-
-        x_mean_pre = np.mean(x_train, axis=0, dtype=np.float64)
-        x_std_pre = np.maximum(np.std(x_train, axis=0, dtype=np.float64), 1e-6)
-        theta_mean_pre = np.mean(theta_train, axis=0, dtype=np.float64)
-        theta_std_pre = np.maximum(np.std(theta_train, axis=0, dtype=np.float64), 1e-6)
-        x_train_n = (x_train - x_mean_pre) / x_std_pre
-        x_val_n = (x_val - x_mean_pre) / x_std_pre
-        theta_train_n = (theta_train - theta_mean_pre) / theta_std_pre
-        theta_val_n = (theta_val - theta_mean_pre) / theta_std_pre
-
-        gaussian_model = ConditionalDiagonalGaussianPrecisionMLP(
-            theta_dim=1,
-            x_dim=int(x_all.shape[1]),
-            hidden_dim=int(getattr(args, "gn_hidden_dim", 128)),
-            depth=int(getattr(args, "gn_depth", 3)),
-            diag_floor=float(getattr(args, "gn_diag_floor", 1e-4)),
-        ).to(dev)
-        gn_train_out = train_gaussian_network(
-            model=gaussian_model,
-            theta_train=theta_train_n,
-            x_train=x_train_n,
-            theta_val=theta_val_n,
-            x_val=x_val_n,
-            device=dev,
-            epochs=int(getattr(args, "gn_epochs", 4000)),
-            batch_size=int(getattr(args, "gn_batch_size", 256)),
-            lr=float(getattr(args, "gn_lr", 1e-3)),
-            weight_decay=float(getattr(args, "gn_weight_decay", 0.0)),
-            patience=int(getattr(args, "gn_early_patience", 300)),
-            min_delta=float(getattr(args, "gn_early_min_delta", 1e-4)),
-            ema_alpha=float(getattr(args, "gn_early_ema_alpha", 0.05)),
-            max_grad_norm=float(getattr(args, "gn_max_grad_norm", 10.0)),
-            log_every=max(1, int(getattr(args, "log_every", 50))),
-            restore_best=True,
-        )
-        model = ContrastiveGaussianNetworkScorer(gaussian_model).to(dev)
-        bw_bins = int(getattr(args, "contrastive_soft_bandwidth_bins", 10))
-        bw_start = float(getattr(args, "contrastive_soft_bandwidth_start", 0.0))
-        bw_end = float(getattr(args, "contrastive_soft_bandwidth_end", 0.0))
-        periodic = bool(getattr(args, "contrastive_soft_periodic", False))
-        period = float(getattr(args, "contrastive_soft_period", 2.0 * np.pi))
-        _fk_gn, _pm_gn, _inc_gn = contrastive_soft_fourier_settings_from_theta_flow_args(args)
-        if contrastive_norm == "contrastive_soft_gaussian_net_no_finetune":
-            train_out = contrastive_soft_metadata_without_training(
-                theta_train=theta_train,
-                x_train=x_train,
-                bandwidth_bins=bw_bins,
-                bandwidth_start=bw_start,
-                bandwidth_end=bw_end,
-                periodic=periodic,
-                period=period,
-            )
-        else:
-            train_out = train_contrastive_soft_llr(
-                model=model,
-                theta_train=theta_train,
-                x_train=x_train,
-                theta_val=theta_val,
-                x_val=x_val,
-                device=dev,
-                epochs=int(getattr(args, "contrastive_epochs", 2000)),
-                batch_size=int(getattr(args, "contrastive_batch_size", 256)),
-                lr=float(getattr(args, "contrastive_lr", 1e-3)),
-                bandwidth_bins=bw_bins,
-                bandwidth_start=bw_start,
-                bandwidth_end=bw_end,
-                periodic=periodic,
-                period=period,
-                weight_decay=float(getattr(args, "contrastive_weight_decay", 0.0)),
-                patience=int(getattr(args, "contrastive_early_patience", 300)),
-                min_delta=float(getattr(args, "contrastive_early_min_delta", 1e-4)),
-                ema_alpha=float(getattr(args, "contrastive_early_ema_alpha", 0.05)),
-                max_grad_norm=float(getattr(args, "contrastive_max_grad_norm", 10.0)),
-                log_every=max(1, int(getattr(args, "log_every", 50))),
-                restore_best=True,
-                contrastive_theta_fourier_k=int(_fk_gn),
-                contrastive_theta_fourier_period_mult=float(_pm_gn),
-                contrastive_theta_fourier_include_linear=bool(_inc_gn),
-            )
-        x_mean = np.asarray(train_out["x_mean"], dtype=np.float64)
-        x_std = np.asarray(train_out["x_std"], dtype=np.float64)
-        theta_mean = np.asarray(train_out["theta_mean"], dtype=np.float64)
-        theta_std = np.asarray(train_out["theta_std"], dtype=np.float64)
-        c_matrix = compute_contrastive_soft_c_matrix(
-            model=model,
-            theta_all=theta_all,
-            x_all=x_all,
-            device=dev,
-            x_mean=x_mean,
-            x_std=x_std,
-            theta_mean=theta_mean,
-            theta_std=theta_std,
-            pair_batch_size=int(getattr(args, "contrastive_pair_batch_size", 65536)),
-            contrastive_theta_fourier_k=int(train_out.get("contrastive_theta_fourier_k", 0)),
-            contrastive_theta_fourier_period_mult=float(train_out.get("contrastive_theta_fourier_period_mult", 2.0)),
-            contrastive_theta_fourier_include_linear=bool(
-                train_out.get("contrastive_theta_fourier_include_linear", False)
-            ),
-            theta_fourier_ref=(
-                theta_train
-                if int(train_out.get("contrastive_theta_fourier_k", 0)) > 0
-                else None
-            ),
-        )
-        delta_l = compute_delta_l_nf(c_matrix)
-        bin_h_payload = contrastive_bin_likelihood_h_payload(method_name, c_matrix)
-        h_sym = bin_h_payload["h_sym_bin_likelihood"]
-        theta_used = theta_all.reshape(-1)
-
-        h_eval_name = (
-            "contrastive_soft_gaussian_net_no_finetune_log_p_x_given_theta"
-            if contrastive_norm == "contrastive_soft_gaussian_net_no_finetune"
-            else "contrastive_soft_gaussian_net_log_p_x_given_theta"
-        )
-        np.savez_compressed(
-            os.path.join(output_dir, "h_matrix_results_theta_cov.npz"),
-            theta_used=np.asarray(theta_used, dtype=np.float64),
-            h_sym=np.asarray(h_sym, dtype=np.float64),
-            c_matrix=np.asarray(c_matrix, dtype=np.float64),
-            delta_l_matrix=np.asarray(delta_l, dtype=np.float64),
-            **bin_h_payload,
-            h_field_method=np.asarray([method_name], dtype=object),
-            h_eval_scalar_name=np.asarray([h_eval_name], dtype=object),
-            sigma_eval=np.asarray([np.nan], dtype=np.float64),
-            theta_field_method=np.asarray([method_name], dtype=object),
-            gn_hidden_dim=np.int64(getattr(args, "gn_hidden_dim", 128)),
-            gn_depth=np.int64(getattr(args, "gn_depth", 3)),
-            gn_diag_floor=np.float64(getattr(args, "gn_diag_floor", 1e-4)),
-            contrastive_effective_batch_size=np.int64(train_out.get("effective_batch_size", 0)),
-            contrastive_soft_bandwidth=np.float64(train_out["bandwidth_raw"]),
-            contrastive_soft_bandwidth_normalized=np.float64(train_out["bandwidth_normalized"]),
-            contrastive_soft_bandwidth_auto=np.bool_(train_out["bandwidth_auto"]),
-            contrastive_soft_bandwidth_anneal_enabled=np.bool_(train_out["bandwidth_anneal_enabled"]),
-            contrastive_soft_bandwidth_start=np.float64(train_out["bandwidth_start_raw"]),
-            contrastive_soft_bandwidth_end=np.float64(train_out["bandwidth_end_raw"]),
-            contrastive_soft_bandwidth_start_normalized=np.float64(train_out["bandwidth_start_normalized"]),
-            contrastive_soft_bandwidth_end_normalized=np.float64(train_out["bandwidth_end_normalized"]),
-            contrastive_soft_bandwidth_schedule=np.asarray(train_out["bandwidth_raw_schedule"], dtype=np.float64),
-            contrastive_soft_bandwidth_schedule_normalized=np.asarray(
-                train_out["bandwidth_normalized_schedule"],
-                dtype=np.float64,
-            ),
-            contrastive_soft_bandwidth_bins=np.int64(train_out["bandwidth_bins"]),
-            contrastive_soft_periodic=np.bool_(periodic),
-            contrastive_soft_period=np.float64(period),
-            contrastive_x_mean=x_mean,
-            contrastive_x_std=x_std,
-            contrastive_theta_mean=theta_mean,
-            contrastive_theta_std=theta_std,
-            contrastive_theta_fourier_k=np.int64(train_out.get("contrastive_theta_fourier_k", 0)),
-            contrastive_theta_fourier_period_mult=np.float64(train_out.get("contrastive_theta_fourier_period_mult", 2.0)),
-            contrastive_theta_fourier_include_linear=np.bool_(train_out.get("contrastive_theta_fourier_include_linear", False)),
-            theta_fourier_ref_min=np.float64(train_out.get("theta_fourier_ref_min", float("nan"))),
-            theta_fourier_ref_max=np.float64(train_out.get("theta_fourier_ref_max", float("nan"))),
-        )
-        empty = np.asarray([], dtype=np.float64)
-        np.savez_compressed(
-            os.path.join(output_dir, "score_prior_training_losses.npz"),
-            theta_field_method=np.asarray([method_name], dtype=object),
-            prior_enable=np.bool_(False),
-            score_train_losses=np.asarray(train_out["train_losses"], dtype=np.float64),
-            score_val_losses=np.asarray(train_out["val_losses"], dtype=np.float64),
-            score_val_monitor_losses=np.asarray(train_out["val_monitor_losses"], dtype=np.float64),
-            score_best_epoch=np.int64(train_out["best_epoch"]),
-            score_stopped_epoch=np.int64(train_out["stopped_epoch"]),
-            score_stopped_early=np.bool_(train_out["stopped_early"]),
-            score_best_val_smooth=np.float64(train_out["best_val_loss"]),
-            score_n_clipped_steps=np.int64(train_out.get("n_clipped_steps", 0)),
-            score_n_total_steps=np.int64(train_out.get("n_total_steps", 0)),
-            score_lr_last=np.float64(train_out.get("lr_last", float("nan"))),
-            gn_pretrain_train_losses=np.asarray(gn_train_out["train_losses"], dtype=np.float64),
-            gn_pretrain_val_losses=np.asarray(gn_train_out["val_losses"], dtype=np.float64),
-            gn_pretrain_val_monitor_losses=np.asarray(gn_train_out["val_monitor_losses"], dtype=np.float64),
-            gn_pretrain_best_epoch=np.int64(gn_train_out["best_epoch"]),
-            gn_pretrain_stopped_epoch=np.int64(gn_train_out["stopped_epoch"]),
-            gn_pretrain_stopped_early=np.bool_(gn_train_out["stopped_early"]),
-            gn_pretrain_best_val_smooth=np.float64(gn_train_out["best_val_loss"]),
-            gn_pretrain_grad_norm_mean=np.float64(gn_train_out.get("grad_norm_mean", float("nan"))),
-            gn_pretrain_grad_norm_max=np.float64(gn_train_out.get("grad_norm_max", float("nan"))),
-            gn_pretrain_param_norm_final=np.float64(gn_train_out.get("param_norm_final", float("nan"))),
-            contrastive_batch_size=np.int64(int(getattr(args, "contrastive_batch_size", 256))),
-            contrastive_effective_batch_size=np.int64(train_out.get("effective_batch_size", 0)),
-            contrastive_soft_bandwidth=np.float64(train_out["bandwidth_raw"]),
-            contrastive_soft_bandwidth_auto=np.bool_(train_out["bandwidth_auto"]),
-            contrastive_soft_bandwidth_anneal_enabled=np.bool_(train_out["bandwidth_anneal_enabled"]),
-            contrastive_soft_bandwidth_start=np.float64(train_out["bandwidth_start_raw"]),
-            contrastive_soft_bandwidth_end=np.float64(train_out["bandwidth_end_raw"]),
-            contrastive_soft_bandwidth_schedule=np.asarray(train_out["bandwidth_raw_schedule"], dtype=np.float64),
-            contrastive_soft_bandwidth_schedule_normalized=np.asarray(
-                train_out["bandwidth_normalized_schedule"],
-                dtype=np.float64,
-            ),
-            score_likelihood_finetune_train_losses=empty,
-            score_likelihood_finetune_val_losses=empty,
-            score_likelihood_finetune_val_monitor_losses=empty,
-            prior_train_losses=empty,
-            prior_val_losses=empty,
-            prior_val_monitor_losses=empty,
-            prior_likelihood_finetune_train_losses=empty,
-            prior_likelihood_finetune_val_losses=empty,
-            prior_likelihood_finetune_val_monitor_losses=empty,
-        )
-        loaded = SimpleNamespace(h_sym=np.asarray(h_sym, dtype=np.float64), theta_used=np.asarray(theta_used, dtype=np.float64))
-        return loaded, np.asarray(x_all, dtype=np.float64), dev
-
-    if contrastive_norm == "bidir_contrastive_soft":
-        method_name = contrastive_norm
-        dev = require_device(str(getattr(args, "device", "cuda")))
-        os.makedirs(output_dir, exist_ok=True)
-        theta_train = np.asarray(bundle.theta_train, dtype=np.float64)
-        theta_val = np.asarray(bundle.theta_validation, dtype=np.float64)
         theta_all = np.asarray(bundle.theta_all, dtype=np.float64)
-        x_train = np.asarray(bundle.x_train, dtype=np.float64)
-        x_val = np.asarray(bundle.x_validation, dtype=np.float64)
-        x_all = np.asarray(bundle.x_all, dtype=np.float64)
-        if theta_train.ndim == 1:
-            theta_train = theta_train.reshape(-1, 1)
-        if theta_val.ndim == 1:
-            theta_val = theta_val.reshape(-1, 1)
-        if theta_all.ndim == 1:
-            theta_all = theta_all.reshape(-1, 1)
-        if theta_train.ndim != 2 or theta_val.ndim != 2 or theta_all.ndim != 2:
-            raise ValueError("bidir-contrastive-soft expects theta arrays to be 1D or 2D.")
-        if int(theta_train.shape[1]) != 1 or int(theta_all.shape[1]) != 1:
-            raise ValueError("bidir-contrastive-soft v1 requires scalar theta.")
         if x_train.ndim != 2 or x_val.ndim != 2 or x_all.ndim != 2:
-            raise ValueError("bidir-contrastive-soft expects x arrays to be 2D.")
-        if theta_train.shape[0] < 2 or theta_val.shape[0] < 2:
-            raise ValueError("bidir-contrastive-soft requires at least two train and two validation rows.")
-        if bin_all is None:
-            raise ValueError("bidir-contrastive-soft requires theta bin labels from the convergence subset.")
+            raise ValueError("contrastive-soft-categorical expects x arrays to be 2D.")
+        if x_train.shape[0] < 2 or x_val.shape[0] < 2:
+            raise ValueError("contrastive-soft-categorical requires at least two train and two validation rows.")
+        if bin_train is None or bin_validation is None or bin_all is None:
+            raise ValueError("contrastive-soft-categorical requires theta bin labels from the convergence subset.")
 
         hidden_dim = int(getattr(args, "contrastive_hidden_dim", 128))
         depth = int(getattr(args, "contrastive_depth", 3))
-        dot_dim = int(getattr(args, "contrastive_soft_dot_dim", 10))
         soft_arch = str(getattr(args, "contrastive_soft_score_arch", "normalized_dot")).strip().lower().replace("-", "_")
-        _fk_bidir, _pm_bidir, _inc_bidir = contrastive_soft_fourier_settings_from_theta_flow_args(args)
-        theta_in_dim = dot_scorer_augmented_theta_dim(
-            fourier_k=int(_fk_bidir),
-            fourier_include_linear=bool(_inc_bidir),
-        )
-        if soft_arch == "mlp":
-            model = ContrastiveLLRMLP(
+        dot_dim = int(getattr(args, "contrastive_soft_dot_dim", 10))
+        if soft_arch == "normalized_dot":
+            model = ContrastiveNormalizedDotScorer(
                 x_dim=int(x_all.shape[1]),
-                theta_dim=1,
-                hidden_dim=hidden_dim,
-                depth=depth,
-            ).to(dev)
-        else:
-            model = ContrastiveNormalizedDotBiasScorer(
-                x_dim=int(x_all.shape[1]),
-                theta_dim=int(theta_in_dim),
+                theta_dim=int(n_bins),
                 feature_dim=dot_dim,
                 hidden_dim=hidden_dim,
                 depth=depth,
             ).to(dev)
-        bw_bins = int(getattr(args, "contrastive_soft_bandwidth_bins", 10))
-        bw_start = float(getattr(args, "contrastive_soft_bandwidth_start", 0.0))
-        bw_end = float(getattr(args, "contrastive_soft_bandwidth_end", 0.0))
-        periodic = bool(getattr(args, "contrastive_soft_periodic", False))
-        period = float(getattr(args, "contrastive_soft_period", 2.0 * np.pi))
-        train_out = train_bidir_contrastive_soft_llr(
+        elif soft_arch == "additive_independent":
+            model = ContrastiveAdditiveIndependentScorer(
+                x_dim=int(x_all.shape[1]),
+                theta_dim=int(n_bins),
+                feature_dim=dot_dim,
+                hidden_dim=hidden_dim,
+                depth=depth,
+            ).to(dev)
+        else:
+            raise ValueError(
+                "--contrastive-soft-score-arch must be one of "
+                "{'normalized_dot','additive_independent'}."
+            )
+        beta = float(getattr(args, "contrastive_soft_categorical_beta", 0.0))
+        train_out = train_contrastive_soft_categorical_llr(
             model=model,
-            theta_train=theta_train,
             x_train=x_train,
-            theta_val=theta_val,
+            y_train=np.asarray(bin_train, dtype=np.int64),
             x_val=x_val,
+            y_val=np.asarray(bin_validation, dtype=np.int64),
+            n_classes=int(n_bins),
             device=dev,
             epochs=int(getattr(args, "contrastive_epochs", 2000)),
             batch_size=int(getattr(args, "contrastive_batch_size", 256)),
             lr=float(getattr(args, "contrastive_lr", 1e-3)),
-            bandwidth_bins=bw_bins,
-            bandwidth_start=bw_start,
-            bandwidth_end=bw_end,
-            periodic=periodic,
-            period=period,
+            beta=beta,
             weight_decay=float(getattr(args, "contrastive_weight_decay", 0.0)),
             patience=int(getattr(args, "contrastive_early_patience", 300)),
             min_delta=float(getattr(args, "contrastive_early_min_delta", 1e-4)),
@@ -1523,46 +1138,29 @@ def _estimate_one(
             max_grad_norm=float(getattr(args, "contrastive_max_grad_norm", 10.0)),
             log_every=max(1, int(getattr(args, "log_every", 50))),
             restore_best=True,
-            contrastive_theta_fourier_k=int(_fk_bidir),
-            contrastive_theta_fourier_period_mult=float(_pm_bidir),
-            contrastive_theta_fourier_include_linear=bool(_inc_bidir),
         )
         x_mean = np.asarray(train_out["x_mean"], dtype=np.float64)
         x_std = np.asarray(train_out["x_std"], dtype=np.float64)
-        theta_mean = np.asarray(train_out["theta_mean"], dtype=np.float64)
-        theta_std = np.asarray(train_out["theta_std"], dtype=np.float64)
         if hasattr(model, "rho") and hasattr(model, "alpha"):
             contrastive_soft_logit_rho = float(model.rho.detach().cpu().item())
             contrastive_soft_logit_alpha = float(model.alpha.detach().cpu().item())
         else:
             contrastive_soft_logit_rho = float("nan")
             contrastive_soft_logit_alpha = float("nan")
-        bidir_score_tag = "mlp" if soft_arch == "mlp" else "normalized_dot_bias"
-        c_matrix = compute_contrastive_soft_c_matrix(
+        c_matrix = compute_contrastive_soft_categorical_c_matrix(
             model=model,
-            theta_all=theta_all,
             x_all=x_all,
+            y_all=np.asarray(bin_all, dtype=np.int64),
+            n_classes=int(n_bins),
             device=dev,
             x_mean=x_mean,
             x_std=x_std,
-            theta_mean=theta_mean,
-            theta_std=theta_std,
             pair_batch_size=int(getattr(args, "contrastive_pair_batch_size", 65536)),
-            contrastive_theta_fourier_k=int(train_out.get("contrastive_theta_fourier_k", 0)),
-            contrastive_theta_fourier_period_mult=float(train_out.get("contrastive_theta_fourier_period_mult", 2.0)),
-            contrastive_theta_fourier_include_linear=bool(
-                train_out.get("contrastive_theta_fourier_include_linear", False)
-            ),
-            theta_fourier_ref=(
-                theta_train
-                if int(train_out.get("contrastive_theta_fourier_k", 0)) > 0
-                else None
-            ),
         )
         delta_l = compute_delta_l_nf(c_matrix)
         bin_h_payload = contrastive_bin_likelihood_h_payload(method_name, c_matrix)
         h_sym = bin_h_payload["h_sym_bin_likelihood"]
-        theta_used = theta_all.reshape(-1)
+        theta_used = theta_all.reshape(-1) if theta_all.ndim == 1 or (theta_all.ndim == 2 and theta_all.shape[1] == 1) else theta_all.copy()
 
         np.savez_compressed(
             os.path.join(output_dir, "h_matrix_results_theta_cov.npz"),
@@ -1572,41 +1170,24 @@ def _estimate_one(
             delta_l_matrix=np.asarray(delta_l, dtype=np.float64),
             **bin_h_payload,
             h_field_method=np.asarray([method_name], dtype=object),
-            h_eval_scalar_name=np.asarray(["bidir_contrastive_soft_llr_score"], dtype=object),
+            h_eval_scalar_name=np.asarray(["contrastive_soft_categorical_llr_score"], dtype=object),
             sigma_eval=np.asarray([np.nan], dtype=np.float64),
             theta_field_method=np.asarray([method_name], dtype=object),
             contrastive_hidden_dim=np.int64(hidden_dim),
             contrastive_depth=np.int64(depth),
             contrastive_effective_batch_size=np.int64(train_out.get("effective_batch_size", 0)),
-            contrastive_soft_score_arch=np.asarray([bidir_score_tag], dtype=object),
+            contrastive_soft_score_arch=np.asarray([soft_arch], dtype=object),
             contrastive_soft_dot_dim=np.int64(dot_dim),
             contrastive_soft_logit_rho=np.float64(contrastive_soft_logit_rho),
             contrastive_soft_logit_alpha=np.float64(contrastive_soft_logit_alpha),
-            contrastive_soft_bandwidth=np.float64(train_out["bandwidth_raw"]),
-            contrastive_soft_bandwidth_normalized=np.float64(train_out["bandwidth_normalized"]),
-            contrastive_soft_bandwidth_auto=np.bool_(train_out["bandwidth_auto"]),
-            contrastive_soft_bandwidth_anneal_enabled=np.bool_(train_out["bandwidth_anneal_enabled"]),
-            contrastive_soft_bandwidth_start=np.float64(train_out["bandwidth_start_raw"]),
-            contrastive_soft_bandwidth_end=np.float64(train_out["bandwidth_end_raw"]),
-            contrastive_soft_bandwidth_start_normalized=np.float64(train_out["bandwidth_start_normalized"]),
-            contrastive_soft_bandwidth_end_normalized=np.float64(train_out["bandwidth_end_normalized"]),
-            contrastive_soft_bandwidth_schedule=np.asarray(train_out["bandwidth_raw_schedule"], dtype=np.float64),
-            contrastive_soft_bandwidth_schedule_normalized=np.asarray(
-                train_out["bandwidth_normalized_schedule"],
-                dtype=np.float64,
-            ),
-            contrastive_soft_bandwidth_bins=np.int64(train_out["bandwidth_bins"]),
-            contrastive_soft_periodic=np.bool_(periodic),
-            contrastive_soft_period=np.float64(period),
+            contrastive_num_theta_bins=np.int64(int(n_bins)),
+            contrastive_theta_dim=np.int64(int(n_bins)),
+            contrastive_soft_categorical_beta=np.float64(beta),
+            contrastive_class_priors=np.asarray(train_out["class_priors"], dtype=np.float64),
             contrastive_x_mean=x_mean,
             contrastive_x_std=x_std,
-            contrastive_theta_mean=theta_mean,
-            contrastive_theta_std=theta_std,
-            contrastive_theta_fourier_k=np.int64(train_out.get("contrastive_theta_fourier_k", 0)),
-            contrastive_theta_fourier_period_mult=np.float64(train_out.get("contrastive_theta_fourier_period_mult", 2.0)),
-            contrastive_theta_fourier_include_linear=np.bool_(train_out.get("contrastive_theta_fourier_include_linear", False)),
-            theta_fourier_ref_min=np.float64(train_out.get("theta_fourier_ref_min", float("nan"))),
-            theta_fourier_ref_max=np.float64(train_out.get("theta_fourier_ref_max", float("nan"))),
+            contrastive_theta_mean=np.asarray([], dtype=np.float64),
+            contrastive_theta_std=np.asarray([], dtype=np.float64),
         )
         empty = np.asarray([], dtype=np.float64)
         np.savez_compressed(
@@ -1614,11 +1195,7 @@ def _estimate_one(
             theta_field_method=np.asarray([method_name], dtype=object),
             prior_enable=np.bool_(False),
             score_train_losses=np.asarray(train_out["train_losses"], dtype=np.float64),
-            score_train_row_losses=np.asarray(train_out["train_row_losses"], dtype=np.float64),
-            score_train_col_losses=np.asarray(train_out["train_col_losses"], dtype=np.float64),
             score_val_losses=np.asarray(train_out["val_losses"], dtype=np.float64),
-            score_val_row_losses=np.asarray(train_out["val_row_losses"], dtype=np.float64),
-            score_val_col_losses=np.asarray(train_out["val_col_losses"], dtype=np.float64),
             score_val_monitor_losses=np.asarray(train_out["val_monitor_losses"], dtype=np.float64),
             score_best_epoch=np.int64(train_out["best_epoch"]),
             score_stopped_epoch=np.int64(train_out["stopped_epoch"]),
@@ -1632,20 +1209,11 @@ def _estimate_one(
             score_lr_last=np.float64(train_out.get("lr_last", float("nan"))),
             contrastive_batch_size=np.int64(int(getattr(args, "contrastive_batch_size", 256))),
             contrastive_effective_batch_size=np.int64(train_out.get("effective_batch_size", 0)),
-            contrastive_soft_score_arch=np.asarray([bidir_score_tag], dtype=object),
+            contrastive_soft_score_arch=np.asarray([soft_arch], dtype=object),
             contrastive_soft_dot_dim=np.int64(dot_dim),
             contrastive_soft_logit_rho=np.float64(contrastive_soft_logit_rho),
             contrastive_soft_logit_alpha=np.float64(contrastive_soft_logit_alpha),
-            contrastive_soft_bandwidth=np.float64(train_out["bandwidth_raw"]),
-            contrastive_soft_bandwidth_auto=np.bool_(train_out["bandwidth_auto"]),
-            contrastive_soft_bandwidth_anneal_enabled=np.bool_(train_out["bandwidth_anneal_enabled"]),
-            contrastive_soft_bandwidth_start=np.float64(train_out["bandwidth_start_raw"]),
-            contrastive_soft_bandwidth_end=np.float64(train_out["bandwidth_end_raw"]),
-            contrastive_soft_bandwidth_schedule=np.asarray(train_out["bandwidth_raw_schedule"], dtype=np.float64),
-            contrastive_soft_bandwidth_schedule_normalized=np.asarray(
-                train_out["bandwidth_normalized_schedule"],
-                dtype=np.float64,
-            ),
+            contrastive_soft_categorical_beta=np.float64(beta),
             score_likelihood_finetune_train_losses=empty,
             score_likelihood_finetune_val_losses=empty,
             score_likelihood_finetune_val_monitor_losses=empty,
@@ -1656,11 +1224,11 @@ def _estimate_one(
             prior_likelihood_finetune_val_losses=empty,
             prior_likelihood_finetune_val_monitor_losses=empty,
         )
-        loaded_bidir = SimpleNamespace(
+        loaded_contrastive_soft_categorical = SimpleNamespace(
             h_sym=np.asarray(h_sym, dtype=np.float64),
             theta_used=np.asarray(theta_used, dtype=np.float64),
         )
-        return loaded_bidir, np.asarray(x_all, dtype=np.float64), dev
+        return loaded_contrastive_soft_categorical, np.asarray(x_all, dtype=np.float64), dev
 
     if contrastive_norm == "contrastive_soft":
         method_name = contrastive_norm
@@ -1694,9 +1262,6 @@ def _estimate_one(
         depth = int(getattr(args, "contrastive_depth", 3))
         soft_arch = str(getattr(args, "contrastive_soft_score_arch", "normalized_dot")).strip().lower().replace("-", "_")
         dot_dim = int(getattr(args, "contrastive_soft_dot_dim", 10))
-        coord_embed_dim = int(getattr(args, "contrastive_soft_coordinate_embed_dim", 16))
-        gaussian_logvar_min = float(getattr(args, "contrastive_soft_gaussian_logvar_min", -8.0))
-        gaussian_logvar_max = float(getattr(args, "contrastive_soft_gaussian_logvar_max", 5.0))
         _fk_soft, _pm_soft, _inc_soft = contrastive_soft_fourier_settings_from_theta_flow_args(args)
         # Bundled Fourier θ from twofig/convergence (--theta-flow-fourier-state): θ rows are already the
         # Fourier feature vector; do not append harmonics again inside contrastive-soft training.
@@ -1728,39 +1293,12 @@ def _estimate_one(
                 hidden_dim=hidden_dim,
                 depth=depth,
             ).to(dev)
-        elif soft_arch == "independent_gaussian":
-            model = ContrastiveIndependentGaussianScorer(
-                x_dim=int(x_all.shape[1]),
-                theta_dim=int(theta_in_dim),
-                hidden_dim=hidden_dim,
-                depth=depth,
-                logvar_min=gaussian_logvar_min,
-                logvar_max=gaussian_logvar_max,
-            ).to(dev)
-        elif soft_arch == "independent_dot_product":
-            model = ContrastiveIndependentDotProductScorer(
-                x_dim=int(x_all.shape[1]),
-                theta_dim=int(theta_in_dim),
-                feature_dim=dot_dim,
-                coord_embed_dim=coord_embed_dim,
-                hidden_dim=hidden_dim,
-                depth=depth,
-            ).to(dev)
-        elif soft_arch == "mlp":
-            model = ContrastiveLLRMLP(
-                x_dim=int(x_all.shape[1]),
-                theta_dim=int(theta_in_dim),
-                hidden_dim=hidden_dim,
-                depth=depth,
-            ).to(dev)
         else:
             raise ValueError(
                 "--contrastive-soft-score-arch must be one of "
-                "{'normalized_dot','additive_independent','independent_gaussian','independent_dot_product','mlp'}."
+                "{'normalized_dot','additive_independent'}."
             )
         bw_bins = int(getattr(args, "contrastive_soft_bandwidth_bins", 10))
-        bw_start = float(getattr(args, "contrastive_soft_bandwidth_start", 0.0))
-        bw_end = float(getattr(args, "contrastive_soft_bandwidth_end", 0.0))
         periodic = bool(getattr(args, "contrastive_soft_periodic", False))
         period = float(getattr(args, "contrastive_soft_period", 2.0 * np.pi))
         train_out = train_contrastive_soft_llr(
@@ -1774,8 +1312,6 @@ def _estimate_one(
             batch_size=int(getattr(args, "contrastive_batch_size", 256)),
             lr=float(getattr(args, "contrastive_lr", 1e-3)),
             bandwidth_bins=bw_bins,
-            bandwidth_start=bw_start,
-            bandwidth_end=bw_end,
             periodic=periodic,
             period=period,
             weight_decay=float(getattr(args, "contrastive_weight_decay", 0.0)),
@@ -1841,24 +1377,11 @@ def _estimate_one(
             contrastive_effective_batch_size=np.int64(train_out.get("effective_batch_size", 0)),
             contrastive_soft_score_arch=np.asarray([soft_arch], dtype=object),
             contrastive_soft_dot_dim=np.int64(dot_dim),
-            contrastive_soft_coordinate_embed_dim=np.int64(coord_embed_dim),
-            contrastive_soft_gaussian_logvar_min=np.float64(gaussian_logvar_min),
-            contrastive_soft_gaussian_logvar_max=np.float64(gaussian_logvar_max),
             contrastive_soft_logit_rho=np.float64(contrastive_soft_logit_rho),
             contrastive_soft_logit_alpha=np.float64(contrastive_soft_logit_alpha),
             contrastive_soft_bandwidth=np.float64(train_out["bandwidth_raw"]),
             contrastive_soft_bandwidth_normalized=np.float64(train_out["bandwidth_normalized"]),
             contrastive_soft_bandwidth_auto=np.bool_(train_out["bandwidth_auto"]),
-            contrastive_soft_bandwidth_anneal_enabled=np.bool_(train_out["bandwidth_anneal_enabled"]),
-            contrastive_soft_bandwidth_start=np.float64(train_out["bandwidth_start_raw"]),
-            contrastive_soft_bandwidth_end=np.float64(train_out["bandwidth_end_raw"]),
-            contrastive_soft_bandwidth_start_normalized=np.float64(train_out["bandwidth_start_normalized"]),
-            contrastive_soft_bandwidth_end_normalized=np.float64(train_out["bandwidth_end_normalized"]),
-            contrastive_soft_bandwidth_schedule=np.asarray(train_out["bandwidth_raw_schedule"], dtype=np.float64),
-            contrastive_soft_bandwidth_schedule_normalized=np.asarray(
-                train_out["bandwidth_normalized_schedule"],
-                dtype=np.float64,
-            ),
             contrastive_soft_bandwidth_bins=np.int64(train_out["bandwidth_bins"]),
             contrastive_theta_dim=np.int64(d_theta),
             contrastive_soft_periodic=np.bool_(periodic),
@@ -1895,21 +1418,10 @@ def _estimate_one(
             contrastive_effective_batch_size=np.int64(train_out.get("effective_batch_size", 0)),
             contrastive_soft_score_arch=np.asarray([soft_arch], dtype=object),
             contrastive_soft_dot_dim=np.int64(dot_dim),
-            contrastive_soft_coordinate_embed_dim=np.int64(coord_embed_dim),
-            contrastive_soft_gaussian_logvar_min=np.float64(gaussian_logvar_min),
-            contrastive_soft_gaussian_logvar_max=np.float64(gaussian_logvar_max),
             contrastive_soft_logit_rho=np.float64(contrastive_soft_logit_rho),
             contrastive_soft_logit_alpha=np.float64(contrastive_soft_logit_alpha),
             contrastive_soft_bandwidth=np.float64(train_out["bandwidth_raw"]),
             contrastive_soft_bandwidth_auto=np.bool_(train_out["bandwidth_auto"]),
-            contrastive_soft_bandwidth_anneal_enabled=np.bool_(train_out["bandwidth_anneal_enabled"]),
-            contrastive_soft_bandwidth_start=np.float64(train_out["bandwidth_start_raw"]),
-            contrastive_soft_bandwidth_end=np.float64(train_out["bandwidth_end_raw"]),
-            contrastive_soft_bandwidth_schedule=np.asarray(train_out["bandwidth_raw_schedule"], dtype=np.float64),
-            contrastive_soft_bandwidth_schedule_normalized=np.asarray(
-                train_out["bandwidth_normalized_schedule"],
-                dtype=np.float64,
-            ),
             score_likelihood_finetune_train_losses=empty,
             score_likelihood_finetune_val_losses=empty,
             score_likelihood_finetune_val_monitor_losses=empty,
@@ -1925,143 +1437,6 @@ def _estimate_one(
             theta_used=np.asarray(theta_used, dtype=np.float64),
         )
         return loaded_contrastive_soft, np.asarray(x_all, dtype=np.float64), dev
-
-    if contrastive_norm is not None:
-        method_name = contrastive_norm
-        dev = require_device(str(getattr(args, "device", "cuda")))
-        os.makedirs(output_dir, exist_ok=True)
-        theta_train = np.asarray(bundle.theta_train, dtype=np.float64)
-        theta_val = np.asarray(bundle.theta_validation, dtype=np.float64)
-        theta_all = np.asarray(bundle.theta_all, dtype=np.float64)
-        x_train = np.asarray(bundle.x_train, dtype=np.float64)
-        x_val = np.asarray(bundle.x_validation, dtype=np.float64)
-        x_all = np.asarray(bundle.x_all, dtype=np.float64)
-        if theta_train.ndim == 1:
-            theta_train = theta_train.reshape(-1, 1)
-        if theta_val.ndim == 1:
-            theta_val = theta_val.reshape(-1, 1)
-        if theta_all.ndim == 1:
-            theta_all = theta_all.reshape(-1, 1)
-        if theta_train.ndim != 2 or theta_val.ndim != 2 or theta_all.ndim != 2:
-            raise ValueError("contrastive expects theta arrays to be 1D or 2D.")
-        if x_train.ndim != 2 or x_val.ndim != 2 or x_all.ndim != 2:
-            raise ValueError("contrastive expects x arrays to be 2D.")
-        if theta_train.shape[0] < 2 or theta_val.shape[0] < 2:
-            raise ValueError("contrastive requires at least two train and two validation rows.")
-        if theta_train.shape[1] != theta_all.shape[1]:
-            raise ValueError("contrastive theta dimension mismatch.")
-        if bin_train is None or bin_validation is None or bin_all is None:
-            raise ValueError("contrastive requires theta bin labels from the convergence subset.")
-
-        hidden_dim = int(getattr(args, "contrastive_hidden_dim", 128))
-        depth = int(getattr(args, "contrastive_depth", 3))
-        theta_encoding = normalize_contrastive_theta_encoding(
-            str(getattr(args, "contrastive_theta_encoding", "one_hot_bin"))
-        )
-        model = ContrastiveLLRMLP(
-            x_dim=int(x_all.shape[1]),
-            theta_dim=contrastive_theta_dim_for_encoding(int(n_bins), theta_encoding),
-            hidden_dim=hidden_dim,
-            depth=depth,
-        ).to(dev)
-        train_out = train_contrastive_llr(
-            model=model,
-            theta_train=theta_train,
-            x_train=x_train,
-            theta_val=theta_val,
-            x_val=x_val,
-            bin_train=np.asarray(bin_train, dtype=np.int64),
-            bin_val=np.asarray(bin_validation, dtype=np.int64),
-            n_bins=int(n_bins),
-            theta_encoding=theta_encoding,
-            device=dev,
-            epochs=int(getattr(args, "contrastive_epochs", 2000)),
-            batch_size=int(getattr(args, "contrastive_batch_size", 256)),
-            lr=float(getattr(args, "contrastive_lr", 1e-3)),
-            weight_decay=float(getattr(args, "contrastive_weight_decay", 0.0)),
-            patience=int(getattr(args, "contrastive_early_patience", 300)),
-            min_delta=float(getattr(args, "contrastive_early_min_delta", 1e-4)),
-            ema_alpha=float(getattr(args, "contrastive_early_ema_alpha", 0.05)),
-            max_grad_norm=float(getattr(args, "contrastive_max_grad_norm", 10.0)),
-            log_every=max(1, int(getattr(args, "log_every", 50))),
-            restore_best=True,
-        )
-        x_mean = np.asarray(train_out["x_mean"], dtype=np.float64)
-        x_std = np.asarray(train_out["x_std"], dtype=np.float64)
-        theta_mean = np.asarray(train_out["theta_mean"], dtype=np.float64)
-        theta_std = np.asarray(train_out["theta_std"], dtype=np.float64)
-        c_matrix = compute_contrastive_c_matrix(
-            model=model,
-            theta_all=theta_all,
-            x_all=x_all,
-            bin_all=np.asarray(bin_all, dtype=np.int64),
-            n_bins=int(n_bins),
-            theta_encoding=theta_encoding,
-            device=dev,
-            x_mean=x_mean,
-            x_std=x_std,
-            pair_batch_size=int(getattr(args, "contrastive_pair_batch_size", 65536)),
-        )
-        delta_l = compute_delta_l_nf(c_matrix)
-        bin_h_payload = contrastive_bin_likelihood_h_payload(method_name, c_matrix)
-        h_sym = bin_h_payload["h_sym_bin_likelihood"]
-        theta_used = theta_all.reshape(-1) if int(theta_all.shape[1]) == 1 else theta_all.copy()
-
-        np.savez_compressed(
-            os.path.join(output_dir, "h_matrix_results_theta_cov.npz"),
-            theta_used=np.asarray(theta_used, dtype=np.float64),
-            h_sym=np.asarray(h_sym, dtype=np.float64),
-            c_matrix=np.asarray(c_matrix, dtype=np.float64),
-            delta_l_matrix=np.asarray(delta_l, dtype=np.float64),
-            **bin_h_payload,
-            h_field_method=np.asarray([method_name], dtype=object),
-            h_eval_scalar_name=np.asarray(["contrastive_llr_score"], dtype=object),
-            sigma_eval=np.asarray([np.nan], dtype=np.float64),
-            theta_field_method=np.asarray([method_name], dtype=object),
-            contrastive_hidden_dim=np.int64(hidden_dim),
-            contrastive_depth=np.int64(depth),
-            contrastive_num_theta_bins=np.int64(int(n_bins)),
-            contrastive_theta_encoding=np.asarray([theta_encoding], dtype=object),
-            contrastive_unique_bin_batches=np.bool_(True),
-            contrastive_x_mean=x_mean,
-            contrastive_x_std=x_std,
-            contrastive_theta_mean=theta_mean,
-            contrastive_theta_std=theta_std,
-        )
-        empty = np.asarray([], dtype=np.float64)
-        np.savez_compressed(
-            os.path.join(output_dir, "score_prior_training_losses.npz"),
-            theta_field_method=np.asarray([method_name], dtype=object),
-            prior_enable=np.bool_(False),
-            score_train_losses=np.asarray(train_out["train_losses"], dtype=np.float64),
-            score_val_losses=np.asarray(train_out["val_losses"], dtype=np.float64),
-            score_val_monitor_losses=np.asarray(train_out["val_monitor_losses"], dtype=np.float64),
-            score_best_epoch=np.int64(train_out["best_epoch"]),
-            score_stopped_epoch=np.int64(train_out["stopped_epoch"]),
-            score_stopped_early=np.bool_(train_out["stopped_early"]),
-            score_best_val_smooth=np.float64(train_out["best_val_loss"]),
-            score_grad_norm_mean=np.float64(float("nan")),
-            score_grad_norm_max=np.float64(float("nan")),
-            score_param_norm_final=np.float64(float("nan")),
-            score_n_clipped_steps=np.int64(train_out.get("n_clipped_steps", 0)),
-            score_n_total_steps=np.int64(train_out.get("n_total_steps", 0)),
-            score_lr_last=np.float64(train_out.get("lr_last", float("nan"))),
-            contrastive_batch_size=np.int64(int(getattr(args, "contrastive_batch_size", 256))),
-            score_likelihood_finetune_train_losses=empty,
-            score_likelihood_finetune_val_losses=empty,
-            score_likelihood_finetune_val_monitor_losses=empty,
-            prior_train_losses=empty,
-            prior_val_losses=empty,
-            prior_val_monitor_losses=empty,
-            prior_likelihood_finetune_train_losses=empty,
-            prior_likelihood_finetune_val_losses=empty,
-            prior_likelihood_finetune_val_monitor_losses=empty,
-        )
-        loaded_contrastive = SimpleNamespace(
-            h_sym=np.asarray(h_sym, dtype=np.float64),
-            theta_used=np.asarray(theta_used, dtype=np.float64),
-        )
-        return loaded_contrastive, np.asarray(x_all, dtype=np.float64), dev
 
     gxf_norm = _normalize_gaussian_x_flow_method(tfm)
     if gxf_norm is not None:
@@ -3480,110 +2855,6 @@ def _estimate_one(
             theta_chk,
             loaded.theta_used,
             err_suffix=f"h_field_method={flow_ae_norm!r}",
-        )
-        return loaded, np.asarray(bundle.x_all, dtype=np.float64), dev
-
-    contrastive_flow_norm = _normalize_contrastive_flow_method(tfm)
-    if contrastive_flow_norm is not None:
-        base_method = _base_flow_method_for_contrastive_flow(contrastive_flow_norm)
-        dev = require_device(str(getattr(args, "device", "cuda")))
-        os.makedirs(output_dir, exist_ok=True)
-        theta_binning_mode = str(getattr(args, "theta_binning_mode", "theta1")).strip().lower()
-        encoded_bundle, ctr_train_out, latent_dim = _train_contrastive_soft_and_encode_bundle(
-            args=args,
-            bundle=bundle,
-            device=dev,
-            theta_binning_mode=theta_binning_mode,
-        )
-        if contrastive_flow_norm == "contrastive_theta_flow" and latent_dim < 2:
-            raise ValueError(
-                "contrastive-theta-flow requires --contrastive-soft-dot-dim >= 2 for theta-flow conditioning."
-            )
-        d = vars(args).copy()
-        d.setdefault("h_matrix_npz", None)
-        d.setdefault("h_only", False)
-        args2 = argparse.Namespace(**d)
-        args2.theta_field_method = base_method
-        args2.output_dir = output_dir
-        full_args = _make_full_args(args2, meta)
-        setattr(full_args, "theta_field_method", base_method)
-        setattr(full_args, "x_dim", int(latent_dim))
-        ctx = _run_ctx_for_bundle(args2, meta, encoded_bundle, full_args, n_bins)
-        vhb.run_h_estimation_if_needed(ctx)
-
-        h_path = os.path.join(
-            output_dir, _h_matrix_results_npz_basename(dataset_family=str(meta.get("dataset_family", "")))
-        )
-        if not os.path.exists(h_path):
-            h_path = os.path.join(output_dir, "h_matrix_results_theta_cov.npz")
-        if base_method == "theta_flow":
-            eval_name = "contrastive_theta_flow_log_ratio_theta_given_z"
-        else:
-            eval_name = "contrastive_x_flow_log_p_z_given_theta"
-        periodic = bool(getattr(args, "contrastive_soft_periodic", False))
-        period = float(getattr(args, "contrastive_soft_period", 2.0 * np.pi))
-        _rewrite_npz_fields(
-            h_path,
-            h_field_method=np.asarray([contrastive_flow_norm], dtype=object),
-            h_eval_scalar_name=np.asarray([eval_name], dtype=object),
-            contrastive_soft_encoder_arch=np.asarray(["normalized_dot"], dtype=object),
-            contrastive_embed_dim=np.int64(latent_dim),
-            contrastive_embed_best_val_smooth=np.float64(ctr_train_out["best_val_loss"]),
-            contrastive_effective_batch_size=np.int64(ctr_train_out.get("effective_batch_size", 0)),
-            contrastive_soft_bandwidth=np.float64(ctr_train_out["bandwidth_raw"]),
-            contrastive_soft_bandwidth_normalized=np.float64(ctr_train_out["bandwidth_normalized"]),
-            contrastive_soft_bandwidth_auto=np.bool_(ctr_train_out["bandwidth_auto"]),
-            contrastive_soft_bandwidth_anneal_enabled=np.bool_(ctr_train_out["bandwidth_anneal_enabled"]),
-            contrastive_soft_bandwidth_start=np.float64(ctr_train_out["bandwidth_start_raw"]),
-            contrastive_soft_bandwidth_end=np.float64(ctr_train_out["bandwidth_end_raw"]),
-            contrastive_soft_bandwidth_start_normalized=np.float64(ctr_train_out["bandwidth_start_normalized"]),
-            contrastive_soft_bandwidth_end_normalized=np.float64(ctr_train_out["bandwidth_end_normalized"]),
-            contrastive_soft_bandwidth_schedule=np.asarray(ctr_train_out["bandwidth_raw_schedule"], dtype=np.float64),
-            contrastive_soft_bandwidth_schedule_normalized=np.asarray(
-                ctr_train_out["bandwidth_normalized_schedule"],
-                dtype=np.float64,
-            ),
-            contrastive_soft_bandwidth_bins=np.int64(ctr_train_out["bandwidth_bins"]),
-            contrastive_soft_periodic=np.bool_(periodic),
-            contrastive_soft_period=np.float64(period),
-            contrastive_x_mean=np.asarray(ctr_train_out["x_mean"], dtype=np.float64),
-            contrastive_x_std=np.asarray(ctr_train_out["x_std"], dtype=np.float64),
-            contrastive_theta_mean=np.asarray(ctr_train_out["theta_mean"], dtype=np.float64),
-            contrastive_theta_std=np.asarray(ctr_train_out["theta_std"], dtype=np.float64),
-        )
-        loss_path = os.path.join(output_dir, "score_prior_training_losses.npz")
-        _rewrite_npz_fields(
-            loss_path,
-            theta_field_method=np.asarray([contrastive_flow_norm], dtype=object),
-            contrastive_embed_train_losses=np.asarray(ctr_train_out["train_losses"], dtype=np.float64),
-            contrastive_embed_val_losses=np.asarray(ctr_train_out["val_losses"], dtype=np.float64),
-            contrastive_embed_val_monitor_losses=np.asarray(ctr_train_out["val_monitor_losses"], dtype=np.float64),
-            contrastive_embed_best_epoch=np.int64(ctr_train_out["best_epoch"]),
-            contrastive_embed_stopped_epoch=np.int64(ctr_train_out["stopped_epoch"]),
-            contrastive_embed_stopped_early=np.bool_(ctr_train_out["stopped_early"]),
-            contrastive_embed_dim=np.int64(latent_dim),
-            contrastive_embed_n_clipped_steps=np.int64(ctr_train_out.get("n_clipped_steps", 0)),
-            contrastive_embed_n_total_steps=np.int64(ctr_train_out.get("n_total_steps", 0)),
-            contrastive_embed_lr_last=np.float64(ctr_train_out.get("lr_last", float("nan"))),
-            contrastive_soft_bandwidth=np.float64(ctr_train_out["bandwidth_raw"]),
-            contrastive_soft_bandwidth_auto=np.bool_(ctr_train_out["bandwidth_auto"]),
-            contrastive_soft_bandwidth_anneal_enabled=np.bool_(ctr_train_out["bandwidth_anneal_enabled"]),
-            contrastive_soft_bandwidth_start=np.float64(ctr_train_out["bandwidth_start_raw"]),
-            contrastive_soft_bandwidth_end=np.float64(ctr_train_out["bandwidth_end_raw"]),
-            contrastive_soft_bandwidth_schedule=np.asarray(ctr_train_out["bandwidth_raw_schedule"], dtype=np.float64),
-            contrastive_soft_bandwidth_schedule_normalized=np.asarray(
-                ctr_train_out["bandwidth_normalized_schedule"],
-                dtype=np.float64,
-            ),
-            contrastive_batch_size=np.int64(int(getattr(args, "contrastive_batch_size", 256))),
-            contrastive_effective_batch_size=np.int64(ctr_train_out.get("effective_batch_size", 0)),
-        )
-        loaded = vhb.load_h_matrix(ctx)
-        theta_chk = vhb.theta_for_h_matrix_alignment(ctx.bundle, ctx.full_args)
-        _validate_theta_used_matches_bundle(
-            theta_chk,
-            loaded.theta_used,
-            err_suffix=f"h_field_method={contrastive_flow_norm!r}",
         )
         return loaded, np.asarray(bundle.x_all, dtype=np.float64), dev
 

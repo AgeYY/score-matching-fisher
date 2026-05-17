@@ -87,21 +87,10 @@ from fisher.linear_theta_flow import (
 )
 from fisher.contrastive_llr import (
     ContrastiveAdditiveIndependentScorer,
-    ContrastiveGaussianNetworkScorer,
-    ContrastiveIndependentDotProductScorer,
-    ContrastiveIndependentGaussianScorer,
-    ContrastiveLLRMLP,
-    ContrastiveNormalizedDotBiasScorer,
     ContrastiveNormalizedDotScorer,
-    compute_contrastive_c_matrix,
     compute_contrastive_soft_c_matrix,
-    contrastive_soft_metadata_without_training,
     dot_scorer_augmented_theta_dim,
     h_directed_from_delta_l as compute_h_directed_contrastive,
-    normalize_theta_encoding as normalize_contrastive_theta_encoding,
-    theta_dim_for_encoding as contrastive_theta_dim_for_encoding,
-    train_bidir_contrastive_soft_llr,
-    train_contrastive_llr,
     train_contrastive_soft_llr,
 )
 
@@ -165,7 +154,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Also writes h_decoding_convergence_combined.{png,svg} (matrix panel + correlation curves + "
             "off-diagonal est-vs-GT H scatter + training-loss panel in one figure) and h_decoding_training_losses_panel.{png,svg} "
             "(standalone training-loss panel, one column per n). Runs that save Gaussian-network pretrain curves "
-            "(e.g. contrastive-soft-gaussian-net) also write h_decoding_gn_pretrain_losses_panel.{png,svg}."
+            "Gaussian-network methods also write h_decoding_gn_pretrain_losses_panel.{png,svg}."
         )
     )
     p.add_argument(
@@ -280,7 +269,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Replace scalar / native θ coordinates with Fourier features built per coordinate from reference ranges "
             "on the n_ref permutation prefix (theta_flow / theta_flow_autoencoder / linear_x_flow_t / xflow_sir_lrank), "
-            "or enable contrastive-soft dot-family Fourier augmentation (contrastive_soft / bidir_contrastive_soft). "
+            "or enable contrastive-soft dot-family Fourier augmentation (contrastive_soft). "
             "With d θ coordinates, flow state width is d*(2*K + optional linear channel). Base period per coordinate is "
             "theta_flow_fourier_period_mult * (theta_max - theta_min) on that coordinate's ref slice, "
             "then harmonics k=1..K."
@@ -966,74 +955,64 @@ def build_parser() -> argparse.ArgumentParser:
         default=65536,
         help="linear-theta-flow only: approximate pair budget per C-matrix block (rows*cols).",
     )
-    p.add_argument("--contrastive-epochs", type=int, default=2000, help="contrastive method only: training epochs.")
+    p.add_argument("--contrastive-epochs", type=int, default=2000, help="contrastive-family methods: training epochs.")
     p.add_argument(
         "--contrastive-batch-size",
         type=int,
         default=256,
-        help="contrastive method only: minibatch size for row-wise shuffled-theta cross entropy.",
+        help="contrastive-family methods: minibatch size for soft contrastive cross entropy.",
     )
-    p.add_argument("--contrastive-lr", type=float, default=1e-3, help="contrastive method only: learning rate.")
+    p.add_argument("--contrastive-lr", type=float, default=1e-3, help="contrastive-family methods: learning rate.")
     p.add_argument(
         "--contrastive-hidden-dim",
         type=int,
         default=128,
-        help="contrastive method only: MLP hidden width.",
+        help="contrastive-family methods: MLP hidden width.",
     )
-    p.add_argument("--contrastive-depth", type=int, default=3, help="contrastive method only: MLP depth.")
+    p.add_argument("--contrastive-depth", type=int, default=3, help="contrastive-family methods: MLP depth.")
     p.add_argument(
         "--contrastive-weight-decay",
         type=float,
         default=0.0,
-        help="contrastive method only: AdamW weight decay.",
+        help="contrastive-family methods: AdamW weight decay.",
     )
     p.add_argument(
         "--contrastive-early-patience",
         type=int,
         default=300,
-        help="contrastive method only: early-stop patience; 0 disables early stopping.",
+        help="contrastive-family methods: early-stop patience; 0 disables early stopping.",
     )
     p.add_argument(
         "--contrastive-early-min-delta",
         type=float,
         default=1e-4,
-        help="contrastive method only: early-stop min delta.",
+        help="contrastive-family methods: early-stop min delta.",
     )
     p.add_argument(
         "--contrastive-early-ema-alpha",
         type=float,
         default=0.05,
-        help="contrastive method only: EMA alpha for validation monitor.",
+        help="contrastive-family methods: EMA alpha for validation monitor.",
     )
     p.add_argument(
         "--contrastive-max-grad-norm",
         type=float,
         default=10.0,
-        help="contrastive method only: gradient clipping max norm; <=0 disables clipping.",
+        help="contrastive-family methods: gradient clipping max norm; <=0 disables clipping.",
     )
     p.add_argument(
         "--contrastive-pair-batch-size",
         type=int,
         default=65536,
-        help="contrastive method only: approximate pair budget per C-matrix block (rows*cols).",
-    )
-    p.add_argument(
-        "--contrastive-theta-encoding",
-        type=str,
-        default="one_hot_bin",
-        choices=["one_hot_bin", "integer_bin"],
-        help=(
-            "contrastive method only: theta-bin code passed to scalar S(x, theta_code). "
-            "one_hot_bin uses K-dimensional one-hot bins; integer_bin uses one normalized scalar in [-1,1]."
-        ),
+        help="contrastive-family methods: approximate pair budget per C-matrix block (rows*cols).",
     )
     p.add_argument(
         "--contrastive-soft-bandwidth-bins",
         type=int,
         default=10,
         help=(
-            "contrastive-soft only: Gaussian theta-kernel bandwidth (raw θ units) when bandwidth "
-            "annealing is disabled is train_theta_span / (2 * K), where K is this bin count."
+            "contrastive-soft only: Gaussian theta-kernel bandwidth (raw θ units) is "
+            "train_theta_span / (2 * K), where K is this bin count."
         ),
     )
     p.add_argument(
@@ -1042,25 +1021,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="normalized_dot",
         choices=[
             "normalized_dot",
-            "norm_dot",
-            "dot",
             "additive_independent",
-            "additive",
-            "additive_independent_feature",
-            "independent",
-            "independent_gaussian",
-            "gaussian",
-            "independent_dot_product",
-            "independent_dot",
-            "dot_independent",
-            "mlp",
         ],
         help=(
             "contrastive-soft only: scalar score architecture. normalized_dot uses "
             "S(x,theta)=alpha normalize(g(x))^T normalize(a(theta)); additive_independent uses "
-            "D^{-1} sum_d h_d(x_d)^T a(theta); independent_gaussian uses a diagonal Gaussian "
-            "score; independent_dot_product uses alpha/sqrt(D) sum_d h(x_d,e_d)^T a(theta); "
-            "mlp uses the old joint MLP scorer."
+            "D^{-1} sum_d h_d(x_d)^T a(theta)."
         ),
     )
     p.add_argument(
@@ -1073,42 +1039,6 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
-        "--contrastive-soft-coordinate-embed-dim",
-        type=int,
-        default=16,
-        help="contrastive-soft independent_dot_product only: learned coordinate embedding dimension.",
-    )
-    p.add_argument(
-        "--contrastive-soft-gaussian-logvar-min",
-        type=float,
-        default=-8.0,
-        help="contrastive-soft independent_gaussian only: minimum clipped log variance.",
-    )
-    p.add_argument(
-        "--contrastive-soft-gaussian-logvar-max",
-        type=float,
-        default=5.0,
-        help="contrastive-soft independent_gaussian only: maximum clipped log variance.",
-    )
-    p.add_argument(
-        "--contrastive-soft-bandwidth-start",
-        type=float,
-        default=0.0,
-        help=(
-            "contrastive-soft only: start bandwidth in raw theta units for linear annealing; "
-            "set both start and end > 0 to enable."
-        ),
-    )
-    p.add_argument(
-        "--contrastive-soft-bandwidth-end",
-        type=float,
-        default=0.0,
-        help=(
-            "contrastive-soft only: final bandwidth in raw theta units for linear annealing; "
-            "set both start and end > 0 to enable."
-        ),
-    )
-    p.add_argument(
         "--contrastive-soft-periodic",
         action="store_true",
         help="contrastive-soft only: use circular theta distance in the soft target kernel (scalar θ only).",
@@ -1118,6 +1048,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=2.0 * np.pi,
         help="contrastive-soft only: period for circular theta distance when --contrastive-soft-periodic is set.",
+    )
+    p.add_argument(
+        "--contrastive-soft-categorical-beta",
+        type=float,
+        default=0.0,
+        help=(
+            "contrastive-soft-categorical only: off-class target weight before row normalization; "
+            "0 makes the true class the only positive class."
+        ),
     )
     add_estimation_arguments(p)
     p.set_defaults(
@@ -1237,28 +1176,12 @@ def _normalize_pi_nf_method(tfm: str) -> str | None:
 def _normalize_contrastive_method(tfm: str) -> str | None:
     key = str(tfm).strip().lower()
     aliases = {
-        "contrastive": "contrastive",
-        "contrasive": "contrastive",
-        "shuffled-contrastive": "contrastive",
-        "shuffled_contrastive": "contrastive",
         "contrastive-soft": "contrastive_soft",
         "contrastive_soft": "contrastive_soft",
         "contrasive-soft": "contrastive_soft",
         "contrasive_soft": "contrastive_soft",
-        "bidir-contrastive-soft": "bidir_contrastive_soft",
-        "bidir_contrastive_soft": "bidir_contrastive_soft",
-        "bidirectional-contrastive-soft": "bidir_contrastive_soft",
-        "bidirectional_contrastive_soft": "bidir_contrastive_soft",
-        "bidir-contrasive-soft": "bidir_contrastive_soft",
-        "bidir_contrasive_soft": "bidir_contrastive_soft",
-        "contrastive-soft-gaussian-net": "contrastive_soft_gaussian_net",
-        "contrastive_soft_gaussian_net": "contrastive_soft_gaussian_net",
-        "contrasive-soft-gaussian-net": "contrastive_soft_gaussian_net",
-        "contrasive_soft_gaussian_net": "contrastive_soft_gaussian_net",
-        "contrastive-soft-gaussian-net-no-finetune": "contrastive_soft_gaussian_net_no_finetune",
-        "contrastive_soft_gaussian_net_no_finetune": "contrastive_soft_gaussian_net_no_finetune",
-        "contrasive-soft-gaussian-net-no-finetune": "contrastive_soft_gaussian_net_no_finetune",
-        "contrasive_soft_gaussian_net_no_finetune": "contrastive_soft_gaussian_net_no_finetune",
+        "contrastive-soft-categorical": "contrastive_soft_categorical",
+        "contrastive_soft_categorical": "contrastive_soft_categorical",
     }
     return aliases.get(key)
 
@@ -1281,28 +1204,6 @@ def _normalize_flow_pca_method(tfm: str) -> str | None:
         "x_flow_pca": "x_flow_pca",
     }
     return aliases.get(key)
-
-
-def _normalize_contrastive_flow_method(tfm: str) -> str | None:
-    key = str(tfm).strip().lower()
-    aliases = {
-        "contrastive-thetaflow": "contrastive_theta_flow",
-        "contrastive_thetaflow": "contrastive_theta_flow",
-        "contrastive_theta_flow": "contrastive_theta_flow",
-        "contrastive-xflow": "contrastive_x_flow",
-        "contrastive_xflow": "contrastive_x_flow",
-        "contrastive_x_flow": "contrastive_x_flow",
-    }
-    return aliases.get(key)
-
-
-def _base_flow_method_for_contrastive_flow(tfm: str) -> str:
-    method = str(tfm).strip().lower()
-    if method == "contrastive_theta_flow":
-        return "theta_flow"
-    if method == "contrastive_x_flow":
-        return "x_flow"
-    raise ValueError(f"Unsupported contrastive+flow method: {tfm!r}.")
 
 
 # Public SIR wrapper tokens -> inner estimator run after projecting x -> z on train.
@@ -1633,73 +1534,19 @@ def _validate_pinf_cli(args: argparse.Namespace) -> None:
         raise ValueError("--pinf-early-ema-alpha must be in (0, 1].")
 
 
-def _validate_contrastive_soft_gaussian_net_no_finetune_cli(args: argparse.Namespace) -> None:
-    """GN MLE pretrain only; same bandwidth metadata checks as soft contrastive (no Adam fine-tuning)."""
-    if int(getattr(args, "gn_epochs", 0)) < 1:
-        raise ValueError("--gn-epochs must be >= 1.")
-    if int(getattr(args, "gn_batch_size", 0)) < 1:
-        raise ValueError("--gn-batch-size must be >= 1.")
-    if float(getattr(args, "gn_lr", 0.0)) <= 0.0:
-        raise ValueError("--gn-lr must be > 0.")
-    if int(getattr(args, "gn_hidden_dim", 0)) < 1:
-        raise ValueError("--gn-hidden-dim must be >= 1.")
-    if int(getattr(args, "gn_depth", 0)) < 1:
-        raise ValueError("--gn-depth must be >= 1.")
-    if float(getattr(args, "gn_weight_decay", 0.0)) < 0.0:
-        raise ValueError("--gn-weight-decay must be >= 0.")
-    if float(getattr(args, "gn_diag_floor", 0.0)) <= 0.0:
-        raise ValueError("--gn-diag-floor must be > 0.")
-    if int(getattr(args, "gn_early_patience", -1)) < 0:
-        raise ValueError("--gn-early-patience must be >= 0.")
-    if float(getattr(args, "gn_early_min_delta", 0.0)) < 0.0:
-        raise ValueError("--gn-early-min-delta must be >= 0.")
-    alpha = float(getattr(args, "gn_early_ema_alpha", 0.0))
-    if not np.isfinite(alpha) or alpha <= 0.0 or alpha > 1.0:
-        raise ValueError("--gn-early-ema-alpha must be in (0, 1].")
-    if int(getattr(args, "gn_pair_batch_size", 0)) < 1:
-        raise ValueError("--gn-pair-batch-size must be >= 1.")
-    if int(getattr(args, "contrastive_pair_batch_size", 0)) < 1:
-        raise ValueError("--contrastive-pair-batch-size must be >= 1.")
-    if int(getattr(args, "contrastive_soft_bandwidth_bins", 0)) < 1:
-        raise ValueError("--contrastive-soft-bandwidth-bins must be >= 1.")
-    bw_start = float(getattr(args, "contrastive_soft_bandwidth_start", 0.0))
-    bw_end = float(getattr(args, "contrastive_soft_bandwidth_end", 0.0))
-    if not np.isfinite(bw_start) or not np.isfinite(bw_end):
-        raise ValueError("--contrastive-soft-bandwidth-start/end must be finite.")
-    if (bw_start > 0.0) != (bw_end > 0.0):
-        raise ValueError(
-            "--contrastive-soft-bandwidth-start and --contrastive-soft-bandwidth-end must both be > 0 "
-            "to enable annealing."
-        )
-    period = float(getattr(args, "contrastive_soft_period", 2.0 * np.pi))
-    if not np.isfinite(period) or period <= 0.0:
-        raise ValueError("--contrastive-soft-period must be finite and > 0.")
-
-
 def _validate_contrastive_cli(args: argparse.Namespace) -> None:
     from fisher.h_decoding_convergence_methods import contrastive_soft_fourier_settings_from_theta_flow_args
 
     tfm = str(getattr(args, "theta_field_method", "")).strip().lower()
     cnorm = _normalize_contrastive_method(tfm)
-    if cnorm == "contrastive" and bool(getattr(args, "theta_flow_fourier_state", False)):
-        raise ValueError(
-            "--theta-flow-fourier-state is not supported for hard contrastive (binned theta encoding); "
-            "use contrastive_soft or bidir_contrastive_soft."
-        )
+    if cnorm == "contrastive_soft_categorical" and bool(getattr(args, "theta_flow_fourier_state", False)):
+        raise ValueError("--theta-flow-fourier-state is not supported for contrastive_soft_categorical.")
     fk, pm, inc_lin = contrastive_soft_fourier_settings_from_theta_flow_args(args)
     if fk > 0 and (not np.isfinite(pm) or pm <= 0.0):
         raise ValueError(
             "--theta-flow-fourier-period-mult must be finite and > 0 when --theta-flow-fourier-state is set "
             f"(effective Fourier harmonics K={fk})."
         )
-    if tfm == "contrastive_soft_gaussian_net_no_finetune":
-        if fk > 0:
-            raise ValueError(
-                "--theta-flow-fourier-state is incompatible with contrastive_soft_gaussian_net_no_finetune "
-                "(Gaussian likelihood scorer uses scalar θ only)."
-            )
-        _validate_contrastive_soft_gaussian_net_no_finetune_cli(args)
-        return
     if int(getattr(args, "contrastive_epochs", 0)) < 1:
         raise ValueError("--contrastive-epochs must be >= 1.")
     if int(getattr(args, "contrastive_batch_size", 0)) < 2:
@@ -1724,59 +1571,27 @@ def _validate_contrastive_cli(args: argparse.Namespace) -> None:
         raise ValueError("--contrastive-max-grad-norm must be finite and >= 0.")
     if int(getattr(args, "contrastive_pair_batch_size", 0)) < 1:
         raise ValueError("--contrastive-pair-batch-size must be >= 1.")
-    enc = normalize_contrastive_theta_encoding(str(getattr(args, "contrastive_theta_encoding", "one_hot_bin")))
-    setattr(args, "contrastive_theta_encoding", enc)
     soft_arch = str(getattr(args, "contrastive_soft_score_arch", "normalized_dot")).strip().lower().replace("-", "_")
     soft_arch_aliases = {
         "normalized_dot": "normalized_dot",
-        "norm_dot": "normalized_dot",
-        "dot": "normalized_dot",
-        "additive": "additive_independent",
         "additive_independent": "additive_independent",
-        "additive_independent_feature": "additive_independent",
-        "independent": "additive_independent",
-        "gaussian": "independent_gaussian",
-        "independent_gaussian": "independent_gaussian",
-        "independent_dot": "independent_dot_product",
-        "independent_dot_product": "independent_dot_product",
-        "dot_independent": "independent_dot_product",
-        "mlp": "mlp",
     }
     if soft_arch not in soft_arch_aliases:
         raise ValueError(
             "--contrastive-soft-score-arch must be one of "
-            "{'normalized_dot','additive_independent','independent_gaussian','independent_dot_product','mlp'}."
+            "{'normalized_dot','additive_independent'}."
         )
     setattr(args, "contrastive_soft_score_arch", soft_arch_aliases[soft_arch])
-    if fk > 0 and getattr(args, "contrastive_soft_score_arch") in ("mlp", "independent_gaussian"):
-        raise ValueError(
-            "--theta-flow-fourier-state (with K >= 1) is incompatible with "
-            f"--contrastive-soft-score-arch={getattr(args, 'contrastive_soft_score_arch')!r}."
-        )
-    if fk > 0 and tfm == "contrastive_soft_gaussian_net":
-        raise ValueError(
-            "--theta-flow-fourier-state is incompatible with contrastive_soft_gaussian_net "
-            "(Gaussian likelihood scorer uses scalar θ only)."
-        )
     if int(getattr(args, "contrastive_soft_dot_dim", 0)) < 1:
         raise ValueError("--contrastive-soft-dot-dim must be >= 1.")
-    if int(getattr(args, "contrastive_soft_coordinate_embed_dim", 0)) < 1:
-        raise ValueError("--contrastive-soft-coordinate-embed-dim must be >= 1.")
-    logvar_min = float(getattr(args, "contrastive_soft_gaussian_logvar_min", -8.0))
-    logvar_max = float(getattr(args, "contrastive_soft_gaussian_logvar_max", 5.0))
-    if not np.isfinite(logvar_min) or not np.isfinite(logvar_max) or logvar_min >= logvar_max:
-        raise ValueError("--contrastive-soft-gaussian-logvar-min/max must be finite with min < max.")
     if int(getattr(args, "contrastive_soft_bandwidth_bins", 0)) < 1:
         raise ValueError("--contrastive-soft-bandwidth-bins must be >= 1.")
-    bw_start = float(getattr(args, "contrastive_soft_bandwidth_start", 0.0))
-    bw_end = float(getattr(args, "contrastive_soft_bandwidth_end", 0.0))
-    if not np.isfinite(bw_start) or not np.isfinite(bw_end):
-        raise ValueError("--contrastive-soft-bandwidth-start/end must be finite.")
-    if (bw_start > 0.0) != (bw_end > 0.0):
-        raise ValueError("--contrastive-soft-bandwidth-start and --contrastive-soft-bandwidth-end must both be > 0 to enable annealing.")
     period = float(getattr(args, "contrastive_soft_period", 2.0 * np.pi))
     if not np.isfinite(period) or period <= 0.0:
         raise ValueError("--contrastive-soft-period must be finite and > 0.")
+    beta = float(getattr(args, "contrastive_soft_categorical_beta", 0.0))
+    if not np.isfinite(beta) or beta < 0.0:
+        raise ValueError("--contrastive-soft-categorical-beta must be finite and >= 0.")
 
 def _validate_cli(args: argparse.Namespace) -> None:
     tfm = str(getattr(args, "theta_field_method", "theta_flow")).strip().lower()
@@ -1793,21 +1608,12 @@ def _validate_cli(args: argparse.Namespace) -> None:
         or nfr_norm is not None
         or pinf_norm is not None
         or contrastive_norm is not None
-        or _normalize_contrastive_flow_method(tfm) is not None
         or _normalize_sir_xflow_method(tfm) is not None
     ) else _normalize_gaussian_network_method(tfm)
     flow_ae_norm = _normalize_flow_autoencoder_method(tfm)
     flow_pca_norm = _normalize_flow_pca_method(tfm)
     sir_xflow_norm = _normalize_sir_xflow_method(tfm)
-    cf_flow_norm = _normalize_contrastive_flow_method(tfm)
-    if cf_flow_norm is not None:
-        setattr(args, "theta_field_method", cf_flow_norm)
-        _validate_contrastive_cli(args)
-        base_cf = argparse.Namespace(**vars(args).copy())
-        setattr(base_cf, "theta_field_method", _base_flow_method_for_contrastive_flow(cf_flow_norm))
-        validate_estimation_args(base_cf)
-        tfm = cf_flow_norm
-    elif contrastive_norm is not None:
+    if contrastive_norm is not None:
         setattr(args, "theta_field_method", contrastive_norm)
         _validate_contrastive_cli(args)
         tfm = contrastive_norm
@@ -1965,13 +1771,8 @@ def _validate_cli(args: argparse.Namespace) -> None:
         "linear_theta_flow",
         "nf_reduction",
         "pi_nf",
-        "contrastive",
         "contrastive_soft",
-        "bidir_contrastive_soft",
-        "contrastive_soft_gaussian_net",
-        "contrastive_soft_gaussian_net_no_finetune",
-        "contrastive_theta_flow",
-        "contrastive_x_flow",
+        "contrastive_soft_categorical",
     ):
         validate_estimation_args(args)
     if int(args.num_theta_bins) < 1:
@@ -2025,12 +1826,12 @@ def _validate_cli(args: argparse.Namespace) -> None:
         fourier_ok = (
             raw_tfm in ("theta_flow", "theta_flow_autoencoder")
             or lxf_norm in ("linear_x_flow_t", "xflow_sir_lrank")
-            or cnorm in ("contrastive_soft", "bidir_contrastive_soft")
+            or cnorm == "contrastive_soft"
         )
         if not fourier_ok:
             raise ValueError(
                 "--theta-flow-fourier-state requires --theta-field-method theta_flow, theta-flow-autoencoder, "
-                "linear_x_flow_t, xflow_sir_lrank, contrastive_soft, or bidir_contrastive_soft "
+                "linear_x_flow_t, xflow_sir_lrank, or contrastive_soft "
                 f"(got {getattr(args, 'theta_field_method', None)!r})."
             )
         if raw_tfm in ("theta_flow", "theta_flow_autoencoder") and arch != "mlp":
