@@ -120,7 +120,7 @@ class HMatrixEstimator:
         flow_ode_steps: int = 64,
         flow_likelihood_exact_divergence: bool = False,
         ctsm_int_n_time: int = 300,
-        ctsm_t_eps: float = 1e-5,
+        ctsm_t_eps: float = 0.01,
         theta_flow_posterior_only_likelihood: bool = False,
     ) -> None:
         if pair_batch_size < 1:

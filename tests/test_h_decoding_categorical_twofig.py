@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 from types import SimpleNamespace
 from pathlib import Path
 import xml.etree.ElementTree as ET
@@ -25,12 +26,25 @@ from fisher.h_decoding_categorical_twofig import (
     _fit_lda_weighted_projection,
     _fit_pca_weighted_projection,
     _fit_pls_weighted_projection,
+    _binary_llr_1_minus_0_to_delta_l,
+    _binary_delta_l_to_raw_llr_1_minus_0,
+    _raw_llr_metrics,
+    _save_raw_binary_llr_est_vs_true_figure,
 )
 from fisher.h_matrix import HMatrixEstimator
 from fisher import h_decoding_convergence as conv
 from fisher.h_decoding_convergence_methods import prepare_categorical_binning_for_convergence
 from fisher.shared_dataset_io import SharedDatasetBundle, load_shared_dataset_npz
-from fisher.svg_utils import concatenate_svgs_horizontally, concatenate_svgs_horizontally_to_png
+from fisher.svg_utils import concatenate_pngs_horizontally, concatenate_svgs_horizontally, concatenate_svgs_horizontally_to_png
+
+
+def _load_llr_scatter_study_module():
+    path = Path(__file__).resolve().parent / "study_h_decoding_categorical_llr_scatter.py"
+    spec = importlib.util.spec_from_file_location("study_h_decoding_categorical_llr_scatter", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _write_tiny_svg(path: Path, *, width: int = 10, height: int = 8) -> str:
@@ -39,6 +53,14 @@ def _write_tiny_svg(path: Path, *, width: int = 10, height: int = 8) -> str:
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}"></svg>',
         encoding="utf-8",
     )
+    return str(path)
+
+
+def _write_tiny_png(path: Path, *, width: int = 10, height: int = 8, color=(255, 0, 0, 255)) -> str:
+    from PIL import Image
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGBA", (width, height), color).save(path, format="PNG")
     return str(path)
 
 
@@ -65,6 +87,55 @@ def test_concatenate_svgs_horizontally_viewbox_order(tmp_path: Path) -> None:
     assert [col.attrib["viewBox"] for col in cols] == ["0 0 10 20", "0 0 30 15"]
 
 
+def test_concatenate_svgs_horizontally_normalized_height(tmp_path: Path) -> None:
+    a = tmp_path / "a.svg"
+    b = tmp_path / "b.svg"
+    out = tmp_path / "out.svg"
+    a.write_text(
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><rect width="10" height="10"/></svg>',
+        encoding="utf-8",
+    )
+    b.write_text(
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 30 10"><circle cx="5" cy="5" r="5"/></svg>',
+        encoding="utf-8",
+    )
+
+    concatenate_svgs_horizontally([a, b], out, spacing=5.0, target_height=20.0, valign="center")
+
+    root = ET.parse(out).getroot()
+    assert root.attrib["viewBox"] == "0 0 85 20"
+    cols = [child for child in list(root) if child.tag.endswith("svg")]
+    assert [col.attrib["x"] for col in cols] == ["0", "25"]
+    assert [col.attrib["y"] for col in cols] == ["0", "0"]
+    assert [col.attrib["width"] for col in cols] == ["20", "60"]
+    assert [col.attrib["height"] for col in cols] == ["20", "20"]
+
+
+def test_concatenate_svgs_horizontally_prefixes_duplicate_ids(tmp_path: Path) -> None:
+    a = tmp_path / "a.svg"
+    b = tmp_path / "b.svg"
+    out = tmp_path / "out.svg"
+    source = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10">'
+        '<defs><clipPath id="clip"><rect id="shape" width="10" height="10"/></clipPath></defs>'
+        '<g clip-path="url(#clip)"><use href="#shape" xlink:href="#shape" '
+        'xmlns:xlink="http://www.w3.org/1999/xlink"/></g>'
+        "</svg>"
+    )
+    a.write_text(source, encoding="utf-8")
+    b.write_text(source, encoding="utf-8")
+
+    concatenate_svgs_horizontally([a, b], out, spacing=0.0)
+
+    text = out.read_text(encoding="utf-8")
+    assert 'id="svg0_clip"' in text
+    assert 'id="svg1_clip"' in text
+    assert "url(#svg0_clip)" in text
+    assert "url(#svg1_clip)" in text
+    assert '#svg0_shape' in text
+    assert '#svg1_shape' in text
+
+
 def test_concatenate_svgs_horizontally_to_png_uses_dpi(tmp_path: Path) -> None:
     from PIL import Image
 
@@ -88,6 +159,265 @@ def test_concatenate_svgs_horizontally_to_png_uses_dpi(tmp_path: Path) -> None:
         assert im.size == (600, 300)
 
 
+def test_concatenate_pngs_horizontally_normalizes_height(tmp_path: Path) -> None:
+    from PIL import Image
+
+    a = Path(_write_tiny_png(tmp_path / "a.png", width=20, height=10, color=(255, 0, 0, 128)))
+    b = Path(_write_tiny_png(tmp_path / "b.png", width=10, height=20, color=(0, 0, 255, 255)))
+    out = tmp_path / "combined.png"
+
+    got = concatenate_pngs_horizontally([a, b], out, spacing=5, target_height=20, valign="center")
+
+    assert got == str(out)
+    with Image.open(out) as im:
+        assert im.format == "PNG"
+        assert im.mode == "RGB"
+        assert im.size == (55, 20)
+        assert im.getpixel((0, 0)) != (255, 0, 0, 128)
+
+
+def test_concatenate_svgs_horizontally_to_png_removes_empty_failed_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    a = tmp_path / "a.svg"
+    out = tmp_path / "out.png"
+    a.write_text(
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 72 36"><rect width="72" height="36"/></svg>',
+        encoding="utf-8",
+    )
+    out.write_bytes(b"")
+
+    def fake_run(cmd, check):
+        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"")
+        raise RuntimeError("rsvg failed")
+
+    monkeypatch.setattr("fisher.svg_utils.subprocess.run", fake_run)
+
+    with pytest.raises(RuntimeError, match="rsvg failed"):
+        concatenate_svgs_horizontally_to_png([a], out, dpi=300)
+    assert not out.exists()
+
+
+def test_llr_scatter_combined_loss_outputs_and_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    study = _load_llr_scatter_study_module()
+    method = "linear_x_flow_t"
+    loss_npz = tmp_path / "training_losses" / study._sanitize_row_label(method) / "n_000123.npz"
+    study._save_method_training_loss_npz(
+        loss_npz,
+        method_name=method,
+        result={"train_out": {"train_losses": [2.0, 1.0], "val_losses": [2.5, 1.5]}},
+    )
+    assert loss_npz.is_file()
+    with np.load(loss_npz, allow_pickle=True) as z:
+        assert z["theta_field_method"].tolist() == [method]
+        assert z["score_train_losses"].tolist() == [2.0, 1.0]
+
+    llr_svg = Path(_write_tiny_svg(tmp_path / "llr.svg", width=20, height=5)).resolve()
+    llr_png = Path(_write_tiny_png(tmp_path / "llr.png", width=40, height=10)).resolve()
+    loss_svg = Path(_write_tiny_svg(tmp_path / "loss.svg", width=12, height=10)).resolve()
+    combined_svg = tmp_path / "llr_est_vs_true_all_with_losses.svg"
+    combined_png = tmp_path / "llr_est_vs_true_all_with_losses.png"
+
+    def fake_svg_to_png(source_paths, out_path, *, spacing=24.0, dpi=300, target_height=None, valign="center"):
+        assert source_paths == [loss_svg]
+        assert dpi == 300
+        _write_tiny_png(Path(out_path), width=12, height=10)
+        return str(out_path)
+
+    def fake_concat_png(source_paths, out_path, *, spacing=100, target_height=None, valign="center"):
+        assert source_paths[0] == llr_png
+        assert Path(source_paths[1]).name == "loss_panel.png"
+        assert spacing == 100
+        assert target_height == 10
+        assert valign == "center"
+        Path(out_path).write_bytes(b"png")
+        return str(out_path)
+
+    monkeypatch.setattr(study, "concatenate_svgs_horizontally_to_png", fake_svg_to_png)
+    monkeypatch.setattr(study, "concatenate_pngs_horizontally", fake_concat_png)
+    got_svg, got_png = study._write_combined_llr_loss_outputs(
+        llr_svg=llr_svg,
+        llr_png=llr_png,
+        loss_panel_svg=loss_svg,
+        combined_svg=combined_svg,
+        combined_png=combined_png,
+    )
+
+    assert got_svg == combined_svg.resolve()
+    assert got_png == combined_png.resolve()
+    assert combined_svg.is_file()
+    assert combined_png.read_bytes() == b"png"
+    root = ET.parse(combined_svg).getroot()
+    assert root.attrib["viewBox"] == "0 0 76 10"
+
+    pca_svg = Path(_write_tiny_svg(tmp_path / "dataset_pca.svg", width=10, height=5)).resolve()
+    pca_png = Path(_write_tiny_png(tmp_path / "dataset_pca.png", width=20, height=10)).resolve()
+    mse_svg = Path(_write_tiny_svg(tmp_path / "dataset_pca_llr_mse.svg", width=15, height=5)).resolve()
+    mse_png = Path(_write_tiny_png(tmp_path / "dataset_pca_llr_mse.png", width=30, height=10)).resolve()
+    combined_three_svg = tmp_path / "llr_est_vs_true_all_with_losses_and_dataset_pca.svg"
+    combined_three_png = tmp_path / "llr_est_vs_true_all_with_losses_and_dataset_pca.png"
+
+    def fake_three_concat_png(source_paths, out_path, *, spacing=100, target_height=None, valign="center"):
+        assert source_paths[0] == pca_png
+        assert source_paths[1] == mse_png
+        assert Path(source_paths[2]).name == "loss_panel.png"
+        assert source_paths[3] == llr_png
+        assert spacing == 100
+        assert target_height == 10
+        assert valign == "center"
+        Path(out_path).write_bytes(b"three-png")
+        return str(out_path)
+
+    monkeypatch.setattr(study, "concatenate_pngs_horizontally", fake_three_concat_png)
+    got_three_svg, got_three_png = study._write_combined_llr_loss_dataset_pca_outputs(
+        llr_svg=llr_svg,
+        llr_png=llr_png,
+        loss_panel_svg=loss_svg,
+        dataset_pca_svg=pca_svg,
+        dataset_pca_png=pca_png,
+        dataset_pca_llr_mse_svg=mse_svg,
+        dataset_pca_llr_mse_png=mse_png,
+        combined_svg=combined_three_svg,
+        combined_png=combined_three_png,
+    )
+
+    assert got_three_svg == combined_three_svg.resolve()
+    assert got_three_png == combined_three_png.resolve()
+    assert combined_three_png.read_bytes() == b"three-png"
+    root_three = ET.parse(combined_three_svg).getroot()
+    assert root_three.attrib["viewBox"] == "0 0 174 10"
+    cols = [child for child in list(root_three) if child.tag.endswith("svg")]
+    assert [col.attrib["viewBox"] for col in cols] == [
+        "0 0 10 5",
+        "0 0 15 5",
+        "0 0 12 10",
+        "0 0 20 5",
+    ]
+
+
+def test_llr_scatter_per_sample_llr_mse_uses_row_and_column_offdiag() -> None:
+    study = _load_llr_scatter_study_module()
+    true = np.zeros((3, 3), dtype=np.float64)
+    est = np.array(
+        [
+            [99.0, 1.0, 2.0],
+            [3.0, 99.0, np.nan],
+            [4.0, 5.0, 99.0],
+        ],
+        dtype=np.float64,
+    )
+
+    got = study._per_sample_llr_mse(est, true)
+
+    assert got[0] == pytest.approx((1.0 + 4.0 + 9.0 + 16.0) / 4.0)
+    assert got[1] == pytest.approx((9.0 + 1.0 + 25.0) / 3.0)
+    assert got[2] == pytest.approx((16.0 + 4.0 + 25.0) / 3.0)
+
+
+def test_llr_scatter_dataset_pca_projection_outputs(tmp_path: Path) -> None:
+    study = _load_llr_scatter_study_module()
+    x_eval = np.array(
+        [
+            [-2.0, 0.0, 0.5],
+            [-1.0, 0.2, 0.4],
+            [1.0, -0.1, -0.3],
+            [2.0, 0.0, -0.5],
+        ],
+        dtype=np.float64,
+    )
+    bins_eval = np.array([0, 0, 1, 1], dtype=np.int64)
+
+    svg_path, png_path = study._save_dataset_pca_projection_figure(
+        x_eval,
+        bins_eval,
+        k_cat=2,
+        out_base=tmp_path / "dataset_pca_projection",
+    )
+
+    assert svg_path == (tmp_path / "dataset_pca_projection.svg").resolve()
+    assert png_path == (tmp_path / "dataset_pca_projection.png").resolve()
+    assert svg_path.is_file()
+    assert png_path.is_file()
+    root = ET.parse(svg_path).getroot()
+    assert root.tag.endswith("svg")
+
+    mse_svg_path, mse_png_path = study._save_dataset_pca_llr_mse_projection_figure(
+        x_eval,
+        np.array([0.1, 0.2, 1.5, 2.0], dtype=np.float64),
+        method_label="ctsm_v_binary",
+        out_base=tmp_path / "dataset_pca_llr_mse_ctsm_v_binary",
+    )
+
+    assert mse_svg_path == (tmp_path / "dataset_pca_llr_mse_ctsm_v_binary.svg").resolve()
+    assert mse_png_path == (tmp_path / "dataset_pca_llr_mse_ctsm_v_binary.png").resolve()
+    assert mse_svg_path.is_file()
+    assert mse_png_path.is_file()
+    root = ET.parse(mse_svg_path).getroot()
+    assert root.tag.endswith("svg")
+
+
+def test_llr_scatter_summary_records_loss_and_combined_paths(tmp_path: Path) -> None:
+    study = _load_llr_scatter_study_module()
+    summary = tmp_path / "llr_scatter_summary.txt"
+    args = SimpleNamespace(
+        output_dir=tmp_path,
+        num_categories=2,
+        n_eval=123,
+        pr_project=True,
+        device="cuda",
+    )
+    paths = {
+        "dataset_npz": (tmp_path / "random_mog_categorical.npz").resolve(),
+        "work_dataset_npz": (tmp_path / "random_mog_categorical_pr5.npz").resolve(),
+        "results_npz": (tmp_path / "llr_scatter_results.npz").resolve(),
+        "llr_svg": (tmp_path / "llr_est_vs_true_all.svg").resolve(),
+        "llr_png": (tmp_path / "llr_est_vs_true_all.png").resolve(),
+        "training_losses_root": (tmp_path / "training_losses").resolve(),
+        "loss_panel_svg": (tmp_path / "h_decoding_categorical_llr_scatter_training_losses_panel.svg").resolve(),
+        "combined_svg": (tmp_path / "llr_est_vs_true_all_with_losses.svg").resolve(),
+        "combined_png": (tmp_path / "llr_est_vs_true_all_with_losses.png").resolve(),
+        "dataset_pca_svg": (tmp_path / "dataset_pca_projection.svg").resolve(),
+        "dataset_pca_png": (tmp_path / "dataset_pca_projection.png").resolve(),
+        "dataset_pca_llr_mse_svg": (tmp_path / "dataset_pca_llr_mse_ctsm_v_binary.svg").resolve(),
+        "dataset_pca_llr_mse_png": (tmp_path / "dataset_pca_llr_mse_ctsm_v_binary.png").resolve(),
+        "combined_with_dataset_pca_svg": (
+            tmp_path / "llr_est_vs_true_all_with_losses_and_dataset_pca.svg"
+        ).resolve(),
+        "combined_with_dataset_pca_png": (
+            tmp_path / "llr_est_vs_true_all_with_losses_and_dataset_pca.png"
+        ).resolve(),
+    }
+
+    study._write_summary(
+        summary,
+        args=args,
+        methods=["x_flow"],
+        eval_split="all",
+        n_eval_matrix=123,
+        wall_seconds=np.asarray([1.25], dtype=np.float64),
+        **paths,
+    )
+
+    text = summary.read_text(encoding="utf-8")
+    assert f"training_losses_root: {paths['training_losses_root']}" in text
+    assert f"h_decoding_categorical_llr_scatter_training_losses_panel.svg: {paths['loss_panel_svg']}" in text
+    assert f"llr_est_vs_true_all_with_losses.svg: {paths['combined_svg']}" in text
+    assert f"llr_est_vs_true_all_with_losses.png: {paths['combined_png']}" in text
+    assert f"dataset_pca_projection.svg: {paths['dataset_pca_svg']}" in text
+    assert f"dataset_pca_projection.png: {paths['dataset_pca_png']}" in text
+    assert f"dataset_pca_llr_mse_ctsm_v_binary.svg: {paths['dataset_pca_llr_mse_svg']}" in text
+    assert f"dataset_pca_llr_mse_ctsm_v_binary.png: {paths['dataset_pca_llr_mse_png']}" in text
+    assert (
+        "llr_est_vs_true_all_with_losses_and_dataset_pca.svg: "
+        f"{paths['combined_with_dataset_pca_svg']}"
+    ) in text
+    assert (
+        "llr_est_vs_true_all_with_losses_and_dataset_pca.png: "
+        f"{paths['combined_with_dataset_pca_png']}"
+    ) in text
+
+
 def test_parse_methods_aliases_and_dedup() -> None:
     assert parse_methods("x-flow, X_FLOW, binary-classifier") == ["x_flow", "binary_classifier"]
     assert parse_methods("bin-gaussian, bin_gaussian, x_flow") == ["bin_gaussian", "x_flow"]
@@ -97,6 +427,7 @@ def test_parse_methods_aliases_and_dedup() -> None:
     ]
     assert parse_methods("theta-flow-cate, theta_flow_cate, thetaflow-cate") == ["theta_flow_cate"]
     assert parse_methods("ctsm-v, ctsm_v, ctsm") == ["ctsm_v"]
+    assert parse_methods("ctsm-v-binary, ctsm_v_binary, ctsm_binary") == ["ctsm_v_binary"]
     assert parse_methods("lda-ctsm-v, lda_ctsm_v, ldactsm-v") == ["lda_ctsm_v"]
     assert parse_methods("pls-ctsm-v, pls_ctsm_v, plsctsm-v") == ["pls_ctsm_v"]
     assert parse_methods("pca-ctsm-v, pca_ctsm_v, pcactsm-v") == ["pca_ctsm_v"]
@@ -268,6 +599,136 @@ def test_ctsm_pair_models_accept_one_hot_theta() -> None:
         assert tuple(y.shape) == (4, 2)
 
 
+def test_ctsm_binary_model_accepts_no_theta_conditioning() -> None:
+    from fisher.ctsm_models import ToyBinaryTimeScoreNet
+
+    x = torch.zeros((4, 2), dtype=torch.float32)
+    t = torch.full((4, 1), 0.5, dtype=torch.float32)
+    model = ToyBinaryTimeScoreNet(dim=2, hidden_dim=8)
+
+    y = model.forward_full(x, t)
+
+    assert tuple(y.shape) == (4, 2)
+    assert tuple(model(x, t).shape) == (4, 1)
+
+
+def test_ctsm_binary_llr_transform_matches_delta_convention() -> None:
+    llr = np.array([2.0, 3.0, -5.0, 7.0], dtype=np.float64)
+    bins = np.array([0, 1, 0, 1], dtype=np.int64)
+
+    got = _binary_llr_1_minus_0_to_delta_l(llr, bins)
+
+    expected = np.array(
+        [
+            [0.0, 2.0, 0.0, 2.0],
+            [-3.0, 0.0, -3.0, 0.0],
+            [0.0, -5.0, 0.0, -5.0],
+            [-7.0, 0.0, -7.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    assert np.allclose(got, expected)
+
+
+def test_llr_scatter_raw_binary_reconstruction_from_delta() -> None:
+    study = _load_llr_scatter_study_module()
+    llr = np.array([2.0, 3.0, -5.0, 7.0], dtype=np.float64)
+    bins = np.array([0, 1, 0, 1], dtype=np.int64)
+    delta = _binary_llr_1_minus_0_to_delta_l(llr, bins)
+
+    got = study._binary_delta_l_to_raw_llr_1_minus_0(delta, bins)
+
+    assert np.allclose(got, llr)
+
+
+def test_llr_scatter_raw_binary_metrics_are_finite() -> None:
+    study = _load_llr_scatter_study_module()
+    true = np.array([-1.0, 0.0, 1.0, 2.0], dtype=np.float64)
+    est = np.array([-0.8, 0.1, 1.1, 1.7], dtype=np.float64)
+
+    got = study._raw_llr_metrics(est, true)
+
+    assert np.isfinite(got["llr_raw_rmse"])
+    assert np.isfinite(got["llr_raw_pearson_r"])
+    assert got["llr_raw_rmse"] > 0.0
+    assert got["llr_raw_pearson_r"] > 0.9
+
+
+def test_llr_scatter_raw_binary_figure_writes_svg_png(tmp_path: Path) -> None:
+    study = _load_llr_scatter_study_module()
+    true = np.array([-2.0, 1.5, 0.5, -1.0], dtype=np.float64)
+    bins = np.array([0, 1, 0, 1], dtype=np.int64)
+    est = np.array([-1.8, 1.4, 0.7, -0.9], dtype=np.float64)
+    metrics = {"method_a": study._raw_llr_metrics(est, true)}
+
+    study._save_raw_binary_llr_est_vs_true_figure(
+        {"method_a": est},
+        true,
+        bins,
+        out_base=tmp_path / "llr_est_vs_true_all",
+        metrics_by_method=metrics,
+    )
+
+    svg = tmp_path / "llr_est_vs_true_all.svg"
+    png = tmp_path / "llr_est_vs_true_all.png"
+    assert svg.is_file()
+    assert png.is_file()
+    text = svg.read_text(encoding="utf-8")
+    assert "class 0" in text
+    assert "class 1" in text
+
+
+def test_twofig_raw_binary_reconstruction_from_delta() -> None:
+    llr = np.array([1.5, -2.0, 0.25, 4.0], dtype=np.float64)
+    bins = np.array([0, 1, 0, 1], dtype=np.int64)
+    delta = _binary_llr_1_minus_0_to_delta_l(llr, bins)
+
+    got = _binary_delta_l_to_raw_llr_1_minus_0(delta, bins)
+
+    assert np.allclose(got, llr)
+
+
+def test_twofig_raw_binary_metrics_are_finite() -> None:
+    true = np.array([-2.0, -0.5, 0.5, 3.0], dtype=np.float64)
+    est = np.array([-1.7, -0.6, 0.75, 2.8], dtype=np.float64)
+
+    got = _raw_llr_metrics(est, true)
+
+    assert np.isfinite(got["llr_raw_rmse"])
+    assert np.isfinite(got["llr_raw_pearson_r"])
+    assert got["llr_raw_rmse"] > 0.0
+    assert got["llr_raw_pearson_r"] > 0.9
+
+
+def test_twofig_raw_binary_figure_writes_svg_png(tmp_path: Path) -> None:
+    true = np.array([-2.0, 1.5, 0.5, -1.0], dtype=np.float64)
+    bins = np.array([0, 1, 0, 1], dtype=np.int64)
+    est_a = np.array([-1.8, 1.4, 0.7, -0.9], dtype=np.float64)
+    est_b = np.array([-2.2, 1.7, 0.3, -1.2], dtype=np.float64)
+    metrics = {
+        "method_a": _raw_llr_metrics(est_a, true),
+        "method_b": _raw_llr_metrics(est_b, true),
+    }
+
+    _save_raw_binary_llr_est_vs_true_figure(
+        {"method_a": est_a, "method_b": est_b},
+        true,
+        bins,
+        out_base=tmp_path / "llr_est_vs_true_all",
+        metrics_by_method=metrics,
+    )
+
+    svg = tmp_path / "llr_est_vs_true_all.svg"
+    png = tmp_path / "llr_est_vs_true_all.png"
+    assert svg.is_file()
+    assert png.is_file()
+    text = svg.read_text(encoding="utf-8")
+    assert "method_a" in text
+    assert "method_b" in text
+    assert "class 0" in text
+    assert "class 1" in text
+
+
 def test_h_matrix_ctsm_accepts_one_hot_theta() -> None:
     from fisher.ctsm_models import ToyPairConditionedTimeScoreNet
 
@@ -286,6 +747,48 @@ def test_h_matrix_ctsm_accepts_one_hot_theta() -> None:
     got = est.compute_ctsm_delta_l_matrix(theta, x)
     assert got.shape == (3, 3)
     assert np.allclose(np.diag(got), 0.0)
+
+
+def test_ctsm_v_binary_dispatch_uses_bins(monkeypatch: pytest.MonkeyPatch) -> None:
+    import fisher.h_decoding_categorical_twofig as cat
+
+    seen: dict[str, np.ndarray | int] = {}
+
+    def fake_ctsm_binary(*args, **kwargs):
+        seen["bins_train"] = np.asarray(kwargs["bins_train"], dtype=np.int64)
+        seen["bins_val"] = np.asarray(kwargs["bins_val"], dtype=np.int64)
+        seen["bins_all"] = np.asarray(kwargs["bins_all"], dtype=np.int64)
+        seen["k_cat"] = int(kwargs["k_cat"])
+        n = int(np.asarray(kwargs["x_all"]).shape[0])
+        return {"delta_l": np.zeros((n, n), dtype=np.float64), "train_out": None}
+
+    monkeypatch.setattr(cat, "_train_ctsm_v_binary_delta", fake_ctsm_binary)
+    args = SimpleNamespace()
+    theta = np.eye(2, dtype=np.float64)[[0, 1, 0, 1]]
+    x = np.zeros((4, 2), dtype=np.float64)
+    bins = np.array([0, 1, 0, 1], dtype=np.int64)
+
+    result = cat._train_one_method(
+        args,
+        dev=torch.device("cpu"),
+        method_name="ctsm_v_binary",
+        theta_train=theta[:2],
+        x_train=x[:2],
+        theta_val=theta[2:],
+        x_val=x[2:],
+        theta_all=theta,
+        x_all=x,
+        bins_train=bins[:2],
+        bins_val=bins[2:],
+        bins_all=bins,
+        k_cat=2,
+    )
+
+    assert result["delta_l"].shape == (4, 4)
+    assert np.array_equal(seen["bins_train"], bins[:2])
+    assert np.array_equal(seen["bins_val"], bins[2:])
+    assert np.array_equal(seen["bins_all"], bins)
+    assert seen["k_cat"] == 2
 
 
 def test_lda_ctsm_v_dispatch_transforms_x_before_ctsm(monkeypatch: pytest.MonkeyPatch) -> None:

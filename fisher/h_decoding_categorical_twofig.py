@@ -66,7 +66,7 @@ from fisher.contrastive_llr import (
 )
 from fisher.h_matrix import HMatrixEstimator
 from fisher.shared_dataset_io import SharedDatasetBundle, load_shared_dataset_npz
-from fisher.ctsm_models import ToyPairConditionedTimeScoreNet, ToyPairConditionedTimeScoreNetFiLM
+from fisher.ctsm_models import ToyBinaryTimeScoreNet, ToyPairConditionedTimeScoreNet, ToyPairConditionedTimeScoreNetFiLM
 from fisher.linear_x_flow import (
     ConditionalTimeLinearXFlowMLP,
     ConditionalTimeLowRankCorrectionLinearXFlowMLP,
@@ -78,6 +78,8 @@ from fisher.shared_fisher_est import (
     build_conditional_x_velocity_model,
     build_dataset_from_meta,
     require_device,
+    estimate_binary_ctsm_v_log_ratio,
+    train_binary_ctsm_v_model,
     train_pair_conditioned_ctsm_v_model,
 )
 from fisher.svg_utils import concatenate_svgs_horizontally_to_png
@@ -121,6 +123,9 @@ _METHOD_ALIASES: dict[str, str] = {
     "ctsm-v": "ctsm_v",
     "ctsm_v": "ctsm_v",
     "ctsm": "ctsm_v",
+    "ctsm-v-binary": "ctsm_v_binary",
+    "ctsm_v_binary": "ctsm_v_binary",
+    "ctsm_binary": "ctsm_v_binary",
     "lda-ctsm-v": "lda_ctsm_v",
     "lda_ctsm_v": "lda_ctsm_v",
     "ldactsm-v": "lda_ctsm_v",
@@ -139,6 +144,7 @@ _SUPPORTED_METHODS_HELP = ", ".join(
         "theta_flow_cate",
         "bin_gaussian",
         "ctsm_v",
+        "ctsm_v_binary",
         "lda_ctsm_v",
         "pls_ctsm_v",
         "pca_ctsm_v",
@@ -483,6 +489,64 @@ def _llr_comparison_metrics(est_delta: np.ndarray, true_delta: np.ndarray) -> di
     return out
 
 
+def _metric_table(metrics_by_method: dict[str, dict[str, float]]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    metric_names = sorted({k for metrics in metrics_by_method.values() for k in metrics})
+    method_names = list(metrics_by_method)
+    table = np.full((len(method_names), len(metric_names)), np.nan, dtype=np.float64)
+    for i, method_name in enumerate(method_names):
+        metrics = metrics_by_method[method_name]
+        for j, metric_name in enumerate(metric_names):
+            table[i, j] = float(metrics.get(metric_name, np.nan))
+    return np.asarray(method_names, dtype=object), np.asarray(metric_names, dtype=object), table
+
+
+def _binary_delta_l_to_raw_llr_1_minus_0(delta_l: np.ndarray, bins: np.ndarray) -> np.ndarray:
+    """Reconstruct row-wise binary LLR r(x)=log p1(x)-log p0(x)."""
+    delta = np.asarray(delta_l, dtype=np.float64)
+    labels = np.asarray(bins, dtype=np.int64).reshape(-1)
+    if delta.ndim != 2 or delta.shape[0] != delta.shape[1]:
+        raise ValueError(f"Binary raw LLR reconstruction expects a square matrix; got shape {delta.shape}.")
+    n = int(delta.shape[0])
+    if int(labels.shape[0]) != n:
+        raise ValueError(f"Binary raw LLR reconstruction label length {labels.shape[0]} does not match n={n}.")
+    unique = set(np.unique(labels).tolist())
+    if not unique.issubset({0, 1}) or unique != {0, 1}:
+        raise ValueError("Raw binary LLR reconstruction requires both binary labels 0 and 1.")
+
+    out = np.full((n,), np.nan, dtype=np.float64)
+    for i, yi in enumerate(labels):
+        if int(yi) == 0:
+            vals = delta[i, labels == 1]
+        else:
+            vals = -delta[i, labels == 0]
+        vals = vals[np.isfinite(vals)]
+        if vals.size > 0:
+            out[i] = float(np.mean(vals))
+    return out
+
+
+def _raw_llr_metrics(est: np.ndarray, true: np.ndarray) -> dict[str, float]:
+    est_arr = np.asarray(est, dtype=np.float64).reshape(-1)
+    true_arr = np.asarray(true, dtype=np.float64).reshape(-1)
+    if est_arr.shape != true_arr.shape:
+        raise ValueError(f"Raw LLR metric shapes must match; got {est_arr.shape} and {true_arr.shape}.")
+    mask = np.isfinite(est_arr) & np.isfinite(true_arr)
+    if not np.any(mask):
+        return {
+            "llr_raw_rmse": float("nan"),
+            "llr_raw_mae": float("nan"),
+            "llr_raw_bias": float("nan"),
+            "llr_raw_pearson_r": float("nan"),
+        }
+    diff = est_arr[mask] - true_arr[mask]
+    return {
+        "llr_raw_rmse": float(np.sqrt(np.mean(diff**2))),
+        "llr_raw_mae": float(np.mean(np.abs(diff))),
+        "llr_raw_bias": float(np.mean(diff)),
+        "llr_raw_pearson_r": _pearson_r(est_arr[mask], true_arr[mask]),
+    }
+
+
 def _save_llr_est_vs_true_figure(
     method_deltas: dict[str, np.ndarray],
     true_delta: np.ndarray,
@@ -519,6 +583,72 @@ def _save_llr_est_vs_true_figure(
     ax.set_xlabel(r"true $\Delta L$")
     ax.set_ylabel(r"estimated $\Delta L$")
     ax.set_title(r"LLR: estimated vs ground truth")
+    ax.grid(True, alpha=0.25)
+    out_base = Path(out_base)
+    out_base.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_base.with_suffix(".svg"), bbox_inches="tight")
+    fig.savefig(out_base.with_suffix(".png"), dpi=160, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _save_raw_binary_llr_est_vs_true_figure(
+    method_llrs: dict[str, np.ndarray],
+    true_llr: np.ndarray,
+    bins_eval: np.ndarray,
+    *,
+    out_base: Path,
+    metrics_by_method: dict[str, dict[str, float]],
+) -> None:
+    """Save raw binary LLR scatter, with color by method and marker by true class."""
+    true_arr = np.asarray(true_llr, dtype=np.float64).reshape(-1)
+    labels = np.asarray(bins_eval, dtype=np.int64).reshape(-1)
+    if true_arr.shape[0] != labels.shape[0]:
+        raise ValueError(f"Raw LLR label length {labels.shape[0]} does not match values {true_arr.shape[0]}.")
+
+    fig, ax = plt.subplots(figsize=(6.4, 5.8), layout="constrained")
+    markers = {0: "o", 1: "^"}
+    cmap = plt.get_cmap("tab10")
+    ys: list[np.ndarray] = []
+    if true_arr.size == 0:
+        ax.text(0.5, 0.5, "No raw binary LLR rows", ha="center", va="center", transform=ax.transAxes)
+    else:
+        for method_idx, (method_name, est_llr) in enumerate(method_llrs.items()):
+            y = np.asarray(est_llr, dtype=np.float64).reshape(-1)
+            if y.shape != true_arr.shape:
+                raise ValueError(f"Method {method_name!r} raw LLR shape {y.shape} does not match {true_arr.shape}.")
+            ys.append(y)
+            color = cmap(method_idx % 10)
+            m = metrics_by_method.get(method_name, {})
+            label_prefix = (
+                f"{method_name} "
+                f"(RMSE={m.get('llr_raw_rmse', float('nan')):.3g}, "
+                f"r={m.get('llr_raw_pearson_r', float('nan')):.3g})"
+            )
+            for cls in (0, 1):
+                mask = (labels == cls) & np.isfinite(true_arr) & np.isfinite(y)
+                if not np.any(mask):
+                    continue
+                ax.scatter(
+                    true_arr[mask],
+                    y[mask],
+                    s=18,
+                    alpha=0.45,
+                    linewidths=0,
+                    marker=markers[cls],
+                    color=color,
+                    label=f"{label_prefix}, class {cls}",
+                )
+        vals = np.concatenate([true_arr] + ys) if ys else true_arr
+        vals = vals[np.isfinite(vals)]
+        lo = float(np.min(vals)) if vals.size else -1.0
+        hi = float(np.max(vals)) if vals.size else 1.0
+        pad = 0.05 * (hi - lo) if hi > lo else 1.0
+        ax.plot([lo - pad, hi + pad], [lo - pad, hi + pad], "k--", lw=1.0, alpha=0.7)
+        ax.set_aspect("equal", adjustable="box")
+        ax.legend(loc="best", fontsize=7, framealpha=0.9)
+    ax.set_xlabel(r"true log $p_1(x)$ - log $p_0(x)$")
+    ax.set_ylabel(r"estimated log $p_1(x)$ - log $p_0(x)$")
+    ax.set_title("Raw binary LLR: estimated vs ground truth")
     ax.grid(True, alpha=0.25)
     out_base = Path(out_base)
     out_base.parent.mkdir(parents=True, exist_ok=True)
@@ -1179,6 +1309,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--contrastive-soft-dot-dim", type=int, default=10)
     p.add_argument("--contrastive-soft-categorical-beta", type=float, default=0.0)
     p.add_argument("--ctsm-epochs", type=int, default=8000)
+    p.add_argument(
+        "--ctsm-binary-epochs",
+        type=int,
+        default=50000,
+        help="Max training epochs for ctsm_v_binary (pair-conditioned ctsm_v uses --ctsm-epochs).",
+    )
     p.add_argument("--ctsm-batch-size", type=int, default=512)
     p.add_argument("--ctsm-lr", type=float, default=2e-3)
     p.add_argument("--ctsm-hidden-dim", type=int, default=256)
@@ -1186,7 +1322,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ctsm-path-schedule", type=str, default="linear", choices=["linear", "cosine"])
     p.add_argument("--ctsm-path-eps", type=float, default=1e-12)
     p.add_argument("--ctsm-factor", type=float, default=1.0)
-    p.add_argument("--ctsm-t-eps", type=float, default=1e-5)
+    p.add_argument("--ctsm-t-eps", type=float, default=0.01)
     p.add_argument("--ctsm-int-n-time", type=int, default=300)
     p.add_argument("--ctsm-m-scale", type=float, default=1.0)
     p.add_argument("--ctsm-delta-scale", type=float, default=0.5)
@@ -1429,6 +1565,107 @@ def _train_binary_classifier_delta(
             valid_pairs[b, a] = True
             stats["ok_pairs"] += 1
     return {"c_matrix": None, "delta_l": delta, "classifier_valid_pairs": valid_pairs, "classifier_stats": stats}
+
+
+def _binary_llr_1_minus_0_to_delta_l(llr_1_minus_0: np.ndarray, bins_all: np.ndarray) -> np.ndarray:
+    r = np.asarray(llr_1_minus_0, dtype=np.float64).reshape(-1)
+    bins = np.asarray(bins_all, dtype=np.int64).reshape(-1)
+    if bins.shape[0] != r.shape[0]:
+        raise ValueError("ctsm_v_binary LLR vector length must match bins_all length.")
+    if np.any((bins != 0) & (bins != 1)):
+        raise ValueError("ctsm_v_binary delta transform expects binary bins 0/1.")
+    target_sign = (bins == 1).astype(np.float64)
+    delta = r.reshape(-1, 1) * (target_sign.reshape(1, -1) - target_sign.reshape(-1, 1))
+    np.fill_diagonal(delta, 0.0)
+    return delta.astype(np.float64, copy=False)
+
+
+def _train_ctsm_v_binary_delta(
+    args: argparse.Namespace,
+    *,
+    dev: torch.device,
+    x_train: np.ndarray,
+    bins_train: np.ndarray,
+    x_val: np.ndarray,
+    bins_val: np.ndarray,
+    x_all: np.ndarray,
+    bins_all: np.ndarray,
+    k_cat: int,
+) -> dict[str, Any]:
+    if int(k_cat) != 2:
+        raise ValueError("ctsm_v_binary currently supports exactly two categories.")
+    bins_train = np.asarray(bins_train, dtype=np.int64).reshape(-1)
+    bins_val = np.asarray(bins_val, dtype=np.int64).reshape(-1)
+    bins_all = np.asarray(bins_all, dtype=np.int64).reshape(-1)
+    x_train = np.asarray(x_train, dtype=np.float64)
+    x_val = np.asarray(x_val, dtype=np.float64)
+    x_all = np.asarray(x_all, dtype=np.float64)
+    if x_train.ndim != 2 or x_val.ndim != 2 or x_all.ndim != 2:
+        raise ValueError("ctsm_v_binary expects x_train, x_val, and x_all to be 2D.")
+    if x_train.shape[0] != bins_train.size or x_val.shape[0] != bins_val.size or x_all.shape[0] != bins_all.size:
+        raise ValueError("ctsm_v_binary bin arrays must match x rows.")
+    if x_train.shape[1] != x_val.shape[1] or x_train.shape[1] != x_all.shape[1]:
+        raise ValueError("ctsm_v_binary x dimension mismatch across train/validation/eval.")
+
+    train0 = np.flatnonzero(bins_train == 0)
+    train1 = np.flatnonzero(bins_train == 1)
+    val0 = np.flatnonzero(bins_val == 0)
+    val1 = np.flatnonzero(bins_val == 1)
+    min_count = int(getattr(args, "clf_min_class_count", 5))
+    if train0.size < min_count or train1.size < min_count:
+        raise ValueError(
+            "ctsm_v_binary requires at least "
+            f"{min_count} training samples in each class; got {train0.size} and {train1.size}."
+        )
+    x0_val = x_val[val0] if val0.size >= 1 and val1.size >= 1 else None
+    x1_val = x_val[val1] if val0.size >= 1 and val1.size >= 1 else None
+    print(
+        f"[cat-twofig] training ctsm_v_binary: class0={train0.size} class1={train1.size} "
+        f"val0={val0.size} val1={val1.size} eval={x_all.shape[0]} x_dim={x_all.shape[1]}",
+        flush=True,
+    )
+    model = ToyBinaryTimeScoreNet(
+        dim=int(x_all.shape[1]),
+        hidden_dim=int(getattr(args, "ctsm_hidden_dim", 256)),
+    ).to(dev)
+    train_out = train_binary_ctsm_v_model(
+        model=model,
+        x0_train=x_train[train0],
+        x1_train=x_train[train1],
+        epochs=int(getattr(args, "ctsm_binary_epochs", 50000)),
+        batch_size=int(getattr(args, "ctsm_batch_size", 512)),
+        lr=float(getattr(args, "ctsm_lr", 2e-3)),
+        weight_decay=float(getattr(args, "ctsm_weight_decay", 0.0)),
+        device=dev,
+        log_every=max(1, int(getattr(args, "log_every", 50))),
+        two_sb_var=float(getattr(args, "ctsm_two_sb_var", 2.0)),
+        path_schedule=str(getattr(args, "ctsm_path_schedule", "linear")),
+        path_eps=float(getattr(args, "ctsm_path_eps", 1e-12)),
+        factor=float(getattr(args, "ctsm_factor", 1.0)),
+        t_eps=float(getattr(args, "ctsm_t_eps", 1e-5)),
+        x0_val=x0_val,
+        x1_val=x1_val,
+        early_stopping_patience=int(getattr(args, "flow_early_patience", 1000)),
+        early_stopping_min_delta=float(getattr(args, "flow_early_min_delta", 1e-4)),
+        early_stopping_ema_alpha=float(getattr(args, "flow_early_ema_alpha", 0.05)),
+        restore_best=bool(getattr(args, "flow_restore_best", True)),
+    )
+    llr_1_minus_0 = estimate_binary_ctsm_v_log_ratio(
+        model,
+        x_all,
+        device=dev,
+        batch_size=int(getattr(args, "h_batch_size", 65536)),
+        eps1=float(getattr(args, "ctsm_t_eps", 1e-5)),
+        eps2=float(getattr(args, "ctsm_t_eps", 1e-5)),
+        n_time=int(getattr(args, "ctsm_int_n_time", 300)),
+    )
+    return {
+        "c_matrix": None,
+        "delta_l": _binary_llr_1_minus_0_to_delta_l(llr_1_minus_0, bins_all),
+        "ctsm_binary_llr_1_minus_0": np.asarray(llr_1_minus_0, dtype=np.float64),
+        "train_out": train_out,
+        "ctsm_theta_encoding": np.asarray(["none_binary"], dtype=object),
+    }
 
 
 def _train_linear_x_flow_delta(
@@ -2199,6 +2436,18 @@ def _train_one_method(
             theta_all=theta_all,
             x_all=x_all,
         )
+    if method_name == "ctsm_v_binary":
+        return _train_ctsm_v_binary_delta(
+            args,
+            dev=dev,
+            x_train=x_train,
+            bins_train=bins_train,
+            x_val=x_val,
+            bins_val=bins_val,
+            x_all=x_all,
+            bins_all=bins_all,
+            k_cat=k_cat,
+        )
     if method_name == "lda_ctsm_v":
         return _train_lda_ctsm_v_delta(
             args,
@@ -2366,8 +2615,10 @@ def main(argv: list[str] | None = None) -> None:
 
     dbg = _debug_categorical_module()
     scatter_deltas: dict[str, np.ndarray] = {}
+    scatter_direct_llrs: dict[str, np.ndarray] = {}
     scatter_cat_h2: dict[str, np.ndarray] = {}
     scatter_true_delta: np.ndarray | None = None
+    scatter_bins: np.ndarray | None = None
     n_scatter = max(ns)
     out_dir = str(args.output_dir)
     loss_root = os.path.join(out_dir, "training_losses")
@@ -2503,12 +2754,18 @@ def main(argv: list[str] | None = None) -> None:
 
             if int(n) == int(n_scatter):
                 scatter_true_delta = np.asarray(true_delta_l, dtype=np.float64).copy()
+                scatter_bins = np.asarray(bins_h, dtype=np.int64).reshape(-1).copy()
                 if method_name == "bin_gaussian":
                     scatter_cat_h2[method_name] = np.asarray(bg_h2, dtype=np.float64).copy()
                 elif "h_sqrt" in result:
                     scatter_cat_h2[method_name] = np.asarray(h_cat_sq, dtype=np.float64).copy()
                 else:
                     scatter_deltas[method_name] = np.asarray(delta, dtype=np.float64)
+                    if method_name == "ctsm_v_binary" and "ctsm_binary_llr_1_minus_0" in result:
+                        scatter_direct_llrs[method_name] = np.asarray(
+                            result["ctsm_binary_llr_1_minus_0"],
+                            dtype=np.float64,
+                        ).reshape(-1)
                     scatter_cat_h2[method_name] = np.asarray(h_cat_sq, dtype=np.float64).copy()
 
     decode_sweep = np.stack(decode_sweep_list, axis=0)
@@ -2562,6 +2819,9 @@ def main(argv: list[str] | None = None) -> None:
         out_svg_path=os.path.join(out_dir, "h_decoding_categorical_twofig_training_losses_panel.svg"),
     )
 
+    scatter_raw_llrs: dict[str, np.ndarray] = {}
+    scatter_raw_metrics_by_method: dict[str, dict[str, float]] = {}
+    scatter_true_llr_1_minus_0: np.ndarray | None = None
     if not bool(args.no_scatter_diagnostics) and scatter_true_delta is not None and scatter_cat_h2:
         metrics_by_method: dict[str, dict[str, float]] = {}
         hell_cat: dict[str, np.ndarray] = {}
@@ -2581,18 +2841,66 @@ def main(argv: list[str] | None = None) -> None:
             metrics_by_method[name].update(
                 dbg._hellinger_comparison_metrics_cat(scatter_cat_h2[name], hellinger_gt_sq)
             )
-        dbg._save_llr_est_vs_true_figure(
-            scatter_deltas,
-            scatter_true_delta,
-            out_base=Path(out_dir) / "llr_est_vs_true_all",
-            metrics_by_method=metrics_by_method,
-        )
+        if k_cat == 2:
+            if scatter_bins is None:
+                raise RuntimeError("Binary raw LLR scatter requires saved scatter bin labels.")
+            scatter_true_llr_1_minus_0 = dbg._binary_delta_l_to_raw_llr_1_minus_0(scatter_true_delta, scatter_bins)
+            for name in methods:
+                if name not in scatter_deltas:
+                    continue
+                reconstructed_llr = dbg._binary_delta_l_to_raw_llr_1_minus_0(scatter_deltas[name], scatter_bins)
+                if name == "ctsm_v_binary" and name in scatter_direct_llrs:
+                    direct_llr = np.asarray(scatter_direct_llrs[name], dtype=np.float64).reshape(-1)
+                    if direct_llr.shape != reconstructed_llr.shape:
+                        raise ValueError(
+                            "ctsm_v_binary returned ctsm_binary_llr_1_minus_0 shape "
+                            f"{direct_llr.shape}, expected {reconstructed_llr.shape}."
+                        )
+                    if not np.allclose(direct_llr, reconstructed_llr, rtol=1e-5, atol=1e-7, equal_nan=True):
+                        max_abs = float(np.nanmax(np.abs(direct_llr - reconstructed_llr)))
+                        raise ValueError(
+                            "ctsm_v_binary ctsm_binary_llr_1_minus_0 does not match "
+                            f"the reconstructed vector from delta_l (max_abs={max_abs:.6g})."
+                        )
+                    raw_llr = direct_llr
+                else:
+                    raw_llr = reconstructed_llr
+                scatter_raw_llrs[name] = raw_llr
+                scatter_raw_metrics_by_method[name] = dbg._raw_llr_metrics(raw_llr, scatter_true_llr_1_minus_0)
+            dbg._save_raw_binary_llr_est_vs_true_figure(
+                scatter_raw_llrs,
+                scatter_true_llr_1_minus_0,
+                scatter_bins,
+                out_base=Path(out_dir) / "llr_est_vs_true_all",
+                metrics_by_method=scatter_raw_metrics_by_method,
+            )
+        else:
+            dbg._save_llr_est_vs_true_figure(
+                scatter_deltas,
+                scatter_true_delta,
+                out_base=Path(out_dir) / "llr_est_vs_true_all",
+                metrics_by_method=metrics_by_method,
+            )
         dbg._save_hellinger_est_vs_gt_figure(
             hell_cat,
             hellinger_gt_sq,
             out_base=Path(out_dir) / "hellinger_est_vs_gt_all",
             metrics_by_method=metrics_by_method,
         )
+
+    scatter_npz_payload: dict[str, Any] = {}
+    if k_cat == 2 and scatter_true_llr_1_minus_0 is not None and scatter_raw_llrs:
+        raw_method_names, raw_metric_names, raw_metric_values = _metric_table(scatter_raw_metrics_by_method)
+        scatter_npz_payload = {
+            "scatter_true_llr_1_minus_0": np.asarray(scatter_true_llr_1_minus_0, dtype=np.float64),
+            "scatter_llr_1_minus_0_est": np.stack(
+                [scatter_raw_llrs[str(name)] for name in raw_method_names],
+                axis=0,
+            ).astype(np.float64, copy=False),
+            "scatter_llr_raw_metric_method_names": raw_method_names,
+            "scatter_llr_raw_metric_names": raw_metric_names,
+            "scatter_llr_raw_metric_values": raw_metric_values,
+        }
 
     source_indices = np.asarray(perm[: int(args.n_ref)], dtype=np.int64)
     out_npz = os.path.join(out_dir, "h_decoding_categorical_twofig_results.npz")
@@ -2629,6 +2937,7 @@ def main(argv: list[str] | None = None) -> None:
         pr_dim=np.int64(int(args.pr_dim) if pr_project else native_x_dim),
         training_losses_root=np.asarray([os.path.abspath(loss_root)], dtype=object),
         eval_split=np.asarray([eval_split], dtype=object),
+        **scatter_npz_payload,
     )
 
     summary_path = os.path.join(out_dir, "h_decoding_categorical_twofig_summary.txt")

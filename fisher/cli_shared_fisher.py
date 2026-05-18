@@ -751,7 +751,7 @@ def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--ctsm-t-eps",
         type=float,
-        default=1e-5,
+        default=0.01,
         help="ctsm_v: time sampling clamp t in [t_eps, 1-t_eps] for stability.",
     )
     p.add_argument(

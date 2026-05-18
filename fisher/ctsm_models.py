@@ -44,6 +44,15 @@ class ToyFullTimeScoreNet(nn.Module):
         return self.forward_full(x, t).sum(dim=-1, keepdim=True)
 
 
+class ToyBinaryTimeScoreNet(ToyFullTimeScoreNet):
+    """
+    Unconditioned CTSM-v network for a fixed binary distribution pair.
+
+    The scalar forward output integrates to ``log p_1(x) - log p_0(x)`` when
+    trained with class-0 samples as ``x0`` and class-1 samples as ``x1``.
+    """
+
+
 class ToyPairConditionedTimeScoreNet(PairConditionedTimeScoreNetBase):
     """
     Pair-conditioned CTSM-v network: f_phi(x, t, m, Delta) in R^dim.
