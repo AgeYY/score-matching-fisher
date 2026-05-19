@@ -59,10 +59,18 @@ from fisher.dataset_family_recipes import raise_if_legacy_dataset_family, raise_
 from fisher.ctsm_models import (
     PairConditionedTimeScoreNetBase,
     ToyBinaryTimeScoreNet,
+    ToyLatentBeliefBinaryTimeScoreNet,
     ToyPairConditionedTimeScoreNet,
     ToyPairConditionedTimeScoreNetFiLM,
 )
-from fisher.ctsm_objectives import ctsm_v_pair_conditioned_loss, ctsm_v_two_sample_loss, estimate_log_ratio_trapz
+from fisher.ctsm_objectives import (
+    ctsm_v_pair_conditioned_loss,
+    ctsm_v_two_sample_loss,
+    estimate_log_ratio_trapz,
+    latent_belief_ctsm_v_inner_posterior_loss,
+    latent_belief_ctsm_v_posterior_mean_loss,
+    latent_belief_ctsm_v_two_sample_loss,
+)
 from fisher.ctsm_paths import TwoSB
 from fisher.shared_dataset_io import (
     SHARED_DATASET_META_KEYS,
@@ -2010,6 +2018,425 @@ def train_binary_ctsm_v_model(
     }
 
 
+def train_latent_belief_binary_ctsm_v_model(
+    *,
+    model: ToyLatentBeliefBinaryTimeScoreNet,
+    x0_train: np.ndarray,
+    x1_train: np.ndarray,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    weight_decay: float = 0.0,
+    device: torch.device,
+    log_every: int,
+    two_sb_var: float,
+    path_schedule: str = "linear",
+    path_eps: float = 1e-12,
+    factor: float,
+    t_eps: float,
+    x0_val: np.ndarray | None = None,
+    x1_val: np.ndarray | None = None,
+    early_stopping_patience: int = 1000,
+    early_stopping_min_delta: float = 1e-4,
+    early_stopping_ema_alpha: float = 0.05,
+    restore_best: bool = True,
+    val_batches_per_epoch: int = 8,
+    n_posterior_pairs: int = 1,
+    n_mc_val: int = 8,
+) -> dict[str, Any]:
+    x0_fit_np = np.asarray(x0_train, dtype=np.float32)
+    x1_fit_np = np.asarray(x1_train, dtype=np.float32)
+    if x0_fit_np.ndim != 2 or x1_fit_np.ndim != 2 or x0_fit_np.shape[1] != x1_fit_np.shape[1]:
+        raise ValueError("latent_belief_ctsm_v_binary training expects x0_train/x1_train shape (N,d) with matching d.")
+    if x0_fit_np.shape[0] < 1 or x1_fit_np.shape[0] < 1:
+        raise ValueError("latent_belief_ctsm_v_binary training requires at least one sample from each class.")
+
+    x0_val_np = None
+    x1_val_np = None
+    if x0_val is not None and x1_val is not None:
+        x0_val_np = np.asarray(x0_val, dtype=np.float32)
+        x1_val_np = np.asarray(x1_val, dtype=np.float32)
+        if x0_val_np.ndim != 2 or x1_val_np.ndim != 2 or x0_val_np.shape[1] != x0_fit_np.shape[1]:
+            raise ValueError("latent_belief_ctsm_v_binary validation expects x0_val/x1_val shape (N,d) matching training d.")
+        if x1_val_np.shape[1] != x0_fit_np.shape[1]:
+            raise ValueError("latent_belief_ctsm_v_binary validation expects x0_val/x1_val shape (N,d) matching training d.")
+        if x0_val_np.shape[0] < 1 or x1_val_np.shape[0] < 1:
+            x0_val_np = None
+            x1_val_np = None
+
+    prob_path = TwoSB(
+        dim=int(x0_fit_np.shape[1]),
+        var=float(two_sb_var),
+        scheduler=str(path_schedule),
+        eps=float(path_eps),
+    )
+    opt = torch.optim.AdamW(model.parameters(), lr=float(lr), weight_decay=float(weight_decay))
+
+    x0_fit_t = torch.from_numpy(x0_fit_np).to(device)
+    x1_fit_t = torch.from_numpy(x1_fit_np).to(device)
+    x0_val_t = torch.from_numpy(x0_val_np).to(device) if x0_val_np is not None else None
+    x1_val_t = torch.from_numpy(x1_val_np).to(device) if x1_val_np is not None else None
+
+    train_losses: list[float] = []
+    val_losses: list[float] = []
+    val_monitor_losses: list[float] = []
+    best_epoch = 0
+    best_val_loss = float("inf")
+    best_state: dict[str, torch.Tensor] | None = None
+    ema_monitor: float | None = None
+    patience_bad = 0
+    stopped_early = False
+    has_nonfinite = False
+
+    grad_norm_sum = 0.0
+    grad_norm_max = 0.0
+    n_total_steps = 0
+    n0 = int(x0_fit_t.shape[0])
+    n1 = int(x1_fit_t.shape[0])
+    n0_val = int(x0_val_t.shape[0]) if x0_val_t is not None else 0
+    n1_val = int(x1_val_t.shape[0]) if x1_val_t is not None else 0
+
+    for epoch in range(1, int(epochs) + 1):
+        model.train()
+        i0 = torch.randint(0, n0, (int(batch_size),), device=device)
+        i1 = torch.randint(0, n1, (int(batch_size),), device=device)
+        loss = latent_belief_ctsm_v_two_sample_loss(
+            model=model,
+            prob_path=prob_path,
+            x0=x0_fit_t[i0],
+            x1=x1_fit_t[i1],
+            factor=float(factor),
+            t_eps=float(t_eps),
+            n_posterior_pairs=int(n_posterior_pairs),
+        )
+        if not torch.isfinite(loss):
+            has_nonfinite = True
+            raise RuntimeError(
+                f"Non-finite latent_belief_ctsm_v_binary train loss at epoch {epoch}: "
+                f"{float(loss.detach().cpu())!r}"
+            )
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+
+        grad_sq = 0.0
+        for p in model.parameters():
+            if p.grad is None:
+                continue
+            gn = float(p.grad.detach().norm(2).item())
+            grad_sq += gn * gn
+        grad_norm = float(math.sqrt(grad_sq))
+        grad_norm_sum += grad_norm
+        grad_norm_max = max(grad_norm_max, grad_norm)
+        n_total_steps += 1
+
+        opt.step()
+        train_loss = float(loss.detach().cpu().item())
+        train_losses.append(train_loss)
+
+        if x0_val_t is None or x1_val_t is None:
+            val_loss = train_loss
+        else:
+            model.eval()
+            v_losses: list[float] = []
+            with torch.no_grad():
+                for _ in range(max(1, int(val_batches_per_epoch))):
+                    i0_v = torch.randint(0, n0_val, (int(batch_size),), device=device)
+                    i1_v = torch.randint(0, n1_val, (int(batch_size),), device=device)
+                    lv = latent_belief_ctsm_v_posterior_mean_loss(
+                        model=model,
+                        prob_path=prob_path,
+                        x0=x0_val_t[i0_v],
+                        x1=x1_val_t[i1_v],
+                        factor=float(factor),
+                        t_eps=float(t_eps),
+                        n_mc=int(n_mc_val),
+                    )
+                    if not torch.isfinite(lv):
+                        has_nonfinite = True
+                        raise RuntimeError(
+                            "Non-finite latent_belief_ctsm_v_binary validation loss "
+                            f"at epoch {epoch}: {float(lv.detach().cpu())!r}"
+                        )
+                    v_losses.append(float(lv.detach().cpu().item()))
+            val_loss = float(np.mean(v_losses))
+
+        val_losses.append(val_loss)
+        if ema_monitor is None:
+            ema_monitor = val_loss
+        else:
+            alpha = float(early_stopping_ema_alpha)
+            ema_monitor = alpha * val_loss + (1.0 - alpha) * ema_monitor
+        val_monitor_losses.append(float(ema_monitor))
+
+        improved = float(ema_monitor) < (best_val_loss - float(early_stopping_min_delta))
+        if improved:
+            best_val_loss = float(ema_monitor)
+            best_epoch = int(epoch)
+            patience_bad = 0
+            if restore_best:
+                best_state = deepcopy(model.state_dict())
+        else:
+            patience_bad += 1
+
+        if epoch % max(1, int(log_every)) == 0:
+            print(
+                "[latent_belief_ctsm_v_binary] "
+                f"epoch={epoch} train={train_loss:.6f} val={val_loss:.6f} "
+                f"val_ema={float(ema_monitor):.6f} best_epoch={best_epoch}"
+            )
+        if patience_bad >= int(early_stopping_patience):
+            stopped_early = True
+            break
+
+    stopped_epoch = int(len(train_losses))
+    if restore_best and best_state is not None:
+        model.load_state_dict(best_state)
+
+    param_sq = 0.0
+    with torch.no_grad():
+        for p in model.parameters():
+            pn = float(p.detach().norm(2).item())
+            param_sq += pn * pn
+    param_norm_final = float(math.sqrt(param_sq))
+
+    if best_epoch <= 0:
+        best_epoch = stopped_epoch
+        if np.isfinite(np.asarray(val_monitor_losses, dtype=np.float64)).any():
+            best_val_loss = float(np.nanmin(np.asarray(val_monitor_losses, dtype=np.float64)))
+        else:
+            best_val_loss = float("nan")
+
+    return {
+        "train_losses": np.asarray(train_losses, dtype=np.float64),
+        "val_losses": np.asarray(val_losses, dtype=np.float64),
+        "val_monitor_losses": np.asarray(val_monitor_losses, dtype=np.float64),
+        "best_epoch": int(best_epoch),
+        "stopped_epoch": int(stopped_epoch),
+        "stopped_early": bool(stopped_early),
+        "best_val_loss": float(best_val_loss),
+        "has_nonfinite": bool(has_nonfinite),
+        "grad_norm_mean": float(grad_norm_sum / max(1, n_total_steps)),
+        "grad_norm_max": float(grad_norm_max),
+        "param_norm_final": float(param_norm_final),
+        "n_clipped_steps": int(0),
+        "n_total_steps": int(n_total_steps),
+        "lr_last": float(opt.param_groups[0]["lr"]),
+    }
+
+
+def train_latent_belief_binary_ctsm_v_inner_post_model(
+    *,
+    model: ToyLatentBeliefBinaryTimeScoreNet,
+    x0_train: np.ndarray,
+    x1_train: np.ndarray,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    weight_decay: float = 0.0,
+    device: torch.device,
+    log_every: int,
+    two_sb_var: float,
+    path_schedule: str = "linear",
+    path_eps: float = 1e-12,
+    factor: float,
+    t_eps: float,
+    x0_val: np.ndarray | None = None,
+    x1_val: np.ndarray | None = None,
+    early_stopping_patience: int = 1000,
+    early_stopping_min_delta: float = 1e-4,
+    early_stopping_ema_alpha: float = 0.05,
+    restore_best: bool = True,
+    val_batches_per_epoch: int = 8,
+    latent_n_mc_train: int = 32,
+    n_mc_val: int = 8,
+) -> dict[str, Any]:
+    x0_fit_np = np.asarray(x0_train, dtype=np.float32)
+    x1_fit_np = np.asarray(x1_train, dtype=np.float32)
+    if x0_fit_np.ndim != 2 or x1_fit_np.ndim != 2 or x0_fit_np.shape[1] != x1_fit_np.shape[1]:
+        raise ValueError(
+            "latent_belief_ctsm_v_binary_inner_post training expects x0_train/x1_train shape (N,d) with matching d."
+        )
+    if x0_fit_np.shape[0] < 1 or x1_fit_np.shape[0] < 1:
+        raise ValueError("latent_belief_ctsm_v_binary_inner_post training requires at least one sample from each class.")
+
+    x0_val_np = None
+    x1_val_np = None
+    if x0_val is not None and x1_val is not None:
+        x0_val_np = np.asarray(x0_val, dtype=np.float32)
+        x1_val_np = np.asarray(x1_val, dtype=np.float32)
+        if x0_val_np.ndim != 2 or x1_val_np.ndim != 2 or x0_val_np.shape[1] != x0_fit_np.shape[1]:
+            raise ValueError(
+                "latent_belief_ctsm_v_binary_inner_post validation expects x0_val/x1_val shape (N,d) matching training d."
+            )
+        if x1_val_np.shape[1] != x0_fit_np.shape[1]:
+            raise ValueError(
+                "latent_belief_ctsm_v_binary_inner_post validation expects x0_val/x1_val shape (N,d) matching training d."
+            )
+        if x0_val_np.shape[0] < 1 or x1_val_np.shape[0] < 1:
+            x0_val_np = None
+            x1_val_np = None
+
+    prob_path = TwoSB(
+        dim=int(x0_fit_np.shape[1]),
+        var=float(two_sb_var),
+        scheduler=str(path_schedule),
+        eps=float(path_eps),
+    )
+    opt = torch.optim.AdamW(model.parameters(), lr=float(lr), weight_decay=float(weight_decay))
+
+    x0_fit_t = torch.from_numpy(x0_fit_np).to(device)
+    x1_fit_t = torch.from_numpy(x1_fit_np).to(device)
+    x0_val_t = torch.from_numpy(x0_val_np).to(device) if x0_val_np is not None else None
+    x1_val_t = torch.from_numpy(x1_val_np).to(device) if x1_val_np is not None else None
+
+    train_losses: list[float] = []
+    val_losses: list[float] = []
+    val_monitor_losses: list[float] = []
+    best_epoch = 0
+    best_val_loss = float("inf")
+    best_state: dict[str, torch.Tensor] | None = None
+    ema_monitor: float | None = None
+    patience_bad = 0
+    stopped_early = False
+    has_nonfinite = False
+
+    grad_norm_sum = 0.0
+    grad_norm_max = 0.0
+    n_total_steps = 0
+    n0 = int(x0_fit_t.shape[0])
+    n1 = int(x1_fit_t.shape[0])
+    n0_val = int(x0_val_t.shape[0]) if x0_val_t is not None else 0
+    n1_val = int(x1_val_t.shape[0]) if x1_val_t is not None else 0
+
+    for epoch in range(1, int(epochs) + 1):
+        model.train()
+        i0 = torch.randint(0, n0, (int(batch_size),), device=device)
+        i1 = torch.randint(0, n1, (int(batch_size),), device=device)
+        loss = latent_belief_ctsm_v_inner_posterior_loss(
+            model=model,
+            prob_path=prob_path,
+            x0=x0_fit_t[i0],
+            x1=x1_fit_t[i1],
+            factor=float(factor),
+            t_eps=float(t_eps),
+            nh=int(latent_n_mc_train),
+        )
+        if not torch.isfinite(loss):
+            has_nonfinite = True
+            raise RuntimeError(
+                "Non-finite latent_belief_ctsm_v_binary_inner_post train loss "
+                f"at epoch {epoch}: {float(loss.detach().cpu())!r}"
+            )
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+
+        grad_sq = 0.0
+        for p in model.parameters():
+            if p.grad is None:
+                continue
+            gn = float(p.grad.detach().norm(2).item())
+            grad_sq += gn * gn
+        grad_norm = float(math.sqrt(grad_sq))
+        grad_norm_sum += grad_norm
+        grad_norm_max = max(grad_norm_max, grad_norm)
+        n_total_steps += 1
+
+        opt.step()
+        train_loss = float(loss.detach().cpu().item())
+        train_losses.append(train_loss)
+
+        if x0_val_t is None or x1_val_t is None:
+            val_loss = train_loss
+        else:
+            model.eval()
+            v_losses: list[float] = []
+            with torch.no_grad():
+                for _ in range(max(1, int(val_batches_per_epoch))):
+                    i0_v = torch.randint(0, n0_val, (int(batch_size),), device=device)
+                    i1_v = torch.randint(0, n1_val, (int(batch_size),), device=device)
+                    lv = latent_belief_ctsm_v_posterior_mean_loss(
+                        model=model,
+                        prob_path=prob_path,
+                        x0=x0_val_t[i0_v],
+                        x1=x1_val_t[i1_v],
+                        factor=float(factor),
+                        t_eps=float(t_eps),
+                        n_mc=int(n_mc_val),
+                    )
+                    if not torch.isfinite(lv):
+                        has_nonfinite = True
+                        raise RuntimeError(
+                            "Non-finite latent_belief_ctsm_v_binary_inner_post validation loss "
+                            f"at epoch {epoch}: {float(lv.detach().cpu())!r}"
+                        )
+                    v_losses.append(float(lv.detach().cpu().item()))
+            val_loss = float(np.mean(v_losses))
+
+        val_losses.append(val_loss)
+        if ema_monitor is None:
+            ema_monitor = val_loss
+        else:
+            alpha = float(early_stopping_ema_alpha)
+            ema_monitor = alpha * val_loss + (1.0 - alpha) * ema_monitor
+        val_monitor_losses.append(float(ema_monitor))
+
+        improved = float(ema_monitor) < (best_val_loss - float(early_stopping_min_delta))
+        if improved:
+            best_val_loss = float(ema_monitor)
+            best_epoch = int(epoch)
+            patience_bad = 0
+            if restore_best:
+                best_state = deepcopy(model.state_dict())
+        else:
+            patience_bad += 1
+
+        if epoch % max(1, int(log_every)) == 0:
+            print(
+                "[latent_belief_ctsm_v_binary_inner_post] "
+                f"epoch={epoch} train={train_loss:.6f} val={val_loss:.6f} "
+                f"val_ema={float(ema_monitor):.6f} best_epoch={best_epoch}"
+            )
+        if patience_bad >= int(early_stopping_patience):
+            stopped_early = True
+            break
+
+    stopped_epoch = int(len(train_losses))
+    if restore_best and best_state is not None:
+        model.load_state_dict(best_state)
+
+    param_sq = 0.0
+    with torch.no_grad():
+        for p in model.parameters():
+            pn = float(p.detach().norm(2).item())
+            param_sq += pn * pn
+    param_norm_final = float(math.sqrt(param_sq))
+
+    if best_epoch <= 0:
+        best_epoch = stopped_epoch
+        if np.isfinite(np.asarray(val_monitor_losses, dtype=np.float64)).any():
+            best_val_loss = float(np.nanmin(np.asarray(val_monitor_losses, dtype=np.float64)))
+        else:
+            best_val_loss = float("nan")
+
+    return {
+        "train_losses": np.asarray(train_losses, dtype=np.float64),
+        "val_losses": np.asarray(val_losses, dtype=np.float64),
+        "val_monitor_losses": np.asarray(val_monitor_losses, dtype=np.float64),
+        "best_epoch": int(best_epoch),
+        "stopped_epoch": int(stopped_epoch),
+        "stopped_early": bool(stopped_early),
+        "best_val_loss": float(best_val_loss),
+        "has_nonfinite": bool(has_nonfinite),
+        "grad_norm_mean": float(grad_norm_sum / max(1, n_total_steps)),
+        "grad_norm_max": float(grad_norm_max),
+        "param_norm_final": float(param_norm_final),
+        "n_clipped_steps": int(0),
+        "n_total_steps": int(n_total_steps),
+        "lr_last": float(opt.param_groups[0]["lr"]),
+        "latent_n_mc_train": int(latent_n_mc_train),
+    }
+
+
 @torch.no_grad()
 def estimate_binary_ctsm_v_log_ratio(
     model: ToyBinaryTimeScoreNet,
@@ -2031,6 +2458,38 @@ def estimate_binary_ctsm_v_log_ratio(
         i1 = min(int(x_np.shape[0]), i0 + bsz)
         x_t = torch.from_numpy(x_np[i0:i1]).to(device)
         llr = estimate_log_ratio_trapz(model, x_t, eps1=float(eps1), eps2=float(eps2), n_time=int(n_time))
+        out[i0:i1] = llr.detach().cpu().numpy().astype(np.float64)
+    return out
+
+
+@torch.no_grad()
+def estimate_latent_belief_ctsm_v_binary_log_ratio(
+    model: ToyLatentBeliefBinaryTimeScoreNet,
+    x: np.ndarray,
+    *,
+    device: torch.device,
+    batch_size: int,
+    eps1: float = 1e-5,
+    eps2: float = 1e-5,
+    n_time: int = 300,
+    n_mc_eval: int = 16,
+) -> np.ndarray:
+    x_np = np.asarray(x, dtype=np.float32)
+    if x_np.ndim != 2:
+        raise ValueError("latent_belief_ctsm_v_binary log-ratio estimation expects x shape (N,d).")
+    out = np.zeros((x_np.shape[0],), dtype=np.float64)
+    model.eval()
+    bsz = max(1, int(batch_size))
+    for i0 in range(0, int(x_np.shape[0]), bsz):
+        i1 = min(int(x_np.shape[0]), i0 + bsz)
+        x_t = torch.from_numpy(x_np[i0:i1]).to(device)
+        ts = torch.linspace(float(eps1), 1.0 - float(eps2), int(n_time), device=device)
+        values = []
+        for t in ts:
+            t_batch = torch.full((x_t.shape[0], 1), float(t), device=device)
+            s_mean = model.posterior_mean_vector(x_t, t_batch, n_mc=max(1, int(n_mc_eval)))
+            values.append(s_mean.sum(dim=-1))
+        llr = torch.trapz(torch.stack(values, dim=0), ts, dim=0)
         out[i0:i1] = llr.detach().cpu().numpy().astype(np.float64)
     return out
 

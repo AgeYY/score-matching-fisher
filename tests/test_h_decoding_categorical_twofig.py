@@ -428,6 +428,14 @@ def test_parse_methods_aliases_and_dedup() -> None:
     assert parse_methods("theta-flow-cate, theta_flow_cate, thetaflow-cate") == ["theta_flow_cate"]
     assert parse_methods("ctsm-v, ctsm_v, ctsm") == ["ctsm_v"]
     assert parse_methods("ctsm-v-binary, ctsm_v_binary, ctsm_binary") == ["ctsm_v_binary"]
+    assert parse_methods("latent-belief-ctsm-v-binary, latent_ctsm_v_binary") == [
+        "latent_belief_ctsm_v_binary"
+    ]
+    assert parse_methods(
+        "latent_belief_ctsm_v_binary_inner_post, "
+        "latent-belief-ctsm-v-binary-inner-post, "
+        "latent_belief_ctsm_v_binary_innner_post"
+    ) == ["latent_belief_ctsm_v_binary_inner_post"]
     assert parse_methods("lda-ctsm-v, lda_ctsm_v, ldactsm-v") == ["lda_ctsm_v"]
     assert parse_methods("pls-ctsm-v, pls_ctsm_v, plsctsm-v") == ["pls_ctsm_v"]
     assert parse_methods("pca-ctsm-v, pca_ctsm_v, pcactsm-v") == ["pca_ctsm_v"]
@@ -612,6 +620,61 @@ def test_ctsm_binary_model_accepts_no_theta_conditioning() -> None:
     assert tuple(model(x, t).shape) == (4, 1)
 
 
+def test_latent_belief_ctsm_binary_model_shapes() -> None:
+    from fisher.ctsm_models import ToyLatentBeliefBinaryTimeScoreNet
+
+    x = torch.zeros((4, 3), dtype=torch.float32)
+    t = torch.full((4, 1), 0.5, dtype=torch.float32)
+    model = ToyLatentBeliefBinaryTimeScoreNet(dim=3, h_dim=5, hidden_dim=8)
+
+    mean, std = model.posterior(x, t)
+    b1, b2 = model.sample_two_readouts(x, t)
+    s_mean = model.posterior_mean_vector(x, t, n_mc=2)
+
+    assert tuple(mean.shape) == (4, 5)
+    assert tuple(std.shape) == (4, 5)
+    assert torch.all(std > 0)
+    assert tuple(b1.shape) == (4, 3)
+    assert tuple(b2.shape) == (4, 3)
+    assert tuple(s_mean.shape) == (4, 3)
+    assert tuple(model(x, t, n_mc=2).shape) == (4, 1)
+
+
+def test_latent_belief_ctsm_loss_backward_and_inference() -> None:
+    from fisher.ctsm_models import ToyLatentBeliefBinaryTimeScoreNet
+    from fisher.ctsm_objectives import latent_belief_ctsm_v_inner_posterior_loss, latent_belief_ctsm_v_two_sample_loss
+    from fisher.ctsm_paths import TwoSB
+    from fisher.shared_fisher_est import estimate_latent_belief_ctsm_v_binary_log_ratio
+
+    model = ToyLatentBeliefBinaryTimeScoreNet(dim=2, h_dim=3, hidden_dim=8)
+    path = TwoSB(dim=2, var=2.0)
+    x0 = torch.randn((6, 2), dtype=torch.float32)
+    x1 = torch.randn((6, 2), dtype=torch.float32)
+
+    loss = latent_belief_ctsm_v_two_sample_loss(model, path, x0, x1, t_eps=0.01)
+    loss.backward()
+    model.zero_grad(set_to_none=True)
+    inner_loss = latent_belief_ctsm_v_inner_posterior_loss(model, path, x0, x1, t_eps=0.01, nh=2)
+    inner_loss.backward()
+    llr = estimate_latent_belief_ctsm_v_binary_log_ratio(
+        model,
+        np.zeros((5, 2), dtype=np.float32),
+        device=torch.device("cpu"),
+        batch_size=3,
+        eps1=0.01,
+        eps2=0.01,
+        n_time=3,
+        n_mc_eval=2,
+    )
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(inner_loss)
+    assert float(inner_loss.detach()) >= 0.0
+    assert any(p.grad is not None for p in model.parameters())
+    assert llr.shape == (5,)
+    assert np.all(np.isfinite(llr))
+
+
 def test_ctsm_binary_llr_transform_matches_delta_convention() -> None:
     llr = np.array([2.0, 3.0, -5.0, 7.0], dtype=np.float64)
     bins = np.array([0, 1, 0, 1], dtype=np.int64)
@@ -789,6 +852,92 @@ def test_ctsm_v_binary_dispatch_uses_bins(monkeypatch: pytest.MonkeyPatch) -> No
     assert np.array_equal(seen["bins_val"], bins[2:])
     assert np.array_equal(seen["bins_all"], bins)
     assert seen["k_cat"] == 2
+
+
+def test_latent_belief_ctsm_v_binary_dispatch_uses_bins(monkeypatch: pytest.MonkeyPatch) -> None:
+    import fisher.h_decoding_categorical_twofig as cat
+
+    seen: dict[str, np.ndarray | int] = {}
+
+    def fake_latent_ctsm_binary(*args, **kwargs):
+        seen["bins_train"] = np.asarray(kwargs["bins_train"], dtype=np.int64)
+        seen["bins_val"] = np.asarray(kwargs["bins_val"], dtype=np.int64)
+        seen["bins_all"] = np.asarray(kwargs["bins_all"], dtype=np.int64)
+        seen["k_cat"] = int(kwargs["k_cat"])
+        n = int(np.asarray(kwargs["x_all"]).shape[0])
+        return {"delta_l": np.zeros((n, n), dtype=np.float64), "train_out": None}
+
+    monkeypatch.setattr(cat, "_train_latent_belief_ctsm_v_binary_delta", fake_latent_ctsm_binary)
+    args = SimpleNamespace()
+    theta = np.eye(2, dtype=np.float64)[[0, 1, 0, 1]]
+    x = np.zeros((4, 2), dtype=np.float64)
+    bins = np.array([0, 1, 0, 1], dtype=np.int64)
+
+    result = cat._train_one_method(
+        args,
+        dev=torch.device("cpu"),
+        method_name="latent_belief_ctsm_v_binary",
+        theta_train=theta[:2],
+        x_train=x[:2],
+        theta_val=theta[2:],
+        x_val=x[2:],
+        theta_all=theta,
+        x_all=x,
+        bins_train=bins[:2],
+        bins_val=bins[2:],
+        bins_all=bins,
+        k_cat=2,
+    )
+
+    assert result["delta_l"].shape == (4, 4)
+    assert np.array_equal(seen["bins_train"], bins[:2])
+    assert np.array_equal(seen["bins_val"], bins[2:])
+    assert np.array_equal(seen["bins_all"], bins)
+    assert seen["k_cat"] == 2
+
+
+def test_latent_belief_ctsm_v_binary_inner_post_dispatch_uses_bins(monkeypatch: pytest.MonkeyPatch) -> None:
+    import fisher.h_decoding_categorical_twofig as cat
+
+    seen: dict[str, np.ndarray | int | str] = {}
+
+    def fake_latent_ctsm_binary(*args, **kwargs):
+        seen["bins_train"] = np.asarray(kwargs["bins_train"], dtype=np.int64)
+        seen["bins_val"] = np.asarray(kwargs["bins_val"], dtype=np.int64)
+        seen["bins_all"] = np.asarray(kwargs["bins_all"], dtype=np.int64)
+        seen["k_cat"] = int(kwargs["k_cat"])
+        seen["method_name"] = str(kwargs["method_name"])
+        n = int(np.asarray(kwargs["x_all"]).shape[0])
+        return {"delta_l": np.zeros((n, n), dtype=np.float64), "train_out": None}
+
+    monkeypatch.setattr(cat, "_train_latent_belief_ctsm_v_binary_delta", fake_latent_ctsm_binary)
+    args = SimpleNamespace()
+    theta = np.eye(2, dtype=np.float64)[[0, 1, 0, 1]]
+    x = np.zeros((4, 2), dtype=np.float64)
+    bins = np.array([0, 1, 0, 1], dtype=np.int64)
+
+    result = cat._train_one_method(
+        args,
+        dev=torch.device("cpu"),
+        method_name="latent_belief_ctsm_v_binary_inner_post",
+        theta_train=theta[:2],
+        x_train=x[:2],
+        theta_val=theta[2:],
+        x_val=x[2:],
+        theta_all=theta,
+        x_all=x,
+        bins_train=bins[:2],
+        bins_val=bins[2:],
+        bins_all=bins,
+        k_cat=2,
+    )
+
+    assert result["delta_l"].shape == (4, 4)
+    assert np.array_equal(seen["bins_train"], bins[:2])
+    assert np.array_equal(seen["bins_val"], bins[2:])
+    assert np.array_equal(seen["bins_all"], bins)
+    assert seen["k_cat"] == 2
+    assert seen["method_name"] == "latent_belief_ctsm_v_binary_inner_post"
 
 
 def test_lda_ctsm_v_dispatch_transforms_x_before_ctsm(monkeypatch: pytest.MonkeyPatch) -> None:

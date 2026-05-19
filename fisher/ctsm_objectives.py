@@ -7,7 +7,7 @@ from __future__ import annotations
 import torch
 from torchdiffeq import odeint
 
-from fisher.ctsm_models import PairConditionedTimeScoreNetBase, ToyFullTimeScoreNet
+from fisher.ctsm_models import PairConditionedTimeScoreNetBase, ToyFullTimeScoreNet, ToyLatentBeliefBinaryTimeScoreNet
 from fisher.ctsm_paths import TwoEndpointBridge
 
 
@@ -81,6 +81,90 @@ def ctsm_v_pair_conditioned_loss(
     )
 
     pred = lambda_t * model.forward_full(x_t, t, m, delta)
+    loss_per_sample = torch.mean((targets - pred) ** 2, dim=-1)
+    return loss_per_sample.mean()
+
+
+def _two_sample_path_batch(
+    prob_path: TwoEndpointBridge,
+    x0: torch.Tensor,
+    x1: torch.Tensor,
+    factor: float,
+    t_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch_size = x0.shape[0]
+    t = torch.rand(batch_size, 1, device=x0.device) * (1.0 - 2.0 * t_eps) + t_eps
+    mean, std, _ = prob_path.marginal_prob(x0, x1, t)
+    epsilon = torch.randn_like(x0)
+    x_t = mean + std * epsilon
+    lambda_t, targets = prob_path.full_epsilon_target(
+        epsilon=epsilon,
+        x0=x0,
+        x1=x1,
+        t=t,
+        factor=factor,
+    )
+    return x_t, t, lambda_t, targets
+
+
+def latent_belief_ctsm_v_two_sample_loss(
+    model: ToyLatentBeliefBinaryTimeScoreNet,
+    prob_path: TwoEndpointBridge,
+    x0: torch.Tensor,
+    x1: torch.Tensor,
+    factor: float = 1.0,
+    t_eps: float = 1e-5,
+    n_posterior_pairs: int = 1,
+) -> torch.Tensor:
+    """
+    Latent-belief CTSM-v posterior-outer loss.
+
+    Uses two independent posterior samples per pair and the same lambda-scaled
+    convention as ctsm_v_two_sample_loss.
+    """
+    x_t, t, lambda_t, targets = _two_sample_path_batch(prob_path, x0, x1, factor, t_eps)
+    losses = []
+    for _ in range(max(1, int(n_posterior_pairs))):
+        b1, b2 = model.sample_two_readouts(x_t, t)
+        res1 = targets - lambda_t * b1
+        res2 = targets - lambda_t * b2
+        losses.append(torch.mean(res1 * res2, dim=-1))
+    return torch.stack(losses, dim=0).mean()
+
+
+def latent_belief_ctsm_v_posterior_mean_loss(
+    model: ToyLatentBeliefBinaryTimeScoreNet,
+    prob_path: TwoEndpointBridge,
+    x0: torch.Tensor,
+    x1: torch.Tensor,
+    factor: float = 1.0,
+    t_eps: float = 1e-5,
+    n_mc: int = 8,
+) -> torch.Tensor:
+    """Stable nonnegative validation loss based on posterior-mean readout."""
+    x_t, t, lambda_t, targets = _two_sample_path_batch(prob_path, x0, x1, factor, t_eps)
+    pred = lambda_t * model.posterior_mean_vector(x_t, t, n_mc=max(1, int(n_mc)))
+    loss_per_sample = torch.mean((targets - pred) ** 2, dim=-1)
+    return loss_per_sample.mean()
+
+
+def latent_belief_ctsm_v_inner_posterior_loss(
+    model: ToyLatentBeliefBinaryTimeScoreNet,
+    prob_path: TwoEndpointBridge,
+    x0: torch.Tensor,
+    x1: torch.Tensor,
+    factor: float = 1.0,
+    t_eps: float = 1e-5,
+    nh: int = 32,
+) -> torch.Tensor:
+    """
+    Latent-belief CTSM-v loss with posterior expectation inside the square.
+
+    The posterior mean readout is estimated by Monte Carlo samples, then used
+    in the same lambda-scaled CTSM-v residual as the deterministic binary loss.
+    """
+    x_t, t, lambda_t, targets = _two_sample_path_batch(prob_path, x0, x1, factor, t_eps)
+    pred = lambda_t * model.posterior_mean_vector(x_t, t, n_mc=max(1, int(nh)))
     loss_per_sample = torch.mean((targets - pred) ** 2, dim=-1)
     return loss_per_sample.mean()
 

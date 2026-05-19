@@ -44,6 +44,22 @@ def test_parser_defaults_are_binary_native_random_mog() -> None:
     assert args.pr_dim == 10
     assert args.pr_cache_dir == "data/pr_autoencoder_cache"
     assert "random_mog_binary_llr_simple" in str(args.output_dir)
+    assert args.latent_n_mc_train == 32
+
+
+def test_parser_normalizes_latent_inner_post_aliases() -> None:
+    mod = _load_study_module()
+    parser = mod.build_parser()
+
+    assert parser.parse_args(["--method", "latent_belief_ctsm_v_binary_inner_post"]).method == (
+        "latent_belief_ctsm_v_binary_inner_post"
+    )
+    assert parser.parse_args(["--method", "latent-belief-ctsm-v-binary-inner-post"]).method == (
+        "latent_belief_ctsm_v_binary_inner_post"
+    )
+    assert parser.parse_args(["--method", "latent_belief_ctsm_v_binary_innner_post"]).method == (
+        "latent_belief_ctsm_v_binary_inner_post"
+    )
 
 
 def test_prepare_work_features_pr_project_uses_high_dimensional_work_features(

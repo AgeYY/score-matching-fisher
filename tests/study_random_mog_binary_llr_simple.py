@@ -23,15 +23,37 @@ import numpy as np
 import torch
 from sklearn.linear_model import LogisticRegression
 
-from fisher.ctsm_models import ToyBinaryTimeScoreNet
+from fisher.ctsm_models import ToyBinaryTimeScoreNet, ToyLatentBeliefBinaryTimeScoreNet
 from fisher.data import ToyCategoricalRandomMoGDataset
 from fisher.dataset_visualization import pca_project
 from fisher.pr_autoencoder_embedding import pr_autoencoder_config_from_namespace, project_x_through_pr_autoencoder
 from fisher.shared_fisher_est import (
     estimate_binary_ctsm_v_log_ratio,
+    estimate_latent_belief_ctsm_v_binary_log_ratio,
     require_device,
     train_binary_ctsm_v_model,
+    train_latent_belief_binary_ctsm_v_model,
+    train_latent_belief_binary_ctsm_v_inner_post_model,
 )
+
+_METHOD_ALIASES = {
+    "ctsm-v-binary": "ctsm_v_binary",
+    "ctsm_v_binary": "ctsm_v_binary",
+    "latent-belief-ctsm-v-binary": "latent_belief_ctsm_v_binary",
+    "latent_belief_ctsm_v_binary": "latent_belief_ctsm_v_binary",
+    "latent-belief-ctsm-v-binary-inner-post": "latent_belief_ctsm_v_binary_inner_post",
+    "latent_belief_ctsm_v_binary_inner_post": "latent_belief_ctsm_v_binary_inner_post",
+    "latent-belief-ctsm-v-binary-innner-post": "latent_belief_ctsm_v_binary_inner_post",
+    "latent_belief_ctsm_v_binary_innner_post": "latent_belief_ctsm_v_binary_inner_post",
+}
+
+
+def normalize_method(value: str) -> str:
+    key = str(value).strip().lower()
+    try:
+        return _METHOD_ALIASES[key]
+    except KeyError as exc:
+        raise argparse.ArgumentTypeError(f"unknown method {value!r}") from exc
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -46,6 +68,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--n-test-per-class", type=int, default=400)
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--clf-max-iter", type=int, default=1000)
+    p.add_argument("--method", type=normalize_method, default="ctsm_v_binary")
     p.add_argument("--ctsm-binary-epochs", type=int, default=50000)
     p.add_argument("--ctsm-batch-size", type=int, default=256)
     p.add_argument("--ctsm-lr", type=float, default=2e-3)
@@ -57,6 +80,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ctsm-factor", type=float, default=1.0)
     p.add_argument("--ctsm-t-eps", type=float, default=0.01)
     p.add_argument("--ctsm-int-n-time", type=int, default=300)
+    p.add_argument("--latent-h-dim", type=int, default=4)
+    p.add_argument("--latent-n-mc-train", type=int, default=32)
+    p.add_argument("--latent-n-mc-val", type=int, default=8)
+    p.add_argument("--latent-n-mc-eval", type=int, default=16)
+    p.add_argument("--latent-n-posterior-pairs", type=int, default=1)
+    p.add_argument("--latent-precision-eps", type=float, default=1e-4)
     p.add_argument("--log-every", type=int, default=100)
     p.add_argument("--early-stopping-patience", type=int, default=1000)
     p.add_argument("--early-stopping-min-delta", type=float, default=1e-4)
@@ -298,6 +327,7 @@ def save_diagnostic_figure(
     gt_llr: np.ndarray,
     binary_llr: np.ndarray,
     ctsm_llr: np.ndarray,
+    ctsm_label: str = "ctsm_v_binary",
 ) -> tuple[Path, Path]:
     binary_metrics = regression_metrics(binary_llr, gt_llr)
     ctsm_metrics = regression_metrics(ctsm_llr, gt_llr)
@@ -335,7 +365,7 @@ def save_diagnostic_figure(
 
     ax = axes[0, 2]
     ax.scatter(gt_llr, binary_llr, s=13, alpha=0.55, label="binary_classifier")
-    ax.scatter(gt_llr, ctsm_llr, s=13, alpha=0.55, label="ctsm_v_binary")
+    ax.scatter(gt_llr, ctsm_llr, s=13, alpha=0.55, label=ctsm_label)
     lo = float(np.nanmin([np.min(gt_llr), np.min(binary_llr), np.min(ctsm_llr)]))
     hi = float(np.nanmax([np.max(gt_llr), np.max(binary_llr), np.max(ctsm_llr)]))
     ax.plot([lo, hi], [lo, hi], color="black", linewidth=1)
@@ -349,7 +379,7 @@ def save_diagnostic_figure(
         "\n".join(
             [
                 _metrics_label("binary_classifier", binary_metrics),
-                _metrics_label("ctsm_v_binary", ctsm_metrics),
+                _metrics_label(ctsm_label, ctsm_metrics),
             ]
         ),
         transform=ax.transAxes,
@@ -364,9 +394,9 @@ def save_diagnostic_figure(
     lo = float(np.nanmin([np.min(binary_llr), np.min(ctsm_llr)]))
     hi = float(np.nanmax([np.max(binary_llr), np.max(ctsm_llr)]))
     ax.plot([lo, hi], [lo, hi], color="black", linewidth=1)
-    ax.set_title("binary_classifier vs ctsm_v_binary")
+    ax.set_title(f"binary_classifier vs {ctsm_label}")
     ax.set_xlabel("binary_classifier LLR")
-    ax.set_ylabel("ctsm_v_binary LLR")
+    ax.set_ylabel(f"{ctsm_label} LLR")
 
     err = np.asarray(ctsm_llr, dtype=np.float64) - np.asarray(gt_llr, dtype=np.float64)
     ax = axes[1, 1]
@@ -380,7 +410,7 @@ def save_diagnostic_figure(
     ax = axes[1, 2]
     bins = max(10, min(60, int(np.sqrt(len(err)))))
     ax.hist(binary_llr - gt_llr, bins=_hist_bins_for(binary_llr - gt_llr, bins), alpha=0.55, label="binary_classifier")
-    ax.hist(err, bins=_hist_bins_for(err, bins), alpha=0.55, label="ctsm_v_binary")
+    ax.hist(err, bins=_hist_bins_for(err, bins), alpha=0.55, label=ctsm_label)
     ax.set_title("LLR residuals")
     ax.set_xlabel("estimated - GT")
     ax.legend()
@@ -390,7 +420,7 @@ def save_diagnostic_figure(
         "\n".join(
             [
                 _metrics_label("binary_classifier", binary_metrics),
-                _metrics_label("ctsm_v_binary", ctsm_metrics),
+                _metrics_label(ctsm_label, ctsm_metrics),
             ]
         ),
         transform=ax.transAxes,
@@ -419,6 +449,7 @@ def write_summary(
     figure_png: Path,
     binary_metrics: dict[str, float],
     ctsm_metrics: dict[str, float],
+    ctsm_label: str = "ctsm_v_binary",
 ) -> Path:
     path = path.resolve()
     with path.open("w", encoding="utf-8") as f:
@@ -429,8 +460,8 @@ def write_summary(
         f.write(f"simple_binary_llr_diagnostic.png: {figure_png.resolve()}\n")
         f.write(f"binary_classifier_rmse: {binary_metrics['rmse']:.8g}\n")
         f.write(f"binary_classifier_corr: {binary_metrics['corr']:.8g}\n")
-        f.write(f"ctsm_v_binary_rmse: {ctsm_metrics['rmse']:.8g}\n")
-        f.write(f"ctsm_v_binary_corr: {ctsm_metrics['corr']:.8g}\n")
+        f.write(f"{ctsm_label}_rmse: {ctsm_metrics['rmse']:.8g}\n")
+        f.write(f"{ctsm_label}_corr: {ctsm_metrics['corr']:.8g}\n")
     return path
 
 
@@ -490,42 +521,98 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     train1 = np.flatnonzero(y_train == 1)
     val0 = np.flatnonzero(y_val == 0)
     val1 = np.flatnonzero(y_val == 1)
-    model = ToyBinaryTimeScoreNet(dim=work_x_dim, hidden_dim=int(args.ctsm_hidden_dim)).to(dev)
-    train_out = train_binary_ctsm_v_model(
-        model=model,
-        x0_train=x_train[train0],
-        x1_train=x_train[train1],
-        epochs=int(args.ctsm_binary_epochs),
-        batch_size=int(args.ctsm_batch_size),
-        lr=float(args.ctsm_lr),
-        weight_decay=float(args.ctsm_weight_decay),
-        device=dev,
-        log_every=max(1, int(args.log_every)),
-        two_sb_var=float(args.ctsm_two_sb_var),
-        path_schedule=str(args.ctsm_path_schedule),
-        path_eps=float(args.ctsm_path_eps),
-        factor=float(args.ctsm_factor),
-        t_eps=float(args.ctsm_t_eps),
-        x0_val=x_val[val0],
-        x1_val=x_val[val1],
-        early_stopping_patience=int(args.early_stopping_patience),
-        early_stopping_min_delta=float(args.early_stopping_min_delta),
-        early_stopping_ema_alpha=float(args.early_stopping_ema_alpha),
-        restore_best=bool(args.restore_best),
-    )
-    ctsm_llr = estimate_binary_ctsm_v_log_ratio(
-        model,
-        x_test,
-        device=dev,
-        batch_size=int(args.ctsm_batch_size),
-        eps1=float(args.ctsm_t_eps),
-        eps2=float(args.ctsm_t_eps),
-        n_time=int(args.ctsm_int_n_time),
-    )
+    method = str(args.method)
+    if method in {"latent_belief_ctsm_v_binary", "latent_belief_ctsm_v_binary_inner_post"}:
+        model = ToyLatentBeliefBinaryTimeScoreNet(
+            dim=work_x_dim,
+            h_dim=int(args.latent_h_dim),
+            hidden_dim=int(args.ctsm_hidden_dim),
+            precision_eps=float(args.latent_precision_eps),
+        ).to(dev)
+        train_fn = (
+            train_latent_belief_binary_ctsm_v_inner_post_model
+            if method == "latent_belief_ctsm_v_binary_inner_post"
+            else train_latent_belief_binary_ctsm_v_model
+        )
+        train_kwargs = {}
+        if method == "latent_belief_ctsm_v_binary_inner_post":
+            train_kwargs["latent_n_mc_train"] = int(args.latent_n_mc_train)
+        else:
+            train_kwargs["n_posterior_pairs"] = int(args.latent_n_posterior_pairs)
+        train_out = train_fn(
+            model=model,
+            x0_train=x_train[train0],
+            x1_train=x_train[train1],
+            epochs=int(args.ctsm_binary_epochs),
+            batch_size=int(args.ctsm_batch_size),
+            lr=float(args.ctsm_lr),
+            weight_decay=float(args.ctsm_weight_decay),
+            device=dev,
+            log_every=max(1, int(args.log_every)),
+            two_sb_var=float(args.ctsm_two_sb_var),
+            path_schedule=str(args.ctsm_path_schedule),
+            path_eps=float(args.ctsm_path_eps),
+            factor=float(args.ctsm_factor),
+            t_eps=float(args.ctsm_t_eps),
+            x0_val=x_val[val0],
+            x1_val=x_val[val1],
+            early_stopping_patience=int(args.early_stopping_patience),
+            early_stopping_min_delta=float(args.early_stopping_min_delta),
+            early_stopping_ema_alpha=float(args.early_stopping_ema_alpha),
+            restore_best=bool(args.restore_best),
+            n_mc_val=int(args.latent_n_mc_val),
+            **train_kwargs,
+        )
+        ctsm_llr = estimate_latent_belief_ctsm_v_binary_log_ratio(
+            model,
+            x_test,
+            device=dev,
+            batch_size=int(args.ctsm_batch_size),
+            eps1=float(args.ctsm_t_eps),
+            eps2=float(args.ctsm_t_eps),
+            n_time=int(args.ctsm_int_n_time),
+            n_mc_eval=int(args.latent_n_mc_eval),
+        )
+    else:
+        model = ToyBinaryTimeScoreNet(dim=work_x_dim, hidden_dim=int(args.ctsm_hidden_dim)).to(dev)
+        train_out = train_binary_ctsm_v_model(
+            model=model,
+            x0_train=x_train[train0],
+            x1_train=x_train[train1],
+            epochs=int(args.ctsm_binary_epochs),
+            batch_size=int(args.ctsm_batch_size),
+            lr=float(args.ctsm_lr),
+            weight_decay=float(args.ctsm_weight_decay),
+            device=dev,
+            log_every=max(1, int(args.log_every)),
+            two_sb_var=float(args.ctsm_two_sb_var),
+            path_schedule=str(args.ctsm_path_schedule),
+            path_eps=float(args.ctsm_path_eps),
+            factor=float(args.ctsm_factor),
+            t_eps=float(args.ctsm_t_eps),
+            x0_val=x_val[val0],
+            x1_val=x_val[val1],
+            early_stopping_patience=int(args.early_stopping_patience),
+            early_stopping_min_delta=float(args.early_stopping_min_delta),
+            early_stopping_ema_alpha=float(args.early_stopping_ema_alpha),
+            restore_best=bool(args.restore_best),
+        )
+        ctsm_llr = estimate_binary_ctsm_v_log_ratio(
+            model,
+            x_test,
+            device=dev,
+            batch_size=int(args.ctsm_batch_size),
+            eps1=float(args.ctsm_t_eps),
+            eps2=float(args.ctsm_t_eps),
+            n_time=int(args.ctsm_int_n_time),
+        )
 
     binary_metrics = regression_metrics(binary_llr, gt_llr)
     ctsm_metrics = regression_metrics(ctsm_llr, gt_llr)
     results_npz = (out_dir / "simple_binary_llr_results.npz").resolve()
+    extra_llr_payload = {}
+    if method != "ctsm_v_binary":
+        extra_llr_payload[f"{method}_llr"] = ctsm_llr
     np.savez_compressed(
         results_npz,
         theta_train=theta_train,
@@ -546,9 +633,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         gt_llr=gt_llr,
         binary_classifier_llr=binary_llr,
         ctsm_v_binary_llr=ctsm_llr,
+        **extra_llr_payload,
         ctsm_train_losses=np.asarray(train_out["train_losses"], dtype=np.float64),
         ctsm_val_losses=np.asarray(train_out["val_losses"], dtype=np.float64),
         ctsm_val_monitor_losses=np.asarray(train_out["val_monitor_losses"], dtype=np.float64),
+        method=np.asarray(method, dtype=np.str_),
+        latent_h_dim=np.int64(int(args.latent_h_dim)),
+        latent_n_mc_train=np.int64(int(args.latent_n_mc_train)),
+        latent_n_mc_val=np.int64(int(args.latent_n_mc_val)),
+        latent_n_mc_eval=np.int64(int(args.latent_n_mc_eval)),
+        latent_n_posterior_pairs=np.int64(int(args.latent_n_posterior_pairs)),
+        latent_precision_eps=np.float64(float(args.latent_precision_eps)),
         pr_projected=np.bool_(bool(work["pr_projected"])),
         pr_dim=np.int64(int(work["pr_dim"])),
         native_x_dim=np.int64(int(args.x_dim)),
@@ -575,6 +670,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         gt_llr=gt_llr,
         binary_llr=binary_llr,
         ctsm_llr=ctsm_llr,
+        ctsm_label=method,
     )
     summary = write_summary(
         path=out_dir / "simple_binary_llr_summary.txt",
@@ -584,6 +680,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         figure_png=fig_png,
         binary_metrics=binary_metrics,
         ctsm_metrics=ctsm_metrics,
+        ctsm_label=method,
     )
     print(f"Saved results: {results_npz}", flush=True)
     print(f"Saved figure: {fig_svg}", flush=True)

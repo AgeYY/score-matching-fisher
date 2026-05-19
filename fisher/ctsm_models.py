@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class PairConditionedTimeScoreNetBase(nn.Module):
@@ -51,6 +52,142 @@ class ToyBinaryTimeScoreNet(ToyFullTimeScoreNet):
     The scalar forward output integrates to ``log p_1(x) - log p_0(x)`` when
     trained with class-0 samples as ``x0`` and class-1 samples as ``x1``.
     """
+
+
+class AdditiveDiagonalGaussianPosterior(nn.Module):
+    """
+    Additive-evidence diagonal Gaussian posterior in natural parameters.
+
+    q(z | x, t) has diagonal precision
+        lambda(x,t) = lambda_0(t) + sum_i lambda_i(x_i,t)
+    and natural mean
+        eta(x,t) = eta_0(t) + sum_i eta_i(x_i,t).
+    """
+
+    def __init__(self, x_dim: int, z_dim: int, hidden_dim: int = 128, eps: float = 1e-4):
+        super().__init__()
+        self.x_dim = int(x_dim)
+        self.z_dim = int(z_dim)
+        self.eps = float(eps)
+        if self.x_dim < 1:
+            raise ValueError("x_dim must be >= 1.")
+        if self.z_dim < 1:
+            raise ValueError("z_dim must be >= 1.")
+        if self.eps <= 0.0:
+            raise ValueError("eps must be positive.")
+
+        self.prior_net = nn.Sequential(
+            nn.Linear(1, hidden_dim),
+            nn.ELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ELU(),
+            nn.Linear(hidden_dim, 2 * self.z_dim),
+        )
+        self.evidence_net = nn.Sequential(
+            nn.Linear(2, hidden_dim),
+            nn.ELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ELU(),
+            nn.Linear(hidden_dim, 2 * self.z_dim),
+        )
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if x.ndim != 2:
+            raise ValueError("x must have shape (B, D).")
+        if t.ndim == 1:
+            t = t.unsqueeze(-1)
+        if t.ndim != 2 or t.shape[-1] != 1:
+            raise ValueError("t must have shape (B, 1).")
+        if x.shape[-1] != self.x_dim:
+            raise ValueError(f"Expected x last dim {self.x_dim}, got {x.shape[-1]}.")
+        if x.shape[0] != t.shape[0]:
+            raise ValueError("x and t batch sizes must match.")
+
+        prior_raw_prec, prior_eta = self.prior_net(t).chunk(2, dim=-1)
+        precision = F.softplus(prior_raw_prec) + self.eps
+        eta = prior_eta
+
+        t_expand = t.unsqueeze(1).expand(-1, self.x_dim, -1)
+        coord_in = torch.cat([x.unsqueeze(-1), t_expand], dim=-1).reshape(-1, 2)
+        raw_prec_i, eta_i = self.evidence_net(coord_in).chunk(2, dim=-1)
+        precision_i = F.softplus(raw_prec_i).reshape(x.shape[0], self.x_dim, self.z_dim)
+        eta_i = eta_i.reshape(x.shape[0], self.x_dim, self.z_dim)
+
+        precision = precision + precision_i.sum(dim=1)
+        eta = eta + eta_i.sum(dim=1)
+        mean = eta / precision
+        std = torch.rsqrt(precision)
+        return mean, std
+
+    def rsample(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        mean, std = self.forward(x, t)
+        return mean + std * torch.randn_like(mean)
+
+    def rsample_pair(self, x: torch.Tensor, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.rsample(x, t), self.rsample(x, t)
+
+
+class ToyLatentBeliefBinaryTimeScoreNet(nn.Module):
+    """
+    Latent-belief CTSM-v network for a fixed binary distribution pair.
+
+    The posterior q_phi(z | x,t) is additive-evidence diagonal Gaussian; the
+    readout B_psi(z,t) returns a vector in R^dim. Inference integrates the sum
+    of the posterior-mean vector readout.
+    """
+
+    def __init__(
+        self,
+        dim: int = 2,
+        h_dim: int = 4,
+        hidden_dim: int = 128,
+        *,
+        precision_eps: float = 1e-4,
+    ):
+        super().__init__()
+        self.dim = int(dim)
+        self.h_dim = int(h_dim)
+        self.posterior = AdditiveDiagonalGaussianPosterior(
+            x_dim=self.dim,
+            z_dim=self.h_dim,
+            hidden_dim=int(hidden_dim),
+            eps=float(precision_eps),
+        )
+        self.readout_net = nn.Sequential(
+            nn.Linear(self.h_dim + 1, hidden_dim),
+            nn.ELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ELU(),
+            nn.Linear(hidden_dim, self.dim),
+        )
+
+    def readout(self, z: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        if t.ndim == 1:
+            t = t.unsqueeze(-1)
+        if z.ndim != 2:
+            raise ValueError("z must have shape (B, h_dim).")
+        if t.shape[0] != z.shape[0]:
+            raise ValueError("z and t batch sizes must match.")
+        return self.readout_net(torch.cat([z, t], dim=-1))
+
+    def sample_two_readouts(self, x: torch.Tensor, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        z1, z2 = self.posterior.rsample_pair(x, t)
+        return self.readout(z1, t), self.readout(z2, t)
+
+    def sample_readouts(self, x: torch.Tensor, t: torch.Tensor, n_mc: int = 1) -> torch.Tensor:
+        n = max(1, int(n_mc))
+        return torch.stack([self.readout(self.posterior.rsample(x, t), t) for _ in range(n)], dim=0)
+
+    def posterior_mean_vector(self, x: torch.Tensor, t: torch.Tensor, n_mc: int = 16) -> torch.Tensor:
+        return self.sample_readouts(x, t, n_mc=n_mc).mean(dim=0)
+
+    def forward_full(self, x: torch.Tensor, t: torch.Tensor, n_mc: int = 16) -> torch.Tensor:
+        return self.posterior_mean_vector(x, t, n_mc=n_mc)
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor, n_mc: int = 16) -> torch.Tensor:
+        return self.forward_full(x, t, n_mc=n_mc).sum(dim=-1, keepdim=True)
 
 
 class ToyPairConditionedTimeScoreNet(PairConditionedTimeScoreNetBase):

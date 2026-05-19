@@ -66,7 +66,12 @@ from fisher.contrastive_llr import (
 )
 from fisher.h_matrix import HMatrixEstimator
 from fisher.shared_dataset_io import SharedDatasetBundle, load_shared_dataset_npz
-from fisher.ctsm_models import ToyBinaryTimeScoreNet, ToyPairConditionedTimeScoreNet, ToyPairConditionedTimeScoreNetFiLM
+from fisher.ctsm_models import (
+    ToyBinaryTimeScoreNet,
+    ToyLatentBeliefBinaryTimeScoreNet,
+    ToyPairConditionedTimeScoreNet,
+    ToyPairConditionedTimeScoreNetFiLM,
+)
 from fisher.linear_x_flow import (
     ConditionalTimeLinearXFlowMLP,
     ConditionalTimeLowRankCorrectionLinearXFlowMLP,
@@ -79,7 +84,10 @@ from fisher.shared_fisher_est import (
     build_dataset_from_meta,
     require_device,
     estimate_binary_ctsm_v_log_ratio,
+    estimate_latent_belief_ctsm_v_binary_log_ratio,
     train_binary_ctsm_v_model,
+    train_latent_belief_binary_ctsm_v_model,
+    train_latent_belief_binary_ctsm_v_inner_post_model,
     train_pair_conditioned_ctsm_v_model,
 )
 from fisher.svg_utils import concatenate_svgs_horizontally_to_png
@@ -126,6 +134,13 @@ _METHOD_ALIASES: dict[str, str] = {
     "ctsm-v-binary": "ctsm_v_binary",
     "ctsm_v_binary": "ctsm_v_binary",
     "ctsm_binary": "ctsm_v_binary",
+    "latent-belief-ctsm-v-binary": "latent_belief_ctsm_v_binary",
+    "latent_belief_ctsm_v_binary": "latent_belief_ctsm_v_binary",
+    "latent_ctsm_v_binary": "latent_belief_ctsm_v_binary",
+    "latent-belief-ctsm-v-binary-inner-post": "latent_belief_ctsm_v_binary_inner_post",
+    "latent_belief_ctsm_v_binary_inner_post": "latent_belief_ctsm_v_binary_inner_post",
+    "latent-belief-ctsm-v-binary-innner-post": "latent_belief_ctsm_v_binary_inner_post",
+    "latent_belief_ctsm_v_binary_innner_post": "latent_belief_ctsm_v_binary_inner_post",
     "lda-ctsm-v": "lda_ctsm_v",
     "lda_ctsm_v": "lda_ctsm_v",
     "ldactsm-v": "lda_ctsm_v",
@@ -145,6 +160,8 @@ _SUPPORTED_METHODS_HELP = ", ".join(
         "bin_gaussian",
         "ctsm_v",
         "ctsm_v_binary",
+        "latent_belief_ctsm_v_binary",
+        "latent_belief_ctsm_v_binary_inner_post",
         "lda_ctsm_v",
         "pls_ctsm_v",
         "pca_ctsm_v",
@@ -1324,6 +1341,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ctsm-factor", type=float, default=1.0)
     p.add_argument("--ctsm-t-eps", type=float, default=0.01)
     p.add_argument("--ctsm-int-n-time", type=int, default=300)
+    p.add_argument("--latent-h-dim", type=int, default=4)
+    p.add_argument("--latent-n-mc-train", type=int, default=32)
+    p.add_argument("--latent-n-mc-val", type=int, default=8)
+    p.add_argument("--latent-n-mc-eval", type=int, default=16)
+    p.add_argument("--latent-n-posterior-pairs", type=int, default=1)
+    p.add_argument("--latent-precision-eps", type=float, default=1e-4)
     p.add_argument("--ctsm-m-scale", type=float, default=1.0)
     p.add_argument("--ctsm-delta-scale", type=float, default=0.5)
     p.add_argument("--ctsm-arch", type=str, default="film", choices=["mlp", "film"])
@@ -1665,6 +1688,112 @@ def _train_ctsm_v_binary_delta(
         "ctsm_binary_llr_1_minus_0": np.asarray(llr_1_minus_0, dtype=np.float64),
         "train_out": train_out,
         "ctsm_theta_encoding": np.asarray(["none_binary"], dtype=object),
+    }
+
+
+def _train_latent_belief_ctsm_v_binary_delta(
+    args: argparse.Namespace,
+    *,
+    dev: torch.device,
+    x_train: np.ndarray,
+    bins_train: np.ndarray,
+    x_val: np.ndarray,
+    bins_val: np.ndarray,
+    x_all: np.ndarray,
+    bins_all: np.ndarray,
+    k_cat: int,
+    method_name: str = "latent_belief_ctsm_v_binary",
+) -> dict[str, Any]:
+    if int(k_cat) != 2:
+        raise ValueError(f"{method_name} currently supports exactly two categories.")
+    bins_train = np.asarray(bins_train, dtype=np.int64).reshape(-1)
+    bins_val = np.asarray(bins_val, dtype=np.int64).reshape(-1)
+    bins_all = np.asarray(bins_all, dtype=np.int64).reshape(-1)
+    x_train = np.asarray(x_train, dtype=np.float64)
+    x_val = np.asarray(x_val, dtype=np.float64)
+    x_all = np.asarray(x_all, dtype=np.float64)
+    if x_train.ndim != 2 or x_val.ndim != 2 or x_all.ndim != 2:
+        raise ValueError(f"{method_name} expects x_train, x_val, and x_all to be 2D.")
+    if x_train.shape[0] != bins_train.size or x_val.shape[0] != bins_val.size or x_all.shape[0] != bins_all.size:
+        raise ValueError(f"{method_name} bin arrays must match x rows.")
+    if x_train.shape[1] != x_val.shape[1] or x_train.shape[1] != x_all.shape[1]:
+        raise ValueError(f"{method_name} x dimension mismatch across train/validation/eval.")
+
+    train0 = np.flatnonzero(bins_train == 0)
+    train1 = np.flatnonzero(bins_train == 1)
+    val0 = np.flatnonzero(bins_val == 0)
+    val1 = np.flatnonzero(bins_val == 1)
+    min_count = int(getattr(args, "clf_min_class_count", 5))
+    if train0.size < min_count or train1.size < min_count:
+        raise ValueError(
+            f"{method_name} requires at least "
+            f"{min_count} training samples in each class; got {train0.size} and {train1.size}."
+        )
+    x0_val = x_val[val0] if val0.size >= 1 and val1.size >= 1 else None
+    x1_val = x_val[val1] if val0.size >= 1 and val1.size >= 1 else None
+    print(
+        f"[cat-twofig] training {method_name}: class0={train0.size} class1={train1.size} "
+        f"val0={val0.size} val1={val1.size} eval={x_all.shape[0]} x_dim={x_all.shape[1]} "
+        f"h_dim={int(getattr(args, 'latent_h_dim', 4))}",
+        flush=True,
+    )
+    model = ToyLatentBeliefBinaryTimeScoreNet(
+        dim=int(x_all.shape[1]),
+        h_dim=int(getattr(args, "latent_h_dim", 4)),
+        hidden_dim=int(getattr(args, "ctsm_hidden_dim", 256)),
+        precision_eps=float(getattr(args, "latent_precision_eps", 1e-4)),
+    ).to(dev)
+    train_fn = (
+        train_latent_belief_binary_ctsm_v_inner_post_model
+        if method_name == "latent_belief_ctsm_v_binary_inner_post"
+        else train_latent_belief_binary_ctsm_v_model
+    )
+    train_kwargs: dict[str, Any] = {}
+    if method_name == "latent_belief_ctsm_v_binary_inner_post":
+        train_kwargs["latent_n_mc_train"] = int(getattr(args, "latent_n_mc_train", 32))
+    else:
+        train_kwargs["n_posterior_pairs"] = int(getattr(args, "latent_n_posterior_pairs", 1))
+    train_out = train_fn(
+        model=model,
+        x0_train=x_train[train0],
+        x1_train=x_train[train1],
+        epochs=int(getattr(args, "ctsm_binary_epochs", 50000)),
+        batch_size=int(getattr(args, "ctsm_batch_size", 512)),
+        lr=float(getattr(args, "ctsm_lr", 2e-3)),
+        weight_decay=float(getattr(args, "ctsm_weight_decay", 0.0)),
+        device=dev,
+        log_every=max(1, int(getattr(args, "log_every", 50))),
+        two_sb_var=float(getattr(args, "ctsm_two_sb_var", 2.0)),
+        path_schedule=str(getattr(args, "ctsm_path_schedule", "linear")),
+        path_eps=float(getattr(args, "ctsm_path_eps", 1e-12)),
+        factor=float(getattr(args, "ctsm_factor", 1.0)),
+        t_eps=float(getattr(args, "ctsm_t_eps", 1e-5)),
+        x0_val=x0_val,
+        x1_val=x1_val,
+        early_stopping_patience=int(getattr(args, "flow_early_patience", 1000)),
+        early_stopping_min_delta=float(getattr(args, "flow_early_min_delta", 1e-4)),
+        early_stopping_ema_alpha=float(getattr(args, "flow_early_ema_alpha", 0.05)),
+        restore_best=bool(getattr(args, "flow_restore_best", True)),
+        n_mc_val=int(getattr(args, "latent_n_mc_val", 8)),
+        **train_kwargs,
+    )
+    llr_1_minus_0 = estimate_latent_belief_ctsm_v_binary_log_ratio(
+        model,
+        x_all,
+        device=dev,
+        batch_size=int(getattr(args, "h_batch_size", 65536)),
+        eps1=float(getattr(args, "ctsm_t_eps", 1e-5)),
+        eps2=float(getattr(args, "ctsm_t_eps", 1e-5)),
+        n_time=int(getattr(args, "ctsm_int_n_time", 300)),
+        n_mc_eval=int(getattr(args, "latent_n_mc_eval", 16)),
+    )
+    return {
+        "c_matrix": None,
+        "delta_l": _binary_llr_1_minus_0_to_delta_l(llr_1_minus_0, bins_all),
+        "ctsm_binary_llr_1_minus_0": np.asarray(llr_1_minus_0, dtype=np.float64),
+        "latent_belief_ctsm_binary_llr_1_minus_0": np.asarray(llr_1_minus_0, dtype=np.float64),
+        "train_out": train_out,
+        "ctsm_theta_encoding": np.asarray([f"none_binary_{method_name}"], dtype=object),
     }
 
 
@@ -2447,6 +2576,19 @@ def _train_one_method(
             x_all=x_all,
             bins_all=bins_all,
             k_cat=k_cat,
+        )
+    if method_name in {"latent_belief_ctsm_v_binary", "latent_belief_ctsm_v_binary_inner_post"}:
+        return _train_latent_belief_ctsm_v_binary_delta(
+            args,
+            dev=dev,
+            x_train=x_train,
+            bins_train=bins_train,
+            x_val=x_val,
+            bins_val=bins_val,
+            x_all=x_all,
+            bins_all=bins_all,
+            k_cat=k_cat,
+            method_name=method_name,
         )
     if method_name == "lda_ctsm_v":
         return _train_lda_ctsm_v_delta(
