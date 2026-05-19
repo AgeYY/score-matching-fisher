@@ -334,6 +334,53 @@ def _validation_only_work_sweep_subset(subset_w: SweepSubset) -> SweepSubset:
     return SweepSubset(bundle=new_b, bin_all=binv, bin_train=binv, bin_validation=binv)
 
 
+def _binned_gaussian_delta_l(
+    subset: SweepSubset,
+    n_bins: int,
+    *,
+    variance_floor: float = 1e-6,
+) -> np.ndarray:
+    """Binned-Gaussian row/column LLR matrix for the same model used by the Hellinger baseline."""
+    x_all = np.asarray(subset.bundle.x_all, dtype=np.float64)
+    bin_all = np.asarray(subset.bin_all, dtype=np.int64).reshape(-1)
+    nb = int(n_bins)
+    vf = float(variance_floor)
+    if x_all.ndim != 2:
+        raise ValueError("x_all must be 2D.")
+    if x_all.shape[0] != bin_all.shape[0]:
+        raise ValueError("x_all and bin_all must have the same number of rows.")
+    if nb < 1:
+        raise ValueError("n_bins must be >= 1.")
+    if np.any((bin_all < 0) | (bin_all >= nb)):
+        raise ValueError("bin labels must be in [0, n_bins).")
+    if not np.isfinite(vf) or vf <= 0.0:
+        raise ValueError("variance_floor must be a finite positive number.")
+
+    n, x_dim = int(x_all.shape[0]), int(x_all.shape[1])
+    means = np.zeros((nb, x_dim), dtype=np.float64)
+    counts = np.bincount(bin_all, minlength=nb).astype(np.int64)
+    for b in range(nb):
+        idx = np.flatnonzero(bin_all == b)
+        if idx.size > 0:
+            means[b] = np.mean(x_all[idx], axis=0)
+
+    nonempty_idx = np.flatnonzero(counts > 0)
+    if nonempty_idx.size == 0:
+        return np.full((n, n), np.nan, dtype=np.float64)
+    for b in np.flatnonzero(counts == 0):
+        nearest = int(nonempty_idx[np.argmin(np.abs(nonempty_idx - int(b)))])
+        means[int(b)] = means[nearest]
+
+    train_means = means[bin_all]
+    global_var = np.maximum(np.mean((x_all - train_means) ** 2, axis=0), vf)
+    inv_var = 1.0 / global_var
+    log_norm = float(x_dim) * np.log(2.0 * np.pi) + float(np.sum(np.log(global_var)))
+    diff = x_all[:, None, :] - means[None, :, :]
+    logp_by_bin = -0.5 * (np.sum(diff * diff * inv_var.reshape(1, 1, -1), axis=2) + log_norm)
+    c_matrix = logp_by_bin[:, bin_all]
+    return HMatrixEstimator.compute_delta_l(c_matrix)
+
+
 def compute_true_conditional_loglik_matrix(x_all: np.ndarray, theta_all: np.ndarray, meta: dict) -> np.ndarray:
     gen_ds = build_dataset_from_meta(dict(meta))
     n = int(np.asarray(x_all).shape[0])
@@ -542,6 +589,40 @@ def _binary_delta_l_to_raw_llr_1_minus_0(delta_l: np.ndarray, bins: np.ndarray) 
     return out
 
 
+def _pairwise_delta_l_to_raw_llr(delta_l: np.ndarray, bins: np.ndarray, *, k_cat: int) -> tuple[np.ndarray, np.ndarray]:
+    """Reconstruct one-vs-one raw LLRs ``log p_b(x) - log p_a(x)`` for all category pairs."""
+    delta = np.asarray(delta_l, dtype=np.float64)
+    labels = np.asarray(bins, dtype=np.int64).reshape(-1)
+    if delta.ndim != 2 or delta.shape[0] != delta.shape[1]:
+        raise ValueError(f"Pairwise raw LLR reconstruction expects a square matrix; got shape {delta.shape}.")
+    n = int(delta.shape[0])
+    if int(labels.shape[0]) != n:
+        raise ValueError(f"Pairwise raw LLR reconstruction label length {labels.shape[0]} does not match n={n}.")
+    if np.any((labels < 0) | (labels >= int(k_cat))):
+        raise ValueError("Pairwise raw LLR reconstruction found labels outside [0, k_cat).")
+
+    pair_labels: list[tuple[int, int]] = []
+    raw_rows: list[np.ndarray] = []
+    for a in range(int(k_cat)):
+        for b in range(a + 1, int(k_cat)):
+            out = np.full((n,), np.nan, dtype=np.float64)
+            cols_a = labels == a
+            cols_b = labels == b
+            for i, yi in enumerate(labels):
+                if int(yi) == a:
+                    vals = delta[i, cols_b]
+                elif int(yi) == b:
+                    vals = -delta[i, cols_a]
+                else:
+                    continue
+                vals = vals[np.isfinite(vals)]
+                if vals.size > 0:
+                    out[i] = float(np.mean(vals))
+            pair_labels.append((a, b))
+            raw_rows.append(out)
+    return np.asarray(pair_labels, dtype=np.int64), np.stack(raw_rows, axis=0).astype(np.float64, copy=False)
+
+
 def _raw_llr_metrics(est: np.ndarray, true: np.ndarray) -> dict[str, float]:
     est_arr = np.asarray(est, dtype=np.float64).reshape(-1)
     true_arr = np.asarray(true, dtype=np.float64).reshape(-1)
@@ -562,6 +643,222 @@ def _raw_llr_metrics(est: np.ndarray, true: np.ndarray) -> dict[str, float]:
         "llr_raw_bias": float(np.mean(diff)),
         "llr_raw_pearson_r": _pearson_r(est_arr[mask], true_arr[mask]),
     }
+
+
+def _pairwise_raw_llr_metrics(est_pairwise: np.ndarray, true_pairwise: np.ndarray) -> dict[str, float]:
+    est = np.asarray(est_pairwise, dtype=np.float64)
+    true = np.asarray(true_pairwise, dtype=np.float64)
+    if est.shape != true.shape:
+        raise ValueError(f"Pairwise raw LLR metric shapes must match; got {est.shape} and {true.shape}.")
+    if est.ndim != 2:
+        raise ValueError(f"Pairwise raw LLR metrics expect 2D arrays; got shape {est.shape}.")
+
+    metrics = _raw_llr_metrics(est, true)
+    pair_rmse: list[float] = []
+    pair_r: list[float] = []
+    pair_band_rmse: list[float] = []
+    pair_band_r: list[float] = []
+    for pidx in range(est.shape[0]):
+        e = est[pidx]
+        t = true[pidx]
+        mask = np.isfinite(e) & np.isfinite(t)
+        if np.any(mask):
+            diff = e[mask] - t[mask]
+            pair_rmse.append(float(np.sqrt(np.mean(diff**2))))
+            pair_r.append(_pearson_r(e[mask], t[mask]))
+        else:
+            pair_rmse.append(float("nan"))
+            pair_r.append(float("nan"))
+
+        band_mask = mask & (t >= LLR_GT_METRIC_BAND_LO) & (t <= LLR_GT_METRIC_BAND_HI)
+        if np.any(band_mask):
+            band_diff = e[band_mask] - t[band_mask]
+            pair_band_rmse.append(float(np.sqrt(np.mean(band_diff**2))))
+            pair_band_r.append(_pearson_r(e[band_mask], t[band_mask]))
+        else:
+            pair_band_rmse.append(float("nan"))
+            pair_band_r.append(float("nan"))
+
+    return {
+        "llr_pairwise_raw_rmse": metrics["llr_raw_rmse"],
+        "llr_pairwise_raw_mae": metrics["llr_raw_mae"],
+        "llr_pairwise_raw_bias": metrics["llr_raw_bias"],
+        "llr_pairwise_raw_pearson_r": metrics["llr_raw_pearson_r"],
+        "llr_pairwise_raw_rmse_mean_pair": (
+            float(np.nanmean(pair_rmse)) if np.any(np.isfinite(pair_rmse)) else float("nan")
+        ),
+        "llr_pairwise_raw_pearson_r_mean_pair": (
+            float(np.nanmean(pair_r)) if np.any(np.isfinite(pair_r)) else float("nan")
+        ),
+        "llr_pairwise_raw_rmse_mean_pair_true_in_m8_p8": (
+            float(np.nanmean(pair_band_rmse)) if np.any(np.isfinite(pair_band_rmse)) else float("nan")
+        ),
+        "llr_pairwise_raw_pearson_r_mean_pair_true_in_m8_p8": (
+            float(np.nanmean(pair_band_r)) if np.any(np.isfinite(pair_band_r)) else float("nan")
+        ),
+    }
+
+
+def _plot_pairwise_llr_metric_bars(
+    ax: plt.Axes,
+    metrics_by_method: dict[str, dict[str, float]],
+    metric_name: str,
+    title: str,
+    ylabel: str,
+    *,
+    ylim: tuple[float, float] | None = None,
+) -> None:
+    method_names = list(metrics_by_method)
+    vals = np.asarray(
+        [float(metrics_by_method[name].get(metric_name, np.nan)) for name in method_names],
+        dtype=np.float64,
+    )
+    x = np.arange(len(method_names))
+    finite = np.isfinite(vals)
+    colors = [plt.get_cmap("tab10")(idx % 10) for idx in range(len(method_names))]
+    ax.bar(x[finite], vals[finite], color=[colors[idx] for idx in np.flatnonzero(finite)], width=0.72)
+    ax.set_title(title)
+    ax.set_ylabel(ylabel)
+    ax.set_xticks(x)
+    ax.set_xticklabels(method_names, rotation=35, ha="right")
+    if ylim is not None:
+        ax.set_ylim(*ylim)
+    ax.grid(True, axis="y", alpha=0.25)
+    if not np.any(finite):
+        ax.text(0.5, 0.5, "No finite values", ha="center", va="center", transform=ax.transAxes)
+
+
+def _pairwise_llr_metric_ylim(
+    metrics_by_method: dict[str, dict[str, float]],
+    metric_names: tuple[str, ...],
+    *,
+    default_hi: float,
+) -> tuple[float, float]:
+    vals = [
+        float(metrics.get(metric_name, np.nan))
+        for metrics in metrics_by_method.values()
+        for metric_name in metric_names
+    ]
+    arr = np.asarray(vals, dtype=np.float64)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return (0.0, float(default_hi))
+    hi = float(np.max(finite))
+    if hi <= 0.0:
+        return (0.0, float(default_hi))
+    return (0.0, hi * 1.08)
+
+
+def _save_pairwise_raw_llr_est_vs_true_figure(
+    method_pairwise_llrs: dict[str, np.ndarray],
+    true_pairwise_llr: np.ndarray,
+    pair_labels: np.ndarray,
+    bins_eval: np.ndarray,
+    *,
+    out_base: Path,
+    metrics_by_method: dict[str, dict[str, float]],
+) -> None:
+    """Save real one-vs-one category LLR scatters for all category pairs."""
+    true_arr = np.asarray(true_pairwise_llr, dtype=np.float64)
+    pairs = np.asarray(pair_labels, dtype=np.int64)
+    labels = np.asarray(bins_eval, dtype=np.int64).reshape(-1)
+    if true_arr.ndim != 2:
+        raise ValueError(f"Pairwise true LLR must be 2D; got shape {true_arr.shape}.")
+    if pairs.shape != (true_arr.shape[0], 2):
+        raise ValueError(f"pair_labels shape {pairs.shape} does not match true LLR pair count {true_arr.shape[0]}.")
+    if labels.shape[0] != true_arr.shape[1]:
+        raise ValueError(f"bins_eval length {labels.shape[0]} does not match true LLR rows {true_arr.shape[1]}.")
+
+    n_pairs = int(true_arr.shape[0])
+    n_cols = min(3, max(1, n_pairs))
+    n_rows = int(np.ceil(n_pairs / n_cols))
+    grid_cols = 12
+    fig = plt.figure(figsize=(5.3 * max(n_cols, 3), 4.7 * n_rows + 3.8))
+    gs = fig.add_gridspec(n_rows + 1, grid_cols, height_ratios=[1.0] * n_rows + [0.82])
+    cmap = plt.get_cmap("tab10")
+    for pidx in range(n_rows * n_cols):
+        row = pidx // n_cols
+        col = pidx % n_cols
+        col_width = grid_cols // n_cols
+        ax = fig.add_subplot(gs[row, col * col_width : (col + 1) * col_width])
+        if pidx >= n_pairs:
+            ax.axis("off")
+            continue
+        a, b = int(pairs[pidx, 0]), int(pairs[pidx, 1])
+        row_mask = (labels == a) | (labels == b)
+        x = true_arr[pidx, row_mask]
+        ys: list[np.ndarray] = []
+        for method_idx, (method_name, est_pairwise) in enumerate(method_pairwise_llrs.items()):
+            y_all = np.asarray(est_pairwise, dtype=np.float64)
+            if y_all.shape != true_arr.shape:
+                raise ValueError(
+                    f"Method {method_name!r} pairwise raw LLR shape {y_all.shape} does not match {true_arr.shape}."
+                )
+            y = y_all[pidx, row_mask]
+            finite = np.isfinite(x) & np.isfinite(y)
+            if not np.any(finite):
+                continue
+            ys.append(y[finite])
+            m = metrics_by_method.get(method_name, {})
+            label = (
+                f"{method_name} "
+                f"(RMSE={m.get('llr_pairwise_raw_rmse', float('nan')):.3g}, "
+                f"r={m.get('llr_pairwise_raw_pearson_r', float('nan')):.3g})"
+            )
+            ax.scatter(x[finite], y[finite], s=12, alpha=0.38, linewidths=0, color=cmap(method_idx % 10), label=label)
+        vals = [x[np.isfinite(x)]] + ys
+        vals = [v for v in vals if v.size > 0]
+        if vals:
+            all_vals = np.concatenate(vals)
+            lo = float(np.min(all_vals))
+            hi = float(np.max(all_vals))
+            pad = 0.05 * (hi - lo) if hi > lo else 1.0
+            ax.plot([lo - pad, hi + pad], [lo - pad, hi + pad], "k--", lw=1.0, alpha=0.7)
+            ax.set_xlim(lo - pad, hi + pad)
+            ax.set_ylim(lo - pad, hi + pad)
+        else:
+            ax.text(0.5, 0.5, "No finite LLR rows", ha="center", va="center", transform=ax.transAxes)
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_title(rf"classes {a} vs {b}: log $p_{b}(x)$ - log $p_{a}(x)$")
+        ax.set_xlabel("true raw LLR")
+        ax.set_ylabel("estimated raw LLR")
+        ax.grid(True, alpha=0.25)
+        if pidx == 0:
+            ax.legend(loc="best", fontsize=7, framealpha=0.9)
+
+    full_rmse_metric = "llr_pairwise_raw_rmse_mean_pair"
+    band_rmse_metric = "llr_pairwise_raw_rmse_mean_pair_true_in_m8_p8"
+    rmse_ylim = _pairwise_llr_metric_ylim(
+        metrics_by_method,
+        (full_rmse_metric, band_rmse_metric),
+        default_hi=1.0,
+    )
+    pearson_ylim = (0.0, 1.0)
+    bar_specs = [
+        (full_rmse_metric, "RMSE", "RMSE", rmse_ylim),
+        ("llr_pairwise_raw_pearson_r_mean_pair", "Pearson r", "r", pearson_ylim),
+        (
+            band_rmse_metric,
+            "RMSE\ntrue raw LLR in [-8, 8]",
+            "RMSE",
+            rmse_ylim,
+        ),
+        (
+            "llr_pairwise_raw_pearson_r_mean_pair_true_in_m8_p8",
+            "Pearson r\ntrue raw LLR in [-8, 8]",
+            "r",
+            pearson_ylim,
+        ),
+    ]
+    for idx, (metric_name, title, ylabel, ylim) in enumerate(bar_specs):
+        ax = fig.add_subplot(gs[n_rows, idx * 3 : (idx + 1) * 3])
+        _plot_pairwise_llr_metric_bars(ax, metrics_by_method, metric_name, title, ylabel, ylim=ylim)
+    out_base = Path(out_base)
+    out_base.parent.mkdir(parents=True, exist_ok=True)
+    fig.subplots_adjust(hspace=0.65, wspace=0.75)
+    fig.savefig(out_base.with_suffix(".svg"), bbox_inches="tight")
+    fig.savefig(out_base.with_suffix(".png"), dpi=160, bbox_inches="tight")
+    plt.close(fig)
 
 
 def _save_llr_est_vs_true_figure(
@@ -1210,6 +1507,18 @@ def _write_summary(
             f.write(f"{_ALL_COLUMNS_PNG_NAME}: {all_columns_png}\n")
         if training_losses_root:
             f.write(f"training_losses_root: {training_losses_root}\n")
+        llr_svg = os.path.abspath(os.path.join(args.output_dir, "llr_est_vs_true_all.svg"))
+        llr_png = os.path.abspath(os.path.join(args.output_dir, "llr_est_vs_true_all.png"))
+        h_svg = os.path.abspath(os.path.join(args.output_dir, "hellinger_est_vs_gt_all.svg"))
+        h_png = os.path.abspath(os.path.join(args.output_dir, "hellinger_est_vs_gt_all.png"))
+        if os.path.isfile(llr_svg):
+            f.write(f"llr_est_vs_true_all.svg: {llr_svg}\n")
+        if os.path.isfile(llr_png):
+            f.write(f"llr_est_vs_true_all.png: {llr_png}\n")
+        if os.path.isfile(h_svg):
+            f.write(f"hellinger_est_vs_gt_all.svg: {h_svg}\n")
+        if os.path.isfile(h_png):
+            f.write(f"hellinger_est_vs_gt_all.png: {h_png}\n")
         f.write(f"eval_split: {_selected_eval_split(args)}\n")
 
 
@@ -2828,12 +3137,15 @@ def main(argv: list[str] | None = None) -> None:
                 )
                 subset_bg = _validation_only_work_sweep_subset(subset_w) if val_h else subset_w
                 bg_h2 = conv._binned_gaussian_hellinger_sq(subset_bg, k_cat, variance_floor=vf)
-                h_sqrt_sweep[i, j] = np.asarray(conv._sqrt_h_like(np.asarray(bg_h2, dtype=np.float64)), dtype=np.float64)
+                delta = _binned_gaussian_delta_l(subset_bg, k_cat, variance_floor=vf)
+                h_sqrt_sweep[i, j] = np.asarray(
+                    conv._sqrt_h_like(np.asarray(bg_h2, dtype=np.float64)),
+                    dtype=np.float64,
+                )
                 np.fill_diagonal(h_sqrt_sweep[i, j], 0.0)
                 wall_s[i, j] = time.time() - t0
                 result = {"train_out": None}
-                nan_delta = np.full(np.asarray(true_delta_l, dtype=np.float64).shape, np.nan, dtype=np.float64)
-                m_llr = dbg._llr_comparison_metrics(nan_delta, true_delta_l)
+                m_llr = dbg._llr_comparison_metrics(delta, true_delta_l)
                 llr_pearson_offdiag[i, j] = float(m_llr["llr_pearson_r_offdiag"])
                 m_h = dbg._hellinger_comparison_metrics_cat(bg_h2, hellinger_gt_sq)
                 hellinger_pearson_offdiag_cat[i, j] = float(m_h["hellinger_pearson_r_offdiag_cat"])
@@ -2898,6 +3210,7 @@ def main(argv: list[str] | None = None) -> None:
                 scatter_true_delta = np.asarray(true_delta_l, dtype=np.float64).copy()
                 scatter_bins = np.asarray(bins_h, dtype=np.int64).reshape(-1).copy()
                 if method_name == "bin_gaussian":
+                    scatter_deltas[method_name] = np.asarray(delta, dtype=np.float64).copy()
                     scatter_cat_h2[method_name] = np.asarray(bg_h2, dtype=np.float64).copy()
                 elif "h_sqrt" in result:
                     scatter_cat_h2[method_name] = np.asarray(h_cat_sq, dtype=np.float64).copy()
@@ -2961,9 +3274,10 @@ def main(argv: list[str] | None = None) -> None:
         out_svg_path=os.path.join(out_dir, "h_decoding_categorical_twofig_training_losses_panel.svg"),
     )
 
-    scatter_raw_llrs: dict[str, np.ndarray] = {}
-    scatter_raw_metrics_by_method: dict[str, dict[str, float]] = {}
-    scatter_true_llr_1_minus_0: np.ndarray | None = None
+    scatter_pair_labels: np.ndarray | None = None
+    scatter_true_pairwise_llr: np.ndarray | None = None
+    scatter_pairwise_llrs: dict[str, np.ndarray] = {}
+    scatter_pairwise_metrics_by_method: dict[str, dict[str, float]] = {}
     if not bool(args.no_scatter_diagnostics) and scatter_true_delta is not None and scatter_cat_h2:
         metrics_by_method: dict[str, dict[str, float]] = {}
         hell_cat: dict[str, np.ndarray] = {}
@@ -2971,10 +3285,7 @@ def main(argv: list[str] | None = None) -> None:
             if name not in scatter_cat_h2:
                 continue
             hell_cat[name] = scatter_cat_h2[name]
-            if name == "bin_gaussian":
-                nan_d = np.full_like(scatter_true_delta, np.nan, dtype=np.float64)
-                metrics_by_method[name] = dbg._llr_comparison_metrics(nan_d, scatter_true_delta)
-            elif name not in scatter_deltas:
+            if name not in scatter_deltas:
                 nan_d = np.full_like(scatter_true_delta, np.nan, dtype=np.float64)
                 metrics_by_method[name] = dbg._llr_comparison_metrics(nan_d, scatter_true_delta)
             else:
@@ -2983,46 +3294,51 @@ def main(argv: list[str] | None = None) -> None:
             metrics_by_method[name].update(
                 dbg._hellinger_comparison_metrics_cat(scatter_cat_h2[name], hellinger_gt_sq)
             )
-        if k_cat == 2:
-            if scatter_bins is None:
-                raise RuntimeError("Binary raw LLR scatter requires saved scatter bin labels.")
-            scatter_true_llr_1_minus_0 = dbg._binary_delta_l_to_raw_llr_1_minus_0(scatter_true_delta, scatter_bins)
-            for name in methods:
-                if name not in scatter_deltas:
-                    continue
-                reconstructed_llr = dbg._binary_delta_l_to_raw_llr_1_minus_0(scatter_deltas[name], scatter_bins)
-                if name == "ctsm_v_binary" and name in scatter_direct_llrs:
-                    direct_llr = np.asarray(scatter_direct_llrs[name], dtype=np.float64).reshape(-1)
-                    if direct_llr.shape != reconstructed_llr.shape:
-                        raise ValueError(
-                            "ctsm_v_binary returned ctsm_binary_llr_1_minus_0 shape "
-                            f"{direct_llr.shape}, expected {reconstructed_llr.shape}."
-                        )
-                    if not np.allclose(direct_llr, reconstructed_llr, rtol=1e-5, atol=1e-7, equal_nan=True):
-                        max_abs = float(np.nanmax(np.abs(direct_llr - reconstructed_llr)))
-                        raise ValueError(
-                            "ctsm_v_binary ctsm_binary_llr_1_minus_0 does not match "
-                            f"the reconstructed vector from delta_l (max_abs={max_abs:.6g})."
-                        )
-                    raw_llr = direct_llr
-                else:
-                    raw_llr = reconstructed_llr
-                scatter_raw_llrs[name] = raw_llr
-                scatter_raw_metrics_by_method[name] = dbg._raw_llr_metrics(raw_llr, scatter_true_llr_1_minus_0)
-            dbg._save_raw_binary_llr_est_vs_true_figure(
-                scatter_raw_llrs,
-                scatter_true_llr_1_minus_0,
+        if scatter_bins is None:
+            raise RuntimeError("Pairwise raw LLR scatter requires saved scatter bin labels.")
+        scatter_pair_labels, scatter_true_pairwise_llr = dbg._pairwise_delta_l_to_raw_llr(
+            scatter_true_delta,
+            scatter_bins,
+            k_cat=k_cat,
+        )
+        for name in methods:
+            if name not in scatter_deltas:
+                continue
+            pair_labels_est, reconstructed_pairwise = dbg._pairwise_delta_l_to_raw_llr(
+                scatter_deltas[name],
                 scatter_bins,
-                out_base=Path(out_dir) / "llr_est_vs_true_all",
-                metrics_by_method=scatter_raw_metrics_by_method,
+                k_cat=k_cat,
             )
-        else:
-            dbg._save_llr_est_vs_true_figure(
-                scatter_deltas,
-                scatter_true_delta,
-                out_base=Path(out_dir) / "llr_est_vs_true_all",
-                metrics_by_method=metrics_by_method,
+            if not np.array_equal(pair_labels_est, scatter_pair_labels):
+                raise ValueError(f"Method {name!r} pair labels do not match true pair labels.")
+            if name == "ctsm_v_binary" and name in scatter_direct_llrs and k_cat == 2:
+                direct_llr = np.asarray(scatter_direct_llrs[name], dtype=np.float64).reshape(-1)
+                reconstructed_llr = reconstructed_pairwise[0]
+                if direct_llr.shape != reconstructed_llr.shape:
+                    raise ValueError(
+                        "ctsm_v_binary returned ctsm_binary_llr_1_minus_0 shape "
+                        f"{direct_llr.shape}, expected {reconstructed_llr.shape}."
+                    )
+                if not np.allclose(direct_llr, reconstructed_llr, rtol=1e-5, atol=1e-7, equal_nan=True):
+                    max_abs = float(np.nanmax(np.abs(direct_llr - reconstructed_llr)))
+                    raise ValueError(
+                        "ctsm_v_binary ctsm_binary_llr_1_minus_0 does not match "
+                        f"the reconstructed vector from delta_l (max_abs={max_abs:.6g})."
+                    )
+                reconstructed_pairwise = direct_llr.reshape(1, -1)
+            scatter_pairwise_llrs[name] = reconstructed_pairwise
+            scatter_pairwise_metrics_by_method[name] = dbg._pairwise_raw_llr_metrics(
+                reconstructed_pairwise,
+                scatter_true_pairwise_llr,
             )
+        dbg._save_pairwise_raw_llr_est_vs_true_figure(
+            scatter_pairwise_llrs,
+            scatter_true_pairwise_llr,
+            scatter_pair_labels,
+            scatter_bins,
+            out_base=Path(out_dir) / "llr_est_vs_true_all",
+            metrics_by_method=scatter_pairwise_metrics_by_method,
+        )
         dbg._save_hellinger_est_vs_gt_figure(
             hell_cat,
             hellinger_gt_sq,
@@ -3031,18 +3347,32 @@ def main(argv: list[str] | None = None) -> None:
         )
 
     scatter_npz_payload: dict[str, Any] = {}
-    if k_cat == 2 and scatter_true_llr_1_minus_0 is not None and scatter_raw_llrs:
-        raw_method_names, raw_metric_names, raw_metric_values = _metric_table(scatter_raw_metrics_by_method)
+    if scatter_true_pairwise_llr is not None and scatter_pair_labels is not None and scatter_pairwise_llrs:
+        raw_method_names, raw_metric_names, raw_metric_values = _metric_table(scatter_pairwise_metrics_by_method)
         scatter_npz_payload = {
-            "scatter_true_llr_1_minus_0": np.asarray(scatter_true_llr_1_minus_0, dtype=np.float64),
-            "scatter_llr_1_minus_0_est": np.stack(
-                [scatter_raw_llrs[str(name)] for name in raw_method_names],
+            "scatter_llr_pair_labels": np.asarray(scatter_pair_labels, dtype=np.int64),
+            "scatter_true_llr_pairwise": np.asarray(scatter_true_pairwise_llr, dtype=np.float64),
+            "scatter_llr_pairwise_est": np.stack(
+                [scatter_pairwise_llrs[str(name)] for name in raw_method_names],
                 axis=0,
             ).astype(np.float64, copy=False),
-            "scatter_llr_raw_metric_method_names": raw_method_names,
-            "scatter_llr_raw_metric_names": raw_metric_names,
-            "scatter_llr_raw_metric_values": raw_metric_values,
+            "scatter_llr_pairwise_metric_method_names": raw_method_names,
+            "scatter_llr_pairwise_metric_names": raw_metric_names,
+            "scatter_llr_pairwise_metric_values": raw_metric_values,
         }
+        if k_cat == 2:
+            scatter_npz_payload.update(
+                {
+                    "scatter_true_llr_1_minus_0": np.asarray(scatter_true_pairwise_llr[0], dtype=np.float64),
+                    "scatter_llr_1_minus_0_est": np.stack(
+                        [scatter_pairwise_llrs[str(name)][0] for name in raw_method_names],
+                        axis=0,
+                    ).astype(np.float64, copy=False),
+                    "scatter_llr_raw_metric_method_names": raw_method_names,
+                    "scatter_llr_raw_metric_names": raw_metric_names,
+                    "scatter_llr_raw_metric_values": raw_metric_values,
+                }
+            )
 
     source_indices = np.asarray(perm[: int(args.n_ref)], dtype=np.int64)
     out_npz = os.path.join(out_dir, "h_decoding_categorical_twofig_results.npz")
@@ -3115,6 +3445,15 @@ def main(argv: list[str] | None = None) -> None:
     print(f"  - {os.path.abspath(sweep_svg)}", flush=True)
     print(f"  - {os.path.abspath(corr_nmse_svg)}", flush=True)
     print(f"  - {os.path.abspath(loss_panel_svg)}", flush=True)
+    for diag_name in (
+        "llr_est_vs_true_all.svg",
+        "llr_est_vs_true_all.png",
+        "hellinger_est_vs_gt_all.svg",
+        "hellinger_est_vs_gt_all.png",
+    ):
+        diag_path = os.path.join(out_dir, diag_name)
+        if os.path.isfile(diag_path):
+            print(f"  - {os.path.abspath(diag_path)}", flush=True)
     if all_columns_png:
         print(f"  - {os.path.abspath(all_columns_png)}", flush=True)
     print(f"  - {os.path.abspath(summary_path)}", flush=True)

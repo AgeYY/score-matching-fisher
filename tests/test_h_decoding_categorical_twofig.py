@@ -23,12 +23,17 @@ from fisher.h_decoding_categorical_twofig import (
     _validate_cached_cli,
     _save_method_training_loss_npz,
     _validation_only_work_sweep_subset,
+    _binned_gaussian_delta_l,
     _fit_lda_weighted_projection,
     _fit_pca_weighted_projection,
     _fit_pls_weighted_projection,
     _binary_llr_1_minus_0_to_delta_l,
     _binary_delta_l_to_raw_llr_1_minus_0,
+    _pairwise_delta_l_to_raw_llr,
+    _pairwise_llr_metric_ylim,
+    _pairwise_raw_llr_metrics,
     _raw_llr_metrics,
+    _save_pairwise_raw_llr_est_vs_true_figure,
     _save_raw_binary_llr_est_vs_true_figure,
 )
 from fisher.h_matrix import HMatrixEstimator
@@ -792,6 +797,168 @@ def test_twofig_raw_binary_figure_writes_svg_png(tmp_path: Path) -> None:
     assert "class 1" in text
 
 
+def test_twofig_pairwise_raw_llr_reconstruction_k3() -> None:
+    bins = np.array([0, 1, 2, 0, 1, 2], dtype=np.int64)
+    delta = np.zeros((6, 6), dtype=np.float64)
+    expected = np.full((3, 6), np.nan, dtype=np.float64)
+    pair_values = {
+        (0, 1): np.array([10.0, 11.0, np.nan, 13.0, 14.0, np.nan], dtype=np.float64),
+        (0, 2): np.array([20.0, np.nan, 22.0, 23.0, np.nan, 25.0], dtype=np.float64),
+        (1, 2): np.array([np.nan, 31.0, 32.0, np.nan, 34.0, 35.0], dtype=np.float64),
+    }
+    for pidx, ((a, b), values) in enumerate(pair_values.items()):
+        expected[pidx] = values
+        cols_a = bins == a
+        cols_b = bins == b
+        for i, yi in enumerate(bins):
+            if int(yi) == a:
+                delta[i, cols_b] = values[i]
+            elif int(yi) == b:
+                delta[i, cols_a] = -values[i]
+
+    pair_labels, got = _pairwise_delta_l_to_raw_llr(delta, bins, k_cat=3)
+
+    assert pair_labels.tolist() == [[0, 1], [0, 2], [1, 2]]
+    assert np.allclose(got, expected, equal_nan=True)
+
+
+def test_twofig_pairwise_raw_llr_metrics_are_finite() -> None:
+    true = np.array([[1.0, 2.0, np.nan], [np.nan, -1.0, 4.0]], dtype=np.float64)
+    est = np.array([[1.1, 1.8, np.nan], [np.nan, -0.8, 3.7]], dtype=np.float64)
+
+    got = _pairwise_raw_llr_metrics(est, true)
+
+    assert np.isfinite(got["llr_pairwise_raw_rmse"])
+    assert np.isfinite(got["llr_pairwise_raw_pearson_r"])
+    assert got["llr_pairwise_raw_rmse"] > 0.0
+
+
+def test_twofig_pairwise_raw_llr_metrics_macro_average_and_band() -> None:
+    true = np.array(
+        [
+            [-10.0, -4.0, 0.0, 4.0, 10.0],
+            [-12.0, -2.0, 2.0, 6.0, 12.0],
+        ],
+        dtype=np.float64,
+    )
+    est_a = true + np.array(
+        [
+            [10.0, 1.0, -1.0, 1.0, -10.0],
+            [20.0, 2.0, -2.0, 2.0, -20.0],
+        ],
+        dtype=np.float64,
+    )
+    est_b = true + np.array(
+        [
+            [1.0, -2.0, 2.0, -2.0, 1.0],
+            [-3.0, 3.0, -3.0, 3.0, -3.0],
+        ],
+        dtype=np.float64,
+    )
+
+    got_a = _pairwise_raw_llr_metrics(est_a, true)
+    got_b = _pairwise_raw_llr_metrics(est_b, true)
+
+    expected_pair_rmse_a = np.array(
+        [
+            np.sqrt(np.mean(np.array([10.0, 1.0, -1.0, 1.0, -10.0]) ** 2)),
+            np.sqrt(np.mean(np.array([20.0, 2.0, -2.0, 2.0, -20.0]) ** 2)),
+        ],
+        dtype=np.float64,
+    )
+    expected_pair_r_a = np.array([np.corrcoef(est_a[pidx], true[pidx])[0, 1] for pidx in range(2)])
+    expected_band_rmse_a = np.array(
+        [
+            np.sqrt(np.mean(np.array([1.0, -1.0, 1.0]) ** 2)),
+            np.sqrt(np.mean(np.array([2.0, -2.0, 2.0]) ** 2)),
+        ],
+        dtype=np.float64,
+    )
+
+    assert got_a["llr_pairwise_raw_rmse_mean_pair"] == pytest.approx(float(np.mean(expected_pair_rmse_a)))
+    assert got_a["llr_pairwise_raw_pearson_r_mean_pair"] == pytest.approx(float(np.mean(expected_pair_r_a)))
+    assert np.isfinite(got_a["llr_pairwise_raw_pearson_r_mean_pair"])
+    assert got_a["llr_pairwise_raw_rmse_mean_pair_true_in_m8_p8"] == pytest.approx(
+        float(np.mean(expected_band_rmse_a))
+    )
+    assert got_a["llr_pairwise_raw_rmse_mean_pair_true_in_m8_p8"] < got_a["llr_pairwise_raw_rmse_mean_pair"]
+    assert np.isfinite(got_a["llr_pairwise_raw_pearson_r_mean_pair_true_in_m8_p8"])
+    assert got_b["llr_pairwise_raw_rmse_mean_pair"] == pytest.approx(
+        (np.sqrt(14.0 / 5.0) + 3.0) / 2.0
+    )
+    assert got_b["llr_pairwise_raw_rmse_mean_pair_true_in_m8_p8"] == pytest.approx(
+        (2.0 + 3.0) / 2.0
+    )
+
+
+def test_twofig_pairwise_raw_llr_metric_ylim_shared_rmse_scale() -> None:
+    metrics = {
+        "method_a": {
+            "llr_pairwise_raw_rmse_mean_pair": 2.0,
+            "llr_pairwise_raw_rmse_mean_pair_true_in_m8_p8": 5.0,
+        },
+        "method_b": {
+            "llr_pairwise_raw_rmse_mean_pair": 3.0,
+            "llr_pairwise_raw_rmse_mean_pair_true_in_m8_p8": np.nan,
+        },
+    }
+
+    got = _pairwise_llr_metric_ylim(
+        metrics,
+        (
+            "llr_pairwise_raw_rmse_mean_pair",
+            "llr_pairwise_raw_rmse_mean_pair_true_in_m8_p8",
+        ),
+        default_hi=1.0,
+    )
+
+    assert got == pytest.approx((0.0, 5.0 * 1.08))
+
+
+def test_twofig_pairwise_raw_llr_figure_writes_svg_png_k3(tmp_path: Path) -> None:
+    bins = np.array([0, 1, 2, 0, 1, 2], dtype=np.int64)
+    pair_labels = np.array([[0, 1], [0, 2], [1, 2]], dtype=np.int64)
+    true = np.array(
+        [
+            [10.0, 11.0, np.nan, 13.0, 14.0, np.nan],
+            [20.0, np.nan, 22.0, 23.0, np.nan, 25.0],
+            [np.nan, 31.0, 32.0, np.nan, 34.0, 35.0],
+        ],
+        dtype=np.float64,
+    )
+    est = true + np.array(
+        [
+            [0.1, -0.1, np.nan, 0.2, -0.2, np.nan],
+            [-0.2, np.nan, 0.1, -0.1, np.nan, 0.3],
+            [np.nan, 0.3, -0.2, np.nan, 0.1, -0.1],
+        ],
+        dtype=np.float64,
+    )
+    metrics = {"method_a": _pairwise_raw_llr_metrics(est, true)}
+
+    _save_pairwise_raw_llr_est_vs_true_figure(
+        {"method_a": est},
+        true,
+        pair_labels,
+        bins,
+        out_base=tmp_path / "llr_est_vs_true_all",
+        metrics_by_method=metrics,
+    )
+
+    svg = tmp_path / "llr_est_vs_true_all.svg"
+    png = tmp_path / "llr_est_vs_true_all.png"
+    assert svg.is_file()
+    assert png.is_file()
+    text = svg.read_text(encoding="utf-8")
+    assert "classes 0 vs 1" in text
+    assert "classes 0 vs 2" in text
+    assert "classes 1 vs 2" in text
+    assert "method_a" in text
+    assert "RMSE" in text
+    assert "Pearson r" in text
+    assert "true raw LLR in [-8, 8]" in text
+
+
 def test_h_matrix_ctsm_accepts_one_hot_theta() -> None:
     from fisher.ctsm_models import ToyPairConditionedTimeScoreNet
 
@@ -1367,6 +1534,24 @@ def test_validation_only_work_sweep_subset_aligns_with_bundle_validation() -> No
     assert np.array_equal(vs.bin_all, subset_w.bin_validation)
 
 
+def test_binned_gaussian_delta_l_matches_shared_diag_log_ratio() -> None:
+    x = np.array([[-1.0], [1.0], [4.0], [6.0]], dtype=np.float64)
+    bins = np.array([0, 0, 1, 1], dtype=np.int64)
+    subset = SimpleNamespace(bundle=SimpleNamespace(x_all=x), bin_all=bins)
+
+    got = _binned_gaussian_delta_l(subset, 2, variance_floor=1e-6)
+
+    means = np.array([[0.0], [5.0]], dtype=np.float64)
+    var = np.array([1.0], dtype=np.float64)
+    log_norm = np.log(2.0 * np.pi * var[0])
+    logp_by_bin = -0.5 * (((x - means.reshape(1, 2)) ** 2) / var[0] + log_norm)
+    c_matrix = logp_by_bin[:, bins]
+    expected = HMatrixEstimator.compute_delta_l(c_matrix)
+    assert got.shape == (4, 4)
+    assert np.allclose(got, expected)
+    assert np.allclose(np.diag(got), 0.0)
+
+
 def test_eval_split_validation_controls_classifier_and_decoding_rows(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1391,7 +1576,11 @@ def test_eval_split_validation_controls_classifier_and_decoding_rows(
 
     monkeypatch.setattr(cat, "_ensure_dataset", lambda args: None)
     monkeypatch.setattr(cat, "load_shared_dataset_npz", lambda path: bundle)
-    monkeypatch.setattr(cat, "hellinger_gt_sq_category_matrix", lambda gen_ds: np.array([[0.0, 0.25], [0.25, 0.0]]))
+    monkeypatch.setattr(
+        cat,
+        "hellinger_gt_sq_category_matrix",
+        lambda gen_ds: np.array([[0.0, 0.25], [0.25, 0.0]]),
+    )
     monkeypatch.setattr(cat, "build_dataset_from_meta", lambda meta: object())
     monkeypatch.setattr(cat, "compute_true_conditional_loglik_matrix", lambda x_all, theta_all, meta: np.zeros((len(x_all), len(x_all))))
     def fake_pairwise(**kwargs):
@@ -1548,6 +1737,89 @@ def test_eval_split_all_controls_classifier_and_decoding_rows(
     assert seen["decode"][-1][0] == 3
     assert seen["decode"][-1][1] == 6
     assert seen["method"][0][0] == 6
+
+
+def test_bin_gaussian_writes_finite_llr_scatter_metrics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import fisher.h_decoding_categorical_twofig as cat
+
+    labels = np.array([0, 0, 0, 1, 1, 1], dtype=np.int64)
+    theta = np.eye(2, dtype=np.float64)[labels]
+    x = np.array(
+        [[-1.0, 0.0], [0.0, 0.0], [1.0, 0.0], [4.0, 0.0], [5.0, 0.0], [6.0, 0.0]],
+        dtype=np.float64,
+    )
+    meta = {
+        "dataset_family": "random_mog_categorical",
+        "theta_type": "categorical",
+        "num_categories": 2,
+        "train_frac": 0.5,
+    }
+    bundle = SharedDatasetBundle(
+        meta=meta,
+        theta_all=theta,
+        x_all=x,
+        train_idx=np.arange(4, dtype=np.int64),
+        validation_idx=np.arange(4, 6, dtype=np.int64),
+        theta_train=theta[:4],
+        x_train=x[:4],
+        theta_validation=theta[4:],
+        x_validation=x[4:],
+    )
+
+    def true_loglik(x_all: np.ndarray, theta_all: np.ndarray, meta: dict) -> np.ndarray:
+        x_eval = np.asarray(x_all, dtype=np.float64)[:, 0]
+        bins = np.argmax(np.asarray(theta_all, dtype=np.float64), axis=1)
+        return x_eval.reshape(-1, 1) * (2.0 * bins.reshape(1, -1) - 1.0)
+
+    monkeypatch.setattr(cat, "_ensure_dataset", lambda args: None)
+    monkeypatch.setattr(cat, "load_shared_dataset_npz", lambda path: bundle)
+    monkeypatch.setattr(cat, "hellinger_gt_sq_category_matrix", lambda gen_ds: np.array([[0.0, 0.25], [0.25, 0.0]]))
+    monkeypatch.setattr(cat, "build_dataset_from_meta", lambda meta: object())
+    monkeypatch.setattr(cat, "compute_true_conditional_loglik_matrix", true_loglik)
+    monkeypatch.setattr(
+        cat.conv,
+        "_pairwise_clf_from_bundle",
+        lambda **kwargs: np.array([[np.nan, 0.5], [0.5, np.nan]]),
+    )
+    monkeypatch.setattr(cat, "_render_method_sweep_panel", lambda **kwargs: _write_tiny_svg(tmp_path / "sweep.svg"))
+    monkeypatch.setattr(cat, "_render_corr_nmse_two_panel", lambda **kwargs: _write_tiny_svg(tmp_path / "corr.svg"))
+    monkeypatch.setattr(cat, "_render_row_n_training_losses_panel", lambda **kwargs: _write_tiny_svg(tmp_path / "loss.svg"))
+
+    cat.main(
+        [
+            "--dataset-npz",
+            str(tmp_path / "fake.npz"),
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--num-categories",
+            "2",
+            "--n-ref",
+            "6",
+            "--n-list",
+            "6",
+            "--methods",
+            "bin_gaussian",
+            "--device",
+            "cpu",
+        ]
+    )
+
+    with np.load(tmp_path / "out" / "h_decoding_categorical_twofig_results.npz", allow_pickle=True) as z:
+        methods = [str(x) for x in z["method_names"]]
+        assert methods == ["bin_gaussian"]
+        assert np.isfinite(np.asarray(z["llr_pearson_offdiag"], dtype=np.float64)[0, 0])
+        raw_methods = [str(x) for x in z["scatter_llr_pairwise_metric_method_names"]]
+        assert raw_methods == ["bin_gaussian"]
+        raw_est = np.asarray(z["scatter_llr_pairwise_est"], dtype=np.float64)
+        assert raw_est.shape[:2] == (1, 1)
+        assert np.isfinite(raw_est).any()
+        raw_metric_names = [str(x) for x in z["scatter_llr_pairwise_metric_names"]]
+        raw_metric_values = np.asarray(z["scatter_llr_pairwise_metric_values"], dtype=np.float64)
+        r_idx = raw_metric_names.index("llr_pairwise_raw_pearson_r")
+        assert np.isfinite(raw_metric_values[0, r_idx])
 
 
 def test_pr_project_classifier_rows_use_work_features(
