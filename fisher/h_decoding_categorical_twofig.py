@@ -656,8 +656,10 @@ def _pairwise_raw_llr_metrics(est_pairwise: np.ndarray, true_pairwise: np.ndarra
     metrics = _raw_llr_metrics(est, true)
     pair_rmse: list[float] = []
     pair_r: list[float] = []
+    pair_bias: list[float] = []
     pair_band_rmse: list[float] = []
     pair_band_r: list[float] = []
+    pair_band_bias: list[float] = []
     for pidx in range(est.shape[0]):
         e = est[pidx]
         t = true[pidx]
@@ -666,18 +668,22 @@ def _pairwise_raw_llr_metrics(est_pairwise: np.ndarray, true_pairwise: np.ndarra
             diff = e[mask] - t[mask]
             pair_rmse.append(float(np.sqrt(np.mean(diff**2))))
             pair_r.append(_pearson_r(e[mask], t[mask]))
+            pair_bias.append(float(np.mean(diff)))
         else:
             pair_rmse.append(float("nan"))
             pair_r.append(float("nan"))
+            pair_bias.append(float("nan"))
 
         band_mask = mask & (t >= LLR_GT_METRIC_BAND_LO) & (t <= LLR_GT_METRIC_BAND_HI)
         if np.any(band_mask):
             band_diff = e[band_mask] - t[band_mask]
             pair_band_rmse.append(float(np.sqrt(np.mean(band_diff**2))))
             pair_band_r.append(_pearson_r(e[band_mask], t[band_mask]))
+            pair_band_bias.append(float(np.mean(band_diff)))
         else:
             pair_band_rmse.append(float("nan"))
             pair_band_r.append(float("nan"))
+            pair_band_bias.append(float("nan"))
 
     return {
         "llr_pairwise_raw_rmse": metrics["llr_raw_rmse"],
@@ -690,11 +696,17 @@ def _pairwise_raw_llr_metrics(est_pairwise: np.ndarray, true_pairwise: np.ndarra
         "llr_pairwise_raw_pearson_r_mean_pair": (
             float(np.nanmean(pair_r)) if np.any(np.isfinite(pair_r)) else float("nan")
         ),
+        "llr_pairwise_raw_bias_mean_pair": (
+            float(np.nanmean(pair_bias)) if np.any(np.isfinite(pair_bias)) else float("nan")
+        ),
         "llr_pairwise_raw_rmse_mean_pair_true_in_m8_p8": (
             float(np.nanmean(pair_band_rmse)) if np.any(np.isfinite(pair_band_rmse)) else float("nan")
         ),
         "llr_pairwise_raw_pearson_r_mean_pair_true_in_m8_p8": (
             float(np.nanmean(pair_band_r)) if np.any(np.isfinite(pair_band_r)) else float("nan")
+        ),
+        "llr_pairwise_raw_bias_mean_pair_true_in_m8_p8": (
+            float(np.nanmean(pair_band_bias)) if np.any(np.isfinite(pair_band_bias)) else float("nan")
         ),
     }
 
@@ -728,32 +740,56 @@ def _plot_pairwise_llr_metric_bars(
         ax.text(0.5, 0.5, "No finite values", ha="center", va="center", transform=ax.transAxes)
 
 
-def _pairwise_llr_metric_ylim(
-    metrics_by_method: dict[str, dict[str, float]],
-    metric_names: tuple[str, ...],
-    *,
-    default_hi: float,
-) -> tuple[float, float]:
-    vals = [
-        float(metrics.get(metric_name, np.nan))
-        for metrics in metrics_by_method.values()
-        for metric_name in metric_names
-    ]
-    arr = np.asarray(vals, dtype=np.float64)
-    finite = arr[np.isfinite(arr)]
-    if finite.size == 0:
-        return (0.0, float(default_hi))
-    hi = float(np.max(finite))
-    if hi <= 0.0:
-        return (0.0, float(default_hi))
-    return (0.0, hi * 1.08)
+def _iqr_zoom_ylim_from_pooled_methods(values: list[np.ndarray]) -> tuple[float, float] | None:
+    """Return y-limits after excluding pooled-method IQR outliers."""
+    finite_parts = [np.asarray(v, dtype=np.float64).ravel() for v in values]
+    finite_parts = [v[np.isfinite(v)] for v in finite_parts if v.size > 0]
+    if not finite_parts:
+        return None
+    pooled = np.concatenate(finite_parts)
+    if pooled.size < 4:
+        kept = pooled
+    else:
+        q1, q3 = np.percentile(pooled, [25.0, 75.0])
+        iqr = float(q3 - q1)
+        if not np.isfinite(iqr) or iqr <= 0.0:
+            kept = pooled
+        else:
+            lo_fence = float(q1 - 1.5 * iqr)
+            hi_fence = float(q3 + 1.5 * iqr)
+            kept = pooled[(pooled >= lo_fence) & (pooled <= hi_fence)]
+            if kept.size == 0:
+                kept = pooled
+    lo = float(np.min(kept))
+    hi = float(np.max(kept))
+    pad = 0.05 * (hi - lo) if hi > lo else 1.0
+    return (lo - pad, hi + pad)
+
+
+def _metric_table_to_dict(
+    method_names: np.ndarray,
+    metric_names: np.ndarray,
+    metric_values: np.ndarray,
+) -> dict[str, dict[str, float]]:
+    methods = [str(x) for x in np.asarray(method_names, dtype=object).tolist()]
+    metrics = [str(x) for x in np.asarray(metric_names, dtype=object).tolist()]
+    vals = np.asarray(metric_values, dtype=np.float64)
+    if vals.shape != (len(methods), len(metrics)):
+        raise ValueError(
+            f"Metric table shape {vals.shape} does not match "
+            f"{len(methods)} methods x {len(metrics)} metrics."
+        )
+    return {
+        method: {metric: float(vals[i, j]) for j, metric in enumerate(metrics)}
+        for i, method in enumerate(methods)
+    }
 
 
 def _save_pairwise_raw_llr_est_vs_true_figure(
     method_pairwise_llrs: dict[str, np.ndarray],
     true_pairwise_llr: np.ndarray,
     pair_labels: np.ndarray,
-    bins_eval: np.ndarray,
+    bins_eval: np.ndarray | None,
     *,
     out_base: Path,
     metrics_by_method: dict[str, dict[str, float]],
@@ -761,31 +797,39 @@ def _save_pairwise_raw_llr_est_vs_true_figure(
     """Save real one-vs-one category LLR scatters for all category pairs."""
     true_arr = np.asarray(true_pairwise_llr, dtype=np.float64)
     pairs = np.asarray(pair_labels, dtype=np.int64)
-    labels = np.asarray(bins_eval, dtype=np.int64).reshape(-1)
     if true_arr.ndim != 2:
         raise ValueError(f"Pairwise true LLR must be 2D; got shape {true_arr.shape}.")
     if pairs.shape != (true_arr.shape[0], 2):
         raise ValueError(f"pair_labels shape {pairs.shape} does not match true LLR pair count {true_arr.shape[0]}.")
-    if labels.shape[0] != true_arr.shape[1]:
-        raise ValueError(f"bins_eval length {labels.shape[0]} does not match true LLR rows {true_arr.shape[1]}.")
+    labels: np.ndarray | None = None
+    if bins_eval is not None:
+        labels = np.asarray(bins_eval, dtype=np.int64).reshape(-1)
+        if labels.shape[0] != true_arr.shape[1]:
+            raise ValueError(f"bins_eval length {labels.shape[0]} does not match true LLR rows {true_arr.shape[1]}.")
 
     n_pairs = int(true_arr.shape[0])
     n_cols = min(3, max(1, n_pairs))
     n_rows = int(np.ceil(n_pairs / n_cols))
-    grid_cols = 12
-    fig = plt.figure(figsize=(5.3 * max(n_cols, 3), 4.7 * n_rows + 3.8))
-    gs = fig.add_gridspec(n_rows + 1, grid_cols, height_ratios=[1.0] * n_rows + [0.82])
+    grid_cols = 15
+    scatter_rows = 2 * n_rows
+    fig = plt.figure(figsize=(5.3 * max(n_cols, 3), 4.7 * scatter_rows + 6.0))
+    gs = fig.add_gridspec(scatter_rows + 2, grid_cols, height_ratios=[1.0] * scatter_rows + [0.82, 0.82])
     cmap = plt.get_cmap("tab10")
     for pidx in range(n_rows * n_cols):
         row = pidx // n_cols
         col = pidx % n_cols
-        col_width = grid_cols // n_cols
+        col_width = 12 // n_cols
         ax = fig.add_subplot(gs[row, col * col_width : (col + 1) * col_width])
+        ax_zoom = fig.add_subplot(gs[row + n_rows, col * col_width : (col + 1) * col_width])
         if pidx >= n_pairs:
             ax.axis("off")
+            ax_zoom.axis("off")
             continue
         a, b = int(pairs[pidx, 0]), int(pairs[pidx, 1])
-        row_mask = (labels == a) | (labels == b)
+        if labels is None:
+            row_mask = np.isfinite(true_arr[pidx])
+        else:
+            row_mask = (labels == a) | (labels == b)
         x = true_arr[pidx, row_mask]
         ys: list[np.ndarray] = []
         for method_idx, (method_name, est_pairwise) in enumerate(method_pairwise_llrs.items()):
@@ -806,6 +850,7 @@ def _save_pairwise_raw_llr_est_vs_true_figure(
                 f"r={m.get('llr_pairwise_raw_pearson_r', float('nan')):.3g})"
             )
             ax.scatter(x[finite], y[finite], s=12, alpha=0.38, linewidths=0, color=cmap(method_idx % 10), label=label)
+            ax_zoom.scatter(x[finite], y[finite], s=12, alpha=0.38, linewidths=0, color=cmap(method_idx % 10), label=label)
         vals = [x[np.isfinite(x)]] + ys
         vals = [v for v in vals if v.size > 0]
         if vals:
@@ -818,41 +863,63 @@ def _save_pairwise_raw_llr_est_vs_true_figure(
             ax.set_ylim(lo - pad, hi + pad)
         else:
             ax.text(0.5, 0.5, "No finite LLR rows", ha="center", va="center", transform=ax.transAxes)
+            ax_zoom.text(0.5, 0.5, "No finite LLR rows", ha="center", va="center", transform=ax_zoom.transAxes)
+        x_finite = x[np.isfinite(x)]
+        if x_finite.size > 0:
+            x_lo = float(np.min(x_finite))
+            x_hi = float(np.max(x_finite))
+            x_pad = 0.05 * (x_hi - x_lo) if x_hi > x_lo else 1.0
+            x_lim = (x_lo - x_pad, x_hi + x_pad)
+            ax_zoom.set_xlim(*x_lim)
+            y_lim = _iqr_zoom_ylim_from_pooled_methods(ys)
+            if y_lim is None:
+                y_lim = x_lim
+            ax_zoom.set_ylim(*y_lim)
+            diag_lo = min(x_lim[0], y_lim[0])
+            diag_hi = max(x_lim[1], y_lim[1])
+            ax_zoom.plot([diag_lo, diag_hi], [diag_lo, diag_hi], "k--", lw=1.0, alpha=0.7)
         ax.set_aspect("equal", adjustable="box")
+        ax_zoom.set_aspect("equal", adjustable="box")
         ax.set_title(rf"classes {a} vs {b}: log $p_{b}(x)$ - log $p_{a}(x)$")
+        ax_zoom.set_title(rf"classes {a} vs {b}: y zoom (IQR pooled methods)")
         ax.set_xlabel("true raw LLR")
         ax.set_ylabel("estimated raw LLR")
+        ax_zoom.set_xlabel("true raw LLR")
+        ax_zoom.set_ylabel("estimated raw LLR")
         ax.grid(True, alpha=0.25)
+        ax_zoom.grid(True, alpha=0.25)
         if pidx == 0:
             ax.legend(loc="best", fontsize=7, framealpha=0.9)
 
     full_rmse_metric = "llr_pairwise_raw_rmse_mean_pair"
     band_rmse_metric = "llr_pairwise_raw_rmse_mean_pair_true_in_m8_p8"
-    rmse_ylim = _pairwise_llr_metric_ylim(
-        metrics_by_method,
-        (full_rmse_metric, band_rmse_metric),
-        default_hi=1.0,
-    )
-    pearson_ylim = (0.0, 1.0)
+    bias_metric = "llr_pairwise_raw_bias_mean_pair"
+    band_bias_metric = "llr_pairwise_raw_bias_mean_pair_true_in_m8_p8"
     bar_specs = [
-        (full_rmse_metric, "RMSE", "RMSE", rmse_ylim),
-        ("llr_pairwise_raw_pearson_r_mean_pair", "Pearson r", "r", pearson_ylim),
-        (
-            band_rmse_metric,
-            "RMSE\ntrue raw LLR in [-8, 8]",
-            "RMSE",
-            rmse_ylim,
-        ),
-        (
-            "llr_pairwise_raw_pearson_r_mean_pair_true_in_m8_p8",
-            "Pearson r\ntrue raw LLR in [-8, 8]",
-            "r",
-            pearson_ylim,
-        ),
+        [
+            (full_rmse_metric, "Full range RMSE", "RMSE"),
+            ("llr_pairwise_raw_pearson_r_mean_pair", "Full range Pearson r", "r"),
+            (bias_metric, "Full range mean error", "mean(est - true)"),
+        ],
+        [
+            (band_rmse_metric, "RMSE\ntrue raw LLR in [-8, 8]", "RMSE"),
+            (
+                "llr_pairwise_raw_pearson_r_mean_pair_true_in_m8_p8",
+                "Pearson r\ntrue raw LLR in [-8, 8]",
+                "r",
+            ),
+            (
+                band_bias_metric,
+                "Mean error\ntrue raw LLR in [-8, 8]",
+                "mean(est - true)",
+            ),
+        ],
     ]
-    for idx, (metric_name, title, ylabel, ylim) in enumerate(bar_specs):
-        ax = fig.add_subplot(gs[n_rows, idx * 3 : (idx + 1) * 3])
-        _plot_pairwise_llr_metric_bars(ax, metrics_by_method, metric_name, title, ylabel, ylim=ylim)
+    metric_col_width = grid_cols // 3
+    for metric_row, specs in enumerate(bar_specs):
+        for idx, (metric_name, title, ylabel) in enumerate(specs):
+            ax = fig.add_subplot(gs[scatter_rows + metric_row, idx * metric_col_width : (idx + 1) * metric_col_width])
+            _plot_pairwise_llr_metric_bars(ax, metrics_by_method, metric_name, title, ylabel)
     out_base = Path(out_base)
     out_base.parent.mkdir(parents=True, exist_ok=True)
     fig.subplots_adjust(hspace=0.65, wspace=0.75)
@@ -1456,6 +1523,53 @@ def _run_visualization_only(args: argparse.Namespace, methods: list[str], ns: li
         corr_nmse_svg=corr_nmse_svg,
         loss_panel_svg=loss_panel_svg,
     )
+    scatter_paths: list[str] = []
+    scatter_keys = (
+        "scatter_llr_pair_labels",
+        "scatter_true_llr_pairwise",
+        "scatter_llr_pairwise_est",
+        "scatter_llr_pairwise_metric_method_names",
+        "scatter_llr_pairwise_metric_names",
+        "scatter_llr_pairwise_metric_values",
+    )
+    if all(k in cached for k in scatter_keys) and not bool(args.no_scatter_diagnostics):
+        scatter_method_names = [str(x) for x in np.asarray(
+            cached["scatter_llr_pairwise_metric_method_names"],
+            dtype=object,
+        ).tolist()]
+        scatter_est = np.asarray(cached["scatter_llr_pairwise_est"], dtype=np.float64)
+        if scatter_est.ndim != 3 or scatter_est.shape[0] != len(scatter_method_names):
+            raise ValueError(
+                "Cached scatter_llr_pairwise_est must have shape "
+                "(n_methods, n_pairs, n_eval_rows)."
+            )
+        method_pairwise_llrs = {
+            name: scatter_est[idx]
+            for idx, name in enumerate(scatter_method_names)
+            if name in methods
+        }
+        scatter_true = np.asarray(cached["scatter_true_llr_pairwise"], dtype=np.float64)
+        metrics_by_method = {
+            name: _pairwise_raw_llr_metrics(est_pairwise, scatter_true)
+            for name, est_pairwise in method_pairwise_llrs.items()
+        }
+        if method_pairwise_llrs:
+            out_base = Path(args.output_dir) / "llr_est_vs_true_all"
+            _save_pairwise_raw_llr_est_vs_true_figure(
+                method_pairwise_llrs,
+                scatter_true,
+                np.asarray(cached["scatter_llr_pair_labels"], dtype=np.int64),
+                None,
+                out_base=out_base,
+                metrics_by_method=metrics_by_method,
+            )
+            scatter_paths = [str(out_base.with_suffix(".svg")), str(out_base.with_suffix(".png"))]
+    elif not bool(args.no_scatter_diagnostics):
+        print(
+            "[cat-twofig] WARNING: cached NPZ lacks scatter arrays; "
+            "skipping llr_est_vs_true_all regeneration.",
+            flush=True,
+        )
     out_npz = os.path.join(args.output_dir, "h_decoding_categorical_twofig_results.npz")
     summary_path = os.path.join(args.output_dir, "h_decoding_categorical_twofig_summary.txt")
     _write_summary(
@@ -1470,7 +1584,7 @@ def _run_visualization_only(args: argparse.Namespace, methods: list[str], ns: li
         training_losses_root=os.path.abspath(loss_root),
     )
     print("[cat-twofig] Saved (visualization-only):", flush=True)
-    for p in (sweep_svg, corr_nmse_svg, loss_panel_svg, all_columns_png, summary_path):
+    for p in (sweep_svg, corr_nmse_svg, loss_panel_svg, all_columns_png, *scatter_paths, summary_path):
         print(f"  - {os.path.abspath(p)}", flush=True)
 
 

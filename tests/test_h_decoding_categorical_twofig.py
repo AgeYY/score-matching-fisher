@@ -30,7 +30,7 @@ from fisher.h_decoding_categorical_twofig import (
     _binary_llr_1_minus_0_to_delta_l,
     _binary_delta_l_to_raw_llr_1_minus_0,
     _pairwise_delta_l_to_raw_llr,
-    _pairwise_llr_metric_ylim,
+    _iqr_zoom_ylim_from_pooled_methods,
     _pairwise_raw_llr_metrics,
     _raw_llr_metrics,
     _save_pairwise_raw_llr_est_vs_true_figure,
@@ -867,6 +867,7 @@ def test_twofig_pairwise_raw_llr_metrics_macro_average_and_band() -> None:
         dtype=np.float64,
     )
     expected_pair_r_a = np.array([np.corrcoef(est_a[pidx], true[pidx])[0, 1] for pidx in range(2)])
+    expected_pair_bias_a = np.array([0.2, 0.4], dtype=np.float64)
     expected_band_rmse_a = np.array(
         [
             np.sqrt(np.mean(np.array([1.0, -1.0, 1.0]) ** 2)),
@@ -874,9 +875,14 @@ def test_twofig_pairwise_raw_llr_metrics_macro_average_and_band() -> None:
         ],
         dtype=np.float64,
     )
+    expected_band_bias_a = np.array([1.0 / 3.0, 2.0 / 3.0], dtype=np.float64)
 
     assert got_a["llr_pairwise_raw_rmse_mean_pair"] == pytest.approx(float(np.mean(expected_pair_rmse_a)))
     assert got_a["llr_pairwise_raw_pearson_r_mean_pair"] == pytest.approx(float(np.mean(expected_pair_r_a)))
+    assert got_a["llr_pairwise_raw_bias_mean_pair"] == pytest.approx(float(np.mean(expected_pair_bias_a)))
+    assert got_a["llr_pairwise_raw_bias_mean_pair_true_in_m8_p8"] == pytest.approx(
+        float(np.mean(expected_band_bias_a))
+    )
     assert np.isfinite(got_a["llr_pairwise_raw_pearson_r_mean_pair"])
     assert got_a["llr_pairwise_raw_rmse_mean_pair_true_in_m8_p8"] == pytest.approx(
         float(np.mean(expected_band_rmse_a))
@@ -889,30 +895,21 @@ def test_twofig_pairwise_raw_llr_metrics_macro_average_and_band() -> None:
     assert got_b["llr_pairwise_raw_rmse_mean_pair_true_in_m8_p8"] == pytest.approx(
         (2.0 + 3.0) / 2.0
     )
+    assert got_b["llr_pairwise_raw_bias_mean_pair_true_in_m8_p8"] == pytest.approx(1.0 / 6.0)
 
 
-def test_twofig_pairwise_raw_llr_metric_ylim_shared_rmse_scale() -> None:
-    metrics = {
-        "method_a": {
-            "llr_pairwise_raw_rmse_mean_pair": 2.0,
-            "llr_pairwise_raw_rmse_mean_pair_true_in_m8_p8": 5.0,
-        },
-        "method_b": {
-            "llr_pairwise_raw_rmse_mean_pair": 3.0,
-            "llr_pairwise_raw_rmse_mean_pair_true_in_m8_p8": np.nan,
-        },
-    }
-
-    got = _pairwise_llr_metric_ylim(
-        metrics,
-        (
-            "llr_pairwise_raw_rmse_mean_pair",
-            "llr_pairwise_raw_rmse_mean_pair_true_in_m8_p8",
-        ),
-        default_hi=1.0,
+def test_twofig_iqr_zoom_ylim_uses_pooled_method_values() -> None:
+    got = _iqr_zoom_ylim_from_pooled_methods(
+        [
+            np.array([0.0, 0.1, 0.2, 0.3], dtype=np.float64),
+            np.array([0.15, 0.25, 0.35, 1000.0], dtype=np.float64),
+        ]
     )
 
-    assert got == pytest.approx((0.0, 5.0 * 1.08))
+    assert got is not None
+    lo, hi = got
+    assert lo < 0.0
+    assert 0.35 < hi < 1000.0
 
 
 def test_twofig_pairwise_raw_llr_figure_writes_svg_png_k3(tmp_path: Path) -> None:
@@ -954,9 +951,15 @@ def test_twofig_pairwise_raw_llr_figure_writes_svg_png_k3(tmp_path: Path) -> Non
     assert "classes 0 vs 2" in text
     assert "classes 1 vs 2" in text
     assert "method_a" in text
-    assert "RMSE" in text
-    assert "Pearson r" in text
+    assert "Full range RMSE" in text
+    assert "Full range Pearson r" in text
+    assert "Full range mean error" in text
+    assert "Mean error" in text
+    assert "mean(est - true)" in text
     assert "true raw LLR in [-8, 8]" in text
+    assert text.count("true raw LLR in [-8, 8]") >= 3
+    assert "y zoom (IQR pooled methods)" in text
+    assert "fill-opacity: 0.8" not in text
 
 
 def test_h_matrix_ctsm_accepts_one_hot_theta() -> None:
@@ -1436,6 +1439,92 @@ def test_visualization_only_cached_shapes(tmp_path: Path) -> None:
     assert all_columns.is_file()
     summary = (out_dir / "h_decoding_categorical_twofig_summary.txt").read_text(encoding="utf-8")
     assert f"h_decoding_categorical_twofig_all_columns.png: {all_columns.resolve()}" in summary
+
+
+def test_visualization_only_rerenders_cached_scatter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import fisher.h_decoding_categorical_twofig as cat
+
+    k = 2
+    ns = [20]
+    methods = ["bin_gaussian"]
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    fake_ds = tmp_path / "fake.npz"
+    fake_ds.write_bytes(b"not a real npz")
+    h_gt = np.array([[0.0, 0.4], [0.4, 0.0]], dtype=np.float64)
+    dec_ref = np.array([[np.nan, 0.7], [0.7, np.nan]], dtype=np.float64)
+    scatter_true = np.array([[-2.0, -1.0, 1.0, 2.0]], dtype=np.float64)
+    scatter_est = np.array([[[-1.8, -1.2, 1.1, 100.0]]], dtype=np.float64)
+    metric_names = np.array(["llr_pairwise_raw_rmse", "llr_pairwise_raw_pearson_r"], dtype=object)
+    metric_values = np.array([[1.0, 0.5]], dtype=np.float64)
+    np.savez_compressed(
+        out_dir / "h_decoding_categorical_twofig_results.npz",
+        n=np.asarray(ns, dtype=np.int64),
+        n_ref=np.int64(40),
+        num_categories=np.int64(k),
+        method_names=np.asarray(methods, dtype=object),
+        theta_bin_centers=np.arange(k, dtype=np.float64).reshape(-1, 1),
+        h_gt_sqrt=h_gt,
+        decode_ref=dec_ref,
+        decode_sweep=np.asarray([dec_ref], dtype=np.float64),
+        h_sqrt_sweep=np.asarray([[h_gt]], dtype=np.float64),
+        corr_h_vs_gt=np.asarray([[1.0]], dtype=np.float64),
+        nmse_h_vs_gt=np.asarray([[0.0]], dtype=np.float64),
+        corr_decode_vs_ref=np.asarray([1.0], dtype=np.float64),
+        nmse_decode_vs_ref=np.asarray([0.0], dtype=np.float64),
+        native_dataset_npz=np.asarray([str(fake_ds.resolve())], dtype=object),
+        eval_split=np.asarray(["all"], dtype=object),
+        scatter_llr_pair_labels=np.asarray([[0, 1]], dtype=np.int64),
+        scatter_true_llr_pairwise=scatter_true,
+        scatter_llr_pairwise_est=scatter_est,
+        scatter_llr_pairwise_metric_method_names=np.asarray(methods, dtype=object),
+        scatter_llr_pairwise_metric_names=metric_names,
+        scatter_llr_pairwise_metric_values=metric_values,
+    )
+    loss_root = out_dir / "training_losses" / methods[0]
+    loss_root.mkdir(parents=True)
+    _save_method_training_loss_npz(loss_root / "n_000020.npz", method_name=methods[0], result={})
+    monkeypatch.setattr(cat, "_render_method_sweep_panel", lambda **kwargs: _write_tiny_svg(out_dir / "sweep.svg"))
+    monkeypatch.setattr(cat, "_render_corr_nmse_two_panel", lambda **kwargs: _write_tiny_svg(out_dir / "corr.svg"))
+    monkeypatch.setattr(cat, "_render_row_n_training_losses_panel", lambda **kwargs: _write_tiny_svg(out_dir / "loss.svg"))
+    monkeypatch.setattr(cat, "_write_all_columns_png", lambda *args, **kwargs: str(_write_tiny_png(out_dir / "all.png")))
+
+    cat.main(
+        [
+            "--visualization-only",
+            "--output-dir",
+            str(out_dir),
+            "--dataset-npz",
+            str(fake_ds),
+            "--num-categories",
+            str(k),
+            "--n-ref",
+            "40",
+            "--n-list",
+            "20",
+            "--methods",
+            ",".join(methods),
+            "--device",
+            "cpu",
+        ]
+    )
+
+    svg = out_dir / "llr_est_vs_true_all.svg"
+    png = out_dir / "llr_est_vs_true_all.png"
+    assert svg.is_file()
+    assert png.is_file()
+    text = svg.read_text(encoding="utf-8")
+    assert "y zoom (IQR pooled methods)" in text
+    assert "Full range mean error" in text
+    assert "Mean error" in text
+    assert "true raw LLR in [-8, 8]" in text
+    assert text.count("true raw LLR in [-8, 8]") >= 3
+    summary = (out_dir / "h_decoding_categorical_twofig_summary.txt").read_text(encoding="utf-8")
+    assert f"llr_est_vs_true_all.svg: {svg.resolve()}" in summary
+    assert f"llr_est_vs_true_all.png: {png.resolve()}" in summary
 
 
 def test_build_parser_eval_split() -> None:
