@@ -44,6 +44,14 @@ def pr_autoencoder_config_from_namespace(ns: Any, *, h_dim: int) -> PRAutoencode
         train_lr=float(getattr(ns, "pr_autoencoder_train_lr", 1e-3)),
         lambda_pr=float(getattr(ns, "pr_autoencoder_lambda_pr", 1e-2)),
         pr_eps=float(getattr(ns, "pr_autoencoder_pr_eps", 1e-8)),
+        adversarial_categorical=bool(getattr(ns, "pr_autoencoder_adversarial_categorical", False)),
+        lambda_adv=float(getattr(ns, "pr_autoencoder_lambda_adv", 0.1)),
+        adv_warmup_epochs=int(getattr(ns, "pr_autoencoder_adv_warmup_epochs", 0)),
+        adv_ramp_epochs=int(getattr(ns, "pr_autoencoder_adv_ramp_epochs", 40)),
+        adv_steps=int(getattr(ns, "pr_autoencoder_adv_steps", 1)),
+        adv_train_samples=int(getattr(ns, "pr_autoencoder_adv_train_samples", 0)),
+        adv_num_classes=int(getattr(ns, "pr_autoencoder_adv_num_classes", 0)),
+        adv_source_sha256=str(getattr(ns, "pr_autoencoder_adv_source_sha256", "")),
     )
 
 
@@ -55,6 +63,7 @@ def project_x_through_pr_autoencoder(
     device: torch.device,
     cache_dir: str,
     force_retrain: bool,
+    train_y: np.ndarray | None = None,
 ) -> tuple[np.ndarray, Path, bool, dict[str, np.ndarray], InputAutoencoder]:
     """Map low-dimensional rows ``x_low`` (N, z_dim) to embedded ``x_embed`` (N, h_dim) via PR-AE encoder.
 
@@ -74,6 +83,8 @@ def project_x_through_pr_autoencoder(
         device=device,
         cache_dir=cache_dir,
         force_retrain=force_retrain,
+        train_z=x_arr if bool(config.adversarial_categorical) else None,
+        train_y=train_y if bool(config.adversarial_categorical) else None,
     )
     z_t = torch.from_numpy(x_arr).to(device=device, dtype=torch.float32)
     with torch.no_grad():

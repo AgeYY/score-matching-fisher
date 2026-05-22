@@ -57,6 +57,61 @@ def _file_sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+def _categorical_labels_from_theta(theta: np.ndarray, *, num_categories: int) -> np.ndarray:
+    arr = np.asarray(theta)
+    k = int(num_categories)
+    if k < 2:
+        raise ValueError("Adversarial categorical PR projection requires num_categories >= 2.")
+    if arr.ndim == 2 and int(arr.shape[1]) == k:
+        vals = np.asarray(arr, dtype=np.float64)
+        row_sums = vals.sum(axis=1)
+        is_binary = np.all((np.abs(vals) <= 1e-6) | (np.abs(vals - 1.0) <= 1e-6), axis=1)
+        if np.any(np.abs(row_sums - 1.0) > 1e-6) or not bool(np.all(is_binary)):
+            raise ValueError("Adversarial categorical PR projection requires one-hot categorical theta rows.")
+        return np.argmax(vals, axis=1).astype(np.int64)
+    vals = np.asarray(arr, dtype=np.float64).reshape(-1)
+    labels = np.rint(vals).astype(np.int64)
+    if np.any(np.abs(vals - labels.astype(np.float64)) > 1e-6):
+        raise ValueError("Adversarial categorical PR projection requires integer categorical theta labels.")
+    if np.any((labels < 0) | (labels >= k)):
+        raise ValueError(f"Categorical labels must be in [0, {k - 1}].")
+    return labels
+
+
+def _stratified_label_subsample(labels: np.ndarray, *, n_samples: int, seed: int) -> np.ndarray:
+    lab = np.asarray(labels, dtype=np.int64).reshape(-1)
+    n = int(lab.shape[0])
+    m = int(n_samples)
+    if m <= 0 or m >= n:
+        return np.arange(n, dtype=np.int64)
+    classes = np.unique(lab)
+    if m < int(classes.shape[0]):
+        raise ValueError(
+            f"--pr-adv-train-samples={m} is smaller than the number of observed classes ({classes.shape[0]})."
+        )
+    rng = np.random.default_rng(int(seed))
+    chosen: list[np.ndarray] = []
+    remaining = m
+    for j, cls in enumerate(classes):
+        cls_idx = np.flatnonzero(lab == cls)
+        quota = int(round(float(m) * float(cls_idx.shape[0]) / float(n)))
+        quota = max(1, min(int(cls_idx.shape[0]), quota))
+        if j == int(classes.shape[0]) - 1:
+            quota = max(1, min(int(cls_idx.shape[0]), remaining))
+        chosen.append(rng.choice(cls_idx, size=quota, replace=False))
+        remaining -= quota
+    out = np.concatenate(chosen)
+    if int(out.shape[0]) > m:
+        out = rng.choice(out, size=m, replace=False)
+    elif int(out.shape[0]) < m:
+        mask = np.ones(n, dtype=bool)
+        mask[out] = False
+        extra = rng.choice(np.flatnonzero(mask), size=m - int(out.shape[0]), replace=False)
+        out = np.concatenate([out, extra])
+    rng.shuffle(out)
+    return out.astype(np.int64, copy=False)
+
+
 def _binned_empirical_embedded_mean(
     theta_all: np.ndarray,
     x_embed: np.ndarray,
@@ -236,7 +291,17 @@ def _save_projection_summary_figure(
     if loss_raw is not None and np.asarray(loss_raw).size >= 1:
         loss = np.asarray(loss_raw, dtype=np.float64).reshape(-1)
         epochs = np.arange(1, loss.shape[0] + 1, dtype=np.float64)
-        ax_loss.plot(epochs, loss, color="#4c78a8", linewidth=1.2)
+        ax_loss.plot(epochs, loss, color="#4c78a8", linewidth=1.2, label="loss")
+        adv_acc_raw = train_metrics.get("adv_acc")
+        if adv_acc_raw is not None and np.asarray(adv_acc_raw).size == loss.shape[0]:
+            ax_loss.plot(
+                epochs,
+                np.asarray(adv_acc_raw, dtype=np.float64).reshape(-1),
+                color="#f58518",
+                linewidth=1.1,
+                label="linear adv acc",
+            )
+            ax_loss.legend(frameon=False, fontsize=7)
         ax_loss.set_xlabel("epoch")
         ax_loss.set_ylabel("loss")
         ax_loss.set_title("PR-autoencoder training loss")
@@ -329,6 +394,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--pr-train-lr", type=float, default=None)
     p.add_argument("--pr-lambda-pr", type=float, default=None)
     p.add_argument("--pr-eps", type=float, default=None)
+    p.add_argument(
+        "--pr-adversarial-categorical",
+        action="store_true",
+        help=(
+            "Enable adversarial PR projection with a gradient-reversal linear categorical classifier. "
+            "Only valid when input meta theta_type is categorical."
+        ),
+    )
+    p.add_argument("--pr-lambda-adv", type=float, default=0.1)
+    p.add_argument("--pr-adv-warmup-epochs", type=int, default=0)
+    p.add_argument(
+        "--pr-adv-ramp-epochs",
+        type=int,
+        default=None,
+        help="Epochs used to ramp the adversarial coefficient to --pr-lambda-adv; default train_epochs // 5.",
+    )
+    p.add_argument("--pr-adv-steps", type=int, default=1)
+    p.add_argument(
+        "--pr-adv-train-samples",
+        type=int,
+        default=0,
+        help="Rows to stratified-subsample for adversarial PR training; 0 uses all input rows.",
+    )
     return p.parse_args(argv)
 
 
@@ -370,30 +458,83 @@ def main() -> None:
     device = torch.device(device_name)
 
     seed = int(args.seed) if args.seed is not None else int(meta["seed"])
+    source_sha256 = _file_sha256(in_path)
+    adv_labels: np.ndarray | None = None
+    adv_x_train = x_all
+    adv_train_samples = int(args.pr_adv_train_samples)
+    train_epochs = int(args.pr_train_epochs) if args.pr_train_epochs is not None else 200
+    adv_ramp_epochs = (
+        int(args.pr_adv_ramp_epochs)
+        if args.pr_adv_ramp_epochs is not None
+        else max(1, int(train_epochs) // 5)
+    )
+    if bool(args.pr_adversarial_categorical):
+        if str(meta.get("theta_type", "")) != "categorical":
+            raise ValueError(
+                "--pr-adversarial-categorical only works when the input dataset has categorical labels "
+                f"(meta theta_type='categorical'); got {meta.get('theta_type')!r}."
+            )
+        if float(args.pr_lambda_adv) < 0.0:
+            raise ValueError("--pr-lambda-adv must be non-negative.")
+        if int(args.pr_adv_warmup_epochs) < 0:
+            raise ValueError("--pr-adv-warmup-epochs must be >= 0.")
+        if int(adv_ramp_epochs) < 1:
+            raise ValueError("--pr-adv-ramp-epochs must be >= 1.")
+        if int(args.pr_adv_steps) < 1:
+            raise ValueError("--pr-adv-steps must be >= 1.")
+        if int(adv_train_samples) < 0:
+            raise ValueError("--pr-adv-train-samples must be >= 0.")
+        num_categories = int(meta.get("num_categories", 0))
+        labels_all = _categorical_labels_from_theta(bundle.theta_all, num_categories=num_categories)
+        if int(labels_all.shape[0]) != int(x_all.shape[0]):
+            raise ValueError("Categorical theta row count does not match x_all row count.")
+        adv_idx = _stratified_label_subsample(labels_all, n_samples=adv_train_samples, seed=seed)
+        adv_x_train = x_all[adv_idx]
+        adv_labels = labels_all[adv_idx]
+        observed = np.unique(adv_labels)
+        if int(observed.shape[0]) < num_categories:
+            raise ValueError(
+                "Adversarial categorical PR training sample does not include every category; "
+                "increase --pr-adv-train-samples or use 0 for all rows."
+            )
 
     cfg_ns = SimpleNamespace(
         pr_autoencoder_z_dim=z_dim,
         pr_autoencoder_hidden1=int(args.pr_hidden1) if args.pr_hidden1 is not None else 100,
         pr_autoencoder_hidden2=int(args.pr_hidden2) if args.pr_hidden2 is not None else 200,
         pr_autoencoder_train_samples=int(args.pr_train_samples) if args.pr_train_samples is not None else 12000,
-        pr_autoencoder_train_epochs=int(args.pr_train_epochs) if args.pr_train_epochs is not None else 200,
+        pr_autoencoder_train_epochs=train_epochs,
         pr_autoencoder_train_batch_size=(
             int(args.pr_train_batch_size) if args.pr_train_batch_size is not None else 512
         ),
         pr_autoencoder_train_lr=float(args.pr_train_lr) if args.pr_train_lr is not None else 1e-3,
         pr_autoencoder_lambda_pr=float(args.pr_lambda_pr) if args.pr_lambda_pr is not None else 1e-2,
         pr_autoencoder_pr_eps=float(args.pr_eps) if args.pr_eps is not None else 1e-8,
+        pr_autoencoder_adversarial_categorical=bool(args.pr_adversarial_categorical),
+        pr_autoencoder_lambda_adv=float(args.pr_lambda_adv),
+        pr_autoencoder_adv_warmup_epochs=int(args.pr_adv_warmup_epochs),
+        pr_autoencoder_adv_ramp_epochs=adv_ramp_epochs,
+        pr_autoencoder_adv_steps=int(args.pr_adv_steps),
+        pr_autoencoder_adv_train_samples=adv_train_samples,
+        pr_autoencoder_adv_num_classes=int(meta.get("num_categories", 0)) if bool(args.pr_adversarial_categorical) else 0,
+        pr_autoencoder_adv_source_sha256=source_sha256 if bool(args.pr_adversarial_categorical) else "",
     )
     cfg = pr_autoencoder_config_from_namespace(cfg_ns, h_dim=h_dim)
 
     x_embed_all, cache_run_dir, loaded_from_cache, train_metrics, ae_model = project_x_through_pr_autoencoder(
-        x_all,
+        adv_x_train if bool(args.pr_adversarial_categorical) else x_all,
         config=cfg,
         seed=seed,
         device=device,
         cache_dir=str(args.cache_dir),
         force_retrain=not bool(args.use_cache),
+        train_y=adv_labels,
     )
+    if bool(args.pr_adversarial_categorical):
+        z_t = torch.from_numpy(x_all.astype(np.float32, copy=False)).to(device=device, dtype=torch.float32)
+        with torch.no_grad():
+            h_t, _ = ae_model(z_t)
+        x_embed_all = h_t.detach().cpu().numpy().astype(np.float64, copy=False)
 
     train_idx = np.asarray(bundle.train_idx, dtype=np.int64)
     val_idx = np.asarray(bundle.validation_idx, dtype=np.int64)
@@ -416,10 +557,25 @@ def main() -> None:
     out_meta["pr_autoencoder_train_lr"] = float(cfg.train_lr)
     out_meta["pr_autoencoder_lambda_pr"] = float(cfg.lambda_pr)
     out_meta["pr_autoencoder_pr_eps"] = float(cfg.pr_eps)
+    out_meta["pr_autoencoder_adversarial_categorical"] = bool(cfg.adversarial_categorical)
+    out_meta["pr_autoencoder_lambda_adv"] = float(cfg.lambda_adv)
+    out_meta["pr_autoencoder_adv_warmup_epochs"] = int(cfg.adv_warmup_epochs)
+    out_meta["pr_autoencoder_adv_ramp_epochs"] = int(cfg.adv_ramp_epochs)
+    out_meta["pr_autoencoder_adv_steps"] = int(cfg.adv_steps)
+    out_meta["pr_autoencoder_adv_train_samples"] = int(cfg.adv_train_samples)
+    out_meta["pr_autoencoder_adv_num_classes"] = int(cfg.adv_num_classes)
+    adv_acc = np.asarray(train_metrics.get("adv_acc", []), dtype=np.float64).reshape(-1)
+    adv_ce = np.asarray(train_metrics.get("adv_ce", []), dtype=np.float64).reshape(-1)
+    out_meta["pr_autoencoder_adv_final_linear_accuracy"] = (
+        float(adv_acc[-1]) if bool(cfg.adversarial_categorical) and adv_acc.size else None
+    )
+    out_meta["pr_autoencoder_adv_final_ce"] = (
+        float(adv_ce[-1]) if bool(cfg.adversarial_categorical) and adv_ce.size else None
+    )
     out_meta["pr_autoencoder_seed"] = seed
     out_meta["pr_autoencoder_cache_key"] = str(cache_run_dir.name)
     out_meta["pr_autoencoder_source_npz"] = str(in_path)
-    out_meta["pr_autoencoder_source_sha256"] = _file_sha256(in_path)
+    out_meta["pr_autoencoder_source_sha256"] = source_sha256
     out_meta["pr_autoencoder_projection_note"] = (
         "Embedded x via bin/project_dataset_pr_autoencoder.py; generative model dim is pr_autoencoder_z_dim."
     )
@@ -468,6 +624,10 @@ def main() -> None:
                 "z_dim": z_dim,
                 "h_dim": h_dim,
                 "pr_autoencoder_cache_key": out_meta["pr_autoencoder_cache_key"],
+                "pr_autoencoder_adversarial_categorical": bool(cfg.adversarial_categorical),
+                "pr_autoencoder_adv_final_linear_accuracy": out_meta[
+                    "pr_autoencoder_adv_final_linear_accuracy"
+                ],
             },
             indent=2,
             sort_keys=True,
