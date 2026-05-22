@@ -335,6 +335,83 @@ class ObservationAutoencoder(nn.Module):
         return z, x_hat
 
 
+class ObservationVariationalAutoencoder(nn.Module):
+    """Variational autoencoder for stochastic latent observation embeddings."""
+
+    def __init__(
+        self,
+        *,
+        x_dim: int,
+        latent_dim: int,
+        hidden_dim: int = 128,
+        depth: int = 2,
+    ) -> None:
+        super().__init__()
+        if int(x_dim) < 1:
+            raise ValueError("x_dim must be >= 1.")
+        if int(latent_dim) < 1:
+            raise ValueError("latent_dim must be >= 1.")
+        if int(latent_dim) > int(x_dim):
+            raise ValueError("latent_dim must be <= x_dim.")
+        if int(hidden_dim) < 1:
+            raise ValueError("hidden_dim must be >= 1.")
+        if int(depth) < 1:
+            raise ValueError("depth must be >= 1.")
+        self.x_dim = int(x_dim)
+        self.latent_dim = int(latent_dim)
+
+        enc_layers: list[nn.Module] = []
+        in_dim = self.x_dim
+        for _ in range(int(depth)):
+            enc_layers.append(nn.Linear(in_dim, int(hidden_dim)))
+            enc_layers.append(nn.SiLU())
+            in_dim = int(hidden_dim)
+        self.encoder_body = nn.Sequential(*enc_layers)
+        self.encoder_mu = nn.Linear(in_dim, self.latent_dim)
+        self.encoder_logvar = nn.Linear(in_dim, self.latent_dim)
+
+        dec_layers: list[nn.Module] = []
+        in_dim = self.latent_dim
+        for _ in range(int(depth)):
+            dec_layers.append(nn.Linear(in_dim, int(hidden_dim)))
+            dec_layers.append(nn.SiLU())
+            in_dim = int(hidden_dim)
+        dec_layers.append(nn.Linear(in_dim, self.x_dim))
+        self.decoder = nn.Sequential(*dec_layers)
+        self.classifier = nn.Sequential(
+            nn.Linear(self.latent_dim, int(hidden_dim)),
+            nn.SiLU(),
+            nn.Linear(int(hidden_dim), 1),
+        )
+
+    def encode(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if x.ndim == 1:
+            x = x.unsqueeze(0)
+        h = self.encoder_body(x)
+        return self.encoder_mu(h), self.encoder_logvar(h)
+
+    def sample(self, x: torch.Tensor, *, n_samples: int = 1) -> torch.Tensor:
+        if int(n_samples) < 1:
+            raise ValueError("n_samples must be >= 1.")
+        mu, logvar = self.encode(x)
+        std = torch.exp(0.5 * torch.clamp(logvar, min=-30.0, max=20.0))
+        if int(n_samples) == 1:
+            return mu + torch.randn_like(std) * std
+        eps = torch.randn((int(n_samples),) + tuple(std.shape), dtype=std.dtype, device=std.device)
+        return mu.unsqueeze(0) + eps * std.unsqueeze(0)
+
+    def classify_latent(self, z: torch.Tensor) -> torch.Tensor:
+        if z.ndim == 1:
+            z = z.unsqueeze(0)
+        return self.classifier(z).squeeze(-1)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        mu, logvar = self.encode(x)
+        z = mu + torch.randn_like(mu) * torch.exp(0.5 * torch.clamp(logvar, min=-30.0, max=20.0))
+        x_hat = self.decoder(z)
+        return z, x_hat, mu, logvar
+
+
 def _as_2d_float64(a: np.ndarray, *, name: str) -> np.ndarray:
     arr = np.asarray(a, dtype=np.float64)
     if arr.ndim == 1:
@@ -464,6 +541,349 @@ def train_observation_autoencoder(
     }
 
 
+def train_observation_variational_autoencoder(
+    *,
+    model: ObservationVariationalAutoencoder,
+    x_train: np.ndarray,
+    x_val: np.ndarray,
+    device: torch.device,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    beta: float = 1e-3,
+    weight_decay: float = 0.0,
+    patience: int = 200,
+    min_delta: float = 1e-4,
+    ema_alpha: float = 0.05,
+    log_every: int = 50,
+    restore_best: bool = True,
+) -> dict[str, Any]:
+    if int(epochs) < 1:
+        raise ValueError("epochs must be >= 1.")
+    if int(batch_size) < 1:
+        raise ValueError("batch_size must be >= 1.")
+    if float(lr) <= 0.0:
+        raise ValueError("lr must be > 0.")
+    if float(beta) < 0.0 or not math.isfinite(float(beta)):
+        raise ValueError("beta must be finite and >= 0.")
+    if float(weight_decay) < 0.0:
+        raise ValueError("weight_decay must be >= 0.")
+    if int(patience) < 0:
+        raise ValueError("patience must be >= 0.")
+    if float(min_delta) < 0.0:
+        raise ValueError("min_delta must be >= 0.")
+    if not (0.0 < float(ema_alpha) <= 1.0):
+        raise ValueError("ema_alpha must be in (0, 1].")
+
+    x_tr = _as_2d_float64(x_train, name="x_train")
+    x_va = _as_2d_float64(x_val, name="x_val")
+    if x_tr.shape[0] < 1 or x_va.shape[0] < 1:
+        raise ValueError("variational autoencoder requires non-empty train and validation splits.")
+    if x_tr.shape[1] != model.x_dim or x_va.shape[1] != model.x_dim:
+        raise ValueError("variational autoencoder x dimension mismatch.")
+
+    train_ds = TensorDataset(torch.from_numpy(x_tr.astype(np.float32)))
+    val_ds = TensorDataset(torch.from_numpy(x_va.astype(np.float32)))
+    train_loader = DataLoader(train_ds, batch_size=int(batch_size), shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=int(batch_size), shuffle=False)
+    opt = torch.optim.AdamW(model.parameters(), lr=float(lr), weight_decay=float(weight_decay))
+
+    def loss_parts(xb: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        _, x_hat, mu, logvar = model(xb)
+        recon = torch.mean((x_hat - xb) ** 2)
+        logvar_safe = torch.clamp(logvar, min=-30.0, max=20.0)
+        kl_per_row = -0.5 * torch.sum(1.0 + logvar_safe - mu.pow(2) - torch.exp(logvar_safe), dim=1)
+        kl = torch.mean(kl_per_row)
+        total = recon + float(beta) * kl
+        return total, recon, kl
+
+    train_losses: list[float] = []
+    train_recon_losses: list[float] = []
+    train_kl_losses: list[float] = []
+    val_losses: list[float] = []
+    val_recon_losses: list[float] = []
+    val_kl_losses: list[float] = []
+    val_monitor_losses: list[float] = []
+    best_val = float("inf")
+    best_epoch = 0
+    best_state: dict[str, torch.Tensor] | None = None
+    val_ema: float | None = None
+    patience_counter = 0
+    stopped_early = False
+    stopped_epoch = int(epochs)
+
+    for epoch in range(1, int(epochs) + 1):
+        model.train()
+        ep_total: list[float] = []
+        ep_recon: list[float] = []
+        ep_kl: list[float] = []
+        for (xb,) in train_loader:
+            xb = xb.to(device)
+            total, recon, kl = loss_parts(xb)
+            opt.zero_grad(set_to_none=True)
+            total.backward()
+            opt.step()
+            ep_total.append(float(total.detach().cpu()))
+            ep_recon.append(float(recon.detach().cpu()))
+            ep_kl.append(float(kl.detach().cpu()))
+        train_loss = float(np.mean(ep_total))
+        train_recon = float(np.mean(ep_recon))
+        train_kl = float(np.mean(ep_kl))
+        train_losses.append(train_loss)
+        train_recon_losses.append(train_recon)
+        train_kl_losses.append(train_kl)
+
+        model.eval()
+        val_total_ep: list[float] = []
+        val_recon_ep: list[float] = []
+        val_kl_ep: list[float] = []
+        with torch.no_grad():
+            for (xb,) in val_loader:
+                xb = xb.to(device)
+                total, recon, kl = loss_parts(xb)
+                val_total_ep.append(float(total.detach().cpu()))
+                val_recon_ep.append(float(recon.detach().cpu()))
+                val_kl_ep.append(float(kl.detach().cpu()))
+        val_loss = float(np.mean(val_total_ep))
+        val_recon = float(np.mean(val_recon_ep))
+        val_kl = float(np.mean(val_kl_ep))
+        val_losses.append(val_loss)
+        val_recon_losses.append(val_recon)
+        val_kl_losses.append(val_kl)
+        val_ema = val_loss if val_ema is None else float(ema_alpha) * val_loss + (1.0 - float(ema_alpha)) * val_ema
+        val_monitor_losses.append(float(val_ema))
+        if val_ema < best_val - float(min_delta):
+            best_val = float(val_ema)
+            best_epoch = int(epoch)
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            patience_counter = 0
+        else:
+            patience_counter += 1
+        if epoch == 1 or epoch % max(1, int(log_every)) == 0 or epoch == int(epochs):
+            print(
+                f"[gaussian_network_vae {epoch:4d}/{int(epochs)}] train_loss={train_loss:.6f} "
+                f"train_recon={train_recon:.6f} train_kl={train_kl:.6f} val_loss={val_loss:.6f} "
+                f"val_recon={val_recon:.6f} val_kl={val_kl:.6f} val_smooth={val_ema:.6f} "
+                f"best_epoch={best_epoch}",
+                flush=True,
+            )
+        if int(patience) > 0 and patience_counter >= int(patience):
+            stopped_early = True
+            stopped_epoch = int(epoch)
+            print(
+                f"[gaussian_network_vae early-stop] epoch={epoch} best_epoch={best_epoch} "
+                f"best_smooth={best_val:.6f} patience={int(patience)}",
+                flush=True,
+            )
+            break
+
+    if restore_best and best_state is not None:
+        model.load_state_dict(best_state)
+        print(f"[gaussian_network_vae restore-best] restored epoch={best_epoch} val_smooth={best_val:.6f}", flush=True)
+
+    return {
+        "train_losses": train_losses,
+        "train_recon_losses": train_recon_losses,
+        "train_kl_losses": train_kl_losses,
+        "val_losses": val_losses,
+        "val_recon_losses": val_recon_losses,
+        "val_kl_losses": val_kl_losses,
+        "val_monitor_losses": val_monitor_losses,
+        "best_val_loss": float(best_val),
+        "best_epoch": int(best_epoch),
+        "stopped_epoch": int(stopped_epoch),
+        "stopped_early": bool(stopped_early),
+        "lr_last": float(opt.param_groups[0]["lr"]),
+        "beta": float(beta),
+    }
+
+
+def train_label_guided_observation_variational_autoencoder(
+    *,
+    model: ObservationVariationalAutoencoder,
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    x_val: np.ndarray,
+    y_val: np.ndarray,
+    device: torch.device,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    beta: float = 1e-3,
+    cls_weight: float = 1.0,
+    weight_decay: float = 0.0,
+    patience: int = 200,
+    min_delta: float = 1e-4,
+    ema_alpha: float = 0.05,
+    log_every: int = 50,
+    restore_best: bool = True,
+) -> dict[str, Any]:
+    if int(epochs) < 1:
+        raise ValueError("epochs must be >= 1.")
+    if int(batch_size) < 1:
+        raise ValueError("batch_size must be >= 1.")
+    if float(lr) <= 0.0:
+        raise ValueError("lr must be > 0.")
+    if float(beta) < 0.0 or not math.isfinite(float(beta)):
+        raise ValueError("beta must be finite and >= 0.")
+    if float(cls_weight) < 0.0 or not math.isfinite(float(cls_weight)):
+        raise ValueError("cls_weight must be finite and >= 0.")
+    if float(weight_decay) < 0.0:
+        raise ValueError("weight_decay must be >= 0.")
+    if int(patience) < 0:
+        raise ValueError("patience must be >= 0.")
+    if float(min_delta) < 0.0:
+        raise ValueError("min_delta must be >= 0.")
+    if not (0.0 < float(ema_alpha) <= 1.0):
+        raise ValueError("ema_alpha must be in (0, 1].")
+
+    x_tr = _as_2d_float64(x_train, name="x_train")
+    x_va = _as_2d_float64(x_val, name="x_val")
+    y_tr = np.asarray(y_train, dtype=np.float32).reshape(-1)
+    y_va = np.asarray(y_val, dtype=np.float32).reshape(-1)
+    if x_tr.shape[0] < 1 or x_va.shape[0] < 1:
+        raise ValueError("label-guided variational autoencoder requires non-empty train and validation splits.")
+    if x_tr.shape[0] != y_tr.shape[0] or x_va.shape[0] != y_va.shape[0]:
+        raise ValueError("x and y row counts must match.")
+    if x_tr.shape[1] != model.x_dim or x_va.shape[1] != model.x_dim:
+        raise ValueError("variational autoencoder x dimension mismatch.")
+
+    train_ds = TensorDataset(torch.from_numpy(x_tr.astype(np.float32)), torch.from_numpy(y_tr))
+    val_ds = TensorDataset(torch.from_numpy(x_va.astype(np.float32)), torch.from_numpy(y_va))
+    train_loader = DataLoader(train_ds, batch_size=int(batch_size), shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=int(batch_size), shuffle=False)
+    opt = torch.optim.AdamW(model.parameters(), lr=float(lr), weight_decay=float(weight_decay))
+    bce = nn.BCEWithLogitsLoss()
+
+    def loss_parts(xb: torch.Tensor, yb: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        z, x_hat, mu, logvar = model(xb)
+        recon = torch.mean((x_hat - xb) ** 2)
+        logvar_safe = torch.clamp(logvar, min=-30.0, max=20.0)
+        kl_per_row = -0.5 * torch.sum(1.0 + logvar_safe - mu.pow(2) - torch.exp(logvar_safe), dim=1)
+        kl = torch.mean(kl_per_row)
+        cls = bce(model.classify_latent(z), yb)
+        total = recon + float(beta) * kl + float(cls_weight) * cls
+        return total, recon, kl, cls
+
+    train_losses: list[float] = []
+    train_recon_losses: list[float] = []
+    train_kl_losses: list[float] = []
+    train_cls_losses: list[float] = []
+    val_losses: list[float] = []
+    val_recon_losses: list[float] = []
+    val_kl_losses: list[float] = []
+    val_cls_losses: list[float] = []
+    val_monitor_losses: list[float] = []
+    best_val = float("inf")
+    best_epoch = 0
+    best_state: dict[str, torch.Tensor] | None = None
+    val_ema: float | None = None
+    patience_counter = 0
+    stopped_early = False
+    stopped_epoch = int(epochs)
+
+    for epoch in range(1, int(epochs) + 1):
+        model.train()
+        ep_total: list[float] = []
+        ep_recon: list[float] = []
+        ep_kl: list[float] = []
+        ep_cls: list[float] = []
+        for xb, yb in train_loader:
+            xb = xb.to(device)
+            yb = yb.to(device)
+            total, recon, kl, cls = loss_parts(xb, yb)
+            opt.zero_grad(set_to_none=True)
+            total.backward()
+            opt.step()
+            ep_total.append(float(total.detach().cpu()))
+            ep_recon.append(float(recon.detach().cpu()))
+            ep_kl.append(float(kl.detach().cpu()))
+            ep_cls.append(float(cls.detach().cpu()))
+        train_loss = float(np.mean(ep_total))
+        train_recon = float(np.mean(ep_recon))
+        train_kl = float(np.mean(ep_kl))
+        train_cls = float(np.mean(ep_cls))
+        train_losses.append(train_loss)
+        train_recon_losses.append(train_recon)
+        train_kl_losses.append(train_kl)
+        train_cls_losses.append(train_cls)
+
+        model.eval()
+        val_total_ep: list[float] = []
+        val_recon_ep: list[float] = []
+        val_kl_ep: list[float] = []
+        val_cls_ep: list[float] = []
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb = xb.to(device)
+                yb = yb.to(device)
+                total, recon, kl, cls = loss_parts(xb, yb)
+                val_total_ep.append(float(total.detach().cpu()))
+                val_recon_ep.append(float(recon.detach().cpu()))
+                val_kl_ep.append(float(kl.detach().cpu()))
+                val_cls_ep.append(float(cls.detach().cpu()))
+        val_loss = float(np.mean(val_total_ep))
+        val_recon = float(np.mean(val_recon_ep))
+        val_kl = float(np.mean(val_kl_ep))
+        val_cls = float(np.mean(val_cls_ep))
+        val_losses.append(val_loss)
+        val_recon_losses.append(val_recon)
+        val_kl_losses.append(val_kl)
+        val_cls_losses.append(val_cls)
+        val_ema = val_loss if val_ema is None else float(ema_alpha) * val_loss + (1.0 - float(ema_alpha)) * val_ema
+        val_monitor_losses.append(float(val_ema))
+        if val_ema < best_val - float(min_delta):
+            best_val = float(val_ema)
+            best_epoch = int(epoch)
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            patience_counter = 0
+        else:
+            patience_counter += 1
+        if epoch == 1 or epoch % max(1, int(log_every)) == 0 or epoch == int(epochs):
+            print(
+                f"[gaussian_network_label_vae {epoch:4d}/{int(epochs)}] train_loss={train_loss:.6f} "
+                f"train_recon={train_recon:.6f} train_kl={train_kl:.6f} train_cls={train_cls:.6f} "
+                f"val_loss={val_loss:.6f} val_recon={val_recon:.6f} val_kl={val_kl:.6f} "
+                f"val_cls={val_cls:.6f} val_smooth={val_ema:.6f} best_epoch={best_epoch}",
+                flush=True,
+            )
+        if int(patience) > 0 and patience_counter >= int(patience):
+            stopped_early = True
+            stopped_epoch = int(epoch)
+            print(
+                f"[gaussian_network_label_vae early-stop] epoch={epoch} best_epoch={best_epoch} "
+                f"best_smooth={best_val:.6f} patience={int(patience)}",
+                flush=True,
+            )
+            break
+
+    if restore_best and best_state is not None:
+        model.load_state_dict(best_state)
+        print(
+            f"[gaussian_network_label_vae restore-best] restored epoch={best_epoch} val_smooth={best_val:.6f}",
+            flush=True,
+        )
+
+    return {
+        "train_losses": train_losses,
+        "train_recon_losses": train_recon_losses,
+        "train_kl_losses": train_kl_losses,
+        "train_cls_losses": train_cls_losses,
+        "val_losses": val_losses,
+        "val_recon_losses": val_recon_losses,
+        "val_kl_losses": val_kl_losses,
+        "val_cls_losses": val_cls_losses,
+        "val_monitor_losses": val_monitor_losses,
+        "best_val_loss": float(best_val),
+        "best_epoch": int(best_epoch),
+        "stopped_epoch": int(stopped_epoch),
+        "stopped_early": bool(stopped_early),
+        "lr_last": float(opt.param_groups[0]["lr"]),
+        "beta": float(beta),
+        "cls_weight": float(cls_weight),
+    }
+
+
 def encode_observations(
     *,
     model: ObservationAutoencoder,
@@ -480,6 +900,52 @@ def encode_observations(
         for i in range(0, arr.shape[0], int(batch_size)):
             xb = torch.from_numpy(arr[i : i + int(batch_size)].astype(np.float32)).to(device)
             out.append(model.encode(xb).detach().cpu().numpy().astype(np.float64))
+    return np.concatenate(out, axis=0) if out else np.zeros((0, model.latent_dim), dtype=np.float64)
+
+
+def encode_observation_vae_means(
+    *,
+    model: ObservationVariationalAutoencoder,
+    x: np.ndarray,
+    device: torch.device,
+    batch_size: int = 4096,
+) -> np.ndarray:
+    arr = _as_2d_float64(x, name="x")
+    if int(batch_size) < 1:
+        raise ValueError("batch_size must be >= 1.")
+    out: list[np.ndarray] = []
+    model.eval()
+    with torch.no_grad():
+        for i in range(0, arr.shape[0], int(batch_size)):
+            xb = torch.from_numpy(arr[i : i + int(batch_size)].astype(np.float32)).to(device)
+            mu, _ = model.encode(xb)
+            out.append(mu.detach().cpu().numpy().astype(np.float64))
+    return np.concatenate(out, axis=0) if out else np.zeros((0, model.latent_dim), dtype=np.float64)
+
+
+def sample_observation_vae_latents(
+    *,
+    model: ObservationVariationalAutoencoder,
+    x: np.ndarray,
+    device: torch.device,
+    n_samples: int,
+    batch_size: int = 4096,
+) -> np.ndarray:
+    arr = _as_2d_float64(x, name="x")
+    if int(n_samples) < 1:
+        raise ValueError("n_samples must be >= 1.")
+    if int(batch_size) < 1:
+        raise ValueError("batch_size must be >= 1.")
+    out: list[np.ndarray] = []
+    model.eval()
+    with torch.no_grad():
+        for i in range(0, arr.shape[0], int(batch_size)):
+            xb = torch.from_numpy(arr[i : i + int(batch_size)].astype(np.float32)).to(device)
+            z = model.sample(xb, n_samples=int(n_samples))
+            if int(n_samples) == 1:
+                z = z.unsqueeze(0)
+            z_np = z.permute(1, 0, 2).reshape(-1, model.latent_dim).detach().cpu().numpy().astype(np.float64)
+            out.append(z_np)
     return np.concatenate(out, axis=0) if out else np.zeros((0, model.latent_dim), dtype=np.float64)
 
 

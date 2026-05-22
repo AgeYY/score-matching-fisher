@@ -52,6 +52,15 @@ def _load_llr_scatter_study_module():
     return module
 
 
+def _load_bench_llr_module():
+    path = Path(__file__).resolve().parents[1] / "bin" / "bench_llr.py"
+    spec = importlib.util.spec_from_file_location("bench_llr", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _write_tiny_svg(path: Path, *, width: int = 10, height: int = 8) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -421,6 +430,128 @@ def test_llr_scatter_summary_records_loss_and_combined_paths(tmp_path: Path) -> 
         "llr_est_vs_true_all_with_losses_and_dataset_pca.png: "
         f"{paths['combined_with_dataset_pca_png']}"
     ) in text
+
+
+def test_bench_llr_parser_n_eval_default_and_override() -> None:
+    bench = _load_bench_llr_module()
+
+    args = bench.build_parser().parse_args([])
+    assert args.n_eval == 600
+    assert args.device == "cuda"
+
+    args2 = bench.build_parser().parse_args(["--n-eval", "123", "--methods", "bin_gaussian"])
+    assert args2.n_eval == 123
+    assert args2.methods == "bin_gaussian"
+
+
+def test_bench_llr_combined_writer_outputs_svg_png(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    bench = _load_bench_llr_module()
+    llr_svg = Path(_write_tiny_svg(tmp_path / "llr_est_vs_true_all.svg", width=20, height=5)).resolve()
+    llr_png = Path(_write_tiny_png(tmp_path / "llr_est_vs_true_all.png", width=40, height=10)).resolve()
+    loss_svg = Path(_write_tiny_svg(tmp_path / "bench_llr_training_losses_panel.svg", width=12, height=10)).resolve()
+    combined_svg = tmp_path / "bench_llr.svg"
+    combined_png = tmp_path / "bench_llr.png"
+
+    def fake_svg_to_png(source_paths, out_path, *, spacing=24.0, dpi=300, target_height=None, valign="center"):
+        assert source_paths == [loss_svg]
+        assert dpi == 300
+        _write_tiny_png(Path(out_path), width=12, height=10)
+        return str(out_path)
+
+    def fake_concat_png(source_paths, out_path, *, spacing=100, target_height=None, valign="center"):
+        assert source_paths[0] == llr_png
+        assert Path(source_paths[1]).name == "loss_panel.png"
+        assert spacing == 100
+        assert target_height == 10
+        assert valign == "center"
+        Path(out_path).write_bytes(b"png")
+        return str(out_path)
+
+    monkeypatch.setattr(bench, "concatenate_svgs_horizontally_to_png", fake_svg_to_png)
+    monkeypatch.setattr(bench, "concatenate_pngs_horizontally", fake_concat_png)
+
+    got_svg, got_png = bench._write_combined_llr_loss_outputs(
+        llr_svg=llr_svg,
+        llr_png=llr_png,
+        loss_panel_svg=loss_svg,
+        combined_svg=combined_svg,
+        combined_png=combined_png,
+    )
+
+    assert got_svg == combined_svg.resolve()
+    assert got_png == combined_png.resolve()
+    assert combined_svg.is_file()
+    assert combined_png.read_bytes() == b"png"
+    root = ET.parse(combined_svg).getroot()
+    assert root.attrib["viewBox"] == "0 0 76 10"
+
+
+def test_bench_llr_diagnostic_metric_bars_include_rmse_and_pearson(tmp_path: Path) -> None:
+    bench = _load_bench_llr_module()
+    pair_labels = np.array([[0, 1], [0, 2], [1, 2]], dtype=np.int64)
+    bins = np.array([0, 1, 2, 0, 1, 2], dtype=np.int64)
+    true = np.array(
+        [
+            [1.0, 2.0, np.nan, 3.0, 4.0, np.nan],
+            [5.0, np.nan, 6.0, 7.0, np.nan, 8.0],
+            [np.nan, 9.0, 10.0, np.nan, 11.0, 12.0],
+        ],
+        dtype=np.float64,
+    )
+    est = true + 0.1
+    metrics = {"method_a": bench._pairwise_raw_llr_metrics(est, true)}
+
+    bench._save_pairwise_raw_llr_est_vs_true_figure(
+        {"method_a": est},
+        true,
+        pair_labels,
+        bins,
+        out_base=tmp_path / "llr_est_vs_true_all",
+        metrics_by_method=metrics,
+    )
+
+    svg = tmp_path / "llr_est_vs_true_all.svg"
+    png = tmp_path / "llr_est_vs_true_all.png"
+    assert svg.is_file()
+    assert png.is_file()
+    text = svg.read_text(encoding="utf-8")
+    assert "Full range RMSE" in text
+    assert "Full range Pearson r" in text
+    assert "Full range mean error" in text
+    assert text.count("true raw LLR in [-8, 8]") >= 3
+
+
+def test_bench_llr_summary_records_loss_llr_combined_and_results_paths(tmp_path: Path) -> None:
+    bench = _load_bench_llr_module()
+    summary = tmp_path / "bench_llr_summary.txt"
+    args = SimpleNamespace(
+        output_dir=tmp_path,
+        dataset_npz=tmp_path / "random_mog_categorical.npz",
+        num_categories=3,
+        n_eval=123,
+        pr_project=False,
+        device="cuda",
+    )
+    paths = {
+        "results_npz": (tmp_path / "bench_llr_results.npz").resolve(),
+        "bench_llr_training_losses_panel.svg": (tmp_path / "bench_llr_training_losses_panel.svg").resolve(),
+        "llr_est_vs_true_all.svg": (tmp_path / "llr_est_vs_true_all.svg").resolve(),
+        "llr_est_vs_true_all.png": (tmp_path / "llr_est_vs_true_all.png").resolve(),
+        "bench_llr.svg": (tmp_path / "bench_llr.svg").resolve(),
+        "bench_llr.png": (tmp_path / "bench_llr.png").resolve(),
+        "training_losses_root": (tmp_path / "training_losses").resolve(),
+    }
+
+    bench._write_summary(summary, args=args, methods=["bin_gaussian"], eval_split="all", paths=paths)
+
+    text = summary.read_text(encoding="utf-8")
+    assert f"results_npz: {paths['results_npz']}" in text
+    assert f"bench_llr_training_losses_panel.svg: {paths['bench_llr_training_losses_panel.svg']}" in text
+    assert f"llr_est_vs_true_all.svg: {paths['llr_est_vs_true_all.svg']}" in text
+    assert f"llr_est_vs_true_all.png: {paths['llr_est_vs_true_all.png']}" in text
+    assert f"bench_llr.svg: {paths['bench_llr.svg']}" in text
+    assert f"bench_llr.png: {paths['bench_llr.png']}" in text
+    assert f"training_losses_root: {paths['training_losses_root']}" in text
 
 
 def test_parse_methods_aliases_and_dedup() -> None:
