@@ -72,7 +72,7 @@ def meta_dict_from_args(ns: Any) -> dict[str, Any]:
         "theta_high": float(ns.theta_high),
         "theta_dim": (
             int(getattr(ns, "num_categories", 5))
-            if str(ns.dataset_family) == "random_mog_categorical"
+            if str(ns.dataset_family) in ("random_mog_categorical", "multi_rings_radial")
             else 2
             if str(ns.dataset_family)
             in (
@@ -81,8 +81,12 @@ def meta_dict_from_args(ns: Any) -> dict[str, Any]:
             )
             else 1
         ),
-        "theta_type": "categorical" if str(ns.dataset_family) == "random_mog_categorical" else "continuous",
-        "theta_encoding": "one_hot" if str(ns.dataset_family) == "random_mog_categorical" else "native",
+        "theta_type": "categorical"
+        if str(ns.dataset_family) in ("random_mog_categorical", "multi_rings_radial")
+        else "continuous",
+        "theta_encoding": "one_hot"
+        if str(ns.dataset_family) in ("random_mog_categorical", "multi_rings_radial")
+        else "native",
         "num_categories": int(getattr(ns, "num_categories", 5)),
         "x_dim": int(ns.x_dim),
         "sigma_x1": float(ns.sigma_x1),
@@ -125,6 +129,9 @@ def meta_dict_from_args(ns: Any) -> dict[str, Any]:
             if str(ns.dataset_family) == "random_mog_categorical"
             else None
         ),
+        "rings_radius_start": float(getattr(ns, "rings_radius_start", 1.0)),
+        "rings_radius_step": float(getattr(ns, "rings_radius_step", 0.8)),
+        "rings_noise": float(getattr(ns, "rings_noise", 0.20)),
         "n_total": int(ns.n_total),
         "train_frac": float(ns.train_frac),
     }

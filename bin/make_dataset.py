@@ -40,6 +40,9 @@ Run ``python bin/make_dataset.py --help`` for argparse defaults and exact wordin
       ``--mog-mean-min-dist`` apart in Euclidean distance (default ``0.5 * sqrt(x_dim)`` when omitted
       or negative); override with ``--mog-mean-max-attempts`` (default 10000). Stored means in NPZ
       meta are authoritative and skip resampling.
+    - ``multi_rings_radial`` — Uniform categorical native-2D concentric rings with one-hot labels
+      and exact radial density metadata. Ring recipe defaults are radius start 1.0, radius step 0.8,
+      and isotropic noise 0.20.
     - ``cosine_gmm`` — Cosine-like mean branch inside a theta-dependent two-component mixture (see
       ``ToyConditionalGMMNonGaussianDataset``).
     - ``cos_sin_piecewise`` — Means ``(cos θ, sin θ)``; scalar observation std piecewise in ``θ``

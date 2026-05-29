@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
+import sys
 
 import numpy as np
+import pytest
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score
 from sklearn.svm import SVC
+
+from fisher.data import ToyCategoricalMultiRingsDataset
+from fisher.h_decoding_categorical_twofig import hellinger_gt_sq_category_matrix
+from fisher.shared_fisher_est import build_dataset_from_meta
+from fisher.shared_dataset_io import load_shared_dataset_npz
 
 
 def make_multi_rings(
@@ -119,6 +127,74 @@ def test_make_multi_rings_shapes_and_balanced_labels() -> None:
     assert y.shape == (902,)
     assert set(np.unique(y).tolist()) == {0, 1, 2, 3}
     assert np.bincount(y).tolist() == [226, 226, 225, 225]
+
+
+def test_production_multi_rings_dataset_shapes_and_log_density() -> None:
+    ds = ToyCategoricalMultiRingsDataset(num_categories=4, seed=0)
+    theta, x = ds.sample_joint(200)
+
+    assert theta.shape == (200, 4)
+    assert x.shape == (200, 2)
+    assert np.allclose(theta.sum(axis=1), 1.0)
+    logp = ds.log_p_x_given_theta(x[:10], theta[:10])
+    assert logp.shape == (10,)
+    assert np.all(np.isfinite(logp))
+    cov = ds.covariance(theta[:3])
+    assert cov.shape == (3, 2, 2)
+    assert np.allclose(cov[:, 0, 0], 0.04)
+
+
+def test_production_multi_rings_rejects_non_native_2d() -> None:
+    with pytest.raises(ValueError, match="x_dim == 2"):
+        ToyCategoricalMultiRingsDataset(x_dim=3)
+
+
+def test_multi_rings_build_from_meta_and_gt_ordering() -> None:
+    meta = {
+        "dataset_family": "multi_rings_radial",
+        "seed": 3,
+        "x_dim": 2,
+        "num_categories": 4,
+        "rings_radius_start": 1.0,
+        "rings_radius_step": 0.8,
+        "rings_noise": 0.2,
+    }
+    ds = build_dataset_from_meta(meta)
+    h2 = hellinger_gt_sq_category_matrix(ds)
+
+    assert isinstance(ds, ToyCategoricalMultiRingsDataset)
+    assert h2.shape == (4, 4)
+    assert np.allclose(h2, h2.T)
+    assert np.allclose(np.diag(h2), 0.0)
+    assert np.all(h2[np.triu_indices(4, 1)] > 0.0)
+    assert h2[0, 1] < h2[0, 2] < h2[0, 3]
+
+
+def test_make_dataset_multi_rings_writes_categorical_shared_npz(tmp_path: Path) -> None:
+    out = tmp_path / "multi_rings_radial.npz"
+    subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).resolve().parents[1] / "bin" / "make_dataset.py"),
+            "--dataset-family",
+            "multi_rings_radial",
+            "--num-categories",
+            "4",
+            "--n-total",
+            "80",
+            "--output-npz",
+            str(out),
+        ],
+        check=True,
+        cwd=str(Path(__file__).resolve().parents[1]),
+    )
+    bundle = load_shared_dataset_npz(out)
+    assert bundle.meta["dataset_family"] == "multi_rings_radial"
+    assert bundle.meta["theta_type"] == "categorical"
+    assert bundle.meta["theta_encoding"] == "one_hot"
+    assert int(bundle.meta["num_categories"]) == 4
+    assert bundle.theta_all.shape == (80, 4)
+    assert bundle.x_all.shape == (80, 2)
 
 
 def test_make_multi_rings_is_reproducible() -> None:

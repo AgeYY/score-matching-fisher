@@ -228,6 +228,20 @@ def family_recipe_dict(family: str) -> dict[str, Any]:
             "mog_alpha": 0.15,
             "mog_eps": 1e-5,
         }
+    if fam == "multi_rings_radial":
+        return {
+            **base,
+            "theta_low": 0.0,
+            "theta_high": 4.0,
+            "sigma_x1": 0.20,
+            "sigma_x2": 0.20,
+            "cov_theta_amp1": 0.0,
+            "cov_theta_amp2": 0.0,
+            "cov_theta_amp_rho": 0.0,
+            "rings_radius_start": 1.0,
+            "rings_radius_step": 0.8,
+            "rings_noise": 0.20,
+        }
     if fam == "cosine_gmm":
         return {**base, "sigma_x1": 0.30, "sigma_x2": 0.30}
     if fam == "cos_sin_piecewise":
@@ -255,7 +269,7 @@ def apply_family_recipe_to_namespace(ns: Any) -> None:
     if amp_scale != 1.0:
         setattr(ns, "cov_theta_amp1", float(getattr(ns, "cov_theta_amp1")) * amp_scale)
         setattr(ns, "cov_theta_amp2", float(getattr(ns, "cov_theta_amp2")) * amp_scale)
-    if fam == "random_mog_categorical":
+    if fam in ("random_mog_categorical", "multi_rings_radial"):
         k = int(getattr(ns, "num_categories", 5))
         setattr(ns, "theta_low", 0.0)
         setattr(ns, "theta_high", float(k - 1))

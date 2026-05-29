@@ -19,6 +19,7 @@ from fisher.data import (
     RANDAMP_SQRTD_VAR_MU_LAW_ADDITIVE,
     RANDAMP_SQRTD_VAR_MU_LAW_LEGACY,
     ToyCategoricalRandomMoGDataset,
+    ToyCategoricalMultiRingsDataset,
     ToyConditionalGMMNonGaussianDataset,
     ToyConditionalGaussianDataset,
     ToyConditionalGaussianCosineRandampSqrtdDataset,
@@ -726,6 +727,7 @@ def build_dataset_from_meta(
     | ToyConditionalGaussianRandampDataset
     | ToyConditionalGaussianRandampSqrtdDataset
     | ToyCategoricalRandomMoGDataset
+    | ToyCategoricalMultiRingsDataset
     | ToyCosSinPiecewiseNoiseDataset
     | ToyLinearPiecewiseNoiseDataset
     | ToyConditionalGMMNonGaussianDataset
@@ -1021,6 +1023,15 @@ def build_dataset_from_meta(
             ),
             seed=seed,
         )
+    if family == "multi_rings_radial":
+        return ToyCategoricalMultiRingsDataset(
+            x_dim=generative_x_dim_from_meta(meta),
+            num_categories=int(meta.get("num_categories", 5)),
+            radius_start=float(meta.get("rings_radius_start", 1.0)),
+            radius_step=float(meta.get("rings_radius_step", 0.8)),
+            rings_noise=float(meta.get("rings_noise", 0.20)),
+            seed=seed,
+        )
     if family == "cosine_gmm":
         return ToyConditionalGMMNonGaussianDataset(
             theta_low=float(meta["theta_low"]),
@@ -1083,6 +1094,7 @@ def build_dataset_from_args(
     | ToyConditionalGaussianRandampDataset
     | ToyConditionalGaussianRandampSqrtdDataset
     | ToyCategoricalRandomMoGDataset
+    | ToyCategoricalMultiRingsDataset
     | ToyCosSinPiecewiseNoiseDataset
     | ToyLinearPiecewiseNoiseDataset
     | ToyConditionalGMMNonGaussianDataset
@@ -1104,11 +1116,14 @@ def validate_dataset_sample_args(args: Any) -> None:
         raise ValueError("--cov-theta-amp-scale must be a finite positive number.")
     if args.x_dim < 1:
         raise ValueError("--x-dim must be >= 1.")
-    if str(getattr(args, "dataset_family", "")) == "random_mog_categorical":
+    if str(getattr(args, "dataset_family", "")) in ("random_mog_categorical", "multi_rings_radial"):
         if int(getattr(args, "num_categories", 5)) < 2:
-            raise ValueError("--num-categories must be >= 2 for random_mog_categorical.")
+            raise ValueError("--num-categories must be >= 2 for categorical datasets.")
+    if str(getattr(args, "dataset_family", "")) == "random_mog_categorical":
         if int(getattr(args, "mog_mean_max_attempts", 10_000)) < 1:
             raise ValueError("--mog-mean-max-attempts must be >= 1 for random_mog_categorical.")
+    if str(getattr(args, "dataset_family", "")) == "multi_rings_radial" and int(args.x_dim) != 2:
+        raise ValueError("--dataset-family multi_rings_radial requires native --x-dim 2.")
     if str(getattr(args, "dataset_family", "")) in (
         "cos_sin_piecewise",
         "linear_piecewise",

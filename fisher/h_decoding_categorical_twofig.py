@@ -44,6 +44,7 @@ from fisher import h_binned_visualization as vhb
 from fisher import h_decoding_convergence as conv
 from fisher.gaussian_x_flow import path_schedule_from_name
 from fisher.hellinger_gt import hellinger_sq_gaussian_diag
+from scipy.special import i0e
 from fisher.h_decoding_convergence_methods import (
     SweepSubset,
     _fit_sir_projection,
@@ -208,8 +209,18 @@ def _write_all_columns_png(
     return concatenate_svgs_horizontally_to_png(source_paths, out_dir / _ALL_COLUMNS_PNG_NAME, dpi=300)
 
 
-def _default_dataset_npz(num_categories: int) -> Path:
-    return _repo_root / "data" / f"random_mog_categorical_xdim2_k{int(num_categories)}" / "random_mog_categorical.npz"
+def _default_dataset_npz(dataset_family: str | int, num_categories: int | None = None) -> Path:
+    if num_categories is None:
+        fam = "random_mog_categorical"
+        k = int(dataset_family)
+    else:
+        fam = str(dataset_family)
+        k = int(num_categories)
+    if fam == "random_mog_categorical":
+        return _repo_root / "data" / f"random_mog_categorical_xdim2_k{k}" / "random_mog_categorical.npz"
+    if fam == "multi_rings_radial":
+        return _repo_root / "data" / f"multi_rings_radial_xdim2_k{k}" / "multi_rings_radial.npz"
+    raise ValueError(f"Unsupported categorical dataset family: {dataset_family!r}")
 
 
 def _abs_without_resolving_symlinks(path: Path) -> Path:
@@ -219,8 +230,9 @@ def _abs_without_resolving_symlinks(path: Path) -> Path:
     return _repo_root / p
 
 
-def _default_pr_output_npz(native_npz: Path, pr_dim: int) -> Path:
-    return _abs_without_resolving_symlinks(native_npz).parent / f"pr_xdim{int(pr_dim)}" / "random_mog_categorical_pr.npz"
+def _default_pr_output_npz(native_npz: Path, pr_dim: int, dataset_family: str = "random_mog_categorical") -> Path:
+    stem = "random_mog_categorical_pr" if str(dataset_family) == "random_mog_categorical" else "multi_rings_radial_pr"
+    return _abs_without_resolving_symlinks(native_npz).parent / f"pr_xdim{int(pr_dim)}" / f"{stem}.npz"
 
 
 def _run(cmd: list[str]) -> None:
@@ -237,7 +249,7 @@ def _ensure_dataset(args: argparse.Namespace) -> None:
                 sys.executable,
                 "bin/make_dataset.py",
                 "--dataset-family",
-                "random_mog_categorical",
+                str(args.dataset_family),
                 "--num-categories",
                 str(int(args.num_categories)),
                 "--n-total",
@@ -394,6 +406,8 @@ def compute_true_conditional_loglik_matrix(x_all: np.ndarray, theta_all: np.ndar
 
 
 def hellinger_gt_sq_category_matrix(gen_ds: object) -> np.ndarray:
+    if hasattr(gen_ds, "_rings_radii"):
+        return hellinger_gt_sq_multi_rings_radial(gen_ds)
     means = np.asarray(getattr(gen_ds, "_mog_means"), dtype=np.float64)
     variances = np.asarray(getattr(gen_ds, "_mog_variances"), dtype=np.float64)
     k = int(means.shape[0])
@@ -403,6 +417,34 @@ def hellinger_gt_sq_category_matrix(gen_ds: object) -> np.ndarray:
     for a in range(k):
         for b in range(k):
             h2[a, b] = hellinger_sq_gaussian_diag(means[a], variances[a], means[b], variances[b])
+    np.fill_diagonal(h2, 0.0)
+    np.clip(h2, 0.0, 1.0, out=h2)
+    return h2
+
+
+def _multi_rings_radial_log_density(rho: np.ndarray, radius: float, noise: float) -> np.ndarray:
+    rho = np.asarray(rho, dtype=np.float64)
+    s2 = float(noise) ** 2
+    r = float(radius)
+    z = rho * r / s2
+    return -np.log(2.0 * np.pi * s2) - (rho**2 + r**2) / (2.0 * s2) + np.log(i0e(z)) + np.abs(z)
+
+
+def hellinger_gt_sq_multi_rings_radial(gen_ds: object, *, n_grid: int = 4096) -> np.ndarray:
+    radii = np.asarray(getattr(gen_ds, "_rings_radii"), dtype=np.float64).reshape(-1)
+    noise = float(getattr(gen_ds, "rings_noise"))
+    k = int(radii.shape[0])
+    r_max = float(np.max(radii) + 8.0 * noise)
+    rho = np.linspace(0.0, r_max, int(n_grid), dtype=np.float64)
+    logp = np.stack([_multi_rings_radial_log_density(rho, float(r), noise) for r in radii], axis=0)
+    h2 = np.zeros((k, k), dtype=np.float64)
+    weight = 2.0 * np.pi * rho
+    for a in range(k):
+        for b in range(a + 1, k):
+            integrand = np.exp(0.5 * (logp[a] + logp[b])) * weight
+            affinity = float(np.trapezoid(integrand, rho))
+            val = 1.0 - affinity
+            h2[a, b] = h2[b, a] = val
     np.fill_diagonal(h2, 0.0)
     np.clip(h2, 0.0, 1.0, out=h2)
     return h2
@@ -1419,6 +1461,11 @@ def _validate_cached_cli(
         )
     if int(np.asarray(cached["num_categories"]).reshape(-1)[0]) != int(args.num_categories):
         raise ValueError("Cached num_categories does not match --num-categories.")
+    if "dataset_family" in cached:
+        got_family = str(np.asarray(cached["dataset_family"], dtype=object).reshape(-1)[0])
+        want_family = str(getattr(args, "dataset_family", "random_mog_categorical"))
+        if got_family != want_family:
+            raise ValueError(f"Cached dataset_family={got_family!r} does not match --dataset-family={want_family!r}.")
     names = [str(x) for x in np.asarray(cached["method_names"], dtype=object).tolist()]
     if names != methods:
         raise ValueError(f"Cached method_names {names} do not match CLI methods {methods}.")
@@ -1638,12 +1685,23 @@ def _write_summary(
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument(
+        "--dataset-family",
+        type=str,
+        default="random_mog_categorical",
+        choices=("random_mog_categorical", "multi_rings_radial"),
+        help="Categorical dataset family. Default preserves the original random MoG behavior.",
+    )
     p.add_argument("--num-categories", type=int, default=2)
     p.add_argument(
         "--dataset-npz",
         type=Path,
         default=None,
-        help="Native 2D NPZ. Default: data/random_mog_categorical_xdim2_kK/random_mog_categorical.npz",
+        help=(
+            "Native 2D NPZ. Defaults by --dataset-family: "
+            "data/random_mog_categorical_xdim2_kK/random_mog_categorical.npz or "
+            "data/multi_rings_radial_xdim2_kK/multi_rings_radial.npz."
+        ),
     )
     p.add_argument("--output-dir", type=Path, default=None)
     p.add_argument("--force-regenerate", action="store_true")
@@ -3067,7 +3125,7 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError(f"Require max(n-list) <= n-ref; got max(n_list)={max(ns)} n_ref={args.n_ref}.")
 
     if args.dataset_npz is None:
-        args.dataset_npz = _default_dataset_npz(int(args.num_categories))
+        args.dataset_npz = _default_dataset_npz(str(args.dataset_family), int(args.num_categories))
     args.dataset_npz = _abs_without_resolving_symlinks(Path(args.dataset_npz))
     if args.output_dir is None:
         args.output_dir = Path(DATA_DIR) / "h_decoding_categorical_twofig"
@@ -3082,8 +3140,11 @@ def main(argv: list[str] | None = None) -> None:
     native_npz = Path(args.dataset_npz).resolve()
     native_bundle = load_shared_dataset_npz(native_npz)
     native_meta = dict(native_bundle.meta)
-    if str(native_meta.get("dataset_family", "")) != "random_mog_categorical":
-        raise ValueError(f"Expected random_mog_categorical NPZ, got {native_meta.get('dataset_family')!r}.")
+    if str(native_meta.get("dataset_family", "")) != str(args.dataset_family):
+        raise ValueError(
+            f"Expected {args.dataset_family} NPZ, got {native_meta.get('dataset_family')!r}. "
+            "Pass the matching --dataset-family or regenerate the dataset."
+        )
     if str(native_meta.get("theta_type", "")) != "categorical":
         raise ValueError(f"Expected categorical theta_type, got {native_meta.get('theta_type')!r}.")
     native_x_dim = int(native_bundle.x_all.shape[1])
@@ -3098,7 +3159,7 @@ def main(argv: list[str] | None = None) -> None:
             raise ValueError(f"--pr-dim must exceed native x_dim={native_x_dim}; got {args.pr_dim}.")
         pr_out = args.pr_output_npz
         if pr_out is None:
-            pr_out = _default_pr_output_npz(native_npz, int(args.pr_dim))
+            pr_out = _default_pr_output_npz(native_npz, int(args.pr_dim), str(args.dataset_family))
         else:
             pr_out = _abs_without_resolving_symlinks(Path(pr_out))
         pr_out_resolved = Path(pr_out)
@@ -3495,6 +3556,7 @@ def main(argv: list[str] | None = None) -> None:
         n=np.asarray(ns, dtype=np.int64),
         n_ref=np.int64(int(args.n_ref)),
         num_categories=np.int64(k_cat),
+        dataset_family=np.asarray([str(args.dataset_family)], dtype=object),
         method_names=np.asarray(methods, dtype=object),
         theta_bin_centers=np.asarray(theta_centers, dtype=np.float64),
         perm_seed=np.int64(int(args.run_seed)),

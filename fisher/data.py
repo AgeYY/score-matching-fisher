@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import ClassVar
 
 import numpy as np
-from scipy.special import expit, logsumexp
+from scipy.special import expit, i0e, logsumexp
 
 
 def set_seed(seed: int) -> None:
@@ -1070,6 +1070,112 @@ class ToyCategoricalRandomMoGDataset:
         logdet = np.sum(np.log(v), axis=1)
         d = float(self.x_dim)
         return -0.5 * (d * np.log(2.0 * np.pi) + logdet + quad)
+
+
+@dataclass
+class ToyCategoricalMultiRingsDataset:
+    """Uniform categorical concentric-ring dataset in native 2D.
+
+    Category ``k`` samples a point on the circle with radius
+    ``radius_start + k * radius_step`` and adds isotropic Gaussian noise.
+    Theta is stored as one-hot categorical labels, matching
+    :class:`ToyCategoricalRandomMoGDataset`.
+    """
+
+    x_dim: int = 2
+    num_categories: int = 5
+    radius_start: float = 1.0
+    radius_step: float = 0.8
+    rings_noise: float = 0.20
+    seed: int = 42
+    theta_dim: int = 1
+    theta_type: str = "categorical"
+    diagonal_gaussian_observation_noise: ClassVar[bool] = False
+
+    def __post_init__(self) -> None:
+        if int(self.x_dim) != 2:
+            raise ValueError("ToyCategoricalMultiRingsDataset requires native x_dim == 2.")
+        if int(self.num_categories) < 2:
+            raise ValueError("num_categories must be >= 2.")
+        if float(self.radius_start) <= 0.0:
+            raise ValueError("radius_start must be positive.")
+        if float(self.radius_step) <= 0.0:
+            raise ValueError("radius_step must be positive.")
+        if float(self.rings_noise) <= 0.0:
+            raise ValueError("rings_noise must be positive.")
+        self.x_dim = 2
+        self.num_categories = int(self.num_categories)
+        if int(self.theta_dim) not in (1, self.num_categories):
+            raise ValueError(
+                "ToyCategoricalMultiRingsDataset theta_dim must be 1 for legacy scalar labels "
+                f"or num_categories={self.num_categories} for one-hot labels."
+            )
+        self.theta_dim = self.num_categories
+        self.rng = np.random.default_rng(self.seed)
+        self._rings_radii = (
+            float(self.radius_start) + float(self.radius_step) * np.arange(self.num_categories, dtype=np.float64)
+        )
+        self.theta_low = 0.0
+        self.theta_high = float(self.num_categories - 1)
+        self.cov = (float(self.rings_noise) ** 2) * np.eye(2, dtype=np.float64)
+        self.cov_chol = np.linalg.cholesky(self.cov)
+
+    def _labels(self, theta: np.ndarray) -> np.ndarray:
+        raw = np.asarray(theta)
+        arr = np.asarray(raw, dtype=np.float64)
+        if arr.ndim == 2 and int(arr.shape[1]) == self.num_categories:
+            row_sums = arr.sum(axis=1)
+            is_binary = np.all((np.abs(arr) <= 1e-6) | (np.abs(arr - 1.0) <= 1e-6), axis=1)
+            if np.any(np.abs(row_sums - 1.0) > 1e-6) or not bool(np.all(is_binary)):
+                raise ValueError("Categorical one-hot theta rows must contain one 1 and otherwise 0s.")
+            return np.argmax(arr, axis=1).astype(np.int64)
+        if arr.ndim == 2 and int(arr.shape[1]) != 1:
+            raise ValueError(
+                "Categorical theta must be legacy integer labels with shape (N, 1) "
+                f"or one-hot labels with shape (N, {self.num_categories})."
+            )
+        flat = arr.reshape(-1)
+        lab = np.rint(flat).astype(np.int64)
+        if np.any(np.abs(flat - lab.astype(np.float64)) > 1e-6):
+            raise ValueError("Categorical theta labels must be integer-valued.")
+        if np.any((lab < 0) | (lab >= self.num_categories)):
+            raise ValueError(f"Categorical theta labels must be in [0, {self.num_categories - 1}].")
+        return lab
+
+    def sample_theta(self, n: int) -> np.ndarray:
+        labels = self.rng.integers(0, self.num_categories, size=(int(n),), dtype=np.int64)
+        return np.eye(self.num_categories, dtype=np.float64)[labels]
+
+    def tuning_curve(self, theta: np.ndarray) -> np.ndarray:
+        labels = self._labels(theta)
+        return np.column_stack((self._rings_radii[labels], np.zeros(labels.shape[0], dtype=np.float64)))
+
+    def covariance(self, theta: np.ndarray) -> np.ndarray:
+        n = int(self._labels(theta).shape[0])
+        return np.broadcast_to(self.cov.reshape(1, 2, 2), (n, 2, 2)).copy()
+
+    def sample_x(self, theta: np.ndarray) -> np.ndarray:
+        labels = self._labels(theta)
+        angles = self.rng.uniform(0.0, 2.0 * np.pi, size=(labels.shape[0],))
+        radii = self._rings_radii[labels]
+        centers = np.column_stack((radii * np.cos(angles), radii * np.sin(angles)))
+        noise = float(self.rings_noise) * self.rng.standard_normal(size=centers.shape)
+        return (centers + noise).astype(np.float64)
+
+    def sample_joint(self, n: int) -> tuple[np.ndarray, np.ndarray]:
+        theta = self.sample_theta(n)
+        return theta, self.sample_x(theta)
+
+    def log_p_x_given_theta(self, x: np.ndarray, theta: np.ndarray) -> np.ndarray:
+        x_arr = np.asarray(x, dtype=np.float64).reshape(-1, 2)
+        labels = self._labels(theta)
+        if int(labels.shape[0]) != int(x_arr.shape[0]):
+            raise ValueError("x and theta must have the same number of rows.")
+        rho = np.linalg.norm(x_arr, axis=1)
+        r = self._rings_radii[labels]
+        s2 = float(self.rings_noise) ** 2
+        z = rho * r / s2
+        return -np.log(2.0 * np.pi * s2) - (rho**2 + r**2) / (2.0 * s2) + np.log(i0e(z)) + np.abs(z)
 
 
 @dataclass

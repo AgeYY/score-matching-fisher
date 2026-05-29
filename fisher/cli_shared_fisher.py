@@ -48,6 +48,7 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
             "randamp_gaussian2d_sqrtd",
             "gridcos_gaussian2d_sqrtd_rand_tune_additive",
             "random_mog_categorical",
+            "multi_rings_radial",
             "cosine_gmm",
             "cos_sin_piecewise",
             "linear_piecewise",
@@ -71,6 +72,7 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
             "'random_mog_categorical' (uniform categorical random diagonal Gaussian mixture; "
             "one-hot theta labels over categories 0..K-1; component means rejection-sampled with a "
             "hard pairwise Euclidean minimum distance unless means are supplied in NPZ meta); "
+            "'multi_rings_radial' (uniform categorical native-2D concentric rings with one-hot theta labels); "
             "For PR-autoencoder embedding into higher-dimensional x, generate this family first, then run "
             "`bin/project_dataset_pr_autoencoder.py`; "
             "'cosine_gmm' (theta-dependent 2-component mixture); "
@@ -146,7 +148,7 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
         type=int,
         default=5,
         help=(
-            "random_mog_categorical only: number of uniform mixture categories K. "
+            "Categorical families only: number of uniform categories K. "
             "Generated theta labels are one-hot vectors. Default 5."
         ),
     )

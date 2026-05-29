@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 import torch
 
-from fisher.data import ToyCategoricalRandomMoGDataset
+from fisher.data import ToyCategoricalMultiRingsDataset, ToyCategoricalRandomMoGDataset
 from fisher.h_decoding_categorical_twofig import (
     build_parser,
     h_sq_category_from_sample_directed,
@@ -1487,15 +1487,75 @@ def test_theta_flow_categorical_degeneracy_skips_low_train_count(monkeypatch: py
 def test_cli_defaults_from_parser() -> None:
     p = build_parser()
     ns = p.parse_args([])
+    assert ns.dataset_family == "random_mog_categorical"
     assert int(ns.num_categories) == 2
     assert ns.n_list == "80,200,400,600"
     assert int(ns.n_ref) == 10000
     assert str(ns.device) == "cuda"
 
 
+def test_cli_accepts_multi_rings_dataset_family() -> None:
+    p = build_parser()
+    ns = p.parse_args(["--dataset-family", "multi_rings_radial", "--num-categories", "4"])
+    assert ns.dataset_family == "multi_rings_radial"
+    assert int(ns.num_categories) == 4
+
+
+def test_hellinger_gt_category_matrix_multi_rings() -> None:
+    ds = ToyCategoricalMultiRingsDataset(num_categories=3, seed=0)
+    h2 = hellinger_gt_sq_category_matrix(ds)
+    assert h2.shape == (3, 3)
+    assert np.allclose(h2, h2.T)
+    assert np.allclose(np.diag(h2), 0.0)
+    assert 0.0 < h2[0, 1] < h2[0, 2] < 1.0
+
+
 def test_main_rejects_num_categories_lt2() -> None:
     with pytest.raises(ValueError, match="num-categories"):
         main(["--num-categories", "1", "--device", "cpu"])
+
+
+def test_main_rejects_mismatched_dataset_family(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import fisher.h_decoding_categorical_twofig as cat
+
+    theta = np.eye(2, dtype=np.float64)[np.array([0, 1, 0, 1], dtype=np.int64)]
+    x = np.zeros((4, 2), dtype=np.float64)
+    bundle = SharedDatasetBundle(
+        meta={"dataset_family": "multi_rings_radial", "theta_type": "categorical", "num_categories": 2},
+        theta_all=theta,
+        x_all=x,
+        train_idx=np.array([0, 1], dtype=np.int64),
+        validation_idx=np.array([2, 3], dtype=np.int64),
+        theta_train=theta[:2],
+        x_train=x[:2],
+        theta_validation=theta[2:],
+        x_validation=x[2:],
+    )
+    fake_npz = tmp_path / "multi_rings_radial.npz"
+    fake_npz.write_bytes(b"placeholder")
+    monkeypatch.setattr(cat, "_ensure_dataset", lambda args: None)
+    monkeypatch.setattr(cat, "load_shared_dataset_npz", lambda path: bundle)
+
+    with pytest.raises(ValueError, match="Expected random_mog_categorical NPZ"):
+        cat.main(
+            [
+                "--dataset-npz",
+                str(fake_npz),
+                "--num-categories",
+                "2",
+                "--n-ref",
+                "4",
+                "--n-list",
+                "2",
+                "--methods",
+                "bin_gaussian",
+                "--device",
+                "cpu",
+            ]
+        )
 
 
 def test_visualization_only_cached_shapes(tmp_path: Path) -> None:
