@@ -1,0 +1,23 @@
+# Install CUDA-enabled PyTorch before installing this file.
+# Choose the CUDA wheel for your machine from the official selector:
+# https://pytorch.org/get-started/locally/
+#
+# Example, update cuXXX as appropriate for your CUDA/driver:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+#
+# Then install repo dependencies:
+#   pip install -r requirements.txt
+#
+# Verify GPU support:
+#   python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+
+numpy
+scipy
+matplotlib
+scikit-learn
+pillow
+typing-extensions
+pytest
+torchdiffeq
+flow-matching
+zuko

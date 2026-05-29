@@ -8,7 +8,8 @@ import os
 # Override at runtime: export SCORE_MATCHING_FISHER_DATAROOT=/path/to/data
 DATAROOT = os.environ.get(
     "SCORE_MATCHING_FISHER_DATAROOT",
-    "/data/zeyuan/score-matching-fisher",
+    # "/data/zeyuan/score-matching-fisher",
+    "./data/",
 )
 
 # Default datasets and run outputs live directly under DATAROOT (same tree as the repo `data/` symlink).
