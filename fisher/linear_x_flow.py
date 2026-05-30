@@ -33,6 +33,23 @@ def _phi_expm1_div_a(a: torch.Tensor) -> torch.Tensor:
     return torch.where(mask, taylor, ref)
 
 
+def resolve_lxf_low_rank_dim(requested: int, x_dim: int, *, log_prefix: str = "") -> int:
+    """Clamp ``--lxf-low-rank-dim`` to ``x_dim`` when the requested rank is too large."""
+    r = int(requested)
+    xd = int(x_dim)
+    if r < 1:
+        raise ValueError(f"{log_prefix}--lxf-low-rank-dim must be >= 1; got {r}.")
+    if xd < 1:
+        raise ValueError(f"{log_prefix}x_dim must be >= 1; got {xd}.")
+    if r > xd:
+        print(
+            f"{log_prefix}warning: --lxf-low-rank-dim={r} exceeds x_dim={xd}; using r={xd}.",
+            flush=True,
+        )
+        return xd
+    return r
+
+
 def _as_2d_float64(a: np.ndarray, *, name: str) -> np.ndarray:
     arr = np.asarray(a, dtype=np.float64)
     if arr.ndim == 1:

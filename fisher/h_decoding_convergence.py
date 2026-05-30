@@ -599,9 +599,10 @@ def main(argv: list[str] | None = None) -> None:
             flush=True,
         )
     elif tfm == "xflow_sir_pure_lrank":
+        lxf_rank_desc = "auto_90_plus1" if getattr(args, "lxf_low_rank_dim", None) is None else str(int(getattr(args, "lxf_low_rank_dim")))
         print(
             f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
-            f"(lxf_low_rank_dim={int(getattr(args, 'lxf_low_rank_dim', 3))}; "
+            f"(lxf_low_rank_dim={lxf_rank_desc}; "
             f"sir_num_bins={int(getattr(args, 'sir_num_bins', 10))}; raw SIR U; pure U h(U^T x), no A or b)",
             flush=True,
         )
@@ -611,6 +612,7 @@ def main(argv: list[str] | None = None) -> None:
             flush=True,
         )
     elif tfm in ("xflow_sir_lrank", "xflow_sir_lrank_dia", "xflow_sir_lrank_dia_theta", "xflow_sir_lrank_scalar", "xflow_sir_lrank_scalar_theta"):
+        lxf_rank_desc = "auto_90_plus1" if getattr(args, "lxf_low_rank_dim", None) is None else str(int(getattr(args, "lxf_low_rank_dim")))
         if tfm == "xflow_sir_lrank_dia":
             a_desc = "diagonal A(t)"
         elif tfm == "xflow_sir_lrank_dia_theta":
@@ -623,7 +625,7 @@ def main(argv: list[str] | None = None) -> None:
             a_desc = "full A(t)"
         print(
             f"[convergence] sweep n in --n-list: --theta-field-method={tfm} "
-            f"(lxf_low_rank_dim={int(getattr(args, 'lxf_low_rank_dim', 3))}; "
+            f"(lxf_low_rank_dim={lxf_rank_desc}; "
             f"sir_num_bins={int(getattr(args, 'sir_num_bins', 10))}; raw SIR U in full x-space; {a_desc})",
             flush=True,
         )

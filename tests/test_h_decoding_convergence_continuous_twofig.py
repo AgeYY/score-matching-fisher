@@ -84,6 +84,8 @@ def test_parser_methods_default_and_old_selectors_rejected():
     parser = conv2.build_parser()
     args = parser.parse_args(["--dataset-npz", "dummy.npz"])
     assert args.methods == conv2.DEFAULT_METHODS
+    assert args.lxf_low_rank_dim is None
+    assert parser.parse_args(["--dataset-npz", "dummy.npz", "--lxf-low-rank-dim", "4"]).lxf_low_rank_dim == 4
     assert conv2._parse_methods(args.methods) == [
         "theta_flow",
         "x_flow",

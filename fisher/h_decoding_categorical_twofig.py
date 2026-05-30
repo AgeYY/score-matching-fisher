@@ -1910,7 +1910,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lxfs-quadrature-steps", type=int, default=64)
     p.add_argument("--lxfs-pair-batch-size", type=int, default=65536)
     p.add_argument("--lxfs-solve-jitter", type=float, default=1e-6)
-    p.add_argument("--lxf-low-rank-dim", type=int, default=1)
+    p.add_argument(
+        "--lxf-low-rank-dim",
+        type=int,
+        default=None,
+        help=(
+            "xflow_sir_lrank: raw SIR U rank r (also passed to SIR fit). "
+            "Default: automatic smallest SIR rank explaining >=90%% inverse-regression eigenvalue mass, plus one."
+        ),
+    )
     p.add_argument("--lxf-low-rank-divergence-estimator", type=str, default="hutchinson")
     p.add_argument("--lxf-hutchinson-probes", type=int, default=1)
     p.add_argument("--lxf-nlpca-ode-steps", type=int, default=32)
@@ -2379,7 +2387,6 @@ def _train_linear_x_flow_delta(
     x_all: np.ndarray,
 ) -> dict[str, Any]:
     print(f"[cat-twofig] training {method_name}", flush=True)
-    rank = int(args.lxf_low_rank_dim)
     common = dict(
         theta_dim=int(theta_all.shape[1]),
         x_dim=int(x_all.shape[1]),
@@ -2394,18 +2401,18 @@ def _train_linear_x_flow_delta(
         ).to(dev)
         ode_likelihood = False
     elif method_name == "xflow_sir_lrank":
-        if rank > int(x_all.shape[1]):
-            raise ValueError(f"--lxf-low-rank-dim must be <= x_dim={x_all.shape[1]}; got {rank}.")
+        rank_arg = args.lxf_low_rank_dim
         _, _, _, fitted = _fit_sir_projection(
             x_train=x_train,
             theta_train=theta_train,
             x_val=x_val,
             x_all=x_all,
-            sir_dim=rank,
+            sir_dim=None if rank_arg is None else int(rank_arg),
             num_bins=int(args.sir_num_bins),
             ridge=float(args.sir_ridge),
         )
         sir_meta = dict(fitted)
+        rank = int(sir_meta["sir_dim"])
         model = ConditionalTimeLowRankCorrectionLinearXFlowMLP(
             **common,
             correction_rank=rank,

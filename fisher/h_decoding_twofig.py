@@ -683,8 +683,10 @@ def build_parser() -> argparse.ArgumentParser:
             "linear_x_flow_low_rank_t,linear_x_flow_pure_low_rank_t,linear_x_flow_pure_cond_low_rank_t,linear_x_flow_diagonal_t. "
             "For linear_x_flow_t and xflow_sir_lrank, --theta-flow-fourier-state can replace scalar theta "
             "with the shared Fourier theta state. "
-            "For low-rank linear_x_flow rows use --lxf-low-rank-dim (default 3). "
-            "For xflow_sir_lrank and xflow_sir_pure_lrank variants, --lxf-low-rank-dim is the raw SIR U rank and "
+            "For low-rank linear_x_flow rows use --lxf-low-rank-dim (default 3 for non-SIR low-rank rows). "
+            "For xflow_sir_lrank and xflow_sir_pure_lrank variants, omitting --lxf-low-rank-dim selects "
+            "the raw SIR U rank automatically from >=90%% inverse-regression eigenvalue mass plus one; when set, "
+            "--lxf-low-rank-dim is the manual raw SIR U rank and "
             "--sir-num-bins/--sir-ridge control SIR. "
             "For SIR preprocessing use sir_xflow_lrank_t, sir_xflow, or sir_thetaflow with --sir-dim and --sir-num-bins "
             "(sir_xflow_lrank_t also needs --lxf-low-rank-dim <= --sir-dim)."
@@ -921,6 +923,10 @@ def _project_sir_first_subset(
         sir_components=np.asarray(sir_meta["sir_components"], dtype=np.float64),
         sir_x_mean=np.asarray(sir_meta["sir_x_mean"], dtype=np.float64),
         sir_eigenvalues=np.asarray(sir_meta["sir_eigenvalues"], dtype=np.float64),
+        sir_eigenvalues_all=np.asarray(sir_meta.get("sir_eigenvalues_all", sir_meta["sir_eigenvalues"]), dtype=np.float64),
+        sir_rank_mode=np.asarray(sir_meta.get("sir_rank_mode", ["manual"]), dtype=object),
+        sir_rank_requested=np.asarray(sir_meta.get("sir_rank_requested", args.sir_dim)),
+        sir_rank_auto_threshold=np.asarray(sir_meta.get("sir_rank_auto_threshold", 0.90)),
         sir_bin_counts=np.asarray(sir_meta["sir_bin_counts"], dtype=np.int64),
         sir_nonempty_bin_ids=np.asarray(sir_meta["sir_nonempty_bin_ids"], dtype=np.int64),
         sir_slice_means=np.asarray(sir_meta["sir_slice_means"], dtype=np.float64),
@@ -989,7 +995,7 @@ def _save_vae_wrapper_loss_npz(path: str, *, method_name: str, vae_payload: dict
     )
 
 
-def _annotate_npz_with_sir(path: str, sir_meta: dict[str, np.ndarray | int | float], sir_path: str) -> None:
+def _annotate_npz_with_sir(path: str, sir_meta: dict[str, Any], sir_path: str) -> None:
     if not os.path.isfile(path):
         return
     with np.load(path, allow_pickle=True) as data:
@@ -1003,6 +1009,10 @@ def _annotate_npz_with_sir(path: str, sir_meta: dict[str, np.ndarray | int | flo
         sir_components=np.asarray(sir_meta["sir_components"], dtype=np.float64),
         sir_x_mean=np.asarray(sir_meta["sir_x_mean"], dtype=np.float64),
         sir_eigenvalues=np.asarray(sir_meta["sir_eigenvalues"], dtype=np.float64),
+        sir_eigenvalues_all=np.asarray(sir_meta.get("sir_eigenvalues_all", sir_meta["sir_eigenvalues"]), dtype=np.float64),
+        sir_rank_mode=np.asarray(sir_meta.get("sir_rank_mode", ["manual"]), dtype=object),
+        sir_rank_requested=np.asarray(sir_meta.get("sir_rank_requested", sir_meta["sir_dim"])),
+        sir_rank_auto_threshold=np.asarray(sir_meta.get("sir_rank_auto_threshold", 0.90)),
         sir_bin_counts=np.asarray(sir_meta["sir_bin_counts"], dtype=np.int64),
         sir_theta_edges=np.asarray(sir_meta["sir_theta_edges"], dtype=np.float64),
     )

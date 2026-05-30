@@ -79,6 +79,7 @@ from fisher.linear_x_flow import (
     train_low_rank_t_warmup_then_full,
     train_low_rank_t_theta_only_b_mean_regression_pretrain_then_freeze_b,
     train_time_linear_x_flow_schedule,
+    resolve_lxf_low_rank_dim,
 )
 from fisher.linear_theta_flow import (
     ConditionalLinearThetaFlowMixtureMLP,
@@ -900,10 +901,10 @@ def _fit_sir_projection(
     theta_train: np.ndarray,
     x_val: np.ndarray,
     x_all: np.ndarray,
-    sir_dim: int,
+    sir_dim: int | None,
     num_bins: int,
     ridge: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray | int | float]]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
     """Fit SIR on train data and project train/val/all observations."""
     x_tr = np.asarray(x_train, dtype=np.float64)
     th_tr = np.asarray(theta_train, dtype=np.float64)
@@ -919,18 +920,17 @@ def _fit_sir_projection(
         raise ValueError("SIR theta_train length must match x_train rows.")
     if x_tr.shape[1] != x_va.shape[1] or x_tr.shape[1] != x_full.shape[1]:
         raise ValueError("SIR x dimension mismatch.")
-    m = int(sir_dim)
+    x_dim = int(x_tr.shape[1])
+    manual_rank = sir_dim is not None
+    m_requested = int(sir_dim) if manual_rank else 0
     nb = int(num_bins)
     lam = float(ridge)
-    if m < 1:
-        raise ValueError("--sir-dim must be >= 1.")
+    if manual_rank and m_requested < 1:
+        raise ValueError("[SIR] --lxf-low-rank-dim must be >= 1.")
     if nb < 2:
         raise ValueError("--sir-num-bins must be >= 2.")
     if not np.isfinite(lam) or lam <= 0.0:
         raise ValueError("--sir-ridge must be finite and > 0.")
-    x_dim = int(x_tr.shape[1])
-    if m > x_dim:
-        raise ValueError(f"--sir-dim must be <= x_dim={x_dim}; got {m}.")
 
     theta_dim = int(th_tr.shape[1])
     per_dim_bins = np.zeros((int(th_tr.shape[0]), theta_dim), dtype=np.int64)
@@ -955,11 +955,6 @@ def _fit_sir_projection(
     if n_slices < 2:
         raise ValueError("SIR projection requires at least two non-empty theta bins in the train split.")
     max_rank = min(x_dim, n_slices - 1)
-    if m > max_rank:
-        raise ValueError(
-            f"--sir-dim={m} exceeds available SIR rank {max_rank} "
-            f"(non_empty_bins={n_slices}, x_dim={x_dim})."
-        )
 
     x_mean = np.mean(x_tr, axis=0, dtype=np.float64)
     centered = x_tr - x_mean
@@ -980,12 +975,40 @@ def _fit_sir_projection(
     order = np.argsort(eigvals)[::-1]
     eigvals = np.asarray(eigvals[order], dtype=np.float64)
     eigvecs = np.asarray(eigvecs[:, order], dtype=np.float64)
+    eigvals_for_rank = np.asarray(eigvals[:max_rank], dtype=np.float64)
+    if manual_rank:
+        m = int(m_requested)
+        if m > max_rank:
+            print(
+                f"[SIR] warning: requested rank {m} exceeds available SIR rank {max_rank} "
+                f"(non_empty_bins={n_slices}, x_dim={x_dim}); using r={max_rank}.",
+                flush=True,
+            )
+            m = max_rank
+        rank_mode = "manual"
+    else:
+        rank_threshold = 0.90
+        clipped = np.clip(eigvals_for_rank, 0.0, None)
+        clipped = np.where(np.isfinite(clipped), clipped, 0.0)
+        total = float(np.sum(clipped))
+        if total > 0.0 and np.isfinite(total):
+            cum_ratio = np.cumsum(clipped) / total
+            k90 = int(np.searchsorted(cum_ratio, rank_threshold, side="left")) + 1
+            m = min(k90 + 1, max_rank)
+        else:
+            m = 1
+        rank_mode = "auto_90_plus1"
+        print(
+            f"[SIR] auto rank selected r={m} "
+            f"(threshold=0.90, available SIR rank {max_rank}, non_empty_bins={n_slices}, x_dim={x_dim}).",
+            flush=True,
+        )
     components = np.linalg.solve(chol.T, eigvecs[:, :m]).astype(np.float64, copy=False)
 
     z_train = centered @ components
     z_val = (x_va - x_mean) @ components
     z_all = (x_full - x_mean) @ components
-    meta: dict[str, np.ndarray | int | float] = {
+    meta: dict[str, Any] = {
         "sir_dim": np.int64(m),
         "sir_num_bins": np.int64(nb),
         "sir_ridge": np.float64(lam),
@@ -993,6 +1016,10 @@ def _fit_sir_projection(
         "sir_x_mean": x_mean.astype(np.float64, copy=False),
         "sir_components": components,
         "sir_eigenvalues": np.asarray(eigvals[:m], dtype=np.float64),
+        "sir_eigenvalues_all": eigvals_for_rank,
+        "sir_rank_mode": np.asarray([rank_mode], dtype=object),
+        "sir_rank_requested": np.int64(m_requested),
+        "sir_rank_auto_threshold": np.float64(0.90),
         "sir_bin_counts": np.asarray(counts, dtype=np.int64),
         "sir_nonempty_bin_ids": np.asarray(nonempty_ids, dtype=np.int64),
         "sir_slice_means": slice_means,
@@ -1697,6 +1724,10 @@ def _estimate_one(
             sir_x_mean=np.asarray(sir_meta["sir_x_mean"], dtype=np.float64),
             sir_components=np.asarray(sir_meta["sir_components"], dtype=np.float64),
             sir_eigenvalues=np.asarray(sir_meta["sir_eigenvalues"], dtype=np.float64),
+            sir_eigenvalues_all=np.asarray(sir_meta.get("sir_eigenvalues_all", sir_meta["sir_eigenvalues"]), dtype=np.float64),
+            sir_rank_mode=np.asarray(sir_meta.get("sir_rank_mode", ["manual"]), dtype=object),
+            sir_rank_requested=np.asarray(sir_meta.get("sir_rank_requested", sir_dim)),
+            sir_rank_auto_threshold=np.asarray(sir_meta.get("sir_rank_auto_threshold", 0.90)),
             sir_bin_counts=np.asarray(sir_meta["sir_bin_counts"], dtype=np.int64),
             sir_nonempty_bin_ids=np.asarray(sir_meta["sir_nonempty_bin_ids"], dtype=np.int64),
             sir_slice_means=np.asarray(sir_meta["sir_slice_means"], dtype=np.float64),
@@ -1753,27 +1784,35 @@ def _estimate_one(
         theta_val_model = theta_val
         theta_all_model = theta_all
         x_dim_lxf = int(x_all.shape[1])
-        lxf_rank = int(getattr(args, "lxf_low_rank_dim", 3))
-        sir_meta_lxf: dict[str, np.ndarray | int | float] | None = None
+        sir_meta_lxf: dict[str, Any] | None = None
         fixed_sir_u: np.ndarray | None = None
-        if method_name in (
+        sir_lxf_methods = (
             "xflow_sir_lrank",
             "xflow_sir_lrank_dia",
             "xflow_sir_lrank_dia_theta",
             "xflow_sir_lrank_scalar",
             "xflow_sir_lrank_scalar_theta",
             "xflow_sir_pure_lrank",
-        ):
+        )
+        if method_name in sir_lxf_methods:
+            lxf_rank_arg = getattr(args, "lxf_low_rank_dim", None)
             _, _, _, sir_meta_lxf = _fit_sir_projection(
                 x_train=x_train,
                 theta_train=theta_train,
                 x_val=x_val,
                 x_all=x_all,
-                sir_dim=lxf_rank,
+                sir_dim=None if lxf_rank_arg is None else int(lxf_rank_arg),
                 num_bins=int(getattr(args, "sir_num_bins", 10)),
                 ridge=float(getattr(args, "sir_ridge", 1e-6)),
             )
             fixed_sir_u = np.asarray(sir_meta_lxf["sir_components"], dtype=np.float64)
+            lxf_rank = int(sir_meta_lxf["sir_dim"])
+        else:
+            lxf_rank = resolve_lxf_low_rank_dim(
+                int(3 if getattr(args, "lxf_low_rank_dim", None) is None else getattr(args, "lxf_low_rank_dim")),
+                x_dim_lxf,
+                log_prefix="[convergence] ",
+            )
         common = dict(theta_dim=int(theta_all.shape[1]), x_dim=x_dim_lxf, hidden_dim=int(getattr(args, f"{lxf_prefix}_hidden_dim", 128)), depth=int(getattr(args, f"{lxf_prefix}_depth", 3)))
         if method_name == "linear_x_flow_t":
             drift_type = "full_symmetric_time"
@@ -1788,41 +1827,34 @@ def _estimate_one(
             drift_type = "diagonal_theta_time"
             model = ConditionalTimeThetaDiagonalLinearXFlowMLP(**common, quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64))).to(dev)
         elif method_name == "linear_x_flow_low_rank_t":
-            if lxf_rank > x_dim_lxf: raise ValueError(f"--lxf-low-rank-dim must be <= x_dim={x_dim_lxf}; got {lxf_rank}.")
             drift_type = "low_rank_correction_time"
             model = ConditionalTimeLowRankCorrectionLinearXFlowMLP(**common, correction_rank=lxf_rank, quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)), divergence_estimator=str(getattr(args, "lxf_low_rank_divergence_estimator", "hutchinson")).strip().lower(), hutchinson_probes=int(getattr(args, "lxf_hutchinson_probes", 1))).to(dev)
         elif method_name == "xflow_sir_lrank":
-            if lxf_rank > x_dim_lxf: raise ValueError(f"--lxf-low-rank-dim must be <= x_dim={x_dim_lxf}; got {lxf_rank}.")
             if fixed_sir_u is None:
                 raise RuntimeError("xflow_sir_lrank expected a fitted SIR basis.")
             drift_type = "sir_low_rank_correction_time"
             model = ConditionalTimeLowRankCorrectionLinearXFlowMLP(**common, correction_rank=lxf_rank, quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)), divergence_estimator=str(getattr(args, "lxf_low_rank_divergence_estimator", "hutchinson")).strip().lower(), hutchinson_probes=int(getattr(args, "lxf_hutchinson_probes", 1),), fixed_u=fixed_sir_u).to(dev)
         elif method_name == "xflow_sir_lrank_dia":
-            if lxf_rank > x_dim_lxf: raise ValueError(f"--lxf-low-rank-dim must be <= x_dim={x_dim_lxf}; got {lxf_rank}.")
             if fixed_sir_u is None:
                 raise RuntimeError("xflow_sir_lrank_dia expected a fitted SIR basis.")
             drift_type = "sir_low_rank_correction_diagonal_time"
             model = ConditionalTimeDiagonalLowRankCorrectionLinearXFlowMLP(**common, correction_rank=lxf_rank, quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)), divergence_estimator=str(getattr(args, "lxf_low_rank_divergence_estimator", "hutchinson")).strip().lower(), hutchinson_probes=int(getattr(args, "lxf_hutchinson_probes", 1),), fixed_u=fixed_sir_u).to(dev)
         elif method_name == "xflow_sir_lrank_dia_theta":
-            if lxf_rank > x_dim_lxf: raise ValueError(f"--lxf-low-rank-dim must be <= x_dim={x_dim_lxf}; got {lxf_rank}.")
             if fixed_sir_u is None:
                 raise RuntimeError("xflow_sir_lrank_dia_theta expected a fitted SIR basis.")
             drift_type = "sir_low_rank_correction_diagonal_theta_time"
             model = ConditionalTimeThetaDiagonalLowRankCorrectionLinearXFlowMLP(**common, correction_rank=lxf_rank, quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)), divergence_estimator=str(getattr(args, "lxf_low_rank_divergence_estimator", "hutchinson")).strip().lower(), hutchinson_probes=int(getattr(args, "lxf_hutchinson_probes", 1),), fixed_u=fixed_sir_u).to(dev)
         elif method_name == "xflow_sir_lrank_scalar":
-            if lxf_rank > x_dim_lxf: raise ValueError(f"--lxf-low-rank-dim must be <= x_dim={x_dim_lxf}; got {lxf_rank}.")
             if fixed_sir_u is None:
                 raise RuntimeError("xflow_sir_lrank_scalar expected a fitted SIR basis.")
             drift_type = "sir_low_rank_correction_scalar_time"
             model = ConditionalTimeScalarLowRankCorrectionLinearXFlowMLP(**common, correction_rank=lxf_rank, quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)), divergence_estimator=str(getattr(args, "lxf_low_rank_divergence_estimator", "hutchinson")).strip().lower(), hutchinson_probes=int(getattr(args, "lxf_hutchinson_probes", 1),), fixed_u=fixed_sir_u).to(dev)
         elif method_name == "xflow_sir_lrank_scalar_theta":
-            if lxf_rank > x_dim_lxf: raise ValueError(f"--lxf-low-rank-dim must be <= x_dim={x_dim_lxf}; got {lxf_rank}.")
             if fixed_sir_u is None:
                 raise RuntimeError("xflow_sir_lrank_scalar_theta expected a fitted SIR basis.")
             drift_type = "sir_low_rank_correction_scalar_theta_time"
             model = ConditionalTimeThetaScalarLowRankCorrectionLinearXFlowMLP(**common, correction_rank=lxf_rank, quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)), divergence_estimator=str(getattr(args, "lxf_low_rank_divergence_estimator", "hutchinson")).strip().lower(), hutchinson_probes=int(getattr(args, "lxf_hutchinson_probes", 1),), fixed_u=fixed_sir_u).to(dev)
         elif method_name == "xflow_sir_pure_lrank":
-            if lxf_rank > x_dim_lxf: raise ValueError(f"--lxf-low-rank-dim must be <= x_dim={x_dim_lxf}; got {lxf_rank}.")
             if fixed_sir_u is None:
                 raise RuntimeError("xflow_sir_pure_lrank expected a fitted SIR basis.")
             drift_type = "sir_pure_low_rank_time"
@@ -1835,19 +1867,15 @@ def _estimate_one(
                 fixed_u=fixed_sir_u,
             ).to(dev)
         elif method_name == "linear_x_flow_pure_low_rank_t":
-            if lxf_rank > x_dim_lxf: raise ValueError(f"--lxf-low-rank-dim must be <= x_dim={x_dim_lxf}; got {lxf_rank}.")
             drift_type = "pure_low_rank_time"
             model = ConditionalTimePureLowRankLinearXFlowMLP(**common, correction_rank=lxf_rank, quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)), divergence_estimator=str(getattr(args, "lxf_low_rank_divergence_estimator", "hutchinson")).strip().lower(), hutchinson_probes=int(getattr(args, "lxf_hutchinson_probes", 1))).to(dev)
         elif method_name == "linear_x_flow_pure_cond_low_rank_t":
-            if lxf_rank > x_dim_lxf: raise ValueError(f"--lxf-low-rank-dim must be <= x_dim={x_dim_lxf}; got {lxf_rank}.")
             drift_type = "pure_cond_low_rank_time"
             model = ConditionalTimePureConditionalLowRankLinearXFlowMLP(**common, correction_rank=lxf_rank, quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)), divergence_estimator=str(getattr(args, "lxf_low_rank_divergence_estimator", "hutchinson")).strip().lower(), hutchinson_probes=int(getattr(args, "lxf_hutchinson_probes", 1))).to(dev)
         elif method_name == "linear_x_flow_lr_t_ts":
-            if lxf_rank > x_dim_lxf: raise ValueError(f"--lxf-low-rank-dim must be <= x_dim={x_dim_lxf}; got {lxf_rank}.")
             drift_type = "low_rank_correction_time_theta_only_b"
             model = ConditionalTimeThetaOnlyBLowRankCorrectionLinearXFlowMLP(**common, correction_rank=lxf_rank, quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)), divergence_estimator=str(getattr(args, "lxf_low_rank_divergence_estimator", "hutchinson")).strip().lower(), hutchinson_probes=int(getattr(args, "lxf_hutchinson_probes", 1))).to(dev)
         elif method_name == "linear_x_flow_low_rank_randb_t":
-            if lxf_rank > x_dim_lxf: raise ValueError(f"--lxf-low-rank-dim must be <= x_dim={x_dim_lxf}; got {lxf_rank}.")
             drift_type = "low_rank_randb_time"
             model = ConditionalTimeRandomBasisLowRankLinearXFlowMLP(**common, rank=lxf_rank, quadrature_steps=int(getattr(args, "lxfs_quadrature_steps", 64)), lambda_a=float(getattr(args, "lxf_randb_lambda_a", 1e-4)), lambda_s=float(getattr(args, "lxf_randb_lambda_s", 1e-4))).to(dev)
         else:
@@ -1935,6 +1963,10 @@ def _estimate_one(
                     "sir_x_mean": np.asarray(sir_meta_lxf["sir_x_mean"], dtype=np.float64),
                     "sir_components": np.asarray(sir_meta_lxf["sir_components"], dtype=np.float64),
                     "sir_eigenvalues": np.asarray(sir_meta_lxf["sir_eigenvalues"], dtype=np.float64),
+                    "sir_eigenvalues_all": np.asarray(sir_meta_lxf.get("sir_eigenvalues_all", sir_meta_lxf["sir_eigenvalues"]), dtype=np.float64),
+                    "sir_rank_mode": np.asarray(sir_meta_lxf.get("sir_rank_mode", ["manual"]), dtype=object),
+                    "sir_rank_requested": np.asarray(sir_meta_lxf.get("sir_rank_requested", lxf_rank)),
+                    "sir_rank_auto_threshold": np.asarray(sir_meta_lxf.get("sir_rank_auto_threshold", 0.90)),
                     "sir_bin_counts": np.asarray(sir_meta_lxf["sir_bin_counts"], dtype=np.int64),
                     "sir_nonempty_bin_ids": np.asarray(sir_meta_lxf["sir_nonempty_bin_ids"], dtype=np.int64),
                     "sir_slice_means": np.asarray(sir_meta_lxf["sir_slice_means"], dtype=np.float64),

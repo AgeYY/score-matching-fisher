@@ -700,9 +700,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--lxf-low-rank-dim",
         type=int,
-        default=3,
+        default=None,
         help=(
-            "Default: 3. "
+            "Default: automatic for xflow_sir_lrank variants (smallest SIR rank explaining >=90%% "
+            "inverse-regression eigenvalue mass, plus one, capped to available SIR rank); "
+            "3 for non-SIR low-rank linear_x_flow variants. "
             "linear_x_flow_low_rank_t / linear_x_flow_pure_low_rank_t / linear_x_flow_pure_cond_low_rank_t / "
             "linear_x_flow_lr_t_ts / xflow_sir_lrank / xflow_sir_lrank_dia / xflow_sir_lrank_dia_theta / xflow_sir_lrank_scalar / "
             "xflow_sir_lrank_scalar_theta / xflow_sir_pure_lrank: "
@@ -1301,7 +1303,9 @@ def _validate_sir_wrapper_cli(args: argparse.Namespace) -> None:
     setattr(base_args, "theta_field_method", inner)
     if inner == "linear_x_flow_low_rank_t":
         _validate_lxf_cli(base_args)
-        if int(getattr(args, "lxf_low_rank_dim", 0)) > sir_dim:
+        low_rank_dim = getattr(args, "lxf_low_rank_dim", None)
+        low_rank_dim_eff = 3 if low_rank_dim is None else int(low_rank_dim)
+        if low_rank_dim_eff > sir_dim:
             raise ValueError("--lxf-low-rank-dim must be <= --sir-dim for sir_xflow_lrank_t.")
     elif inner == "x_flow":
         validate_estimation_args(base_args)
@@ -1364,28 +1368,27 @@ def _validate_lxf_cli(args: argparse.Namespace) -> None:
         raise ValueError(f"{label}-hidden-dim must be >= 1.")
     if int(getattr(args, f"{prefix}_depth", 0)) < 1:
         raise ValueError(f"{label}-depth must be >= 1.")
-    if method in (
-        "linear_x_flow_low_rank_t",
+    low_rank_dim = getattr(args, "lxf_low_rank_dim", None)
+    sir_lxf_methods = (
         "xflow_sir_lrank",
         "xflow_sir_lrank_dia",
         "xflow_sir_lrank_dia_theta",
         "xflow_sir_lrank_scalar",
         "xflow_sir_lrank_scalar_theta",
         "xflow_sir_pure_lrank",
+    )
+    low_rank_methods = (
+        "linear_x_flow_low_rank_t",
         "linear_x_flow_pure_low_rank_t",
         "linear_x_flow_pure_cond_low_rank_t",
         "linear_x_flow_lr_t_ts",
         "linear_x_flow_low_rank_randb_t",
-    ) and int(getattr(args, "lxf_low_rank_dim", 0)) < 1:
+    )
+    if method in low_rank_methods and low_rank_dim is None:
+        low_rank_dim = 3
+    if method in (*low_rank_methods, *sir_lxf_methods) and low_rank_dim is not None and int(low_rank_dim) < 1:
         raise ValueError("--lxf-low-rank-dim must be >= 1.")
-    if method in (
-        "xflow_sir_lrank",
-        "xflow_sir_lrank_dia",
-        "xflow_sir_lrank_dia_theta",
-        "xflow_sir_lrank_scalar",
-        "xflow_sir_lrank_scalar_theta",
-        "xflow_sir_pure_lrank",
-    ):
+    if method in sir_lxf_methods:
         if int(getattr(args, "sir_num_bins", 0)) < 2:
             raise ValueError(f"--sir-num-bins must be >= 2 for {method}.")
         ridge = float(getattr(args, "sir_ridge", 0.0))

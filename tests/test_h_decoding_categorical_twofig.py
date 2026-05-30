@@ -2336,3 +2336,151 @@ def test_pairwise_clf_from_bundle_decode_bin_override_row_mismatch(tmp_path: Pat
             decode_x_all=np.ones((3, 2), dtype=np.float64),
             decode_bin_all=np.array([0, 1], dtype=np.int64),
         )
+
+
+def test_resolve_lxf_low_rank_dim_clamps_to_x_dim(capsys: pytest.CaptureFixture[str]) -> None:
+    from fisher.linear_x_flow import resolve_lxf_low_rank_dim
+
+    assert resolve_lxf_low_rank_dim(3, 2, log_prefix="[test] ") == 2
+    captured = capsys.readouterr().out
+    assert "warning" in captured.lower()
+    assert "using r=2" in captured
+    assert resolve_lxf_low_rank_dim(2, 5) == 2
+
+
+def test_fit_sir_projection_clamps_to_available_rank(capsys: pytest.CaptureFixture[str]) -> None:
+    from fisher.h_decoding_convergence_methods import _fit_sir_projection
+
+    theta = np.eye(2, dtype=np.float64)[np.array([0, 1, 0, 1, 0, 1])]
+    x = np.array(
+        [
+            [0.0, 0.0, 0.0, 0.0, 0.0],
+            [1.0, 0.2, 0.0, 0.0, 0.0],
+            [0.1, 0.0, 0.1, 0.0, 0.0],
+            [1.1, 0.1, 0.0, 0.1, 0.0],
+            [0.2, 0.0, 0.0, 0.0, 0.1],
+            [1.2, 0.2, 0.1, 0.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+
+    z_train, z_val, z_all, meta = _fit_sir_projection(
+        x_train=x,
+        theta_train=theta,
+        x_val=x,
+        x_all=x,
+        sir_dim=3,
+        num_bins=10,
+        ridge=1e-6,
+    )
+
+    captured = capsys.readouterr().out
+    assert "available SIR rank 1" in captured
+    assert "using r=1" in captured
+    assert int(meta["sir_dim"]) == 1
+    assert z_train.shape == (6, 1)
+    assert z_val.shape == (6, 1)
+    assert z_all.shape == (6, 1)
+
+
+def test_fit_sir_projection_caps_requested_rank_with_sir_max_rank(capsys: pytest.CaptureFixture[str]) -> None:
+    from fisher.h_decoding_convergence_methods import _fit_sir_projection
+
+    theta = np.linspace(0.0, 1.0, 8, dtype=np.float64).reshape(-1, 1)
+    x = np.column_stack(
+        [
+            theta[:, 0],
+            theta[:, 0] ** 2,
+        ]
+    ).astype(np.float64)
+
+    z_train, z_val, z_all, meta = _fit_sir_projection(
+        x_train=x,
+        theta_train=theta,
+        x_val=x,
+        x_all=x,
+        sir_dim=3,
+        num_bins=4,
+        ridge=1e-6,
+    )
+
+    captured = capsys.readouterr().out
+    assert "available SIR rank 2" in captured
+    assert "using r=2" in captured
+    assert "--lxf-low-rank-dim=3 exceeds x_dim=2" not in captured
+    assert int(meta["sir_dim"]) == 2
+    assert z_train.shape == (8, 2)
+    assert z_val.shape == (8, 2)
+    assert z_all.shape == (8, 2)
+
+
+def test_fit_sir_projection_auto_rank_uses_eigenvalue_ratio(capsys: pytest.CaptureFixture[str]) -> None:
+    from fisher.h_decoding_convergence_methods import _fit_sir_projection
+
+    theta = np.linspace(-1.0, 1.0, 12, dtype=np.float64).reshape(-1, 1)
+    x = np.column_stack(
+        [
+            theta[:, 0],
+            theta[:, 0] ** 2,
+            0.25 * theta[:, 0] ** 3,
+        ]
+    ).astype(np.float64)
+
+    z_train, z_val, z_all, meta = _fit_sir_projection(
+        x_train=x,
+        theta_train=theta,
+        x_val=x,
+        x_all=x,
+        sir_dim=None,
+        num_bins=4,
+        ridge=1e-6,
+    )
+
+    captured = capsys.readouterr().out
+    eig = np.asarray(meta["sir_eigenvalues_all"], dtype=np.float64)
+    clipped = np.clip(eig, 0.0, None)
+    total = float(np.sum(clipped))
+    k90 = int(np.searchsorted(np.cumsum(clipped) / total, 0.90, side="left")) + 1
+    expected_rank = min(k90 + 1, int(eig.shape[0]))
+    assert "auto rank selected" in captured
+    assert str(np.asarray(meta["sir_rank_mode"], dtype=object).reshape(-1)[0]) == "auto_90_plus1"
+    assert int(meta["sir_rank_requested"]) == 0
+    assert float(meta["sir_rank_auto_threshold"]) == pytest.approx(0.90)
+    assert int(meta["sir_dim"]) == expected_rank
+    assert z_train.shape == (12, expected_rank)
+    assert z_val.shape == (12, expected_rank)
+    assert z_all.shape == (12, expected_rank)
+
+
+def test_fit_sir_projection_auto_rank_zero_eigenvalues_falls_back_to_one() -> None:
+    from fisher.h_decoding_convergence_methods import _fit_sir_projection
+
+    theta = np.linspace(0.0, 1.0, 8, dtype=np.float64).reshape(-1, 1)
+    x = np.ones((8, 3), dtype=np.float64)
+
+    z_train, z_val, z_all, meta = _fit_sir_projection(
+        x_train=x,
+        theta_train=theta,
+        x_val=x,
+        x_all=x,
+        sir_dim=None,
+        num_bins=4,
+        ridge=1e-6,
+    )
+
+    assert int(meta["sir_dim"]) == 1
+    assert str(np.asarray(meta["sir_rank_mode"], dtype=object).reshape(-1)[0]) == "auto_90_plus1"
+    assert z_train.shape == (8, 1)
+    assert z_val.shape == (8, 1)
+    assert z_all.shape == (8, 1)
+
+
+def test_categorical_lxf_low_rank_dim_default_auto_and_manual_override() -> None:
+    from fisher.h_decoding_categorical_twofig import build_parser
+
+    parser = build_parser()
+    args_auto = parser.parse_args([])
+    args_manual = parser.parse_args(["--lxf-low-rank-dim", "3"])
+
+    assert args_auto.lxf_low_rank_dim is None
+    assert args_manual.lxf_low_rank_dim == 3

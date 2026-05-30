@@ -2079,7 +2079,21 @@ def _write_summary(
             f.write(f"lxf_hidden_dim: {int(getattr(args, 'lxf_hidden_dim', 0))}\n")
             f.write(f"lxf_depth: {int(getattr(args, 'lxf_depth', 0))}\n")
             f.write(f"lxf_b_net: {getattr(args, 'lxf_b_net', 'mlp')}\n")
-            f.write(f"lxf_low_rank_dim: {int(getattr(args, 'lxf_low_rank_dim', 0))}\n")
+            _lxf_rank_summary = getattr(args, "lxf_low_rank_dim", None)
+            _is_sir_lxf_summary = _tfm_sum in (
+                "xflow_sir_lrank",
+                "xflow_sir_lrank_dia",
+                "xflow_sir_lrank_dia_theta",
+                "xflow_sir_lrank_scalar",
+                "xflow_sir_lrank_scalar_theta",
+                "xflow_sir_pure_lrank",
+            )
+            _lxf_rank_summary_text = (
+                "auto_90_plus1"
+                if _lxf_rank_summary is None and _is_sir_lxf_summary
+                else int(3 if _lxf_rank_summary is None else _lxf_rank_summary)
+            )
+            f.write(f"lxf_low_rank_dim: {_lxf_rank_summary_text}\n")
             f.write(f"lxf_randb_lambda_a: {float(getattr(args, 'lxf_randb_lambda_a', 0.0))}\n")
             f.write(f"lxf_randb_lambda_s: {float(getattr(args, 'lxf_randb_lambda_s', 0.0))}\n")
             f.write(f"lxf_weight_decay: {float(getattr(args, 'lxf_weight_decay', 0.0))}\n")
@@ -2158,7 +2172,11 @@ def _write_summary(
             "xflow_sir_pure_lrank",
         ):
             _sir_dim_summary = (
-                int(getattr(args, "lxf_low_rank_dim", 0))
+                (
+                    "auto_90_plus1"
+                    if getattr(args, "lxf_low_rank_dim", None) is None
+                    else int(getattr(args, "lxf_low_rank_dim"))
+                )
                 if _tfm_sum in (
                     "xflow_sir_lrank",
                     "xflow_sir_lrank_dia",
