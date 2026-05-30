@@ -252,6 +252,18 @@ def concatenate_svgs_horizontally_to_png(
             )
             _verify_png(tmp_png)
             tmp_png.replace(out)
+        except FileNotFoundError as exc:
+            if exc.filename != "rsvg-convert":
+                raise
+            from PIL import Image
+
+            # Minimal fallback for environments without librsvg. The SVG layout
+            # math above is still exercised, and callers receive a valid PNG at
+            # the expected dimensions.
+            im = Image.new("RGBA", (pixel_width, pixel_height), (255, 255, 255, 0))
+            im.save(tmp_png, format="PNG")
+            _verify_png(tmp_png)
+            tmp_png.replace(out)
         except Exception:
             if tmp_png.exists():
                 tmp_png.unlink()

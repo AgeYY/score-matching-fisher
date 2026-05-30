@@ -66,6 +66,7 @@ from fisher.decoding_native_x import decoding_x_train_all_from_native, load_nati
 from fisher.shared_dataset_io import SharedDatasetBundle, load_shared_dataset_npz
 from fisher.h_decoding_convergence_methods import SweepSubset, _fit_sir_projection
 from fisher.shared_fisher_est import build_dataset_from_meta, normalize_flow_arch, normalize_theta_field_method
+from fisher.vae_ctsm_v import _vae_payload, prepare_vae_mean_features
 
 # Valid row choices for --theta-field-rows:
 # - theta_flow:mlp
@@ -105,6 +106,12 @@ _FLOW_BASED_METHODS = {"theta_flow", "theta_path_integral", "x_flow", "sir_xflow
 # Row specs allow ``method:arch`` when the trained estimator ultimately uses ``--flow-arch`` (includes staged embeddings).
 _FLOW_ROW_ARCH_METHODS = _FLOW_BASED_METHODS
 _NO_TRAIN_METHODS = {"bin_gaussian"}
+_VAE_WRAPPED_METHODS = {
+    "vae_x_flow": "x_flow",
+    "vae_xflow_sir_lrank": "xflow_sir_lrank",
+    "vae_bin_gaussian": "bin_gaussian",
+    "vae_ctsm_v": "ctsm_v",
+}
 
 
 class CachedTwofigBundle(TypedDict, total=False):
@@ -608,6 +615,14 @@ def _run_twofig_visualization_only(
 
 def _normalize_theta_field_method_local(method: str) -> str:
     m = str(method).strip().lower()
+    if m in {"vae-x-flow", "vae_x_flow"}:
+        return "vae_x_flow"
+    if m in {"vae-xflow-sir-lrank", "vae_xflow_sir_lrank"}:
+        return "vae_xflow_sir_lrank"
+    if m in {"vae-bin-gaussian", "vae_bin_gaussian"}:
+        return "vae_bin_gaussian"
+    if m in {"vae-ctsm-v", "vae_ctsm_v"}:
+        return "vae_ctsm_v"
     if m in {"bin_gaussian", "binned_gaussian", "binned-gaussian", "bin-gaussian"}:
         return "bin_gaussian"
     if m == "nf":
@@ -649,6 +664,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Comma-separated theta-field methods to sweep in one run. "
             "Overrides --theta-field-method when non-empty. "
             "Supported values: theta_flow, theta_path_integral, x_flow, ctsm_v, nf, bin_gaussian, "
+            "vae_x_flow, vae_xflow_sir_lrank, vae_bin_gaussian, vae_ctsm_v, "
             "contrastive_soft / contrastive_soft_categorical "
             "(same aliases as study_h_decoding_convergence.py), "
             "and supported scheduled linear_x_flow variants including linear_x_flow_diagonal_t "
@@ -705,6 +721,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=argparse.SUPPRESS,
     )
+    p.add_argument("--vae-latent-dim", type=int, default=0, help="VAE wrapper latent dimension. 0 uses min(5, x_dim).")
+    p.add_argument("--vae-hidden-dim", type=int, default=128)
+    p.add_argument("--vae-depth", type=int, default=4)
+    p.add_argument("--vae-epochs", type=int, default=5000)
+    p.add_argument("--vae-batch-size", type=int, default=256)
+    p.add_argument("--vae-lr", type=float, default=1e-3)
+    p.add_argument("--vae-weight-decay", type=float, default=0.0)
+    p.add_argument("--vae-early-patience", type=int, default=500)
+    p.add_argument("--vae-early-min-delta", type=float, default=1e-4)
+    p.add_argument("--vae-early-ema-alpha", type=float, default=0.05)
+    p.add_argument("--vae-kl-weight", type=float, default=0.01)
     return p
 
 
@@ -810,10 +837,11 @@ def _parse_theta_field_rows(args: argparse.Namespace) -> list[ThetaFieldRowSpec]
 
 def _validate_cli_for_rows(args: argparse.Namespace, rows: list[ThetaFieldRowSpec]) -> None:
     for row in rows:
-        if row.method in _NO_TRAIN_METHODS:
+        base_method = _VAE_WRAPPED_METHODS.get(row.method, row.method)
+        if row.method in _NO_TRAIN_METHODS or base_method in _NO_TRAIN_METHODS:
             continue
         args_r = deepcopy(args)
-        setattr(args_r, "theta_field_method", row.method)
+        setattr(args_r, "theta_field_method", base_method)
         if row.arch is not None:
             setattr(args_r, "flow_arch", row.arch)
         try:
@@ -904,6 +932,61 @@ def _project_sir_first_subset(
         bin_all=np.asarray(subset.bin_all, dtype=np.int64),
     )
     return projected, sir_meta, sir_path
+
+
+def _subset_with_vae_mean_x(
+    *,
+    subset: SweepSubset,
+    args: argparse.Namespace,
+    dev: Any,
+) -> tuple[SweepSubset, dict[str, Any]]:
+    vae = prepare_vae_mean_features(
+        args,
+        device=dev,
+        x_train=subset.bundle.x_train,
+        x_val=subset.bundle.x_validation,
+        x_eval=subset.bundle.x_all,
+    )
+    meta = dict(subset.bundle.meta)
+    meta["x_dim"] = int(np.asarray(vae["x_eval"], dtype=np.float64).shape[1])
+    meta["vae_preprocessed"] = True
+    bundle = SharedDatasetBundle(
+        meta=meta,
+        theta_all=subset.bundle.theta_all,
+        x_all=np.asarray(vae["x_eval"], dtype=np.float64),
+        train_idx=subset.bundle.train_idx,
+        validation_idx=subset.bundle.validation_idx,
+        theta_train=subset.bundle.theta_train,
+        x_train=np.asarray(vae["x_train"], dtype=np.float64),
+        theta_validation=subset.bundle.theta_validation,
+        x_validation=np.asarray(vae["x_validation"], dtype=np.float64),
+    )
+    return (
+        SweepSubset(
+            bundle=bundle,
+            bin_all=subset.bin_all,
+            bin_train=subset.bin_train,
+            bin_validation=subset.bin_validation,
+        ),
+        _vae_payload(vae, args),
+    )
+
+
+def _save_vae_wrapper_loss_npz(path: str, *, method_name: str, vae_payload: dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tr = np.asarray(vae_payload.get("train_losses", []), dtype=np.float64).ravel()
+    va = np.asarray(vae_payload.get("val_losses", []), dtype=np.float64).ravel()
+    em = np.asarray(vae_payload.get("val_monitor_losses", []), dtype=np.float64).ravel()
+    extra = {f"vae_{k}": v for k, v in vae_payload.items()}
+    np.savez_compressed(
+        path,
+        theta_field_method=np.asarray([str(method_name)], dtype=object),
+        prior_enable=np.bool_(False),
+        score_train_losses=tr,
+        score_val_losses=va,
+        score_val_monitor_losses=em,
+        **extra,
+    )
 
 
 def _annotate_npz_with_sir(path: str, sir_meta: dict[str, np.ndarray | int | float], sir_path: str) -> None:
@@ -1733,7 +1816,8 @@ def main(argv: list[str] | None = None, *, sir_first_default: bool = False) -> N
     setattr(args, "theta_field_row_methods_resolved", row_methods)
     setattr(args, "theta_field_row_arches_resolved", row_arches)
     validation_row = next((r for r in row_specs if r.method not in _NO_TRAIN_METHODS), row_specs[0])
-    args.theta_field_method = "theta_flow" if validation_row.method in _NO_TRAIN_METHODS else validation_row.method
+    validation_method = _VAE_WRAPPED_METHODS.get(validation_row.method, validation_row.method)
+    args.theta_field_method = "theta_flow" if validation_method in _NO_TRAIN_METHODS else validation_method
     if validation_row.arch is not None:
         args.flow_arch = validation_row.arch
     conv._validate_cli(args)
@@ -2003,6 +2087,7 @@ def main(argv: list[str] | None = None, *, sir_first_default: bool = False) -> N
         os.makedirs(sweep_root, exist_ok=True)
     loss_root = os.path.join(args.output_dir, "training_losses")
     os.makedirs(loss_root, exist_ok=True)
+    dev = conv.require_device(str(args.device))
 
     decode_dir = os.path.join(args.output_dir, "decode_shared")
     os.makedirs(decode_dir, exist_ok=True)
@@ -2057,7 +2142,8 @@ def main(argv: list[str] | None = None, *, sir_first_default: bool = False) -> N
             t1 = time.time()
             tmp_ctx: tempfile.TemporaryDirectory[str] | None = None
             args_method = deepcopy(args)
-            args_method.theta_field_method = row.method
+            base_method = _VAE_WRAPPED_METHODS.get(row.method, row.method)
+            args_method.theta_field_method = base_method
             if row.arch is not None:
                 args_method.flow_arch = row.arch
             try:
@@ -2076,7 +2162,14 @@ def main(argv: list[str] | None = None, *, sir_first_default: bool = False) -> N
                     )
                     sir_meta_n = {}
                     sir_path_n = ""
-                if row.method == "bin_gaussian":
+                vae_payload_n: dict[str, Any] | None = None
+                if row.method in _VAE_WRAPPED_METHODS:
+                    subset_n, vae_payload_n = _subset_with_vae_mean_x(
+                        subset=subset_n,
+                        args=args,
+                        dev=dev,
+                    )
+                if base_method == "bin_gaussian":
                     variance_floor = float(
                         getattr(args, "flow_theta_reg_variance_floor", getattr(args, "flow_x_reg_variance_floor", 1e-6))
                     )
@@ -2087,6 +2180,14 @@ def main(argv: list[str] | None = None, *, sir_first_default: bool = False) -> N
                     )
                     method_h.append(np.asarray(conv._sqrt_h_like(bg_h2), dtype=np.float64))
                     wall_s[m_idx, k] = time.time() - t1
+                    if vae_payload_n is not None:
+                        row_loss_dir = os.path.join(loss_root, _sanitize_row_label(row.label))
+                        os.makedirs(row_loss_dir, exist_ok=True)
+                        _save_vae_wrapper_loss_npz(
+                            os.path.abspath(os.path.join(row_loss_dir, f"n_{int(n):06d}.npz")),
+                            method_name=row.label,
+                            vae_payload=vae_payload_n,
+                        )
                     print(
                         f"[twofig] row={row.label} n={n} done in {wall_s[m_idx, k]:.1f}s "
                         f"(binned Gaussian, variance_floor={variance_floor:g})",
@@ -2105,7 +2206,7 @@ def main(argv: list[str] | None = None, *, sir_first_default: bool = False) -> N
 
                 loaded_n, _, _ = conv._estimate_one(
                     args=args_method,
-                    meta=subset_n.bundle.meta if sir_first else meta,
+                    meta=subset_n.bundle.meta,
                     bundle=subset_n.bundle,
                     output_dir=run_dir,
                     n_bins=n_bins,
@@ -2122,6 +2223,11 @@ def main(argv: list[str] | None = None, *, sir_first_default: bool = False) -> N
                 os.makedirs(row_loss_dir, exist_ok=True)
                 dst_loss_npz = os.path.abspath(os.path.join(row_loss_dir, f"n_{int(n):06d}.npz"))
                 shutil.copy2(src_loss_npz, dst_loss_npz)
+                if vae_payload_n is not None:
+                    with np.load(dst_loss_npz, allow_pickle=True) as z_loss:
+                        payload_loss = {k2: np.asarray(z_loss[k2]) for k2 in z_loss.files}
+                    payload_loss.update({f"vae_{k2}": v2 for k2, v2 in vae_payload_n.items()})
+                    np.savez_compressed(dst_loss_npz, **payload_loss)
                 if sir_first:
                     _annotate_npz_with_sir(dst_loss_npz, sir_meta_n, sir_path_n)
                     for h_name in ("h_matrix_results.npz", "h_matrix_results_theta_cov.npz"):

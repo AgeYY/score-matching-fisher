@@ -556,7 +556,10 @@ def test_bench_llr_summary_records_loss_llr_combined_and_results_paths(tmp_path:
 
 def test_parse_methods_aliases_and_dedup() -> None:
     assert parse_methods("x-flow, X_FLOW, binary-classifier") == ["x_flow", "binary_classifier"]
+    assert parse_methods("vae-x-flow, vae_x_flow") == ["vae_x_flow"]
+    assert parse_methods("vae-xflow-sir-lrank, vae_xflow_sir_lrank") == ["vae_xflow_sir_lrank"]
     assert parse_methods("bin-gaussian, bin_gaussian, x_flow") == ["bin_gaussian", "x_flow"]
+    assert parse_methods("vae-bin-gaussian, vae_bin_gaussian") == ["vae_bin_gaussian"]
     assert parse_methods("bin_gaussian_cate") == ["bin_gaussian"]
     assert parse_methods("contrastive-soft-categorical, contrastive_soft_categorical") == [
         "contrastive_soft_categorical"
@@ -564,6 +567,7 @@ def test_parse_methods_aliases_and_dedup() -> None:
     assert parse_methods("theta-flow-cate, theta_flow_cate, thetaflow-cate") == ["theta_flow_cate"]
     assert parse_methods("ctsm-v, ctsm_v, ctsm") == ["ctsm_v"]
     assert parse_methods("ctsm-v-binary, ctsm_v_binary, ctsm_binary") == ["ctsm_v_binary"]
+    assert parse_methods("vae-ctsm-v, vae_ctsm_v") == ["vae_ctsm_v"]
     assert parse_methods("latent-belief-ctsm-v-binary, latent_ctsm_v_binary") == [
         "latent_belief_ctsm_v_binary"
     ]

@@ -92,6 +92,7 @@ from fisher.shared_fisher_est import (
     train_pair_conditioned_ctsm_v_model,
 )
 from fisher.svg_utils import concatenate_svgs_horizontally_to_png
+from fisher.vae_ctsm_v import _vae_payload, prepare_vae_mean_features
 from fisher.models import (
     ConditionalThetaFlowVelocity,
     ConditionalThetaFlowVelocityFiLMPerLayer,
@@ -110,6 +111,8 @@ _METHOD_ALIASES: dict[str, str] = {
     "x-flow": "x_flow",
     "x_flow": "x_flow",
     "xflow": "x_flow",
+    "vae-x-flow": "vae_x_flow",
+    "vae_x_flow": "vae_x_flow",
     "binary-classification": "binary_classifier",
     "binary_classification": "binary_classifier",
     "binary-classifier": "binary_classifier",
@@ -119,6 +122,8 @@ _METHOD_ALIASES: dict[str, str] = {
     "linear_x_flow_t": "linear_x_flow_t",
     "xflow-sir-lrank": "xflow_sir_lrank",
     "xflow_sir_lrank": "xflow_sir_lrank",
+    "vae-xflow-sir-lrank": "vae_xflow_sir_lrank",
+    "vae_xflow_sir_lrank": "vae_xflow_sir_lrank",
     "contrastive-soft-categorical": "contrastive_soft_categorical",
     "contrastive_soft_categorical": "contrastive_soft_categorical",
     "theta-flow-cate": "theta_flow_cate",
@@ -129,12 +134,16 @@ _METHOD_ALIASES: dict[str, str] = {
     "bin-gaussian": "bin_gaussian",
     "binned_gaussian": "bin_gaussian",
     "binned-gaussian": "bin_gaussian",
+    "vae-bin-gaussian": "vae_bin_gaussian",
+    "vae_bin_gaussian": "vae_bin_gaussian",
     "ctsm-v": "ctsm_v",
     "ctsm_v": "ctsm_v",
     "ctsm": "ctsm_v",
     "ctsm-v-binary": "ctsm_v_binary",
     "ctsm_v_binary": "ctsm_v_binary",
     "ctsm_binary": "ctsm_v_binary",
+    "vae-ctsm-v": "vae_ctsm_v",
+    "vae_ctsm_v": "vae_ctsm_v",
     "latent-belief-ctsm-v-binary": "latent_belief_ctsm_v_binary",
     "latent_belief_ctsm_v_binary": "latent_belief_ctsm_v_binary",
     "latent_ctsm_v_binary": "latent_belief_ctsm_v_binary",
@@ -159,8 +168,12 @@ _SUPPORTED_METHODS_HELP = ", ".join(
         "contrastive_soft_categorical",
         "theta_flow_cate",
         "bin_gaussian",
+        "vae_x_flow",
+        "vae_xflow_sir_lrank",
+        "vae_bin_gaussian",
         "ctsm_v",
         "ctsm_v_binary",
+        "vae_ctsm_v",
         "latent_belief_ctsm_v_binary",
         "latent_belief_ctsm_v_binary_inner_post",
         "lda_ctsm_v",
@@ -1828,6 +1841,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--latent-n-mc-eval", type=int, default=16)
     p.add_argument("--latent-n-posterior-pairs", type=int, default=1)
     p.add_argument("--latent-precision-eps", type=float, default=1e-4)
+    p.add_argument(
+        "--vae-latent-dim",
+        type=int,
+        default=0,
+        help="vae_ctsm_v latent dimension. 0 uses min(5, x_dim).",
+    )
+    p.add_argument("--vae-hidden-dim", type=int, default=128)
+    p.add_argument("--vae-depth", type=int, default=4)
+    p.add_argument("--vae-epochs", type=int, default=5000)
+    p.add_argument("--vae-batch-size", type=int, default=256)
+    p.add_argument("--vae-lr", type=float, default=1e-3)
+    p.add_argument("--vae-weight-decay", type=float, default=0.0)
+    p.add_argument("--vae-early-patience", type=int, default=500)
+    p.add_argument("--vae-early-min-delta", type=float, default=1e-4)
+    p.add_argument("--vae-early-ema-alpha", type=float, default=0.05)
+    p.add_argument("--vae-kl-weight", type=float, default=0.01)
+    p.add_argument("--vae-n-samples", type=int, default=16)
     p.add_argument("--ctsm-m-scale", type=float, default=1.0)
     p.add_argument("--ctsm-delta-scale", type=float, default=0.5)
     p.add_argument("--ctsm-arch", type=str, default="film", choices=["mlp", "film"])
@@ -1937,9 +1967,15 @@ def _save_method_training_loss_npz(out_path: str | Path, *, method_name: str, re
         "theta_flow_cate_val_counts",
         "theta_flow_cate_num_valid_pairs",
         "theta_flow_cate_num_skipped_pairs",
+        "ctsm_binary_llr_1_minus_0",
+        "vae_ctsm_binary_llr_1_minus_0",
     ):
         if key in result:
             extra[key] = result[key]
+    vae_payload = result.get("vae_payload")
+    if isinstance(vae_payload, dict) and bool(vae_payload.get("enabled", False)):
+        for key, value in vae_payload.items():
+            extra[f"vae_{key}"] = value
     np.savez_compressed(
         str(p),
         theta_field_method=np.asarray([str(method_name)], dtype=object),
@@ -1948,6 +1984,58 @@ def _save_method_training_loss_npz(out_path: str | Path, *, method_name: str, re
         score_val_losses=va,
         score_val_monitor_losses=em,
         **extra,
+    )
+
+
+def _vae_mean_result(
+    args: argparse.Namespace,
+    *,
+    dev: torch.device,
+    x_train: np.ndarray,
+    x_val: np.ndarray,
+    x_all: np.ndarray,
+) -> dict[str, Any]:
+    vae = prepare_vae_mean_features(
+        args,
+        device=dev,
+        x_train=x_train,
+        x_val=x_val,
+        x_eval=x_all,
+    )
+    return {
+        "x_train": np.asarray(vae["x_train"], dtype=np.float64),
+        "x_val": np.asarray(vae["x_validation"], dtype=np.float64),
+        "x_all": np.asarray(vae["x_eval"], dtype=np.float64),
+        "vae_payload": _vae_payload(vae, args),
+        "vae_train_out": vae.get("train_out", {}),
+    }
+
+
+def _sweep_subset_with_x(
+    subset: SweepSubset,
+    *,
+    x_train: np.ndarray,
+    x_val: np.ndarray,
+    x_all: np.ndarray,
+) -> SweepSubset:
+    meta = dict(subset.bundle.meta)
+    meta["x_dim"] = int(np.asarray(x_all).shape[1])
+    bundle = SharedDatasetBundle(
+        meta=meta,
+        theta_all=subset.bundle.theta_all,
+        x_all=np.asarray(x_all, dtype=np.float64),
+        train_idx=subset.bundle.train_idx,
+        validation_idx=subset.bundle.validation_idx,
+        theta_train=subset.bundle.theta_train,
+        x_train=np.asarray(x_train, dtype=np.float64),
+        theta_validation=subset.bundle.theta_validation,
+        x_validation=np.asarray(x_val, dtype=np.float64),
+    )
+    return SweepSubset(
+        bundle=bundle,
+        bin_all=subset.bin_all,
+        bin_train=subset.bin_train,
+        bin_validation=subset.bin_validation,
     )
 
 
@@ -2990,6 +3078,21 @@ def _train_one_method(
             theta_all=theta_all,
             x_all=x_all,
         )
+    if method_name == "vae_x_flow":
+        vae = _vae_mean_result(args, dev=dev, x_train=x_train, x_val=x_val, x_all=x_all)
+        result = _train_x_flow_delta(
+            args,
+            dev=dev,
+            theta_train=theta_train,
+            x_train=vae["x_train"],
+            theta_val=theta_val,
+            x_val=vae["x_val"],
+            theta_all=theta_all,
+            x_all=vae["x_all"],
+        )
+        result["vae_payload"] = vae["vae_payload"]
+        result["vae_train_out"] = vae["vae_train_out"]
+        return result
     if method_name == "binary_classifier":
         return _train_binary_classifier_delta(
             args,
@@ -3023,6 +3126,22 @@ def _train_one_method(
             theta_all=theta_all,
             x_all=x_all,
         )
+    if method_name == "vae_xflow_sir_lrank":
+        vae = _vae_mean_result(args, dev=dev, x_train=x_train, x_val=x_val, x_all=x_all)
+        result = _train_linear_x_flow_delta(
+            args,
+            method_name="xflow_sir_lrank",
+            dev=dev,
+            theta_train=theta_train,
+            x_train=vae["x_train"],
+            theta_val=theta_val,
+            x_val=vae["x_val"],
+            theta_all=theta_all,
+            x_all=vae["x_all"],
+        )
+        result["vae_payload"] = vae["vae_payload"]
+        result["vae_train_out"] = vae["vae_train_out"]
+        return result
     if method_name == "theta_flow_cate":
         return theta_flow_categorical_hellinger_sqrt(
             args,
@@ -3046,6 +3165,22 @@ def _train_one_method(
             theta_all=theta_all,
             x_all=x_all,
         )
+    if method_name == "vae_ctsm_v":
+        vae = _vae_mean_result(args, dev=dev, x_train=x_train, x_val=x_val, x_all=x_all)
+        result = _train_ctsm_v_delta(
+            args,
+            dev=dev,
+            theta_train=theta_train,
+            x_train=vae["x_train"],
+            theta_val=theta_val,
+            x_val=vae["x_val"],
+            theta_all=theta_all,
+            x_all=vae["x_all"],
+        )
+        result["vae_payload"] = vae["vae_payload"]
+        result["vae_train_out"] = vae["vae_train_out"]
+        result["ctsm_theta_encoding"] = np.asarray(["one_hot_vae_mean_x"], dtype=object)
+        return result
     if method_name == "ctsm_v_binary":
         return _train_ctsm_v_binary_delta(
             args,
@@ -3302,7 +3437,7 @@ def main(argv: list[str] | None = None) -> None:
             os.makedirs(row_loss_dir, exist_ok=True)
             loss_npz_path = os.path.join(row_loss_dir, f"n_{int(n):06d}.npz")
 
-            if method_name == "bin_gaussian":
+            if method_name in {"bin_gaussian", "vae_bin_gaussian"}:
                 vf = float(
                     getattr(
                         args,
@@ -3310,7 +3445,29 @@ def main(argv: list[str] | None = None) -> None:
                         getattr(args, "flow_x_reg_variance_floor", 1e-6),
                     )
                 )
-                subset_bg = _validation_only_work_sweep_subset(subset_w) if val_h else subset_w
+                subset_bg_base = _validation_only_work_sweep_subset(subset_w) if val_h else subset_w
+                result = {"train_out": None}
+                if method_name == "vae_bin_gaussian":
+                    vae = _vae_mean_result(
+                        args,
+                        dev=dev,
+                        x_train=x_train,
+                        x_val=x_val,
+                        x_all=np.asarray(subset_bg_base.bundle.x_all, dtype=np.float64),
+                    )
+                    subset_bg = _sweep_subset_with_x(
+                        subset_bg_base,
+                        x_train=vae["x_train"],
+                        x_val=vae["x_val"],
+                        x_all=vae["x_all"],
+                    )
+                    result = {
+                        "train_out": vae["vae_train_out"],
+                        "vae_payload": vae["vae_payload"],
+                        "vae_train_out": vae["vae_train_out"],
+                    }
+                else:
+                    subset_bg = subset_bg_base
                 bg_h2 = conv._binned_gaussian_hellinger_sq(subset_bg, k_cat, variance_floor=vf)
                 delta = _binned_gaussian_delta_l(subset_bg, k_cat, variance_floor=vf)
                 h_sqrt_sweep[i, j] = np.asarray(
@@ -3319,7 +3476,6 @@ def main(argv: list[str] | None = None) -> None:
                 )
                 np.fill_diagonal(h_sqrt_sweep[i, j], 0.0)
                 wall_s[i, j] = time.time() - t0
-                result = {"train_out": None}
                 m_llr = dbg._llr_comparison_metrics(delta, true_delta_l)
                 llr_pearson_offdiag[i, j] = float(m_llr["llr_pearson_r_offdiag"])
                 m_h = dbg._hellinger_comparison_metrics_cat(bg_h2, hellinger_gt_sq)
@@ -3384,7 +3540,7 @@ def main(argv: list[str] | None = None) -> None:
             if int(n) == int(n_scatter):
                 scatter_true_delta = np.asarray(true_delta_l, dtype=np.float64).copy()
                 scatter_bins = np.asarray(bins_h, dtype=np.int64).reshape(-1).copy()
-                if method_name == "bin_gaussian":
+                if method_name in {"bin_gaussian", "vae_bin_gaussian"}:
                     scatter_deltas[method_name] = np.asarray(delta, dtype=np.float64).copy()
                     scatter_cat_h2[method_name] = np.asarray(bg_h2, dtype=np.float64).copy()
                 elif "h_sqrt" in result:
@@ -3491,13 +3647,13 @@ def main(argv: list[str] | None = None) -> None:
                 reconstructed_llr = reconstructed_pairwise[0]
                 if direct_llr.shape != reconstructed_llr.shape:
                     raise ValueError(
-                        "ctsm_v_binary returned ctsm_binary_llr_1_minus_0 shape "
+                        f"{name} returned ctsm_binary_llr_1_minus_0 shape "
                         f"{direct_llr.shape}, expected {reconstructed_llr.shape}."
                     )
                 if not np.allclose(direct_llr, reconstructed_llr, rtol=1e-5, atol=1e-7, equal_nan=True):
                     max_abs = float(np.nanmax(np.abs(direct_llr - reconstructed_llr)))
                     raise ValueError(
-                        "ctsm_v_binary ctsm_binary_llr_1_minus_0 does not match "
+                        f"{name} ctsm_binary_llr_1_minus_0 does not match "
                         f"the reconstructed vector from delta_l (max_abs={max_abs:.6g})."
                     )
                 reconstructed_pairwise = direct_llr.reshape(1, -1)

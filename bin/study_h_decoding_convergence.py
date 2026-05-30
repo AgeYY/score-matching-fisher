@@ -16,8 +16,10 @@ if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 
 from fisher import h_decoding_convergence as _impl
+from fisher import h_decoding_convergence_twofig as _entrypoint
 
 globals().update({name: value for name, value in vars(_impl).items() if not name.startswith("__")})
+globals().update({name: value for name, value in vars(_entrypoint).items() if not name.startswith("__")})
 
 
 if __name__ == "__main__":
