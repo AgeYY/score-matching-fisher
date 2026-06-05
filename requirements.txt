@@ -21,3 +21,8 @@ pytest
 torchdiffeq
 flow-matching
 zuko
+torchvision
+datasets
+thingsvision
+defusedxml
+tqdm
