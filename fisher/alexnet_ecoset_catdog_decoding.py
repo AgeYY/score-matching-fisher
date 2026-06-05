@@ -3,10 +3,7 @@
 from __future__ import annotations
 
 import argparse
-import contextlib
-import getpass as getpass_module
 import os
-import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,10 +21,11 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from global_setting import DATA_DIR
+from global_setting import DATA_DIR, ECOSET_VALIDATION_DIR
 from fisher.alexnet_ecoset_model import load_alexnet_ecoset
 
 
+ECOSET_VALIDATION_ARROW = "ecoset-validation.arrow"
 ALEXNET_ECOSET_LAYERS: tuple[str, ...] = (
     "features.0",
     "features.3",
@@ -55,6 +53,14 @@ class DecodingResult:
     accuracy: float
     n_train: int
     n_test: int
+
+
+class EcosetValidationDirAction(argparse.Action):
+    """Store the local validation path under canonical and legacy argparse names."""
+
+    def __call__(self, parser, namespace, values, option_string=None) -> None:
+        setattr(namespace, self.dest, values)
+        setattr(namespace, "hf_cache_dir", values)
 
 
 def _repo_root() -> Path:
@@ -183,53 +189,64 @@ def save_accuracy_figure(results: Sequence[DecodingResult], output_dir: str | os
     return fig_path
 
 
-@contextlib.contextmanager
-def ecoset_password_from_env(env_var: str = "ECOSET_PASSWORD"):
-    password = os.environ.get(env_var)
-    if not password:
-        raise RuntimeError(
-            f"Set {env_var} before downloading Ecoset so the Hugging Face loader can run non-interactively."
-        )
-    old_getpass = getpass_module.getpass
-    getpass_module.getpass = lambda prompt="": password
+def _missing_ecoset_validation_error(root: Path) -> FileNotFoundError:
+    direct = root if root.name == ECOSET_VALIDATION_ARROW else root / ECOSET_VALIDATION_ARROW
+    return FileNotFoundError(
+        "EcoSet validation Arrow data is missing locally. "
+        f"Expected {ECOSET_VALIDATION_ARROW!r} at {direct} or somewhere below {root}. "
+        "Set SCORE_MATCHING_FISHER_ECOSET_VALIDATION_DIR to a local Arrow file, build directory, "
+        "or parent cache directory. Downloads are not attempted from this sampling path."
+    )
+
+
+def _find_ecoset_validation_arrow(root: Path) -> Path | None:
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in {"downloads", "__pycache__"})
+        if ECOSET_VALIDATION_ARROW in filenames:
+            return Path(dirpath) / ECOSET_VALIDATION_ARROW
+    return None
+
+
+def resolve_ecoset_validation_arrow(validation_dir: str | os.PathLike[str] | None = None) -> Path:
+    """Resolve a local EcoSet validation Arrow file from a file, build dir, or cache parent."""
+    root = _abs_without_resolving_symlinks(ECOSET_VALIDATION_DIR if validation_dir is None else validation_dir)
+    if root.is_file():
+        if root.name == ECOSET_VALIDATION_ARROW:
+            return root
+        raise _missing_ecoset_validation_error(root)
+    if root.is_dir():
+        direct = root / ECOSET_VALIDATION_ARROW
+        if direct.is_file():
+            return direct
+        builder_root = root / "kietzmannlab___ecoset" / "Full"
+        if builder_root.is_dir():
+            arrow_path = _find_ecoset_validation_arrow(builder_root)
+            if arrow_path is not None:
+                return arrow_path
+        arrow_path = _find_ecoset_validation_arrow(root)
+        if arrow_path is not None:
+            return arrow_path
+    raise _missing_ecoset_validation_error(root)
+
+
+def ecoset_validation_cache_ready(cache_dir: str | os.PathLike[str]) -> bool:
+    """True when a local EcoSet validation Arrow table can be found under cache_dir."""
     try:
-        yield
-    finally:
-        getpass_module.getpass = old_getpass
+        arrow_path = resolve_ecoset_validation_arrow(cache_dir)
+        return arrow_path.is_file() and arrow_path.stat().st_size > 0
+    except FileNotFoundError:
+        return False
 
 
-@contextlib.contextmanager
-def quieter_resumable_wget_for_ecoset():
-    old_run = subprocess.run
-
-    def run(cmd, *args, **kwargs):
-        if isinstance(cmd, str) and cmd.startswith("wget --no-check-certificate "):
-            cmd = cmd.replace("wget --no-check-certificate ", "wget --no-check-certificate -c --progress=dot:giga ", 1)
-        return old_run(cmd, *args, **kwargs)
-
-    subprocess.run = run
+def load_ecoset_validation(cache_dir: str | os.PathLike[str] | None = None):
+    """Load EcoSet validation from a locally cached Arrow file without downloading."""
     try:
-        yield
-    finally:
-        subprocess.run = old_run
-
-
-def load_ecoset_validation(cache_dir: str | os.PathLike[str]):
-    try:
-        from datasets import load_dataset
+        from datasets import Dataset
     except ImportError as exc:
-        raise ImportError("Install the 'datasets' package to download Ecoset validation data.") from exc
+        raise ImportError("Install the 'datasets' package to load local EcoSet validation Arrow data.") from exc
 
-    Path(cache_dir).mkdir(parents=True, exist_ok=True)
-    with ecoset_password_from_env(), quieter_resumable_wget_for_ecoset():
-        return load_dataset(
-            "kietzmannlab/ecoset",
-            "Full",
-            split="validation",
-            verification_mode="no_checks",
-            cache_dir=str(cache_dir),
-            trust_remote_code=True,
-        )
+    arrow_path = resolve_ecoset_validation_arrow(cache_dir)
+    return Dataset.from_file(str(arrow_path))
 
 
 def _dataset_label_names(ds) -> Sequence[str] | None:
@@ -288,7 +305,7 @@ def load_exported_samples(image_root: str | os.PathLike[str], *, classes: Sequen
 def ensure_sampled_images(
     *,
     image_root: str | os.PathLike[str],
-    cache_dir: str | os.PathLike[str],
+    cache_dir: str | os.PathLike[str] | None = None,
     classes: Sequence[str] = DEFAULT_CLASSES,
     n_per_class: int = 100,
     seed: int = 0,
@@ -390,14 +407,23 @@ def parse_classes(raw: str) -> tuple[str, str]:
 
 def build_parser() -> argparse.ArgumentParser:
     root = _default_output_root()
+    validation_dir = _abs_without_resolving_symlinks(ECOSET_VALIDATION_DIR)
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    p.set_defaults(hf_cache_dir=str(validation_dir))
     p.add_argument("--classes", default="cat,dog", help="Two comma-separated Ecoset validation class names.")
     p.add_argument("--n-per-class", type=int, default=100, help="Number of validation images sampled per class.")
     p.add_argument("--test-size", type=float, default=0.2, help="Held-out stratified test fraction.")
     p.add_argument("--seed", type=int, default=0, help="Random seed for sampling, split, and classifier.")
     p.add_argument("--batch-size", type=int, default=64, help="Image batch size for AlexNet-EcoSet extraction.")
     p.add_argument("--device", default="cuda", help="Execution device; this project run requires cuda.")
-    p.add_argument("--hf-cache-dir", default=str(root / "hf_cache"), help="Hugging Face cache/download directory.")
+    p.add_argument(
+        "--ecoset-validation-dir",
+        "--hf-cache-dir",
+        dest="ecoset_validation_dir",
+        action=EcosetValidationDirAction,
+        default=str(validation_dir),
+        help="Local EcoSet validation Arrow file, build directory, or parent cache directory; no downloads are attempted.",
+    )
     p.add_argument(
         "--image-root",
         default=str(root / "validation_catdog_100"),
@@ -419,9 +445,10 @@ def run(args: argparse.Namespace) -> Path:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is unavailable; AGENTS.md requires --device cuda for project runs.")
     classes = parse_classes(args.classes)
+    validation_dir = getattr(args, "ecoset_validation_dir", getattr(args, "hf_cache_dir", None))
     samples = ensure_sampled_images(
         image_root=args.image_root,
-        cache_dir=args.hf_cache_dir,
+        cache_dir=validation_dir,
         classes=classes,
         n_per_class=int(args.n_per_class),
         seed=int(args.seed),

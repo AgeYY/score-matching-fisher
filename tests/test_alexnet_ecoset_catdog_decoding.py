@@ -4,12 +4,16 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
+import pytest
 
 from fisher.alexnet_ecoset_catdog_decoding import (
     DecodingResult,
+    ECOSET_VALIDATION_ARROW,
     export_sampled_images,
     fit_linear_decoders,
+    load_ecoset_validation,
     make_train_test_indices,
+    resolve_ecoset_validation_arrow,
     save_accuracy_figure,
     stratified_sample_indices,
 )
@@ -33,6 +37,62 @@ class _FakeDataset:
             return list(self._labels)
         arr = np.full((12, 12, 3), int(self._labels[idx]) * 100, dtype=np.uint8)
         return {"label": self._labels[idx], "image": Image.fromarray(arr)}
+
+
+def _write_tiny_arrow(path: Path) -> None:
+    from datasets import Dataset, disable_progress_bar
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    disable_progress_bar()
+    ds = Dataset.from_dict({"label": [0, 1], "name": ["cat", "dog"]})
+    ds.map(lambda example: example, cache_file_name=str(path), load_from_cache_file=False)
+
+
+def test_resolve_ecoset_validation_arrow_accepts_file_build_dir_and_parent(tmp_path: Path) -> None:
+    arrow_path = (
+        tmp_path
+        / "hf_cache"
+        / "kietzmannlab___ecoset"
+        / "Full"
+        / "1.0.0"
+        / "builder-hash"
+        / ECOSET_VALIDATION_ARROW
+    )
+    arrow_path.parent.mkdir(parents=True)
+    arrow_path.write_bytes(b"arrow")
+
+    assert resolve_ecoset_validation_arrow(arrow_path) == arrow_path
+    assert resolve_ecoset_validation_arrow(arrow_path.parent) == arrow_path
+    assert resolve_ecoset_validation_arrow(tmp_path / "hf_cache") == arrow_path
+
+
+def test_load_ecoset_validation_reads_tiny_local_arrow_with_dataset_from_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datasets import Dataset
+
+    arrow_path = tmp_path / ECOSET_VALIDATION_ARROW
+    _write_tiny_arrow(arrow_path)
+    original_from_file = Dataset.from_file
+    calls: list[Path] = []
+
+    def wrapped_from_file(filename: str, *args, **kwargs):
+        calls.append(Path(filename))
+        return original_from_file(filename, *args, **kwargs)
+
+    monkeypatch.setattr(Dataset, "from_file", staticmethod(wrapped_from_file))
+
+    ds = load_ecoset_validation(tmp_path)
+
+    assert calls == [arrow_path]
+    assert ds["label"] == [0, 1]
+    assert ds["name"] == ["cat", "dog"]
+
+
+def test_load_ecoset_validation_missing_local_arrow_raises_clear_error(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError, match="SCORE_MATCHING_FISHER_ECOSET_VALIDATION_DIR"):
+        load_ecoset_validation(tmp_path / "missing")
 
 
 def test_stratified_sample_indices_balanced_reproducible() -> None:

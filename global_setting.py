@@ -15,6 +15,14 @@ DATAROOT = os.environ.get(
 # Default datasets and run outputs live directly under DATAROOT (same tree as the repo `data/` symlink).
 DATA_DIR = DATAROOT
 
+# Local Hugging Face builder cache location for the EcoSet validation Arrow table.
+# Override at runtime:
+# export SCORE_MATCHING_FISHER_ECOSET_VALIDATION_DIR=/path/to/ecoset-validation.arrow
+ECOSET_VALIDATION_DIR = os.environ.get(
+    "SCORE_MATCHING_FISHER_ECOSET_VALIDATION_DIR",
+    os.path.join(DATA_DIR, "ecoset", "hf_cache", "kietzmannlab___ecoset", "Full"),
+)
+
 # Score matching: when using train_split validation, this fraction of the score pool is held out for val.
 SCORE_VAL_FRACTION = 0.2
 

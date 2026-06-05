@@ -15,6 +15,7 @@ from fisher.alexnet_fmri_simulation import (
     AlexNetFMRISimulator,
     FMRIBetaSimulator,
     FMRISimulationConfig,
+    make_event_design,
     measurement_filter_correlation,
     save_layer_decoding_accuracy_figure,
 )
@@ -168,6 +169,25 @@ def test_measurement_filter_correlation_is_symmetric_unit_diagonal() -> None:
     assert corr.shape == (3, 3)
     np.testing.assert_allclose(corr, corr.T)
     np.testing.assert_allclose(np.diag(corr), np.ones(3))
+
+
+def test_make_event_design_uses_stimulus_duration_boxcars() -> None:
+    design = make_event_design(
+        3,
+        tr=2.0,
+        stim_interval=4.0,
+        blank_interval=2.0,
+        hrf=np.array([1.0], dtype=np.float64),
+        rng=np.random.default_rng(2),
+    )
+
+    assert design.shape == (11, 3)
+    np.testing.assert_allclose(np.sum(design, axis=0), np.full(3, 2.0))
+    assert np.all(np.sum(design > 0.0, axis=1) <= 1)
+    for col in range(design.shape[1]):
+        active = np.flatnonzero(design[:, col] > 0.0)
+        assert active.shape == (2,)
+        assert int(active[1] - active[0]) == 1
 
 
 _IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}

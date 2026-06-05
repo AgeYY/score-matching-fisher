@@ -14,8 +14,8 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from global_setting import DATA_DIR
-from fisher.alexnet_ecoset_catdog_decoding import ensure_sampled_images
+from global_setting import DATA_DIR, ECOSET_VALIDATION_DIR
+from fisher.alexnet_ecoset_catdog_decoding import EcosetValidationDirAction, ensure_sampled_images
 from fisher.alexnet_fmri_simulation import (
     AlexNetFMRISimulator,
     FMRISimulationConfig,
@@ -44,7 +44,7 @@ def _count_images(root: Path) -> int:
 def _ensure_class_dirs(
     *,
     image_root: Path,
-    hf_cache_dir: Path,
+    ecoset_validation_dir: Path | None,
     n_per_class: int,
     seed: int,
     force_export: bool,
@@ -55,7 +55,7 @@ def _ensure_class_dirs(
 
     ensure_sampled_images(
         image_root=image_root,
-        cache_dir=hf_cache_dir,
+        cache_dir=ecoset_validation_dir,
         classes=("cat", "dog"),
         n_per_class=int(n_per_class),
         seed=int(seed),
@@ -83,13 +83,22 @@ def _parse_layers(raw: str) -> tuple[int | str, ...]:
 
 def build_parser() -> argparse.ArgumentParser:
     ecoset_root = _default_ecoset_root()
+    validation_dir = _abs_without_resolving_symlinks(ECOSET_VALIDATION_DIR)
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    p.set_defaults(hf_cache_dir=str(validation_dir))
     p.add_argument(
         "--image-root",
         default=str(ecoset_root / "validation_catdog"),
         help="Folder where sampled EcoSet cat/dog validation images are exported or reused.",
     )
-    p.add_argument("--hf-cache-dir", default=str(ecoset_root / "hf_cache"))
+    p.add_argument(
+        "--ecoset-validation-dir",
+        "--hf-cache-dir",
+        dest="ecoset_validation_dir",
+        action=EcosetValidationDirAction,
+        default=str(validation_dir),
+        help="Local EcoSet validation Arrow file, build directory, or parent cache directory; no downloads are attempted.",
+    )
     p.add_argument("--output-dir", default=str(ecoset_root / "alexnet_fmri_catdog_decoding"))
     p.add_argument("--n-per-class", type=int, default=50)
     p.add_argument("--batch-size", type=int, default=16)
@@ -117,9 +126,10 @@ def run(args: argparse.Namespace) -> Path:
         raise RuntimeError("CUDA is unavailable; AGENTS.md requires --device cuda for project runs.")
 
     n_per_class = int(args.n_per_class)
+    validation_dir = getattr(args, "ecoset_validation_dir", getattr(args, "hf_cache_dir", None))
     class_dirs = _ensure_class_dirs(
         image_root=_abs_without_resolving_symlinks(args.image_root),
-        hf_cache_dir=_abs_without_resolving_symlinks(args.hf_cache_dir),
+        ecoset_validation_dir=None if validation_dir is None else _abs_without_resolving_symlinks(validation_dir),
         n_per_class=n_per_class,
         seed=int(args.seed),
         force_export=bool(args.force_export),

@@ -454,15 +454,17 @@ def make_event_design(
     hrf: np.ndarray,
     rng: np.random.Generator,
 ) -> np.ndarray:
-    """Create a run design with one presentation of each stimulus."""
+    """Create a run design with one boxcar presentation of each stimulus."""
     order = rng.permutation(int(n_stimuli))
-    step = max(1, int(round((float(stim_interval) + float(blank_interval)) / float(tr))))
+    stim_duration = max(1, int(round(float(stim_interval) / float(tr))))
+    blank_duration = max(0, int(round(float(blank_interval) / float(tr))))
+    step = stim_duration + blank_duration
     onset_offset = max(0, int(round(float(blank_interval) / float(tr))))
     n_time = onset_offset + step * int(n_stimuli) + len(hrf)
     impulses = np.zeros((n_time, int(n_stimuli)), dtype=np.float64)
     for pos, stimulus_idx in enumerate(order):
         onset = onset_offset + pos * step
-        impulses[onset, int(stimulus_idx)] = 1.0
+        impulses[onset : onset + stim_duration, int(stimulus_idx)] = 1.0
     design = np.empty_like(impulses)
     for col in range(int(n_stimuli)):
         design[:, col] = fftconvolve(impulses[:, col], hrf, mode="full")[:n_time]
