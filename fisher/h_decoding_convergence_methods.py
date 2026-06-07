@@ -115,6 +115,7 @@ _TIME_LXF_METHODS = {
     "xflow_sir_pure_lrank",
 }
 from fisher.lxf_bin_likelihood_hellinger import lxf_bin_likelihood_hellinger
+from fisher.llr_divergence import sym_kl_sample_from_delta_l
 from fisher.nf_hellinger import (
     ConditionalThetaNF,
     PriorThetaNF,
@@ -1100,6 +1101,10 @@ def _estimate_one(
             "h_directed_bin_likelihood": np.asarray(bin_h["h_directed_bin"], dtype=np.float64),
             "h_binned_direct": np.asarray(bin_h["h_binned"], dtype=np.float64),
             "h_binned_bin_likelihood": np.asarray(bin_h["h_binned"], dtype=np.float64),
+            "skl_sym_bin_likelihood": np.asarray(bin_h["skl_sym"], dtype=np.float64),
+            "skl_directed_bin_likelihood": np.asarray(bin_h["skl_directed_bin"], dtype=np.float64),
+            "skl_binned_direct": np.asarray(bin_h["skl_binned_directed"], dtype=np.float64),
+            "skl_binned_bin_likelihood": np.asarray(bin_h["skl_binned"], dtype=np.float64),
             "bin_counts": np.asarray(bin_h["bin_counts"], dtype=np.int64),
         }
 
@@ -1195,6 +1200,7 @@ def _estimate_one(
             h_sym=np.asarray(h_sym, dtype=np.float64),
             c_matrix=np.asarray(c_matrix, dtype=np.float64),
             delta_l_matrix=np.asarray(delta_l, dtype=np.float64),
+            skl_sym_matrix=sym_kl_sample_from_delta_l(delta_l),
             **bin_h_payload,
             h_field_method=np.asarray([method_name], dtype=object),
             h_eval_scalar_name=np.asarray(["contrastive_soft_categorical_llr_score"], dtype=object),
@@ -1394,6 +1400,7 @@ def _estimate_one(
             h_sym=np.asarray(h_sym, dtype=np.float64),
             c_matrix=np.asarray(c_matrix, dtype=np.float64),
             delta_l_matrix=np.asarray(delta_l, dtype=np.float64),
+            skl_sym_matrix=sym_kl_sample_from_delta_l(delta_l),
             **bin_h_payload,
             h_field_method=np.asarray([method_name], dtype=object),
             h_eval_scalar_name=np.asarray(["contrastive_soft_llr_score"], dtype=object),
@@ -1558,6 +1565,7 @@ def _estimate_one(
             h_sym=np.asarray(h_sym, dtype=np.float64),
             c_matrix=np.asarray(c_matrix, dtype=np.float64),
             delta_l_matrix=np.asarray(delta_l, dtype=np.float64),
+            skl_sym_matrix=sym_kl_sample_from_delta_l(delta_l),
             h_field_method=np.asarray([method_name], dtype=object),
             h_eval_scalar_name=np.asarray([h_eval_name], dtype=object),
             sigma_eval=np.asarray([np.nan], dtype=np.float64),
@@ -1997,12 +2005,17 @@ def _estimate_one(
             h_payload["c_matrix"] = np.asarray(c_matrix, dtype=np.float64)
         if delta_l is not None:
             h_payload["delta_l_matrix"] = np.asarray(delta_l, dtype=np.float64)
+            h_payload["skl_sym_matrix"] = sym_kl_sample_from_delta_l(delta_l)
         if lxf_bin_h is not None:
             h_payload.update(
                 bin_log_likelihood_matrix=np.asarray(lxf_bin_h["bin_log_likelihood"], dtype=np.float64),
                 bin_delta_l_matrix=np.asarray(lxf_bin_h["bin_delta_l"], dtype=np.float64),
                 h_directed_bin_likelihood=np.asarray(lxf_bin_h["h_directed_bin"], dtype=np.float64),
                 h_binned_bin_likelihood=np.asarray(lxf_bin_h["h_binned"], dtype=np.float64),
+                skl_sym_bin_likelihood=np.asarray(lxf_bin_h["skl_sym"], dtype=np.float64),
+                skl_directed_bin_likelihood=np.asarray(lxf_bin_h["skl_directed_bin"], dtype=np.float64),
+                skl_binned_direct=np.asarray(lxf_bin_h["skl_binned_directed"], dtype=np.float64),
+                skl_binned_bin_likelihood=np.asarray(lxf_bin_h["skl_binned"], dtype=np.float64),
                 bin_counts=np.asarray(lxf_bin_h["bin_counts"], dtype=np.int64),
             )
         np.savez_compressed(os.path.join(output_dir, "h_matrix_results_theta_cov.npz"), **h_payload)
@@ -2119,6 +2132,7 @@ def _estimate_one(
             c_matrix=np.asarray(c_matrix, dtype=np.float64),
             theta_flow_log_post_matrix=np.asarray(c_matrix, dtype=np.float64),
             delta_l_matrix=np.asarray(delta_l, dtype=np.float64),
+            skl_sym_matrix=sym_kl_sample_from_delta_l(delta_l),
             h_field_method=np.asarray([method_name], dtype=object),
             h_eval_scalar_name=np.asarray([f"{method_name}_log_p_theta_given_x"], dtype=object),
             sigma_eval=np.asarray([np.nan], dtype=np.float64),
@@ -2351,6 +2365,7 @@ def _estimate_one(
             h_sym=np.asarray(h_sym, dtype=np.float64),
             c_matrix=np.asarray(c_matrix, dtype=np.float64),
             delta_l_matrix=np.asarray(delta_l, dtype=np.float64),
+            skl_sym_matrix=sym_kl_sample_from_delta_l(delta_l),
             h_field_method=np.asarray([gn_method], dtype=object),
             h_eval_scalar_name=np.asarray([h_eval_scalar_name], dtype=object),
             sigma_eval=np.asarray([np.nan], dtype=np.float64),
@@ -2527,6 +2542,7 @@ def _estimate_one(
             h_sym=np.asarray(h_sym, dtype=np.float64),
             c_matrix=np.asarray(c_matrix, dtype=np.float64),
             delta_l_matrix=np.asarray(delta_l, dtype=np.float64),
+            skl_sym_matrix=sym_kl_sample_from_delta_l(delta_l),
             h_field_method=np.asarray(["pi_nf"], dtype=object),
             h_eval_scalar_name=np.asarray(["pi_nf_log_p_z_given_theta"], dtype=object),
             sigma_eval=np.asarray([np.nan], dtype=np.float64),
@@ -2667,6 +2683,7 @@ def _estimate_one(
             h_sym=np.asarray(h_sym, dtype=np.float64),
             c_matrix=np.asarray(c_matrix, dtype=np.float64),
             delta_l_matrix=np.asarray(delta_l, dtype=np.float64),
+            skl_sym_matrix=sym_kl_sample_from_delta_l(delta_l),
             h_field_method=np.asarray(["nf_reduction"], dtype=object),
             h_eval_scalar_name=np.asarray(["nf_reduction_log_p_z_given_theta"], dtype=object),
             sigma_eval=np.asarray([np.nan], dtype=np.float64),
@@ -2809,6 +2826,7 @@ def _estimate_one(
             c_matrix_ratio=np.asarray(r_matrix, dtype=np.float64),
             log_p_theta_prior=np.asarray(log_p_theta_prior, dtype=np.float64),
             delta_l_matrix=np.asarray(delta_l, dtype=np.float64),
+            skl_sym_matrix=sym_kl_sample_from_delta_l(delta_l),
             h_field_method=np.asarray(["nf"], dtype=object),
             h_eval_scalar_name=np.asarray(["nf_log_ratio_post_minus_prior"], dtype=object),
             sigma_eval=np.asarray([np.nan], dtype=np.float64),

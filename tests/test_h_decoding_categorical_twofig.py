@@ -37,6 +37,11 @@ from fisher.h_decoding_categorical_twofig import (
     _save_raw_binary_llr_est_vs_true_figure,
 )
 from fisher.h_matrix import HMatrixEstimator
+from fisher.llr_divergence import (
+    directed_kl_from_delta_l,
+    sym_kl_category_from_sample_directed,
+    symmetric_kl_gaussian_diag_matrix,
+)
 from fisher import h_decoding_convergence as conv
 from fisher.h_decoding_convergence_methods import prepare_categorical_binning_for_convergence
 from fisher.shared_dataset_io import SharedDatasetBundle, load_shared_dataset_npz
@@ -727,6 +732,53 @@ def test_category_aggregation_small_delta_l() -> None:
     assert h_cat.shape == (k, k)
     assert np.allclose(np.diag(h_cat), 0.0)
     assert np.all(h_cat >= 0.0)
+
+
+def test_directed_kl_from_delta_l_negates_and_zeroes_diagonal() -> None:
+    delta_l = np.array(
+        [
+            [3.0, -2.0, 1.5],
+            [4.0, -7.0, -0.5],
+            [0.25, 2.5, 9.0],
+        ],
+        dtype=np.float64,
+    )
+    got = directed_kl_from_delta_l(delta_l)
+    expected = -delta_l
+    np.fill_diagonal(expected, 0.0)
+    assert np.allclose(got, expected)
+
+
+def test_symmetric_kl_category_aggregation_small_delta_l() -> None:
+    delta_l = np.array(
+        [
+            [0.0, -1.0, -3.0, -5.0],
+            [-2.0, 0.0, -7.0, -11.0],
+            [-13.0, -17.0, 0.0, -19.0],
+            [-23.0, -29.0, -31.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    labels = np.array([0, 0, 1, 1], dtype=np.int64)
+    directed = directed_kl_from_delta_l(delta_l)
+    got = sym_kl_category_from_sample_directed(directed, labels, k_cat=2)
+
+    d01 = float(np.mean(directed[np.ix_([0, 1], [2, 3])]))
+    d10 = float(np.mean(directed[np.ix_([2, 3], [0, 1])]))
+    expected = np.array([[0.0, 0.5 * (d01 + d10)], [0.5 * (d01 + d10), 0.0]], dtype=np.float64)
+    assert np.allclose(got, expected)
+
+
+def test_symmetric_kl_gaussian_diag_matrix_matches_1d_manual_case() -> None:
+    means = np.array([[0.0], [2.0]], dtype=np.float64)
+    variances = np.array([[1.0], [4.0]], dtype=np.float64)
+    got = symmetric_kl_gaussian_diag_matrix(means, variances)
+    manual = 0.25 * ((1.0 / 4.0) + (4.0 / 1.0) + (2.0**2) * (1.0 / 1.0 + 1.0 / 4.0) - 2.0)
+    assert got.shape == (2, 2)
+    assert np.allclose(got, got.T)
+    assert np.allclose(np.diag(got), 0.0)
+    assert np.all(got >= 0.0)
+    assert got[0, 1] == pytest.approx(manual)
 
 
 def test_ctsm_pair_models_accept_one_hot_theta() -> None:
