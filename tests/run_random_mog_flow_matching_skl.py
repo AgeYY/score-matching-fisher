@@ -52,6 +52,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--quadrature-steps", type=int, default=64)
     p.add_argument("--divergence-estimator", choices=("hutchinson", "exact"), default="hutchinson")
     p.add_argument("--hutchinson-probes", type=int, default=1)
+    p.add_argument("--shared-affine-a-diag-jitter", type=float, default=1e-3)
     p.add_argument("--mc-jeffreys-sample", dest="mc_jeffreys_sample", type=int, default=4096)
     p.add_argument("--mc-samples", dest="mc_jeffreys_sample", type=int, help=argparse.SUPPRESS)
     p.add_argument("--ode-steps", type=int, default=64)
@@ -252,6 +253,7 @@ def main(argv: list[str] | None = None) -> int:
         path_schedule=str(args.path_schedule),
         divergence_estimator=str(args.divergence_estimator),
         hutchinson_probes=int(args.hutchinson_probes),
+        shared_affine_a_diag_jitter=float(args.shared_affine_a_diag_jitter),
     ).to(device)
 
     train_out = train_flow_skl_model(

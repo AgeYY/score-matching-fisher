@@ -83,6 +83,7 @@ class FlowComparisonConfig:
     ode_method: str = "midpoint"
     divergence_estimator: str = "exact"
     hutchinson_probes: int = 1
+    shared_affine_a_diag_jitter: float = 1e-3
     solve_jitter: float = 1e-6
     max_grad_norm: float = 10.0
     log_every: int = 50
@@ -513,6 +514,7 @@ def train_and_estimate_flow(
         path_schedule=str(config.path_schedule),
         divergence_estimator=str(config.divergence_estimator),
         hutchinson_probes=int(config.hutchinson_probes),
+        shared_affine_a_diag_jitter=float(config.shared_affine_a_diag_jitter),
     ).to(device)
     train_meta = train_flow_skl_model(
         model=model,

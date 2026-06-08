@@ -63,6 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--quadrature-steps", type=int, default=64)
     p.add_argument("--divergence-estimator", choices=("hutchinson", "exact"), default="hutchinson")
     p.add_argument("--hutchinson-probes", type=int, default=1)
+    p.add_argument("--shared-affine-a-diag-jitter", type=float, default=1e-3)
     p.add_argument("--t-eps", type=float, default=0.05)
     p.add_argument("--early-patience", type=int, default=0)
     p.add_argument("--early-min-delta", type=float, default=1e-4)
@@ -244,6 +245,7 @@ def main(argv: list[str] | None = None) -> int:
         path_schedule=str(args.path_schedule),
         divergence_estimator=str(args.divergence_estimator),
         hutchinson_probes=int(args.hutchinson_probes),
+        shared_affine_a_diag_jitter=float(args.shared_affine_a_diag_jitter),
     ).to(dev)
 
     train_meta = train_flow_skl_model(

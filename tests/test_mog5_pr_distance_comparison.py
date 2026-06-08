@@ -208,6 +208,7 @@ def test_flow_metric_mapping_and_mahalanobis_shared_assembly(monkeypatch, tmp_pa
 
 def test_train_and_estimate_flow_uses_model_jeffreys_readout(monkeypatch) -> None:
     bundle = _toy_bundle()
+    build_calls: list[dict[str, object]] = []
     estimate_calls: list[dict[str, object]] = []
 
     class DummyModel(torch.nn.Module):
@@ -219,6 +220,7 @@ def test_train_and_estimate_flow_uses_model_jeffreys_readout(monkeypatch) -> Non
             return torch.zeros_like(x)
 
     def fake_build_flow_skl_model(**kwargs):
+        build_calls.append(kwargs)
         return DummyModel()
 
     def fake_train_flow_skl_model(**kwargs):
@@ -254,9 +256,11 @@ def test_train_and_estimate_flow_uses_model_jeffreys_readout(monkeypatch) -> Non
         velocity_family="translation",
         device=torch.device("cpu"),
         seed=123,
-        config=dc.FlowComparisonConfig(epochs=1),
+        config=dc.FlowComparisonConfig(epochs=1, shared_affine_a_diag_jitter=2e-3),
     )
 
+    assert build_calls
+    assert build_calls[0]["shared_affine_a_diag_jitter"] == 2e-3
     assert estimate_calls
     call = estimate_calls[0]
     assert "theta_data" not in call

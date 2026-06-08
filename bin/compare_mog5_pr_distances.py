@@ -112,6 +112,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ode-method", type=str, default="midpoint")
     p.add_argument("--divergence-estimator", choices=("hutchinson", "exact"), default="exact")
     p.add_argument("--hutchinson-probes", type=int, default=1)
+    p.add_argument("--shared-affine-a-diag-jitter", type=float, default=1e-3)
     p.add_argument("--solve-jitter", type=float, default=1e-6)
     p.add_argument("--max-grad-norm", type=float, default=10.0)
     p.add_argument("--log-every", type=int, default=50)
@@ -180,6 +181,7 @@ def _flow_config_from_args(args: argparse.Namespace) -> FlowComparisonConfig:
         ode_method=str(args.ode_method),
         divergence_estimator=str(args.divergence_estimator),
         hutchinson_probes=int(args.hutchinson_probes),
+        shared_affine_a_diag_jitter=float(args.shared_affine_a_diag_jitter),
         solve_jitter=float(args.solve_jitter),
         max_grad_norm=float(args.max_grad_norm),
         log_every=int(args.log_every),

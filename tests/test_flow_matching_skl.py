@@ -195,6 +195,79 @@ def test_shared_affine_full_A_is_symmetric_for_arbitrary_t() -> None:
     torch.testing.assert_close(a_t, a_t.transpose(-1, -2), rtol=1e-12, atol=1e-12)
 
 
+@pytest.mark.parametrize(
+    ("family", "net_values", "base_a"),
+    (
+        ("shared_affine", torch.zeros(4, dtype=torch.float64), torch.zeros(2, 2, dtype=torch.float64)),
+        ("shared_affine_scalar", torch.tensor([0.25], dtype=torch.float64), 0.25 * torch.eye(2, dtype=torch.float64)),
+        ("shared_affine_diag", torch.tensor([0.2, -0.4], dtype=torch.float64), torch.diag(torch.tensor([0.2, -0.4], dtype=torch.float64))),
+    ),
+)
+def test_shared_affine_default_A_includes_diagonal_jitter(
+    family: str,
+    net_values: torch.Tensor,
+    base_a: torch.Tensor,
+) -> None:
+    model = build_flow_skl_model(
+        velocity_family=family,
+        theta_dim=2,
+        x_dim=2,
+        hidden_dim=4,
+        depth=1,
+        path_schedule="linear",
+    ).double()
+    model.a_net = ConstantNet(net_values)
+
+    t = torch.tensor([[0.25], [0.75]], dtype=torch.float64)
+    expected = (base_a + 1e-3 * torch.eye(2, dtype=torch.float64)).reshape(1, 2, 2).expand(2, 2, 2)
+    assert model.a_diag_jitter == pytest.approx(1e-3)
+    torch.testing.assert_close(model.A(t), expected, rtol=1e-12, atol=1e-12)
+
+
+@pytest.mark.parametrize(
+    ("family", "net_values", "base_a"),
+    (
+        ("shared_affine_low_rank", torch.zeros(4, dtype=torch.float64), torch.zeros(2, 2, dtype=torch.float64)),
+        ("shared_affine_low_rank_scalar", torch.tensor([0.25], dtype=torch.float64), 0.25 * torch.eye(2, dtype=torch.float64)),
+        ("shared_affine_low_rank_diag", torch.tensor([0.2, -0.4], dtype=torch.float64), torch.diag(torch.tensor([0.2, -0.4], dtype=torch.float64))),
+    ),
+)
+def test_shared_affine_low_rank_default_base_A_includes_diagonal_jitter(
+    family: str,
+    net_values: torch.Tensor,
+    base_a: torch.Tensor,
+) -> None:
+    model = build_flow_skl_model(
+        velocity_family=family,
+        theta_dim=2,
+        x_dim=2,
+        hidden_dim=4,
+        depth=1,
+        low_rank_dim=1,
+        path_schedule="linear",
+    ).double()
+    model.a_net = ConstantNet(net_values)
+
+    t = torch.tensor([[0.25], [0.75]], dtype=torch.float64)
+    expected = (base_a + 1e-3 * torch.eye(2, dtype=torch.float64)).reshape(1, 2, 2).expand(2, 2, 2)
+    assert model.a_diag_jitter == pytest.approx(1e-3)
+    torch.testing.assert_close(model.A(t), expected, rtol=1e-12, atol=1e-12)
+
+
+@pytest.mark.parametrize("bad_jitter", (-1e-6, float("inf"), float("nan")))
+def test_shared_affine_a_diag_jitter_must_be_finite_nonnegative(bad_jitter: float) -> None:
+    with pytest.raises(ValueError):
+        build_flow_skl_model(
+            velocity_family="shared_affine",
+            theta_dim=2,
+            x_dim=2,
+            hidden_dim=4,
+            depth=1,
+            path_schedule="linear",
+            shared_affine_a_diag_jitter=bad_jitter,
+        )
+
+
 def test_condition_affine_full_A_is_symmetric_for_arbitrary_theta_and_t() -> None:
     torch.manual_seed(123)
     model = build_flow_skl_model(
@@ -435,6 +508,7 @@ def test_shared_affine_forward_uses_centered_residual() -> None:
         hidden_dim=4,
         depth=1,
         path_schedule="linear",
+        shared_affine_a_diag_jitter=0.0,
     ).double()
     means = torch.tensor([[1.0, -2.0], [0.5, 3.0]], dtype=torch.float64)
     a_mat = torch.tensor([[0.2, -0.4], [-0.4, 0.1]], dtype=torch.float64)
@@ -459,6 +533,7 @@ def test_shared_affine_scalar_forward_uses_scalar_identity_base() -> None:
         hidden_dim=4,
         depth=1,
         path_schedule="linear",
+        shared_affine_a_diag_jitter=0.0,
     ).double()
     means = torch.tensor([[1.0, -2.0], [0.5, 3.0]], dtype=torch.float64)
     scale = torch.tensor([0.35], dtype=torch.float64)
@@ -484,6 +559,7 @@ def test_shared_affine_diag_forward_uses_diagonal_base() -> None:
         hidden_dim=4,
         depth=1,
         path_schedule="linear",
+        shared_affine_a_diag_jitter=0.0,
     ).double()
     means = torch.tensor([[1.0, -2.0], [0.5, 3.0]], dtype=torch.float64)
     diag = torch.tensor([0.2, -0.4], dtype=torch.float64)
@@ -597,6 +673,7 @@ def test_shared_affine_low_rank_forward_centers_low_rank_correction() -> None:
         depth=1,
         low_rank_dim=1,
         path_schedule="linear",
+        shared_affine_a_diag_jitter=0.0,
     ).double()
     means = torch.tensor([[1.0, -2.0], [0.5, 3.0]], dtype=torch.float64)
     _patch_table_b(model, means)
@@ -624,6 +701,7 @@ def test_shared_affine_low_rank_scalar_forward_includes_scalar_base_and_correcti
         depth=1,
         low_rank_dim=1,
         path_schedule="linear",
+        shared_affine_a_diag_jitter=0.0,
     ).double()
     means = torch.tensor([[1.0, -2.0], [0.5, 3.0]], dtype=torch.float64)
     scale = torch.tensor([0.25], dtype=torch.float64)
@@ -650,6 +728,7 @@ def test_shared_affine_low_rank_diag_forward_includes_diagonal_base_and_correcti
         depth=1,
         low_rank_dim=1,
         path_schedule="linear",
+        shared_affine_a_diag_jitter=0.0,
     ).double()
     means = torch.tensor([[1.0, -2.0], [0.5, 3.0]], dtype=torch.float64)
     diag = torch.tensor([0.25, -0.1], dtype=torch.float64)

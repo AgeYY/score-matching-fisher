@@ -558,6 +558,7 @@ class CenteredSharedAffineFlowSKLModel(_CenteredAffineFlowSKLBase):
         path_schedule: str | GaussianAffinePathSchedule = "cosine",
         divergence_estimator: str = "exact",
         hutchinson_probes: int = 1,
+        a_diag_jitter: float = 1e-3,
     ) -> None:
         super().__init__(
             theta_dim=theta_dim,
@@ -570,6 +571,11 @@ class CenteredSharedAffineFlowSKLModel(_CenteredAffineFlowSKLBase):
             hutchinson_probes=int(hutchinson_probes),
         )
         self.velocity_family = "shared_affine"
+        if not math.isfinite(float(a_diag_jitter)):
+            raise ValueError("a_diag_jitter must be finite.")
+        if float(a_diag_jitter) < 0.0:
+            raise ValueError("a_diag_jitter must be nonnegative.")
+        self.a_diag_jitter = float(a_diag_jitter)
         self.a_net = _make_mlp(
             in_dim=1,
             out_dim=self.x_dim * self.x_dim,
@@ -578,10 +584,16 @@ class CenteredSharedAffineFlowSKLModel(_CenteredAffineFlowSKLBase):
             final_gain=0.01,
         )
 
+    def _add_a_diag_jitter(self, a: torch.Tensor) -> torch.Tensor:
+        if self.a_diag_jitter == 0.0:
+            return a
+        eye = torch.eye(self.x_dim, dtype=a.dtype, device=a.device).reshape(1, self.x_dim, self.x_dim)
+        return a + self.a_diag_jitter * eye
+
     def A(self, t: torch.Tensor) -> torch.Tensor:
         t = _as_col_t(t)
         raw = self.a_net(t).reshape(int(t.shape[0]), self.x_dim, self.x_dim)
-        return 0.5 * (raw + raw.transpose(-1, -2))
+        return self._add_a_diag_jitter(0.5 * (raw + raw.transpose(-1, -2)))
 
     def forward(self, x: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         theta = _expand_theta_to_batch(theta, batch=int(x.shape[0]))
@@ -626,6 +638,7 @@ class CenteredSharedAffineScalarFlowSKLModel(CenteredSharedAffineFlowSKLModel):
         path_schedule: str | GaussianAffinePathSchedule = "cosine",
         divergence_estimator: str = "exact",
         hutchinson_probes: int = 1,
+        a_diag_jitter: float = 1e-3,
     ) -> None:
         super().__init__(
             theta_dim=theta_dim,
@@ -636,6 +649,7 @@ class CenteredSharedAffineScalarFlowSKLModel(CenteredSharedAffineFlowSKLModel):
             path_schedule=path_schedule,
             divergence_estimator=divergence_estimator,
             hutchinson_probes=int(hutchinson_probes),
+            a_diag_jitter=float(a_diag_jitter),
         )
         self.velocity_family = "shared_affine_scalar"
         self.a_net = _make_mlp(
@@ -648,7 +662,7 @@ class CenteredSharedAffineScalarFlowSKLModel(CenteredSharedAffineFlowSKLModel):
 
     def A(self, t: torch.Tensor) -> torch.Tensor:
         t = _as_col_t(t)
-        return _scalar_batch_to_matrix(self.a_net(t), x_dim=self.x_dim)
+        return self._add_a_diag_jitter(_scalar_batch_to_matrix(self.a_net(t), x_dim=self.x_dim))
 
 
 class CenteredSharedAffineDiagFlowSKLModel(CenteredSharedAffineFlowSKLModel):
@@ -665,6 +679,7 @@ class CenteredSharedAffineDiagFlowSKLModel(CenteredSharedAffineFlowSKLModel):
         path_schedule: str | GaussianAffinePathSchedule = "cosine",
         divergence_estimator: str = "exact",
         hutchinson_probes: int = 1,
+        a_diag_jitter: float = 1e-3,
     ) -> None:
         super().__init__(
             theta_dim=theta_dim,
@@ -675,6 +690,7 @@ class CenteredSharedAffineDiagFlowSKLModel(CenteredSharedAffineFlowSKLModel):
             path_schedule=path_schedule,
             divergence_estimator=divergence_estimator,
             hutchinson_probes=int(hutchinson_probes),
+            a_diag_jitter=float(a_diag_jitter),
         )
         self.velocity_family = "shared_affine_diag"
         self.a_net = _make_mlp(
@@ -687,7 +703,7 @@ class CenteredSharedAffineDiagFlowSKLModel(CenteredSharedAffineFlowSKLModel):
 
     def A(self, t: torch.Tensor) -> torch.Tensor:
         t = _as_col_t(t)
-        return _diag_batch_to_matrix(self.a_net(t), x_dim=self.x_dim)
+        return self._add_a_diag_jitter(_diag_batch_to_matrix(self.a_net(t), x_dim=self.x_dim))
 
 
 class CenteredConditionAffineFlowSKLModel(_CenteredAffineFlowSKLBase):
@@ -857,6 +873,7 @@ class CenteredSharedAffineLowRankFlowSKLModel(CenteredSharedAffineFlowSKLModel):
         path_schedule: str | GaussianAffinePathSchedule = "cosine",
         divergence_estimator: str = "hutchinson",
         hutchinson_probes: int = 1,
+        a_diag_jitter: float = 1e-3,
     ) -> None:
         if int(correction_rank) < 1:
             raise ValueError("correction_rank must be >= 1.")
@@ -875,6 +892,7 @@ class CenteredSharedAffineLowRankFlowSKLModel(CenteredSharedAffineFlowSKLModel):
             path_schedule=path_schedule,
             divergence_estimator=de,
             hutchinson_probes=probes,
+            a_diag_jitter=float(a_diag_jitter),
         )
         self.velocity_family = "shared_affine_low_rank"
         self.correction_rank = int(correction_rank)
@@ -952,6 +970,7 @@ class CenteredSharedAffineLowRankScalarFlowSKLModel(CenteredSharedAffineLowRankF
         path_schedule: str | GaussianAffinePathSchedule = "cosine",
         divergence_estimator: str = "hutchinson",
         hutchinson_probes: int = 1,
+        a_diag_jitter: float = 1e-3,
     ) -> None:
         super().__init__(
             theta_dim=theta_dim,
@@ -963,6 +982,7 @@ class CenteredSharedAffineLowRankScalarFlowSKLModel(CenteredSharedAffineLowRankF
             path_schedule=path_schedule,
             divergence_estimator=divergence_estimator,
             hutchinson_probes=hutchinson_probes,
+            a_diag_jitter=float(a_diag_jitter),
         )
         self.velocity_family = "shared_affine_low_rank_scalar"
         self.a_net = _make_mlp(
@@ -975,7 +995,7 @@ class CenteredSharedAffineLowRankScalarFlowSKLModel(CenteredSharedAffineLowRankF
 
     def A(self, t: torch.Tensor) -> torch.Tensor:
         t = _as_col_t(t)
-        return _scalar_batch_to_matrix(self.a_net(t), x_dim=self.x_dim)
+        return self._add_a_diag_jitter(_scalar_batch_to_matrix(self.a_net(t), x_dim=self.x_dim))
 
 
 class CenteredSharedAffineLowRankDiagFlowSKLModel(CenteredSharedAffineLowRankFlowSKLModel):
@@ -993,6 +1013,7 @@ class CenteredSharedAffineLowRankDiagFlowSKLModel(CenteredSharedAffineLowRankFlo
         path_schedule: str | GaussianAffinePathSchedule = "cosine",
         divergence_estimator: str = "hutchinson",
         hutchinson_probes: int = 1,
+        a_diag_jitter: float = 1e-3,
     ) -> None:
         super().__init__(
             theta_dim=theta_dim,
@@ -1004,6 +1025,7 @@ class CenteredSharedAffineLowRankDiagFlowSKLModel(CenteredSharedAffineLowRankFlo
             path_schedule=path_schedule,
             divergence_estimator=divergence_estimator,
             hutchinson_probes=hutchinson_probes,
+            a_diag_jitter=float(a_diag_jitter),
         )
         self.velocity_family = "shared_affine_low_rank_diag"
         self.a_net = _make_mlp(
@@ -1016,7 +1038,7 @@ class CenteredSharedAffineLowRankDiagFlowSKLModel(CenteredSharedAffineLowRankFlo
 
     def A(self, t: torch.Tensor) -> torch.Tensor:
         t = _as_col_t(t)
-        return _diag_batch_to_matrix(self.a_net(t), x_dim=self.x_dim)
+        return self._add_a_diag_jitter(_diag_batch_to_matrix(self.a_net(t), x_dim=self.x_dim))
 
 
 def build_flow_skl_model(
@@ -1032,6 +1054,7 @@ def build_flow_skl_model(
     path_schedule: str | GaussianAffinePathSchedule = "cosine",
     divergence_estimator: str = "hutchinson",
     hutchinson_probes: int = 1,
+    shared_affine_a_diag_jitter: float = 1e-3,
 ) -> nn.Module:
     """Build a velocity-family model for flow-matching SKL estimation."""
 
@@ -1062,6 +1085,7 @@ def build_flow_skl_model(
             path_schedule=path_schedule,
             divergence_estimator=str(divergence_estimator),
             hutchinson_probes=int(hutchinson_probes),
+            a_diag_jitter=float(shared_affine_a_diag_jitter),
             **common,
         )
     condition_affine_classes = {
@@ -1090,6 +1114,7 @@ def build_flow_skl_model(
             path_schedule=path_schedule,
             divergence_estimator=str(divergence_estimator),
             hutchinson_probes=int(hutchinson_probes),
+            a_diag_jitter=float(shared_affine_a_diag_jitter),
             **common,
         )
     if fam == "nonlinear":
