@@ -180,6 +180,21 @@ def test_build_flow_skl_model_constructs_restricted_velocity_families() -> None:
         assert type(model).__name__ == class_name
 
 
+def test_shared_affine_full_A_is_symmetric_for_arbitrary_t() -> None:
+    torch.manual_seed(123)
+    model = build_flow_skl_model(
+        velocity_family="shared_affine",
+        theta_dim=2,
+        x_dim=4,
+        hidden_dim=8,
+        depth=2,
+        path_schedule="linear",
+    ).double()
+    t = torch.tensor([[0.0], [0.17], [0.5], [0.91]], dtype=torch.float64)
+    a_t = model.A(t)
+    torch.testing.assert_close(a_t, a_t.transpose(-1, -2), rtol=1e-12, atol=1e-12)
+
+
 def test_translation_families_report_model_jeffreys(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -403,7 +418,7 @@ def test_shared_affine_forward_uses_centered_residual() -> None:
         path_schedule="linear",
     ).double()
     means = torch.tensor([[1.0, -2.0], [0.5, 3.0]], dtype=torch.float64)
-    a_mat = torch.tensor([[0.2, -0.4], [0.7, 0.1]], dtype=torch.float64)
+    a_mat = torch.tensor([[0.2, -0.4], [-0.4, 0.1]], dtype=torch.float64)
     _patch_table_b(model, means)
     _patch_shared_A(model, a_mat)
 

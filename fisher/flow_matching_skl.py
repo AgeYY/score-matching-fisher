@@ -545,7 +545,7 @@ class _CenteredAffineFlowSKLBase(nn.Module):
         return None
 
 class CenteredSharedAffineFlowSKLModel(_CenteredAffineFlowSKLBase):
-    """Centered shared-affine velocity ``bdot b(theta) + A(t)(x - beta b(theta))``."""
+    """Centered shared-affine velocity with symmetric shared ``A(t)``."""
 
     def __init__(
         self,
@@ -580,7 +580,8 @@ class CenteredSharedAffineFlowSKLModel(_CenteredAffineFlowSKLBase):
 
     def A(self, t: torch.Tensor) -> torch.Tensor:
         t = _as_col_t(t)
-        return self.a_net(t).reshape(int(t.shape[0]), self.x_dim, self.x_dim)
+        raw = self.a_net(t).reshape(int(t.shape[0]), self.x_dim, self.x_dim)
+        return 0.5 * (raw + raw.transpose(-1, -2))
 
     def forward(self, x: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         theta = _expand_theta_to_batch(theta, batch=int(x.shape[0]))
