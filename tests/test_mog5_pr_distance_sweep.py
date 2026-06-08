@@ -74,7 +74,7 @@ def test_parser_defaults() -> None:
 
     assert args.n_list == [100, 550, 1000, 1550]
     assert args.pr_dim == 5
-    assert args.pr_dim_list == [3, 5, 8, 11]
+    assert not hasattr(args, "pr_dim_list")
     assert args.n_total == 1000
     assert args.device == "cuda"
     assert args.yscale == "log"
@@ -83,15 +83,17 @@ def test_parser_defaults() -> None:
 
 def test_aggregate_mean_pairwise_abs_errors(tmp_path: Path) -> None:
     mod = _load_cli_module()
-    args = mod.build_parser().parse_args(["--n-list", "100", "--pr-dim-list", "3"])
+    args = mod.build_parser().parse_args(["--n-list", "100"])
     data = {
         (100, 5): mod._load_case_cache(_write_case_npz(tmp_path / "case_a.npz", offset=0.0)),
-        (1000, 3): mod._load_case_cache(_write_case_npz(tmp_path / "case_b.npz", offset=5.0)),
     }
 
     aggregate, rows = mod.aggregate_sweeps(args=args, case_data=data)
 
     assert aggregate["n_sweep_classical_matrices"].shape == (1, 2, 3, 3)
+    assert "pr_dim_list" not in aggregate
+    assert "pr_dim_sweep_classical_matrices" not in aggregate
+    assert {r["axis"] for r in rows} == {"n_total"}
     n_rows = [r for r in rows if r["axis"] == "n_total" and r["metric"] == "squared_euclidean"]
     classical_errors = [r["abs_error"] for r in n_rows if r["estimator"] == "classical"]
     flow_errors = [r["abs_error"] for r in n_rows if r["estimator"] == "flow_matching"]
@@ -105,10 +107,9 @@ def test_aggregate_mean_pairwise_abs_errors(tmp_path: Path) -> None:
 
 def test_relative_error_uses_denominator_floor_for_zero_ground_truth(tmp_path: Path) -> None:
     mod = _load_cli_module()
-    args = mod.build_parser().parse_args(["--n-list", "100", "--pr-dim-list", "3"])
+    args = mod.build_parser().parse_args(["--n-list", "100"])
     data = {
         (100, 5): mod._load_case_cache(_write_zero_gt_case_npz(tmp_path / "case_a.npz")),
-        (1000, 3): mod._load_case_cache(_write_zero_gt_case_npz(tmp_path / "case_b.npz")),
     }
 
     _, rows = mod.aggregate_sweeps(args=args, case_data=data)
@@ -148,9 +149,7 @@ def test_cache_hits_do_not_rerun_and_duplicate_case_is_deduped(monkeypatch, tmp_
     args = mod.build_parser().parse_args(
         [
             "--n-list",
-            "1000",
-            "--pr-dim-list",
-            "5,8",
+            "1000,2000,1000",
             "--output-dir",
             str(tmp_path / "sweep"),
             "--yscale",
@@ -160,8 +159,8 @@ def test_cache_hits_do_not_rerun_and_duplicate_case_is_deduped(monkeypatch, tmp_
     mod.run(args)
 
     assert len(calls) == 1
-    assert calls[0].n_total == 1000
-    assert calls[0].pr_dim == 8
+    assert calls[0].n_total == 2000
+    assert calls[0].pr_dim == 5
 
 
 def test_visualization_only_missing_cache_fails(monkeypatch, tmp_path: Path) -> None:
@@ -171,9 +170,7 @@ def test_visualization_only_missing_cache_fails(monkeypatch, tmp_path: Path) -> 
         "case_output_dir",
         lambda *, n_total, pr_dim, case_output_name: tmp_path / f"case_{n_total}_{pr_dim}",
     )
-    args = mod.build_parser().parse_args(
-        ["--visualization-only", "--n-list", "100", "--pr-dim-list", "3", "--output-dir", str(tmp_path / "sweep")]
-    )
+    args = mod.build_parser().parse_args(["--visualization-only", "--n-list", "100", "--output-dir", str(tmp_path / "sweep")])
 
     with pytest.raises(FileNotFoundError, match="visualization-only"):
         mod.run(args)
@@ -187,14 +184,11 @@ def test_visualization_only_writes_outputs_from_fake_caches(monkeypatch, tmp_pat
         lambda *, n_total, pr_dim, case_output_name: tmp_path / f"case_{n_total}_{pr_dim}",
     )
     _write_case_npz(tmp_path / "case_100_5" / mod.RESULTS_NAME)
-    _write_case_npz(tmp_path / "case_1000_3" / mod.RESULTS_NAME, offset=2.0)
     args = mod.build_parser().parse_args(
         [
             "--visualization-only",
             "--n-list",
             "100",
-            "--pr-dim-list",
-            "3",
             "--output-dir",
             str(tmp_path / "sweep"),
         ]
@@ -213,11 +207,15 @@ def test_visualization_only_writes_outputs_from_fake_caches(monkeypatch, tmp_pat
     assert outputs["summary_json"].is_file()
     with np.load(outputs["results_npz"], allow_pickle=False) as data:
         assert data["n_sweep_classical_matrices"].shape == (1, 2, 3, 3)
+        assert "pr_dim_list" not in data.files
+        assert "pr_dim_sweep_classical_matrices" not in data.files
     with outputs["errors_csv"].open(newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
     assert "rel_error" in rows[0]
+    assert {row["axis"] for row in rows} == {"n_total"}
     summary = json.loads(outputs["summary_json"].read_text(encoding="utf-8"))
     assert summary["config"]["abs_error_yscale"] == "log"
     assert summary["config"]["rel_error_yscale"] == "linear"
+    assert "pr_dim_list" not in summary["config"]
     assert "abs_error_figure_svg" in summary["outputs"]
     assert "rel_error_figure_svg" in summary["outputs"]

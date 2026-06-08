@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run MoG5 PR distance comparisons across sample-size and PR-dimension sweeps."""
+"""Run MoG5 PR distance comparisons across sample-size sweeps."""
 
 from __future__ import annotations
 
@@ -72,12 +72,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma-separated sample-size sweep values.",
     )
     p.add_argument(
-        "--pr-dim-list",
-        type=_parse_int_list,
-        default=[3, 5, 8, 11],
-        help="Comma-separated PR-dimension sweep values.",
-    )
-    p.add_argument(
         "--case-output-name",
         type=str,
         default="distance_comparison_flow_skl",
@@ -111,11 +105,6 @@ def _unique_cases(args: argparse.Namespace) -> list[tuple[int, int]]:
     seen: set[tuple[int, int]] = set()
     for n_total in args.n_list:
         case = (int(n_total), int(args.pr_dim))
-        if case not in seen:
-            cases.append(case)
-            seen.add(case)
-    for pr_dim in args.pr_dim_list:
-        case = (int(args.n_total), int(pr_dim))
         if case not in seen:
             cases.append(case)
             seen.add(case)
@@ -201,8 +190,6 @@ def aggregate_sweeps(
         np.testing.assert_array_equal(np.asarray(data["pair_indices"], dtype=np.int64), pair_indices)
 
     n_cases = [(int(n_total), int(args.pr_dim)) for n_total in args.n_list]
-    pr_cases = [(int(args.n_total), int(pr_dim)) for pr_dim in args.pr_dim_list]
-
     def stack(cases: list[tuple[int, int]], key: str) -> np.ndarray:
         return np.stack([np.asarray(case_data[case][key], dtype=np.float64) for case in cases], axis=0)
 
@@ -212,46 +199,41 @@ def aggregate_sweeps(
         "pair_indices": pair_indices,
         "n_list": np.asarray(args.n_list, dtype=np.int64),
         "pr_dim": int(args.pr_dim),
-        "pr_dim_list": np.asarray(args.pr_dim_list, dtype=np.int64),
         "n_total": int(args.n_total),
         "n_sweep_classical_matrices": stack(n_cases, "classical_matrices"),
         "n_sweep_flow_matching_matrices": stack(n_cases, "flow_matching_matrices"),
         "n_sweep_ground_truth_matrices": stack(n_cases, "ground_truth_matrices"),
-        "pr_dim_sweep_classical_matrices": stack(pr_cases, "classical_matrices"),
-        "pr_dim_sweep_flow_matching_matrices": stack(pr_cases, "flow_matching_matrices"),
-        "pr_dim_sweep_ground_truth_matrices": stack(pr_cases, "ground_truth_matrices"),
     }
 
     rows: list[dict[str, Any]] = []
-    for axis, cases in (("n_total", n_cases), ("pr_dim", pr_cases)):
-        for n_total, pr_dim in cases:
-            data = case_data[(n_total, pr_dim)]
-            for metric_idx, metric in enumerate(metric_names):
-                gt = np.asarray(data["ground_truth_matrices"][metric_idx], dtype=np.float64)
-                for i, j in pair_indices:
-                    ci, cj = int(i), int(j)
-                    for estimator, matrix_key in (
-                        ("classical", "classical_matrices"),
-                        ("flow_matching", "flow_matching_matrices"),
-                    ):
-                        est = float(np.asarray(data[matrix_key][metric_idx], dtype=np.float64)[ci, cj])
-                        truth = float(gt[ci, cj])
-                        abs_error = abs(est - truth)
-                        rows.append(
-                            {
-                                "axis": axis,
-                                "n_total": int(n_total),
-                                "pr_dim": int(pr_dim),
-                                "metric": str(metric),
-                                "estimator": estimator,
-                                "condition_i": condition_labels[ci],
-                                "condition_j": condition_labels[cj],
-                                "estimate": est,
-                                "ground_truth": truth,
-                                "abs_error": abs_error,
-                                "rel_error": _relative_error(abs_error, truth),
-                            }
-                        )
+    for n_total, pr_dim in n_cases:
+        data = case_data[(n_total, pr_dim)]
+        for metric_idx, metric in enumerate(metric_names):
+            gt = np.asarray(data["ground_truth_matrices"][metric_idx], dtype=np.float64)
+            for i, j in pair_indices:
+                ci, cj = int(i), int(j)
+                for estimator, matrix_key in (
+                    ("classical", "classical_matrices"),
+                    ("flow_matching", "flow_matching_matrices"),
+                ):
+                    est = float(np.asarray(data[matrix_key][metric_idx], dtype=np.float64)[ci, cj])
+                    truth = float(gt[ci, cj])
+                    abs_error = abs(est - truth)
+                    rows.append(
+                        {
+                            "axis": "n_total",
+                            "n_total": int(n_total),
+                            "pr_dim": int(pr_dim),
+                            "metric": str(metric),
+                            "estimator": estimator,
+                            "condition_i": condition_labels[ci],
+                            "condition_j": condition_labels[cj],
+                            "estimate": est,
+                            "ground_truth": truth,
+                            "abs_error": abs_error,
+                            "rel_error": _relative_error(abs_error, truth),
+                        }
+                    )
     return aggregate, rows
 
 
@@ -264,14 +246,10 @@ def write_aggregate_npz(path: Path, aggregate: dict[str, Any]) -> Path:
         pair_indices=np.asarray(aggregate["pair_indices"], dtype=np.int64),
         n_list=np.asarray(aggregate["n_list"], dtype=np.int64),
         pr_dim=np.asarray([int(aggregate["pr_dim"])], dtype=np.int64),
-        pr_dim_list=np.asarray(aggregate["pr_dim_list"], dtype=np.int64),
         n_total=np.asarray([int(aggregate["n_total"])], dtype=np.int64),
         n_sweep_classical_matrices=np.asarray(aggregate["n_sweep_classical_matrices"], dtype=np.float64),
         n_sweep_flow_matching_matrices=np.asarray(aggregate["n_sweep_flow_matching_matrices"], dtype=np.float64),
         n_sweep_ground_truth_matrices=np.asarray(aggregate["n_sweep_ground_truth_matrices"], dtype=np.float64),
-        pr_dim_sweep_classical_matrices=np.asarray(aggregate["pr_dim_sweep_classical_matrices"], dtype=np.float64),
-        pr_dim_sweep_flow_matching_matrices=np.asarray(aggregate["pr_dim_sweep_flow_matching_matrices"], dtype=np.float64),
-        pr_dim_sweep_ground_truth_matrices=np.asarray(aggregate["pr_dim_sweep_ground_truth_matrices"], dtype=np.float64),
     )
     return path
 
@@ -320,29 +298,34 @@ def plot_sweep_error(
             axes[0],
             np.asarray(aggregate["n_list"], dtype=np.int64),
             "n_total",
-            int(aggregate["pr_dim"]),
             aggregate["n_sweep_classical_matrices"],
             aggregate["n_sweep_flow_matching_matrices"],
             aggregate["n_sweep_ground_truth_matrices"],
             f"Sample-size sweep (PR dim={int(aggregate['pr_dim'])})",
+            ("classical", "flow_matching"),
         ),
         (
             axes[1],
-            np.asarray(aggregate["pr_dim_list"], dtype=np.int64),
-            "pr_dim",
-            int(aggregate["n_total"]),
-            aggregate["pr_dim_sweep_classical_matrices"],
-            aggregate["pr_dim_sweep_flow_matching_matrices"],
-            aggregate["pr_dim_sweep_ground_truth_matrices"],
-            f"PR-dimension sweep (n={int(aggregate['n_total'])})",
+            np.asarray(aggregate["n_list"], dtype=np.int64),
+            "n_total",
+            aggregate["n_sweep_classical_matrices"],
+            aggregate["n_sweep_flow_matching_matrices"],
+            aggregate["n_sweep_ground_truth_matrices"],
+            f"Flow estimation only (PR dim={int(aggregate['pr_dim'])})",
+            ("flow_matching",),
         ),
     )
 
     handles_by_label: dict[str, Any] = {}
-    for ax, xvals, xlabel, _, classical, flow, gt, title in panels:
+    for ax, xvals, xlabel, classical, flow, gt, title, estimators in panels:
         for metric_idx, metric in enumerate(metric_names):
             color = colors(metric_idx % 10)
-            for estimator, matrices in (("classical", classical), ("flow_matching", flow)):
+            matrices_by_estimator = {
+                "classical": classical,
+                "flow_matching": flow,
+            }
+            for estimator in estimators:
+                matrices = matrices_by_estimator[estimator]
                 yvals = [
                     _mean_pair_error(
                         np.asarray(matrices[row_idx, metric_idx], dtype=np.float64),
@@ -402,7 +385,6 @@ def write_summary(path: Path, *, args: argparse.Namespace, case_paths: dict[tupl
         "config": {
             "n_list": [int(v) for v in args.n_list],
             "pr_dim": int(args.pr_dim),
-            "pr_dim_list": [int(v) for v in args.pr_dim_list],
             "n_total": int(args.n_total),
             "seed": int(args.seed),
             "device": str(args.device),
