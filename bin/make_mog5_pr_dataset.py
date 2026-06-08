@@ -70,7 +70,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--n-total", type=int, default=50_000, help="Total joint samples.")
+    p.add_argument("--n-total", type=int, default=1_000, help="Total joint samples.")
     p.add_argument("--pr-dim", type=int, default=5, help="Target PR-embedded x dimension; must be > 2.")
     p.add_argument("--seed", type=int, default=7, help="Dataset and PR-autoencoder seed.")
     p.add_argument("--train-frac", type=float, default=0.7, help="Fraction of rows assigned to train_idx.")

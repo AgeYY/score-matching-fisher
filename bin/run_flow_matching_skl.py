@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train flow-matching endpoint models and estimate model-induced symmetric KL."""
+"""Train flow-matching endpoint models and estimate model-sampled symmetric KL."""
 
 from __future__ import annotations
 
@@ -38,12 +38,12 @@ def build_parser() -> argparse.ArgumentParser:
     src.add_argument("--toy", choices=("random_mog",), default=None)
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--path-schedule", choices=("cosine", "linear", "straight"), default="cosine")
-    p.add_argument("--normalize-x", dest="normalize_x", action="store_true", default=True)
-    p.add_argument("--no-normalize-x", dest="normalize_x", action="store_false")
     p.add_argument("--radius", type=float, default=1.0)
     p.add_argument("--fisher-kind", choices=("none", "full", "linear", "both"), default="none")
-    p.add_argument("--mc-samples", type=int, default=4096)
+    p.add_argument("--mc-jeffreys-sample", dest="mc_jeffreys_sample", type=int, default=4096)
+    p.add_argument("--mc-samples", dest="mc_jeffreys_sample", type=int, help=argparse.SUPPRESS)
     p.add_argument("--ode-steps", type=int, default=64)
+    p.add_argument("--ode-method", type=str, default="midpoint")
     p.add_argument("--output-dir", type=Path, default=None)
 
     p.add_argument("--seed", type=int, default=7)
@@ -255,7 +255,6 @@ def main(argv: list[str] | None = None) -> int:
         device=dev,
         velocity_family=str(args.velocity_family),
         path_schedule=str(args.path_schedule),
-        normalize_x=bool(args.normalize_x),
         epochs=int(args.epochs),
         batch_size=int(args.batch_size),
         lr=float(args.lr),
@@ -273,18 +272,14 @@ def main(argv: list[str] | None = None) -> int:
         device=dev,
         velocity_family=str(args.velocity_family),
         radius=float(args.radius),
-        mc_samples=int(args.mc_samples),
+        mc_jeffreys_sample=int(args.mc_jeffreys_sample),
         ode_steps=int(args.ode_steps),
+        ode_method=str(args.ode_method),
         batch_size=int(args.batch_size),
         solve_jitter=float(args.solve_jitter),
         quadrature_steps=int(args.quadrature_steps),
         fisher_kind=str(args.fisher_kind),
         train_metadata=train_meta,
-        normalization={
-            "x_mean": train_meta["x_mean"],
-            "x_std": train_meta["x_std"],
-            "normalize_x": bool(args.normalize_x),
-        },
     )
 
     out_dir = args.output_dir
@@ -314,7 +309,7 @@ def main(argv: list[str] | None = None) -> int:
         "velocity_family": str(args.velocity_family),
         "device": str(dev),
         "path_schedule": str(args.path_schedule),
-        "normalize_x": bool(args.normalize_x),
+        "ode_method": str(args.ode_method),
         "theta_train_shape": list(theta_train.shape),
         "x_train_shape": list(x_train.shape),
         "theta_eval_shape": list(theta_eval.shape),

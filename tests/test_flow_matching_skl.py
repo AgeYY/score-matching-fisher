@@ -5,6 +5,7 @@ import types
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 from torch import nn
 
@@ -12,6 +13,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from fisher import flow_matching_skl as fms
 from fisher.flow_matching_skl import (
     FlowSKLResult,
     VELOCITY_FAMILIES,
@@ -19,9 +21,11 @@ from fisher.flow_matching_skl import (
     centered_radius_normalize,
     estimate_model_symmetric_kl,
     estimate_scalar_fisher_from_skl,
+    flow_endpoint_log_prob,
     flow_skl_result_to_npz_dict,
+    sample_flow_endpoint,
+    train_flow_skl_model,
 )
-from fisher.llr_divergence import symmetric_kl_gaussian_full_matrix
 
 
 class TableTranslationModel(nn.Module):
@@ -55,34 +59,6 @@ class ScalarLinearTranslationModel(nn.Module):
         if theta.ndim == 1:
             theta = theta.unsqueeze(-1)
         return theta.to(self.slope.dtype) @ self.slope
-
-
-class GaussianEndpointModel(nn.Module):
-    def __init__(
-        self,
-        means: np.ndarray,
-        covariance: np.ndarray,
-        *,
-        velocity_family: str,
-    ) -> None:
-        super().__init__()
-        self.velocity_family = velocity_family
-        self.x_dim = int(means.shape[1])
-        self.register_buffer("means", torch.as_tensor(means, dtype=torch.float64))
-        self.register_buffer("covariance", torch.as_tensor(covariance, dtype=torch.float64))
-
-    def _mean(self, theta: torch.Tensor) -> torch.Tensor:
-        if theta.ndim == 1:
-            theta = theta.unsqueeze(-1)
-        return theta.to(self.means.dtype) @ self.means
-
-    def endpoint_mean_covariance(self, theta: torch.Tensor, *, solve_jitter: float = 1e-6, quadrature_steps=None):
-        del solve_jitter, quadrature_steps
-        mu = self._mean(theta)
-        cov = self.covariance
-        if cov.ndim == 2:
-            cov = cov.reshape(1, self.x_dim, self.x_dim).expand(int(mu.shape[0]), self.x_dim, self.x_dim)
-        return mu, cov
 
 
 class ConstantNet(nn.Module):
@@ -120,24 +96,33 @@ class StandardNormalMCFlowModel(nn.Module):
         del theta, t
         return torch.zeros_like(x)
 
-    def log_prob_normalized(
-        self,
-        x_norm: torch.Tensor,
-        theta: torch.Tensor,
-        *,
-        solve_jitter: float = 1e-6,
-        quadrature_steps=None,
-        ode_steps: int = 32,
-    ) -> torch.Tensor:
-        del theta, solve_jitter, quadrature_steps, ode_steps
-        if x_norm.ndim == 1:
-            x_norm = x_norm.unsqueeze(0)
-        d = int(x_norm.shape[1])
-        return -0.5 * (torch.sum(x_norm**2, dim=1) + float(d) * np.log(2.0 * np.pi))
-
 
 def _one_hot(n: int) -> np.ndarray:
     return np.eye(int(n), dtype=np.float64)
+
+
+def _sentinel_skl(n: int, *, offset: float = 10.0) -> np.ndarray:
+    raw = np.arange(int(n) * int(n), dtype=np.float64).reshape(int(n), int(n)) + float(offset)
+    out = raw + raw.T
+    np.fill_diagonal(out, 0.0)
+    return out
+
+
+def _patch_model_jeffreys(
+    monkeypatch: pytest.MonkeyPatch,
+    sentinel: np.ndarray,
+    calls: list[dict[str, object]] | None = None,
+) -> None:
+    def fake_estimate_model_jeffreys(**kwargs):
+        if calls is not None:
+            calls.append(dict(kwargs))
+        theta = np.asarray(kwargs["theta_all"], dtype=np.float64)
+        assert theta.shape[0] == sentinel.shape[0]
+        assert "theta_data" not in kwargs
+        assert "x_data" not in kwargs
+        return sentinel.copy()
+
+    monkeypatch.setattr(fms, "_estimate_model_jeffreys", fake_estimate_model_jeffreys)
 
 
 def _patch_table_b(model: nn.Module, table: torch.Tensor) -> None:
@@ -195,55 +180,217 @@ def test_build_flow_skl_model_constructs_restricted_velocity_families() -> None:
         assert type(model).__name__ == class_name
 
 
-def test_translation_skl_equals_squared_euclidean() -> None:
-    means = np.array([[0.0, 0.0], [1.0, 2.0], [-2.0, 1.0]], dtype=np.float64)
-    model = TableTranslationModel(means)
-    result = estimate_model_symmetric_kl(
+def test_translation_families_report_model_jeffreys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    radius_fixed = 2.5
+    fixed_means = radius_fixed * np.array([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]], dtype=np.float64)
+    radius_centered = 1.75
+    centered_raw = np.array([[1.0, 2.0, 5.0], [3.0, 6.0, 9.0], [5.0, 2.0, 1.0]], dtype=np.float64)
+    cases = (
+        (
+            "translation",
+            TableTranslationModel(np.array([[0.0, 0.0], [1.0, 2.0], [-2.0, 1.0]], dtype=np.float64)),
+            None,
+        ),
+        (
+            "translation_fixed_norm",
+            TableTranslationModel(fixed_means, velocity_family="translation_fixed_norm", radius=radius_fixed),
+            radius_fixed,
+        ),
+        (
+            "translation_centered_fixed_norm",
+            CenteredTableTranslationModel(
+                centered_raw,
+                velocity_family="translation_centered_fixed_norm",
+                radius=radius_centered,
+            ),
+            radius_centered,
+        ),
+    )
+
+    for idx, (family, model, radius) in enumerate(cases):
+        theta_eval = _one_hot(3)
+        sentinel = _sentinel_skl(3, offset=10.0 * (idx + 1))
+        calls: list[dict[str, object]] = []
+        _patch_model_jeffreys(monkeypatch, sentinel, calls)
+        result = estimate_model_symmetric_kl(
+            model=model,
+            theta_all=theta_eval,
+            device=torch.device("cpu"),
+            velocity_family=family,
+            radius=radius,
+            mc_jeffreys_sample=17,
+            ode_steps=5,
+            batch_size=4,
+            solve_jitter=3e-5,
+            quadrature_steps=7,
+            ode_method="heun3",
+        )
+
+        np.testing.assert_allclose(result.symmetric_kl_matrix, sentinel)
+        np.testing.assert_allclose(result.canonical_metric_matrix, sentinel)
+        assert result.canonical_metric_name == "model_jeffreys_symmetric_kl"
+        assert calls and calls[0]["mc_jeffreys_sample"] == 17
+        assert "normalization" not in calls[0]
+        assert calls[0]["ode_steps"] == 5
+        assert calls[0]["batch_size"] == 4
+        assert calls[0]["solve_jitter"] == 3e-5
+        assert calls[0]["quadrature_steps"] == 7
+        assert calls[0]["ode_method"] == "heun3"
+
+
+def test_translation_training_uses_flow_matching_forward_loss() -> None:
+    model = build_flow_skl_model(
+        velocity_family="translation",
+        theta_dim=2,
+        x_dim=2,
+        hidden_dim=4,
+        depth=1,
+        path_schedule="linear",
+    )
+    calls: list[dict[str, object]] = []
+    original_forward = model.forward
+
+    def spy_forward(self, x: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        del self
+        calls.append({"x_shape": tuple(x.shape), "t_ndim": int(t.ndim)})
+        return original_forward(x, theta, t)
+
+    model.forward = types.MethodType(spy_forward, model)  # type: ignore[method-assign]
+    theta = np.eye(2, dtype=np.float64)[[0, 1, 0, 1]]
+    x = np.array([[0.0, 0.0], [1.0, -1.0], [0.2, 0.1], [1.2, -0.8]], dtype=np.float64)
+
+    out = train_flow_skl_model(
         model=model,
-        theta_all=_one_hot(3),
+        theta_train=theta,
+        x_train=x,
+        theta_val=theta,
+        x_val=x,
         device=torch.device("cpu"),
         velocity_family="translation",
+        path_schedule="linear",
+        epochs=1,
+        batch_size=2,
+        t_eps=0.1,
+        log_every=999,
     )
-    diff = means[:, None, :] - means[None, :, :]
-    expected = np.sum(diff * diff, axis=2)
-    np.testing.assert_allclose(result.symmetric_kl_matrix, expected, rtol=1e-7, atol=1e-7)
-    np.testing.assert_allclose(result.canonical_metric_matrix, expected, rtol=1e-7, atol=1e-7)
-    assert result.canonical_metric_name == "squared_euclidean"
+
+    assert out["n_total_steps"] == 2
+    assert calls
+    assert all(c["t_ndim"] == 1 for c in calls)
 
 
-def test_fixed_norm_translation_canonical_metric_is_cosine_distance() -> None:
-    radius = 2.5
-    means = radius * np.array([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]], dtype=np.float64)
-    model = TableTranslationModel(means, velocity_family="translation_fixed_norm", radius=radius)
+def test_translation_log_prob_uses_package_likelihood_against_shifted_normal() -> None:
+    model = build_flow_skl_model(
+        velocity_family="translation",
+        theta_dim=2,
+        x_dim=2,
+        hidden_dim=4,
+        depth=1,
+        path_schedule="linear",
+        divergence_estimator="exact",
+    ).double()
+    mean = torch.tensor([1.0, -2.0], dtype=torch.float64)
+    model.mean_net = ConstantNet(mean)
+
+    x = torch.tensor([[2.0, 1.0]], dtype=torch.float64)
+    theta = torch.eye(2, dtype=torch.float64)[:1]
+    got = flow_endpoint_log_prob(model, x, theta, ode_steps=1, ode_method="midpoint")
+    x0 = x - mean.reshape(1, -1)
+    expected = -0.5 * (torch.sum(x0**2, dim=1) + 2.0 * np.log(2.0 * np.pi))
+    torch.testing.assert_close(got, expected, rtol=1e-12, atol=1e-12)
+
+
+def test_model_jeffreys_matches_translation_model_skl_with_deterministic_samples(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = build_flow_skl_model(
+        velocity_family="translation",
+        theta_dim=2,
+        x_dim=2,
+        hidden_dim=4,
+        depth=1,
+        path_schedule="linear",
+        divergence_estimator="exact",
+    ).double()
+    means = torch.tensor([[0.0, 0.0], [1.0, -2.0]], dtype=torch.float64)
+    mean_net = nn.Linear(2, 2, bias=False).double()
+    with torch.no_grad():
+        mean_net.weight.copy_(means.T)
+    model.mean_net = mean_net
+
+    theta_eval = np.eye(2, dtype=np.float64)
+
+    def fake_sample_flow_endpoint(**kwargs):
+        theta = torch.as_tensor(kwargs["theta"], dtype=torch.float64)
+        mean = theta @ means
+        base = torch.tensor([[1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0]], dtype=torch.float64)
+        return base + mean
+
+    monkeypatch.setattr(fms, "sample_flow_endpoint", fake_sample_flow_endpoint)
     result = estimate_model_symmetric_kl(
         model=model,
-        theta_all=_one_hot(3),
+        theta_all=theta_eval,
         device=torch.device("cpu"),
-        velocity_family="translation_fixed_norm",
-        radius=radius,
+        velocity_family="translation",
+        mc_jeffreys_sample=4,
+        ode_steps=1,
+        ode_method="midpoint",
+        batch_size=2,
     )
-    cosine_distance = 1.0 - (means @ means.T) / (radius * radius)
-    np.fill_diagonal(cosine_distance, 0.0)
-    np.testing.assert_allclose(result.canonical_metric_matrix, cosine_distance, rtol=1e-7, atol=1e-7)
-    np.testing.assert_allclose(result.symmetric_kl_matrix / (2.0 * radius * radius), cosine_distance, rtol=1e-7, atol=1e-7)
+
+    expected = np.array([[0.0, 5.0], [5.0, 0.0]], dtype=np.float64)
+    np.testing.assert_allclose(result.symmetric_kl_matrix, expected, rtol=1e-10, atol=1e-10)
+    np.testing.assert_allclose(result.canonical_metric_matrix, expected, rtol=1e-10, atol=1e-10)
+    assert result.canonical_metric_name == "model_jeffreys_symmetric_kl"
 
 
-def test_centered_fixed_norm_translation_canonical_metric_is_correlation_distance() -> None:
-    radius = 1.75
-    raw = np.array([[1.0, 2.0, 5.0], [3.0, 6.0, 9.0], [5.0, 2.0, 1.0]], dtype=np.float64)
-    model = CenteredTableTranslationModel(raw, velocity_family="translation_centered_fixed_norm", radius=radius)
-    result = estimate_model_symmetric_kl(
+def test_x_independent_velocity_likelihood_has_zero_divergence() -> None:
+    model = build_flow_skl_model(
+        velocity_family="translation",
+        theta_dim=2,
+        x_dim=2,
+        hidden_dim=4,
+        depth=1,
+        path_schedule="linear",
+        divergence_estimator="exact",
+    ).double()
+    mean = torch.tensor([0.0, 0.0], dtype=torch.float64)
+    model.mean_net = ConstantNet(mean)
+
+    x = torch.tensor([[1.0, 2.0]], dtype=torch.float64)
+    theta = torch.eye(2, dtype=torch.float64)[:1]
+    got = flow_endpoint_log_prob(model, x, theta, ode_steps=2, ode_method="midpoint")
+    expected = -0.5 * (torch.sum(x**2, dim=1) + 2.0 * np.log(2.0 * np.pi))
+    torch.testing.assert_close(got, expected, rtol=1e-12, atol=1e-12)
+
+
+def test_sample_flow_endpoint_uses_package_solver_for_constant_velocity() -> None:
+    model = build_flow_skl_model(
+        velocity_family="translation",
+        theta_dim=2,
+        x_dim=2,
+        hidden_dim=4,
+        depth=1,
+        path_schedule="linear",
+    )
+    mean = torch.tensor([0.5, -1.25], dtype=torch.float32)
+    model.mean_net = ConstantNet(mean)
+
+    theta = np.eye(2, dtype=np.float64)[:1]
+    torch.manual_seed(123)
+    expected_x0 = torch.randn(4, 2, dtype=torch.float32)
+    torch.manual_seed(123)
+    got = sample_flow_endpoint(
         model=model,
-        theta_all=_one_hot(3),
+        theta=theta,
+        n_samples=4,
         device=torch.device("cpu"),
-        velocity_family="translation_centered_fixed_norm",
-        radius=radius,
+        ode_steps=3,
+        ode_method="midpoint",
     )
-    centered = raw - raw.mean(axis=1, keepdims=True)
-    centered = radius * centered / np.linalg.norm(centered, axis=1, keepdims=True)
-    corr_distance = 1.0 - (centered @ centered.T) / (radius * radius)
-    np.fill_diagonal(corr_distance, 0.0)
-    np.testing.assert_allclose(result.canonical_metric_matrix, corr_distance, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(got, expected_x0 + mean.reshape(1, -1), rtol=1e-6, atol=1e-6)
 
 
 def test_shared_affine_forward_uses_centered_residual() -> None:
@@ -486,93 +633,45 @@ def test_shared_affine_low_rank_diag_forward_includes_diagonal_base_and_correcti
     torch.testing.assert_close(model(x, theta, t), expected, rtol=1e-12, atol=1e-12)
 
 
-def test_shared_affine_skl_reduces_to_mahalanobis_squared() -> None:
-    means = np.array([[0.0, 0.0], [1.0, 2.0], [-1.0, 0.5]], dtype=np.float64)
-    cov = np.array([[2.0, 0.3], [0.3, 0.8]], dtype=np.float64)
-    model = GaussianEndpointModel(means, cov, velocity_family="shared_affine")
-    result = estimate_model_symmetric_kl(
-        model=model,
-        theta_all=_one_hot(3),
-        device=torch.device("cpu"),
-        velocity_family="shared_affine",
-    )
-    inv = np.linalg.inv(cov)
-    expected = np.zeros((3, 3), dtype=np.float64)
-    for i in range(3):
-        for j in range(3):
-            d = means[i] - means[j]
-            expected[i, j] = float(d @ inv @ d)
-    np.testing.assert_allclose(result.symmetric_kl_matrix, expected, rtol=2e-6, atol=1e-5)
-    np.testing.assert_allclose(result.canonical_metric_matrix, expected, rtol=2e-6, atol=1e-5)
-    assert result.canonical_metric_name == "mahalanobis_sq"
-    assert result.endpoint_covariance is not None
-    assert result.endpoint_covariance.shape == (2, 2)
-
-
-def test_restricted_shared_affine_endpoint_covariance_is_shared_full_matrix() -> None:
-    means = np.array([[0.0, 0.0], [1.0, 2.0], [-1.0, 0.5]], dtype=np.float64)
-    cov = np.array([[2.0, 0.3], [0.3, 0.8]], dtype=np.float64)
-    for family in ("shared_affine_scalar", "shared_affine_diag"):
-        model = GaussianEndpointModel(means, cov, velocity_family=family)
+def test_shared_affine_families_report_model_jeffreys_without_endpoint_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for idx, family in enumerate(("shared_affine", "shared_affine_scalar", "shared_affine_diag")):
+        model = StandardNormalMCFlowModel(velocity_family=family, x_dim=2)
+        theta_eval = _one_hot(3)
+        sentinel = _sentinel_skl(3, offset=20.0 * (idx + 1))
+        _patch_model_jeffreys(monkeypatch, sentinel)
         result = estimate_model_symmetric_kl(
             model=model,
-            theta_all=_one_hot(3),
+            theta_all=theta_eval,
             device=torch.device("cpu"),
             velocity_family=family,
         )
-        assert result.endpoint_covariance is not None
-        assert result.endpoint_covariance.shape == (2, 2)
-        assert result.canonical_metric_name == "mahalanobis_sq"
+        np.testing.assert_allclose(result.symmetric_kl_matrix, sentinel)
+        np.testing.assert_allclose(result.canonical_metric_matrix, sentinel)
+        assert result.canonical_metric_name == "model_jeffreys_symmetric_kl"
 
 
-def test_condition_affine_skl_uses_full_gaussian_helper_with_jeffreys_scaling() -> None:
-    means = np.array([[0.0, 0.0], [1.0, 2.0], [-1.0, 0.5]], dtype=np.float64)
-    covs = np.array(
-        [
-            [[1.0, 0.2], [0.2, 2.0]],
-            [[0.7, -0.15], [-0.15, 1.5]],
-            [[2.5, 0.4], [0.4, 0.9]],
-        ],
-        dtype=np.float64,
-    )
-    model = GaussianEndpointModel(means, covs, velocity_family="condition_affine")
-    result = estimate_model_symmetric_kl(
-        model=model,
-        theta_all=_one_hot(3),
-        device=torch.device("cpu"),
-        velocity_family="condition_affine",
-    )
-    helper = symmetric_kl_gaussian_full_matrix(means, covs, jitter=1e-6)
-    np.testing.assert_allclose(result.symmetric_kl_matrix, 2.0 * helper, rtol=1e-6, atol=1e-6)
-    assert result.endpoint_covariance is not None
-    assert result.endpoint_covariance.shape == (3, 2, 2)
-    assert result.canonical_metric_name == "gaussian_symmetric_kl"
-
-
-def test_restricted_condition_affine_endpoint_covariance_is_batched_full_matrix() -> None:
-    means = np.array([[0.0, 0.0], [1.0, 2.0], [-1.0, 0.5]], dtype=np.float64)
-    covs = np.array(
-        [
-            [[1.0, 0.2], [0.2, 2.0]],
-            [[0.7, -0.15], [-0.15, 1.5]],
-            [[2.5, 0.4], [0.4, 0.9]],
-        ],
-        dtype=np.float64,
-    )
-    for family in ("condition_affine_scalar", "condition_affine_diag"):
-        model = GaussianEndpointModel(means, covs, velocity_family=family)
+def test_condition_affine_families_report_model_jeffreys_without_endpoint_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for idx, family in enumerate(("condition_affine", "condition_affine_scalar", "condition_affine_diag")):
+        model = StandardNormalMCFlowModel(velocity_family=family, x_dim=2)
+        theta_eval = _one_hot(3)
+        sentinel = _sentinel_skl(3, offset=30.0 * (idx + 1))
+        _patch_model_jeffreys(monkeypatch, sentinel)
         result = estimate_model_symmetric_kl(
             model=model,
-            theta_all=_one_hot(3),
+            theta_all=theta_eval,
             device=torch.device("cpu"),
             velocity_family=family,
         )
-        assert result.endpoint_covariance is not None
-        assert result.endpoint_covariance.shape == (3, 2, 2)
-        assert result.canonical_metric_name == "gaussian_symmetric_kl"
+        np.testing.assert_allclose(result.symmetric_kl_matrix, sentinel)
+        np.testing.assert_allclose(result.canonical_metric_matrix, sentinel)
+        assert result.canonical_metric_name == "model_jeffreys_symmetric_kl"
 
 
-def test_restricted_low_rank_affine_endpoint_uses_mc_without_gaussian_covariance() -> None:
+def test_restricted_low_rank_affine_endpoint_uses_model_jeffreys_without_endpoint_diagnostics() -> None:
     theta = np.eye(2, dtype=np.float64)
     for family in ("shared_affine_low_rank_scalar", "shared_affine_low_rank_diag"):
         model = StandardNormalMCFlowModel(velocity_family=family, x_dim=2)
@@ -581,33 +680,37 @@ def test_restricted_low_rank_affine_endpoint_uses_mc_without_gaussian_covariance
             theta_all=theta,
             device=torch.device("cpu"),
             velocity_family=family,
-            mc_samples=8,
+            mc_jeffreys_sample=8,
             ode_steps=2,
             batch_size=4,
         )
-        assert result.endpoint_mean is None
-        assert result.endpoint_covariance is None
-        assert result.canonical_metric_name == "model_symmetric_kl_mc"
+        assert result.canonical_metric_name == "model_jeffreys_symmetric_kl"
+        np.testing.assert_allclose(result.canonical_metric_matrix, result.symmetric_kl_matrix)
 
 
-def test_flow_skl_result_npz_uses_endpoint_covariance_field() -> None:
+def test_flow_skl_result_npz_omits_endpoint_distribution_fields() -> None:
     result = FlowSKLResult(
         symmetric_kl_matrix=np.zeros((1, 1), dtype=np.float64),
         canonical_metric_matrix=np.zeros((1, 1), dtype=np.float64),
-        canonical_metric_name="gaussian_symmetric_kl",
-        endpoint_mean=np.zeros((1, 2), dtype=np.float64),
-        endpoint_covariance=np.eye(2, dtype=np.float64),
+        canonical_metric_name="model_jeffreys_symmetric_kl",
     )
     fields = flow_skl_result_to_npz_dict(result)
-    assert "endpoint_covariance" in fields
+    assert "endpoint_mean" not in fields
+    assert "endpoint_covariance" not in fields
     assert "endpoint_cov_or_diag" not in fields
     assert "endpoint_is_diag" not in fields
 
 
-def test_scalar_fisher_finite_differences_recover_linear_gaussian_case() -> None:
+def test_scalar_fisher_finite_differences_use_model_jeffreys_matrix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     theta = np.array([[0.0], [0.1], [0.2], [0.35]], dtype=np.float64)
     slope = np.array([2.0, -1.0], dtype=np.float64)
     model = ScalarLinearTranslationModel(slope)
+    expected_fisher = float(slope @ slope)
+    diff = theta[:, None, 0] - theta[None, :, 0]
+    sentinel = expected_fisher * diff * diff
+    _patch_model_jeffreys(monkeypatch, sentinel)
     result = estimate_model_symmetric_kl(
         model=model,
         theta_all=theta,
@@ -615,7 +718,9 @@ def test_scalar_fisher_finite_differences_recover_linear_gaussian_case() -> None
         velocity_family="translation",
         fisher_kind="full",
     )
-    expected_fisher = float(slope @ slope)
+    np.testing.assert_allclose(result.symmetric_kl_matrix, sentinel)
+    np.testing.assert_allclose(result.canonical_metric_matrix, sentinel)
+    assert result.canonical_metric_name == "model_jeffreys_symmetric_kl"
     np.testing.assert_allclose(result.fisher_full, expected_fisher, rtol=1e-6, atol=1e-6)
     fd = estimate_scalar_fisher_from_skl(theta, result.symmetric_kl_matrix)
     np.testing.assert_allclose(fd["fisher"], expected_fisher, rtol=1e-6, atol=1e-6)

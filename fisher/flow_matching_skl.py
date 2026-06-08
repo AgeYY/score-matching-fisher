@@ -1,12 +1,9 @@
-"""Flow-matching endpoint metrics for model-induced symmetric KL.
+"""Flow-matching model-likelihood metrics for symmetric KL.
 
 This module uses the Jeffreys convention
-``DSKL(p, q) = KL(p || q) + KL(q || p)``.  The existing
-``fisher.llr_divergence.symmetric_kl_gaussian_full_matrix`` helper returns the
-half-symmetrized convention used by older LLR code, so Gaussian endpoint calls
-are multiplied by two here.  With this convention, adjacent
-``DSKL(theta, theta + dtheta) / dtheta**2`` estimates the scalar Fisher
-information directly.
+``DSKL(p, q) = KL(p || q) + KL(q || p)``.  With this convention,
+adjacent ``DSKL(theta, theta + dtheta) / dtheta**2`` estimates the
+scalar Fisher information directly.
 """
 
 from __future__ import annotations
@@ -23,7 +20,6 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from fisher.gaussian_x_flow import GaussianAffinePathSchedule, path_schedule_from_name
 from fisher.linear_x_flow import resolve_lxf_low_rank_dim
-from fisher.llr_divergence import symmetric_kl_gaussian_full_matrix
 
 
 VELOCITY_FAMILIES = (
@@ -48,47 +44,26 @@ TRANSLATION_FAMILIES = {
     "translation_centered_fixed_norm",
 }
 
-SHARED_GAUSSIAN_AFFINE_FAMILIES = {
-    "shared_affine",
-    "shared_affine_scalar",
-    "shared_affine_diag",
-}
-
-CONDITION_GAUSSIAN_AFFINE_FAMILIES = {
-    "condition_affine",
-    "condition_affine_scalar",
-    "condition_affine_diag",
-}
-
 LOW_RANK_AFFINE_FAMILIES = {
     "shared_affine_low_rank",
     "shared_affine_low_rank_scalar",
     "shared_affine_low_rank_diag",
 }
 
-GAUSSIAN_ENDPOINT_FAMILIES = (
-    TRANSLATION_FAMILIES
-    | SHARED_GAUSSIAN_AFFINE_FAMILIES
-    | CONDITION_GAUSSIAN_AFFINE_FAMILIES
-)
-
 MC_ENDPOINT_FAMILIES = LOW_RANK_AFFINE_FAMILIES | {"nonlinear"}
 
 
 @dataclass
 class FlowSKLResult:
-    """Endpoint metric bundle returned by ``estimate_model_symmetric_kl``."""
+    """Metric bundle returned by ``estimate_model_symmetric_kl``."""
 
     symmetric_kl_matrix: np.ndarray
     canonical_metric_matrix: np.ndarray
     canonical_metric_name: str
-    endpoint_mean: np.ndarray | None
-    endpoint_covariance: np.ndarray | None
     fisher_theta_midpoints: np.ndarray | None = None
     fisher_full: np.ndarray | None = None
     fisher_linear: np.ndarray | None = None
     train_metadata: dict[str, Any] = field(default_factory=dict)
-    normalization: dict[str, Any] = field(default_factory=dict)
 
 
 def _normalize_velocity_family(velocity_family: str) -> str:
@@ -164,6 +139,48 @@ def _resolve_path_schedule(
     return path_schedule, type(path_schedule).__name__
 
 
+def _make_flow_matching_affine_path(path_schedule: str | GaussianAffinePathSchedule) -> tuple[Any, str]:
+    """Build a ``flow_matching`` affine path matching the local schedule names."""
+
+    if isinstance(path_schedule, str):
+        key = str(path_schedule).strip().lower()
+    else:
+        _, schedule_name = _resolve_path_schedule(path_schedule)
+        low = schedule_name.strip().lower()
+        if "linear" in low:
+            key = "linear"
+        elif "cosine" in low:
+            key = "cosine"
+        else:
+            raise TypeError("flow_matching AffineProbPath supports only linear/straight and cosine schedules.")
+
+    try:
+        from flow_matching.path import AffineProbPath
+        from flow_matching.path.scheduler import CondOTScheduler, CosineScheduler
+    except ImportError as e:
+        raise ImportError(
+            "Flow-SKL training/evaluation requires the `flow_matching` package. "
+            "Install it in the geo_diffusion environment."
+        ) from e
+
+    if key in ("linear", "straight"):
+        return AffineProbPath(scheduler=CondOTScheduler()), "linear"
+    if key in ("cosine", "cos"):
+        return AffineProbPath(scheduler=CosineScheduler()), "cosine"
+    raise ValueError(f"Unknown path schedule: {path_schedule!r}; use linear/straight or cosine/cos.")
+
+
+def _make_flow_ode_solver(model: nn.Module) -> Any:
+    try:
+        from flow_matching.solver.ode_solver import ODESolver
+    except ImportError as e:
+        raise ImportError(
+            "Flow-SKL endpoint sampling and likelihood require the `flow_matching` package. "
+            "Install it in the geo_diffusion environment."
+        ) from e
+    return ODESolver(velocity_model=_ThetaCondVelocityAdapter(model))
+
+
 def _expand_theta_to_batch(theta: torch.Tensor, *, batch: int) -> torch.Tensor:
     if theta.ndim == 1:
         theta = theta.unsqueeze(-1)
@@ -188,16 +205,6 @@ def _apply_matrix(a: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     raise ValueError("matrix must have shape [D, D] or [B, D, D].")
 
 
-def _trace_matrix_batch(a: torch.Tensor, *, batch: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-    if a.ndim == 2:
-        return torch.trace(a).to(dtype=dtype, device=device).reshape(1).expand(int(batch))
-    if a.ndim == 3:
-        if int(a.shape[0]) == 1 and int(batch) > 1:
-            a = a.expand(int(batch), int(a.shape[1]), int(a.shape[2]))
-        return torch.diagonal(a, dim1=-2, dim2=-1).sum(dim=-1).to(dtype=dtype, device=device)
-    raise ValueError("matrix must have shape [D, D] or [B, D, D].")
-
-
 def _scalar_batch_to_matrix(scale: torch.Tensor, *, x_dim: int) -> torch.Tensor:
     if scale.ndim == 1:
         scale = scale.unsqueeze(-1)
@@ -213,6 +220,107 @@ def _diag_batch_to_matrix(diag: torch.Tensor, *, x_dim: int) -> torch.Tensor:
     if diag.ndim != 2 or int(diag.shape[1]) != int(x_dim):
         raise ValueError("diagonal affine output must have shape [B, D].")
     return torch.diag_embed(diag)
+
+
+def _resolve_divergence_controls(
+    divergence_estimator: str = "exact",
+    hutchinson_probes: int = 1,
+) -> tuple[str, int]:
+    de = str(divergence_estimator).strip().lower()
+    if de not in ("hutchinson", "exact"):
+        raise ValueError("divergence_estimator must be one of: hutchinson, exact.")
+    probes = int(hutchinson_probes)
+    if probes < 1:
+        raise ValueError("hutchinson_probes must be >= 1.")
+    return de, probes
+
+
+def _set_divergence_controls(
+    model: nn.Module,
+    *,
+    divergence_estimator: str = "exact",
+    hutchinson_probes: int = 1,
+) -> None:
+    de, probes = _resolve_divergence_controls(
+        divergence_estimator=divergence_estimator,
+        hutchinson_probes=hutchinson_probes,
+    )
+    model.divergence_estimator = de  # type: ignore[attr-defined]
+    model.hutchinson_probes = probes  # type: ignore[attr-defined]
+
+
+class _ThetaCondVelocityAdapter(nn.Module):
+    """Adapt ``model(x, theta, t_col)`` to the ``flow_matching`` ODE API."""
+
+    def __init__(self, model: nn.Module) -> None:
+        super().__init__()
+        self.model = model
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor, **extras: Any) -> torch.Tensor:
+        if "theta_cond" not in extras:
+            raise ValueError("theta_cond must be provided in model_extras.")
+        theta = extras["theta_cond"]
+        if not torch.is_tensor(theta):
+            theta = torch.as_tensor(theta, dtype=x.dtype, device=x.device)
+        else:
+            theta = theta.to(device=x.device, dtype=x.dtype)
+        theta_b = _expand_theta_to_batch(theta, batch=int(x.shape[0]))
+        t_col = _as_col_t(t.to(device=x.device, dtype=x.dtype), batch=int(x.shape[0]))
+        return self.model(x, theta_b, t_col) + 0.0 * x
+
+
+def _standard_normal_log_prob(x: torch.Tensor) -> torch.Tensor:
+    flat = x.reshape(int(x.shape[0]), -1)
+    return -0.5 * (torch.sum(flat * flat, dim=1) + float(flat.shape[1]) * math.log(2.0 * math.pi))
+
+
+def flow_endpoint_log_prob(
+    model: nn.Module,
+    x_norm: torch.Tensor,
+    theta: torch.Tensor,
+    *,
+    solve_jitter: float = 1e-6,
+    quadrature_steps: int | None = None,
+    ode_steps: int = 32,
+    ode_method: str = "midpoint",
+) -> torch.Tensor:
+    """Compute endpoint log probability with ``flow_matching`` ODE likelihood."""
+
+    del solve_jitter, quadrature_steps
+    if x_norm.ndim == 1:
+        x_norm = x_norm.unsqueeze(0)
+    steps = int(ode_steps)
+    if steps < 1:
+        raise ValueError("ode_steps must be >= 1.")
+    if not str(ode_method).strip():
+        raise ValueError("ode_method must be non-empty.")
+    x_eval = x_norm.detach()
+    theta = theta.to(device=x_eval.device, dtype=x_eval.dtype)
+    theta_b = _expand_theta_to_batch(theta, batch=int(x_eval.shape[0]))
+    de, probes = _resolve_divergence_controls(
+        divergence_estimator=str(getattr(model, "divergence_estimator", "exact")),
+        hutchinson_probes=int(getattr(model, "hutchinson_probes", 1)),
+    )
+    exact = de == "exact"
+    repeats = 1 if exact else probes
+    time_grid = torch.linspace(1.0, 0.0, steps + 1, dtype=x_eval.dtype, device=x_eval.device)
+    solver = _make_flow_ode_solver(model)
+    logps: list[torch.Tensor] = []
+    for _ in range(repeats):
+        _, logp = solver.compute_likelihood(
+            x_1=x_eval,
+            log_p0=_standard_normal_log_prob,
+            step_size=None,
+            method=str(ode_method),
+            time_grid=time_grid,
+            exact_divergence=exact,
+            enable_grad=False,
+            theta_cond=theta_b,
+        )
+        logps.append(logp)
+    if len(logps) == 1:
+        return logps[0]
+    return torch.stack(logps, dim=0).mean(dim=0)
 
 
 def row_radius_normalize(x: torch.Tensor, radius: float, *, eps: float = 1e-12) -> torch.Tensor:
@@ -244,6 +352,8 @@ class TranslationFlowSKLModel(nn.Module):
         hidden_dim: int = 128,
         depth: int = 3,
         path_schedule: str | GaussianAffinePathSchedule = "cosine",
+        divergence_estimator: str = "exact",
+        hutchinson_probes: int = 1,
     ) -> None:
         super().__init__()
         fam = _normalize_velocity_family(velocity_family)
@@ -255,6 +365,11 @@ class TranslationFlowSKLModel(nn.Module):
         self.theta_dim = int(theta_dim)
         self.x_dim = int(x_dim)
         self.radius = float(radius)
+        _set_divergence_controls(
+            self,
+            divergence_estimator=divergence_estimator,
+            hutchinson_probes=int(hutchinson_probes),
+        )
         self.set_path_schedule(path_schedule)
         self.mean_net = _make_mlp(
             in_dim=self.theta_dim,
@@ -285,16 +400,25 @@ class TranslationFlowSKLModel(nn.Module):
         _, _, _, beta_dot = self.path_schedule.ab_ad_bd(t)
         return beta_dot * self.endpoint_mean(theta)
 
-    def log_prob_normalized(self, x_norm: torch.Tensor, theta: torch.Tensor, *, solve_jitter: float = 1e-6) -> torch.Tensor:
-        del solve_jitter
-        if x_norm.ndim == 1:
-            x_norm = x_norm.unsqueeze(0)
-        if theta.ndim == 1:
-            theta = theta.unsqueeze(-1)
-        mu = self.endpoint_mean(theta)
-        d = int(x_norm.shape[1])
-        quad = torch.sum((x_norm - mu) ** 2, dim=1)
-        return -0.5 * (quad + float(d) * math.log(2.0 * math.pi))
+    def log_prob_normalized(
+        self,
+        x_norm: torch.Tensor,
+        theta: torch.Tensor,
+        *,
+        solve_jitter: float = 1e-6,
+        quadrature_steps: int | None = None,
+        ode_steps: int = 32,
+        ode_method: str = "midpoint",
+    ) -> torch.Tensor:
+        return flow_endpoint_log_prob(
+            self,
+            x_norm,
+            theta,
+            solve_jitter=float(solve_jitter),
+            quadrature_steps=quadrature_steps,
+            ode_steps=int(ode_steps),
+            ode_method=str(ode_method),
+        )
 
 
 class ConditionalNonlinearXFlowMLP(nn.Module):
@@ -311,16 +435,14 @@ class ConditionalNonlinearXFlowMLP(nn.Module):
         hutchinson_probes: int = 1,
     ) -> None:
         super().__init__()
-        de = str(divergence_estimator).strip().lower()
-        if de not in ("hutchinson", "exact"):
-            raise ValueError("divergence_estimator must be one of: hutchinson, exact.")
-        if int(hutchinson_probes) < 1:
-            raise ValueError("hutchinson_probes must be >= 1.")
         self.velocity_family = "nonlinear"
         self.theta_dim = int(theta_dim)
         self.x_dim = int(x_dim)
-        self.divergence_estimator = de
-        self.hutchinson_probes = int(hutchinson_probes)
+        _set_divergence_controls(
+            self,
+            divergence_estimator=divergence_estimator,
+            hutchinson_probes=int(hutchinson_probes),
+        )
         self.net = _make_mlp(
             in_dim=self.x_dim + 1 + self.theta_dim,
             out_dim=self.x_dim,
@@ -335,46 +457,6 @@ class ConditionalNonlinearXFlowMLP(nn.Module):
         t = _as_col_t(t, batch=int(x.shape[0]))
         return self.net(torch.cat([x, t, theta], dim=1))
 
-    def _trace_exact(self, x_req: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        trace = torch.zeros(x_req.shape[0], dtype=x_req.dtype, device=x_req.device)
-        for j in range(self.x_dim):
-            grad_j = torch.autograd.grad(
-                v[:, j].sum(),
-                x_req,
-                create_graph=False,
-                retain_graph=j < self.x_dim - 1,
-            )[0]
-            trace = trace + grad_j[:, j]
-        return trace
-
-    def _trace_hutchinson(self, x_req: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        acc = torch.zeros(x_req.shape[0], dtype=x_req.dtype, device=x_req.device)
-        for p in range(self.hutchinson_probes):
-            probe = torch.empty_like(x_req)
-            probe.bernoulli_(0.5).mul_(2.0).sub_(1.0)
-            dot = torch.sum(v * probe, dim=1)
-            grad = torch.autograd.grad(
-                dot.sum(),
-                x_req,
-                create_graph=False,
-                retain_graph=p < self.hutchinson_probes - 1,
-            )[0]
-            acc = acc + torch.sum(grad * probe, dim=1)
-        return acc / float(self.hutchinson_probes)
-
-    def divergence(self, x: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        if theta.ndim == 1:
-            theta = theta.unsqueeze(-1)
-        t = _as_col_t(t, batch=int(x.shape[0]))
-        with torch.enable_grad():
-            x_req = x.detach().requires_grad_(True)
-            v = self.forward(x_req, theta, t)
-            if self.divergence_estimator == "exact":
-                div = self._trace_exact(x_req, v)
-            else:
-                div = self._trace_hutchinson(x_req, v)
-        return div.detach()
-
     def log_prob_normalized(
         self,
         x_norm: torch.Tensor,
@@ -383,28 +465,17 @@ class ConditionalNonlinearXFlowMLP(nn.Module):
         solve_jitter: float = 1e-6,
         quadrature_steps: int | None = None,
         ode_steps: int = 32,
+        ode_method: str = "midpoint",
     ) -> torch.Tensor:
-        del solve_jitter, quadrature_steps
-        if x_norm.ndim == 1:
-            x_norm = x_norm.unsqueeze(0)
-        if theta.ndim == 1:
-            theta = theta.unsqueeze(-1)
-        if int(x_norm.shape[0]) != int(theta.shape[0]):
-            raise ValueError("x and theta batch sizes must match.")
-        steps = int(ode_steps)
-        if steps < 1:
-            raise ValueError("ode_steps must be >= 1.")
-        x = x_norm
-        div_int = torch.zeros(x.shape[0], dtype=x.dtype, device=x.device)
-        dt = 1.0 / float(steps)
-        for s in range(steps, 0, -1):
-            t = torch.full((x.shape[0], 1), float(s) / float(steps), dtype=x.dtype, device=x.device)
-            div_int = div_int + dt * self.divergence(x, theta, t)
-            with torch.no_grad():
-                x = x - dt * self.forward(x, theta, t)
-        d = int(x.shape[1])
-        base = -0.5 * (torch.sum(x**2, dim=1) + float(d) * math.log(2.0 * math.pi))
-        return base - div_int
+        return flow_endpoint_log_prob(
+            self,
+            x_norm,
+            theta,
+            solve_jitter=float(solve_jitter),
+            quadrature_steps=quadrature_steps,
+            ode_steps=int(ode_steps),
+            ode_method=str(ode_method),
+        )
 
 
 class _CenteredAffineFlowSKLBase(nn.Module):
@@ -419,6 +490,8 @@ class _CenteredAffineFlowSKLBase(nn.Module):
         depth: int = 3,
         quadrature_steps: int = 64,
         path_schedule: str | GaussianAffinePathSchedule = "cosine",
+        divergence_estimator: str = "exact",
+        hutchinson_probes: int = 1,
     ) -> None:
         super().__init__()
         if int(theta_dim) < 1:
@@ -436,6 +509,11 @@ class _CenteredAffineFlowSKLBase(nn.Module):
         self.hidden_dim = int(hidden_dim)
         self.depth = int(depth)
         self.quadrature_steps = int(quadrature_steps)
+        _set_divergence_controls(
+            self,
+            divergence_estimator=divergence_estimator,
+            hutchinson_probes=int(hutchinson_probes),
+        )
         self.b_net = _make_mlp(
             in_dim=self.theta_dim,
             out_dim=self.x_dim,
@@ -466,54 +544,6 @@ class _CenteredAffineFlowSKLBase(nn.Module):
     def regularization_loss(self) -> torch.Tensor | None:
         return None
 
-    def _full_gaussian_log_prob(
-        self,
-        x_norm: torch.Tensor,
-        theta: torch.Tensor,
-        *,
-        solve_jitter: float,
-        quadrature_steps: int | None,
-    ) -> torch.Tensor:
-        if x_norm.ndim == 1:
-            x_norm = x_norm.unsqueeze(0)
-        theta = _expand_theta_to_batch(theta, batch=int(x_norm.shape[0]))
-        mu, cov = self.endpoint_mean_covariance(
-            theta,
-            solve_jitter=float(solve_jitter),
-            quadrature_steps=quadrature_steps,
-        )
-        d = int(x_norm.shape[1])
-        if cov.ndim == 2:
-            cov = cov.reshape(1, d, d).expand(int(x_norm.shape[0]), d, d)
-        eye = torch.eye(d, dtype=x_norm.dtype, device=x_norm.device).reshape(1, d, d)
-        l = torch.linalg.cholesky(cov + float(solve_jitter) * eye)
-        diff = x_norm - mu
-        z = torch.cholesky_solve(diff.unsqueeze(-1), l).squeeze(-1)
-        quad = torch.sum(diff * z, dim=1)
-        diag = torch.diagonal(l, dim1=-2, dim2=-1)
-        log_det = 2.0 * torch.sum(torch.log(torch.clamp(diag, min=1e-12)), dim=1)
-        return -0.5 * (quad + log_det + float(d) * math.log(2.0 * math.pi))
-
-    def log_prob_observed(
-        self,
-        x_raw: torch.Tensor,
-        theta: torch.Tensor,
-        *,
-        x_mean: torch.Tensor,
-        x_std: torch.Tensor,
-        solve_jitter: float = 1e-6,
-        quadrature_steps: int | None = None,
-    ) -> torch.Tensor:
-        z = (x_raw - x_mean) / x_std
-        logjac = -torch.sum(torch.log(x_std))
-        return self.log_prob_normalized(
-            z,
-            theta,
-            solve_jitter=float(solve_jitter),
-            quadrature_steps=quadrature_steps,
-        ) + logjac
-
-
 class CenteredSharedAffineFlowSKLModel(_CenteredAffineFlowSKLBase):
     """Centered shared-affine velocity ``bdot b(theta) + A(t)(x - beta b(theta))``."""
 
@@ -526,6 +556,8 @@ class CenteredSharedAffineFlowSKLModel(_CenteredAffineFlowSKLBase):
         depth: int = 3,
         quadrature_steps: int = 64,
         path_schedule: str | GaussianAffinePathSchedule = "cosine",
+        divergence_estimator: str = "exact",
+        hutchinson_probes: int = 1,
     ) -> None:
         super().__init__(
             theta_dim=theta_dim,
@@ -534,6 +566,8 @@ class CenteredSharedAffineFlowSKLModel(_CenteredAffineFlowSKLBase):
             depth=depth,
             quadrature_steps=quadrature_steps,
             path_schedule=path_schedule,
+            divergence_estimator=divergence_estimator,
+            hutchinson_probes=int(hutchinson_probes),
         )
         self.velocity_family = "shared_affine"
         self.a_net = _make_mlp(
@@ -556,32 +590,6 @@ class CenteredSharedAffineFlowSKLModel(_CenteredAffineFlowSKLBase):
         centered = x - beta * b
         return beta_dot * b + _apply_matrix(self.A(t), centered)
 
-    def endpoint_mean_covariance(
-        self,
-        theta: torch.Tensor,
-        *,
-        solve_jitter: float = 1e-6,
-        quadrature_steps: int | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if theta.ndim == 1:
-            theta = theta.unsqueeze(-1)
-        q = self.quadrature_steps if quadrature_steps is None else int(quadrature_steps)
-        if q < 2:
-            raise ValueError("quadrature_steps must be >= 2.")
-        d = int(self.x_dim)
-        cov = torch.eye(d, dtype=theta.dtype, device=theta.device)
-        dt = 1.0 / float(q)
-        for k in range(q):
-            tk = torch.full((1, 1), (float(k) + 0.5) / float(q), dtype=theta.dtype, device=theta.device)
-            a = self.A(tk)
-            if a.ndim == 3:
-                a = a[0]
-            cov = cov + dt * (a @ cov + cov @ a.transpose(0, 1))
-            cov = 0.5 * (cov + cov.transpose(0, 1))
-        eye = torch.eye(d, dtype=theta.dtype, device=theta.device)
-        cov = 0.5 * (cov + cov.transpose(0, 1)) + float(solve_jitter) * eye
-        return self.b(theta), cov
-
     def log_prob_normalized(
         self,
         x_norm: torch.Tensor,
@@ -589,12 +597,17 @@ class CenteredSharedAffineFlowSKLModel(_CenteredAffineFlowSKLBase):
         *,
         solve_jitter: float = 1e-6,
         quadrature_steps: int | None = None,
+        ode_steps: int = 32,
+        ode_method: str = "midpoint",
     ) -> torch.Tensor:
-        return self._full_gaussian_log_prob(
+        return flow_endpoint_log_prob(
+            self,
             x_norm,
             theta,
             solve_jitter=float(solve_jitter),
             quadrature_steps=quadrature_steps,
+            ode_steps=int(ode_steps),
+            ode_method=str(ode_method),
         )
 
 
@@ -610,6 +623,8 @@ class CenteredSharedAffineScalarFlowSKLModel(CenteredSharedAffineFlowSKLModel):
         depth: int = 3,
         quadrature_steps: int = 64,
         path_schedule: str | GaussianAffinePathSchedule = "cosine",
+        divergence_estimator: str = "exact",
+        hutchinson_probes: int = 1,
     ) -> None:
         super().__init__(
             theta_dim=theta_dim,
@@ -618,6 +633,8 @@ class CenteredSharedAffineScalarFlowSKLModel(CenteredSharedAffineFlowSKLModel):
             depth=depth,
             quadrature_steps=quadrature_steps,
             path_schedule=path_schedule,
+            divergence_estimator=divergence_estimator,
+            hutchinson_probes=int(hutchinson_probes),
         )
         self.velocity_family = "shared_affine_scalar"
         self.a_net = _make_mlp(
@@ -645,6 +662,8 @@ class CenteredSharedAffineDiagFlowSKLModel(CenteredSharedAffineFlowSKLModel):
         depth: int = 3,
         quadrature_steps: int = 64,
         path_schedule: str | GaussianAffinePathSchedule = "cosine",
+        divergence_estimator: str = "exact",
+        hutchinson_probes: int = 1,
     ) -> None:
         super().__init__(
             theta_dim=theta_dim,
@@ -653,6 +672,8 @@ class CenteredSharedAffineDiagFlowSKLModel(CenteredSharedAffineFlowSKLModel):
             depth=depth,
             quadrature_steps=quadrature_steps,
             path_schedule=path_schedule,
+            divergence_estimator=divergence_estimator,
+            hutchinson_probes=int(hutchinson_probes),
         )
         self.velocity_family = "shared_affine_diag"
         self.a_net = _make_mlp(
@@ -680,6 +701,8 @@ class CenteredConditionAffineFlowSKLModel(_CenteredAffineFlowSKLBase):
         depth: int = 3,
         quadrature_steps: int = 64,
         path_schedule: str | GaussianAffinePathSchedule = "cosine",
+        divergence_estimator: str = "exact",
+        hutchinson_probes: int = 1,
     ) -> None:
         super().__init__(
             theta_dim=theta_dim,
@@ -688,6 +711,8 @@ class CenteredConditionAffineFlowSKLModel(_CenteredAffineFlowSKLBase):
             depth=depth,
             quadrature_steps=quadrature_steps,
             path_schedule=path_schedule,
+            divergence_estimator=divergence_estimator,
+            hutchinson_probes=int(hutchinson_probes),
         )
         self.velocity_family = "condition_affine"
         self.a_net = _make_mlp(
@@ -712,31 +737,6 @@ class CenteredConditionAffineFlowSKLModel(_CenteredAffineFlowSKLBase):
         centered = x - beta * b
         return beta_dot * b + _apply_matrix(self.A(theta, t), centered)
 
-    def endpoint_mean_covariance(
-        self,
-        theta: torch.Tensor,
-        *,
-        solve_jitter: float = 1e-6,
-        quadrature_steps: int | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if theta.ndim == 1:
-            theta = theta.unsqueeze(-1)
-        q = self.quadrature_steps if quadrature_steps is None else int(quadrature_steps)
-        if q < 2:
-            raise ValueError("quadrature_steps must be >= 2.")
-        batch = int(theta.shape[0])
-        d = int(self.x_dim)
-        cov = torch.eye(d, dtype=theta.dtype, device=theta.device).reshape(1, d, d).expand(batch, d, d).clone()
-        dt = 1.0 / float(q)
-        for k in range(q):
-            tk = torch.full((batch, 1), (float(k) + 0.5) / float(q), dtype=theta.dtype, device=theta.device)
-            a = self.A(theta, tk)
-            cov = cov + dt * (torch.bmm(a, cov) + torch.bmm(cov, a.transpose(1, 2)))
-            cov = 0.5 * (cov + cov.transpose(1, 2))
-        eye = torch.eye(d, dtype=theta.dtype, device=theta.device).reshape(1, d, d)
-        cov = 0.5 * (cov + cov.transpose(1, 2)) + float(solve_jitter) * eye
-        return self.b(theta), cov
-
     def log_prob_normalized(
         self,
         x_norm: torch.Tensor,
@@ -744,12 +744,17 @@ class CenteredConditionAffineFlowSKLModel(_CenteredAffineFlowSKLBase):
         *,
         solve_jitter: float = 1e-6,
         quadrature_steps: int | None = None,
+        ode_steps: int = 32,
+        ode_method: str = "midpoint",
     ) -> torch.Tensor:
-        return self._full_gaussian_log_prob(
+        return flow_endpoint_log_prob(
+            self,
             x_norm,
             theta,
             solve_jitter=float(solve_jitter),
             quadrature_steps=quadrature_steps,
+            ode_steps=int(ode_steps),
+            ode_method=str(ode_method),
         )
 
 
@@ -765,6 +770,8 @@ class CenteredConditionAffineScalarFlowSKLModel(CenteredConditionAffineFlowSKLMo
         depth: int = 3,
         quadrature_steps: int = 64,
         path_schedule: str | GaussianAffinePathSchedule = "cosine",
+        divergence_estimator: str = "exact",
+        hutchinson_probes: int = 1,
     ) -> None:
         super().__init__(
             theta_dim=theta_dim,
@@ -773,6 +780,8 @@ class CenteredConditionAffineScalarFlowSKLModel(CenteredConditionAffineFlowSKLMo
             depth=depth,
             quadrature_steps=quadrature_steps,
             path_schedule=path_schedule,
+            divergence_estimator=divergence_estimator,
+            hutchinson_probes=int(hutchinson_probes),
         )
         self.velocity_family = "condition_affine_scalar"
         self.a_net = _make_mlp(
@@ -802,6 +811,8 @@ class CenteredConditionAffineDiagFlowSKLModel(CenteredConditionAffineFlowSKLMode
         depth: int = 3,
         quadrature_steps: int = 64,
         path_schedule: str | GaussianAffinePathSchedule = "cosine",
+        divergence_estimator: str = "exact",
+        hutchinson_probes: int = 1,
     ) -> None:
         super().__init__(
             theta_dim=theta_dim,
@@ -810,6 +821,8 @@ class CenteredConditionAffineDiagFlowSKLModel(CenteredConditionAffineFlowSKLMode
             depth=depth,
             quadrature_steps=quadrature_steps,
             path_schedule=path_schedule,
+            divergence_estimator=divergence_estimator,
+            hutchinson_probes=int(hutchinson_probes),
         )
         self.velocity_family = "condition_affine_diag"
         self.a_net = _make_mlp(
@@ -847,11 +860,10 @@ class CenteredSharedAffineLowRankFlowSKLModel(CenteredSharedAffineFlowSKLModel):
             raise ValueError("correction_rank must be >= 1.")
         if int(correction_rank) > int(x_dim):
             raise ValueError("correction_rank must be <= x_dim.")
-        de = str(divergence_estimator).strip().lower()
-        if de not in ("hutchinson", "exact"):
-            raise ValueError("divergence_estimator must be one of: hutchinson, exact.")
-        if int(hutchinson_probes) < 1:
-            raise ValueError("hutchinson_probes must be >= 1.")
+        de, probes = _resolve_divergence_controls(
+            divergence_estimator=divergence_estimator,
+            hutchinson_probes=int(hutchinson_probes),
+        )
         super().__init__(
             theta_dim=theta_dim,
             x_dim=x_dim,
@@ -859,11 +871,11 @@ class CenteredSharedAffineLowRankFlowSKLModel(CenteredSharedAffineFlowSKLModel):
             depth=depth,
             quadrature_steps=quadrature_steps,
             path_schedule=path_schedule,
+            divergence_estimator=de,
+            hutchinson_probes=probes,
         )
         self.velocity_family = "shared_affine_low_rank"
         self.correction_rank = int(correction_rank)
-        self.divergence_estimator = de
-        self.hutchinson_probes = int(hutchinson_probes)
         u_lin = nn.Linear(self.correction_rank, self.x_dim, bias=False)
         nn.init.orthogonal_(u_lin.weight)
         self.u_layer = parametrizations.orthogonal(u_lin, "weight", orthogonal_map="householder")
@@ -902,48 +914,6 @@ class CenteredSharedAffineLowRankFlowSKLModel(CenteredSharedAffineFlowSKLModel):
         h = self.h_net(torch.cat([z, t, theta], dim=1))
         return beta_dot * b + a_part + h @ u_mat.transpose(0, 1)
 
-    def _reduced_trace_exact(self, z: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
-        tr_h = torch.zeros(z.shape[0], dtype=z.dtype, device=z.device)
-        for j in range(self.correction_rank):
-            grad_j = torch.autograd.grad(
-                h[:, j].sum(),
-                z,
-                create_graph=False,
-                retain_graph=j < self.correction_rank - 1,
-            )[0]
-            tr_h = tr_h + grad_j[:, j]
-        return tr_h
-
-    def _reduced_trace_hutchinson(self, z: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
-        bsz = int(z.shape[0])
-        rank = int(self.correction_rank)
-        acc = torch.zeros(bsz, dtype=z.dtype, device=z.device)
-        for p in range(self.hutchinson_probes):
-            probe = torch.empty(bsz, rank, dtype=z.dtype, device=z.device)
-            probe.bernoulli_(0.5).mul_(2.0).sub_(1.0)
-            dot = torch.sum(h * probe, dim=1)
-            grad = torch.autograd.grad(
-                dot.sum(),
-                z,
-                create_graph=False,
-                retain_graph=p < self.hutchinson_probes - 1,
-            )[0]
-            acc = acc + torch.sum(grad * probe, dim=1)
-        return acc / float(self.hutchinson_probes)
-
-    def divergence(self, x: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        theta, t, _, _, centered = self._centered_inputs(x, theta, t)
-        tr_a = _trace_matrix_batch(self.A(t), batch=int(x.shape[0]), dtype=x.dtype, device=x.device)
-        u_mat = self.U
-        with torch.enable_grad():
-            z = (centered @ u_mat).detach().requires_grad_(True)
-            h = self.h_net(torch.cat([z, t, theta], dim=1))
-            if self.divergence_estimator == "exact":
-                tr_h = self._reduced_trace_exact(z, h)
-            else:
-                tr_h = self._reduced_trace_hutchinson(z, h)
-        return tr_a.detach() + tr_h.detach()
-
     def log_prob_normalized(
         self,
         x_norm: torch.Tensor,
@@ -952,25 +922,17 @@ class CenteredSharedAffineLowRankFlowSKLModel(CenteredSharedAffineFlowSKLModel):
         solve_jitter: float = 1e-6,
         quadrature_steps: int | None = None,
         ode_steps: int = 32,
+        ode_method: str = "midpoint",
     ) -> torch.Tensor:
-        del solve_jitter, quadrature_steps
-        if x_norm.ndim == 1:
-            x_norm = x_norm.unsqueeze(0)
-        theta = _expand_theta_to_batch(theta, batch=int(x_norm.shape[0]))
-        steps = int(ode_steps)
-        if steps < 1:
-            raise ValueError("ode_steps must be >= 1.")
-        x = x_norm
-        div_int = torch.zeros(x.shape[0], dtype=x.dtype, device=x.device)
-        dt = 1.0 / float(steps)
-        for s in range(steps, 0, -1):
-            t = torch.full((x.shape[0], 1), float(s) / float(steps), dtype=x.dtype, device=x.device)
-            div_int = div_int + dt * self.divergence(x, theta, t)
-            with torch.no_grad():
-                x = x - dt * self.forward(x, theta, t)
-        d = int(x.shape[1])
-        base = -0.5 * (torch.sum(x**2, dim=1) + float(d) * math.log(2.0 * math.pi))
-        return base - div_int
+        return flow_endpoint_log_prob(
+            self,
+            x_norm,
+            theta,
+            solve_jitter=float(solve_jitter),
+            quadrature_steps=quadrature_steps,
+            ode_steps=int(ode_steps),
+            ode_method=str(ode_method),
+        )
 
 
 class CenteredSharedAffineLowRankScalarFlowSKLModel(CenteredSharedAffineLowRankFlowSKLModel):
@@ -1083,6 +1045,8 @@ def build_flow_skl_model(
             velocity_family=fam,
             radius=float(radius),
             path_schedule=path_schedule,
+            divergence_estimator=str(divergence_estimator),
+            hutchinson_probes=int(hutchinson_probes),
             **common,
         )
     shared_affine_classes = {
@@ -1094,6 +1058,8 @@ def build_flow_skl_model(
         return shared_affine_classes[fam](
             quadrature_steps=int(quadrature_steps),
             path_schedule=path_schedule,
+            divergence_estimator=str(divergence_estimator),
+            hutchinson_probes=int(hutchinson_probes),
             **common,
         )
     condition_affine_classes = {
@@ -1105,6 +1071,8 @@ def build_flow_skl_model(
         return condition_affine_classes[fam](
             quadrature_steps=int(quadrature_steps),
             path_schedule=path_schedule,
+            divergence_estimator=str(divergence_estimator),
+            hutchinson_probes=int(hutchinson_probes),
             **common,
         )
     low_rank_affine_classes = {
@@ -1131,17 +1099,6 @@ def build_flow_skl_model(
     raise AssertionError(f"Unhandled velocity family {fam!r}.")
 
 
-def _normalization_from_train(x_train: np.ndarray, *, normalize_x: bool) -> tuple[np.ndarray, np.ndarray]:
-    x = _as_2d_float64(x_train, name="x_train")
-    if bool(normalize_x):
-        mean = np.mean(x, axis=0, dtype=np.float64)
-        std = np.maximum(np.std(x, axis=0, dtype=np.float64), 1e-6)
-    else:
-        mean = np.zeros(x.shape[1], dtype=np.float64)
-        std = np.ones(x.shape[1], dtype=np.float64)
-    return mean, std
-
-
 def _adamw_parameters(model: nn.Module) -> list[nn.Parameter]:
     return [p for p in model.parameters() if p.requires_grad]
 
@@ -1156,7 +1113,6 @@ def train_flow_skl_model(
     device: torch.device,
     velocity_family: str | None = None,
     path_schedule: str | GaussianAffinePathSchedule = "cosine",
-    normalize_x: bool = True,
     epochs: int = 1000,
     batch_size: int = 512,
     lr: float = 1e-3,
@@ -1167,7 +1123,7 @@ def train_flow_skl_model(
     max_grad_norm: float = 10.0,
     log_every: int = 50,
 ) -> dict[str, Any]:
-    """Train a flow-SKL model and return metadata plus normalization stats."""
+    """Train a flow-SKL model and return training metadata."""
 
     fam = _normalize_velocity_family(velocity_family or getattr(model, "velocity_family", ""))
     if int(epochs) < 1:
@@ -1193,17 +1149,15 @@ def train_flow_skl_model(
     if th_tr.shape[0] != x_tr.shape[0] or th_va.shape[0] != x_va.shape[0]:
         raise ValueError("theta and x split lengths must match.")
 
-    x_mean, x_std = _normalization_from_train(x_tr, normalize_x=bool(normalize_x))
-    x_tr_n = (x_tr - x_mean) / x_std
-    x_va_n = (x_va - x_mean) / x_std
-
-    train_ds = TensorDataset(torch.from_numpy(th_tr.astype(np.float32)), torch.from_numpy(x_tr_n.astype(np.float32)))
-    val_ds = TensorDataset(torch.from_numpy(th_va.astype(np.float32)), torch.from_numpy(x_va_n.astype(np.float32)))
+    train_ds = TensorDataset(torch.from_numpy(th_tr.astype(np.float32)), torch.from_numpy(x_tr.astype(np.float32)))
+    val_ds = TensorDataset(torch.from_numpy(th_va.astype(np.float32)), torch.from_numpy(x_va.astype(np.float32)))
     train_loader = DataLoader(train_ds, batch_size=int(batch_size), shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=int(batch_size), shuffle=False)
 
     model.to(device)
-    schedule, schedule_name = _resolve_path_schedule(path_schedule)
+    _, schedule_name = _resolve_path_schedule(path_schedule)
+    path, path_name = _make_flow_matching_affine_path(path_schedule)
+    schedule_name = path_name
     if hasattr(model, "set_path_schedule"):
         model.set_path_schedule(path_schedule)  # type: ignore[attr-defined]
     opt = torch.optim.AdamW(_adamw_parameters(model), lr=float(lr), weight_decay=float(weight_decay))
@@ -1219,27 +1173,18 @@ def train_flow_skl_model(
     n_clipped_steps = 0
     n_total_steps = 0
 
-    is_translation = fam in TRANSLATION_FAMILIES
     for epoch in range(1, int(epochs) + 1):
         model.train()
         ep_losses: list[float] = []
         for tb, x1b in train_loader:
             tb = tb.to(device)
             x1b = x1b.to(device)
-            if is_translation:
-                if not hasattr(model, "endpoint_mean"):
-                    raise TypeError("Translation family model must expose endpoint_mean(theta).")
-                pred = model.endpoint_mean(tb)  # type: ignore[attr-defined]
-                loss = torch.mean((pred - x1b) ** 2)
-            else:
-                bs = int(x1b.shape[0])
-                t_raw = torch.rand(bs, 1, device=device, dtype=x1b.dtype)
-                t = te + (1.0 - 2.0 * te) * t_raw
-                x0b = torch.randn_like(x1b)
-                a, bcoef, ad, bd = schedule.ab_ad_bd(t)
-                xt = a * x0b + bcoef * x1b
-                ut = ad * x0b + bd * x1b
-                loss = torch.mean((model(xt, tb, t) - ut) ** 2)
+            bs = int(x1b.shape[0])
+            t_raw = torch.rand(bs, device=device, dtype=x1b.dtype)
+            t = te + (1.0 - 2.0 * te) * t_raw
+            x0b = torch.randn_like(x1b)
+            path_sample = path.sample(x_0=x0b, x_1=x1b, t=t)
+            loss = torch.mean((model(path_sample.x_t, tb, path_sample.t) - path_sample.dx_t) ** 2)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             n_total_steps += 1
@@ -1259,18 +1204,18 @@ def train_flow_skl_model(
             for tb, x1b in val_loader:
                 tb = tb.to(device)
                 x1b = x1b.to(device)
-                if is_translation:
-                    pred = model.endpoint_mean(tb)  # type: ignore[attr-defined]
-                    val_ep.append(float(torch.mean((pred - x1b) ** 2).detach().cpu()))
-                else:
-                    bs = int(x1b.shape[0])
-                    t_raw = torch.rand(bs, 1, device=device, dtype=x1b.dtype)
-                    t = te + (1.0 - 2.0 * te) * t_raw
-                    x0b = torch.randn_like(x1b)
-                    a, bcoef, ad, bd = schedule.ab_ad_bd(t)
-                    xt = a * x0b + bcoef * x1b
-                    ut = ad * x0b + bd * x1b
-                    val_ep.append(float(torch.mean((model(xt, tb, t) - ut) ** 2).detach().cpu()))
+                bs = int(x1b.shape[0])
+                t_raw = torch.rand(bs, device=device, dtype=x1b.dtype)
+                t = te + (1.0 - 2.0 * te) * t_raw
+                x0b = torch.randn_like(x1b)
+                path_sample = path.sample(x_0=x0b, x_1=x1b, t=t)
+                val_ep.append(
+                    float(
+                        torch.mean((model(path_sample.x_t, tb, path_sample.t) - path_sample.dx_t) ** 2)
+                        .detach()
+                        .cpu()
+                    )
+                )
         val_loss = float(np.mean(val_ep))
         val_losses.append(val_loss)
 
@@ -1311,114 +1256,8 @@ def train_flow_skl_model(
         "stopped_early": bool(stopped_early),
         "n_clipped_steps": int(n_clipped_steps),
         "n_total_steps": int(n_total_steps),
-        "x_mean": x_mean.astype(np.float64),
-        "x_std": x_std.astype(np.float64),
-        "normalize_x": bool(normalize_x),
         "path_schedule": schedule_name,
     }
-
-
-def _pairwise_squared_euclidean(mu: np.ndarray) -> np.ndarray:
-    m = _as_2d_float64(mu, name="mu")
-    diff = m[:, None, :] - m[None, :, :]
-    out = np.sum(diff * diff, axis=2, dtype=np.float64)
-    out = np.maximum(out, 0.0)
-    np.fill_diagonal(out, 0.0)
-    return out
-
-
-def _shared_mahalanobis_sq(mu: np.ndarray, cov: np.ndarray, *, jitter: float = 1e-9) -> np.ndarray:
-    m = _as_2d_float64(mu, name="mu")
-    s = np.asarray(cov, dtype=np.float64)
-    d = int(m.shape[1])
-    if s.shape != (d, d):
-        raise ValueError("shared covariance must have shape [D, D].")
-    sj = 0.5 * (s + s.T) + float(jitter) * np.eye(d, dtype=np.float64)
-    diff = (m[:, None, :] - m[None, :, :]).reshape(-1, d)
-    sol = np.linalg.solve(sj, diff.T).T
-    out = np.sum(diff * sol, axis=1).reshape(m.shape[0], m.shape[0])
-    out = np.maximum(out, 0.0)
-    np.fill_diagonal(out, 0.0)
-    return 0.5 * (out + out.T)
-
-
-def _gaussian_jeffreys_matrix(
-    mu: np.ndarray,
-    covariance: np.ndarray,
-    *,
-    jitter: float = 1e-9,
-) -> np.ndarray:
-    return 2.0 * symmetric_kl_gaussian_full_matrix(
-        mu,
-        covariance,
-        jitter=float(jitter),
-    )
-
-
-def _translation_endpoint(
-    model: nn.Module,
-    theta_all: np.ndarray,
-    *,
-    device: torch.device,
-) -> np.ndarray:
-    if not hasattr(model, "endpoint_mean"):
-        raise TypeError(f"{type(model).__name__} does not expose endpoint_mean(theta).")
-    theta_t = _as_torch_2d(theta_all, device=device)
-    model.eval()
-    with torch.no_grad():
-        mu = model.endpoint_mean(theta_t)  # type: ignore[attr-defined]
-    return mu.detach().cpu().numpy().astype(np.float64)
-
-
-def _endpoint_gaussian(
-    *,
-    model: nn.Module,
-    theta_all: np.ndarray,
-    velocity_family: str,
-    device: torch.device,
-    solve_jitter: float,
-    quadrature_steps: int | None,
-) -> tuple[np.ndarray, np.ndarray]:
-    fam = _normalize_velocity_family(velocity_family)
-    if fam in TRANSLATION_FAMILIES:
-        mu = _translation_endpoint(model, theta_all, device=device)
-        cov = np.eye(int(mu.shape[1]), dtype=np.float64)
-        return mu, cov
-    theta_t = _as_torch_2d(theta_all, device=device)
-    model.eval()
-    if fam in SHARED_GAUSSIAN_AFFINE_FAMILIES or fam in CONDITION_GAUSSIAN_AFFINE_FAMILIES:
-        if not hasattr(model, "endpoint_mean_covariance"):
-            raise TypeError(f"{type(model).__name__} does not expose endpoint_mean_covariance(theta).")
-        with torch.no_grad():
-            try:
-                mu_t, cov_t = model.endpoint_mean_covariance(  # type: ignore[attr-defined]
-                    theta_t,
-                    solve_jitter=float(solve_jitter),
-                    quadrature_steps=quadrature_steps,
-                )
-            except TypeError:
-                mu_t, cov_t = model.endpoint_mean_covariance(  # type: ignore[attr-defined]
-                    theta_t,
-                    solve_jitter=float(solve_jitter),
-                )
-        mu = mu_t.detach().cpu().numpy().astype(np.float64)
-        cov = cov_t.detach().cpu().numpy().astype(np.float64)
-        d = int(mu.shape[1])
-        n = int(mu.shape[0])
-        if fam in SHARED_GAUSSIAN_AFFINE_FAMILIES:
-            if cov.shape == (d, d):
-                return mu, cov
-            if cov.shape == (n, d, d):
-                cov0 = cov[0]
-                if np.allclose(cov, cov0.reshape(1, d, d), rtol=1e-5, atol=1e-7):
-                    return mu, cov0
-            raise ValueError(f"{fam} endpoint covariance must have shape [D, D].")
-        if cov.shape == (n, d, d):
-            return mu, cov
-        if cov.shape == (d, d):
-            return mu, np.broadcast_to(cov.reshape(1, d, d), (n, d, d)).copy()
-        raise ValueError(f"{fam} endpoint covariance must have shape [N, D, D].")
-    raise AssertionError(f"Unhandled Gaussian endpoint family {fam!r}.")
 
 
 @torch.no_grad()
@@ -1429,6 +1268,7 @@ def sample_flow_endpoint(
     n_samples: int,
     device: torch.device,
     ode_steps: int = 64,
+    ode_method: str = "midpoint",
 ) -> torch.Tensor:
     """Sample ``x_1`` by pushing standard-normal samples through the learned ODE."""
 
@@ -1438,15 +1278,23 @@ def sample_flow_endpoint(
     steps = int(ode_steps)
     if steps < 1:
         raise ValueError("ode_steps must be >= 1.")
+    if not str(ode_method).strip():
+        raise ValueError("ode_method must be non-empty.")
     x_dim = int(getattr(model, "x_dim"))
     x = torch.randn(int(n_samples), x_dim, dtype=torch.float32, device=device)
     theta_b = th.expand(int(n_samples), int(th.shape[1]))
-    dt = 1.0 / float(steps)
     model.eval()
-    for s in range(steps):
-        t = torch.full((int(n_samples), 1), (float(s) + 0.5) / float(steps), dtype=x.dtype, device=device)
-        x = x + dt * model(x, theta_b, t)
-    return x
+    time_grid = torch.linspace(0.0, 1.0, steps + 1, dtype=x.dtype, device=device)
+    solver = _make_flow_ode_solver(model)
+    return solver.sample(
+        x_init=x,
+        step_size=None,
+        method=str(ode_method),
+        time_grid=time_grid,
+        return_intermediates=False,
+        enable_grad=False,
+        theta_cond=theta_b,
+    )
 
 
 def _log_prob_model(
@@ -1459,49 +1307,62 @@ def _log_prob_model(
     batch_size: int,
     solve_jitter: float,
     quadrature_steps: int | None,
+    ode_method: str = "midpoint",
 ) -> np.ndarray:
-    if not hasattr(model, "log_prob_normalized"):
-        raise TypeError(f"{type(model).__name__} does not expose log_prob_normalized.")
     th = _as_torch_2d(theta, device=device)
     if int(th.shape[0]) != 1:
         raise ValueError("theta must contain one endpoint row.")
+    model_dtype = _model_floating_dtype(model)
     outs: list[np.ndarray] = []
     n = int(x.shape[0])
     for start in range(0, n, int(batch_size)):
-        xb = x[start : start + int(batch_size)]
-        tb = th.expand(int(xb.shape[0]), int(th.shape[1]))
-        logp = model.log_prob_normalized(  # type: ignore[attr-defined]
+        xb = x[start : start + int(batch_size)].to(device=device, dtype=model_dtype)
+        tb = th.to(dtype=xb.dtype).expand(int(xb.shape[0]), int(th.shape[1]))
+        logp = flow_endpoint_log_prob(
+            model,
             xb,
             tb,
             solve_jitter=float(solve_jitter),
             quadrature_steps=quadrature_steps,
             ode_steps=int(ode_steps),
+            ode_method=str(ode_method),
         )
         outs.append(logp.detach().cpu().numpy().astype(np.float64))
     return np.concatenate(outs, axis=0)
 
 
-def _estimate_mc_jeffreys(
+def _model_floating_dtype(model: nn.Module) -> torch.dtype:
+    for tensor in list(model.parameters()) + list(model.buffers()):
+        if tensor.is_floating_point():
+            return tensor.dtype
+    return torch.float32
+
+
+def _estimate_model_jeffreys(
     *,
     model: nn.Module,
     theta_all: np.ndarray,
     device: torch.device,
-    mc_samples: int,
+    mc_jeffreys_sample: int,
     ode_steps: int,
     batch_size: int,
     solve_jitter: float,
     quadrature_steps: int | None,
+    ode_method: str = "midpoint",
 ) -> np.ndarray:
     theta = _as_2d_float64(theta_all, name="theta_all")
+    if int(mc_jeffreys_sample) < 1:
+        raise ValueError("mc_jeffreys_sample must be >= 1.")
     k = int(theta.shape[0])
     directed = np.zeros((k, k), dtype=np.float64)
     for i in range(k):
         xi = sample_flow_endpoint(
             model=model,
             theta=theta[i : i + 1],
-            n_samples=int(mc_samples),
+            n_samples=int(mc_jeffreys_sample),
             device=device,
             ode_steps=int(ode_steps),
+            ode_method=str(ode_method),
         )
         logp_i = _log_prob_model(
             model=model,
@@ -1509,6 +1370,7 @@ def _estimate_mc_jeffreys(
             theta=theta[i : i + 1],
             device=device,
             ode_steps=int(ode_steps),
+            ode_method=str(ode_method),
             batch_size=int(batch_size),
             solve_jitter=float(solve_jitter),
             quadrature_steps=quadrature_steps,
@@ -1522,6 +1384,7 @@ def _estimate_mc_jeffreys(
                 theta=theta[j : j + 1],
                 device=device,
                 ode_steps=int(ode_steps),
+                ode_method=str(ode_method),
                 batch_size=int(batch_size),
                 solve_jitter=float(solve_jitter),
                 quadrature_steps=quadrature_steps,
@@ -1540,71 +1403,36 @@ def estimate_model_symmetric_kl(
     device: torch.device,
     velocity_family: str | None = None,
     radius: float | None = None,
-    mc_samples: int = 4096,
+    mc_jeffreys_sample: int = 4096,
     ode_steps: int = 64,
+    ode_method: str = "midpoint",
     batch_size: int = 1024,
     solve_jitter: float = 1e-6,
     quadrature_steps: int | None = None,
     fisher_kind: str = "none",
     train_metadata: dict[str, Any] | None = None,
-    normalization: dict[str, Any] | None = None,
 ) -> FlowSKLResult:
-    """Estimate the endpoint symmetric KL matrix and canonical report metric."""
+    """Estimate model symmetric KL from model-sampled likelihood ratios."""
 
+    del radius
     fam = _normalize_velocity_family(velocity_family or getattr(model, "velocity_family", ""))
     theta = _as_2d_float64(theta_all, name="theta_all")
     model.to(device)
     model.eval()
 
-    endpoint_mean: np.ndarray | None = None
-    endpoint_covariance: np.ndarray | None = None
-    if fam in GAUSSIAN_ENDPOINT_FAMILIES:
-        endpoint_mean, endpoint_covariance = _endpoint_gaussian(
-            model=model,
-            theta_all=theta,
-            velocity_family=fam,
-            device=device,
-            solve_jitter=float(solve_jitter),
-            quadrature_steps=quadrature_steps,
-        )
-        if fam in TRANSLATION_FAMILIES:
-            skl = _pairwise_squared_euclidean(endpoint_mean)
-            if fam == "translation":
-                canonical = skl.copy()
-                metric_name = "squared_euclidean"
-            elif fam == "translation_fixed_norm":
-                r = float(radius if radius is not None else getattr(model, "radius", 1.0))
-                canonical = skl / (2.0 * r * r)
-                metric_name = "cosine"
-            else:
-                r = float(radius if radius is not None else getattr(model, "radius", 1.0))
-                canonical = skl / (2.0 * r * r)
-                metric_name = "correlation"
-        elif fam in SHARED_GAUSSIAN_AFFINE_FAMILIES:
-            skl = _shared_mahalanobis_sq(endpoint_mean, endpoint_covariance, jitter=float(solve_jitter))
-            metric_name = "mahalanobis_sq"
-            canonical = skl.copy()
-        else:
-            skl = _gaussian_jeffreys_matrix(
-                endpoint_mean,
-                endpoint_covariance,
-                jitter=float(solve_jitter),
-            )
-            canonical = skl.copy()
-            metric_name = "gaussian_symmetric_kl"
-    else:
-        skl = _estimate_mc_jeffreys(
-            model=model,
-            theta_all=theta,
-            device=device,
-            mc_samples=int(mc_samples),
-            ode_steps=int(ode_steps),
-            batch_size=int(batch_size),
-            solve_jitter=float(solve_jitter),
-            quadrature_steps=quadrature_steps,
-        )
-        canonical = skl.copy()
-        metric_name = "model_symmetric_kl_mc"
+    skl = _estimate_model_jeffreys(
+        model=model,
+        theta_all=theta,
+        device=device,
+        mc_jeffreys_sample=int(mc_jeffreys_sample),
+        ode_steps=int(ode_steps),
+        ode_method=str(ode_method),
+        batch_size=int(batch_size),
+        solve_jitter=float(solve_jitter),
+        quadrature_steps=quadrature_steps,
+    )
+    canonical = skl.copy()
+    metric_name = "model_jeffreys_symmetric_kl"
 
     fisher_mode = str(fisher_kind).strip().lower()
     if fisher_mode not in ("none", "full", "linear", "both"):
@@ -1627,15 +1455,10 @@ def estimate_model_symmetric_kl(
         symmetric_kl_matrix=skl.astype(np.float64, copy=False),
         canonical_metric_matrix=canonical.astype(np.float64, copy=False),
         canonical_metric_name=metric_name,
-        endpoint_mean=None if endpoint_mean is None else endpoint_mean.astype(np.float64, copy=False),
-        endpoint_covariance=None
-        if endpoint_covariance is None
-        else endpoint_covariance.astype(np.float64, copy=False),
         fisher_theta_midpoints=fisher_mid,
         fisher_full=fisher_full,
         fisher_linear=fisher_linear,
         train_metadata={} if train_metadata is None else dict(train_metadata),
-        normalization={} if normalization is None else dict(normalization),
     )
 
 
@@ -1678,17 +1501,10 @@ def flow_skl_result_to_npz_dict(result: FlowSKLResult) -> dict[str, Any]:
         "canonical_metric_matrix": result.canonical_metric_matrix,
         "canonical_metric_name": np.asarray([result.canonical_metric_name], dtype=object),
     }
-    if result.endpoint_mean is not None:
-        out["endpoint_mean"] = result.endpoint_mean
-    if result.endpoint_covariance is not None:
-        out["endpoint_covariance"] = result.endpoint_covariance
     if result.fisher_theta_midpoints is not None:
         out["fisher_theta_midpoints"] = result.fisher_theta_midpoints
     if result.fisher_full is not None:
         out["fisher_full"] = result.fisher_full
     if result.fisher_linear is not None:
         out["fisher_linear"] = result.fisher_linear
-    for key in ("x_mean", "x_std"):
-        if key in result.normalization:
-            out[key] = np.asarray(result.normalization[key], dtype=np.float64)
     return out

@@ -24,6 +24,10 @@ def test_parser_defaults_and_output_path_naming() -> None:
     mod = _load_module()
     repo_root = Path(__file__).resolve().parent.parent
 
+    default_args = mod.parse_args([])
+    assert default_args.n_total == 1_000
+    assert mod.resolve_output_dir(default_args) == repo_root / "data" / "mog_5pr5_n1000"
+
     args = mod.parse_args(["--n-total", "123", "--pr-dim", "7"])
     out_dir = mod.resolve_output_dir(args)
 

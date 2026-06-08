@@ -28,8 +28,8 @@ from fisher.llr_divergence import symmetric_kl_gaussian_diag_matrix
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
-            "In-memory random MoG check for flow-matching model-induced symmetric KL. "
-            "The reported SKL uses the Jeffreys convention KL(p||q)+KL(q||p), matching "
+            "In-memory random MoG check for flow-matching model-sampled symmetric KL. "
+            "The reported model Jeffreys SKL uses the convention KL(p||q)+KL(q||p), matching "
             "fisher.flow_matching_skl."
         )
     )
@@ -47,15 +47,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--hidden-dim", type=int, default=128)
     p.add_argument("--depth", type=int, default=3)
     p.add_argument("--path-schedule", choices=("cosine", "linear", "straight"), default="cosine")
-    p.add_argument("--normalize-x", dest="normalize_x", action="store_true", default=True)
-    p.add_argument("--no-normalize-x", dest="normalize_x", action="store_false")
     p.add_argument("--radius", type=float, default=1.0)
     p.add_argument("--low-rank-dim", type=int, default=4)
     p.add_argument("--quadrature-steps", type=int, default=64)
     p.add_argument("--divergence-estimator", choices=("hutchinson", "exact"), default="hutchinson")
     p.add_argument("--hutchinson-probes", type=int, default=1)
-    p.add_argument("--mc-samples", type=int, default=4096)
+    p.add_argument("--mc-jeffreys-sample", dest="mc_jeffreys_sample", type=int, default=4096)
+    p.add_argument("--mc-samples", dest="mc_jeffreys_sample", type=int, help=argparse.SUPPRESS)
     p.add_argument("--ode-steps", type=int, default=64)
+    p.add_argument("--ode-method", type=str, default="midpoint")
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--t-eps", type=float, default=0.05)
     p.add_argument("--early-min-delta", type=float, default=1e-4)
@@ -182,18 +182,12 @@ def _plot_dataset(
 def _ground_truth_jeffreys_skl_matrix(
     *,
     ds: ToyCategoricalRandomMoGDataset,
-    x_mean: np.ndarray,
-    x_std: np.ndarray,
 ) -> np.ndarray:
     means = np.asarray(ds._mog_means, dtype=np.float64)
     variances = np.asarray(ds._mog_variances, dtype=np.float64)
-    mean = np.asarray(x_mean, dtype=np.float64).reshape(1, -1)
-    std = np.asarray(x_std, dtype=np.float64).reshape(1, -1)
-    if means.shape != variances.shape or mean.shape[1] != means.shape[1] or std.shape[1] != means.shape[1]:
-        raise ValueError("Ground-truth normalization statistics do not match MoG dimensions.")
-    means_n = (means - mean) / std
-    variances_n = variances / (std * std)
-    return 2.0 * symmetric_kl_gaussian_diag_matrix(means_n, variances_n)
+    if means.shape != variances.shape:
+        raise ValueError("Ground-truth MoG means and variances must have matching dimensions.")
+    return 2.0 * symmetric_kl_gaussian_diag_matrix(means, variances)
 
 
 def _rel_error(abs_error: float, reference: float) -> float:
@@ -269,7 +263,6 @@ def main(argv: list[str] | None = None) -> int:
         device=device,
         velocity_family=str(args.velocity_family),
         path_schedule=str(args.path_schedule),
-        normalize_x=bool(args.normalize_x),
         epochs=int(args.epochs),
         batch_size=int(args.batch_size),
         lr=float(args.lr),
@@ -288,26 +281,18 @@ def main(argv: list[str] | None = None) -> int:
         device=device,
         velocity_family=str(args.velocity_family),
         radius=float(args.radius),
-        mc_samples=int(args.mc_samples),
+        mc_jeffreys_sample=int(args.mc_jeffreys_sample),
         ode_steps=int(args.ode_steps),
+        ode_method=str(args.ode_method),
         batch_size=int(args.batch_size),
         solve_jitter=float(args.solve_jitter),
         quadrature_steps=int(args.quadrature_steps),
         fisher_kind="none",
         train_metadata=train_out,
-        normalization={
-            "x_mean": train_out["x_mean"],
-            "x_std": train_out["x_std"],
-            "normalize_x": bool(args.normalize_x),
-        },
     )
 
     estimated_skl_matrix = np.asarray(result.symmetric_kl_matrix, dtype=np.float64)
-    ground_truth_skl_matrix = _ground_truth_jeffreys_skl_matrix(
-        ds=ds,
-        x_mean=np.asarray(train_out["x_mean"], dtype=np.float64),
-        x_std=np.asarray(train_out["x_std"], dtype=np.float64),
-    )
+    ground_truth_skl_matrix = _ground_truth_jeffreys_skl_matrix(ds=ds)
     estimated_skl = float(estimated_skl_matrix[0, 1])
     ground_truth_skl = float(ground_truth_skl_matrix[0, 1])
     abs_error_skl = abs(estimated_skl - ground_truth_skl)
@@ -333,13 +318,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"best_val_loss: {float(train_out['best_val_loss']):.12g}", flush=True)
     print(f"stopped_epoch: {int(train_out['stopped_epoch'])}", flush=True)
     print(f"stopped_early: {bool(train_out['stopped_early'])}", flush=True)
-    if result.endpoint_mean is not None:
-        print(f"endpoint_mean:\n{np.asarray(result.endpoint_mean, dtype=np.float64)}", flush=True)
-    if result.endpoint_covariance is not None:
-        print(f"endpoint_covariance_shape: {tuple(result.endpoint_covariance.shape)}", flush=True)
     print(f"n_train: {int(theta_train.shape[0])}", flush=True)
     print(f"n_val: {int(theta_val.shape[0])}", flush=True)
-    print(f"normalize_x: {bool(args.normalize_x)}", flush=True)
     return 0
 
 
