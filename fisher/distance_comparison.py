@@ -70,7 +70,7 @@ class FlowComparisonConfig:
     early_patience: int = 1_000
     early_min_delta: float = 1e-4
     batch_size: int = 512
-    lr: float = 1e-3
+    lr: float = 1e-4
     weight_decay: float = 0.0
     hidden_dim: int = 128
     depth: int = 3

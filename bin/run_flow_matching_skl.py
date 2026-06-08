@@ -55,7 +55,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--epochs", type=int, default=1000)
     p.add_argument("--batch-size", type=int, default=512)
-    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--hidden-dim", type=int, default=128)
     p.add_argument("--depth", type=int, default=3)

@@ -1273,7 +1273,7 @@ def train_flow_skl_model(
     path_schedule: str | GaussianAffinePathSchedule = "cosine",
     epochs: int = 1000,
     batch_size: int = 512,
-    lr: float = 1e-3,
+    lr: float = 1e-4,
     weight_decay: float = 0.0,
     t_eps: float = 0.0005,
     patience: int = 0,
