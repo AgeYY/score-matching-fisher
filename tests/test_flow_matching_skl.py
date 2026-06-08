@@ -145,6 +145,87 @@ def test_flow_skl_default_t_eps_is_small_endpoint_clamp() -> None:
     assert args.t_eps == pytest.approx(0.0005)
 
 
+def test_film_net_preserves_shape_dtype_and_zero_initialized_modulation() -> None:
+    torch.manual_seed(123)
+    self_net = fms._FiLMNet(  # type: ignore[attr-defined]
+        trunk_dim=3,
+        cond_dim=3,
+        out_dim=2,
+        hidden_dim=5,
+        depth=2,
+        final_gain=0.01,
+    ).double()
+    x = torch.randn(4, 3, dtype=torch.float64)
+    y = self_net(x)
+    assert y.shape == (4, 2)
+    assert y.dtype == torch.float64
+    assert self_net.network_architecture == "film"
+    assert not self_net.split_condition
+
+    split_net = fms._FiLMNet(  # type: ignore[attr-defined]
+        trunk_dim=2,
+        cond_dim=3,
+        out_dim=4,
+        hidden_dim=6,
+        depth=1,
+        final_gain=0.0,
+        split_condition=True,
+    ).double()
+    inp = torch.randn(4, 5, dtype=torch.float64)
+    out = split_net(inp)
+    assert out.shape == (4, 4)
+    assert out.dtype == torch.float64
+    assert split_net.split_condition
+    assert split_net.in_dim == 5
+    for block in split_net.blocks:
+        torch.testing.assert_close(block.film.weight, torch.zeros_like(block.film.weight))
+        torch.testing.assert_close(block.film.bias, torch.zeros_like(block.film.bias))
+
+
+def test_build_flow_skl_model_uses_film_subnets_for_all_velocity_families() -> None:
+    for family in VELOCITY_FAMILIES:
+        model = build_flow_skl_model(
+            velocity_family=family,
+            theta_dim=2,
+            x_dim=3,
+            hidden_dim=4,
+            depth=1,
+            low_rank_dim=1,
+            path_schedule="linear",
+        )
+        assert getattr(model, "network_architecture") == "film"
+        if family in ("translation", "translation_fixed_norm", "translation_centered_fixed_norm"):
+            assert isinstance(model.mean_net, fms._FiLMNet)  # type: ignore[attr-defined]
+            assert model.mean_net.trunk_dim == 2
+            assert model.mean_net.cond_dim == 2
+            assert not model.mean_net.split_condition
+        elif family == "nonlinear":
+            assert type(model).__name__ == "ConditionalNonlinearXFlowFiLM"
+            assert isinstance(model.net, fms._FiLMNet)  # type: ignore[attr-defined]
+            assert model.net.trunk_dim == 4
+            assert model.net.cond_dim == 2
+            assert model.net.split_condition
+        else:
+            assert isinstance(model.b_net, fms._FiLMNet)  # type: ignore[attr-defined]
+            assert model.b_net.trunk_dim == 2
+            assert model.b_net.cond_dim == 2
+            assert not model.b_net.split_condition
+            assert isinstance(model.a_net, fms._FiLMNet)  # type: ignore[attr-defined]
+            if family.startswith("condition_affine"):
+                assert model.a_net.trunk_dim == 1
+                assert model.a_net.cond_dim == 2
+                assert model.a_net.split_condition
+            else:
+                assert model.a_net.trunk_dim == 1
+                assert model.a_net.cond_dim == 1
+                assert not model.a_net.split_condition
+            if "low_rank" in family:
+                assert isinstance(model.h_net, fms._FiLMNet)  # type: ignore[attr-defined]
+                assert model.h_net.trunk_dim == 2
+                assert model.h_net.cond_dim == 2
+                assert model.h_net.split_condition
+
+
 def _patch_table_b(model: nn.Module, table: torch.Tensor) -> None:
     def b(self, theta: torch.Tensor) -> torch.Tensor:
         if theta.ndim == 1:
@@ -404,6 +485,7 @@ def test_translation_training_uses_flow_matching_forward_loss() -> None:
     )
 
     assert out["n_total_steps"] == 2
+    assert out["network_architecture"] == "film"
     assert calls
     assert all(c["t_ndim"] == 1 for c in calls)
 
@@ -832,6 +914,7 @@ def test_flow_skl_result_npz_omits_endpoint_distribution_fields() -> None:
     assert "endpoint_covariance" not in fields
     assert "endpoint_cov_or_diag" not in fields
     assert "endpoint_is_diag" not in fields
+    assert fields["network_architecture"][0] == "film"
 
 
 def test_scalar_fisher_finite_differences_use_model_jeffreys_matrix(

@@ -99,6 +99,114 @@ def _as_col_t(t: torch.Tensor, *, batch: int | None = None) -> torch.Tensor:
     return t
 
 
+class _FiLMResidualBlock(nn.Module):
+    """Residual hidden block modulated by a condition vector."""
+
+    def __init__(self, *, hidden_dim: int, cond_dim: int) -> None:
+        super().__init__()
+        self.linear = nn.Linear(int(hidden_dim), int(hidden_dim))
+        nn.init.xavier_uniform_(self.linear.weight, gain=float(nn.init.calculate_gain("relu")))
+        nn.init.zeros_(self.linear.bias)
+        self.film = nn.Linear(int(cond_dim), 2 * int(hidden_dim))
+        nn.init.zeros_(self.film.weight)
+        nn.init.zeros_(self.film.bias)
+        self.activation = nn.SiLU()
+
+    def forward(self, h: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        gamma, beta = self.film(cond).chunk(2, dim=1)
+        y = self.linear(h)
+        y = y * (1.0 + gamma) + beta
+        return h + self.activation(y)
+
+
+class _FiLMNet(nn.Module):
+    """One-argument FiLM residual network with optional input splitting.
+
+    ``forward(inp)`` preserves the old MLP call sites.  In self-conditioned
+    mode, the same input is used as trunk and condition.  In split-conditioned
+    mode, the first ``trunk_dim`` columns form the trunk and the following
+    ``cond_dim`` columns form the condition.
+    """
+
+    def __init__(
+        self,
+        *,
+        trunk_dim: int,
+        cond_dim: int,
+        out_dim: int,
+        hidden_dim: int,
+        depth: int,
+        final_gain: float = 0.01,
+        split_condition: bool = False,
+    ) -> None:
+        super().__init__()
+        if int(trunk_dim) < 1 or int(cond_dim) < 1 or int(out_dim) < 1 or int(hidden_dim) < 1:
+            raise ValueError("trunk_dim, cond_dim, out_dim, and hidden_dim must be >= 1.")
+        if int(depth) < 1:
+            raise ValueError("depth must be >= 1.")
+        self.network_architecture = "film"
+        self.trunk_dim = int(trunk_dim)
+        self.cond_dim = int(cond_dim)
+        self.out_dim = int(out_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.depth = int(depth)
+        self.split_condition = bool(split_condition)
+        self.in_dim = self.trunk_dim + self.cond_dim if self.split_condition else self.trunk_dim
+
+        self.trunk_proj = nn.Linear(self.trunk_dim, self.hidden_dim)
+        nn.init.xavier_uniform_(self.trunk_proj.weight, gain=float(nn.init.calculate_gain("relu")))
+        nn.init.zeros_(self.trunk_proj.bias)
+        self.activation = nn.SiLU()
+        self.blocks = nn.ModuleList(
+            [_FiLMResidualBlock(hidden_dim=self.hidden_dim, cond_dim=self.cond_dim) for _ in range(self.depth)]
+        )
+        self.out = nn.Linear(self.hidden_dim, self.out_dim)
+        nn.init.xavier_uniform_(self.out.weight, gain=float(final_gain))
+        nn.init.zeros_(self.out.bias)
+
+    def _split(self, inp: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if inp.ndim != 2:
+            raise ValueError("FiLM network input must have shape [B, features].")
+        if self.split_condition:
+            expected = self.trunk_dim + self.cond_dim
+            if int(inp.shape[1]) != expected:
+                raise ValueError(f"FiLM split input must have {expected} features.")
+            return inp[:, : self.trunk_dim], inp[:, self.trunk_dim :]
+        if int(inp.shape[1]) != self.trunk_dim:
+            raise ValueError(f"FiLM self-conditioned input must have {self.trunk_dim} features.")
+        if self.cond_dim != self.trunk_dim:
+            raise ValueError("self-conditioned FiLM requires cond_dim == trunk_dim.")
+        return inp, inp
+
+    def forward(self, inp: torch.Tensor) -> torch.Tensor:
+        trunk, cond = self._split(inp)
+        h = self.activation(self.trunk_proj(trunk))
+        for block in self.blocks:
+            h = block(h, cond)
+        return self.out(h)
+
+
+def _make_film_net(
+    *,
+    trunk_dim: int,
+    cond_dim: int,
+    out_dim: int,
+    hidden_dim: int,
+    depth: int,
+    final_gain: float = 0.01,
+    split_condition: bool = False,
+) -> _FiLMNet:
+    return _FiLMNet(
+        trunk_dim=int(trunk_dim),
+        cond_dim=int(cond_dim),
+        out_dim=int(out_dim),
+        hidden_dim=int(hidden_dim),
+        depth=int(depth),
+        final_gain=float(final_gain),
+        split_condition=bool(split_condition),
+    )
+
+
 def _make_mlp(
     *,
     in_dim: int,
@@ -371,8 +479,10 @@ class TranslationFlowSKLModel(nn.Module):
             hutchinson_probes=int(hutchinson_probes),
         )
         self.set_path_schedule(path_schedule)
-        self.mean_net = _make_mlp(
-            in_dim=self.theta_dim,
+        self.network_architecture = "film"
+        self.mean_net = _make_film_net(
+            trunk_dim=self.theta_dim,
+            cond_dim=self.theta_dim,
             out_dim=self.x_dim,
             hidden_dim=int(hidden_dim),
             depth=int(depth),
@@ -421,8 +531,8 @@ class TranslationFlowSKLModel(nn.Module):
         )
 
 
-class ConditionalNonlinearXFlowMLP(nn.Module):
-    """Unconstrained conditional velocity with reverse-ODE likelihood."""
+class ConditionalNonlinearXFlowFiLM(nn.Module):
+    """Unconstrained FiLM conditional velocity with reverse-ODE likelihood."""
 
     def __init__(
         self,
@@ -443,12 +553,15 @@ class ConditionalNonlinearXFlowMLP(nn.Module):
             divergence_estimator=divergence_estimator,
             hutchinson_probes=int(hutchinson_probes),
         )
-        self.net = _make_mlp(
-            in_dim=self.x_dim + 1 + self.theta_dim,
+        self.network_architecture = "film"
+        self.net = _make_film_net(
+            trunk_dim=self.x_dim + 1,
+            cond_dim=self.theta_dim,
             out_dim=self.x_dim,
             hidden_dim=int(hidden_dim),
             depth=int(depth),
             final_gain=0.0,
+            split_condition=True,
         )
 
     def forward(self, x: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
@@ -476,6 +589,9 @@ class ConditionalNonlinearXFlowMLP(nn.Module):
             ode_steps=int(ode_steps),
             ode_method=str(ode_method),
         )
+
+
+ConditionalNonlinearXFlowMLP = ConditionalNonlinearXFlowFiLM
 
 
 class _CenteredAffineFlowSKLBase(nn.Module):
@@ -509,13 +625,15 @@ class _CenteredAffineFlowSKLBase(nn.Module):
         self.hidden_dim = int(hidden_dim)
         self.depth = int(depth)
         self.quadrature_steps = int(quadrature_steps)
+        self.network_architecture = "film"
         _set_divergence_controls(
             self,
             divergence_estimator=divergence_estimator,
             hutchinson_probes=int(hutchinson_probes),
         )
-        self.b_net = _make_mlp(
-            in_dim=self.theta_dim,
+        self.b_net = _make_film_net(
+            trunk_dim=self.theta_dim,
+            cond_dim=self.theta_dim,
             out_dim=self.x_dim,
             hidden_dim=self.hidden_dim,
             depth=self.depth,
@@ -576,8 +694,9 @@ class CenteredSharedAffineFlowSKLModel(_CenteredAffineFlowSKLBase):
         if float(a_diag_jitter) < 0.0:
             raise ValueError("a_diag_jitter must be nonnegative.")
         self.a_diag_jitter = float(a_diag_jitter)
-        self.a_net = _make_mlp(
-            in_dim=1,
+        self.a_net = _make_film_net(
+            trunk_dim=1,
+            cond_dim=1,
             out_dim=self.x_dim * self.x_dim,
             hidden_dim=self.hidden_dim,
             depth=self.depth,
@@ -652,8 +771,9 @@ class CenteredSharedAffineScalarFlowSKLModel(CenteredSharedAffineFlowSKLModel):
             a_diag_jitter=float(a_diag_jitter),
         )
         self.velocity_family = "shared_affine_scalar"
-        self.a_net = _make_mlp(
-            in_dim=1,
+        self.a_net = _make_film_net(
+            trunk_dim=1,
+            cond_dim=1,
             out_dim=1,
             hidden_dim=self.hidden_dim,
             depth=self.depth,
@@ -693,8 +813,9 @@ class CenteredSharedAffineDiagFlowSKLModel(CenteredSharedAffineFlowSKLModel):
             a_diag_jitter=float(a_diag_jitter),
         )
         self.velocity_family = "shared_affine_diag"
-        self.a_net = _make_mlp(
-            in_dim=1,
+        self.a_net = _make_film_net(
+            trunk_dim=1,
+            cond_dim=1,
             out_dim=self.x_dim,
             hidden_dim=self.hidden_dim,
             depth=self.depth,
@@ -732,12 +853,14 @@ class CenteredConditionAffineFlowSKLModel(_CenteredAffineFlowSKLBase):
             hutchinson_probes=int(hutchinson_probes),
         )
         self.velocity_family = "condition_affine"
-        self.a_net = _make_mlp(
-            in_dim=self.theta_dim + 1,
+        self.a_net = _make_film_net(
+            trunk_dim=1,
+            cond_dim=self.theta_dim,
             out_dim=self.x_dim * self.x_dim,
             hidden_dim=self.hidden_dim,
             depth=self.depth,
             final_gain=0.01,
+            split_condition=True,
         )
 
     def A(self, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
@@ -802,12 +925,14 @@ class CenteredConditionAffineScalarFlowSKLModel(CenteredConditionAffineFlowSKLMo
             hutchinson_probes=int(hutchinson_probes),
         )
         self.velocity_family = "condition_affine_scalar"
-        self.a_net = _make_mlp(
-            in_dim=self.theta_dim + 1,
+        self.a_net = _make_film_net(
+            trunk_dim=1,
+            cond_dim=self.theta_dim,
             out_dim=1,
             hidden_dim=self.hidden_dim,
             depth=self.depth,
             final_gain=0.01,
+            split_condition=True,
         )
 
     def A(self, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
@@ -843,12 +968,14 @@ class CenteredConditionAffineDiagFlowSKLModel(CenteredConditionAffineFlowSKLMode
             hutchinson_probes=int(hutchinson_probes),
         )
         self.velocity_family = "condition_affine_diag"
-        self.a_net = _make_mlp(
-            in_dim=self.theta_dim + 1,
+        self.a_net = _make_film_net(
+            trunk_dim=1,
+            cond_dim=self.theta_dim,
             out_dim=self.x_dim,
             hidden_dim=self.hidden_dim,
             depth=self.depth,
             final_gain=0.01,
+            split_condition=True,
         )
 
     def A(self, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
@@ -899,12 +1026,14 @@ class CenteredSharedAffineLowRankFlowSKLModel(CenteredSharedAffineFlowSKLModel):
         u_lin = nn.Linear(self.correction_rank, self.x_dim, bias=False)
         nn.init.orthogonal_(u_lin.weight)
         self.u_layer = parametrizations.orthogonal(u_lin, "weight", orthogonal_map="householder")
-        self.h_net = _make_mlp(
-            in_dim=self.correction_rank + 1 + self.theta_dim,
+        self.h_net = _make_film_net(
+            trunk_dim=self.correction_rank + 1,
+            cond_dim=self.theta_dim,
             out_dim=self.correction_rank,
             hidden_dim=self.hidden_dim,
             depth=self.depth,
             final_gain=0.0,
+            split_condition=True,
         )
 
     @property
@@ -985,8 +1114,9 @@ class CenteredSharedAffineLowRankScalarFlowSKLModel(CenteredSharedAffineLowRankF
             a_diag_jitter=float(a_diag_jitter),
         )
         self.velocity_family = "shared_affine_low_rank_scalar"
-        self.a_net = _make_mlp(
-            in_dim=1,
+        self.a_net = _make_film_net(
+            trunk_dim=1,
+            cond_dim=1,
             out_dim=1,
             hidden_dim=self.hidden_dim,
             depth=self.depth,
@@ -1028,8 +1158,9 @@ class CenteredSharedAffineLowRankDiagFlowSKLModel(CenteredSharedAffineLowRankFlo
             a_diag_jitter=float(a_diag_jitter),
         )
         self.velocity_family = "shared_affine_low_rank_diag"
-        self.a_net = _make_mlp(
-            in_dim=1,
+        self.a_net = _make_film_net(
+            trunk_dim=1,
+            cond_dim=1,
             out_dim=self.x_dim,
             hidden_dim=self.hidden_dim,
             depth=self.depth,
@@ -1118,7 +1249,7 @@ def build_flow_skl_model(
             **common,
         )
     if fam == "nonlinear":
-        return ConditionalNonlinearXFlowMLP(
+        return ConditionalNonlinearXFlowFiLM(
             divergence_estimator=str(divergence_estimator),
             hutchinson_probes=int(hutchinson_probes),
             **common,
@@ -1275,6 +1406,7 @@ def train_flow_skl_model(
 
     return {
         "velocity_family": fam,
+        "network_architecture": str(getattr(model, "network_architecture", "film")),
         "train_losses": np.asarray(train_losses, dtype=np.float64),
         "val_losses": np.asarray(val_losses, dtype=np.float64),
         "best_val_loss": float(best_val),
@@ -1478,6 +1610,9 @@ def estimate_model_symmetric_kl(
         fisher_mid = fd["theta_midpoints"]
         fisher_linear = fd["fisher"]
 
+    meta = {} if train_metadata is None else dict(train_metadata)
+    meta.setdefault("network_architecture", str(getattr(model, "network_architecture", "film")))
+
     return FlowSKLResult(
         symmetric_kl_matrix=skl.astype(np.float64, copy=False),
         canonical_metric_matrix=canonical.astype(np.float64, copy=False),
@@ -1485,7 +1620,7 @@ def estimate_model_symmetric_kl(
         fisher_theta_midpoints=fisher_mid,
         fisher_full=fisher_full,
         fisher_linear=fisher_linear,
-        train_metadata={} if train_metadata is None else dict(train_metadata),
+        train_metadata=meta,
     )
 
 
@@ -1527,6 +1662,10 @@ def flow_skl_result_to_npz_dict(result: FlowSKLResult) -> dict[str, Any]:
         "symmetric_kl_matrix": result.symmetric_kl_matrix,
         "canonical_metric_matrix": result.canonical_metric_matrix,
         "canonical_metric_name": np.asarray([result.canonical_metric_name], dtype=object),
+        "network_architecture": np.asarray(
+            [str(result.train_metadata.get("network_architecture", "film"))],
+            dtype=object,
+        ),
     }
     if result.fisher_theta_midpoints is not None:
         out["fisher_theta_midpoints"] = result.fisher_theta_midpoints

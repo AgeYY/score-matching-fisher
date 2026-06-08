@@ -309,6 +309,7 @@ def main(argv: list[str] | None = None) -> int:
         "script": "bin/run_flow_matching_skl.py",
         "dataset": dataset_label,
         "velocity_family": str(args.velocity_family),
+        "network_architecture": str(train_meta.get("network_architecture", "film")),
         "device": str(dev),
         "path_schedule": str(args.path_schedule),
         "ode_method": str(args.ode_method),
