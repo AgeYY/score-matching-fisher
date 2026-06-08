@@ -195,6 +195,25 @@ def test_shared_affine_full_A_is_symmetric_for_arbitrary_t() -> None:
     torch.testing.assert_close(a_t, a_t.transpose(-1, -2), rtol=1e-12, atol=1e-12)
 
 
+def test_condition_affine_full_A_is_symmetric_for_arbitrary_theta_and_t() -> None:
+    torch.manual_seed(123)
+    model = build_flow_skl_model(
+        velocity_family="condition_affine",
+        theta_dim=3,
+        x_dim=4,
+        hidden_dim=8,
+        depth=2,
+        path_schedule="linear",
+    ).double()
+    theta = torch.tensor(
+        [[1.0, 0.0, 0.0], [0.25, 0.5, -0.75], [-1.0, 0.0, 1.0]],
+        dtype=torch.float64,
+    )
+    t = torch.tensor([[0.0], [0.37], [0.91]], dtype=torch.float64)
+    a_t = model.A(theta, t)
+    torch.testing.assert_close(a_t, a_t.transpose(-1, -2), rtol=1e-12, atol=1e-12)
+
+
 def test_translation_families_report_model_jeffreys(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -494,8 +513,8 @@ def test_condition_affine_forward_uses_centered_residual_and_condition_matrix() 
     means = torch.tensor([[1.0, -2.0], [0.5, 3.0]], dtype=torch.float64)
     a_mats = torch.tensor(
         [
-            [[0.2, -0.4], [0.7, 0.1]],
-            [[-0.3, 0.6], [0.25, 0.4]],
+            [[0.2, -0.4], [-0.4, 0.1]],
+            [[-0.3, 0.6], [0.6, 0.4]],
         ],
         dtype=torch.float64,
     )

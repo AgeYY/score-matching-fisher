@@ -691,7 +691,7 @@ class CenteredSharedAffineDiagFlowSKLModel(CenteredSharedAffineFlowSKLModel):
 
 
 class CenteredConditionAffineFlowSKLModel(_CenteredAffineFlowSKLBase):
-    """Centered condition-specific affine velocity with full ``A(theta,t)``."""
+    """Centered condition-specific affine velocity with symmetric ``A(theta,t)``."""
 
     def __init__(
         self,
@@ -728,7 +728,8 @@ class CenteredConditionAffineFlowSKLModel(_CenteredAffineFlowSKLBase):
         if theta.ndim == 1:
             theta = theta.unsqueeze(-1)
         t = _as_col_t(t, batch=int(theta.shape[0]))
-        return self.a_net(torch.cat([t, theta], dim=1)).reshape(int(theta.shape[0]), self.x_dim, self.x_dim)
+        raw = self.a_net(torch.cat([t, theta], dim=1)).reshape(int(theta.shape[0]), self.x_dim, self.x_dim)
+        return 0.5 * (raw + raw.transpose(-1, -2))
 
     def forward(self, x: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         theta = _expand_theta_to_batch(theta, batch=int(x.shape[0]))
