@@ -32,7 +32,7 @@ def test_parser_defaults_and_output_path_naming() -> None:
     out_dir = mod.resolve_output_dir(args)
 
     assert args.seed == 7
-    assert args.train_frac == 0.7
+    assert args.train_frac == 0.9
     assert args.device == "cuda"
     assert args.force is False
     assert args.use_cache is False
@@ -126,7 +126,7 @@ def test_command_construction_for_native_and_pr(monkeypatch: pytest.MonkeyPatch,
     assert _flag_value(native, "--num-categories") == "5"
     assert _flag_value(native, "--x-dim") == "2"
     assert _flag_value(native, "--n-total") == "456"
-    assert _flag_value(native, "--train-frac") == "0.7"
+    assert _flag_value(native, "--train-frac") == "0.9"
     assert _flag_value(native, "--seed") == "7"
 
     assert _flag_value(projected, "--h-dim") == "9"

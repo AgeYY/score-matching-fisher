@@ -96,7 +96,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--epochs", type=int, default=20_000)
     p.add_argument("--early-patience", type=int, default=1_000)
     p.add_argument("--early-min-delta", type=float, default=1e-4)
-    p.add_argument("--batch-size", type=int, default=512)
+    p.add_argument("--batch-size", type=int, default=2048)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--hidden-dim", type=int, default=128)
@@ -273,6 +273,9 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
         extra={
             "script": "bin/compare_mog5_pr_distances.py",
             "device": str(dev),
+            "n_total": int(args.n_total),
+            "pr_dim": int(args.pr_dim),
+            "seed": int(args.seed),
             "dataset_dir": str(dataset_dir),
             "native_npz": str(native_npz),
             "projected_npz": str(projected_npz),
@@ -280,6 +283,11 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
             "results_npz": str(results_npz),
             "pairs_csv": str(pairs_csv),
             "gt_samples_per_class": int(args.gt_samples_per_class),
+            "gt_batch_size": int(args.gt_batch_size),
+            "mahalanobis_ridge": float(args.mahalanobis_ridge),
+            "skl_folds": int(args.skl_folds),
+            "skl_logistic_c": float(args.skl_logistic_c),
+            "pr_cache_dir": str(Path(args.pr_cache_dir)),
             "flow_defaults": vars(_flow_config_from_args(args)),
         },
     )
