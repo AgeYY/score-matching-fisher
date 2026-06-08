@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib.util
+import inspect
 import sys
 import types
 from pathlib import Path
@@ -26,6 +28,15 @@ from fisher.flow_matching_skl import (
     sample_flow_endpoint,
     train_flow_skl_model,
 )
+
+
+def _load_run_flow_matching_skl_module():
+    path = _REPO_ROOT / "bin" / "run_flow_matching_skl.py"
+    spec = importlib.util.spec_from_file_location("run_flow_matching_skl", path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 class TableTranslationModel(nn.Module):
@@ -123,6 +134,15 @@ def _patch_model_jeffreys(
         return sentinel.copy()
 
     monkeypatch.setattr(fms, "_estimate_model_jeffreys", fake_estimate_model_jeffreys)
+
+
+def test_flow_skl_default_t_eps_is_small_endpoint_clamp() -> None:
+    sig = inspect.signature(train_flow_skl_model)
+    assert sig.parameters["t_eps"].default == pytest.approx(0.0005)
+
+    mod = _load_run_flow_matching_skl_module()
+    args = mod.build_parser().parse_args([])
+    assert args.t_eps == pytest.approx(0.0005)
 
 
 def _patch_table_b(model: nn.Module, table: torch.Tensor) -> None:

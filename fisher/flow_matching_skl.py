@@ -1144,7 +1144,7 @@ def train_flow_skl_model(
     batch_size: int = 512,
     lr: float = 1e-3,
     weight_decay: float = 0.0,
-    t_eps: float = 0.05,
+    t_eps: float = 0.0005,
     patience: int = 0,
     min_delta: float = 1e-4,
     max_grad_norm: float = 10.0,

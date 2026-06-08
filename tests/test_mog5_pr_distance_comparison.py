@@ -21,6 +21,16 @@ def _load_cli_module():
     return mod
 
 
+def _load_mahalanobis_cli_module():
+    repo_root = Path(__file__).resolve().parent.parent
+    path = repo_root / "bin" / "compare_mog5_pr_mahalanobis.py"
+    spec = importlib.util.spec_from_file_location("compare_mog5_pr_mahalanobis", path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def _toy_bundle() -> SharedDatasetBundle:
     theta_all = np.eye(3, dtype=np.float64)[np.array([0, 1, 2, 0, 1, 2], dtype=np.int64)]
     x_all = np.array(
@@ -275,6 +285,10 @@ def test_flow_comparison_config_has_no_normalize_x_field() -> None:
     assert "normalize_x" not in dc.FlowComparisonConfig.__dataclass_fields__
 
 
+def test_flow_comparison_config_default_t_eps_is_small_endpoint_clamp() -> None:
+    assert dc.FlowComparisonConfig().t_eps == 0.0005
+
+
 def test_assemble_rows_with_mocked_flow_results() -> None:
     labels = ("category_0", "category_1", "category_2")
     classical = {m: np.ones((3, 3), dtype=np.float64) for m in dc.METRIC_NAMES}
@@ -318,7 +332,163 @@ def test_cli_default_path_resolution_without_running_training() -> None:
     assert args.mc_jeffreys_sample == 4096
     assert args.radius == 1.0
     assert args.ode_method == "midpoint"
+    assert args.t_eps == 0.0005
     assert mod._flow_config_from_args(args).mc_jeffreys_sample == 4096
     assert mod._flow_config_from_args(args).radius == 1.0
+    assert mod._flow_config_from_args(args).t_eps == 0.0005
     assert mod.resolve_dataset_dir(args) == repo_root / "data" / "mog_5pr5_n1000"
     assert mod.resolve_output_dir(args) == repo_root / "data" / "mog_5pr5_n1000" / "distance_comparison_flow_skl"
+
+
+def test_mahalanobis_cli_defaults_match_full_cli_without_running_training() -> None:
+    full = _load_cli_module()
+    mod = _load_mahalanobis_cli_module()
+    repo_root = Path(__file__).resolve().parent.parent
+
+    full_args = full.build_parser().parse_args([])
+    args = mod.build_parser().parse_args([])
+
+    assert args.n_total == full_args.n_total == 1_000
+    assert args.pr_dim == full_args.pr_dim == 5
+    assert args.seed == full_args.seed == 7
+    assert args.device == full_args.device == "cuda"
+    assert args.gt_samples_per_class == full_args.gt_samples_per_class == 100_000
+    assert args.mc_jeffreys_sample == full_args.mc_jeffreys_sample == 4096
+    assert args.radius == full_args.radius == 1.0
+    assert args.ode_method == full_args.ode_method == "midpoint"
+    assert args.t_eps == full_args.t_eps == 0.0005
+    assert mod._flow_config_from_args(args).mc_jeffreys_sample == 4096
+    assert mod._flow_config_from_args(args).radius == 1.0
+    assert mod._flow_config_from_args(args).t_eps == 0.0005
+    assert mod.resolve_dataset_dir(args) == repo_root / "data" / "mog_5pr5_n1000"
+    assert mod.resolve_output_dir(args) == repo_root / "data" / "mog_5pr5_n1000" / "mahalanobis_comparison_flow_skl"
+
+    compatible = mod.build_parser().parse_args(
+        [
+            "--skl-folds",
+            "3",
+            "--skl-logistic-c",
+            "0.5",
+            "--radius",
+            "2.0",
+        ]
+    )
+    assert compatible.skl_folds == 3
+    assert compatible.skl_logistic_c == 0.5
+    assert compatible.radius == 2.0
+
+
+def test_mahalanobis_cli_run_filters_to_mahalanobis_only(monkeypatch, tmp_path: Path) -> None:
+    mod = _load_mahalanobis_cli_module()
+    metric = dc.METRIC_MAHALANOBIS_SQ
+    other_metric = dc.METRIC_SQUARED_EUCLIDEAN
+    calls: dict[str, object] = {}
+    n_total = 1000
+    k = 5
+
+    theta_all = np.eye(k, dtype=np.float64)[np.arange(n_total, dtype=np.int64) % k]
+    x_all = np.zeros((n_total, 5), dtype=np.float64)
+    projected_bundle = SharedDatasetBundle(
+        meta={
+            "dataset_family": "random_mog_categorical",
+            "num_categories": k,
+            "x_dim": 5,
+            "pr_autoencoder_embedded": True,
+        },
+        theta_all=theta_all,
+        x_all=x_all,
+        train_idx=np.arange(10, dtype=np.int64),
+        validation_idx=np.arange(10, 20, dtype=np.int64),
+        theta_train=theta_all[:10],
+        x_train=x_all[:10],
+        theta_validation=theta_all[10:20],
+        x_validation=x_all[10:20],
+    )
+    native_bundle = SharedDatasetBundle(
+        meta={
+            "dataset_family": "random_mog_categorical",
+            "num_categories": k,
+            "x_dim": 2,
+            "mog_component_means": np.zeros((k, 2), dtype=np.float64),
+            "mog_component_variances": np.ones((k, 2), dtype=np.float64),
+        },
+        theta_all=theta_all,
+        x_all=np.zeros((n_total, 2), dtype=np.float64),
+        train_idx=np.arange(10, dtype=np.int64),
+        validation_idx=np.arange(10, 20, dtype=np.int64),
+        theta_train=theta_all[:10],
+        x_train=np.zeros((10, 2), dtype=np.float64),
+        theta_validation=theta_all[10:20],
+        x_validation=np.zeros((10, 2), dtype=np.float64),
+    )
+
+    def fake_ensure_dataset(args, dataset_dir):
+        calls["ensure_dataset"] = (args, dataset_dir)
+        return tmp_path / "native.npz", tmp_path / "projected.npz"
+
+    def fake_load_shared_dataset_npz(path):
+        return native_bundle if Path(path).name == "native.npz" else projected_bundle
+
+    def fake_classical_metric_matrices(*args, **kwargs):
+        calls["classical_metrics"] = tuple(kwargs["metrics"])
+        return {metric: np.ones((k, k), dtype=np.float64)}
+
+    def fake_ground_truth(**kwargs):
+        calls["ground_truth_kwargs"] = kwargs
+        return {
+            metric: 3.0 * np.ones((k, k), dtype=np.float64),
+            other_metric: 9.0 * np.ones((k, k), dtype=np.float64),
+        }
+
+    def fake_flow_metric_matrices(**kwargs):
+        calls["flow_metrics"] = tuple(kwargs["metrics"])
+        calls["flow_output_dir"] = Path(kwargs["output_dir"])
+        return {metric: 2.0 * np.ones((k, k), dtype=np.float64)}, {metric: tmp_path / "flow.npz"}
+
+    def fake_assemble_comparison_result(**kwargs):
+        calls["assemble_metrics"] = tuple(kwargs["metrics"])
+        calls["assemble_ground_truth_keys"] = tuple(kwargs["ground_truth"].keys())
+        calls["assemble_flow_npz_paths"] = dict(kwargs["flow_npz_paths"])
+        return dc.assemble_comparison_result(**kwargs)
+
+    def fake_write_results_npz(path, result):
+        calls["results_npz"] = Path(path)
+        return Path(path)
+
+    def fake_write_pairs_csv(path, rows):
+        calls["pairs_csv"] = Path(path)
+        calls["rows"] = rows
+        return Path(path)
+
+    def fake_write_summary_json(path, *, result, extra):
+        calls["summary_json"] = Path(path)
+        calls["summary_extra"] = dict(extra)
+        return Path(path)
+
+    monkeypatch.setattr(mod, "require_device", lambda device: torch.device("cpu"))
+    monkeypatch.setattr(mod, "ensure_dataset", fake_ensure_dataset)
+    monkeypatch.setattr(mod, "load_shared_dataset_npz", fake_load_shared_dataset_npz)
+    monkeypatch.setattr(mod, "classical_metric_matrices", fake_classical_metric_matrices)
+    monkeypatch.setattr(mod, "pr_autoencoder_ground_truth_matrices", fake_ground_truth)
+    monkeypatch.setattr(mod, "flow_metric_matrices", fake_flow_metric_matrices)
+    monkeypatch.setattr(mod, "assemble_comparison_result", fake_assemble_comparison_result)
+    monkeypatch.setattr(mod, "write_results_npz", fake_write_results_npz)
+    monkeypatch.setattr(mod, "write_pairs_csv", fake_write_pairs_csv)
+    monkeypatch.setattr(mod, "write_summary_json", fake_write_summary_json)
+
+    args = mod.build_parser().parse_args(["--output-dir", str(tmp_path / "out")])
+    paths = mod.run(args)
+
+    assert calls["classical_metrics"] == (metric,)
+    assert calls["flow_metrics"] == (metric,)
+    assert calls["assemble_metrics"] == (metric,)
+    assert calls["assemble_ground_truth_keys"] == (metric,)
+    assert calls["assemble_flow_npz_paths"] == {metric: tmp_path / "flow.npz"}
+    assert calls["flow_output_dir"] == tmp_path / "out" / "flow"
+    assert calls["results_npz"].name == "mog5_pr_mahalanobis_comparison_results.npz"
+    assert calls["pairs_csv"].name == "mog5_pr_mahalanobis_comparison_pairs.csv"
+    assert calls["summary_json"].name == "mog5_pr_mahalanobis_comparison_summary.json"
+    assert calls["summary_extra"]["script"] == "bin/compare_mog5_pr_mahalanobis.py"
+    assert calls["summary_extra"]["metrics"] == [metric]
+    assert paths["output_dir"] == tmp_path / "out"
+    assert paths["results_npz"] == tmp_path / "out" / "mog5_pr_mahalanobis_comparison_results.npz"

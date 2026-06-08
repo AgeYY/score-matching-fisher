@@ -76,7 +76,7 @@ class FlowComparisonConfig:
     depth: int = 3
     low_rank_dim: int = 4
     path_schedule: str = "cosine"
-    t_eps: float = 0.05
+    t_eps: float = 0.0005
     quadrature_steps: int = 64
     mc_jeffreys_sample: int = 4096
     ode_steps: int = 64

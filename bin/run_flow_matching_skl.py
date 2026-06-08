@@ -64,7 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--divergence-estimator", choices=("hutchinson", "exact"), default="hutchinson")
     p.add_argument("--hutchinson-probes", type=int, default=1)
     p.add_argument("--shared-affine-a-diag-jitter", type=float, default=1e-3)
-    p.add_argument("--t-eps", type=float, default=0.05)
+    p.add_argument("--t-eps", type=float, default=0.0005)
     p.add_argument("--early-patience", type=int, default=0)
     p.add_argument("--early-min-delta", type=float, default=1e-4)
     p.add_argument("--max-grad-norm", type=float, default=10.0)

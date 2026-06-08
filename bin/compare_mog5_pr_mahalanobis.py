@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare classical, flow-matching, and ground-truth distances on MoG5 PR data."""
+"""Compare classical, flow-matching, and ground-truth Mahalanobis distance on MoG5 PR data."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from fisher.distance_comparison import (
-    METRIC_NAMES,
+    METRIC_MAHALANOBIS_SQ,
     FlowComparisonConfig,
     assemble_comparison_result,
     classical_metric_matrices,
@@ -31,6 +31,8 @@ from fisher.distance_comparison import (
 )
 from fisher.shared_dataset_io import load_shared_dataset_npz
 from fisher.shared_fisher_est import require_device
+
+MAHALANOBIS_METRICS = (METRIC_MAHALANOBIS_SQ,)
 
 
 def _load_make_mog5_module() -> Any:
@@ -49,7 +51,7 @@ def default_dataset_dir(*, n_total: int = 1_000, pr_dim: int = 5) -> Path:
 
 
 def default_output_dir(*, n_total: int = 1_000, pr_dim: int = 5) -> Path:
-    return default_dataset_dir(n_total=int(n_total), pr_dim=int(pr_dim)) / "distance_comparison_flow_skl"
+    return default_dataset_dir(n_total=int(n_total), pr_dim=int(pr_dim)) / "mahalanobis_comparison_flow_skl"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -71,7 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-dir",
         type=Path,
         default=None,
-        help="Comparison output directory. Defaults to <dataset-dir>/distance_comparison_flow_skl.",
+        help="Comparison output directory. Defaults to <dataset-dir>/mahalanobis_comparison_flow_skl.",
     )
     p.add_argument("--force-dataset", action="store_true", help="Regenerate native and projected MoG5 PR NPZs.")
     p.add_argument(
@@ -128,7 +130,7 @@ def resolve_dataset_dir(args: argparse.Namespace) -> Path:
 def resolve_output_dir(args: argparse.Namespace) -> Path:
     if args.output_dir is not None:
         return Path(args.output_dir).expanduser()
-    return resolve_dataset_dir(args) / "distance_comparison_flow_skl"
+    return resolve_dataset_dir(args) / "mahalanobis_comparison_flow_skl"
 
 
 def _dataset_wrapper_args(args: argparse.Namespace, dataset_dir: Path) -> argparse.Namespace:
@@ -222,20 +224,20 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
     labels = labels_from_theta(projected_bundle.theta_all, num_categories=k)
     names = condition_labels(k)
 
-    print("[distance-comparison] computing classical finite-sample metrics", flush=True)
+    print("[mahalanobis-comparison] computing classical finite-sample metric", flush=True)
     classical = classical_metric_matrices(
         projected_bundle.x_all,
         labels,
         num_categories=k,
-        metrics=METRIC_NAMES,
+        metrics=MAHALANOBIS_METRICS,
         mahalanobis_ridge=float(args.mahalanobis_ridge),
         skl_folds=int(args.skl_folds),
         skl_seed=int(args.seed),
         skl_logistic_c=float(args.skl_logistic_c),
     )
 
-    print("[distance-comparison] computing projected-coordinate Monte Carlo ground truth", flush=True)
-    ground_truth = pr_autoencoder_ground_truth_matrices(
+    print("[mahalanobis-comparison] computing projected-coordinate Monte Carlo ground truth", flush=True)
+    ground_truth_all = pr_autoencoder_ground_truth_matrices(
         native_meta=dict(native_bundle.meta),
         projected_meta=dict(projected_bundle.meta),
         device=dev,
@@ -245,19 +247,20 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
         batch_size=int(args.gt_batch_size),
         mahalanobis_ridge=float(args.mahalanobis_ridge),
     )
+    ground_truth = {metric: ground_truth_all[metric] for metric in MAHALANOBIS_METRICS}
 
-    print("[distance-comparison] training flow-matching metrics", flush=True)
+    print("[mahalanobis-comparison] training flow-matching metric", flush=True)
     flow, flow_paths = flow_metric_matrices(
         bundle=projected_bundle,
         device=dev,
         output_dir=output_dir / "flow",
         config=_flow_config_from_args(args),
         seed=int(args.seed),
-        metrics=METRIC_NAMES,
+        metrics=MAHALANOBIS_METRICS,
     )
 
     result = assemble_comparison_result(
-        metrics=METRIC_NAMES,
+        metrics=MAHALANOBIS_METRICS,
         condition_names=names,
         classical=classical,
         flow_matching=flow,
@@ -265,13 +268,14 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
         flow_npz_paths=flow_paths,
     )
 
-    results_npz = write_results_npz(output_dir / "mog5_pr_distance_comparison_results.npz", result)
-    pairs_csv = write_pairs_csv(output_dir / "mog5_pr_distance_comparison_pairs.csv", result.rows)
+    results_npz = write_results_npz(output_dir / "mog5_pr_mahalanobis_comparison_results.npz", result)
+    pairs_csv = write_pairs_csv(output_dir / "mog5_pr_mahalanobis_comparison_pairs.csv", result.rows)
     summary_json = write_summary_json(
-        output_dir / "mog5_pr_distance_comparison_summary.json",
+        output_dir / "mog5_pr_mahalanobis_comparison_summary.json",
         result=result,
         extra={
-            "script": "bin/compare_mog5_pr_distances.py",
+            "script": "bin/compare_mog5_pr_mahalanobis.py",
+            "metrics": list(MAHALANOBIS_METRICS),
             "device": str(dev),
             "dataset_dir": str(dataset_dir),
             "native_npz": str(native_npz),
