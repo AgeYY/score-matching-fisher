@@ -21,6 +21,8 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from fisher.distance_comparison import METRIC_NAMES
+
 RESULTS_NAME = "mog5_pr_distance_comparison_results.npz"
 SWEEP_NPZ_NAME = "mog5_pr_distance_sweep_results.npz"
 SWEEP_CSV_NAME = "mog5_pr_distance_sweep_errors.csv"
@@ -29,6 +31,8 @@ SWEEP_SVG_NAME = "mog5_pr_distance_sweep_abs_error.svg"
 SWEEP_PNG_NAME = "mog5_pr_distance_sweep_abs_error.png"
 SWEEP_REL_SVG_NAME = "mog5_pr_distance_sweep_rel_error.svg"
 SWEEP_REL_PNG_NAME = "mog5_pr_distance_sweep_rel_error.png"
+SWEEP_FLOW_LOSS_SVG_NAME = "mog5_pr_distance_sweep_flow_loss_vs_epoch.svg"
+SWEEP_FLOW_LOSS_PNG_NAME = "mog5_pr_distance_sweep_flow_loss_vs_epoch.png"
 REL_ERROR_DENOM_FLOOR = 1e-12
 
 
@@ -88,6 +92,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Only rebuild aggregate tables and figures from cached per-case result NPZs.",
     )
     p.add_argument("--yscale", choices=("log", "linear"), default="log", help="Y-axis scale for the error figure.")
+    p.add_argument(
+        "--loss-yscale",
+        choices=("log", "linear"),
+        default="linear",
+        help="Y-axis scale for the aggregate flow loss-vs-epoch figure.",
+    )
     return p
 
 
@@ -100,6 +110,14 @@ def case_results_npz(*, n_total: int, pr_dim: int, case_output_name: str) -> Pat
     return case_output_dir(n_total=n_total, pr_dim=pr_dim, case_output_name=case_output_name) / RESULTS_NAME
 
 
+def case_flow_loss_npz(*, n_total: int, pr_dim: int, case_output_name: str, metric: str) -> Path:
+    return (
+        case_output_dir(n_total=n_total, pr_dim=pr_dim, case_output_name=case_output_name)
+        / "flow"
+        / f"{metric}_flow_matching_skl_results.npz"
+    )
+
+
 def _unique_cases(args: argparse.Namespace) -> list[tuple[int, int]]:
     cases: list[tuple[int, int]] = []
     seen: set[tuple[int, int]] = set()
@@ -109,6 +127,16 @@ def _unique_cases(args: argparse.Namespace) -> list[tuple[int, int]]:
             cases.append(case)
             seen.add(case)
     return cases
+
+
+def resolve_metric_names(args: argparse.Namespace) -> tuple[str, ...]:
+    single = _load_single_case_module()
+    if hasattr(single, "resolve_metric_names"):
+        return tuple(str(m) for m in single.resolve_metric_names(args))
+    metric = str(getattr(args, "metric", "all"))
+    if metric == "all":
+        return tuple(METRIC_NAMES)
+    return (metric,)
 
 
 def _single_case_args(args: argparse.Namespace, *, n_total: int, pr_dim: int, output_dir: Path) -> argparse.Namespace:
@@ -138,12 +166,58 @@ def _load_case_cache(path: Path) -> dict[str, Any]:
         }
 
 
+def _load_flow_loss_cache(path: Path) -> dict[str, Any]:
+    if not Path(path).is_file():
+        raise FileNotFoundError(f"Missing cached flow loss results: {path}")
+    with np.load(path, allow_pickle=False) as data:
+        required = ("train_losses", "val_losses")
+        missing = [key for key in required if key not in data.files]
+        if missing:
+            raise KeyError(f"Cached flow loss results {path} are missing: {', '.join(missing)}")
+        out: dict[str, Any] = {
+            "train_losses": np.asarray(data["train_losses"], dtype=np.float64),
+            "val_losses": np.asarray(data["val_losses"], dtype=np.float64),
+        }
+        if "val_monitor_losses" in data.files:
+            out["val_monitor_losses"] = np.asarray(data["val_monitor_losses"], dtype=np.float64)
+        for key in ("best_epoch", "stopped_epoch", "stopped_early"):
+            if key in data.files:
+                value = np.asarray(data[key]).reshape(-1)
+                if value.size:
+                    out[key] = value[0].item()
+        return out
+
+
+def _filter_case_metrics(data: dict[str, Any], metrics: tuple[str, ...], *, path: Path | None = None) -> dict[str, Any]:
+    available = tuple(str(v) for v in data["metric_names"])
+    missing = [metric for metric in metrics if metric not in available]
+    if missing:
+        where = "" if path is None else f" in {path}"
+        raise ValueError(f"Cached comparison results{where} are missing requested metric(s): {', '.join(missing)}")
+    indices = [available.index(metric) for metric in metrics]
+    return {
+        "metric_names": tuple(metrics),
+        "condition_labels": tuple(data["condition_labels"]),
+        "pair_indices": np.asarray(data["pair_indices"], dtype=np.int64),
+        "classical_matrices": np.asarray(data["classical_matrices"], dtype=np.float64)[indices],
+        "flow_matching_matrices": np.asarray(data["flow_matching_matrices"], dtype=np.float64)[indices],
+        "ground_truth_matrices": np.asarray(data["ground_truth_matrices"], dtype=np.float64)[indices],
+    }
+
+
 def ensure_case_results(args: argparse.Namespace, *, n_total: int, pr_dim: int) -> tuple[Path, bool]:
     output_dir = case_output_dir(n_total=n_total, pr_dim=pr_dim, case_output_name=str(args.case_output_name))
     result_path = output_dir / RESULTS_NAME
     if result_path.is_file() and not bool(args.force_comparison):
-        print(f"[sweep] cache hit n_total={n_total} pr_dim={pr_dim}: {result_path}", flush=True)
-        return result_path, True
+        requested_metrics = resolve_metric_names(args)
+        try:
+            _filter_case_metrics(_load_case_cache(result_path), requested_metrics, path=result_path)
+            print(f"[sweep] cache hit n_total={n_total} pr_dim={pr_dim}: {result_path}", flush=True)
+            return result_path, True
+        except ValueError:
+            if bool(args.visualization_only):
+                raise
+            print(f"[sweep] cache missing requested metrics; rerunning n_total={n_total} pr_dim={pr_dim}", flush=True)
     if bool(args.visualization_only):
         raise FileNotFoundError(f"--visualization-only requires cached results: {result_path}")
 
@@ -378,8 +452,152 @@ def plot_abs_error(aggregate: dict[str, Any], *, svg_path: Path, png_path: Path,
     return plot_sweep_error(aggregate, svg_path=svg_path, png_path=png_path, yscale=yscale, relative=False)
 
 
+def plot_flow_loss_sweep(
+    *,
+    loss_data: dict[tuple[int, int, str], dict[str, Any]],
+    n_list: list[int],
+    pr_dim: int,
+    metrics: tuple[str, ...],
+    svg_path: Path,
+    png_path: Path,
+    yscale: str,
+) -> tuple[Path, Path] | None:
+    if not loss_data:
+        return None
+
+    metric_tuple = tuple(
+        str(metric)
+        for metric in metrics
+        if any((int(n_total), int(pr_dim), str(metric)) in loss_data for n_total in n_list)
+    )
+    if not metric_tuple:
+        return None
+
+    fig_width = max(6.5, 5.2 * len(metric_tuple))
+    fig, axes_obj = plt.subplots(1, len(metric_tuple), figsize=(fig_width, 4.9), squeeze=False, constrained_layout=True)
+    axes = axes_obj[0]
+    loss_styles = {
+        "train": {"color": "tab:blue", "linestyle": "-", "label": "train"},
+        "val": {"color": "tab:orange", "linestyle": "--", "label": "val"},
+        "val_monitor": {"color": "tab:green", "linestyle": ":", "label": "val EMA"},
+    }
+    handles_by_label: dict[str, Any] = {}
+
+    for ax, metric in zip(axes, metric_tuple):
+        for n_total in n_list:
+            case_key = (int(n_total), int(pr_dim), str(metric))
+            item = loss_data.get(case_key)
+            if item is None:
+                continue
+            train_losses = np.asarray(item["train_losses"], dtype=np.float64).reshape(-1)
+            val_losses = np.asarray(item["val_losses"], dtype=np.float64).reshape(-1)
+            val_monitor_losses = np.asarray(item.get("val_monitor_losses", []), dtype=np.float64).reshape(-1)
+            if train_losses.size == 0 and val_losses.size == 0 and val_monitor_losses.size == 0:
+                continue
+            if train_losses.size:
+                style = loss_styles["train"]
+                epochs = np.arange(1, train_losses.size + 1, dtype=np.int64)
+                (line,) = ax.plot(
+                    epochs,
+                    train_losses,
+                    color=style["color"],
+                    linestyle=style["linestyle"],
+                    linewidth=1.4,
+                    label=f"n={int(n_total)} {style['label']}",
+                )
+                handles_by_label[line.get_label()] = line
+            if val_losses.size:
+                style = loss_styles["val"]
+                epochs = np.arange(1, val_losses.size + 1, dtype=np.int64)
+                (line,) = ax.plot(
+                    epochs,
+                    val_losses,
+                    color=style["color"],
+                    linestyle=style["linestyle"],
+                    linewidth=1.4,
+                    label=f"n={int(n_total)} {style['label']}",
+                )
+                handles_by_label[line.get_label()] = line
+
+                best_epoch = item.get("best_epoch")
+                if best_epoch is not None:
+                    best_idx = int(best_epoch) - 1
+                    if 0 <= best_idx < val_losses.size:
+                        ax.scatter(
+                            [best_idx + 1],
+                            [float(val_losses[best_idx])],
+                            color=style["color"],
+                            marker="o",
+                            s=28,
+                            edgecolors="black",
+                            linewidths=0.45,
+                            zorder=4,
+                        )
+
+                stopped_epoch = item.get("stopped_epoch")
+                if stopped_epoch is not None:
+                    stopped_idx = int(stopped_epoch) - 1
+                    if 0 <= stopped_idx < val_losses.size:
+                        stopped_early = bool(item.get("stopped_early", False))
+                        ax.scatter(
+                            [stopped_idx + 1],
+                            [float(val_losses[stopped_idx])],
+                            color=style["color"],
+                            marker="x" if stopped_early else "|",
+                            s=38,
+                            linewidths=1.3,
+                            zorder=5,
+                        )
+            if val_monitor_losses.size:
+                style = loss_styles["val_monitor"]
+                epochs = np.arange(1, val_monitor_losses.size + 1, dtype=np.int64)
+                (line,) = ax.plot(
+                    epochs,
+                    val_monitor_losses,
+                    color=style["color"],
+                    linestyle=style["linestyle"],
+                    linewidth=1.4,
+                    label=f"n={int(n_total)} {style['label']}",
+                )
+                handles_by_label[line.get_label()] = line
+        ax.set_title(str(metric))
+        ax.set_xlabel("epoch")
+        ax.set_ylabel("flow matching loss")
+        ax.grid(True, which="both", alpha=0.25)
+        if str(yscale) == "log":
+            ax.set_yscale("log")
+            positive = [
+                float(value)
+                for line in ax.lines
+                for value in np.asarray(line.get_ydata(), dtype=np.float64)
+                if np.isfinite(value) and value > 0.0
+            ]
+            if positive:
+                ax.set_ylim(bottom=max(min(positive) * 0.5, 1e-12))
+
+    if not handles_by_label:
+        plt.close(fig)
+        return None
+
+    fig.legend(
+        handles_by_label.values(),
+        handles_by_label.keys(),
+        loc="lower center",
+        ncol=min(4, max(1, len(handles_by_label))),
+        frameon=False,
+        fontsize=8,
+    )
+    fig.suptitle(f"MoG5 PR flow training loss sweep (PR dim={int(pr_dim)})", fontsize=13)
+    svg_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(svg_path)
+    fig.savefig(png_path, dpi=200)
+    plt.close(fig)
+    return svg_path, png_path
+
+
 def write_summary(path: Path, *, args: argparse.Namespace, case_paths: dict[tuple[int, int], Path], cache_hits: dict[tuple[int, int], bool], outputs: dict[str, Path]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
+    metrics = resolve_metric_names(args)
     payload = {
         "script": "bin/compare_mog5_pr_distance_sweeps.py",
         "config": {
@@ -391,9 +609,12 @@ def write_summary(path: Path, *, args: argparse.Namespace, case_paths: dict[tupl
             "case_output_name": str(args.case_output_name),
             "force_comparison": bool(args.force_comparison),
             "visualization_only": bool(args.visualization_only),
+            "metric": str(args.metric),
+            "metrics": list(metrics),
             "yscale": str(args.yscale),
             "abs_error_yscale": str(args.yscale),
             "rel_error_yscale": "linear",
+            "loss_yscale": str(args.loss_yscale),
         },
         "case_paths": {
             f"n{int(n_total)}_pr{int(pr_dim)}": str(path)
@@ -412,6 +633,7 @@ def write_summary(path: Path, *, args: argparse.Namespace, case_paths: dict[tupl
 def run(args: argparse.Namespace) -> dict[str, Path]:
     output_dir = Path(args.output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
+    metrics = resolve_metric_names(args)
 
     case_paths: dict[tuple[int, int], Path] = {}
     cache_hits: dict[tuple[int, int], bool] = {}
@@ -421,7 +643,22 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
         case = (int(n_total), int(pr_dim))
         case_paths[case] = Path(path)
         cache_hits[case] = bool(cache_hit)
-        case_data[case] = _load_case_cache(Path(path))
+        case_data[case] = _filter_case_metrics(_load_case_cache(Path(path)), metrics, path=Path(path))
+
+    flow_loss_data: dict[tuple[int, int, str], dict[str, Any]] = {}
+    flow_loss_warnings: list[str] = []
+    for n_total, pr_dim in _unique_cases(args):
+        for metric in metrics:
+            loss_path = case_flow_loss_npz(
+                n_total=int(n_total),
+                pr_dim=int(pr_dim),
+                case_output_name=str(args.case_output_name),
+                metric=str(metric),
+            )
+            try:
+                flow_loss_data[(int(n_total), int(pr_dim), str(metric))] = _load_flow_loss_cache(loss_path)
+            except (FileNotFoundError, KeyError, ValueError) as exc:
+                flow_loss_warnings.append(str(exc))
 
     aggregate, rows = aggregate_sweeps(args=args, case_data=case_data)
     npz_path = write_aggregate_npz(output_dir / SWEEP_NPZ_NAME, aggregate)
@@ -439,6 +676,15 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
         yscale="linear",
         relative=True,
     )
+    loss_paths = plot_flow_loss_sweep(
+        loss_data=flow_loss_data,
+        n_list=[int(v) for v in args.n_list],
+        pr_dim=int(args.pr_dim),
+        metrics=metrics,
+        svg_path=output_dir / SWEEP_FLOW_LOSS_SVG_NAME,
+        png_path=output_dir / SWEEP_FLOW_LOSS_PNG_NAME,
+        yscale=str(args.loss_yscale),
+    )
     outputs = {
         "results_npz": npz_path,
         "errors_csv": csv_path,
@@ -449,6 +695,9 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
         "rel_error_figure_svg": rel_svg_path,
         "rel_error_figure_png": rel_png_path,
     }
+    if loss_paths is not None:
+        outputs["flow_loss_figure_svg"] = loss_paths[0]
+        outputs["flow_loss_figure_png"] = loss_paths[1]
     summary_path = write_summary(
         output_dir / SWEEP_SUMMARY_NAME,
         args=args,
@@ -463,6 +712,22 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
     print(f"figure_png: {png_path}", flush=True)
     print(f"rel_error_figure_svg: {rel_svg_path}", flush=True)
     print(f"rel_error_figure_png: {rel_png_path}", flush=True)
+    if loss_paths is None:
+        if flow_loss_warnings:
+            print(
+                f"[sweep] warning: no usable flow loss histories found; skipped flow loss figure. First issue: {flow_loss_warnings[0]}",
+                flush=True,
+            )
+        else:
+            print("[sweep] warning: no usable flow loss histories found; skipped flow loss figure.", flush=True)
+    else:
+        print(f"flow_loss_figure_svg: {loss_paths[0]}", flush=True)
+        print(f"flow_loss_figure_png: {loss_paths[1]}", flush=True)
+        if flow_loss_warnings:
+            print(
+                f"[sweep] warning: skipped {len(flow_loss_warnings)} missing or incomplete flow loss cache(s). First issue: {flow_loss_warnings[0]}",
+                flush=True,
+            )
     print(f"summary_json: {summary_path}", flush=True)
     return outputs
 

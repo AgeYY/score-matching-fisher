@@ -73,7 +73,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--n-total", type=int, default=1_000, help="Total joint samples.")
     p.add_argument("--pr-dim", type=int, default=5, help="Target PR-embedded x dimension; must be > 2.")
     p.add_argument("--seed", type=int, default=7, help="Dataset and PR-autoencoder seed.")
-    p.add_argument("--train-frac", type=float, default=0.9, help="Fraction of rows assigned to train_idx.")
+    p.add_argument("--train-frac", type=float, default=0.8, help="Fraction of rows assigned to train_idx.")
     p.add_argument("--device", type=str, default="cuda", help="Device passed to the PR projection script.")
     p.add_argument(
         "--output-dir",

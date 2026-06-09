@@ -69,11 +69,12 @@ class FlowComparisonConfig:
     epochs: int = 20_000
     early_patience: int = 1_000
     early_min_delta: float = 1e-4
+    early_ema_alpha: float = 0.05
     batch_size: int = 512
     lr: float = 1e-4
     weight_decay: float = 0.0
-    hidden_dim: int = 128
-    depth: int = 3
+    hidden_dim: int = 256
+    depth: int = 5
     low_rank_dim: int = 4
     path_schedule: str = "cosine"
     t_eps: float = 0.0005
@@ -416,45 +417,49 @@ def pr_autoencoder_ground_truth_matrices(
     seed: int = 7,
     batch_size: int = 8192,
     mahalanobis_ridge: float = 1e-6,
+    metrics: Iterable[str] = METRIC_NAMES,
 ) -> dict[str, np.ndarray]:
     """Monte Carlo projected-coordinate ground truth plus analytic native SKL."""
 
+    metric_tuple = tuple(str(m) for m in metrics)
+    projected_metrics = tuple(m for m in metric_tuple if m != METRIC_SYMMETRIC_KL)
     means = np.asarray(native_meta.get("mog_component_means"), dtype=np.float64)
     variances = np.asarray(native_meta.get("mog_component_variances"), dtype=np.float64)
     if means.ndim != 2 or variances.shape != means.shape:
         raise ValueError("native_meta must contain mog_component_means and mog_component_variances.")
     k, d = means.shape
-    n = int(samples_per_class)
-    if n < 2:
-        raise ValueError("samples_per_class must be at least 2.")
-    rng = np.random.default_rng(int(seed))
-    z_parts: list[np.ndarray] = []
-    labels = np.repeat(np.arange(k, dtype=np.int64), n)
-    for cls in range(k):
-        z = means[cls] + np.sqrt(variances[cls]) * rng.standard_normal(size=(n, d))
-        z_parts.append(z.astype(np.float64, copy=False))
-    z_all = np.vstack(z_parts)
-    h_all = encode_with_pr_autoencoder(
-        z_all,
-        projected_meta=projected_meta,
-        device=device,
-        cache_dir=cache_dir,
-        batch_size=int(batch_size),
-    )
-    out = classical_metric_matrices(
-        h_all,
-        labels,
-        num_categories=k,
-        metrics=(
-            METRIC_SQUARED_EUCLIDEAN,
-            METRIC_COSINE,
-            METRIC_CORRELATION,
-            METRIC_MAHALANOBIS_SQ,
-        ),
-        mahalanobis_ridge=float(mahalanobis_ridge),
-    )
-    out[METRIC_SYMMETRIC_KL] = analytic_diagonal_gaussian_skl_matrix(means, variances)
-    return out
+    out: dict[str, np.ndarray] = {}
+
+    if projected_metrics:
+        n = int(samples_per_class)
+        if n < 2:
+            raise ValueError("samples_per_class must be at least 2.")
+        rng = np.random.default_rng(int(seed))
+        z_parts: list[np.ndarray] = []
+        labels = np.repeat(np.arange(k, dtype=np.int64), n)
+        for cls in range(k):
+            z = means[cls] + np.sqrt(variances[cls]) * rng.standard_normal(size=(n, d))
+            z_parts.append(z.astype(np.float64, copy=False))
+        z_all = np.vstack(z_parts)
+        h_all = encode_with_pr_autoencoder(
+            z_all,
+            projected_meta=projected_meta,
+            device=device,
+            cache_dir=cache_dir,
+            batch_size=int(batch_size),
+        )
+        out.update(
+            classical_metric_matrices(
+                h_all,
+                labels,
+                num_categories=k,
+                metrics=projected_metrics,
+                mahalanobis_ridge=float(mahalanobis_ridge),
+            )
+        )
+    if METRIC_SYMMETRIC_KL in metric_tuple:
+        out[METRIC_SYMMETRIC_KL] = analytic_diagonal_gaussian_skl_matrix(means, variances)
+    return {metric: out[metric] for metric in metric_tuple}
 
 
 def _theta_eval_from_num_categories(num_categories: int) -> np.ndarray:
@@ -532,6 +537,7 @@ def train_and_estimate_flow(
         t_eps=float(config.t_eps),
         patience=int(config.early_patience),
         min_delta=float(config.early_min_delta),
+        ema_alpha=float(config.early_ema_alpha),
         max_grad_norm=float(config.max_grad_norm),
         log_every=max(1, int(config.log_every)),
     )
@@ -574,10 +580,10 @@ def save_flow_result_npz(
     if pair is not None:
         fields["condition_pair"] = np.asarray(pair, dtype=np.int64)
     meta = dict(result.train_metadata)
-    for key in ("train_losses", "val_losses"):
+    for key in ("train_losses", "val_losses", "val_monitor_losses"):
         if key in meta:
             fields[key] = np.asarray(meta[key], dtype=np.float64)
-    for key in ("best_val_loss", "best_epoch", "stopped_epoch", "stopped_early"):
+    for key in ("best_val_loss", "best_epoch", "stopped_epoch", "stopped_early", "early_ema_alpha"):
         if key in meta:
             fields[key] = np.asarray([meta[key]])
     np.savez_compressed(out, **fields)

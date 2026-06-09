@@ -86,6 +86,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=_REPO_ROOT / "data" / "pr_autoencoder_cache",
         help="PR autoencoder cache directory used for ground-truth projected sampling.",
     )
+    p.add_argument(
+        "--metric",
+        choices=("all", *METRIC_NAMES),
+        default="all",
+        help="Distance metric to compute, or all metrics.",
+    )
 
     p.add_argument("--gt-samples-per-class", type=int, default=100_000)
     p.add_argument("--gt-batch-size", type=int, default=8192)
@@ -96,11 +102,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--epochs", type=int, default=20_000)
     p.add_argument("--early-patience", type=int, default=1_000)
     p.add_argument("--early-min-delta", type=float, default=1e-4)
+    p.add_argument("--early-ema-alpha", type=float, default=0.05)
     p.add_argument("--batch-size", type=int, default=2048)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=0.0)
-    p.add_argument("--hidden-dim", type=int, default=128)
-    p.add_argument("--depth", type=int, default=3)
+    p.add_argument("--hidden-dim", type=int, default=256)
+    p.add_argument("--depth", type=int, default=5)
     p.add_argument("--low-rank-dim", type=int, default=4)
     p.add_argument("--radius", type=float, default=1.0, help="Fixed norm radius for cosine/correlation flow rows.")
     p.add_argument("--path-schedule", choices=("cosine", "linear", "straight"), default="cosine")
@@ -117,6 +124,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-grad-norm", type=float, default=10.0)
     p.add_argument("--log-every", type=int, default=50)
     return p
+
+
+def resolve_metric_names(args: argparse.Namespace) -> tuple[str, ...]:
+    metric = str(getattr(args, "metric", "all"))
+    if metric == "all":
+        return tuple(METRIC_NAMES)
+    return (metric,)
 
 
 def resolve_dataset_dir(args: argparse.Namespace) -> Path:
@@ -166,6 +180,7 @@ def _flow_config_from_args(args: argparse.Namespace) -> FlowComparisonConfig:
         epochs=int(args.epochs),
         early_patience=int(args.early_patience),
         early_min_delta=float(args.early_min_delta),
+        early_ema_alpha=float(args.early_ema_alpha),
         batch_size=int(args.batch_size),
         lr=float(args.lr),
         weight_decay=float(args.weight_decay),
@@ -204,6 +219,7 @@ def _validate_bundle(bundle, *, n_total: int, pr_dim: int) -> None:
 
 def run(args: argparse.Namespace) -> dict[str, Path]:
     dev = require_device(str(args.device))
+    metrics = resolve_metric_names(args)
     torch.manual_seed(int(args.seed))
     np.random.seed(int(args.seed))
     if dev.type == "cuda":
@@ -227,7 +243,7 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
         projected_bundle.x_all,
         labels,
         num_categories=k,
-        metrics=METRIC_NAMES,
+        metrics=metrics,
         mahalanobis_ridge=float(args.mahalanobis_ridge),
         skl_folds=int(args.skl_folds),
         skl_seed=int(args.seed),
@@ -244,6 +260,7 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
         seed=int(args.seed) + 12345,
         batch_size=int(args.gt_batch_size),
         mahalanobis_ridge=float(args.mahalanobis_ridge),
+        metrics=metrics,
     )
 
     print("[distance-comparison] training flow-matching metrics", flush=True)
@@ -253,11 +270,11 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
         output_dir=output_dir / "flow",
         config=_flow_config_from_args(args),
         seed=int(args.seed),
-        metrics=METRIC_NAMES,
+        metrics=metrics,
     )
 
     result = assemble_comparison_result(
-        metrics=METRIC_NAMES,
+        metrics=metrics,
         condition_names=names,
         classical=classical,
         flow_matching=flow,
@@ -282,6 +299,8 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
             "output_dir": str(output_dir),
             "results_npz": str(results_npz),
             "pairs_csv": str(pairs_csv),
+            "metric": str(args.metric),
+            "metrics": list(metrics),
             "gt_samples_per_class": int(args.gt_samples_per_class),
             "gt_batch_size": int(args.gt_batch_size),
             "mahalanobis_ridge": float(args.mahalanobis_ridge),

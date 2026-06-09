@@ -8,6 +8,13 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+ALL_METRICS = (
+    "squared_euclidean",
+    "cosine",
+    "correlation",
+    "mahalanobis_sq",
+    "symmetric_kl",
+)
 
 def _load_cli_module():
     repo_root = Path(__file__).resolve().parent.parent
@@ -19,15 +26,15 @@ def _load_cli_module():
     return mod
 
 
-def _write_case_npz(path: Path, *, offset: float = 0.0) -> Path:
+def _write_case_npz(path: Path, *, offset: float = 0.0, metrics: tuple[str, ...] = ALL_METRICS) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    metrics = np.asarray(["squared_euclidean", "cosine"])
+    metric_names = np.asarray(metrics)
     labels = np.asarray(["category_0", "category_1", "category_2"])
     pairs = np.asarray([[0, 1], [0, 2], [1, 2]], dtype=np.int64)
-    classical = np.zeros((2, 3, 3), dtype=np.float64)
-    flow = np.zeros((2, 3, 3), dtype=np.float64)
-    gt = np.zeros((2, 3, 3), dtype=np.float64)
-    for metric_idx in range(2):
+    classical = np.zeros((len(metrics), 3, 3), dtype=np.float64)
+    flow = np.zeros((len(metrics), 3, 3), dtype=np.float64)
+    gt = np.zeros((len(metrics), 3, 3), dtype=np.float64)
+    for metric_idx in range(len(metrics)):
         for i, j in pairs:
             gt_val = offset + 10.0 + metric_idx
             classical_val = gt_val + float(i + 1)
@@ -37,12 +44,33 @@ def _write_case_npz(path: Path, *, offset: float = 0.0) -> Path:
             flow[metric_idx, i, j] = flow[metric_idx, j, i] = flow_val
     np.savez_compressed(
         path,
-        metric_names=metrics,
+        metric_names=metric_names,
         condition_labels=labels,
         pair_indices=pairs,
         classical_matrices=classical,
         flow_matching_matrices=flow,
         ground_truth_matrices=gt,
+    )
+    return path
+
+
+def _write_flow_loss_npz(path: Path, *, scale: float = 1.0, include_val_monitor: bool = True) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    train_losses = np.asarray([1.0, 0.65, 0.42, 0.35], dtype=np.float64) * float(scale)
+    val_losses = np.asarray([1.1, 0.7, 0.5, 0.55], dtype=np.float64) * float(scale)
+    val_monitor_losses = np.asarray([1.1, 0.82, 0.66, 0.60], dtype=np.float64) * float(scale)
+    payload = {
+        "train_losses": train_losses,
+        "val_losses": val_losses,
+        "best_epoch": np.asarray([3], dtype=np.int64),
+        "stopped_epoch": np.asarray([4], dtype=np.int64),
+        "stopped_early": np.asarray([True]),
+    }
+    if include_val_monitor:
+        payload["val_monitor_losses"] = val_monitor_losses
+    np.savez_compressed(
+        path,
+        **payload,
     )
     return path
 
@@ -77,7 +105,11 @@ def test_parser_defaults() -> None:
     assert not hasattr(args, "pr_dim_list")
     assert args.n_total == 1000
     assert args.device == "cuda"
+    assert args.metric == "all"
+    assert mod.resolve_metric_names(args) == ALL_METRICS
+    assert args.early_ema_alpha == pytest.approx(0.05)
     assert args.yscale == "log"
+    assert args.loss_yscale == "linear"
     assert args.output_dir == repo_root / "data" / "mog5_pr_distance_sweeps"
 
 
@@ -90,7 +122,7 @@ def test_aggregate_mean_pairwise_abs_errors(tmp_path: Path) -> None:
 
     aggregate, rows = mod.aggregate_sweeps(args=args, case_data=data)
 
-    assert aggregate["n_sweep_classical_matrices"].shape == (1, 2, 3, 3)
+    assert aggregate["n_sweep_classical_matrices"].shape == (1, 5, 3, 3)
     assert "pr_dim_list" not in aggregate
     assert "pr_dim_sweep_classical_matrices" not in aggregate
     assert {r["axis"] for r in rows} == {"n_total"}
@@ -107,7 +139,7 @@ def test_aggregate_mean_pairwise_abs_errors(tmp_path: Path) -> None:
 
 def test_relative_error_uses_denominator_floor_for_zero_ground_truth(tmp_path: Path) -> None:
     mod = _load_cli_module()
-    args = mod.build_parser().parse_args(["--n-list", "100"])
+    args = mod.build_parser().parse_args(["--n-list", "100", "--metric", "squared_euclidean"])
     data = {
         (100, 5): mod._load_case_cache(_write_zero_gt_case_npz(tmp_path / "case_a.npz")),
     }
@@ -119,6 +151,31 @@ def test_relative_error_uses_denominator_floor_for_zero_ground_truth(tmp_path: P
     flow = next(r for r in n_rows if r["estimator"] == "flow_matching")
     assert classical["rel_error"] == pytest.approx(2.0 / mod.REL_ERROR_DENOM_FLOOR)
     assert flow["rel_error"] == pytest.approx(3.0 / mod.REL_ERROR_DENOM_FLOOR)
+
+
+def test_load_flow_loss_cache_reads_val_monitor_losses(tmp_path: Path) -> None:
+    mod = _load_cli_module()
+    path = _write_flow_loss_npz(tmp_path / "flow_loss.npz", scale=2.0)
+
+    out = mod._load_flow_loss_cache(path)
+
+    np.testing.assert_allclose(out["train_losses"], [2.0, 1.3, 0.84, 0.7])
+    np.testing.assert_allclose(out["val_losses"], [2.2, 1.4, 1.0, 1.1])
+    np.testing.assert_allclose(out["val_monitor_losses"], [2.2, 1.64, 1.32, 1.2])
+    assert out["best_epoch"] == 3
+    assert out["stopped_epoch"] == 4
+    assert out["stopped_early"] is True
+
+
+def test_load_flow_loss_cache_allows_legacy_without_val_monitor_losses(tmp_path: Path) -> None:
+    mod = _load_cli_module()
+    path = _write_flow_loss_npz(tmp_path / "flow_loss.npz", include_val_monitor=False)
+
+    out = mod._load_flow_loss_cache(path)
+
+    assert "val_monitor_losses" not in out
+    np.testing.assert_allclose(out["train_losses"], [1.0, 0.65, 0.42, 0.35])
+    np.testing.assert_allclose(out["val_losses"], [1.1, 0.7, 0.5, 0.55])
 
 
 def test_cache_hits_do_not_rerun_and_duplicate_case_is_deduped(monkeypatch, tmp_path: Path) -> None:
@@ -206,7 +263,7 @@ def test_visualization_only_writes_outputs_from_fake_caches(monkeypatch, tmp_pat
     assert outputs["rel_error_figure_png"].is_file()
     assert outputs["summary_json"].is_file()
     with np.load(outputs["results_npz"], allow_pickle=False) as data:
-        assert data["n_sweep_classical_matrices"].shape == (1, 2, 3, 3)
+        assert data["n_sweep_classical_matrices"].shape == (1, 5, 3, 3)
         assert "pr_dim_list" not in data.files
         assert "pr_dim_sweep_classical_matrices" not in data.files
     with outputs["errors_csv"].open(newline="", encoding="utf-8") as f:
@@ -216,6 +273,100 @@ def test_visualization_only_writes_outputs_from_fake_caches(monkeypatch, tmp_pat
     summary = json.loads(outputs["summary_json"].read_text(encoding="utf-8"))
     assert summary["config"]["abs_error_yscale"] == "log"
     assert summary["config"]["rel_error_yscale"] == "linear"
+    assert summary["config"]["metric"] == "all"
+    assert summary["config"]["metrics"] == list(ALL_METRICS)
     assert "pr_dim_list" not in summary["config"]
     assert "abs_error_figure_svg" in summary["outputs"]
     assert "rel_error_figure_svg" in summary["outputs"]
+    assert "flow_loss_figure_svg" not in summary["outputs"]
+
+
+def test_visualization_only_writes_flow_loss_outputs_from_fake_caches(monkeypatch, tmp_path: Path) -> None:
+    mod = _load_cli_module()
+    monkeypatch.setattr(
+        mod,
+        "case_output_dir",
+        lambda *, n_total, pr_dim, case_output_name: tmp_path / f"case_{n_total}_{pr_dim}",
+    )
+    _write_case_npz(tmp_path / "case_100_5" / mod.RESULTS_NAME)
+    _write_flow_loss_npz(tmp_path / "case_100_5" / "flow" / "symmetric_kl_flow_matching_skl_results.npz")
+    args = mod.build_parser().parse_args(
+        [
+            "--visualization-only",
+            "--metric",
+            "symmetric_kl",
+            "--n-list",
+            "100",
+            "--output-dir",
+            str(tmp_path / "sweep"),
+        ]
+    )
+
+    outputs = mod.run(args)
+
+    assert outputs["flow_loss_figure_svg"].is_file()
+    assert outputs["flow_loss_figure_png"].is_file()
+    summary = json.loads(outputs["summary_json"].read_text(encoding="utf-8"))
+    assert summary["config"]["loss_yscale"] == "linear"
+    assert Path(summary["outputs"]["flow_loss_figure_svg"]).is_file()
+    assert Path(summary["outputs"]["flow_loss_figure_png"]).is_file()
+
+
+def test_visualization_only_filters_cached_metric(monkeypatch, tmp_path: Path) -> None:
+    mod = _load_cli_module()
+    monkeypatch.setattr(
+        mod,
+        "case_output_dir",
+        lambda *, n_total, pr_dim, case_output_name: tmp_path / f"case_{n_total}_{pr_dim}",
+    )
+    _write_case_npz(tmp_path / "case_100_5" / mod.RESULTS_NAME)
+    args = mod.build_parser().parse_args(
+        [
+            "--visualization-only",
+            "--metric",
+            "cosine",
+            "--n-list",
+            "100",
+            "--output-dir",
+            str(tmp_path / "sweep"),
+        ]
+    )
+
+    outputs = mod.run(args)
+
+    with np.load(outputs["results_npz"], allow_pickle=False) as data:
+        assert tuple(str(v) for v in data["metric_names"].tolist()) == ("cosine",)
+        assert data["n_sweep_classical_matrices"].shape == (1, 1, 3, 3)
+    with outputs["errors_csv"].open(newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    assert {row["metric"] for row in rows} == {"cosine"}
+    summary = json.loads(outputs["summary_json"].read_text(encoding="utf-8"))
+    assert summary["config"]["metric"] == "cosine"
+    assert summary["config"]["metrics"] == ["cosine"]
+
+
+def test_visualization_only_requested_metric_missing_from_cache_fails(monkeypatch, tmp_path: Path) -> None:
+    mod = _load_cli_module()
+    monkeypatch.setattr(
+        mod,
+        "case_output_dir",
+        lambda *, n_total, pr_dim, case_output_name: tmp_path / f"case_{n_total}_{pr_dim}",
+    )
+    _write_case_npz(
+        tmp_path / "case_100_5" / mod.RESULTS_NAME,
+        metrics=("squared_euclidean",),
+    )
+    args = mod.build_parser().parse_args(
+        [
+            "--visualization-only",
+            "--metric",
+            "cosine",
+            "--n-list",
+            "100",
+            "--output-dir",
+            str(tmp_path / "sweep"),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="missing requested metric"):
+        mod.run(args)
