@@ -123,6 +123,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--solve-jitter", type=float, default=1e-6)
     p.add_argument("--max-grad-norm", type=float, default=10.0)
     p.add_argument("--log-every", type=int, default=50)
+    p.add_argument(
+        "--flow-normalize-x",
+        action="store_true",
+        help="Fit one train-only affine normalizer on projected x and use normalized x for flow matching.",
+    )
+    p.add_argument(
+        "--flow-normalize-x-eps",
+        type=float,
+        default=1e-8,
+        help="Minimum std threshold for --flow-normalize-x; smaller stds are treated as constant dimensions.",
+    )
     return p
 
 
@@ -200,6 +211,8 @@ def _flow_config_from_args(args: argparse.Namespace) -> FlowComparisonConfig:
         solve_jitter=float(args.solve_jitter),
         max_grad_norm=float(args.max_grad_norm),
         log_every=int(args.log_every),
+        normalize_x=bool(args.flow_normalize_x),
+        normalize_x_eps=float(args.flow_normalize_x_eps),
     )
 
 

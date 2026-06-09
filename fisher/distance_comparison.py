@@ -89,6 +89,8 @@ class FlowComparisonConfig:
     max_grad_norm: float = 10.0
     log_every: int = 50
     radius: float = 1.0
+    normalize_x: bool = False
+    normalize_x_eps: float = 1e-8
 
 
 @dataclass(frozen=True)
@@ -472,6 +474,28 @@ def _flow_npz_name(metric: str, pair: tuple[int, int] | None = None) -> str:
     return f"{metric}_pair_{int(pair[0])}_{int(pair[1])}_flow_matching_skl_results.npz"
 
 
+def _fit_shared_x_normalizer(x_train: np.ndarray, *, eps: float) -> tuple[np.ndarray, np.ndarray]:
+    """Fit one train-only affine x normalizer shared across all classes."""
+
+    x_arr = np.asarray(x_train, dtype=np.float64)
+    if x_arr.ndim == 1:
+        x_arr = x_arr.reshape(-1, 1)
+    if x_arr.ndim != 2:
+        raise ValueError("x_train must be 1D or 2D.")
+    eps_float = float(eps)
+    if not math.isfinite(eps_float) or eps_float <= 0.0:
+        raise ValueError("normalize_x_eps must be finite and positive.")
+    mean = np.mean(x_arr, axis=0, dtype=np.float64)
+    std = np.std(x_arr, axis=0, dtype=np.float64)
+    std = np.where(std < eps_float, 1.0, std).astype(np.float64, copy=False)
+    return mean.astype(np.float64, copy=False), std
+
+
+def _apply_shared_x_normalizer(x: np.ndarray, *, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
+    x_arr = np.asarray(x, dtype=np.float64)
+    return ((x_arr - mean) / std).astype(np.float64, copy=False)
+
+
 def flow_skl_to_metric_readout(metric: str, symmetric_kl_matrix: np.ndarray, *, radius: float) -> np.ndarray:
     """Convert raw model flow Jeffreys SKL to the comparison-row metric."""
 
@@ -586,6 +610,12 @@ def save_flow_result_npz(
     for key in ("best_val_loss", "best_epoch", "stopped_epoch", "stopped_early", "early_ema_alpha"):
         if key in meta:
             fields[key] = np.asarray([meta[key]])
+    for key in ("flow_normalize_x", "flow_normalize_x_eps"):
+        if key in meta:
+            fields[key] = np.asarray([meta[key]])
+    for key in ("flow_normalize_x_mean", "flow_normalize_x_std"):
+        if key in meta:
+            fields[key] = np.asarray(meta[key], dtype=np.float64)
     np.savez_compressed(out, **fields)
     return out
 
@@ -607,6 +637,25 @@ def flow_metric_matrices(
     x_val_all = np.asarray(bundle.x_validation, dtype=np.float64)
     theta_train_all = np.asarray(bundle.theta_train, dtype=np.float64)
     theta_val_all = np.asarray(bundle.theta_validation, dtype=np.float64)
+    normalize_meta: dict[str, Any] = {
+        "flow_normalize_x": bool(config.normalize_x),
+        "flow_normalize_x_eps": float(config.normalize_x_eps),
+    }
+    if bool(config.normalize_x):
+        # One shared invertible x transform preserves true symmetric KL; no
+        # log-Jacobian correction is needed for log-density ratios.
+        x_mean, x_std = _fit_shared_x_normalizer(x_train_all, eps=float(config.normalize_x_eps))
+        x_train_flow = _apply_shared_x_normalizer(x_train_all, mean=x_mean, std=x_std)
+        x_val_flow = _apply_shared_x_normalizer(x_val_all, mean=x_mean, std=x_std)
+        normalize_meta.update(
+            {
+                "flow_normalize_x_mean": x_mean,
+                "flow_normalize_x_std": x_std,
+            }
+        )
+    else:
+        x_train_flow = x_train_all
+        x_val_flow = x_val_all
     flow_dir = Path(output_dir)
     matrices: dict[str, np.ndarray] = {}
     paths: dict[str, Path] = {}
@@ -617,15 +666,16 @@ def flow_metric_matrices(
         print(f"[distance-comparison] flow metric={metric} velocity_family={family}", flush=True)
         result = train_and_estimate_flow(
             theta_train=theta_train_all,
-            x_train=x_train_all,
+            x_train=x_train_flow,
             theta_val=theta_val_all,
-            x_val=x_val_all,
+            x_val=x_val_flow,
             theta_eval=theta_eval,
             velocity_family=family,
             device=device,
             seed=int(seed),
             config=config,
         )
+        result.train_metadata = {**dict(result.train_metadata), **normalize_meta}
         matrices[metric] = flow_skl_to_metric_readout(
             metric,
             result.symmetric_kl_matrix,

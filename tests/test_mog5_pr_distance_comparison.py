@@ -245,6 +245,72 @@ def test_flow_metric_mapping_and_mahalanobis_shared_assembly(monkeypatch, tmp_pa
     assert "mahalanobis_sq:0-1" not in paths
 
 
+def test_flow_metric_matrices_normalizes_x_train_only_and_persists_metadata(monkeypatch, tmp_path: Path) -> None:
+    theta_all = np.eye(2, dtype=np.float64)[np.array([0, 0, 1, 1, 0, 1], dtype=np.int64)]
+    x_all = np.array(
+        [
+            [1.0, 5.0, 9.0],
+            [3.0, 5.0, 9.0],
+            [5.0, 5.0, 9.0],
+            [7.0, 1005.0, 9.0],
+            [9.0, 1005.0, 9.0],
+            [11.0, 1005.0, 9.0],
+        ],
+        dtype=np.float64,
+    )
+    train_idx = np.array([0, 1, 2], dtype=np.int64)
+    val_idx = np.array([3, 4, 5], dtype=np.int64)
+    bundle = SharedDatasetBundle(
+        meta={"dataset_family": "random_mog_categorical", "num_categories": 2, "x_dim": 3},
+        theta_all=theta_all,
+        x_all=x_all,
+        train_idx=train_idx,
+        validation_idx=val_idx,
+        theta_train=theta_all[train_idx],
+        x_train=x_all[train_idx],
+        theta_validation=theta_all[val_idx],
+        x_validation=x_all[val_idx],
+    )
+    calls: list[dict[str, object]] = []
+
+    def fake_train_and_estimate_flow(**kwargs):
+        calls.append(kwargs)
+        mat = np.asarray([[0.0, 1.25], [1.25, 0.0]], dtype=np.float64)
+        return FlowSKLResult(
+            symmetric_kl_matrix=mat,
+            canonical_metric_matrix=mat.copy(),
+            canonical_metric_name="model_jeffreys_symmetric_kl",
+            train_metadata={"train_losses": np.asarray([1.0], dtype=np.float64)},
+        )
+
+    monkeypatch.setattr(dc, "train_and_estimate_flow", fake_train_and_estimate_flow)
+    config = dc.FlowComparisonConfig(epochs=1, normalize_x=True, normalize_x_eps=1e-6)
+
+    _, paths = dc.flow_metric_matrices(
+        bundle=bundle,
+        device=torch.device("cpu"),
+        output_dir=tmp_path,
+        config=config,
+        metrics=(dc.METRIC_SYMMETRIC_KL,),
+    )
+
+    assert len(calls) == 1
+    call = calls[0]
+    expected_mean = np.asarray([3.0, 5.0, 9.0], dtype=np.float64)
+    expected_std = np.asarray([np.std([1.0, 3.0, 5.0]), 1.0, 1.0], dtype=np.float64)
+    np.testing.assert_allclose(call["x_train"], (bundle.x_train - expected_mean) / expected_std)
+    np.testing.assert_allclose(call["x_val"], (bundle.x_validation - expected_mean) / expected_std)
+    np.testing.assert_allclose(call["theta_train"], bundle.theta_train)
+    np.testing.assert_allclose(call["theta_val"], bundle.theta_validation)
+    np.testing.assert_allclose(call["theta_eval"], np.eye(2, dtype=np.float64))
+
+    with np.load(paths[dc.METRIC_SYMMETRIC_KL], allow_pickle=True) as data:
+        assert bool(data["flow_normalize_x"][0]) is True
+        assert float(data["flow_normalize_x_eps"][0]) == pytest.approx(1e-6)
+        np.testing.assert_allclose(data["flow_normalize_x_mean"], expected_mean)
+        np.testing.assert_allclose(data["flow_normalize_x_std"], expected_std)
+
+
 def test_train_and_estimate_flow_uses_model_jeffreys_readout(monkeypatch) -> None:
     bundle = _toy_bundle()
     build_calls: list[dict[str, object]] = []
@@ -316,8 +382,9 @@ def test_train_and_estimate_flow_uses_model_jeffreys_readout(monkeypatch) -> Non
     assert result.canonical_metric_name == "model_jeffreys_symmetric_kl"
 
 
-def test_flow_comparison_config_has_no_normalize_x_field() -> None:
-    assert "normalize_x" not in dc.FlowComparisonConfig.__dataclass_fields__
+def test_flow_comparison_config_normalize_x_defaults_are_opt_in() -> None:
+    assert dc.FlowComparisonConfig().normalize_x is False
+    assert dc.FlowComparisonConfig().normalize_x_eps == pytest.approx(1e-8)
 
 
 def test_flow_comparison_config_default_t_eps_is_small_endpoint_clamp() -> None:
@@ -339,6 +406,10 @@ def test_save_flow_result_npz_persists_monitor_losses_and_ema_alpha(tmp_path: Pa
             "stopped_epoch": 2,
             "stopped_early": False,
             "early_ema_alpha": 0.05,
+            "flow_normalize_x": True,
+            "flow_normalize_x_mean": np.asarray([1.0, 2.0], dtype=np.float64),
+            "flow_normalize_x_std": np.asarray([3.0, 4.0], dtype=np.float64),
+            "flow_normalize_x_eps": 1e-6,
         },
     )
     path = dc.save_flow_result_npz(
@@ -353,6 +424,44 @@ def test_save_flow_result_npz_persists_monitor_losses_and_ema_alpha(tmp_path: Pa
         np.testing.assert_allclose(data["val_monitor_losses"], [4.0, 3.85])
         assert float(data["best_val_loss"][0]) == pytest.approx(3.85)
         assert float(data["early_ema_alpha"][0]) == pytest.approx(0.05)
+        assert bool(data["flow_normalize_x"][0]) is True
+        assert float(data["flow_normalize_x_eps"][0]) == pytest.approx(1e-6)
+        np.testing.assert_allclose(data["flow_normalize_x_mean"], [1.0, 2.0])
+        np.testing.assert_allclose(data["flow_normalize_x_std"], [3.0, 4.0])
+
+
+def test_shared_affine_normalization_preserves_gaussian_symmetric_kl() -> None:
+    def gaussian_kl(mean_p, cov_p, mean_q, cov_q):
+        d = int(mean_p.shape[0])
+        diff = mean_q - mean_p
+        sign_p, logdet_p = np.linalg.slogdet(cov_p)
+        sign_q, logdet_q = np.linalg.slogdet(cov_q)
+        assert sign_p > 0 and sign_q > 0
+        solved_cov = np.linalg.solve(cov_q, cov_p)
+        solved_diff = np.linalg.solve(cov_q, diff)
+        return 0.5 * (np.trace(solved_cov) + float(diff @ solved_diff) - d + logdet_q - logdet_p)
+
+    mean_0 = np.asarray([0.0, 1.0], dtype=np.float64)
+    mean_1 = np.asarray([2.0, -1.0], dtype=np.float64)
+    cov_0 = np.asarray([[2.0, 0.3], [0.3, 0.8]], dtype=np.float64)
+    cov_1 = np.asarray([[1.5, -0.2], [-0.2, 1.2]], dtype=np.float64)
+    original = gaussian_kl(mean_0, cov_0, mean_1, cov_1) + gaussian_kl(mean_1, cov_1, mean_0, cov_0)
+
+    shared_mean = np.asarray([10.0, -3.0], dtype=np.float64)
+    shared_std = np.asarray([4.0, 0.5], dtype=np.float64)
+    a = np.diag(1.0 / shared_std)
+    norm_mean_0 = (mean_0 - shared_mean) / shared_std
+    norm_mean_1 = (mean_1 - shared_mean) / shared_std
+    norm_cov_0 = a @ cov_0 @ a.T
+    norm_cov_1 = a @ cov_1 @ a.T
+    normalized = gaussian_kl(norm_mean_0, norm_cov_0, norm_mean_1, norm_cov_1) + gaussian_kl(
+        norm_mean_1,
+        norm_cov_1,
+        norm_mean_0,
+        norm_cov_0,
+    )
+
+    np.testing.assert_allclose(normalized, original, rtol=1e-12, atol=1e-12)
 
 
 def test_assemble_rows_with_mocked_flow_results() -> None:
@@ -402,10 +511,14 @@ def test_cli_default_path_resolution_without_running_training() -> None:
     assert args.ode_method == "midpoint"
     assert args.t_eps == 0.0005
     assert args.early_ema_alpha == 0.05
+    assert args.flow_normalize_x is False
+    assert args.flow_normalize_x_eps == pytest.approx(1e-8)
     assert mod._flow_config_from_args(args).mc_jeffreys_sample == 4096
     assert mod._flow_config_from_args(args).radius == 1.0
     assert mod._flow_config_from_args(args).t_eps == 0.0005
     assert mod._flow_config_from_args(args).early_ema_alpha == 0.05
+    assert mod._flow_config_from_args(args).normalize_x is False
+    assert mod._flow_config_from_args(args).normalize_x_eps == pytest.approx(1e-8)
     assert mod.resolve_dataset_dir(args) == repo_root / "data" / "mog_5pr5_n1000"
     assert mod.resolve_output_dir(args) == repo_root / "data" / "mog_5pr5_n1000" / "distance_comparison_flow_skl"
 
@@ -415,6 +528,15 @@ def test_cli_early_ema_alpha_override_propagates_to_flow_config() -> None:
     args = mod.build_parser().parse_args(["--early-ema-alpha", "0.2"])
     assert args.early_ema_alpha == pytest.approx(0.2)
     assert mod._flow_config_from_args(args).early_ema_alpha == pytest.approx(0.2)
+
+
+def test_cli_flow_normalize_x_override_propagates_to_flow_config() -> None:
+    mod = _load_cli_module()
+    args = mod.build_parser().parse_args(["--flow-normalize-x", "--flow-normalize-x-eps", "1e-5"])
+    assert args.flow_normalize_x is True
+    assert args.flow_normalize_x_eps == pytest.approx(1e-5)
+    assert mod._flow_config_from_args(args).normalize_x is True
+    assert mod._flow_config_from_args(args).normalize_x_eps == pytest.approx(1e-5)
 
 
 def test_cli_run_passes_selected_metric_only(monkeypatch, tmp_path: Path) -> None:
