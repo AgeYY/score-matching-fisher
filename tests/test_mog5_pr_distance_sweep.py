@@ -155,33 +155,64 @@ def _write_zero_gt_case_npz(path: Path) -> Path:
     return path
 
 
+def _fake_ground_truth_payload(metrics: tuple[str, ...] = ALL_METRICS) -> dict[str, object]:
+    labels = ("category_0", "category_1", "category_2")
+    matrices = np.zeros((len(metrics), len(labels), len(labels)), dtype=np.float64)
+    for metric_idx in range(len(metrics)):
+        values = np.asarray(
+            [
+                [0.0, 1.0 + metric_idx, 2.0 + metric_idx],
+                [1.0 + metric_idx, 0.0, 3.0 + metric_idx],
+                [2.0 + metric_idx, 3.0 + metric_idx, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        matrices[metric_idx] = values
+    return {
+        "metric_names": tuple(metrics),
+        "condition_labels": labels,
+        "ground_truth_matrices": matrices,
+        "n_total": 1000,
+        "pr_dim": 2,
+        "pr_projected": True,
+        "pr_dim_label": "pr2",
+    }
+
+
+def _stub_baseline_ground_truth(monkeypatch: pytest.MonkeyPatch, mod) -> None:
+    def fake_baseline(args, metrics):
+        return _fake_ground_truth_payload(tuple(str(metric) for metric in metrics))
+
+    monkeypatch.setattr(mod, "compute_baseline_ground_truth_rdms", fake_baseline)
+
+
 def test_parser_defaults() -> None:
     mod = _load_cli_module()
     repo_root = Path(__file__).resolve().parent.parent
     args = mod.build_parser().parse_args([])
 
     assert args.n_list == [100, 550, 1000, 1550]
-    assert args.pr_dim == 2
+    assert args.pr_dim is None
     assert not hasattr(args, "pr_dim_list")
-    assert args.n_total == 1000
+    assert args.n_total == 100000
     assert args.device == "cuda"
     assert args.metric == "all"
     assert mod.resolve_metric_names(args) == ALL_METRICS
     assert args.early_ema_alpha == pytest.approx(0.05)
     assert args.yscale == "linear"
     assert args.loss_yscale == "linear"
-    assert args.output_dir == repo_root / "data" / "mog5_pr_distance_sweeps"
+    assert args.output_dir == repo_root / "data" / "mog5_native_distance_sweeps"
 
-    native_args = mod.build_parser().parse_args(["--pr-dim", "none"])
-    assert native_args.pr_dim is None
-    assert native_args.output_dir == repo_root / "data" / "mog5_native_distance_sweeps"
+    pr2_args = mod.build_parser().parse_args(["--pr-dim", "2"])
+    assert pr2_args.pr_dim == 2
+    assert pr2_args.output_dir == repo_root / "data" / "mog5_pr_distance_sweeps"
 
 
 def test_aggregate_mean_pairwise_abs_errors(tmp_path: Path) -> None:
     mod = _load_cli_module()
     args = mod.build_parser().parse_args(["--n-list", "100"])
     data = {
-        (100, 2): mod._load_case_cache(_write_case_npz(tmp_path / "case_a.npz", offset=0.0)),
+        (100, -1): mod._load_case_cache(_write_case_npz(tmp_path / "case_a.npz", offset=0.0)),
     }
 
     aggregate, rows = mod.aggregate_sweeps(args=args, case_data=data)
@@ -227,7 +258,7 @@ def test_relative_error_uses_denominator_floor_for_zero_ground_truth(tmp_path: P
     mod = _load_cli_module()
     args = mod.build_parser().parse_args(["--n-list", "100", "--metric", "squared_euclidean"])
     data = {
-        (100, 2): mod._load_case_cache(_write_zero_gt_case_npz(tmp_path / "case_a.npz")),
+        (100, -1): mod._load_case_cache(_write_zero_gt_case_npz(tmp_path / "case_a.npz")),
     }
 
     _, rows = mod.aggregate_sweeps(args=args, case_data=data)
@@ -244,7 +275,7 @@ def test_mean_pair_error_curve_returns_raw_curve_values(tmp_path: Path) -> None:
     args = mod.build_parser().parse_args(["--n-list", "100,200"])
     case_100 = mod._load_case_cache(_write_case_npz(tmp_path / "case_100.npz", offset=0.0))
     case_200 = mod._load_case_cache(_write_case_npz(tmp_path / "case_200.npz", offset=10.0))
-    aggregate, _ = mod.aggregate_sweeps(args=args, case_data={(100, 2): case_100, (200, 2): case_200})
+    aggregate, _ = mod.aggregate_sweeps(args=args, case_data={(100, -1): case_100, (200, -1): case_200})
 
     yvals = mod._mean_pair_error_curve(
         aggregate["n_sweep_flow_matching_matrices"],
@@ -255,6 +286,41 @@ def test_mean_pair_error_curve_returns_raw_curve_values(tmp_path: Path) -> None:
     )
 
     np.testing.assert_allclose(yvals, [11.0 / 3.0, 11.0 / 3.0])
+
+
+def test_plot_sweep_error_writes_per_metric_panel_grid(tmp_path: Path) -> None:
+    mod = _load_cli_module()
+    metrics = ("squared_euclidean", "cosine", "symmetric_kl")
+    args = mod.build_parser().parse_args(["--n-list", "100,200"])
+    case_100 = mod._load_case_cache(_write_case_npz(tmp_path / "case_100.npz", offset=0.0, metrics=metrics))
+    case_200 = mod._load_case_cache(_write_case_npz(tmp_path / "case_200.npz", offset=5.0, metrics=metrics))
+    aggregate, _ = mod.aggregate_sweeps(args=args, case_data={(100, -1): case_100, (200, -1): case_200})
+
+    abs_svg, abs_png = mod.plot_sweep_error(
+        aggregate,
+        svg_path=tmp_path / "mog5_pr_distance_sweep_abs_error.svg",
+        png_path=tmp_path / "mog5_pr_distance_sweep_abs_error.png",
+        yscale="linear",
+        relative=False,
+    )
+    rel_svg, rel_png = mod.plot_sweep_error(
+        aggregate,
+        svg_path=tmp_path / "mog5_pr_distance_sweep_rel_error.svg",
+        png_path=tmp_path / "mog5_pr_distance_sweep_rel_error.png",
+        yscale="log",
+        relative=True,
+    )
+
+    for path in (abs_svg, abs_png, rel_svg, rel_png):
+        assert path.is_file()
+        assert path.stat().st_size > 0
+    abs_text = abs_svg.read_text(encoding="utf-8")
+    rel_text = rel_svg.read_text(encoding="utf-8")
+    expected_description = "layout=2x3;metrics=squared_euclidean,cosine,symmetric_kl;rows=classical+flow,flow_only"
+    assert expected_description in abs_text
+    assert expected_description in rel_text
+    assert "Mean absolute error" in abs_text
+    assert "Mean relative absolute error" in rel_text
 
 
 def test_load_flow_loss_cache_reads_val_monitor_losses(tmp_path: Path) -> None:
@@ -300,8 +366,47 @@ def test_plot_mog5_native_scatter_covariance_writes_svg_and_png(tmp_path: Path) 
     assert "<image" not in svg_text
 
 
+def test_plot_ground_truth_rdms_writes_requested_metric_panels(tmp_path: Path) -> None:
+    mod = _load_cli_module()
+    ground_truth = _fake_ground_truth_payload(("cosine",))
+
+    svg, png = mod.plot_ground_truth_rdms(
+        ground_truth,
+        svg_path=tmp_path / "gt_rdms.svg",
+        png_path=tmp_path / "gt_rdms.png",
+    )
+
+    assert svg.is_file()
+    assert png.is_file()
+    assert svg.stat().st_size > 0
+    assert png.stat().st_size > 0
+    svg_text = svg.read_text(encoding="utf-8")
+    assert "metrics=cosine" in svg_text
+    assert "squared_euclidean" not in svg_text
+    assert "correlation" not in svg_text
+
+
+def test_plot_ground_truth_rdms_uses_canonical_metric_order(tmp_path: Path) -> None:
+    mod = _load_cli_module()
+    metrics = ("symmetric_kl", "squared_euclidean", "cosine", "mahalanobis_sq", "correlation")
+    ground_truth = _fake_ground_truth_payload(metrics)
+
+    svg, png = mod.plot_ground_truth_rdms(
+        ground_truth,
+        svg_path=tmp_path / "gt_rdms.svg",
+        png_path=tmp_path / "gt_rdms.png",
+    )
+
+    assert svg.is_file()
+    assert png.is_file()
+    assert "metrics=correlation,cosine,squared_euclidean,mahalanobis_sq,symmetric_kl" in svg.read_text(
+        encoding="utf-8"
+    )
+
+
 def test_cache_hits_do_not_rerun_and_duplicate_case_is_deduped(monkeypatch, tmp_path: Path) -> None:
     mod = _load_cli_module()
+    _stub_baseline_ground_truth(monkeypatch, mod)
     calls: list[object] = []
     real_single = mod._load_single_case_module()
 
@@ -310,7 +415,7 @@ def test_cache_hits_do_not_rerun_and_duplicate_case_is_deduped(monkeypatch, tmp_
         "case_output_dir",
         lambda *, n_total, pr_dim, case_output_name: tmp_path / f"case_{n_total}_{pr_dim}",
     )
-    _write_case_npz(tmp_path / "case_1000_2" / mod.RESULTS_NAME)
+    _write_case_npz(tmp_path / "case_1000_None" / mod.RESULTS_NAME)
 
     class FakeSingle:
         @staticmethod
@@ -339,11 +444,12 @@ def test_cache_hits_do_not_rerun_and_duplicate_case_is_deduped(monkeypatch, tmp_
 
     assert len(calls) == 1
     assert calls[0].n_total == 2000
-    assert calls[0].pr_dim == 2
+    assert calls[0].pr_dim is None
 
 
 def test_visualization_only_missing_cache_fails(monkeypatch, tmp_path: Path) -> None:
     mod = _load_cli_module()
+    _stub_baseline_ground_truth(monkeypatch, mod)
     monkeypatch.setattr(
         mod,
         "case_output_dir",
@@ -357,12 +463,13 @@ def test_visualization_only_missing_cache_fails(monkeypatch, tmp_path: Path) -> 
 
 def test_visualization_only_writes_outputs_from_fake_caches(monkeypatch, tmp_path: Path) -> None:
     mod = _load_cli_module()
+    _stub_baseline_ground_truth(monkeypatch, mod)
     monkeypatch.setattr(
         mod,
         "case_output_dir",
         lambda *, n_total, pr_dim, case_output_name: tmp_path / f"case_{n_total}_{pr_dim}",
     )
-    _write_case_npz(tmp_path / "case_100_2" / mod.RESULTS_NAME)
+    _write_case_npz(tmp_path / "case_100_None" / mod.RESULTS_NAME)
     _write_native_mog5_npz(tmp_path / "random_mog_categorical.npz")
     args = mod.build_parser().parse_args(
         [
@@ -384,6 +491,8 @@ def test_visualization_only_writes_outputs_from_fake_caches(monkeypatch, tmp_pat
     assert outputs["abs_error_figure_png"].is_file()
     assert outputs["rel_error_figure_svg"].is_file()
     assert outputs["rel_error_figure_png"].is_file()
+    assert outputs["ground_truth_rdms_figure_svg"].is_file()
+    assert outputs["ground_truth_rdms_figure_png"].is_file()
     assert outputs["dataset_figure_svg"].is_file()
     assert outputs["dataset_figure_png"].is_file()
     assert outputs["summary_json"].is_file()
@@ -403,6 +512,8 @@ def test_visualization_only_writes_outputs_from_fake_caches(monkeypatch, tmp_pat
     assert "pr_dim_list" not in summary["config"]
     assert "abs_error_figure_svg" in summary["outputs"]
     assert "rel_error_figure_svg" in summary["outputs"]
+    assert "ground_truth_rdms_figure_svg" in summary["outputs"]
+    assert "ground_truth_rdms_figure_png" in summary["outputs"]
     assert "dataset_figure_svg" in summary["outputs"]
     assert "dataset_figure_png" in summary["outputs"]
     assert "flow_loss_figure_svg" not in summary["outputs"]
@@ -410,12 +521,13 @@ def test_visualization_only_writes_outputs_from_fake_caches(monkeypatch, tmp_pat
 
 def test_skip_dataset_viz_omits_sweep_dataset_figure(monkeypatch, tmp_path: Path) -> None:
     mod = _load_cli_module()
+    _stub_baseline_ground_truth(monkeypatch, mod)
     monkeypatch.setattr(
         mod,
         "case_output_dir",
         lambda *, n_total, pr_dim, case_output_name: tmp_path / f"case_{n_total}_{pr_dim}",
     )
-    _write_case_npz(tmp_path / "case_100_2" / mod.RESULTS_NAME)
+    _write_case_npz(tmp_path / "case_100_None" / mod.RESULTS_NAME)
     _write_native_mog5_npz(tmp_path / "random_mog_categorical.npz")
     args = mod.build_parser().parse_args(
         [
@@ -439,6 +551,7 @@ def test_skip_dataset_viz_omits_sweep_dataset_figure(monkeypatch, tmp_path: Path
 
 def test_native_visualization_only_uses_native_cache_and_summary(monkeypatch, tmp_path: Path) -> None:
     mod = _load_cli_module()
+    _stub_baseline_ground_truth(monkeypatch, mod)
     monkeypatch.setattr(
         mod,
         "case_output_dir",
@@ -473,13 +586,14 @@ def test_native_visualization_only_uses_native_cache_and_summary(monkeypatch, tm
 
 def test_visualization_only_writes_flow_loss_outputs_from_fake_caches(monkeypatch, tmp_path: Path) -> None:
     mod = _load_cli_module()
+    _stub_baseline_ground_truth(monkeypatch, mod)
     monkeypatch.setattr(
         mod,
         "case_output_dir",
         lambda *, n_total, pr_dim, case_output_name: tmp_path / f"case_{n_total}_{pr_dim}",
     )
-    _write_case_npz(tmp_path / "case_100_2" / mod.RESULTS_NAME)
-    _write_flow_loss_npz(tmp_path / "case_100_2" / "flow" / "symmetric_kl_flow_matching_skl_results.npz")
+    _write_case_npz(tmp_path / "case_100_None" / mod.RESULTS_NAME)
+    _write_flow_loss_npz(tmp_path / "case_100_None" / "flow" / "symmetric_kl_flow_matching_skl_results.npz")
     args = mod.build_parser().parse_args(
         [
             "--visualization-only",
@@ -504,12 +618,13 @@ def test_visualization_only_writes_flow_loss_outputs_from_fake_caches(monkeypatc
 
 def test_visualization_only_filters_cached_metric(monkeypatch, tmp_path: Path) -> None:
     mod = _load_cli_module()
+    _stub_baseline_ground_truth(monkeypatch, mod)
     monkeypatch.setattr(
         mod,
         "case_output_dir",
         lambda *, n_total, pr_dim, case_output_name: tmp_path / f"case_{n_total}_{pr_dim}",
     )
-    _write_case_npz(tmp_path / "case_100_2" / mod.RESULTS_NAME)
+    _write_case_npz(tmp_path / "case_100_None" / mod.RESULTS_NAME)
     args = mod.build_parser().parse_args(
         [
             "--visualization-only",
@@ -537,13 +652,14 @@ def test_visualization_only_filters_cached_metric(monkeypatch, tmp_path: Path) -
 
 def test_visualization_only_requested_metric_missing_from_cache_fails(monkeypatch, tmp_path: Path) -> None:
     mod = _load_cli_module()
+    _stub_baseline_ground_truth(monkeypatch, mod)
     monkeypatch.setattr(
         mod,
         "case_output_dir",
         lambda *, n_total, pr_dim, case_output_name: tmp_path / f"case_{n_total}_{pr_dim}",
     )
     _write_case_npz(
-        tmp_path / "case_100_2" / mod.RESULTS_NAME,
+        tmp_path / "case_100_None" / mod.RESULTS_NAME,
         metrics=("squared_euclidean",),
     )
     args = mod.build_parser().parse_args(

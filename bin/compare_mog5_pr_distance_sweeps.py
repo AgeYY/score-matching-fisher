@@ -34,9 +34,25 @@ SWEEP_REL_SVG_NAME = "mog5_pr_distance_sweep_rel_error.svg"
 SWEEP_REL_PNG_NAME = "mog5_pr_distance_sweep_rel_error.png"
 SWEEP_FLOW_LOSS_SVG_NAME = "mog5_pr_distance_sweep_flow_loss_vs_epoch.svg"
 SWEEP_FLOW_LOSS_PNG_NAME = "mog5_pr_distance_sweep_flow_loss_vs_epoch.png"
+GROUND_TRUTH_RDMS_SVG_NAME = "mog5_pr_distance_ground_truth_rdms.svg"
+GROUND_TRUTH_RDMS_PNG_NAME = "mog5_pr_distance_ground_truth_rdms.png"
 MOG5_DATASET_SVG_NAME = "mog5_native_dataset_scatter_covariance.svg"
 MOG5_DATASET_PNG_NAME = "mog5_native_dataset_scatter_covariance.png"
 REL_ERROR_DENOM_FLOOR = 1e-12
+GROUND_TRUTH_RDM_METRIC_ORDER = (
+    "correlation",
+    "cosine",
+    "squared_euclidean",
+    "mahalanobis_sq",
+    "symmetric_kl",
+)
+GROUND_TRUTH_RDM_METRIC_TITLES = {
+    "correlation": "Correlation",
+    "cosine": "Cosine",
+    "squared_euclidean": "Squared Euclidean",
+    "mahalanobis_sq": "Squared Mahalanobis",
+    "symmetric_kl": "Jeffreys divergence",
+}
 
 
 def _load_single_case_module() -> Any:
@@ -88,7 +104,7 @@ def build_parser() -> argparse.ArgumentParser:
     single = _load_single_case_module()
     p = single.build_parser()
     p.description = __doc__
-    p.set_defaults(n_total=1_000, pr_dim=2, output_dir=default_output_dir())
+    p.set_defaults(n_total=100_000, pr_dim=None, output_dir=default_native_output_dir())
     for action in p._actions:
         if action.dest == "output_dir":
             action.help = "Aggregate sweep output directory."
@@ -127,8 +143,8 @@ def build_parser() -> argparse.ArgumentParser:
         parsed = original_parse_args(args, namespace)
         argv = sys.argv[1:] if args is None else list(args)
         output_was_explicit = any(str(arg) == "--output-dir" or str(arg).startswith("--output-dir=") for arg in argv)
-        if parsed.pr_dim is None and not output_was_explicit:
-            parsed.output_dir = default_native_output_dir()
+        if not output_was_explicit:
+            parsed.output_dir = default_native_output_dir() if parsed.pr_dim is None else default_output_dir()
         return parsed
 
     p.parse_args = parse_args  # type: ignore[method-assign]
@@ -208,6 +224,74 @@ def resolve_metric_names(args: argparse.Namespace) -> tuple[str, ...]:
     if metric == "all":
         return tuple(METRIC_NAMES)
     return (metric,)
+
+
+def compute_baseline_ground_truth_rdms(args: argparse.Namespace, metrics: tuple[str, ...]) -> dict[str, Any]:
+    single = _load_single_case_module()
+    case_args = _single_case_args(
+        args,
+        n_total=int(args.n_total),
+        pr_dim=args.pr_dim,
+        output_dir=case_output_dir(
+            n_total=int(args.n_total),
+            pr_dim=args.pr_dim,
+            case_output_name=str(args.case_output_name),
+        ),
+    )
+    dev = single.require_device(str(case_args.device))
+    dataset_dir = single.resolve_dataset_dir(case_args)
+    native_npz, projected_npz = single.ensure_dataset(case_args, dataset_dir)
+    pr_projected = case_args.pr_dim is not None
+    work_npz = projected_npz if pr_projected else native_npz
+    if work_npz is None:
+        raise RuntimeError("Native mode did not produce a work NPZ.")
+
+    native_bundle = single.load_shared_dataset_npz(native_npz)
+    work_bundle = single.load_shared_dataset_npz(work_npz)
+    single._validate_bundle(
+        work_bundle,
+        n_total=int(case_args.n_total),
+        pr_dim=case_args.pr_dim,
+        pr_projected=pr_projected,
+    )
+    k = int(work_bundle.meta.get("num_categories", 5))
+    names = single.condition_labels(k)
+
+    if pr_projected:
+        print("[sweep] computing projected-coordinate ground-truth RDMs for baseline n_total", flush=True)
+        ground_truth = single.pr_autoencoder_ground_truth_matrices(
+            native_meta=dict(native_bundle.meta),
+            projected_meta=dict(work_bundle.meta),
+            device=dev,
+            cache_dir=Path(case_args.pr_cache_dir),
+            samples_per_class=int(case_args.gt_samples_per_class),
+            seed=int(case_args.seed) + 12345,
+            batch_size=int(case_args.gt_batch_size),
+            mahalanobis_ridge=float(case_args.mahalanobis_ridge),
+            metrics=metrics,
+        )
+    else:
+        print("[sweep] computing native-coordinate ground-truth RDMs for baseline n_total", flush=True)
+        ground_truth = single.native_mog_ground_truth_matrices(
+            native_meta=dict(native_bundle.meta),
+            samples_per_class=int(case_args.gt_samples_per_class),
+            seed=int(case_args.seed) + 12345,
+            mahalanobis_ridge=float(case_args.mahalanobis_ridge),
+            metrics=metrics,
+        )
+
+    return {
+        "metric_names": tuple(metrics),
+        "condition_labels": tuple(names),
+        "ground_truth_matrices": np.stack(
+            [np.asarray(ground_truth[str(metric)], dtype=np.float64) for metric in metrics],
+            axis=0,
+        ),
+        "n_total": int(case_args.n_total),
+        "pr_dim": None if case_args.pr_dim is None else int(case_args.pr_dim),
+        "pr_projected": bool(pr_projected),
+        "pr_dim_label": _pr_dim_label(case_args.pr_dim),
+    }
 
 
 def _single_case_args(args: argparse.Namespace, *, n_total: int, pr_dim: int | None, output_dir: Path) -> argparse.Namespace:
@@ -462,50 +546,37 @@ def plot_sweep_error(
     relative: bool,
 ) -> tuple[Path, Path]:
     metric_names = tuple(str(v) for v in aggregate["metric_names"])
+    if not metric_names:
+        raise ValueError("aggregate must contain at least one metric.")
     pair_indices = np.asarray(aggregate["pair_indices"], dtype=np.int64)
-    colors = plt.get_cmap("tab10")
     estimator_styles = {
-        "classical": {"marker": "o", "linestyle": "-", "label": "classical"},
-        "flow_matching": {"marker": "s", "linestyle": "--", "label": "flow matching"},
+        "classical": {"color": "tab:blue", "marker": "o", "linestyle": "-", "label": "classical"},
+        "flow_matching": {"color": "tab:orange", "marker": "s", "linestyle": "--", "label": "flow matching"},
     }
-
-    fig, axes = plt.subplots(1, 2, figsize=(13.0, 5.2), constrained_layout=True)
-    panels = (
-        (
-            axes[0],
-            np.asarray(aggregate["n_list"], dtype=np.int64),
-            "n_total",
-            aggregate["n_sweep_classical_matrices"],
-            aggregate["n_sweep_flow_matching_matrices"],
-            aggregate["n_sweep_ground_truth_matrices"],
-            f"Sample-size sweep ({aggregate['pr_dim_label']})",
-            ("classical", "flow_matching"),
-        ),
-        (
-            axes[1],
-            np.asarray(aggregate["n_list"], dtype=np.int64),
-            "n_total",
-            aggregate["n_sweep_classical_matrices"],
-            aggregate["n_sweep_flow_matching_matrices"],
-            aggregate["n_sweep_ground_truth_matrices"],
-            f"Flow estimation only ({aggregate['pr_dim_label']})",
-            ("flow_matching",),
-        ),
+    row_specs = (
+        ("Classical + flow", ("classical", "flow_matching")),
+        ("Flow only", ("flow_matching",)),
     )
+    xvals = np.asarray(aggregate["n_list"], dtype=np.int64)
+    gt = np.asarray(aggregate["n_sweep_ground_truth_matrices"], dtype=np.float64)
+    matrices_by_estimator = {
+        "classical": np.asarray(aggregate["n_sweep_classical_matrices"], dtype=np.float64),
+        "flow_matching": np.asarray(aggregate["n_sweep_flow_matching_matrices"], dtype=np.float64),
+    }
+    error_label = "Mean relative absolute error" if relative else "Mean absolute error"
 
+    fig_width = max(7.0, 3.6 * len(metric_names))
+    fig, axes = plt.subplots(2, len(metric_names), figsize=(fig_width, 8.0), squeeze=False, constrained_layout=True)
     handles_by_label: dict[str, Any] = {}
-    for ax, xvals, xlabel, classical, flow, gt, title, estimators in panels:
-        for metric_idx, metric in enumerate(metric_names):
-            color = colors(metric_idx % 10)
-            matrices_by_estimator = {
-                "classical": classical,
-                "flow_matching": flow,
-            }
+    for metric_idx, metric in enumerate(metric_names):
+        axes[0, metric_idx].set_title(metric)
+        for row_idx, (row_label, estimators) in enumerate(row_specs):
+            ax = axes[row_idx, metric_idx]
             for estimator in estimators:
                 matrices = matrices_by_estimator[estimator]
                 yvals = _mean_pair_error_curve(
-                    np.asarray(matrices, dtype=np.float64),
-                    np.asarray(gt, dtype=np.float64),
+                    matrices,
+                    gt,
                     pair_indices,
                     metric_idx=metric_idx,
                     relative=bool(relative),
@@ -514,39 +585,59 @@ def plot_sweep_error(
                 (line,) = ax.plot(
                     xvals,
                     yvals,
-                    color=color,
+                    color=style["color"],
                     marker=style["marker"],
                     linestyle=style["linestyle"],
                     linewidth=1.5,
                     markersize=4.5,
-                    label=f"{metric} · {style['label']}",
+                    label=style["label"],
                 )
                 handles_by_label[line.get_label()] = line
-        ax.set_title(title)
-        ax.set_xlabel(xlabel)
-        if relative:
-            ax.set_ylabel("Mean relative absolute error")
-        else:
-            ax.set_ylabel("Mean absolute error")
-        ax.set_xticks(xvals)
-        ax.grid(True, which="both", alpha=0.25)
-        if str(yscale) == "log":
-            ax.set_yscale("log")
-            ymin = min((line.get_ydata()[line.get_ydata() > 0].min() for line in ax.lines if np.any(line.get_ydata() > 0)), default=1e-12)
-            ax.set_ylim(bottom=max(float(ymin) * 0.5, 1e-12))
-
+            ax.set_xlabel("n_total")
+            ax.set_ylabel(error_label)
+            if metric_idx == 0:
+                ax.text(
+                    -0.36,
+                    0.5,
+                    row_label,
+                    transform=ax.transAxes,
+                    rotation=90,
+                    va="center",
+                    ha="center",
+                    fontsize=10,
+                    fontweight="semibold",
+                )
+            ax.set_xticks(xvals)
+            ax.grid(True, which="both", alpha=0.25)
+            if str(yscale) == "log":
+                ax.set_yscale("log")
+                ymin = min(
+                    (
+                        line.get_ydata()[line.get_ydata() > 0].min()
+                        for line in ax.lines
+                        if np.any(line.get_ydata() > 0)
+                    ),
+                    default=1e-12,
+                )
+                ax.set_ylim(bottom=max(float(ymin) * 0.5, 1e-12))
     fig.legend(
         handles_by_label.values(),
         handles_by_label.keys(),
         loc="lower center",
-        ncol=3,
+        ncol=max(1, len(handles_by_label)),
         frameon=False,
         fontsize=8,
     )
     title_kind = "relative absolute error" if relative else "absolute error"
-    fig.suptitle(f"MoG5 PR distance comparison {title_kind}", fontsize=13)
+    fig.suptitle(f"MoG5 PR distance comparison {title_kind} ({aggregate['pr_dim_label']})", fontsize=13)
     svg_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(svg_path)
+    metadata = {
+        "Description": (
+            f"layout=2x{len(metric_names)};metrics={','.join(metric_names)};"
+            "rows=classical+flow,flow_only"
+        )
+    }
+    fig.savefig(svg_path, metadata=metadata)
     fig.savefig(png_path, dpi=200)
     plt.close(fig)
     return svg_path, png_path
@@ -554,6 +645,68 @@ def plot_sweep_error(
 
 def plot_abs_error(aggregate: dict[str, Any], *, svg_path: Path, png_path: Path, yscale: str) -> tuple[Path, Path]:
     return plot_sweep_error(aggregate, svg_path=svg_path, png_path=png_path, yscale=yscale, relative=False)
+
+
+def plot_ground_truth_rdms(
+    ground_truth: dict[str, Any],
+    *,
+    svg_path: Path,
+    png_path: Path,
+) -> tuple[Path, Path]:
+    metric_names = tuple(str(v) for v in ground_truth["metric_names"])
+    condition_labels = tuple(str(v) for v in ground_truth["condition_labels"])
+    matrices = np.asarray(ground_truth["ground_truth_matrices"], dtype=np.float64)
+    if matrices.ndim != 3:
+        raise ValueError("ground_truth_matrices must have shape [metric, condition, condition].")
+    if matrices.shape[0] != len(metric_names):
+        raise ValueError("ground_truth_matrices metric axis does not match metric_names.")
+    if matrices.shape[1] != len(condition_labels) or matrices.shape[2] != len(condition_labels):
+        raise ValueError("ground_truth_matrices condition axes do not match condition_labels.")
+
+    ordered_metric_names = tuple(metric for metric in GROUND_TRUTH_RDM_METRIC_ORDER if metric in metric_names)
+    ordered_metric_names += tuple(metric for metric in metric_names if metric not in ordered_metric_names)
+    ordered_indices = [metric_names.index(metric) for metric in ordered_metric_names]
+    ordered_matrices = matrices[ordered_indices]
+
+    fig_width = max(4.8, 3.8 * len(ordered_metric_names))
+    fig, axes_obj = plt.subplots(1, len(ordered_metric_names), figsize=(fig_width, 4.6), squeeze=False, constrained_layout=True)
+    axes = axes_obj[0]
+    images = []
+    ticks = np.arange(len(condition_labels), dtype=np.int64)
+    for panel_idx, (ax, metric, matrix) in enumerate(zip(axes, ordered_metric_names, ordered_matrices, strict=True)):
+        arr = np.asarray(matrix, dtype=np.float64)
+        finite = arr[np.isfinite(arr)]
+        if finite.size:
+            vmin = float(np.min(finite))
+            vmax = float(np.max(finite))
+        else:
+            vmin, vmax = 0.0, 1.0
+        if vmin == vmax:
+            vmax = vmin + 1.0
+        image = ax.imshow(arr, cmap="viridis", vmin=vmin, vmax=vmax, aspect="equal")
+        images.append(image)
+        ax.set_title(GROUND_TRUTH_RDM_METRIC_TITLES.get(str(metric), str(metric)))
+        ax.set_xticks(ticks)
+        ax.set_yticks(ticks)
+        ax.set_xticklabels(condition_labels, rotation=45, ha="right", fontsize=8)
+        ax.set_xlabel("condition")
+        if panel_idx == 0:
+            ax.set_yticklabels(condition_labels, fontsize=8)
+            ax.set_ylabel("condition")
+        else:
+            ax.set_yticklabels([])
+            ax.set_ylabel("")
+        fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+
+    fig.suptitle(
+        f"MoG5 ground-truth RDMs ({ground_truth['pr_dim_label']}, n_total={int(ground_truth['n_total'])})",
+        fontsize=13,
+    )
+    svg_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(svg_path, metadata={"Description": "metrics=" + ",".join(ordered_metric_names)})
+    fig.savefig(png_path, dpi=200)
+    plt.close(fig)
+    return svg_path, png_path
 
 
 def plot_flow_loss_sweep(
@@ -741,6 +894,12 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     metrics = resolve_metric_names(args)
+    ground_truth = compute_baseline_ground_truth_rdms(args, metrics)
+    gt_svg_path, gt_png_path = plot_ground_truth_rdms(
+        ground_truth,
+        svg_path=output_dir / GROUND_TRUTH_RDMS_SVG_NAME,
+        png_path=output_dir / GROUND_TRUTH_RDMS_PNG_NAME,
+    )
 
     case_paths: dict[tuple[int, int], Path] = {}
     cache_hits: dict[tuple[int, int], bool] = {}
@@ -807,6 +966,8 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
         "abs_error_figure_png": png_path,
         "rel_error_figure_svg": rel_svg_path,
         "rel_error_figure_png": rel_png_path,
+        "ground_truth_rdms_figure_svg": gt_svg_path,
+        "ground_truth_rdms_figure_png": gt_png_path,
     }
     if loss_paths is not None:
         outputs["flow_loss_figure_svg"] = loss_paths[0]
@@ -828,6 +989,8 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
     print(f"figure_png: {png_path}", flush=True)
     print(f"rel_error_figure_svg: {rel_svg_path}", flush=True)
     print(f"rel_error_figure_png: {rel_png_path}", flush=True)
+    print(f"ground_truth_rdms_figure_svg: {gt_svg_path}", flush=True)
+    print(f"ground_truth_rdms_figure_png: {gt_png_path}", flush=True)
     if loss_paths is None:
         if flow_loss_warnings:
             print(

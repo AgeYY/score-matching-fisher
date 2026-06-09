@@ -21,6 +21,7 @@ from fisher.flow_matching_skl import (
     VELOCITY_FAMILIES,
     build_flow_skl_model,
     centered_radius_normalize,
+    centered_soft_radius_normalize,
     estimate_model_symmetric_kl,
     estimate_scalar_fisher_from_skl,
     flow_endpoint_log_prob,
@@ -147,6 +148,25 @@ def test_flow_skl_default_t_eps_is_small_endpoint_clamp() -> None:
     assert args.early_ema_alpha == pytest.approx(0.05)
 
 
+def test_centered_soft_radius_normalize_has_nonzero_gradient_in_two_dimensions() -> None:
+    raw = torch.zeros((2, 2), dtype=torch.float64, requires_grad=True)
+    out = centered_soft_radius_normalize(raw, radius=1.5, eps=1e-2)
+    loss = out[0, 0] - out[0, 1] + 0.5 * (out[1, 1] - out[1, 0])
+    loss.backward()
+
+    assert raw.grad is not None
+    assert torch.count_nonzero(raw.grad).item() == 4
+    assert torch.linalg.norm(raw.grad).item() > 0.0
+
+
+def test_centered_fixed_radius_normalize_behavior_is_unchanged() -> None:
+    raw = torch.tensor([[1.0, 2.0, 5.0], [3.0, 6.0, 9.0]], dtype=torch.float64)
+    got = centered_radius_normalize(raw, radius=2.0)
+    centered = raw - raw.mean(dim=1, keepdim=True)
+    expected = 2.0 * centered / torch.linalg.norm(centered, dim=1, keepdim=True)
+    torch.testing.assert_close(got, expected)
+
+
 def test_train_flow_skl_early_stopping_uses_ema_monitor(monkeypatch: pytest.MonkeyPatch) -> None:
     monitor_values = [10.0, 9.0, 11.0, 12.0]
     ema_calls: list[tuple[float | None, float, float]] = []
@@ -261,7 +281,12 @@ def test_build_flow_skl_model_uses_mlp_heads_and_film_nonlinear_subnets() -> Non
             path_schedule="linear",
         )
         assert getattr(model, "network_architecture") == "film"
-        if family in ("translation", "translation_fixed_norm", "translation_centered_fixed_norm"):
+        if family in (
+            "translation",
+            "translation_fixed_norm",
+            "translation_centered_fixed_norm",
+            "translation_centered_soft_norm",
+        ):
             assert isinstance(model.mean_net, nn.Sequential)
             assert _first_linear_in_features(model.mean_net) == 2
         elif family == "nonlinear":

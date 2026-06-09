@@ -44,7 +44,7 @@ METRIC_NAMES = (
 FLOW_VELOCITY_FAMILY_BY_METRIC = {
     METRIC_SQUARED_EUCLIDEAN: "translation",
     METRIC_COSINE: "translation_fixed_norm",
-    METRIC_CORRELATION: "translation_centered_fixed_norm",
+    METRIC_CORRELATION: "translation_centered_soft_norm",
     METRIC_MAHALANOBIS_SQ: "shared_affine",
     METRIC_SYMMETRIC_KL: "nonlinear",
 }
@@ -89,6 +89,8 @@ class FlowComparisonConfig:
     max_grad_norm: float = 10.0
     log_every: int = 50
     radius: float = 1.0
+    corr_soft_eps: float = 1e-2
+    correlation_flow_family: str = "soft"
     normalize_x: bool = False
     normalize_x_eps: float = 1e-8
 
@@ -103,6 +105,7 @@ class DistanceComparisonResult:
     ground_truth_matrices: dict[str, np.ndarray]
     rows: list[dict[str, Any]]
     flow_npz_paths: dict[str, Path] = field(default_factory=dict)
+    flow_velocity_families: dict[str, str] = field(default_factory=dict)
 
 
 def labels_from_theta(theta: np.ndarray, *, num_categories: int | None = None) -> np.ndarray:
@@ -554,6 +557,23 @@ def flow_skl_to_metric_readout(metric: str, symmetric_kl_matrix: np.ndarray, *, 
     return out
 
 
+def correlation_velocity_family(config: FlowComparisonConfig) -> str:
+    """Resolve the configured flow family for correlation rows."""
+
+    family = str(config.correlation_flow_family).strip().lower()
+    if family == "soft":
+        return "translation_centered_soft_norm"
+    if family == "fixed":
+        return "translation_centered_fixed_norm"
+    raise ValueError("correlation_flow_family must be one of: soft, fixed.")
+
+
+def velocity_family_for_metric(metric: str, config: FlowComparisonConfig) -> str:
+    if str(metric) == METRIC_CORRELATION:
+        return correlation_velocity_family(config)
+    return FLOW_VELOCITY_FAMILY_BY_METRIC[str(metric)]
+
+
 def train_and_estimate_flow(
     *,
     theta_train: np.ndarray,
@@ -588,6 +608,7 @@ def train_and_estimate_flow(
         divergence_estimator=str(config.divergence_estimator),
         hutchinson_probes=int(config.hutchinson_probes),
         shared_affine_a_diag_jitter=float(config.shared_affine_a_diag_jitter),
+        corr_soft_eps=float(config.corr_soft_eps),
     ).to(device)
     train_meta = train_flow_skl_model(
         model=model,
@@ -634,6 +655,8 @@ def save_flow_result_npz(
     theta_eval: np.ndarray,
     velocity_family: str,
     pair: tuple[int, int] | None = None,
+    flow_metric_matrix: np.ndarray | None = None,
+    corr_soft_eps: float | None = None,
 ) -> Path:
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -645,6 +668,10 @@ def save_flow_result_npz(
             "theta_eval": np.asarray(theta_eval, dtype=np.float64),
         }
     )
+    if flow_metric_matrix is not None:
+        fields["flow_matching_matrix"] = np.asarray(flow_metric_matrix, dtype=np.float64)
+    if corr_soft_eps is not None:
+        fields["corr_soft_eps"] = np.asarray([float(corr_soft_eps)])
     if pair is not None:
         fields["condition_pair"] = np.asarray(pair, dtype=np.int64)
     meta = dict(result.train_metadata)
@@ -706,7 +733,7 @@ def flow_metric_matrices(
     theta_eval = _theta_eval_from_num_categories(k)
 
     for metric in tuple(str(m) for m in metrics):
-        family = FLOW_VELOCITY_FAMILY_BY_METRIC[metric]
+        family = velocity_family_for_metric(metric, config)
         print(f"[distance-comparison] flow metric={metric} velocity_family={family}", flush=True)
         result = train_and_estimate_flow(
             theta_train=theta_train_all,
@@ -731,6 +758,8 @@ def flow_metric_matrices(
             metric=metric,
             theta_eval=theta_eval,
             velocity_family=family,
+            flow_metric_matrix=matrices[metric],
+            corr_soft_eps=float(config.corr_soft_eps) if metric == METRIC_CORRELATION else None,
         )
         paths[metric] = path
     return matrices, paths
@@ -743,9 +772,11 @@ def pair_rows(
     classical: dict[str, np.ndarray],
     flow_matching: dict[str, np.ndarray],
     ground_truth: dict[str, np.ndarray],
+    flow_velocity_families: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     label_tuple = tuple(str(v) for v in labels)
     pairs = pair_indices(len(label_tuple))
+    family_by_metric = FLOW_VELOCITY_FAMILY_BY_METRIC if flow_velocity_families is None else flow_velocity_families
     rows: list[dict[str, Any]] = []
     for metric in tuple(str(m) for m in metrics):
         cmat = np.asarray(classical[metric], dtype=np.float64)
@@ -764,7 +795,7 @@ def pair_rows(
                     "classical": cval,
                     "flow_matching": fval,
                     "ground_truth": gval,
-                    "flow_velocity_family": FLOW_VELOCITY_FAMILY_BY_METRIC[metric],
+                    "flow_velocity_family": family_by_metric[metric],
                     "abs_error_classical": abs(cval - gval),
                     "abs_error_flow": abs(fval - gval),
                 }
@@ -780,15 +811,22 @@ def assemble_comparison_result(
     flow_matching: dict[str, np.ndarray],
     ground_truth: dict[str, np.ndarray],
     flow_npz_paths: dict[str, Path] | None = None,
+    flow_velocity_families: dict[str, str] | None = None,
 ) -> DistanceComparisonResult:
     metric_tuple = tuple(str(m) for m in metrics)
     label_tuple = tuple(str(v) for v in condition_names)
+    family_by_metric = (
+        {m: FLOW_VELOCITY_FAMILY_BY_METRIC[m] for m in metric_tuple}
+        if flow_velocity_families is None
+        else {str(k): str(v) for k, v in flow_velocity_families.items()}
+    )
     rows = pair_rows(
         metrics=metric_tuple,
         labels=label_tuple,
         classical=classical,
         flow_matching=flow_matching,
         ground_truth=ground_truth,
+        flow_velocity_families=family_by_metric,
     )
     return DistanceComparisonResult(
         metrics=metric_tuple,
@@ -799,6 +837,7 @@ def assemble_comparison_result(
         ground_truth_matrices={m: np.asarray(ground_truth[m], dtype=np.float64) for m in metric_tuple},
         rows=rows,
         flow_npz_paths={} if flow_npz_paths is None else dict(flow_npz_paths),
+        flow_velocity_families={m: family_by_metric[m] for m in metric_tuple},
     )
 
 
@@ -867,7 +906,7 @@ def write_summary_json(
         c_err = np.asarray([abs(float(c[i, j]) - float(g[i, j])) for i, j in pairs], dtype=np.float64)
         f_err = np.asarray([abs(float(f[i, j]) - float(g[i, j])) for i, j in pairs], dtype=np.float64)
         metric_summary[metric] = {
-            "flow_velocity_family": FLOW_VELOCITY_FAMILY_BY_METRIC[metric],
+            "flow_velocity_family": result.flow_velocity_families.get(metric, FLOW_VELOCITY_FAMILY_BY_METRIC[metric]),
             "mean_abs_error_classical": float(np.mean(c_err)),
             "mean_abs_error_flow": float(np.mean(f_err)),
             "max_abs_error_classical": float(np.max(c_err)),

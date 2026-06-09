@@ -26,6 +26,7 @@ from fisher.distance_comparison import (
     labels_from_theta,
     native_mog_ground_truth_matrices,
     pr_autoencoder_ground_truth_matrices,
+    velocity_family_for_metric,
     write_pairs_csv,
     write_results_npz,
     write_summary_json,
@@ -130,6 +131,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--depth", type=int, default=5)
     p.add_argument("--low-rank-dim", type=int, default=4)
     p.add_argument("--radius", type=float, default=1.0, help="Fixed norm radius for cosine/correlation flow rows.")
+    p.add_argument(
+        "--corr-soft-eps",
+        type=float,
+        default=1e-2,
+        help="Soft centered normalization epsilon for correlation flow rows.",
+    )
+    p.add_argument(
+        "--correlation-flow-family",
+        choices=("soft", "fixed"),
+        default="soft",
+        help="Centered correlation translation family: soft regularized norm or fixed hard norm.",
+    )
     p.add_argument("--path-schedule", choices=("cosine", "linear", "straight"), default="cosine")
     p.add_argument("--t-eps", type=float, default=0.0005)
     p.add_argument("--quadrature-steps", type=int, default=64)
@@ -219,6 +232,8 @@ def _flow_config_from_args(args: argparse.Namespace) -> FlowComparisonConfig:
         depth=int(args.depth),
         low_rank_dim=int(args.low_rank_dim),
         radius=float(args.radius),
+        corr_soft_eps=float(args.corr_soft_eps),
+        correlation_flow_family=str(args.correlation_flow_family),
         path_schedule=str(args.path_schedule),
         t_eps=float(args.t_eps),
         quadrature_steps=int(args.quadrature_steps),
@@ -315,11 +330,12 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
         )
 
     print("[distance-comparison] training flow-matching metrics", flush=True)
+    flow_config = _flow_config_from_args(args)
     flow, flow_paths = flow_metric_matrices(
         bundle=work_bundle,
         device=dev,
         output_dir=output_dir / "flow",
-        config=_flow_config_from_args(args),
+        config=flow_config,
         seed=int(args.seed),
         metrics=metrics,
     )
@@ -331,6 +347,7 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
         flow_matching=flow,
         ground_truth=ground_truth,
         flow_npz_paths=flow_paths,
+        flow_velocity_families={metric: velocity_family_for_metric(metric, flow_config) for metric in metrics},
     )
 
     results_npz = write_results_npz(output_dir / "mog5_pr_distance_comparison_results.npz", result)
@@ -360,7 +377,7 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
             "skl_folds": int(args.skl_folds),
             "skl_logistic_c": float(args.skl_logistic_c),
             "pr_cache_dir": str(Path(args.pr_cache_dir)),
-            "flow_defaults": vars(_flow_config_from_args(args)),
+            "flow_defaults": vars(flow_config),
         },
     )
     print(f"results_npz: {results_npz}", flush=True)

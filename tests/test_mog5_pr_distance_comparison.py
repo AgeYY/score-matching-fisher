@@ -183,6 +183,7 @@ def test_flow_metric_mapping_and_mahalanobis_shared_assembly(monkeypatch, tmp_pa
         "translation": 11.0,
         "translation_fixed_norm": 22.0,
         "translation_centered_fixed_norm": 33.0,
+        "translation_centered_soft_norm": 66.0,
         "shared_affine": 55.0,
         "nonlinear": 44.0,
     }
@@ -224,7 +225,7 @@ def test_flow_metric_mapping_and_mahalanobis_shared_assembly(monkeypatch, tmp_pa
     assert seen_families[:3] == [
         "translation",
         "translation_fixed_norm",
-        "translation_centered_fixed_norm",
+        "translation_centered_soft_norm",
     ]
     assert seen_families[3:] == ["shared_affine", "nonlinear"]
     shared_call = calls[3]
@@ -236,15 +237,54 @@ def test_flow_metric_mapping_and_mahalanobis_shared_assembly(monkeypatch, tmp_pa
     np.testing.assert_allclose(shared_call["theta_eval"], np.eye(3, dtype=np.float64))
     assert matrices[dc.METRIC_SQUARED_EUCLIDEAN][0, 1] == 11.0
     assert matrices[dc.METRIC_COSINE][0, 1] == 22.0 / 8.0
-    assert matrices[dc.METRIC_CORRELATION][0, 1] == 33.0 / 8.0
+    assert matrices[dc.METRIC_CORRELATION][0, 1] == 66.0 / 8.0
     assert matrices[dc.METRIC_SYMMETRIC_KL][0, 1] == 44.0
     np.testing.assert_allclose(
         matrices[dc.METRIC_MAHALANOBIS_SQ],
         55.0 * (np.ones((3, 3), dtype=np.float64) - np.eye(3, dtype=np.float64)),
     )
     assert paths[dc.METRIC_SQUARED_EUCLIDEAN].is_file()
+    with np.load(paths[dc.METRIC_CORRELATION], allow_pickle=True) as data:
+        assert str(data["velocity_family"][0]) == "translation_centered_soft_norm"
+        assert float(data["corr_soft_eps"][0]) == pytest.approx(1e-2)
+        np.testing.assert_allclose(
+            data["flow_matching_matrix"],
+            matrices[dc.METRIC_CORRELATION],
+        )
     assert paths[dc.METRIC_MAHALANOBIS_SQ].is_file()
     assert "mahalanobis_sq:0-1" not in paths
+
+
+def test_correlation_flow_family_fixed_override_routes_to_hard_norm(monkeypatch, tmp_path: Path) -> None:
+    bundle = _toy_bundle()
+    calls: list[dict[str, object]] = []
+
+    def fake_train_and_estimate_flow(**kwargs):
+        calls.append(kwargs)
+        mat = np.asarray([[0.0, 8.0, 8.0], [8.0, 0.0, 8.0], [8.0, 8.0, 0.0]], dtype=np.float64)
+        return FlowSKLResult(
+            symmetric_kl_matrix=mat,
+            canonical_metric_matrix=mat.copy(),
+            canonical_metric_name="model_jeffreys_symmetric_kl",
+        )
+
+    monkeypatch.setattr(dc, "train_and_estimate_flow", fake_train_and_estimate_flow)
+    matrices, paths = dc.flow_metric_matrices(
+        bundle=bundle,
+        device=torch.device("cpu"),
+        output_dir=tmp_path,
+        config=dc.FlowComparisonConfig(epochs=1, radius=2.0, correlation_flow_family="fixed", corr_soft_eps=3e-3),
+        metrics=(dc.METRIC_CORRELATION,),
+    )
+
+    assert [c["velocity_family"] for c in calls] == ["translation_centered_fixed_norm"]
+    np.testing.assert_allclose(
+        matrices[dc.METRIC_CORRELATION],
+        [[0.0, 1.0, 1.0], [1.0, 0.0, 1.0], [1.0, 1.0, 0.0]],
+    )
+    with np.load(paths[dc.METRIC_CORRELATION], allow_pickle=True) as data:
+        assert str(data["velocity_family"][0]) == "translation_centered_fixed_norm"
+        assert float(data["corr_soft_eps"][0]) == pytest.approx(3e-3)
 
 
 def test_flow_metric_matrices_normalizes_x_train_only_and_persists_metadata(monkeypatch, tmp_path: Path) -> None:
@@ -372,6 +412,7 @@ def test_train_and_estimate_flow_uses_model_jeffreys_readout(monkeypatch) -> Non
 
     assert build_calls
     assert build_calls[0]["shared_affine_a_diag_jitter"] == 2e-3
+    assert build_calls[0]["corr_soft_eps"] == pytest.approx(1e-2)
     assert train_calls
     assert train_calls[0]["ema_alpha"] == pytest.approx(0.2)
     assert estimate_calls
@@ -387,6 +428,8 @@ def test_train_and_estimate_flow_uses_model_jeffreys_readout(monkeypatch) -> Non
 def test_flow_comparison_config_normalize_x_defaults_are_opt_in() -> None:
     assert dc.FlowComparisonConfig().normalize_x is False
     assert dc.FlowComparisonConfig().normalize_x_eps == pytest.approx(1e-8)
+    assert dc.FlowComparisonConfig().corr_soft_eps == pytest.approx(1e-2)
+    assert dc.FlowComparisonConfig().correlation_flow_family == "soft"
 
 
 def test_flow_comparison_config_default_t_eps_is_small_endpoint_clamp() -> None:
@@ -430,6 +473,29 @@ def test_save_flow_result_npz_persists_monitor_losses_and_ema_alpha(tmp_path: Pa
         assert float(data["flow_normalize_x_eps"][0]) == pytest.approx(1e-6)
         np.testing.assert_allclose(data["flow_normalize_x_mean"], [1.0, 2.0])
         np.testing.assert_allclose(data["flow_normalize_x_std"], [3.0, 4.0])
+
+
+def test_save_flow_result_npz_persists_flow_readout_and_corr_soft_eps(tmp_path: Path) -> None:
+    result = FlowSKLResult(
+        symmetric_kl_matrix=np.asarray([[0.0, 8.0], [8.0, 0.0]], dtype=np.float64),
+        canonical_metric_matrix=np.asarray([[0.0, 8.0], [8.0, 0.0]], dtype=np.float64),
+        canonical_metric_name="model_jeffreys_symmetric_kl",
+    )
+    path = dc.save_flow_result_npz(
+        tmp_path / "flow.npz",
+        result=result,
+        metric=dc.METRIC_CORRELATION,
+        theta_eval=np.eye(2, dtype=np.float64),
+        velocity_family="translation_centered_soft_norm",
+        flow_metric_matrix=np.asarray([[0.0, 1.0], [1.0, 0.0]], dtype=np.float64),
+        corr_soft_eps=1e-3,
+    )
+
+    with np.load(path, allow_pickle=True) as data:
+        np.testing.assert_allclose(data["symmetric_kl_matrix"], [[0.0, 8.0], [8.0, 0.0]])
+        np.testing.assert_allclose(data["flow_matching_matrix"], [[0.0, 1.0], [1.0, 0.0]])
+        assert str(data["velocity_family"][0]) == "translation_centered_soft_norm"
+        assert float(data["corr_soft_eps"][0]) == pytest.approx(1e-3)
 
 
 def test_shared_affine_normalization_preserves_gaussian_symmetric_kl() -> None:
@@ -510,6 +576,8 @@ def test_cli_default_path_resolution_without_running_training() -> None:
     assert args.gt_samples_per_class == 100_000
     assert args.mc_jeffreys_sample == 4096
     assert args.radius == 1.0
+    assert args.corr_soft_eps == pytest.approx(1e-2)
+    assert args.correlation_flow_family == "soft"
     assert args.ode_method == "midpoint"
     assert args.t_eps == 0.0005
     assert args.early_ema_alpha == 0.05
@@ -517,6 +585,8 @@ def test_cli_default_path_resolution_without_running_training() -> None:
     assert args.flow_normalize_x_eps == pytest.approx(1e-8)
     assert mod._flow_config_from_args(args).mc_jeffreys_sample == 4096
     assert mod._flow_config_from_args(args).radius == 1.0
+    assert mod._flow_config_from_args(args).corr_soft_eps == pytest.approx(1e-2)
+    assert mod._flow_config_from_args(args).correlation_flow_family == "soft"
     assert mod._flow_config_from_args(args).t_eps == 0.0005
     assert mod._flow_config_from_args(args).early_ema_alpha == 0.05
     assert mod._flow_config_from_args(args).normalize_x is False
@@ -544,6 +614,16 @@ def test_cli_flow_normalize_x_override_propagates_to_flow_config() -> None:
     assert args.flow_normalize_x_eps == pytest.approx(1e-5)
     assert mod._flow_config_from_args(args).normalize_x is True
     assert mod._flow_config_from_args(args).normalize_x_eps == pytest.approx(1e-5)
+
+
+def test_cli_correlation_flow_options_propagate_to_flow_config() -> None:
+    mod = _load_cli_module()
+    args = mod.build_parser().parse_args(["--corr-soft-eps", "0.003", "--correlation-flow-family", "fixed"])
+    assert args.corr_soft_eps == pytest.approx(0.003)
+    assert args.correlation_flow_family == "fixed"
+    cfg = mod._flow_config_from_args(args)
+    assert cfg.corr_soft_eps == pytest.approx(0.003)
+    assert cfg.correlation_flow_family == "fixed"
 
 
 def test_cli_run_passes_selected_metric_only(monkeypatch, tmp_path: Path) -> None:

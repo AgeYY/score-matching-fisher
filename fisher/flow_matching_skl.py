@@ -27,6 +27,7 @@ VELOCITY_FAMILIES = (
     "translation",
     "translation_fixed_norm",
     "translation_centered_fixed_norm",
+    "translation_centered_soft_norm",
     "shared_affine",
     "shared_affine_scalar",
     "shared_affine_diag",
@@ -43,6 +44,7 @@ TRANSLATION_FAMILIES = {
     "translation",
     "translation_fixed_norm",
     "translation_centered_fixed_norm",
+    "translation_centered_soft_norm",
 }
 
 LOW_RANK_AFFINE_FAMILIES = {
@@ -468,6 +470,20 @@ def centered_radius_normalize(x: torch.Tensor, radius: float, *, eps: float = 1e
     return row_radius_normalize(x - x.mean(dim=1, keepdim=True), radius, eps=eps)
 
 
+def centered_soft_radius_normalize(x: torch.Tensor, radius: float, *, eps: float = 1e-2) -> torch.Tensor:
+    """Smooth centered row normalization with nonzero gradients at small row norms."""
+
+    r = float(radius)
+    if not math.isfinite(r) or r <= 0.0:
+        raise ValueError("radius must be finite and positive.")
+    e = float(eps)
+    if not math.isfinite(e) or e <= 0.0:
+        raise ValueError("eps must be finite and positive.")
+    z = x - x.mean(dim=1, keepdim=True)
+    denom = torch.sqrt(torch.sum(z * z, dim=1, keepdim=True) + e * e)
+    return r * z / denom
+
+
 class TranslationFlowSKLModel(nn.Module):
     """Translation endpoint model ``x_1 = x_0 + b(theta)``."""
 
@@ -483,6 +499,7 @@ class TranslationFlowSKLModel(nn.Module):
         path_schedule: str | GaussianAffinePathSchedule = "cosine",
         divergence_estimator: str = "exact",
         hutchinson_probes: int = 1,
+        corr_soft_eps: float = 1e-2,
     ) -> None:
         super().__init__()
         fam = _normalize_velocity_family(velocity_family)
@@ -494,6 +511,10 @@ class TranslationFlowSKLModel(nn.Module):
         self.theta_dim = int(theta_dim)
         self.x_dim = int(x_dim)
         self.radius = float(radius)
+        eps = float(corr_soft_eps)
+        if not math.isfinite(eps) or eps <= 0.0:
+            raise ValueError("corr_soft_eps must be finite and positive.")
+        self.corr_soft_eps = eps
         _set_divergence_controls(
             self,
             divergence_estimator=divergence_estimator,
@@ -522,6 +543,8 @@ class TranslationFlowSKLModel(nn.Module):
             return row_radius_normalize(raw, self.radius)
         if self.velocity_family == "translation_centered_fixed_norm":
             return centered_radius_normalize(raw, self.radius)
+        if self.velocity_family == "translation_centered_soft_norm":
+            return centered_soft_radius_normalize(raw, self.radius, eps=self.corr_soft_eps)
         return raw
 
     def forward(self, x: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
@@ -1195,6 +1218,7 @@ def build_flow_skl_model(
     divergence_estimator: str = "hutchinson",
     hutchinson_probes: int = 1,
     shared_affine_a_diag_jitter: float = 1e-3,
+    corr_soft_eps: float = 1e-2,
 ) -> nn.Module:
     """Build a velocity-family model for flow-matching SKL estimation."""
 
@@ -1212,6 +1236,7 @@ def build_flow_skl_model(
             path_schedule=path_schedule,
             divergence_estimator=str(divergence_estimator),
             hutchinson_probes=int(hutchinson_probes),
+            corr_soft_eps=float(corr_soft_eps),
             **common,
         )
     shared_affine_classes = {
