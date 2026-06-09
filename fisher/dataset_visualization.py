@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.patches import Ellipse
 from matplotlib.cm import ScalarMappable
 from matplotlib.collections import LineCollection
 from matplotlib.colors import Normalize
@@ -27,6 +28,114 @@ def _categorical_labels(theta: np.ndarray, k: int) -> np.ndarray:
     if arr.ndim == 2 and int(arr.shape[1]) == int(k):
         return np.argmax(np.asarray(arr, dtype=np.float64), axis=1).astype(np.int64)
     return np.asarray(arr).reshape(-1).astype(np.int64)
+
+
+def plot_mog5_native_scatter_covariance(
+    npz_path: str | Path,
+    *,
+    svg_path: str | Path,
+    png_path: str | Path,
+    max_points: int = 500,
+) -> tuple[Path, Path]:
+    """Plot a native 2D MoG5 shared-dataset NPZ with component covariance ellipses."""
+    from fisher.shared_dataset_io import load_shared_dataset_npz
+
+    bundle = load_shared_dataset_npz(npz_path)
+    meta = dict(bundle.meta)
+    if str(meta.get("dataset_family", "")) != "random_mog_categorical":
+        raise ValueError(f"Expected random_mog_categorical NPZ, got {meta.get('dataset_family')!r}.")
+    k = int(meta.get("num_categories", -1))
+    if k != 5:
+        raise ValueError(f"Expected num_categories=5, got {meta.get('num_categories')!r}.")
+    if int(meta.get("x_dim", -1)) != 2:
+        raise ValueError(f"Expected native x_dim=2, got {meta.get('x_dim')!r}.")
+
+    x = np.asarray(bundle.x_all, dtype=np.float64)
+    theta = np.asarray(bundle.theta_all)
+    if x.ndim != 2 or int(x.shape[1]) != 2:
+        raise ValueError(f"Expected x_all shape (N, 2), got {x.shape}.")
+    if int(theta.shape[0]) != int(x.shape[0]):
+        raise ValueError(f"theta_all and x_all row counts differ: {theta.shape[0]} vs {x.shape[0]}.")
+
+    means = np.asarray(meta.get("mog_component_means"), dtype=np.float64)
+    variances = np.asarray(meta.get("mog_component_variances"), dtype=np.float64)
+    if means.shape != (5, 2):
+        raise ValueError(f"Expected mog_component_means shape (5, 2), got {means.shape}.")
+    if variances.shape != (5, 2):
+        raise ValueError(f"Expected mog_component_variances shape (5, 2), got {variances.shape}.")
+    if not np.all(np.isfinite(means)) or not np.all(np.isfinite(variances)) or np.any(variances <= 0.0):
+        raise ValueError("MoG component means/variances must be finite with strictly positive variances.")
+
+    labels = _categorical_labels(theta, 5)
+    if labels.shape != (int(x.shape[0]),):
+        raise ValueError(f"Expected one label per row, got labels shape {labels.shape}.")
+    if np.any((labels < 0) | (labels >= 5)):
+        raise ValueError("MoG labels must be in [0, 4].")
+
+    n = int(x.shape[0])
+    cap = min(max(0, int(max_points)), n)
+    if cap < n:
+        rng = np.random.default_rng(0)
+        plot_idx = np.sort(rng.choice(n, size=cap, replace=False))
+    else:
+        plot_idx = np.arange(n, dtype=np.int64)
+
+    colors = [plt.get_cmap("tab10")(i) for i in range(5)]
+    fig, ax = plt.subplots(figsize=(6.6, 6.0), constrained_layout=True)
+    for cls in range(5):
+        mask = labels[plot_idx] == cls
+        if np.any(mask):
+            pts = x[plot_idx][mask]
+            ax.scatter(
+                pts[:, 0],
+                pts[:, 1],
+                s=24,
+                alpha=0.62,
+                color=colors[cls],
+                edgecolors="none",
+                label=f"category {cls}",
+            )
+
+    for cls in range(5):
+        mu = means[cls]
+        sigma = np.sqrt(variances[cls])
+        ax.add_patch(
+            Ellipse(
+                xy=(float(mu[0]), float(mu[1])),
+                width=float(2.0 * sigma[0]),
+                height=float(2.0 * sigma[1]),
+                angle=0.0,
+                facecolor=colors[cls],
+                edgecolor=colors[cls],
+                linewidth=1.35,
+                alpha=0.5,
+                zorder=2,
+            )
+        )
+        ax.scatter(
+            [float(mu[0])],
+            [float(mu[1])],
+            marker="X",
+            s=92,
+            color=colors[cls],
+            edgecolors="black",
+            linewidths=0.75,
+            zorder=4,
+        )
+
+    ax.set_title("MoG5 native dataset")
+    ax.set_aspect("equal", adjustable="datalim")
+    ax.set_axis_off()
+    ax.legend(loc="best", frameon=False, fontsize=8)
+
+    svg_path = Path(svg_path)
+    png_path = Path(png_path)
+    svg_path.parent.mkdir(parents=True, exist_ok=True)
+    png_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(svg_path)
+    fig.savefig(png_path, dpi=220)
+    plt.close(fig)
+    return svg_path, png_path
 
 
 def pca_project(x: np.ndarray, n_components: int = 2) -> tuple[np.ndarray, np.ndarray, np.ndarray]:

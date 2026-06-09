@@ -22,6 +22,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from fisher.distance_comparison import METRIC_NAMES
+from fisher.dataset_visualization import plot_mog5_native_scatter_covariance
 
 RESULTS_NAME = "mog5_pr_distance_comparison_results.npz"
 SWEEP_NPZ_NAME = "mog5_pr_distance_sweep_results.npz"
@@ -33,6 +34,8 @@ SWEEP_REL_SVG_NAME = "mog5_pr_distance_sweep_rel_error.svg"
 SWEEP_REL_PNG_NAME = "mog5_pr_distance_sweep_rel_error.png"
 SWEEP_FLOW_LOSS_SVG_NAME = "mog5_pr_distance_sweep_flow_loss_vs_epoch.svg"
 SWEEP_FLOW_LOSS_PNG_NAME = "mog5_pr_distance_sweep_flow_loss_vs_epoch.png"
+MOG5_DATASET_SVG_NAME = "mog5_native_dataset_scatter_covariance.svg"
+MOG5_DATASET_PNG_NAME = "mog5_native_dataset_scatter_covariance.png"
 REL_ERROR_DENOM_FLOOR = 1e-12
 
 
@@ -146,6 +149,42 @@ def case_flow_loss_npz(*, n_total: int, pr_dim: int | None, case_output_name: st
         case_output_dir(n_total=n_total, pr_dim=pr_dim, case_output_name=case_output_name)
         / "flow"
         / f"{metric}_flow_matching_skl_results.npz"
+    )
+
+
+def representative_native_npz(
+    *,
+    args: argparse.Namespace,
+    case_paths: dict[tuple[int, int], Path],
+) -> Path:
+    n_total = max(int(v) for v in args.n_list)
+    case = _case_key(n_total, args.pr_dim)
+    if case in case_paths:
+        return Path(case_paths[case]).parent.parent / "random_mog_categorical.npz"
+    single = _load_single_case_module()
+    return Path(single.default_dataset_dir(n_total=n_total, pr_dim=args.pr_dim)) / "random_mog_categorical.npz"
+
+
+def maybe_plot_representative_dataset(
+    *,
+    args: argparse.Namespace,
+    case_paths: dict[tuple[int, int], Path],
+    output_dir: Path,
+) -> tuple[Path, Path] | None:
+    if bool(getattr(args, "skip_dataset_viz", False)):
+        return None
+    native_npz = representative_native_npz(args=args, case_paths=case_paths)
+    if not native_npz.is_file():
+        print(
+            f"[sweep] warning: skipped native MoG5 dataset figure; missing representative NPZ: {native_npz}",
+            flush=True,
+        )
+        return None
+    return plot_mog5_native_scatter_covariance(
+        native_npz,
+        svg_path=output_dir / MOG5_DATASET_SVG_NAME,
+        png_path=output_dir / MOG5_DATASET_PNG_NAME,
+        max_points=500,
     )
 
 
@@ -700,6 +739,7 @@ def write_summary(path: Path, *, args: argparse.Namespace, case_paths: dict[tupl
 def run(args: argparse.Namespace) -> dict[str, Path]:
     output_dir = Path(args.output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
+
     metrics = resolve_metric_names(args)
 
     case_paths: dict[tuple[int, int], Path] = {}
@@ -753,6 +793,11 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
         png_path=output_dir / SWEEP_FLOW_LOSS_PNG_NAME,
         yscale=str(args.loss_yscale),
     )
+    dataset_paths = maybe_plot_representative_dataset(
+        args=args,
+        case_paths=case_paths,
+        output_dir=output_dir,
+    )
     outputs = {
         "results_npz": npz_path,
         "errors_csv": csv_path,
@@ -766,6 +811,9 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
     if loss_paths is not None:
         outputs["flow_loss_figure_svg"] = loss_paths[0]
         outputs["flow_loss_figure_png"] = loss_paths[1]
+    if dataset_paths is not None:
+        outputs["dataset_figure_svg"] = dataset_paths[0]
+        outputs["dataset_figure_png"] = dataset_paths[1]
     summary_path = write_summary(
         output_dir / SWEEP_SUMMARY_NAME,
         args=args,
@@ -796,6 +844,9 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
                 f"[sweep] warning: skipped {len(flow_loss_warnings)} missing or incomplete flow loss cache(s). First issue: {flow_loss_warnings[0]}",
                 flush=True,
             )
+    if dataset_paths is not None:
+        print(f"dataset_figure_svg: {dataset_paths[0]}", flush=True)
+        print(f"dataset_figure_png: {dataset_paths[1]}", flush=True)
     print(f"summary_json: {summary_path}", flush=True)
     return outputs
 

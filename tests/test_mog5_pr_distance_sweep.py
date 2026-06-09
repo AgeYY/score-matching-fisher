@@ -8,6 +8,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from fisher.dataset_visualization import plot_mog5_native_scatter_covariance
+from fisher.shared_dataset_io import save_shared_dataset_npz
+
 ALL_METRICS = (
     "squared_euclidean",
     "cosine",
@@ -71,6 +74,63 @@ def _write_flow_loss_npz(path: Path, *, scale: float = 1.0, include_val_monitor:
     np.savez_compressed(
         path,
         **payload,
+    )
+    return path
+
+
+def _write_native_mog5_npz(path: Path, *, n_total: int = 25) -> Path:
+    k = 5
+    labels = np.arange(n_total, dtype=np.int64) % k
+    theta_all = np.eye(k, dtype=np.float64)[labels]
+    means = np.asarray(
+        [
+            [-2.0, -1.0],
+            [0.0, -1.4],
+            [2.0, -0.8],
+            [-1.0, 1.3],
+            [1.4, 1.2],
+        ],
+        dtype=np.float64,
+    )
+    variances = np.asarray(
+        [
+            [0.20, 0.35],
+            [0.30, 0.25],
+            [0.28, 0.40],
+            [0.35, 0.22],
+            [0.24, 0.32],
+        ],
+        dtype=np.float64,
+    )
+    offsets = np.column_stack(
+        [
+            0.05 * np.sin(np.arange(n_total, dtype=np.float64)),
+            0.05 * np.cos(np.arange(n_total, dtype=np.float64)),
+        ]
+    )
+    x_all = means[labels] + offsets
+    train_idx = np.arange(n_total // 2, dtype=np.int64)
+    validation_idx = np.arange(n_total // 2, n_total, dtype=np.int64)
+    save_shared_dataset_npz(
+        path,
+        meta={
+            "dataset_family": "random_mog_categorical",
+            "theta_type": "categorical",
+            "theta_encoding": "one_hot",
+            "num_categories": k,
+            "x_dim": 2,
+            "n_total": n_total,
+            "mog_component_means": means.tolist(),
+            "mog_component_variances": variances.tolist(),
+        },
+        theta_all=theta_all,
+        x_all=x_all,
+        train_idx=train_idx,
+        validation_idx=validation_idx,
+        theta_train=theta_all[train_idx],
+        x_train=x_all[train_idx],
+        theta_validation=theta_all[validation_idx],
+        x_validation=x_all[validation_idx],
     )
     return path
 
@@ -222,6 +282,24 @@ def test_load_flow_loss_cache_allows_legacy_without_val_monitor_losses(tmp_path:
     np.testing.assert_allclose(out["val_losses"], [1.1, 0.7, 0.5, 0.55])
 
 
+def test_plot_mog5_native_scatter_covariance_writes_svg_and_png(tmp_path: Path) -> None:
+    native_npz = _write_native_mog5_npz(tmp_path / "random_mog_categorical.npz")
+
+    svg, png = plot_mog5_native_scatter_covariance(
+        native_npz,
+        svg_path=tmp_path / "figure.svg",
+        png_path=tmp_path / "figure.png",
+        max_points=12,
+    )
+
+    assert svg.is_file()
+    assert png.is_file()
+    assert svg.stat().st_size > 0
+    assert png.stat().st_size > 0
+    svg_text = svg.read_text(encoding="utf-8")
+    assert "<image" not in svg_text
+
+
 def test_cache_hits_do_not_rerun_and_duplicate_case_is_deduped(monkeypatch, tmp_path: Path) -> None:
     mod = _load_cli_module()
     calls: list[object] = []
@@ -285,6 +363,7 @@ def test_visualization_only_writes_outputs_from_fake_caches(monkeypatch, tmp_pat
         lambda *, n_total, pr_dim, case_output_name: tmp_path / f"case_{n_total}_{pr_dim}",
     )
     _write_case_npz(tmp_path / "case_100_2" / mod.RESULTS_NAME)
+    _write_native_mog5_npz(tmp_path / "random_mog_categorical.npz")
     args = mod.build_parser().parse_args(
         [
             "--visualization-only",
@@ -305,6 +384,8 @@ def test_visualization_only_writes_outputs_from_fake_caches(monkeypatch, tmp_pat
     assert outputs["abs_error_figure_png"].is_file()
     assert outputs["rel_error_figure_svg"].is_file()
     assert outputs["rel_error_figure_png"].is_file()
+    assert outputs["dataset_figure_svg"].is_file()
+    assert outputs["dataset_figure_png"].is_file()
     assert outputs["summary_json"].is_file()
     with np.load(outputs["results_npz"], allow_pickle=False) as data:
         assert data["n_sweep_classical_matrices"].shape == (1, 5, 3, 3)
@@ -322,7 +403,38 @@ def test_visualization_only_writes_outputs_from_fake_caches(monkeypatch, tmp_pat
     assert "pr_dim_list" not in summary["config"]
     assert "abs_error_figure_svg" in summary["outputs"]
     assert "rel_error_figure_svg" in summary["outputs"]
+    assert "dataset_figure_svg" in summary["outputs"]
+    assert "dataset_figure_png" in summary["outputs"]
     assert "flow_loss_figure_svg" not in summary["outputs"]
+
+
+def test_skip_dataset_viz_omits_sweep_dataset_figure(monkeypatch, tmp_path: Path) -> None:
+    mod = _load_cli_module()
+    monkeypatch.setattr(
+        mod,
+        "case_output_dir",
+        lambda *, n_total, pr_dim, case_output_name: tmp_path / f"case_{n_total}_{pr_dim}",
+    )
+    _write_case_npz(tmp_path / "case_100_2" / mod.RESULTS_NAME)
+    _write_native_mog5_npz(tmp_path / "random_mog_categorical.npz")
+    args = mod.build_parser().parse_args(
+        [
+            "--visualization-only",
+            "--skip-dataset-viz",
+            "--n-list",
+            "100",
+            "--output-dir",
+            str(tmp_path / "sweep"),
+        ]
+    )
+
+    outputs = mod.run(args)
+
+    assert "dataset_figure_svg" not in outputs
+    assert "dataset_figure_png" not in outputs
+    summary = json.loads(outputs["summary_json"].read_text(encoding="utf-8"))
+    assert "dataset_figure_svg" not in summary["outputs"]
+    assert "dataset_figure_png" not in summary["outputs"]
 
 
 def test_native_visualization_only_uses_native_cache_and_summary(monkeypatch, tmp_path: Path) -> None:
