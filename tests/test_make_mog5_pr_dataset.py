@@ -32,7 +32,7 @@ def test_parser_defaults_and_output_path_naming() -> None:
     out_dir = mod.resolve_output_dir(args)
 
     assert args.seed == 7
-    assert args.train_frac == 0.9
+    assert args.train_frac == 0.8
     assert args.device == "cuda"
     assert args.force is False
     assert args.use_cache is False
@@ -126,7 +126,7 @@ def test_command_construction_for_native_and_pr(monkeypatch: pytest.MonkeyPatch,
     assert _flag_value(native, "--num-categories") == "5"
     assert _flag_value(native, "--x-dim") == "2"
     assert _flag_value(native, "--n-total") == "456"
-    assert _flag_value(native, "--train-frac") == "0.9"
+    assert _flag_value(native, "--train-frac") == "0.8"
     assert _flag_value(native, "--seed") == "7"
 
     assert _flag_value(projected, "--h-dim") == "9"
@@ -143,9 +143,11 @@ def test_command_construction_for_native_and_pr(monkeypatch: pytest.MonkeyPatch,
     assert _flag_value(projected, "--cache-dir") == str(tmp_path / "cache")
 
 
-def test_pr_dim_must_exceed_native_dim() -> None:
+def test_pr_dim_must_be_at_least_native_dim() -> None:
     mod = _load_module()
-    args = mod.parse_args(["--pr-dim", "2"])
+    valid_args = mod.parse_args(["--pr-dim", "2"])
+    mod.validate_args(valid_args)
 
-    with pytest.raises(ValueError, match="--pr-dim must be > 2"):
-        mod.validate_args(args)
+    invalid_args = mod.parse_args(["--pr-dim", "1"])
+    with pytest.raises(ValueError, match="--pr-dim must be >= native x_dim=2"):
+        mod.validate_args(invalid_args)

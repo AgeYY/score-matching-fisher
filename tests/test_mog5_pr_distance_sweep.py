@@ -101,7 +101,7 @@ def test_parser_defaults() -> None:
     args = mod.build_parser().parse_args([])
 
     assert args.n_list == [100, 550, 1000, 1550]
-    assert args.pr_dim == 5
+    assert args.pr_dim == 2
     assert not hasattr(args, "pr_dim_list")
     assert args.n_total == 1000
     assert args.device == "cuda"
@@ -117,7 +117,7 @@ def test_aggregate_mean_pairwise_abs_errors(tmp_path: Path) -> None:
     mod = _load_cli_module()
     args = mod.build_parser().parse_args(["--n-list", "100"])
     data = {
-        (100, 5): mod._load_case_cache(_write_case_npz(tmp_path / "case_a.npz", offset=0.0)),
+        (100, 2): mod._load_case_cache(_write_case_npz(tmp_path / "case_a.npz", offset=0.0)),
     }
 
     aggregate, rows = mod.aggregate_sweeps(args=args, case_data=data)
@@ -141,7 +141,7 @@ def test_relative_error_uses_denominator_floor_for_zero_ground_truth(tmp_path: P
     mod = _load_cli_module()
     args = mod.build_parser().parse_args(["--n-list", "100", "--metric", "squared_euclidean"])
     data = {
-        (100, 5): mod._load_case_cache(_write_zero_gt_case_npz(tmp_path / "case_a.npz")),
+        (100, 2): mod._load_case_cache(_write_zero_gt_case_npz(tmp_path / "case_a.npz")),
     }
 
     _, rows = mod.aggregate_sweeps(args=args, case_data=data)
@@ -188,7 +188,7 @@ def test_cache_hits_do_not_rerun_and_duplicate_case_is_deduped(monkeypatch, tmp_
         "case_output_dir",
         lambda *, n_total, pr_dim, case_output_name: tmp_path / f"case_{n_total}_{pr_dim}",
     )
-    _write_case_npz(tmp_path / "case_1000_5" / mod.RESULTS_NAME)
+    _write_case_npz(tmp_path / "case_1000_2" / mod.RESULTS_NAME)
 
     class FakeSingle:
         @staticmethod
@@ -217,7 +217,7 @@ def test_cache_hits_do_not_rerun_and_duplicate_case_is_deduped(monkeypatch, tmp_
 
     assert len(calls) == 1
     assert calls[0].n_total == 2000
-    assert calls[0].pr_dim == 5
+    assert calls[0].pr_dim == 2
 
 
 def test_visualization_only_missing_cache_fails(monkeypatch, tmp_path: Path) -> None:
@@ -240,7 +240,7 @@ def test_visualization_only_writes_outputs_from_fake_caches(monkeypatch, tmp_pat
         "case_output_dir",
         lambda *, n_total, pr_dim, case_output_name: tmp_path / f"case_{n_total}_{pr_dim}",
     )
-    _write_case_npz(tmp_path / "case_100_5" / mod.RESULTS_NAME)
+    _write_case_npz(tmp_path / "case_100_2" / mod.RESULTS_NAME)
     args = mod.build_parser().parse_args(
         [
             "--visualization-only",
@@ -288,8 +288,8 @@ def test_visualization_only_writes_flow_loss_outputs_from_fake_caches(monkeypatc
         "case_output_dir",
         lambda *, n_total, pr_dim, case_output_name: tmp_path / f"case_{n_total}_{pr_dim}",
     )
-    _write_case_npz(tmp_path / "case_100_5" / mod.RESULTS_NAME)
-    _write_flow_loss_npz(tmp_path / "case_100_5" / "flow" / "symmetric_kl_flow_matching_skl_results.npz")
+    _write_case_npz(tmp_path / "case_100_2" / mod.RESULTS_NAME)
+    _write_flow_loss_npz(tmp_path / "case_100_2" / "flow" / "symmetric_kl_flow_matching_skl_results.npz")
     args = mod.build_parser().parse_args(
         [
             "--visualization-only",
@@ -319,7 +319,7 @@ def test_visualization_only_filters_cached_metric(monkeypatch, tmp_path: Path) -
         "case_output_dir",
         lambda *, n_total, pr_dim, case_output_name: tmp_path / f"case_{n_total}_{pr_dim}",
     )
-    _write_case_npz(tmp_path / "case_100_5" / mod.RESULTS_NAME)
+    _write_case_npz(tmp_path / "case_100_2" / mod.RESULTS_NAME)
     args = mod.build_parser().parse_args(
         [
             "--visualization-only",
@@ -353,7 +353,7 @@ def test_visualization_only_requested_metric_missing_from_cache_fails(monkeypatc
         lambda *, n_total, pr_dim, case_output_name: tmp_path / f"case_{n_total}_{pr_dim}",
     )
     _write_case_npz(
-        tmp_path / "case_100_5" / mod.RESULTS_NAME,
+        tmp_path / "case_100_2" / mod.RESULTS_NAME,
         metrics=("squared_euclidean",),
     )
     args = mod.build_parser().parse_args(

@@ -59,6 +59,15 @@ def test_project_parser_adversarial_defaults() -> None:
     assert args.pr_adv_train_samples == 0
 
 
+def test_project_h_dim_validation_allows_native_dim() -> None:
+    mod = _load_project_module()
+
+    mod.validate_h_dim(h_dim=2, z_dim=2)
+
+    with pytest.raises(ValueError, match="--h-dim must be >= latent z_dim=2"):
+        mod.validate_h_dim(h_dim=1, z_dim=2)
+
+
 def test_adversarial_cache_key_depends_on_source_sha() -> None:
     base = PRAutoencoderConfig(z_dim=2, h_dim=4, train_epochs=2)
     assert config_cache_key(base, seed=7) == config_cache_key(PRAutoencoderConfig(z_dim=2, h_dim=4, train_epochs=2), seed=7)
@@ -136,6 +145,37 @@ def test_non_adversarial_training_does_not_require_labels_cpu(tmp_path: Path) ->
     )
 
     assert set(got.metrics) == {"loss", "recon", "pr"}
+
+
+def test_native_dim_pr_autoencoder_trains_and_preserves_shapes_cpu(tmp_path: Path) -> None:
+    cfg = PRAutoencoderConfig(
+        z_dim=2,
+        h_dim=2,
+        hidden1=8,
+        hidden2=8,
+        train_epochs=1,
+        train_samples=8,
+        train_batch_size=4,
+    )
+
+    got = train_or_load_pr_autoencoder(
+        config=cfg,
+        seed=5,
+        device=torch.device("cpu"),
+        cache_dir=tmp_path,
+        force_retrain=True,
+        logger=None,
+    )
+
+    x = torch.randn(5, 2)
+    with torch.no_grad():
+        h, z_hat = got.model(x)
+
+    assert got.loaded_from_cache is False
+    assert h.shape == (5, 2)
+    assert z_hat.shape == (5, 2)
+    assert got.metrics["loss"].shape == (1,)
+    assert np.all(np.isfinite(got.metrics["loss"]))
 
 
 def _balanced_binary_gaussian_data(

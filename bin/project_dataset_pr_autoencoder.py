@@ -331,7 +331,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--h-dim",
         type=int,
         required=True,
-        help="Target observation dimension after embedding (must be > source x_dim / z_dim).",
+        help="Target observation dimension after embedding (must be >= source x_dim / z_dim).",
     )
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument(
@@ -420,6 +420,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+def validate_h_dim(*, h_dim: int, z_dim: int) -> None:
+    if int(h_dim) < int(z_dim):
+        raise ValueError(f"--h-dim must be >= latent z_dim={int(z_dim)}; got {int(h_dim)}.")
+
+
 def main() -> None:
     args = parse_args()
     in_path = Path(args.input_npz).resolve()
@@ -449,8 +454,7 @@ def main() -> None:
         raise ValueError(f"Input x_all shape {x_all.shape} inconsistent with meta x_dim={z_dim}.")
 
     h_dim = int(args.h_dim)
-    if h_dim <= z_dim:
-        raise ValueError(f"--h-dim must be > latent z_dim={z_dim}; got {h_dim}.")
+    validate_h_dim(h_dim=h_dim, z_dim=z_dim)
 
     device_name = str(args.device)
     if device_name == "cuda" and not torch.cuda.is_available():

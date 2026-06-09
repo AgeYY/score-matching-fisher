@@ -71,7 +71,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--n-total", type=int, default=1_000, help="Total joint samples.")
-    p.add_argument("--pr-dim", type=int, default=5, help="Target PR-embedded x dimension; must be > 2.")
+    p.add_argument("--pr-dim", type=int, default=5, help="Target PR-embedded x dimension; must be >= 2.")
     p.add_argument("--seed", type=int, default=7, help="Dataset and PR-autoencoder seed.")
     p.add_argument("--train-frac", type=float, default=0.8, help="Fraction of rows assigned to train_idx.")
     p.add_argument("--device", type=str, default="cuda", help="Device passed to the PR projection script.")
@@ -118,8 +118,8 @@ def resolve_output_dir(args: argparse.Namespace) -> Path:
 
 
 def validate_args(args: argparse.Namespace) -> None:
-    if int(args.pr_dim) <= NATIVE_X_DIM:
-        raise ValueError(f"--pr-dim must be > {NATIVE_X_DIM}; got {args.pr_dim}.")
+    if int(args.pr_dim) < NATIVE_X_DIM:
+        raise ValueError(f"--pr-dim must be >= native x_dim={NATIVE_X_DIM}; got {args.pr_dim}.")
     if int(args.n_total) <= 0:
         raise ValueError(f"--n-total must be positive; got {args.n_total}.")
     tf = float(args.train_frac)

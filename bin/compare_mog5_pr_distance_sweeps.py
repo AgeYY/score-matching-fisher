@@ -65,7 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
     single = _load_single_case_module()
     p = single.build_parser()
     p.description = __doc__
-    p.set_defaults(n_total=1_000, pr_dim=5, output_dir=default_output_dir())
+    p.set_defaults(n_total=1_000, pr_dim=2, output_dir=default_output_dir())
     for action in p._actions:
         if action.dest == "output_dir":
             action.help = "Aggregate sweep output directory."
