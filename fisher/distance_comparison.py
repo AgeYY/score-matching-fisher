@@ -464,6 +464,50 @@ def pr_autoencoder_ground_truth_matrices(
     return {metric: out[metric] for metric in metric_tuple}
 
 
+def native_mog_ground_truth_matrices(
+    *,
+    native_meta: dict[str, Any],
+    samples_per_class: int = 200_000,
+    seed: int = 7,
+    mahalanobis_ridge: float = 1e-6,
+    metrics: Iterable[str] = METRIC_NAMES,
+) -> dict[str, np.ndarray]:
+    """Monte Carlo native-coordinate MoG ground truth plus analytic native SKL."""
+
+    metric_tuple = tuple(str(m) for m in metrics)
+    sampled_metrics = tuple(m for m in metric_tuple if m != METRIC_SYMMETRIC_KL)
+    means = np.asarray(native_meta.get("mog_component_means"), dtype=np.float64)
+    variances = np.asarray(native_meta.get("mog_component_variances"), dtype=np.float64)
+    if means.ndim != 2 or variances.shape != means.shape:
+        raise ValueError("native_meta must contain mog_component_means and mog_component_variances.")
+    k, d = means.shape
+    out: dict[str, np.ndarray] = {}
+
+    if sampled_metrics:
+        n = int(samples_per_class)
+        if n < 2:
+            raise ValueError("samples_per_class must be at least 2.")
+        rng = np.random.default_rng(int(seed))
+        x_parts: list[np.ndarray] = []
+        labels = np.repeat(np.arange(k, dtype=np.int64), n)
+        for cls in range(k):
+            x = means[cls] + np.sqrt(variances[cls]) * rng.standard_normal(size=(n, d))
+            x_parts.append(x.astype(np.float64, copy=False))
+        x_all = np.vstack(x_parts)
+        out.update(
+            classical_metric_matrices(
+                x_all,
+                labels,
+                num_categories=k,
+                metrics=sampled_metrics,
+                mahalanobis_ridge=float(mahalanobis_ridge),
+            )
+        )
+    if METRIC_SYMMETRIC_KL in metric_tuple:
+        out[METRIC_SYMMETRIC_KL] = analytic_diagonal_gaussian_skl_matrix(means, variances)
+    return {metric: out[metric] for metric in metric_tuple}
+
+
 def _theta_eval_from_num_categories(num_categories: int) -> np.ndarray:
     return np.eye(int(num_categories), dtype=np.float64)
 

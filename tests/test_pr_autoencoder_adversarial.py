@@ -46,6 +46,26 @@ def test_categorical_labels_reject_non_integer_theta() -> None:
         mod._categorical_labels_from_theta(np.array([0.0, 0.5, 1.0]), num_categories=2)
 
 
+def test_categorical_empirical_embedded_mean_includes_last_category() -> None:
+    mod = _load_project_module()
+    k = 5
+    labels = np.array([0, 1, 2, 3, 4, 4, 4], dtype=np.float64)
+    x = np.stack(
+        [
+            labels,
+            labels + 10.0,
+        ],
+        axis=1,
+    )
+
+    t_emp, mu_emp = mod._categorical_empirical_embedded_mean(labels, x, k)
+
+    np.testing.assert_allclose(t_emp.ravel(), np.arange(k, dtype=np.float64))
+    np.testing.assert_allclose(mu_emp[:, 0], np.arange(k, dtype=np.float64))
+    np.testing.assert_allclose(mu_emp[4, 0], 4.0)
+    np.testing.assert_allclose(mu_emp[4, 1], 14.0)
+
+
 def test_project_parser_adversarial_defaults() -> None:
     mod = _load_project_module()
 

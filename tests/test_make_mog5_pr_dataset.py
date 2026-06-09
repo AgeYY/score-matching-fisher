@@ -41,6 +41,11 @@ def test_parser_defaults_and_output_path_naming() -> None:
     assert mod.native_npz_path(out_dir) == out_dir / "random_mog_categorical.npz"
     assert mod.projected_npz_path(out_dir, pr_dim=7) == out_dir / "random_mog_categorical_pr7.npz"
 
+    native_args = mod.parse_args(["--n-total", "123", "--pr-dim", "none"])
+    assert native_args.pr_dim is None
+    assert mod.parse_args(["--pr-dim", "NULL"]).pr_dim is None
+    assert mod.resolve_output_dir(native_args) == repo_root / "data" / "mog_5native_n123"
+
 
 def test_existing_files_are_skipped_unless_force(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     mod = _load_module()
@@ -141,6 +146,37 @@ def test_command_construction_for_native_and_pr(monkeypatch: pytest.MonkeyPatch,
     assert _flag_value(projected, "--pr-hidden1") == "16"
     assert _flag_value(projected, "--pr-hidden2") == "24"
     assert _flag_value(projected, "--cache-dir") == str(tmp_path / "cache")
+
+
+def test_native_mode_builds_only_native_dataset(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    mod = _load_module()
+    out_dir = tmp_path / "mog_5native_n456"
+    commands: list[list[str]] = []
+    validations: list[tuple[str, Path]] = []
+
+    def fake_validate_native(path: Path, *, n_total: int):
+        validations.append(("native", path))
+        assert n_total == 456
+        return None
+
+    def fake_validate_projected(*args, **kwargs):
+        raise AssertionError("native mode must not validate a projected NPZ")
+
+    def fake_build_project_command(*args, **kwargs):
+        raise AssertionError("native mode must not build a projection command")
+
+    monkeypatch.setattr(mod, "validate_native_npz", fake_validate_native)
+    monkeypatch.setattr(mod, "validate_projected_npz", fake_validate_projected)
+    monkeypatch.setattr(mod, "build_project_command", fake_build_project_command)
+
+    args = mod.parse_args(["--n-total", "456", "--pr-dim", "none", "--output-dir", str(out_dir)])
+    native_npz, projected_npz = mod.run(args, runner=lambda cmd: commands.append(list(cmd)))
+
+    assert projected_npz is None
+    assert native_npz == out_dir / "random_mog_categorical.npz"
+    assert len(commands) == 1
+    assert _flag_value(commands[0], "--output-npz") == str(native_npz)
+    assert validations == [("native", native_npz)]
 
 
 def test_pr_dim_must_be_at_least_native_dim() -> None:

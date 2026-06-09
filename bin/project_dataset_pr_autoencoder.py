@@ -112,6 +112,39 @@ def _stratified_label_subsample(labels: np.ndarray, *, n_samples: int, seed: int
     return out.astype(np.int64, copy=False)
 
 
+def _categorical_empirical_embedded_mean(
+    theta_all: np.ndarray,
+    x_embed: np.ndarray,
+    num_categories: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-category empirical mean of embedded x at centers 0, 1, ..., K-1."""
+    k = int(num_categories)
+    if k < 2:
+        raise ValueError("num_categories must be >= 2")
+    th = np.asarray(theta_all, dtype=np.float64).reshape(-1)
+    x = np.asarray(x_embed, dtype=np.float64)
+    if x.ndim != 2:
+        raise ValueError(f"x_embed must be 2D; got {x.shape}")
+    bins = np.arange(-0.5, float(k), 1.0, dtype=np.float64)
+    centers = np.arange(k, dtype=np.float64)
+    idx = np.digitize(th, bins, right=False) - 1
+    valid = (idx >= 0) & (idx < k)
+    if not np.all(valid):
+        bad = np.unique(th[~valid])
+        raise ValueError(f"categorical empirical mean: labels outside [0, {k - 1}]: {bad}")
+    ts: list[float] = []
+    means: list[np.ndarray] = []
+    for b in range(k):
+        mask = idx == b
+        if not np.any(mask):
+            continue
+        ts.append(float(centers[b]))
+        means.append(x[mask].mean(axis=0))
+    if not means:
+        raise ValueError("categorical empirical embedded mean produced no non-empty categories")
+    return np.asarray(ts, dtype=np.float64).reshape(-1, 1), np.vstack(means)
+
+
 def _binned_empirical_embedded_mean(
     theta_all: np.ndarray,
     x_embed: np.ndarray,
@@ -264,13 +297,22 @@ def _save_projection_summary_figure(
         theta_plot = theta_plot[pick]
         x_plot = x_plot[pick]
 
-    t_emp, mu_emp = _binned_empirical_embedded_mean(
-        th_all,
-        x_all,
-        float(base_dataset.theta_low),
-        float(base_dataset.theta_high),
-        int(pr_viz_mean_bins),
-    )
+    is_categorical = getattr(base_dataset, "theta_type", "") == "categorical"
+    if is_categorical:
+        num_categories = int(getattr(base_dataset, "num_categories", 0))
+        if num_categories < 2:
+            raise ValueError("categorical projection summary requires num_categories >= 2")
+        t_emp, mu_emp = _categorical_empirical_embedded_mean(th_all, x_all, num_categories)
+        mean_smooth_window = 0
+    else:
+        t_emp, mu_emp = _binned_empirical_embedded_mean(
+            th_all,
+            x_all,
+            float(base_dataset.theta_low),
+            float(base_dataset.theta_high),
+            int(pr_viz_mean_bins),
+        )
+        mean_smooth_window = int(pr_viz_mean_smooth_window)
 
     fig, axes = plt.subplots(1, 3, figsize=(12.0, 3.2), layout="constrained")
     ax_tune, ax_manifold, ax_loss = axes[0], axes[1], axes[2]
@@ -284,8 +326,11 @@ def _save_projection_summary_figure(
         mu_override=mu_emp,
         theta_grid_override=t_emp,
         n_theta_grid=500,
-        smooth_mean_window=int(pr_viz_mean_smooth_window),
+        smooth_mean_window=mean_smooth_window,
     )
+    if is_categorical:
+        ax_tune.set_xlabel("category")
+        ax_tune.set_ylabel(r"Mean of $x|category$")
 
     loss_raw = train_metrics.get("loss")
     if loss_raw is not None and np.asarray(loss_raw).size >= 1:

@@ -6,7 +6,8 @@ This is a small orchestration wrapper around:
 1. ``bin/make_dataset.py`` for the native 2D ``random_mog_categorical`` NPZ.
 2. ``bin/project_dataset_pr_autoencoder.py`` for the higher-dimensional PR embedding.
 
-The default output directory is ``<repo-root>/data/mog_5pr{pr_dim}_n{n_total}/``.
+The default output directory is ``<repo-root>/data/mog_5pr{pr_dim}_n{n_total}/``
+for PR runs, or ``<repo-root>/data/mog_5native_n{n_total}/`` for native runs.
 Existing native and projected NPZs are reused by default after metadata validation; pass
 ``--force`` to rerun both stages.
 """
@@ -50,7 +51,23 @@ def _repo_data_dir() -> Path:
     return data_dir
 
 
-def default_output_dir(*, n_total: int, pr_dim: int) -> Path:
+def parse_pr_dim(value: str | int | None) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    text = str(value).strip()
+    if text.lower() in {"none", "null"}:
+        return None
+    try:
+        return int(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("--pr-dim must be an integer, 'none', or 'null'.") from exc
+
+
+def default_output_dir(*, n_total: int, pr_dim: int | None) -> Path:
+    if pr_dim is None:
+        return _repo_data_dir() / f"mog_5native_n{int(n_total)}"
     return _repo_data_dir() / f"mog_5pr{int(pr_dim)}_n{int(n_total)}"
 
 
@@ -71,7 +88,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--n-total", type=int, default=1_000, help="Total joint samples.")
-    p.add_argument("--pr-dim", type=int, default=5, help="Target PR-embedded x dimension; must be >= 2.")
+    p.add_argument(
+        "--pr-dim",
+        type=parse_pr_dim,
+        default=5,
+        help="Target PR-embedded x dimension; must be >= 2. Use 'none' or 'null' for native 2D mode.",
+    )
     p.add_argument("--seed", type=int, default=7, help="Dataset and PR-autoencoder seed.")
     p.add_argument("--train-frac", type=float, default=0.8, help="Fraction of rows assigned to train_idx.")
     p.add_argument("--device", type=str, default="cuda", help="Device passed to the PR projection script.")
@@ -79,7 +101,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--output-dir",
         type=str,
         default=None,
-        help="Output directory. Defaults to <repo-root>/data/mog_5pr{pr_dim}_n{n_total}/.",
+        help="Output directory. Defaults to <repo-root>/data/mog_5pr{pr_dim}_n{n_total}/ or mog_5native_n{n_total}/.",
     )
     p.add_argument("--force", action="store_true", help="Regenerate both native and PR-embedded NPZs.")
     p.add_argument(
@@ -114,11 +136,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def resolve_output_dir(args: argparse.Namespace) -> Path:
     if args.output_dir is not None:
         return Path(args.output_dir)
-    return default_output_dir(n_total=int(args.n_total), pr_dim=int(args.pr_dim))
+    return default_output_dir(n_total=int(args.n_total), pr_dim=args.pr_dim)
 
 
 def validate_args(args: argparse.Namespace) -> None:
-    if int(args.pr_dim) < NATIVE_X_DIM:
+    if args.pr_dim is not None and int(args.pr_dim) < NATIVE_X_DIM:
         raise ValueError(f"--pr-dim must be >= native x_dim={NATIVE_X_DIM}; got {args.pr_dim}.")
     if int(args.n_total) <= 0:
         raise ValueError(f"--n-total must be positive; got {args.n_total}.")
@@ -263,11 +285,11 @@ def _remove_native_viz(output_dir: Path) -> None:
             path.unlink()
 
 
-def run(args: argparse.Namespace, *, runner: Runner = _run_command) -> tuple[Path, Path]:
+def run(args: argparse.Namespace, *, runner: Runner = _run_command) -> tuple[Path, Path | None]:
     validate_args(args)
     output_dir = resolve_output_dir(args)
     native_npz = native_npz_path(output_dir)
-    projected_npz = projected_npz_path(output_dir, pr_dim=int(args.pr_dim))
+    projected_npz = None if args.pr_dim is None else projected_npz_path(output_dir, pr_dim=int(args.pr_dim))
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if native_npz.is_file() and not bool(args.force):
@@ -279,6 +301,11 @@ def run(args: argparse.Namespace, *, runner: Runner = _run_command) -> tuple[Pat
             _remove_native_viz(output_dir)
         validate_native_npz(native_npz, n_total=int(args.n_total))
 
+    print(f"[mog5-pr] Native NPZ: {native_npz}", flush=True)
+    if projected_npz is None:
+        print("[mog5-pr] Native mode requested; skipping PR projection.", flush=True)
+        return native_npz, None
+
     if projected_npz.is_file() and not bool(args.force):
         validate_projected_npz(projected_npz, n_total=int(args.n_total), pr_dim=int(args.pr_dim))
         print(f"[mog5-pr] Reusing projected NPZ: {projected_npz}", flush=True)
@@ -286,7 +313,6 @@ def run(args: argparse.Namespace, *, runner: Runner = _run_command) -> tuple[Pat
         runner(build_project_command(args, native_npz, projected_npz))
         validate_projected_npz(projected_npz, n_total=int(args.n_total), pr_dim=int(args.pr_dim))
 
-    print(f"[mog5-pr] Native NPZ: {native_npz}", flush=True)
     print(f"[mog5-pr] Projected NPZ: {projected_npz}", flush=True)
     return native_npz, projected_npz
 

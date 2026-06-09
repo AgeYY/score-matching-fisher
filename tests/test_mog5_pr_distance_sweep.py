@@ -108,9 +108,13 @@ def test_parser_defaults() -> None:
     assert args.metric == "all"
     assert mod.resolve_metric_names(args) == ALL_METRICS
     assert args.early_ema_alpha == pytest.approx(0.05)
-    assert args.yscale == "log"
+    assert args.yscale == "linear"
     assert args.loss_yscale == "linear"
     assert args.output_dir == repo_root / "data" / "mog5_pr_distance_sweeps"
+
+    native_args = mod.build_parser().parse_args(["--pr-dim", "none"])
+    assert native_args.pr_dim is None
+    assert native_args.output_dir == repo_root / "data" / "mog5_native_distance_sweeps"
 
 
 def test_aggregate_mean_pairwise_abs_errors(tmp_path: Path) -> None:
@@ -137,6 +141,28 @@ def test_aggregate_mean_pairwise_abs_errors(tmp_path: Path) -> None:
     assert np.mean(flow_rel_errors) == pytest.approx(((3.0 / 10.0) + (4.0 / 10.0) + (4.0 / 10.0)) / 3.0)
 
 
+def test_native_aggregate_metadata_and_npz(tmp_path: Path) -> None:
+    mod = _load_cli_module()
+    args = mod.build_parser().parse_args(["--pr-dim", "none", "--n-list", "100"])
+    data = {
+        (100, -1): mod._load_case_cache(_write_case_npz(tmp_path / "case_native.npz", offset=0.0)),
+    }
+
+    aggregate, rows = mod.aggregate_sweeps(args=args, case_data=data)
+    out = mod.write_aggregate_npz(tmp_path / "sweep.npz", aggregate)
+
+    assert aggregate["pr_projected"] is False
+    assert aggregate["pr_dim"] is None
+    assert aggregate["pr_dim_label"] == "native"
+    assert rows[0]["pr_projected"] is False
+    assert rows[0]["pr_dim"] is None
+    assert rows[0]["pr_dim_label"] == "native"
+    with np.load(out, allow_pickle=False) as npz:
+        np.testing.assert_array_equal(npz["pr_dim"], [-1])
+        np.testing.assert_array_equal(npz["pr_projected"], [False])
+        assert tuple(str(v) for v in npz["pr_dim_label"].tolist()) == ("native",)
+
+
 def test_relative_error_uses_denominator_floor_for_zero_ground_truth(tmp_path: Path) -> None:
     mod = _load_cli_module()
     args = mod.build_parser().parse_args(["--n-list", "100", "--metric", "squared_euclidean"])
@@ -151,6 +177,24 @@ def test_relative_error_uses_denominator_floor_for_zero_ground_truth(tmp_path: P
     flow = next(r for r in n_rows if r["estimator"] == "flow_matching")
     assert classical["rel_error"] == pytest.approx(2.0 / mod.REL_ERROR_DENOM_FLOOR)
     assert flow["rel_error"] == pytest.approx(3.0 / mod.REL_ERROR_DENOM_FLOOR)
+
+
+def test_mean_pair_error_curve_returns_raw_curve_values(tmp_path: Path) -> None:
+    mod = _load_cli_module()
+    args = mod.build_parser().parse_args(["--n-list", "100,200"])
+    case_100 = mod._load_case_cache(_write_case_npz(tmp_path / "case_100.npz", offset=0.0))
+    case_200 = mod._load_case_cache(_write_case_npz(tmp_path / "case_200.npz", offset=10.0))
+    aggregate, _ = mod.aggregate_sweeps(args=args, case_data={(100, 2): case_100, (200, 2): case_200})
+
+    yvals = mod._mean_pair_error_curve(
+        aggregate["n_sweep_flow_matching_matrices"],
+        aggregate["n_sweep_ground_truth_matrices"],
+        aggregate["pair_indices"],
+        metric_idx=0,
+        relative=False,
+    )
+
+    np.testing.assert_allclose(yvals, [11.0 / 3.0, 11.0 / 3.0])
 
 
 def test_load_flow_loss_cache_reads_val_monitor_losses(tmp_path: Path) -> None:
@@ -271,7 +315,7 @@ def test_visualization_only_writes_outputs_from_fake_caches(monkeypatch, tmp_pat
     assert "rel_error" in rows[0]
     assert {row["axis"] for row in rows} == {"n_total"}
     summary = json.loads(outputs["summary_json"].read_text(encoding="utf-8"))
-    assert summary["config"]["abs_error_yscale"] == "log"
+    assert summary["config"]["abs_error_yscale"] == "linear"
     assert summary["config"]["rel_error_yscale"] == "linear"
     assert summary["config"]["metric"] == "all"
     assert summary["config"]["metrics"] == list(ALL_METRICS)
@@ -279,6 +323,40 @@ def test_visualization_only_writes_outputs_from_fake_caches(monkeypatch, tmp_pat
     assert "abs_error_figure_svg" in summary["outputs"]
     assert "rel_error_figure_svg" in summary["outputs"]
     assert "flow_loss_figure_svg" not in summary["outputs"]
+
+
+def test_native_visualization_only_uses_native_cache_and_summary(monkeypatch, tmp_path: Path) -> None:
+    mod = _load_cli_module()
+    monkeypatch.setattr(
+        mod,
+        "case_output_dir",
+        lambda *, n_total, pr_dim, case_output_name: tmp_path / f"case_{n_total}_{mod._pr_dim_label(pr_dim)}",
+    )
+    _write_case_npz(tmp_path / "case_100_native" / mod.RESULTS_NAME)
+    args = mod.build_parser().parse_args(
+        [
+            "--visualization-only",
+            "--pr-dim",
+            "none",
+            "--n-list",
+            "100",
+            "--output-dir",
+            str(tmp_path / "sweep"),
+        ]
+    )
+
+    outputs = mod.run(args)
+
+    with np.load(outputs["results_npz"], allow_pickle=False) as data:
+        np.testing.assert_array_equal(data["pr_dim"], [-1])
+        np.testing.assert_array_equal(data["pr_projected"], [False])
+        assert tuple(str(v) for v in data["pr_dim_label"].tolist()) == ("native",)
+    summary = json.loads(outputs["summary_json"].read_text(encoding="utf-8"))
+    assert summary["config"]["pr_projected"] is False
+    assert summary["config"]["pr_dim"] is None
+    assert summary["config"]["pr_dim_label"] == "native"
+    assert "n100_native" in summary["case_paths"]
+    assert "n100_native" in summary["cache_hits"]
 
 
 def test_visualization_only_writes_flow_loss_outputs_from_fake_caches(monkeypatch, tmp_path: Path) -> None:

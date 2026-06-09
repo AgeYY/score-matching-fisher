@@ -524,6 +524,11 @@ def test_cli_default_path_resolution_without_running_training() -> None:
     assert mod.resolve_dataset_dir(args) == repo_root / "data" / "mog_5pr5_n1000"
     assert mod.resolve_output_dir(args) == repo_root / "data" / "mog_5pr5_n1000" / "distance_comparison_flow_skl"
 
+    native_args = mod.build_parser().parse_args(["--pr-dim", "none"])
+    assert native_args.pr_dim is None
+    assert mod.resolve_dataset_dir(native_args) == repo_root / "data" / "mog_5native_n1000"
+    assert mod.resolve_output_dir(native_args) == repo_root / "data" / "mog_5native_n1000" / "distance_comparison_flow_skl"
+
 
 def test_cli_early_ema_alpha_override_propagates_to_flow_config() -> None:
     mod = _load_cli_module()
@@ -645,6 +650,84 @@ def test_cli_run_passes_selected_metric_only(monkeypatch, tmp_path: Path) -> Non
     assert calls["summary_extra"]["metric"] == metric
     assert calls["summary_extra"]["metrics"] == [metric]
     assert paths["results_npz"] == tmp_path / "out" / "mog5_pr_distance_comparison_results.npz"
+
+
+def test_cli_native_mode_uses_native_bundle_and_ground_truth(monkeypatch, tmp_path: Path) -> None:
+    mod = _load_cli_module()
+    metric = dc.METRIC_SQUARED_EUCLIDEAN
+    calls: dict[str, object] = {}
+    n_total = 1000
+    k = 5
+
+    theta_all = np.eye(k, dtype=np.float64)[np.arange(n_total, dtype=np.int64) % k]
+    native_x = np.arange(n_total * 2, dtype=np.float64).reshape(n_total, 2)
+    native_bundle = SharedDatasetBundle(
+        meta={
+            "dataset_family": "random_mog_categorical",
+            "num_categories": k,
+            "x_dim": 2,
+            "mog_component_means": np.zeros((k, 2), dtype=np.float64),
+            "mog_component_variances": np.ones((k, 2), dtype=np.float64),
+        },
+        theta_all=theta_all,
+        x_all=native_x,
+        train_idx=np.arange(10, dtype=np.int64),
+        validation_idx=np.arange(10, 20, dtype=np.int64),
+        theta_train=theta_all[:10],
+        x_train=native_x[:10],
+        theta_validation=theta_all[10:20],
+        x_validation=native_x[10:20],
+    )
+
+    def fake_ensure_dataset(args, dataset_dir):
+        calls["ensure_pr_dim"] = args.pr_dim
+        calls["dataset_dir"] = Path(dataset_dir)
+        return tmp_path / "native.npz", None
+
+    def fake_classical_metric_matrices(x, labels, **kwargs):
+        calls["classical_x"] = np.asarray(x)
+        calls["classical_metrics"] = tuple(kwargs["metrics"])
+        return {metric: np.ones((k, k), dtype=np.float64)}
+
+    def fake_native_ground_truth(**kwargs):
+        calls["native_ground_truth_metrics"] = tuple(kwargs["metrics"])
+        return {metric: 3.0 * np.ones((k, k), dtype=np.float64)}
+
+    def fake_pr_ground_truth(**kwargs):
+        raise AssertionError("native mode must not use PR-autoencoder ground truth")
+
+    def fake_flow_metric_matrices(**kwargs):
+        calls["flow_bundle_x"] = np.asarray(kwargs["bundle"].x_all)
+        return {metric: 2.0 * np.ones((k, k), dtype=np.float64)}, {metric: tmp_path / "flow.npz"}
+
+    monkeypatch.setattr(mod, "require_device", lambda device: torch.device("cpu"))
+    monkeypatch.setattr(mod, "ensure_dataset", fake_ensure_dataset)
+    monkeypatch.setattr(mod, "load_shared_dataset_npz", lambda path: native_bundle)
+    monkeypatch.setattr(mod, "classical_metric_matrices", fake_classical_metric_matrices)
+    monkeypatch.setattr(mod, "native_mog_ground_truth_matrices", fake_native_ground_truth)
+    monkeypatch.setattr(mod, "pr_autoencoder_ground_truth_matrices", fake_pr_ground_truth)
+    monkeypatch.setattr(mod, "flow_metric_matrices", fake_flow_metric_matrices)
+    monkeypatch.setattr(mod, "write_results_npz", lambda path, result: Path(path))
+    monkeypatch.setattr(mod, "write_pairs_csv", lambda path, rows: Path(path))
+
+    def fake_write_summary_json(path, *, result, extra):
+        calls["summary_extra"] = dict(extra)
+        return Path(path)
+
+    monkeypatch.setattr(mod, "write_summary_json", fake_write_summary_json)
+
+    args = mod.build_parser().parse_args(["--pr-dim", "none", "--metric", metric, "--output-dir", str(tmp_path / "out")])
+    mod.run(args)
+
+    assert calls["ensure_pr_dim"] is None
+    np.testing.assert_allclose(calls["classical_x"], native_x)
+    np.testing.assert_allclose(calls["flow_bundle_x"], native_x)
+    assert calls["classical_metrics"] == (metric,)
+    assert calls["native_ground_truth_metrics"] == (metric,)
+    assert calls["summary_extra"]["pr_projected"] is False
+    assert calls["summary_extra"]["pr_dim"] is None
+    assert calls["summary_extra"]["projected_npz"] is None
+    assert calls["summary_extra"]["work_npz"] == str(tmp_path / "native.npz")
 
 
 def test_mahalanobis_cli_defaults_match_full_cli_without_running_training() -> None:
