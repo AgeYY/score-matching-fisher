@@ -59,13 +59,13 @@ def parse_pr_dim(value: str | int | None) -> int | None:
         raise argparse.ArgumentTypeError("--pr-dim must be an integer, 'none', or 'null'.") from exc
 
 
-def default_dataset_dir(*, n_total: int = 1_000, pr_dim: int | None = 5) -> Path:
+def default_dataset_dir(*, n_total: int = 1_000, pr_dim: int | None = None, native_x_dim: int = 3) -> Path:
     mod = _load_make_mog5_module()
-    return Path(mod.default_output_dir(n_total=int(n_total), pr_dim=pr_dim))
+    return Path(mod.default_output_dir(n_total=int(n_total), pr_dim=pr_dim, native_x_dim=int(native_x_dim)))
 
 
-def default_output_dir(*, n_total: int = 1_000, pr_dim: int | None = 5) -> Path:
-    return default_dataset_dir(n_total=int(n_total), pr_dim=pr_dim) / "distance_comparison_flow_skl"
+def default_output_dir(*, n_total: int = 1_000, pr_dim: int | None = None, native_x_dim: int = 3) -> Path:
+    return default_dataset_dir(n_total=int(n_total), pr_dim=pr_dim, native_x_dim=int(native_x_dim)) / "distance_comparison_flow_skl"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -75,18 +75,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--n-total", type=int, default=1_000, help="MoG5 PR dataset row count.")
     p.add_argument(
+        "--native-x-dim",
+        type=int,
+        default=3,
+        help="Native MoG5 x dimension before optional PR projection.",
+    )
+    p.add_argument(
         "--pr-dim",
         type=parse_pr_dim,
-        default=5,
-        help="MoG5 PR embedded dimension. Use 'none' or 'null' for native 2D mode.",
+        default=None,
+        help="MoG5 PR embedded dimension. Use 'none' or 'null' for native mode.",
     )
     p.add_argument("--seed", type=int, default=7, help="Dataset, flow, and estimation seed.")
     p.add_argument("--device", type=str, default="cuda", help="Execution device for PR GT encoding and flows.")
     p.add_argument(
+        "--native-template-npz",
+        type=Path,
+        default=None,
+        help="Optional native MoG5 NPZ whose fixed component metadata is reused when generating this dataset.",
+    )
+    p.add_argument(
         "--dataset-dir",
         type=Path,
         default=None,
-        help="MoG5 PR dataset directory. Defaults to <repo-root>/data/mog_5pr{pr_dim}_n{n_total}.",
+        help="MoG5 PR dataset directory. Defaults to a dimension-aware <repo-root>/data/mog_5... path.",
     )
     p.add_argument(
         "--output-dir",
@@ -131,18 +143,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--depth", type=int, default=5)
     p.add_argument("--low-rank-dim", type=int, default=4)
     p.add_argument("--radius", type=float, default=1.0, help="Fixed norm radius for cosine/correlation flow rows.")
-    p.add_argument(
-        "--corr-soft-eps",
-        type=float,
-        default=1e-2,
-        help="Soft centered normalization epsilon for correlation flow rows.",
-    )
-    p.add_argument(
-        "--correlation-flow-family",
-        choices=("soft", "fixed"),
-        default="soft",
-        help="Centered correlation translation family: soft regularized norm or fixed hard norm.",
-    )
     p.add_argument("--path-schedule", choices=("cosine", "linear", "straight"), default="cosine")
     p.add_argument("--t-eps", type=float, default=0.0005)
     p.add_argument("--quadrature-steps", type=int, default=64)
@@ -180,7 +180,7 @@ def resolve_metric_names(args: argparse.Namespace) -> tuple[str, ...]:
 def resolve_dataset_dir(args: argparse.Namespace) -> Path:
     if args.dataset_dir is not None:
         return Path(args.dataset_dir).expanduser()
-    return default_dataset_dir(n_total=int(args.n_total), pr_dim=args.pr_dim)
+    return default_dataset_dir(n_total=int(args.n_total), pr_dim=args.pr_dim, native_x_dim=int(args.native_x_dim))
 
 
 def resolve_output_dir(args: argparse.Namespace) -> Path:
@@ -189,11 +189,21 @@ def resolve_output_dir(args: argparse.Namespace) -> Path:
     return resolve_dataset_dir(args) / "distance_comparison_flow_skl"
 
 
+def validate_args(args: argparse.Namespace) -> None:
+    native_x_dim = int(args.native_x_dim)
+    if native_x_dim < 2:
+        raise ValueError(f"--native-x-dim must be >= 2; got {args.native_x_dim}.")
+    if args.pr_dim is not None and int(args.pr_dim) < native_x_dim:
+        raise ValueError(f"--pr-dim must be >= native x_dim={native_x_dim}; got {args.pr_dim}.")
+
+
 def _dataset_wrapper_args(args: argparse.Namespace, dataset_dir: Path) -> argparse.Namespace:
     mod = _load_make_mog5_module()
     argv = [
         "--n-total",
         str(int(args.n_total)),
+        "--native-x-dim",
+        str(int(args.native_x_dim)),
         "--pr-dim",
         "none" if args.pr_dim is None else str(int(args.pr_dim)),
         "--seed",
@@ -205,6 +215,8 @@ def _dataset_wrapper_args(args: argparse.Namespace, dataset_dir: Path) -> argpar
         "--pr-cache-dir",
         str(Path(args.pr_cache_dir)),
     ]
+    if args.native_template_npz is not None:
+        argv.extend(["--native-template-npz", str(Path(args.native_template_npz))])
     if bool(args.force_dataset):
         argv.append("--force")
     if bool(args.dataset_use_cache):
@@ -232,8 +244,6 @@ def _flow_config_from_args(args: argparse.Namespace) -> FlowComparisonConfig:
         depth=int(args.depth),
         low_rank_dim=int(args.low_rank_dim),
         radius=float(args.radius),
-        corr_soft_eps=float(args.corr_soft_eps),
-        correlation_flow_family=str(args.correlation_flow_family),
         path_schedule=str(args.path_schedule),
         t_eps=float(args.t_eps),
         quadrature_steps=int(args.quadrature_steps),
@@ -251,13 +261,20 @@ def _flow_config_from_args(args: argparse.Namespace) -> FlowComparisonConfig:
     )
 
 
-def _validate_bundle(bundle, *, n_total: int, pr_dim: int | None, pr_projected: bool) -> None:
+def _validate_bundle(
+    bundle,
+    *,
+    n_total: int,
+    native_x_dim: int,
+    pr_dim: int | None,
+    pr_projected: bool,
+) -> None:
     meta = dict(bundle.meta)
     if str(meta.get("dataset_family", "")) != "random_mog_categorical":
         raise ValueError(f"Expected random_mog_categorical, got {meta.get('dataset_family')!r}.")
     if int(meta.get("num_categories", -1)) != 5:
         raise ValueError(f"Expected num_categories=5, got {meta.get('num_categories')!r}.")
-    expected_x_dim = 2 if pr_dim is None else int(pr_dim)
+    expected_x_dim = int(native_x_dim) if pr_dim is None else int(pr_dim)
     if int(meta.get("x_dim", -1)) != int(expected_x_dim):
         raise ValueError(f"Expected work x_dim={expected_x_dim}, got {meta.get('x_dim')!r}.")
     if int(np.asarray(bundle.x_all).shape[0]) != int(n_total):
@@ -267,9 +284,14 @@ def _validate_bundle(bundle, *, n_total: int, pr_dim: int | None, pr_projected: 
         raise ValueError("Projected dataset must have pr_autoencoder_embedded=True.")
     if not bool(pr_projected) and embedded:
         raise ValueError("Native dataset must not have pr_autoencoder_embedded=True.")
+    if bool(pr_projected) and int(meta.get("pr_autoencoder_z_dim", -1)) != int(native_x_dim):
+        raise ValueError(
+            f"Expected pr_autoencoder_z_dim={int(native_x_dim)}, got {meta.get('pr_autoencoder_z_dim')!r}."
+        )
 
 
 def run(args: argparse.Namespace) -> dict[str, Path]:
+    validate_args(args)
     dev = require_device(str(args.device))
     metrics = resolve_metric_names(args)
     torch.manual_seed(int(args.seed))
@@ -288,7 +310,13 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
 
     native_bundle = load_shared_dataset_npz(native_npz)
     work_bundle = load_shared_dataset_npz(work_npz)
-    _validate_bundle(work_bundle, n_total=int(args.n_total), pr_dim=args.pr_dim, pr_projected=pr_projected)
+    _validate_bundle(
+        work_bundle,
+        n_total=int(args.n_total),
+        native_x_dim=int(args.native_x_dim),
+        pr_dim=args.pr_dim,
+        pr_projected=pr_projected,
+    )
 
     k = int(work_bundle.meta.get("num_categories", 5))
     labels = labels_from_theta(work_bundle.theta_all, num_categories=k)
@@ -359,6 +387,7 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
             "script": "bin/compare_mog5_pr_distances.py",
             "device": str(dev),
             "n_total": int(args.n_total),
+            "native_x_dim": int(args.native_x_dim),
             "pr_projected": bool(pr_projected),
             "pr_dim": None if args.pr_dim is None else int(args.pr_dim),
             "seed": int(args.seed),

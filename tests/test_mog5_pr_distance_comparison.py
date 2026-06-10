@@ -183,7 +183,6 @@ def test_flow_metric_mapping_and_mahalanobis_shared_assembly(monkeypatch, tmp_pa
         "translation": 11.0,
         "translation_fixed_norm": 22.0,
         "translation_centered_fixed_norm": 33.0,
-        "translation_centered_soft_norm": 66.0,
         "shared_affine": 55.0,
         "nonlinear": 44.0,
     }
@@ -225,7 +224,7 @@ def test_flow_metric_mapping_and_mahalanobis_shared_assembly(monkeypatch, tmp_pa
     assert seen_families[:3] == [
         "translation",
         "translation_fixed_norm",
-        "translation_centered_soft_norm",
+        "translation_centered_fixed_norm",
     ]
     assert seen_families[3:] == ["shared_affine", "nonlinear"]
     shared_call = calls[3]
@@ -237,7 +236,7 @@ def test_flow_metric_mapping_and_mahalanobis_shared_assembly(monkeypatch, tmp_pa
     np.testing.assert_allclose(shared_call["theta_eval"], np.eye(3, dtype=np.float64))
     assert matrices[dc.METRIC_SQUARED_EUCLIDEAN][0, 1] == 11.0
     assert matrices[dc.METRIC_COSINE][0, 1] == 22.0 / 8.0
-    assert matrices[dc.METRIC_CORRELATION][0, 1] == 66.0 / 8.0
+    assert matrices[dc.METRIC_CORRELATION][0, 1] == 33.0 / 8.0
     assert matrices[dc.METRIC_SYMMETRIC_KL][0, 1] == 44.0
     np.testing.assert_allclose(
         matrices[dc.METRIC_MAHALANOBIS_SQ],
@@ -245,8 +244,8 @@ def test_flow_metric_mapping_and_mahalanobis_shared_assembly(monkeypatch, tmp_pa
     )
     assert paths[dc.METRIC_SQUARED_EUCLIDEAN].is_file()
     with np.load(paths[dc.METRIC_CORRELATION], allow_pickle=True) as data:
-        assert str(data["velocity_family"][0]) == "translation_centered_soft_norm"
-        assert float(data["corr_soft_eps"][0]) == pytest.approx(1e-2)
+        assert str(data["velocity_family"][0]) == "translation_centered_fixed_norm"
+        assert "corr_soft_eps" not in data.files
         np.testing.assert_allclose(
             data["flow_matching_matrix"],
             matrices[dc.METRIC_CORRELATION],
@@ -255,7 +254,7 @@ def test_flow_metric_mapping_and_mahalanobis_shared_assembly(monkeypatch, tmp_pa
     assert "mahalanobis_sq:0-1" not in paths
 
 
-def test_correlation_flow_family_fixed_override_routes_to_hard_norm(monkeypatch, tmp_path: Path) -> None:
+def test_correlation_flow_routes_to_centered_fixed_norm(monkeypatch, tmp_path: Path) -> None:
     bundle = _toy_bundle()
     calls: list[dict[str, object]] = []
 
@@ -273,7 +272,7 @@ def test_correlation_flow_family_fixed_override_routes_to_hard_norm(monkeypatch,
         bundle=bundle,
         device=torch.device("cpu"),
         output_dir=tmp_path,
-        config=dc.FlowComparisonConfig(epochs=1, radius=2.0, correlation_flow_family="fixed", corr_soft_eps=3e-3),
+        config=dc.FlowComparisonConfig(epochs=1, radius=2.0),
         metrics=(dc.METRIC_CORRELATION,),
     )
 
@@ -284,7 +283,7 @@ def test_correlation_flow_family_fixed_override_routes_to_hard_norm(monkeypatch,
     )
     with np.load(paths[dc.METRIC_CORRELATION], allow_pickle=True) as data:
         assert str(data["velocity_family"][0]) == "translation_centered_fixed_norm"
-        assert float(data["corr_soft_eps"][0]) == pytest.approx(3e-3)
+        assert "corr_soft_eps" not in data.files
 
 
 def test_flow_metric_matrices_normalizes_x_train_only_and_persists_metadata(monkeypatch, tmp_path: Path) -> None:
@@ -412,7 +411,7 @@ def test_train_and_estimate_flow_uses_model_jeffreys_readout(monkeypatch) -> Non
 
     assert build_calls
     assert build_calls[0]["shared_affine_a_diag_jitter"] == 2e-3
-    assert build_calls[0]["corr_soft_eps"] == pytest.approx(1e-2)
+    assert "corr_soft_eps" not in build_calls[0]
     assert train_calls
     assert train_calls[0]["ema_alpha"] == pytest.approx(0.2)
     assert estimate_calls
@@ -428,8 +427,6 @@ def test_train_and_estimate_flow_uses_model_jeffreys_readout(monkeypatch) -> Non
 def test_flow_comparison_config_normalize_x_defaults_are_opt_in() -> None:
     assert dc.FlowComparisonConfig().normalize_x is False
     assert dc.FlowComparisonConfig().normalize_x_eps == pytest.approx(1e-8)
-    assert dc.FlowComparisonConfig().corr_soft_eps == pytest.approx(1e-2)
-    assert dc.FlowComparisonConfig().correlation_flow_family == "soft"
 
 
 def test_flow_comparison_config_default_t_eps_is_small_endpoint_clamp() -> None:
@@ -475,7 +472,7 @@ def test_save_flow_result_npz_persists_monitor_losses_and_ema_alpha(tmp_path: Pa
         np.testing.assert_allclose(data["flow_normalize_x_std"], [3.0, 4.0])
 
 
-def test_save_flow_result_npz_persists_flow_readout_and_corr_soft_eps(tmp_path: Path) -> None:
+def test_save_flow_result_npz_persists_flow_readout(tmp_path: Path) -> None:
     result = FlowSKLResult(
         symmetric_kl_matrix=np.asarray([[0.0, 8.0], [8.0, 0.0]], dtype=np.float64),
         canonical_metric_matrix=np.asarray([[0.0, 8.0], [8.0, 0.0]], dtype=np.float64),
@@ -486,16 +483,15 @@ def test_save_flow_result_npz_persists_flow_readout_and_corr_soft_eps(tmp_path: 
         result=result,
         metric=dc.METRIC_CORRELATION,
         theta_eval=np.eye(2, dtype=np.float64),
-        velocity_family="translation_centered_soft_norm",
+        velocity_family="translation_centered_fixed_norm",
         flow_metric_matrix=np.asarray([[0.0, 1.0], [1.0, 0.0]], dtype=np.float64),
-        corr_soft_eps=1e-3,
     )
 
     with np.load(path, allow_pickle=True) as data:
         np.testing.assert_allclose(data["symmetric_kl_matrix"], [[0.0, 8.0], [8.0, 0.0]])
         np.testing.assert_allclose(data["flow_matching_matrix"], [[0.0, 1.0], [1.0, 0.0]])
-        assert str(data["velocity_family"][0]) == "translation_centered_soft_norm"
-        assert float(data["corr_soft_eps"][0]) == pytest.approx(1e-3)
+        assert str(data["velocity_family"][0]) == "translation_centered_fixed_norm"
+        assert "corr_soft_eps" not in data.files
 
 
 def test_shared_affine_normalization_preserves_gaussian_symmetric_kl() -> None:
@@ -568,7 +564,8 @@ def test_cli_default_path_resolution_without_running_training() -> None:
     args = mod.build_parser().parse_args([])
 
     assert args.n_total == 1_000
-    assert args.pr_dim == 5
+    assert args.native_x_dim == 3
+    assert args.pr_dim is None
     assert args.seed == 7
     assert args.device == "cuda"
     assert args.metric == "all"
@@ -576,8 +573,6 @@ def test_cli_default_path_resolution_without_running_training() -> None:
     assert args.gt_samples_per_class == 100_000
     assert args.mc_jeffreys_sample == 4096
     assert args.radius == 1.0
-    assert args.corr_soft_eps == pytest.approx(1e-2)
-    assert args.correlation_flow_family == "soft"
     assert args.ode_method == "midpoint"
     assert args.t_eps == 0.0005
     assert args.early_ema_alpha == 0.05
@@ -585,19 +580,29 @@ def test_cli_default_path_resolution_without_running_training() -> None:
     assert args.flow_normalize_x_eps == pytest.approx(1e-8)
     assert mod._flow_config_from_args(args).mc_jeffreys_sample == 4096
     assert mod._flow_config_from_args(args).radius == 1.0
-    assert mod._flow_config_from_args(args).corr_soft_eps == pytest.approx(1e-2)
-    assert mod._flow_config_from_args(args).correlation_flow_family == "soft"
     assert mod._flow_config_from_args(args).t_eps == 0.0005
     assert mod._flow_config_from_args(args).early_ema_alpha == 0.05
     assert mod._flow_config_from_args(args).normalize_x is False
     assert mod._flow_config_from_args(args).normalize_x_eps == pytest.approx(1e-8)
-    assert mod.resolve_dataset_dir(args) == repo_root / "data" / "mog_5pr5_n1000"
-    assert mod.resolve_output_dir(args) == repo_root / "data" / "mog_5pr5_n1000" / "distance_comparison_flow_skl"
+    assert mod.resolve_dataset_dir(args) == repo_root / "data" / "mog_5native_xdim3_n1000"
+    assert mod.resolve_output_dir(args) == repo_root / "data" / "mog_5native_xdim3_n1000" / "distance_comparison_flow_skl"
 
-    native_args = mod.build_parser().parse_args(["--pr-dim", "none"])
+    native_args = mod.build_parser().parse_args(["--native-x-dim", "2", "--pr-dim", "none"])
     assert native_args.pr_dim is None
     assert mod.resolve_dataset_dir(native_args) == repo_root / "data" / "mog_5native_n1000"
     assert mod.resolve_output_dir(native_args) == repo_root / "data" / "mog_5native_n1000" / "distance_comparison_flow_skl"
+
+    native3_args = mod.build_parser().parse_args(["--native-x-dim", "3", "--pr-dim", "none"])
+    assert mod.resolve_dataset_dir(native3_args) == repo_root / "data" / "mog_5native_xdim3_n1000"
+    assert mod.resolve_output_dir(native3_args) == repo_root / "data" / "mog_5native_xdim3_n1000" / "distance_comparison_flow_skl"
+
+    native3_pr_args = mod.build_parser().parse_args(["--native-x-dim", "3", "--pr-dim", "5"])
+    assert mod.resolve_dataset_dir(native3_pr_args) == repo_root / "data" / "mog_5native_xdim3_pr5_n1000"
+    assert mod.resolve_output_dir(native3_pr_args) == repo_root / "data" / "mog_5native_xdim3_pr5_n1000" / "distance_comparison_flow_skl"
+
+    invalid_args = mod.build_parser().parse_args(["--native-x-dim", "3", "--pr-dim", "2"])
+    with pytest.raises(ValueError, match="--pr-dim must be >= native x_dim=3"):
+        mod.validate_args(invalid_args)
 
 
 def test_cli_early_ema_alpha_override_propagates_to_flow_config() -> None:
@@ -616,16 +621,6 @@ def test_cli_flow_normalize_x_override_propagates_to_flow_config() -> None:
     assert mod._flow_config_from_args(args).normalize_x_eps == pytest.approx(1e-5)
 
 
-def test_cli_correlation_flow_options_propagate_to_flow_config() -> None:
-    mod = _load_cli_module()
-    args = mod.build_parser().parse_args(["--corr-soft-eps", "0.003", "--correlation-flow-family", "fixed"])
-    assert args.corr_soft_eps == pytest.approx(0.003)
-    assert args.correlation_flow_family == "fixed"
-    cfg = mod._flow_config_from_args(args)
-    assert cfg.corr_soft_eps == pytest.approx(0.003)
-    assert cfg.correlation_flow_family == "fixed"
-
-
 def test_cli_run_passes_selected_metric_only(monkeypatch, tmp_path: Path) -> None:
     mod = _load_cli_module()
     metric = dc.METRIC_COSINE
@@ -640,6 +635,7 @@ def test_cli_run_passes_selected_metric_only(monkeypatch, tmp_path: Path) -> Non
             "num_categories": k,
             "x_dim": 5,
             "pr_autoencoder_embedded": True,
+            "pr_autoencoder_z_dim": 2,
         },
         theta_all=theta_all,
         x_all=np.zeros((n_total, 5), dtype=np.float64),
@@ -716,7 +712,9 @@ def test_cli_run_passes_selected_metric_only(monkeypatch, tmp_path: Path) -> Non
     monkeypatch.setattr(mod, "write_pairs_csv", fake_write_pairs_csv)
     monkeypatch.setattr(mod, "write_summary_json", fake_write_summary_json)
 
-    args = mod.build_parser().parse_args(["--metric", metric, "--output-dir", str(tmp_path / "out")])
+    args = mod.build_parser().parse_args(
+        ["--native-x-dim", "2", "--pr-dim", "5", "--metric", metric, "--output-dir", str(tmp_path / "out")]
+    )
     paths = mod.run(args)
 
     assert mod.resolve_metric_names(args) == (metric,)
@@ -729,6 +727,7 @@ def test_cli_run_passes_selected_metric_only(monkeypatch, tmp_path: Path) -> Non
     assert calls["flow_output_dir"] == tmp_path / "out" / "flow"
     assert calls["summary_extra"]["metric"] == metric
     assert calls["summary_extra"]["metrics"] == [metric]
+    assert calls["summary_extra"]["native_x_dim"] == 2
     assert paths["results_npz"] == tmp_path / "out" / "mog5_pr_distance_comparison_results.npz"
 
 
@@ -796,7 +795,9 @@ def test_cli_native_mode_uses_native_bundle_and_ground_truth(monkeypatch, tmp_pa
 
     monkeypatch.setattr(mod, "write_summary_json", fake_write_summary_json)
 
-    args = mod.build_parser().parse_args(["--pr-dim", "none", "--metric", metric, "--output-dir", str(tmp_path / "out")])
+    args = mod.build_parser().parse_args(
+        ["--native-x-dim", "2", "--pr-dim", "none", "--metric", metric, "--output-dir", str(tmp_path / "out")]
+    )
     mod.run(args)
 
     assert calls["ensure_pr_dim"] is None
@@ -805,6 +806,7 @@ def test_cli_native_mode_uses_native_bundle_and_ground_truth(monkeypatch, tmp_pa
     assert calls["classical_metrics"] == (metric,)
     assert calls["native_ground_truth_metrics"] == (metric,)
     assert calls["summary_extra"]["pr_projected"] is False
+    assert calls["summary_extra"]["native_x_dim"] == 2
     assert calls["summary_extra"]["pr_dim"] is None
     assert calls["summary_extra"]["projected_npz"] is None
     assert calls["summary_extra"]["work_npz"] == str(tmp_path / "native.npz")
@@ -819,7 +821,7 @@ def test_mahalanobis_cli_defaults_match_full_cli_without_running_training() -> N
     args = mod.build_parser().parse_args([])
 
     assert args.n_total == full_args.n_total == 1_000
-    assert args.pr_dim == full_args.pr_dim == 5
+    assert args.pr_dim == full_args.pr_dim is None
     assert args.seed == full_args.seed == 7
     assert args.device == full_args.device == "cuda"
     assert args.gt_samples_per_class == full_args.gt_samples_per_class == 100_000
@@ -830,8 +832,8 @@ def test_mahalanobis_cli_defaults_match_full_cli_without_running_training() -> N
     assert mod._flow_config_from_args(args).mc_jeffreys_sample == 4096
     assert mod._flow_config_from_args(args).radius == 1.0
     assert mod._flow_config_from_args(args).t_eps == 0.0005
-    assert mod.resolve_dataset_dir(args) == repo_root / "data" / "mog_5pr5_n1000"
-    assert mod.resolve_output_dir(args) == repo_root / "data" / "mog_5pr5_n1000" / "mahalanobis_comparison_flow_skl"
+    assert mod.resolve_dataset_dir(args) == repo_root / "data" / "mog_5native_xdim3_n1000"
+    assert mod.resolve_output_dir(args) == repo_root / "data" / "mog_5native_xdim3_n1000" / "mahalanobis_comparison_flow_skl"
 
     compatible = mod.build_parser().parse_args(
         [

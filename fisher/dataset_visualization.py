@@ -37,7 +37,7 @@ def plot_mog5_native_scatter_covariance(
     png_path: str | Path,
     max_points: int = 500,
 ) -> tuple[Path, Path]:
-    """Plot a native 2D MoG5 shared-dataset NPZ with component covariance ellipses."""
+    """Plot the (x1, x2) view of a native MoG5 shared-dataset NPZ."""
     from fisher.shared_dataset_io import load_shared_dataset_npz
 
     bundle = load_shared_dataset_npz(npz_path)
@@ -47,22 +47,23 @@ def plot_mog5_native_scatter_covariance(
     k = int(meta.get("num_categories", -1))
     if k != 5:
         raise ValueError(f"Expected num_categories=5, got {meta.get('num_categories')!r}.")
-    if int(meta.get("x_dim", -1)) != 2:
-        raise ValueError(f"Expected native x_dim=2, got {meta.get('x_dim')!r}.")
+    x_dim = int(meta.get("x_dim", -1))
+    if x_dim < 2:
+        raise ValueError(f"Expected native x_dim >= 2, got {meta.get('x_dim')!r}.")
 
     x = np.asarray(bundle.x_all, dtype=np.float64)
     theta = np.asarray(bundle.theta_all)
-    if x.ndim != 2 or int(x.shape[1]) != 2:
-        raise ValueError(f"Expected x_all shape (N, 2), got {x.shape}.")
+    if x.ndim != 2 or int(x.shape[1]) != x_dim or int(x.shape[1]) < 2:
+        raise ValueError(f"Expected x_all shape (N, {x_dim}) with x_dim >= 2, got {x.shape}.")
     if int(theta.shape[0]) != int(x.shape[0]):
         raise ValueError(f"theta_all and x_all row counts differ: {theta.shape[0]} vs {x.shape[0]}.")
 
     means = np.asarray(meta.get("mog_component_means"), dtype=np.float64)
     variances = np.asarray(meta.get("mog_component_variances"), dtype=np.float64)
-    if means.shape != (5, 2):
-        raise ValueError(f"Expected mog_component_means shape (5, 2), got {means.shape}.")
-    if variances.shape != (5, 2):
-        raise ValueError(f"Expected mog_component_variances shape (5, 2), got {variances.shape}.")
+    if means.shape != (5, x_dim):
+        raise ValueError(f"Expected mog_component_means shape (5, {x_dim}), got {means.shape}.")
+    if variances.shape != (5, x_dim):
+        raise ValueError(f"Expected mog_component_variances shape (5, {x_dim}), got {variances.shape}.")
     if not np.all(np.isfinite(means)) or not np.all(np.isfinite(variances)) or np.any(variances <= 0.0):
         raise ValueError("MoG component means/variances must be finite with strictly positive variances.")
 
@@ -97,8 +98,8 @@ def plot_mog5_native_scatter_covariance(
             )
 
     for cls in range(5):
-        mu = means[cls]
-        sigma = np.sqrt(variances[cls])
+        mu = means[cls, :2]
+        sigma = np.sqrt(variances[cls, :2])
         ax.add_patch(
             Ellipse(
                 xy=(float(mu[0]), float(mu[1])),

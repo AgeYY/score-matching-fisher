@@ -76,12 +76,18 @@ def _repo_data_dir() -> Path:
     return _REPO_ROOT / "data"
 
 
-def default_output_dir() -> Path:
-    return _repo_data_dir() / "mog5_pr_distance_sweeps"
+def default_output_dir(*, pr_dim: int | None = 5, native_x_dim: int = 3) -> Path:
+    native_x_dim = int(native_x_dim)
+    if native_x_dim == 2:
+        return _repo_data_dir() / "mog5_pr_distance_sweeps"
+    return _repo_data_dir() / f"mog5_native_xdim{native_x_dim}_pr{int(pr_dim)}_distance_sweeps"
 
 
-def default_native_output_dir() -> Path:
-    return _repo_data_dir() / "mog5_native_distance_sweeps"
+def default_native_output_dir(*, native_x_dim: int = 3) -> Path:
+    native_x_dim = int(native_x_dim)
+    if native_x_dim == 2:
+        return _repo_data_dir() / "mog5_native_distance_sweeps"
+    return _repo_data_dir() / f"mog5_native_xdim{native_x_dim}_distance_sweeps"
 
 
 def _pr_projected(pr_dim: int | None) -> bool:
@@ -100,11 +106,23 @@ def _case_key(n_total: int, pr_dim: int | None) -> tuple[int, int]:
     return (int(n_total), _pr_dim_storage(pr_dim))
 
 
+def _repeat_case_key(n_total: int, pr_dim: int | None, repeat_idx: int) -> tuple[int, int, int]:
+    return (int(n_total), _pr_dim_storage(pr_dim), int(repeat_idx))
+
+
+def _n_repeats(args: argparse.Namespace) -> int:
+    return int(getattr(args, "n_repeats", 1))
+
+
+def _repeat_seed(args: argparse.Namespace, repeat_idx: int) -> int:
+    return int(args.seed) + int(repeat_idx)
+
+
 def build_parser() -> argparse.ArgumentParser:
     single = _load_single_case_module()
     p = single.build_parser()
     p.description = __doc__
-    p.set_defaults(n_total=100_000, pr_dim=None, output_dir=default_native_output_dir())
+    p.set_defaults(n_total=100_000, pr_dim=None, output_dir=default_native_output_dir(native_x_dim=3))
     for action in p._actions:
         if action.dest == "output_dir":
             action.help = "Aggregate sweep output directory."
@@ -119,6 +137,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default="distance_comparison_flow_skl",
         help="Per-case output directory name under each MoG5 PR dataset directory.",
+    )
+    p.add_argument(
+        "--n-repeats",
+        type=int,
+        default=5,
+        help="Independent finite-sample repeats per n_total value.",
     )
     p.add_argument(
         "--force-comparison",
@@ -144,25 +168,74 @@ def build_parser() -> argparse.ArgumentParser:
         argv = sys.argv[1:] if args is None else list(args)
         output_was_explicit = any(str(arg) == "--output-dir" or str(arg).startswith("--output-dir=") for arg in argv)
         if not output_was_explicit:
-            parsed.output_dir = default_native_output_dir() if parsed.pr_dim is None else default_output_dir()
+            parsed.output_dir = (
+                default_native_output_dir(native_x_dim=int(parsed.native_x_dim))
+                if parsed.pr_dim is None
+                else default_output_dir(pr_dim=parsed.pr_dim, native_x_dim=int(parsed.native_x_dim))
+            )
         return parsed
 
     p.parse_args = parse_args  # type: ignore[method-assign]
     return p
 
 
-def case_output_dir(*, n_total: int, pr_dim: int | None, case_output_name: str) -> Path:
+def case_output_dir(
+    *,
+    n_total: int,
+    pr_dim: int | None,
+    case_output_name: str,
+    native_x_dim: int = 3,
+    repeat_idx: int = 0,
+    n_repeats: int = 1,
+) -> Path:
     single = _load_single_case_module()
-    return single.default_dataset_dir(n_total=int(n_total), pr_dim=pr_dim) / str(case_output_name)
+    dataset_dir = single.default_dataset_dir(n_total=int(n_total), pr_dim=pr_dim, native_x_dim=int(native_x_dim))
+    if int(n_repeats) > 1:
+        return dataset_dir / f"repeat_{int(repeat_idx):02d}" / str(case_output_name)
+    return dataset_dir / str(case_output_name)
 
 
-def case_results_npz(*, n_total: int, pr_dim: int | None, case_output_name: str) -> Path:
-    return case_output_dir(n_total=n_total, pr_dim=pr_dim, case_output_name=case_output_name) / RESULTS_NAME
-
-
-def case_flow_loss_npz(*, n_total: int, pr_dim: int | None, case_output_name: str, metric: str) -> Path:
+def case_results_npz(
+    *,
+    n_total: int,
+    pr_dim: int | None,
+    case_output_name: str,
+    native_x_dim: int = 3,
+    repeat_idx: int = 0,
+    n_repeats: int = 1,
+) -> Path:
     return (
-        case_output_dir(n_total=n_total, pr_dim=pr_dim, case_output_name=case_output_name)
+        case_output_dir(
+            n_total=n_total,
+            pr_dim=pr_dim,
+            case_output_name=case_output_name,
+            native_x_dim=int(native_x_dim),
+            repeat_idx=int(repeat_idx),
+            n_repeats=int(n_repeats),
+        )
+        / RESULTS_NAME
+    )
+
+
+def case_flow_loss_npz(
+    *,
+    n_total: int,
+    pr_dim: int | None,
+    case_output_name: str,
+    metric: str,
+    native_x_dim: int = 3,
+    repeat_idx: int = 0,
+    n_repeats: int = 1,
+) -> Path:
+    return (
+        case_output_dir(
+            n_total=n_total,
+            pr_dim=pr_dim,
+            case_output_name=case_output_name,
+            native_x_dim=int(native_x_dim),
+            repeat_idx=int(repeat_idx),
+            n_repeats=int(n_repeats),
+        )
         / "flow"
         / f"{metric}_flow_matching_skl_results.npz"
     )
@@ -171,20 +244,23 @@ def case_flow_loss_npz(*, n_total: int, pr_dim: int | None, case_output_name: st
 def representative_native_npz(
     *,
     args: argparse.Namespace,
-    case_paths: dict[tuple[int, int], Path],
+    case_paths: dict[tuple[int, int, int], Path],
 ) -> Path:
     n_total = max(int(v) for v in args.n_list)
-    case = _case_key(n_total, args.pr_dim)
+    case = _repeat_case_key(n_total, args.pr_dim, 0)
     if case in case_paths:
         return Path(case_paths[case]).parent.parent / "random_mog_categorical.npz"
     single = _load_single_case_module()
-    return Path(single.default_dataset_dir(n_total=n_total, pr_dim=args.pr_dim)) / "random_mog_categorical.npz"
+    return (
+        Path(single.default_dataset_dir(n_total=n_total, pr_dim=args.pr_dim, native_x_dim=int(args.native_x_dim)))
+        / "random_mog_categorical.npz"
+    )
 
 
 def maybe_plot_representative_dataset(
     *,
     args: argparse.Namespace,
-    case_paths: dict[tuple[int, int], Path],
+    case_paths: dict[tuple[int, int, int], Path],
     output_dir: Path,
 ) -> tuple[Path, Path] | None:
     if bool(getattr(args, "skip_dataset_viz", False)):
@@ -204,15 +280,16 @@ def maybe_plot_representative_dataset(
     )
 
 
-def _unique_cases(args: argparse.Namespace) -> list[tuple[int, int | None]]:
-    cases: list[tuple[int, int | None]] = []
-    seen: set[tuple[int, int]] = set()
+def _unique_cases(args: argparse.Namespace) -> list[tuple[int, int | None, int]]:
+    cases: list[tuple[int, int | None, int]] = []
+    seen: set[tuple[int, int, int]] = set()
     for n_total in args.n_list:
-        case = (int(n_total), args.pr_dim)
-        key = _case_key(int(n_total), args.pr_dim)
-        if key not in seen:
-            cases.append(case)
-            seen.add(key)
+        for repeat_idx in range(_n_repeats(args)):
+            case = (int(n_total), args.pr_dim, int(repeat_idx))
+            key = _repeat_case_key(int(n_total), args.pr_dim, int(repeat_idx))
+            if key not in seen:
+                cases.append(case)
+                seen.add(key)
     return cases
 
 
@@ -226,6 +303,16 @@ def resolve_metric_names(args: argparse.Namespace) -> tuple[str, ...]:
     return (metric,)
 
 
+def validate_args(args: argparse.Namespace) -> None:
+    native_x_dim = int(args.native_x_dim)
+    if native_x_dim < 2:
+        raise ValueError(f"--native-x-dim must be >= 2; got {args.native_x_dim}.")
+    if args.pr_dim is not None and int(args.pr_dim) < native_x_dim:
+        raise ValueError(f"--pr-dim must be >= native x_dim={native_x_dim}; got {args.pr_dim}.")
+    if _n_repeats(args) < 1:
+        raise ValueError(f"--n-repeats must be >= 1; got {getattr(args, 'n_repeats', None)}.")
+
+
 def compute_baseline_ground_truth_rdms(args: argparse.Namespace, metrics: tuple[str, ...]) -> dict[str, Any]:
     single = _load_single_case_module()
     case_args = _single_case_args(
@@ -236,6 +323,9 @@ def compute_baseline_ground_truth_rdms(args: argparse.Namespace, metrics: tuple[
             n_total=int(args.n_total),
             pr_dim=args.pr_dim,
             case_output_name=str(args.case_output_name),
+            native_x_dim=int(args.native_x_dim),
+            repeat_idx=0,
+            n_repeats=1,
         ),
     )
     dev = single.require_device(str(case_args.device))
@@ -252,6 +342,7 @@ def compute_baseline_ground_truth_rdms(args: argparse.Namespace, metrics: tuple[
         work_bundle,
         n_total=int(case_args.n_total),
         pr_dim=case_args.pr_dim,
+        native_x_dim=int(case_args.native_x_dim),
         pr_projected=pr_projected,
     )
     k = int(work_bundle.meta.get("num_categories", 5))
@@ -288,13 +379,24 @@ def compute_baseline_ground_truth_rdms(args: argparse.Namespace, metrics: tuple[
             axis=0,
         ),
         "n_total": int(case_args.n_total),
+        "native_x_dim": int(case_args.native_x_dim),
         "pr_dim": None if case_args.pr_dim is None else int(case_args.pr_dim),
         "pr_projected": bool(pr_projected),
         "pr_dim_label": _pr_dim_label(case_args.pr_dim),
+        "native_npz": str(native_npz),
+        "work_npz": str(work_npz),
     }
 
 
-def _single_case_args(args: argparse.Namespace, *, n_total: int, pr_dim: int | None, output_dir: Path) -> argparse.Namespace:
+def _single_case_args(
+    args: argparse.Namespace,
+    *,
+    n_total: int,
+    pr_dim: int | None,
+    output_dir: Path,
+    repeat_idx: int = 0,
+    native_template_npz: Path | None = None,
+) -> argparse.Namespace:
     single = _load_single_case_module()
     case_args = single.build_parser().parse_args([])
     for key, value in vars(args).items():
@@ -302,8 +404,11 @@ def _single_case_args(args: argparse.Namespace, *, n_total: int, pr_dim: int | N
             setattr(case_args, key, value)
     case_args.n_total = int(n_total)
     case_args.pr_dim = pr_dim
-    case_args.dataset_dir = None
+    case_args.seed = _repeat_seed(args, int(repeat_idx))
+    case_args.dataset_dir = Path(output_dir).parent
     case_args.output_dir = Path(output_dir)
+    if hasattr(case_args, "native_template_npz"):
+        case_args.native_template_npz = None if native_template_npz is None else Path(native_template_npz)
     return case_args
 
 
@@ -360,25 +465,60 @@ def _filter_case_metrics(data: dict[str, Any], metrics: tuple[str, ...], *, path
     }
 
 
-def ensure_case_results(args: argparse.Namespace, *, n_total: int, pr_dim: int | None) -> tuple[Path, bool]:
-    output_dir = case_output_dir(n_total=n_total, pr_dim=pr_dim, case_output_name=str(args.case_output_name))
+def ensure_case_results(
+    args: argparse.Namespace,
+    *,
+    n_total: int,
+    pr_dim: int | None,
+    repeat_idx: int = 0,
+    native_template_npz: Path | None = None,
+) -> tuple[Path, bool]:
+    output_dir = case_output_dir(
+        n_total=n_total,
+        pr_dim=pr_dim,
+        case_output_name=str(args.case_output_name),
+        native_x_dim=int(args.native_x_dim),
+        repeat_idx=int(repeat_idx),
+        n_repeats=_n_repeats(args),
+    )
     result_path = output_dir / RESULTS_NAME
     if result_path.is_file() and not bool(args.force_comparison):
         requested_metrics = resolve_metric_names(args)
         try:
             _filter_case_metrics(_load_case_cache(result_path), requested_metrics, path=result_path)
-            print(f"[sweep] cache hit n_total={n_total} pr_dim={_pr_dim_label(pr_dim)}: {result_path}", flush=True)
+            print(
+                f"[sweep] cache hit n_total={n_total} repeat={int(repeat_idx)} "
+                f"pr_dim={_pr_dim_label(pr_dim)}: {result_path}",
+                flush=True,
+            )
             return result_path, True
         except ValueError:
             if bool(args.visualization_only):
                 raise
-            print(f"[sweep] cache missing requested metrics; rerunning n_total={n_total} pr_dim={_pr_dim_label(pr_dim)}", flush=True)
+            print(
+                f"[sweep] cache missing requested metrics; rerunning n_total={n_total} "
+                f"repeat={int(repeat_idx)} pr_dim={_pr_dim_label(pr_dim)}",
+                flush=True,
+            )
     if bool(args.visualization_only):
         raise FileNotFoundError(f"--visualization-only requires cached results: {result_path}")
 
     single = _load_single_case_module()
-    print(f"[sweep] running comparison n_total={n_total} pr_dim={_pr_dim_label(pr_dim)}", flush=True)
-    paths = single.run(_single_case_args(args, n_total=n_total, pr_dim=pr_dim, output_dir=output_dir))
+    print(
+        f"[sweep] running comparison n_total={n_total} repeat={int(repeat_idx)} "
+        f"seed={_repeat_seed(args, int(repeat_idx))} pr_dim={_pr_dim_label(pr_dim)}",
+        flush=True,
+    )
+    paths = single.run(
+        _single_case_args(
+            args,
+            n_total=n_total,
+            pr_dim=pr_dim,
+            output_dir=output_dir,
+            repeat_idx=int(repeat_idx),
+            native_template_npz=native_template_npz,
+        )
+    )
     return Path(paths["results_npz"]), False
 
 
@@ -409,15 +549,33 @@ def _mean_pair_error_curve(
     metric_idx: int,
     relative: bool,
 ) -> np.ndarray:
+    arr = np.asarray(matrices, dtype=np.float64)
+    gt_arr = np.asarray(gt, dtype=np.float64)
+    if arr.ndim == 5:
+        return np.asarray(
+            [
+                [
+                    _mean_pair_error(
+                        np.asarray(arr[n_idx, repeat_idx, int(metric_idx)], dtype=np.float64),
+                        np.asarray(gt_arr[n_idx, repeat_idx, int(metric_idx)], dtype=np.float64),
+                        pair_indices,
+                        relative=bool(relative),
+                    )
+                    for repeat_idx in range(int(arr.shape[1]))
+                ]
+                for n_idx in range(int(arr.shape[0]))
+            ],
+            dtype=np.float64,
+        )
     return np.asarray(
         [
             _mean_pair_error(
-                np.asarray(matrices[row_idx, int(metric_idx)], dtype=np.float64),
-                np.asarray(gt[row_idx, int(metric_idx)], dtype=np.float64),
+                np.asarray(arr[row_idx, int(metric_idx)], dtype=np.float64),
+                np.asarray(gt_arr[row_idx, int(metric_idx)], dtype=np.float64),
                 pair_indices,
                 relative=bool(relative),
             )
-            for row_idx in range(int(np.asarray(matrices).shape[0]))
+            for row_idx in range(int(arr.shape[0]))
         ],
         dtype=np.float64,
     )
@@ -426,10 +584,11 @@ def _mean_pair_error_curve(
 def aggregate_sweeps(
     *,
     args: argparse.Namespace,
-    case_data: dict[tuple[int, int], dict[str, Any]],
+    case_data: dict[tuple[int, int, int], dict[str, Any]],
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    first_n_total, first_pr_dim = _unique_cases(args)[0]
-    first = case_data[_case_key(first_n_total, first_pr_dim)]
+    first_n_total, first_pr_dim, first_repeat_idx = _unique_cases(args)[0]
+    first_key3 = _repeat_case_key(first_n_total, first_pr_dim, first_repeat_idx)
+    first = case_data[first_key3] if first_key3 in case_data else case_data[_case_key(first_n_total, first_pr_dim)]  # type: ignore[index]
     metric_names = tuple(first["metric_names"])
     condition_labels = tuple(first["condition_labels"])
     pair_indices = np.asarray(first["pair_indices"], dtype=np.int64)
@@ -441,9 +600,30 @@ def aggregate_sweeps(
             raise ValueError(f"Condition labels differ for case {case}.")
         np.testing.assert_array_equal(np.asarray(data["pair_indices"], dtype=np.int64), pair_indices)
 
-    n_cases = [_case_key(int(n_total), args.pr_dim) for n_total in args.n_list]
-    def stack(cases: list[tuple[int, int]], key: str) -> np.ndarray:
-        return np.stack([np.asarray(case_data[case][key], dtype=np.float64) for case in cases], axis=0)
+    repeat_indices = np.arange(_n_repeats(args), dtype=np.int64)
+
+    def get_case(n_total: int, repeat_idx: int) -> dict[str, Any]:
+        key3 = _repeat_case_key(int(n_total), args.pr_dim, int(repeat_idx))
+        if key3 in case_data:
+            return case_data[key3]
+        key2 = _case_key(int(n_total), args.pr_dim)
+        return case_data[key2]  # type: ignore[index]
+
+    def stack_repeat(key: str) -> np.ndarray:
+        return np.stack(
+            [
+                np.stack(
+                    [np.asarray(get_case(int(n_total), int(repeat_idx))[key], dtype=np.float64) for repeat_idx in repeat_indices],
+                    axis=0,
+                )
+                for n_total in args.n_list
+            ],
+            axis=0,
+        )
+
+    n_repeat_classical = stack_repeat("classical_matrices")
+    n_repeat_flow = stack_repeat("flow_matching_matrices")
+    n_repeat_ground_truth = stack_repeat("ground_truth_matrices")
 
     aggregate = {
         "metric_names": metric_names,
@@ -454,43 +634,54 @@ def aggregate_sweeps(
         "pr_projected": _pr_projected(args.pr_dim),
         "pr_dim_label": _pr_dim_label(args.pr_dim),
         "pr_dim_storage": _pr_dim_storage(args.pr_dim),
+        "native_x_dim": int(args.native_x_dim),
         "n_total": int(args.n_total),
-        "n_sweep_classical_matrices": stack(n_cases, "classical_matrices"),
-        "n_sweep_flow_matching_matrices": stack(n_cases, "flow_matching_matrices"),
-        "n_sweep_ground_truth_matrices": stack(n_cases, "ground_truth_matrices"),
+        "n_repeats": _n_repeats(args),
+        "repeat_indices": repeat_indices,
+        "repeat_seeds": np.asarray([_repeat_seed(args, int(r)) for r in repeat_indices], dtype=np.int64),
+        "n_repeat_classical_matrices": n_repeat_classical,
+        "n_repeat_flow_matching_matrices": n_repeat_flow,
+        "n_repeat_ground_truth_matrices": n_repeat_ground_truth,
+        "n_sweep_classical_matrices": np.mean(n_repeat_classical, axis=1),
+        "n_sweep_flow_matching_matrices": np.mean(n_repeat_flow, axis=1),
+        "n_sweep_ground_truth_matrices": np.mean(n_repeat_ground_truth, axis=1),
     }
 
     rows: list[dict[str, Any]] = []
-    for n_total, pr_dim in n_cases:
-        data = case_data[(n_total, pr_dim)]
-        for metric_idx, metric in enumerate(metric_names):
-            gt = np.asarray(data["ground_truth_matrices"][metric_idx], dtype=np.float64)
-            for i, j in pair_indices:
-                ci, cj = int(i), int(j)
-                for estimator, matrix_key in (
-                    ("classical", "classical_matrices"),
-                    ("flow_matching", "flow_matching_matrices"),
-                ):
-                    est = float(np.asarray(data[matrix_key][metric_idx], dtype=np.float64)[ci, cj])
-                    truth = float(gt[ci, cj])
-                    abs_error = abs(est - truth)
-                    rows.append(
-                        {
-                            "axis": "n_total",
-                            "n_total": int(n_total),
-                            "pr_dim": None if args.pr_dim is None else int(pr_dim),
-                            "pr_projected": _pr_projected(args.pr_dim),
-                            "pr_dim_label": _pr_dim_label(args.pr_dim),
-                            "metric": str(metric),
-                            "estimator": estimator,
-                            "condition_i": condition_labels[ci],
-                            "condition_j": condition_labels[cj],
-                            "estimate": est,
-                            "ground_truth": truth,
-                            "abs_error": abs_error,
-                            "rel_error": _relative_error(abs_error, truth),
-                        }
-                    )
+    for n_total in args.n_list:
+        for repeat_idx in repeat_indices:
+            data = get_case(int(n_total), int(repeat_idx))
+            for metric_idx, metric in enumerate(metric_names):
+                gt = np.asarray(data["ground_truth_matrices"][metric_idx], dtype=np.float64)
+                for i, j in pair_indices:
+                    ci, cj = int(i), int(j)
+                    for estimator, matrix_key in (
+                        ("classical", "classical_matrices"),
+                        ("flow_matching", "flow_matching_matrices"),
+                    ):
+                        est = float(np.asarray(data[matrix_key][metric_idx], dtype=np.float64)[ci, cj])
+                        truth = float(gt[ci, cj])
+                        abs_error = abs(est - truth)
+                        rows.append(
+                            {
+                                "axis": "n_total",
+                                "n_total": int(n_total),
+                                "repeat_idx": int(repeat_idx),
+                                "repeat_seed": _repeat_seed(args, int(repeat_idx)),
+                                "pr_dim": None if args.pr_dim is None else _pr_dim_storage(args.pr_dim),
+                                "pr_projected": _pr_projected(args.pr_dim),
+                                "pr_dim_label": _pr_dim_label(args.pr_dim),
+                                "native_x_dim": int(args.native_x_dim),
+                                "metric": str(metric),
+                                "estimator": estimator,
+                                "condition_i": condition_labels[ci],
+                                "condition_j": condition_labels[cj],
+                                "estimate": est,
+                                "ground_truth": truth,
+                                "abs_error": abs_error,
+                                "rel_error": _relative_error(abs_error, truth),
+                            }
+                        )
     return aggregate, rows
 
 
@@ -505,10 +696,17 @@ def write_aggregate_npz(path: Path, aggregate: dict[str, Any]) -> Path:
         pr_dim=np.asarray([int(aggregate["pr_dim_storage"])], dtype=np.int64),
         pr_projected=np.asarray([bool(aggregate["pr_projected"])]),
         pr_dim_label=np.asarray([str(aggregate["pr_dim_label"])]),
+        native_x_dim=np.asarray([int(aggregate["native_x_dim"])], dtype=np.int64),
         n_total=np.asarray([int(aggregate["n_total"])], dtype=np.int64),
+        n_repeats=np.asarray([int(aggregate["n_repeats"])], dtype=np.int64),
+        repeat_indices=np.asarray(aggregate["repeat_indices"], dtype=np.int64),
+        repeat_seeds=np.asarray(aggregate["repeat_seeds"], dtype=np.int64),
         n_sweep_classical_matrices=np.asarray(aggregate["n_sweep_classical_matrices"], dtype=np.float64),
         n_sweep_flow_matching_matrices=np.asarray(aggregate["n_sweep_flow_matching_matrices"], dtype=np.float64),
         n_sweep_ground_truth_matrices=np.asarray(aggregate["n_sweep_ground_truth_matrices"], dtype=np.float64),
+        n_repeat_classical_matrices=np.asarray(aggregate["n_repeat_classical_matrices"], dtype=np.float64),
+        n_repeat_flow_matching_matrices=np.asarray(aggregate["n_repeat_flow_matching_matrices"], dtype=np.float64),
+        n_repeat_ground_truth_matrices=np.asarray(aggregate["n_repeat_ground_truth_matrices"], dtype=np.float64),
     )
     return path
 
@@ -518,9 +716,12 @@ def write_errors_csv(path: Path, rows: list[dict[str, Any]]) -> Path:
     fields = (
         "axis",
         "n_total",
+        "repeat_idx",
+        "repeat_seed",
         "pr_dim",
         "pr_projected",
         "pr_dim_label",
+        "native_x_dim",
         "metric",
         "estimator",
         "condition_i",
@@ -558,10 +759,16 @@ def plot_sweep_error(
         ("Flow only", ("flow_matching",)),
     )
     xvals = np.asarray(aggregate["n_list"], dtype=np.int64)
-    gt = np.asarray(aggregate["n_sweep_ground_truth_matrices"], dtype=np.float64)
+    gt = np.asarray(aggregate.get("n_repeat_ground_truth_matrices", aggregate["n_sweep_ground_truth_matrices"]), dtype=np.float64)
     matrices_by_estimator = {
-        "classical": np.asarray(aggregate["n_sweep_classical_matrices"], dtype=np.float64),
-        "flow_matching": np.asarray(aggregate["n_sweep_flow_matching_matrices"], dtype=np.float64),
+        "classical": np.asarray(
+            aggregate.get("n_repeat_classical_matrices", aggregate["n_sweep_classical_matrices"]),
+            dtype=np.float64,
+        ),
+        "flow_matching": np.asarray(
+            aggregate.get("n_repeat_flow_matching_matrices", aggregate["n_sweep_flow_matching_matrices"]),
+            dtype=np.float64,
+        ),
     }
     error_label = "Mean relative absolute error" if relative else "Mean absolute error"
 
@@ -582,15 +789,35 @@ def plot_sweep_error(
                     relative=bool(relative),
                 )
                 style = estimator_styles[estimator]
+                y_arr = np.asarray(yvals, dtype=np.float64)
+                if y_arr.ndim == 1:
+                    y_repeat = y_arr[:, None]
+                else:
+                    y_repeat = y_arr
+                for repeat_idx in range(int(y_repeat.shape[1])):
+                    scatter = ax.scatter(
+                        xvals,
+                        y_repeat[:, repeat_idx],
+                        color=style["color"],
+                        marker=style["marker"],
+                        s=18,
+                        alpha=0.45,
+                        linewidths=0.0,
+                        label=f"{style['label']} repeats" if repeat_idx == 0 else None,
+                        zorder=2,
+                    )
+                    if repeat_idx == 0 and scatter.get_label():
+                        handles_by_label[scatter.get_label()] = scatter
+                y_mean = np.mean(y_repeat, axis=1)
                 (line,) = ax.plot(
                     xvals,
-                    yvals,
+                    y_mean,
                     color=style["color"],
-                    marker=style["marker"],
+                    marker=None,
                     linestyle=style["linestyle"],
-                    linewidth=1.5,
-                    markersize=4.5,
-                    label=style["label"],
+                    linewidth=1.8,
+                    label=f"{style['label']} mean",
+                    zorder=3,
                 )
                 handles_by_label[line.get_label()] = line
             ax.set_xlabel("n_total")
@@ -634,7 +861,7 @@ def plot_sweep_error(
     metadata = {
         "Description": (
             f"layout=2x{len(metric_names)};metrics={','.join(metric_names)};"
-            "rows=classical+flow,flow_only"
+            "rows=classical+flow,flow_only;points=repeats;lines=repeat_means"
         )
     }
     fig.savefig(svg_path, metadata=metadata)
@@ -711,7 +938,7 @@ def plot_ground_truth_rdms(
 
 def plot_flow_loss_sweep(
     *,
-    loss_data: dict[tuple[int, int, str], dict[str, Any]],
+    loss_data: dict[tuple[int, int, int, str], dict[str, Any]],
     n_list: list[int],
     pr_dim: int | None,
     metrics: tuple[str, ...],
@@ -722,10 +949,14 @@ def plot_flow_loss_sweep(
     if not loss_data:
         return None
 
+    n_set = {int(n) for n in n_list}
     metric_tuple = tuple(
         str(metric)
         for metric in metrics
-        if any((_case_key(int(n_total), pr_dim)[0], _case_key(int(n_total), pr_dim)[1], str(metric)) in loss_data for n_total in n_list)
+        if any(
+            int(key[0]) in n_set and int(key[1]) == _pr_dim_storage(pr_dim) and str(key[3]) == str(metric)
+            for key in loss_data
+        )
     )
     if not metric_tuple:
         return None
@@ -742,13 +973,25 @@ def plot_flow_loss_sweep(
 
     for ax, metric in zip(axes, metric_tuple):
         for n_total in n_list:
-            case_key = (_case_key(int(n_total), pr_dim)[0], _case_key(int(n_total), pr_dim)[1], str(metric))
-            item = loss_data.get(case_key)
-            if item is None:
+            items = [
+                item
+                for key, item in loss_data.items()
+                if int(key[0]) == int(n_total) and int(key[1]) == _pr_dim_storage(pr_dim) and str(key[3]) == str(metric)
+            ]
+            if not items:
                 continue
-            train_losses = np.asarray(item["train_losses"], dtype=np.float64).reshape(-1)
-            val_losses = np.asarray(item["val_losses"], dtype=np.float64).reshape(-1)
-            val_monitor_losses = np.asarray(item.get("val_monitor_losses", []), dtype=np.float64).reshape(-1)
+
+            def mean_curve(name: str) -> np.ndarray:
+                curves = [np.asarray(item.get(name, []), dtype=np.float64).reshape(-1) for item in items]
+                curves = [curve for curve in curves if curve.size > 0]
+                if not curves:
+                    return np.asarray([], dtype=np.float64)
+                min_len = min(int(curve.size) for curve in curves)
+                return np.mean(np.stack([curve[:min_len] for curve in curves], axis=0), axis=0)
+
+            train_losses = mean_curve("train_losses")
+            val_losses = mean_curve("val_losses")
+            val_monitor_losses = mean_curve("val_monitor_losses")
             if train_losses.size == 0 and val_losses.size == 0 and val_monitor_losses.size == 0:
                 continue
             if train_losses.size:
@@ -775,36 +1018,6 @@ def plot_flow_loss_sweep(
                     label=f"n={int(n_total)} {style['label']}",
                 )
                 handles_by_label[line.get_label()] = line
-
-                best_epoch = item.get("best_epoch")
-                if best_epoch is not None:
-                    best_idx = int(best_epoch) - 1
-                    if 0 <= best_idx < val_losses.size:
-                        ax.scatter(
-                            [best_idx + 1],
-                            [float(val_losses[best_idx])],
-                            color=style["color"],
-                            marker="o",
-                            s=28,
-                            edgecolors="black",
-                            linewidths=0.45,
-                            zorder=4,
-                        )
-
-                stopped_epoch = item.get("stopped_epoch")
-                if stopped_epoch is not None:
-                    stopped_idx = int(stopped_epoch) - 1
-                    if 0 <= stopped_idx < val_losses.size:
-                        stopped_early = bool(item.get("stopped_early", False))
-                        ax.scatter(
-                            [stopped_idx + 1],
-                            [float(val_losses[stopped_idx])],
-                            color=style["color"],
-                            marker="x" if stopped_early else "|",
-                            s=38,
-                            linewidths=1.3,
-                            zorder=5,
-                        )
             if val_monitor_losses.size:
                 style = loss_styles["val_monitor"]
                 epochs = np.arange(1, val_monitor_losses.size + 1, dtype=np.int64)
@@ -852,7 +1065,14 @@ def plot_flow_loss_sweep(
     return svg_path, png_path
 
 
-def write_summary(path: Path, *, args: argparse.Namespace, case_paths: dict[tuple[int, int], Path], cache_hits: dict[tuple[int, int], bool], outputs: dict[str, Path]) -> Path:
+def write_summary(
+    path: Path,
+    *,
+    args: argparse.Namespace,
+    case_paths: dict[tuple[int, int, int], Path],
+    cache_hits: dict[tuple[int, int, int], bool],
+    outputs: dict[str, Path],
+) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     metrics = resolve_metric_names(args)
     payload = {
@@ -862,8 +1082,11 @@ def write_summary(path: Path, *, args: argparse.Namespace, case_paths: dict[tupl
             "pr_dim": None if args.pr_dim is None else int(args.pr_dim),
             "pr_projected": _pr_projected(args.pr_dim),
             "pr_dim_label": _pr_dim_label(args.pr_dim),
+            "native_x_dim": int(args.native_x_dim),
             "n_total": int(args.n_total),
+            "n_repeats": _n_repeats(args),
             "seed": int(args.seed),
+            "repeat_seeds": [_repeat_seed(args, r) for r in range(_n_repeats(args))],
             "device": str(args.device),
             "case_output_name": str(args.case_output_name),
             "force_comparison": bool(args.force_comparison),
@@ -876,12 +1099,12 @@ def write_summary(path: Path, *, args: argparse.Namespace, case_paths: dict[tupl
             "loss_yscale": str(args.loss_yscale),
         },
         "case_paths": {
-            f"n{int(n_total)}_{'native' if int(pr_dim) == -1 else f'pr{int(pr_dim)}'}": str(path)
-            for (n_total, pr_dim), path in sorted(case_paths.items())
+            f"n{int(n_total)}_repeat{int(repeat_idx):02d}_{'native' if int(pr_dim) == -1 else f'pr{int(pr_dim)}'}": str(path)
+            for (n_total, pr_dim, repeat_idx), path in sorted(case_paths.items())
         },
         "cache_hits": {
-            f"n{int(n_total)}_{'native' if int(pr_dim) == -1 else f'pr{int(pr_dim)}'}": bool(hit)
-            for (n_total, pr_dim), hit in sorted(cache_hits.items())
+            f"n{int(n_total)}_repeat{int(repeat_idx):02d}_{'native' if int(pr_dim) == -1 else f'pr{int(pr_dim)}'}": bool(hit)
+            for (n_total, pr_dim, repeat_idx), hit in sorted(cache_hits.items())
         },
         "outputs": {key: str(value) for key, value in outputs.items()},
     }
@@ -890,6 +1113,7 @@ def write_summary(path: Path, *, args: argparse.Namespace, case_paths: dict[tupl
 
 
 def run(args: argparse.Namespace) -> dict[str, Path]:
+    validate_args(args)
     output_dir = Path(args.output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -901,29 +1125,39 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
         png_path=output_dir / GROUND_TRUTH_RDMS_PNG_NAME,
     )
 
-    case_paths: dict[tuple[int, int], Path] = {}
-    cache_hits: dict[tuple[int, int], bool] = {}
-    case_data: dict[tuple[int, int], dict[str, Any]] = {}
-    for n_total, pr_dim in _unique_cases(args):
-        path, cache_hit = ensure_case_results(args, n_total=n_total, pr_dim=pr_dim)
-        case = _case_key(int(n_total), pr_dim)
+    native_template_npz = Path(str(ground_truth["native_npz"]))
+    case_paths: dict[tuple[int, int, int], Path] = {}
+    cache_hits: dict[tuple[int, int, int], bool] = {}
+    case_data: dict[tuple[int, int, int], dict[str, Any]] = {}
+    for n_total, pr_dim, repeat_idx in _unique_cases(args):
+        path, cache_hit = ensure_case_results(
+            args,
+            n_total=n_total,
+            pr_dim=pr_dim,
+            repeat_idx=int(repeat_idx),
+            native_template_npz=native_template_npz,
+        )
+        case = _repeat_case_key(int(n_total), pr_dim, int(repeat_idx))
         case_paths[case] = Path(path)
         cache_hits[case] = bool(cache_hit)
         case_data[case] = _filter_case_metrics(_load_case_cache(Path(path)), metrics, path=Path(path))
 
-    flow_loss_data: dict[tuple[int, int, str], dict[str, Any]] = {}
+    flow_loss_data: dict[tuple[int, int, int, str], dict[str, Any]] = {}
     flow_loss_warnings: list[str] = []
-    for n_total, pr_dim in _unique_cases(args):
+    for n_total, pr_dim, repeat_idx in _unique_cases(args):
         for metric in metrics:
             loss_path = case_flow_loss_npz(
                 n_total=int(n_total),
                 pr_dim=pr_dim,
                 case_output_name=str(args.case_output_name),
                 metric=str(metric),
+                native_x_dim=int(args.native_x_dim),
+                repeat_idx=int(repeat_idx),
+                n_repeats=_n_repeats(args),
             )
             try:
-                key = _case_key(int(n_total), pr_dim)
-                flow_loss_data[(key[0], key[1], str(metric))] = _load_flow_loss_cache(loss_path)
+                key = _repeat_case_key(int(n_total), pr_dim, int(repeat_idx))
+                flow_loss_data[(key[0], key[1], key[2], str(metric))] = _load_flow_loss_cache(loss_path)
             except (FileNotFoundError, KeyError, ValueError) as exc:
                 flow_loss_warnings.append(str(exc))
 

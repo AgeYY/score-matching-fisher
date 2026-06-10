@@ -21,7 +21,6 @@ from fisher.flow_matching_skl import (
     VELOCITY_FAMILIES,
     build_flow_skl_model,
     centered_radius_normalize,
-    centered_soft_radius_normalize,
     estimate_model_symmetric_kl,
     estimate_scalar_fisher_from_skl,
     flow_endpoint_log_prob,
@@ -146,17 +145,6 @@ def test_flow_skl_default_t_eps_is_small_endpoint_clamp() -> None:
     args = mod.build_parser().parse_args([])
     assert args.t_eps == pytest.approx(0.0005)
     assert args.early_ema_alpha == pytest.approx(0.05)
-
-
-def test_centered_soft_radius_normalize_has_nonzero_gradient_in_two_dimensions() -> None:
-    raw = torch.zeros((2, 2), dtype=torch.float64, requires_grad=True)
-    out = centered_soft_radius_normalize(raw, radius=1.5, eps=1e-2)
-    loss = out[0, 0] - out[0, 1] + 0.5 * (out[1, 1] - out[1, 0])
-    loss.backward()
-
-    assert raw.grad is not None
-    assert torch.count_nonzero(raw.grad).item() == 4
-    assert torch.linalg.norm(raw.grad).item() > 0.0
 
 
 def test_centered_fixed_radius_normalize_behavior_is_unchanged() -> None:
@@ -285,7 +273,6 @@ def test_build_flow_skl_model_uses_mlp_heads_and_film_nonlinear_subnets() -> Non
             "translation",
             "translation_fixed_norm",
             "translation_centered_fixed_norm",
-            "translation_centered_soft_norm",
         ):
             assert isinstance(model.mean_net, nn.Sequential)
             assert _first_linear_in_features(model.mean_net) == 2

@@ -44,7 +44,7 @@ METRIC_NAMES = (
 FLOW_VELOCITY_FAMILY_BY_METRIC = {
     METRIC_SQUARED_EUCLIDEAN: "translation",
     METRIC_COSINE: "translation_fixed_norm",
-    METRIC_CORRELATION: "translation_centered_soft_norm",
+    METRIC_CORRELATION: "translation_centered_fixed_norm",
     METRIC_MAHALANOBIS_SQ: "shared_affine",
     METRIC_SYMMETRIC_KL: "nonlinear",
 }
@@ -89,8 +89,6 @@ class FlowComparisonConfig:
     max_grad_norm: float = 10.0
     log_every: int = 50
     radius: float = 1.0
-    corr_soft_eps: float = 1e-2
-    correlation_flow_family: str = "soft"
     normalize_x: bool = False
     normalize_x_eps: float = 1e-8
 
@@ -557,20 +555,8 @@ def flow_skl_to_metric_readout(metric: str, symmetric_kl_matrix: np.ndarray, *, 
     return out
 
 
-def correlation_velocity_family(config: FlowComparisonConfig) -> str:
-    """Resolve the configured flow family for correlation rows."""
-
-    family = str(config.correlation_flow_family).strip().lower()
-    if family == "soft":
-        return "translation_centered_soft_norm"
-    if family == "fixed":
-        return "translation_centered_fixed_norm"
-    raise ValueError("correlation_flow_family must be one of: soft, fixed.")
-
-
 def velocity_family_for_metric(metric: str, config: FlowComparisonConfig) -> str:
-    if str(metric) == METRIC_CORRELATION:
-        return correlation_velocity_family(config)
+    del config
     return FLOW_VELOCITY_FAMILY_BY_METRIC[str(metric)]
 
 
@@ -608,7 +594,6 @@ def train_and_estimate_flow(
         divergence_estimator=str(config.divergence_estimator),
         hutchinson_probes=int(config.hutchinson_probes),
         shared_affine_a_diag_jitter=float(config.shared_affine_a_diag_jitter),
-        corr_soft_eps=float(config.corr_soft_eps),
     ).to(device)
     train_meta = train_flow_skl_model(
         model=model,
@@ -656,7 +641,6 @@ def save_flow_result_npz(
     velocity_family: str,
     pair: tuple[int, int] | None = None,
     flow_metric_matrix: np.ndarray | None = None,
-    corr_soft_eps: float | None = None,
 ) -> Path:
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -670,8 +654,6 @@ def save_flow_result_npz(
     )
     if flow_metric_matrix is not None:
         fields["flow_matching_matrix"] = np.asarray(flow_metric_matrix, dtype=np.float64)
-    if corr_soft_eps is not None:
-        fields["corr_soft_eps"] = np.asarray([float(corr_soft_eps)])
     if pair is not None:
         fields["condition_pair"] = np.asarray(pair, dtype=np.int64)
     meta = dict(result.train_metadata)
@@ -759,7 +741,6 @@ def flow_metric_matrices(
             theta_eval=theta_eval,
             velocity_family=family,
             flow_metric_matrix=matrices[metric],
-            corr_soft_eps=float(config.corr_soft_eps) if metric == METRIC_CORRELATION else None,
         )
         paths[metric] = path
     return matrices, paths

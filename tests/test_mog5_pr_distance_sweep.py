@@ -78,11 +78,12 @@ def _write_flow_loss_npz(path: Path, *, scale: float = 1.0, include_val_monitor:
     return path
 
 
-def _write_native_mog5_npz(path: Path, *, n_total: int = 25) -> Path:
+def _write_native_mog5_npz(path: Path, *, n_total: int = 25, x_dim: int = 2) -> Path:
     k = 5
+    x_dim = int(x_dim)
     labels = np.arange(n_total, dtype=np.int64) % k
     theta_all = np.eye(k, dtype=np.float64)[labels]
-    means = np.asarray(
+    means2 = np.asarray(
         [
             [-2.0, -1.0],
             [0.0, -1.4],
@@ -92,7 +93,7 @@ def _write_native_mog5_npz(path: Path, *, n_total: int = 25) -> Path:
         ],
         dtype=np.float64,
     )
-    variances = np.asarray(
+    variances2 = np.asarray(
         [
             [0.20, 0.35],
             [0.30, 0.25],
@@ -102,12 +103,23 @@ def _write_native_mog5_npz(path: Path, *, n_total: int = 25) -> Path:
         ],
         dtype=np.float64,
     )
+    means = means2
+    variances = variances2
+    if x_dim > 2:
+        extra = np.arange(1, x_dim - 1, dtype=np.float64)
+        means = np.column_stack([means2, 0.1 * means2[:, :1] + extra])
+        variances = np.column_stack([variances2, np.tile(0.18 + 0.02 * extra, (k, 1))])
     offsets = np.column_stack(
         [
             0.05 * np.sin(np.arange(n_total, dtype=np.float64)),
             0.05 * np.cos(np.arange(n_total, dtype=np.float64)),
         ]
     )
+    if x_dim > 2:
+        extra_offsets = np.column_stack(
+            [0.01 * (j + 1) * np.sin(np.arange(n_total, dtype=np.float64) + j) for j in range(x_dim - 2)]
+        )
+        offsets = np.column_stack([offsets, extra_offsets])
     x_all = means[labels] + offsets
     train_idx = np.arange(n_total // 2, dtype=np.int64)
     validation_idx = np.arange(n_total // 2, n_total, dtype=np.int64)
@@ -118,7 +130,7 @@ def _write_native_mog5_npz(path: Path, *, n_total: int = 25) -> Path:
             "theta_type": "categorical",
             "theta_encoding": "one_hot",
             "num_categories": k,
-            "x_dim": 2,
+            "x_dim": x_dim,
             "n_total": n_total,
             "mog_component_means": means.tolist(),
             "mog_component_variances": variances.tolist(),
@@ -176,6 +188,7 @@ def _fake_ground_truth_payload(metrics: tuple[str, ...] = ALL_METRICS) -> dict[s
         "pr_dim": 2,
         "pr_projected": True,
         "pr_dim_label": "pr2",
+        "native_npz": "random_mog_categorical.npz",
     }
 
 
@@ -192,6 +205,7 @@ def test_parser_defaults() -> None:
     args = mod.build_parser().parse_args([])
 
     assert args.n_list == [100, 550, 1000, 1550]
+    assert args.native_x_dim == 3
     assert args.pr_dim is None
     assert not hasattr(args, "pr_dim_list")
     assert args.n_total == 100000
@@ -201,11 +215,25 @@ def test_parser_defaults() -> None:
     assert args.early_ema_alpha == pytest.approx(0.05)
     assert args.yscale == "linear"
     assert args.loss_yscale == "linear"
-    assert args.output_dir == repo_root / "data" / "mog5_native_distance_sweeps"
+    assert args.n_repeats == 5
+    assert args.output_dir == repo_root / "data" / "mog5_native_xdim3_distance_sweeps"
 
-    pr2_args = mod.build_parser().parse_args(["--pr-dim", "2"])
+    native2_args = mod.build_parser().parse_args(["--native-x-dim", "2", "--pr-dim", "none"])
+    assert native2_args.output_dir == repo_root / "data" / "mog5_native_distance_sweeps"
+
+    pr2_args = mod.build_parser().parse_args(["--native-x-dim", "2", "--pr-dim", "2"])
     assert pr2_args.pr_dim == 2
     assert pr2_args.output_dir == repo_root / "data" / "mog5_pr_distance_sweeps"
+
+    native3_args = mod.build_parser().parse_args(["--native-x-dim", "3", "--pr-dim", "none"])
+    assert native3_args.output_dir == repo_root / "data" / "mog5_native_xdim3_distance_sweeps"
+
+    native3_pr_args = mod.build_parser().parse_args(["--native-x-dim", "3", "--pr-dim", "5"])
+    assert native3_pr_args.output_dir == repo_root / "data" / "mog5_native_xdim3_pr5_distance_sweeps"
+
+    invalid_args = mod.build_parser().parse_args(["--native-x-dim", "3", "--pr-dim", "2"])
+    with pytest.raises(ValueError, match="--pr-dim must be >= native x_dim=3"):
+        mod.validate_args(invalid_args)
 
 
 def test_aggregate_mean_pairwise_abs_errors(tmp_path: Path) -> None:
@@ -232,9 +260,55 @@ def test_aggregate_mean_pairwise_abs_errors(tmp_path: Path) -> None:
     assert np.mean(flow_rel_errors) == pytest.approx(((3.0 / 10.0) + (4.0 / 10.0) + (4.0 / 10.0)) / 3.0)
 
 
+def test_repeat_case_paths_and_single_case_args(tmp_path: Path) -> None:
+    mod = _load_cli_module()
+    args = mod.build_parser().parse_args(["--n-list", "100", "--n-repeats", "5", "--seed", "11"])
+
+    cases = mod._unique_cases(args)
+    assert len(cases) == 5
+    assert [case[2] for case in cases] == [0, 1, 2, 3, 4]
+    assert [mod._repeat_seed(args, case[2]) for case in cases] == [11, 12, 13, 14, 15]
+
+    repeat_dir = mod.case_output_dir(
+        n_total=100,
+        pr_dim=args.pr_dim,
+        case_output_name="distance_comparison_flow_skl",
+        native_x_dim=3,
+        repeat_idx=3,
+        n_repeats=5,
+    )
+    assert repeat_dir.parts[-2:] == ("repeat_03", "distance_comparison_flow_skl")
+
+    single_dir = mod.case_output_dir(
+        n_total=100,
+        pr_dim=args.pr_dim,
+        case_output_name="distance_comparison_flow_skl",
+        native_x_dim=3,
+        repeat_idx=0,
+        n_repeats=1,
+    )
+    assert single_dir.parts[-1] == "distance_comparison_flow_skl"
+    assert "repeat_00" not in single_dir.parts
+
+    case_args = mod._single_case_args(
+        args,
+        n_total=100,
+        pr_dim=args.pr_dim,
+        output_dir=tmp_path / "dataset" / "repeat_02" / "distance_comparison_flow_skl",
+        repeat_idx=2,
+        native_template_npz=tmp_path / "template.npz",
+    )
+    assert case_args.seed == 13
+    assert case_args.dataset_dir == tmp_path / "dataset" / "repeat_02"
+    assert case_args.native_template_npz == tmp_path / "template.npz"
+
+    single_repeat_args = mod.build_parser().parse_args(["--n-list", "100", "--n-repeats", "1"])
+    assert len(mod._unique_cases(single_repeat_args)) == 1
+
+
 def test_native_aggregate_metadata_and_npz(tmp_path: Path) -> None:
     mod = _load_cli_module()
-    args = mod.build_parser().parse_args(["--pr-dim", "none", "--n-list", "100"])
+    args = mod.build_parser().parse_args(["--native-x-dim", "2", "--pr-dim", "none", "--n-list", "100"])
     data = {
         (100, -1): mod._load_case_cache(_write_case_npz(tmp_path / "case_native.npz", offset=0.0)),
     }
@@ -245,13 +319,50 @@ def test_native_aggregate_metadata_and_npz(tmp_path: Path) -> None:
     assert aggregate["pr_projected"] is False
     assert aggregate["pr_dim"] is None
     assert aggregate["pr_dim_label"] == "native"
+    assert aggregate["native_x_dim"] == 2
     assert rows[0]["pr_projected"] is False
     assert rows[0]["pr_dim"] is None
     assert rows[0]["pr_dim_label"] == "native"
+    assert rows[0]["native_x_dim"] == 2
     with np.load(out, allow_pickle=False) as npz:
         np.testing.assert_array_equal(npz["pr_dim"], [-1])
+        np.testing.assert_array_equal(npz["native_x_dim"], [2])
         np.testing.assert_array_equal(npz["pr_projected"], [False])
         assert tuple(str(v) for v in npz["pr_dim_label"].tolist()) == ("native",)
+
+
+def test_repeat_aggregate_arrays_and_csv_rows(tmp_path: Path) -> None:
+    mod = _load_cli_module()
+    args = mod.build_parser().parse_args(["--n-list", "100,200", "--n-repeats", "2", "--seed", "31"])
+    case_data = {
+        (100, -1, 0): mod._load_case_cache(_write_case_npz(tmp_path / "case_100_r0.npz", offset=0.0)),
+        (100, -1, 1): mod._load_case_cache(_write_case_npz(tmp_path / "case_100_r1.npz", offset=2.0)),
+        (200, -1, 0): mod._load_case_cache(_write_case_npz(tmp_path / "case_200_r0.npz", offset=4.0)),
+        (200, -1, 1): mod._load_case_cache(_write_case_npz(tmp_path / "case_200_r1.npz", offset=6.0)),
+    }
+
+    aggregate, rows = mod.aggregate_sweeps(args=args, case_data=case_data)
+    out = mod.write_aggregate_npz(tmp_path / "sweep.npz", aggregate)
+
+    assert aggregate["n_repeat_classical_matrices"].shape == (2, 2, 5, 3, 3)
+    np.testing.assert_allclose(
+        aggregate["n_sweep_classical_matrices"],
+        np.mean(aggregate["n_repeat_classical_matrices"], axis=1),
+    )
+    repeat_errors = mod._mean_pair_error_curve(
+        aggregate["n_repeat_flow_matching_matrices"],
+        aggregate["n_repeat_ground_truth_matrices"],
+        aggregate["pair_indices"],
+        metric_idx=0,
+        relative=False,
+    )
+    assert repeat_errors.shape == (2, 2)
+    np.testing.assert_allclose(repeat_errors, np.full((2, 2), 11.0 / 3.0))
+    assert {row["repeat_idx"] for row in rows} == {0, 1}
+    assert {row["repeat_seed"] for row in rows} == {31, 32}
+    with np.load(out, allow_pickle=False) as npz:
+        assert npz["n_repeat_classical_matrices"].shape == (2, 2, 5, 3, 3)
+        np.testing.assert_array_equal(npz["repeat_seeds"], [31, 32])
 
 
 def test_relative_error_uses_denominator_floor_for_zero_ground_truth(tmp_path: Path) -> None:
@@ -366,6 +477,22 @@ def test_plot_mog5_native_scatter_covariance_writes_svg_and_png(tmp_path: Path) 
     assert "<image" not in svg_text
 
 
+def test_plot_mog5_native_scatter_covariance_accepts_3d_x1_x2_view(tmp_path: Path) -> None:
+    native_npz = _write_native_mog5_npz(tmp_path / "random_mog_categorical_3d.npz", x_dim=3)
+
+    svg, png = plot_mog5_native_scatter_covariance(
+        native_npz,
+        svg_path=tmp_path / "figure3d.svg",
+        png_path=tmp_path / "figure3d.png",
+        max_points=12,
+    )
+
+    assert svg.is_file()
+    assert png.is_file()
+    assert svg.stat().st_size > 0
+    assert png.stat().st_size > 0
+
+
 def test_plot_ground_truth_rdms_writes_requested_metric_panels(tmp_path: Path) -> None:
     mod = _load_cli_module()
     ground_truth = _fake_ground_truth_payload(("cosine",))
@@ -413,7 +540,7 @@ def test_cache_hits_do_not_rerun_and_duplicate_case_is_deduped(monkeypatch, tmp_
     monkeypatch.setattr(
         mod,
         "case_output_dir",
-        lambda *, n_total, pr_dim, case_output_name: tmp_path / f"case_{n_total}_{pr_dim}",
+        lambda *, n_total, pr_dim, case_output_name, native_x_dim=2, repeat_idx=0, n_repeats=1: tmp_path / f"case_{n_total}_{pr_dim}",
     )
     _write_case_npz(tmp_path / "case_1000_None" / mod.RESULTS_NAME)
 
@@ -436,6 +563,8 @@ def test_cache_hits_do_not_rerun_and_duplicate_case_is_deduped(monkeypatch, tmp_
             "1000,2000,1000",
             "--output-dir",
             str(tmp_path / "sweep"),
+            "--n-repeats",
+            "1",
             "--yscale",
             "linear",
         ]
@@ -453,9 +582,11 @@ def test_visualization_only_missing_cache_fails(monkeypatch, tmp_path: Path) -> 
     monkeypatch.setattr(
         mod,
         "case_output_dir",
-        lambda *, n_total, pr_dim, case_output_name: tmp_path / f"case_{n_total}_{pr_dim}",
+        lambda *, n_total, pr_dim, case_output_name, native_x_dim=2, repeat_idx=0, n_repeats=1: tmp_path / f"case_{n_total}_{pr_dim}",
     )
-    args = mod.build_parser().parse_args(["--visualization-only", "--n-list", "100", "--output-dir", str(tmp_path / "sweep")])
+    args = mod.build_parser().parse_args(
+        ["--visualization-only", "--n-list", "100", "--n-repeats", "1", "--output-dir", str(tmp_path / "sweep")]
+    )
 
     with pytest.raises(FileNotFoundError, match="visualization-only"):
         mod.run(args)
@@ -467,7 +598,7 @@ def test_visualization_only_writes_outputs_from_fake_caches(monkeypatch, tmp_pat
     monkeypatch.setattr(
         mod,
         "case_output_dir",
-        lambda *, n_total, pr_dim, case_output_name: tmp_path / f"case_{n_total}_{pr_dim}",
+        lambda *, n_total, pr_dim, case_output_name, native_x_dim=2, repeat_idx=0, n_repeats=1: tmp_path / f"case_{n_total}_{pr_dim}",
     )
     _write_case_npz(tmp_path / "case_100_None" / mod.RESULTS_NAME)
     _write_native_mog5_npz(tmp_path / "random_mog_categorical.npz")
@@ -476,6 +607,8 @@ def test_visualization_only_writes_outputs_from_fake_caches(monkeypatch, tmp_pat
             "--visualization-only",
             "--n-list",
             "100",
+            "--n-repeats",
+            "1",
             "--output-dir",
             str(tmp_path / "sweep"),
         ]
@@ -525,7 +658,7 @@ def test_skip_dataset_viz_omits_sweep_dataset_figure(monkeypatch, tmp_path: Path
     monkeypatch.setattr(
         mod,
         "case_output_dir",
-        lambda *, n_total, pr_dim, case_output_name: tmp_path / f"case_{n_total}_{pr_dim}",
+        lambda *, n_total, pr_dim, case_output_name, native_x_dim=2, repeat_idx=0, n_repeats=1: tmp_path / f"case_{n_total}_{pr_dim}",
     )
     _write_case_npz(tmp_path / "case_100_None" / mod.RESULTS_NAME)
     _write_native_mog5_npz(tmp_path / "random_mog_categorical.npz")
@@ -535,6 +668,8 @@ def test_skip_dataset_viz_omits_sweep_dataset_figure(monkeypatch, tmp_path: Path
             "--skip-dataset-viz",
             "--n-list",
             "100",
+            "--n-repeats",
+            "1",
             "--output-dir",
             str(tmp_path / "sweep"),
         ]
@@ -555,7 +690,7 @@ def test_native_visualization_only_uses_native_cache_and_summary(monkeypatch, tm
     monkeypatch.setattr(
         mod,
         "case_output_dir",
-        lambda *, n_total, pr_dim, case_output_name: tmp_path / f"case_{n_total}_{mod._pr_dim_label(pr_dim)}",
+        lambda *, n_total, pr_dim, case_output_name, native_x_dim=2, repeat_idx=0, n_repeats=1: tmp_path / f"case_{n_total}_{mod._pr_dim_label(pr_dim)}",
     )
     _write_case_npz(tmp_path / "case_100_native" / mod.RESULTS_NAME)
     args = mod.build_parser().parse_args(
@@ -565,6 +700,8 @@ def test_native_visualization_only_uses_native_cache_and_summary(monkeypatch, tm
             "none",
             "--n-list",
             "100",
+            "--n-repeats",
+            "1",
             "--output-dir",
             str(tmp_path / "sweep"),
         ]
@@ -580,8 +717,8 @@ def test_native_visualization_only_uses_native_cache_and_summary(monkeypatch, tm
     assert summary["config"]["pr_projected"] is False
     assert summary["config"]["pr_dim"] is None
     assert summary["config"]["pr_dim_label"] == "native"
-    assert "n100_native" in summary["case_paths"]
-    assert "n100_native" in summary["cache_hits"]
+    assert "n100_repeat00_native" in summary["case_paths"]
+    assert "n100_repeat00_native" in summary["cache_hits"]
 
 
 def test_visualization_only_writes_flow_loss_outputs_from_fake_caches(monkeypatch, tmp_path: Path) -> None:
@@ -590,7 +727,7 @@ def test_visualization_only_writes_flow_loss_outputs_from_fake_caches(monkeypatc
     monkeypatch.setattr(
         mod,
         "case_output_dir",
-        lambda *, n_total, pr_dim, case_output_name: tmp_path / f"case_{n_total}_{pr_dim}",
+        lambda *, n_total, pr_dim, case_output_name, native_x_dim=2, repeat_idx=0, n_repeats=1: tmp_path / f"case_{n_total}_{pr_dim}",
     )
     _write_case_npz(tmp_path / "case_100_None" / mod.RESULTS_NAME)
     _write_flow_loss_npz(tmp_path / "case_100_None" / "flow" / "symmetric_kl_flow_matching_skl_results.npz")
@@ -601,6 +738,8 @@ def test_visualization_only_writes_flow_loss_outputs_from_fake_caches(monkeypatc
             "symmetric_kl",
             "--n-list",
             "100",
+            "--n-repeats",
+            "1",
             "--output-dir",
             str(tmp_path / "sweep"),
         ]
@@ -622,7 +761,7 @@ def test_visualization_only_filters_cached_metric(monkeypatch, tmp_path: Path) -
     monkeypatch.setattr(
         mod,
         "case_output_dir",
-        lambda *, n_total, pr_dim, case_output_name: tmp_path / f"case_{n_total}_{pr_dim}",
+        lambda *, n_total, pr_dim, case_output_name, native_x_dim=2, repeat_idx=0, n_repeats=1: tmp_path / f"case_{n_total}_{pr_dim}",
     )
     _write_case_npz(tmp_path / "case_100_None" / mod.RESULTS_NAME)
     args = mod.build_parser().parse_args(
@@ -632,6 +771,8 @@ def test_visualization_only_filters_cached_metric(monkeypatch, tmp_path: Path) -
             "cosine",
             "--n-list",
             "100",
+            "--n-repeats",
+            "1",
             "--output-dir",
             str(tmp_path / "sweep"),
         ]
@@ -656,7 +797,7 @@ def test_visualization_only_requested_metric_missing_from_cache_fails(monkeypatc
     monkeypatch.setattr(
         mod,
         "case_output_dir",
-        lambda *, n_total, pr_dim, case_output_name: tmp_path / f"case_{n_total}_{pr_dim}",
+        lambda *, n_total, pr_dim, case_output_name, native_x_dim=2, repeat_idx=0, n_repeats=1: tmp_path / f"case_{n_total}_{pr_dim}",
     )
     _write_case_npz(
         tmp_path / "case_100_None" / mod.RESULTS_NAME,
@@ -669,6 +810,8 @@ def test_visualization_only_requested_metric_missing_from_cache_fails(monkeypatc
             "cosine",
             "--n-list",
             "100",
+            "--n-repeats",
+            "1",
             "--output-dir",
             str(tmp_path / "sweep"),
         ]
