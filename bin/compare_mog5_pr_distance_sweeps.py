@@ -53,6 +53,7 @@ GROUND_TRUTH_RDM_METRIC_TITLES = {
     "mahalanobis_sq": "Squared Mahalanobis",
     "symmetric_kl": "Jeffreys divergence",
 }
+SWEEP_X_TICK_VALUES = (50, 1000, 2000, 3000)
 
 
 def _load_single_case_module() -> Any:
@@ -129,7 +130,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--n-list",
         type=_parse_int_list,
-        default=[100, 550, 1000, 1550],
+        default=[50, 500, 1000, 1500, 2000, 3000],
         help="Comma-separated sample-size sweep values.",
     )
     p.add_argument(
@@ -141,7 +142,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--n-repeats",
         type=int,
-        default=5,
+        default=10,
         help="Independent finite-sample repeats per n_total value.",
     )
     p.add_argument(
@@ -738,6 +739,15 @@ def write_errors_csv(path: Path, rows: list[dict[str, Any]]) -> Path:
     return path
 
 
+def _sparse_sweep_x_ticks(xvals: np.ndarray) -> np.ndarray:
+    """Return preferred x-axis tick positions present in the sweep n_list."""
+    x_set = {int(v) for v in np.asarray(xvals, dtype=np.int64).reshape(-1)}
+    ticks = [int(v) for v in SWEEP_X_TICK_VALUES if int(v) in x_set]
+    if ticks:
+        return np.asarray(ticks, dtype=np.int64)
+    return np.asarray(xvals, dtype=np.int64)
+
+
 def plot_sweep_error(
     aggregate: dict[str, Any],
     *,
@@ -749,10 +759,13 @@ def plot_sweep_error(
     metric_names = tuple(str(v) for v in aggregate["metric_names"])
     if not metric_names:
         raise ValueError("aggregate must contain at least one metric.")
+    ordered_metric_names = tuple(metric for metric in GROUND_TRUTH_RDM_METRIC_ORDER if metric in metric_names)
+    ordered_metric_names += tuple(metric for metric in metric_names if metric not in ordered_metric_names)
+    ordered_metric_indices = [metric_names.index(metric) for metric in ordered_metric_names]
     pair_indices = np.asarray(aggregate["pair_indices"], dtype=np.int64)
     estimator_styles = {
-        "classical": {"color": "tab:blue", "marker": "o", "linestyle": "-", "label": "classical"},
-        "flow_matching": {"color": "tab:orange", "marker": "s", "linestyle": "--", "label": "flow matching"},
+        "classical": {"color": "C1", "linestyle": "-", "label": "classical"},
+        "flow_matching": {"color": "C0", "linestyle": "-", "label": "flow matching"},
     }
     row_specs = (
         ("Classical + flow", ("classical", "flow_matching")),
@@ -771,14 +784,15 @@ def plot_sweep_error(
         ),
     }
     error_label = "Mean relative absolute error" if relative else "Mean absolute error"
+    sparse_x_ticks = _sparse_sweep_x_ticks(xvals)
 
-    fig_width = max(7.0, 3.6 * len(metric_names))
-    fig, axes = plt.subplots(2, len(metric_names), figsize=(fig_width, 8.0), squeeze=False, constrained_layout=True)
+    fig_width = max(7.0, 3.6 * len(ordered_metric_names))
+    fig, axes = plt.subplots(2, len(ordered_metric_names), figsize=(fig_width, 8.0), squeeze=False, constrained_layout=True)
     handles_by_label: dict[str, Any] = {}
-    for metric_idx, metric in enumerate(metric_names):
-        axes[0, metric_idx].set_title(metric)
+    for panel_idx, (metric_idx, metric) in enumerate(zip(ordered_metric_indices, ordered_metric_names, strict=True)):
+        axes[0, panel_idx].set_title(GROUND_TRUTH_RDM_METRIC_TITLES.get(str(metric), str(metric)))
         for row_idx, (row_label, estimators) in enumerate(row_specs):
-            ax = axes[row_idx, metric_idx]
+            ax = axes[row_idx, panel_idx]
             for estimator in estimators:
                 matrices = matrices_by_estimator[estimator]
                 yvals = _mean_pair_error_curve(
@@ -794,35 +808,31 @@ def plot_sweep_error(
                     y_repeat = y_arr[:, None]
                 else:
                     y_repeat = y_arr
-                for repeat_idx in range(int(y_repeat.shape[1])):
-                    scatter = ax.scatter(
-                        xvals,
-                        y_repeat[:, repeat_idx],
-                        color=style["color"],
-                        marker=style["marker"],
-                        s=18,
-                        alpha=0.45,
-                        linewidths=0.0,
-                        label=f"{style['label']} repeats" if repeat_idx == 0 else None,
-                        zorder=2,
-                    )
-                    if repeat_idx == 0 and scatter.get_label():
-                        handles_by_label[scatter.get_label()] = scatter
                 y_mean = np.mean(y_repeat, axis=1)
-                (line,) = ax.plot(
+                y_sd = (
+                    np.std(y_repeat, axis=1, ddof=1)
+                    if int(y_repeat.shape[1]) > 1
+                    else np.zeros_like(y_mean, dtype=np.float64)
+                )
+                errorbar = ax.errorbar(
                     xvals,
                     y_mean,
+                    yerr=y_sd,
                     color=style["color"],
-                    marker=None,
-                    linestyle=style["linestyle"],
+                    fmt=style["linestyle"],
                     linewidth=1.8,
+                    elinewidth=1.2,
+                    capsize=3.0,
                     label=f"{style['label']} mean",
                     zorder=3,
                 )
-                handles_by_label[line.get_label()] = line
-            ax.set_xlabel("n_total")
-            ax.set_ylabel(error_label)
-            if metric_idx == 0:
+                handles_by_label[errorbar.get_label()] = errorbar
+            ax.set_xlabel("N data points")
+            if panel_idx == 0:
+                ax.set_ylabel(error_label)
+            else:
+                ax.set_ylabel("")
+            if panel_idx == 0:
                 ax.text(
                     -0.36,
                     0.5,
@@ -834,8 +844,7 @@ def plot_sweep_error(
                     fontsize=10,
                     fontweight="semibold",
                 )
-            ax.set_xticks(xvals)
-            ax.grid(True, which="both", alpha=0.25)
+            ax.set_xticks(sparse_x_ticks)
             if str(yscale) == "log":
                 ax.set_yscale("log")
                 ymin = min(
@@ -860,8 +869,8 @@ def plot_sweep_error(
     svg_path.parent.mkdir(parents=True, exist_ok=True)
     metadata = {
         "Description": (
-            f"layout=2x{len(metric_names)};metrics={','.join(metric_names)};"
-            "rows=classical+flow,flow_only;points=repeats;lines=repeat_means"
+            f"layout=2x{len(ordered_metric_names)};metrics={','.join(ordered_metric_names)};"
+            "rows=classical+flow,flow_only;lines=repeat_means;errorbars=mean_sd"
         )
     }
     fig.savefig(svg_path, metadata=metadata)
@@ -1072,32 +1081,38 @@ def write_summary(
     case_paths: dict[tuple[int, int, int], Path],
     cache_hits: dict[tuple[int, int, int], bool],
     outputs: dict[str, Path],
+    script: str = "bin/compare_mog5_pr_distance_sweeps.py",
+    extra_config: dict[str, Any] | None = None,
+    extra_payload: dict[str, Any] | None = None,
 ) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     metrics = resolve_metric_names(args)
+    config = {
+        "n_list": [int(v) for v in args.n_list],
+        "pr_dim": None if args.pr_dim is None else int(args.pr_dim),
+        "pr_projected": _pr_projected(args.pr_dim),
+        "pr_dim_label": _pr_dim_label(args.pr_dim),
+        "native_x_dim": int(args.native_x_dim),
+        "n_total": int(args.n_total),
+        "n_repeats": _n_repeats(args),
+        "seed": int(args.seed),
+        "repeat_seeds": [_repeat_seed(args, r) for r in range(_n_repeats(args))],
+        "device": str(args.device),
+        "case_output_name": str(args.case_output_name),
+        "force_comparison": bool(args.force_comparison),
+        "visualization_only": bool(args.visualization_only),
+        "metric": str(args.metric),
+        "metrics": list(metrics),
+        "yscale": str(args.yscale),
+        "abs_error_yscale": str(args.yscale),
+        "rel_error_yscale": "linear",
+        "loss_yscale": str(args.loss_yscale),
+    }
+    if extra_config:
+        config.update(extra_config)
     payload = {
-        "script": "bin/compare_mog5_pr_distance_sweeps.py",
-        "config": {
-            "n_list": [int(v) for v in args.n_list],
-            "pr_dim": None if args.pr_dim is None else int(args.pr_dim),
-            "pr_projected": _pr_projected(args.pr_dim),
-            "pr_dim_label": _pr_dim_label(args.pr_dim),
-            "native_x_dim": int(args.native_x_dim),
-            "n_total": int(args.n_total),
-            "n_repeats": _n_repeats(args),
-            "seed": int(args.seed),
-            "repeat_seeds": [_repeat_seed(args, r) for r in range(_n_repeats(args))],
-            "device": str(args.device),
-            "case_output_name": str(args.case_output_name),
-            "force_comparison": bool(args.force_comparison),
-            "visualization_only": bool(args.visualization_only),
-            "metric": str(args.metric),
-            "metrics": list(metrics),
-            "yscale": str(args.yscale),
-            "abs_error_yscale": str(args.yscale),
-            "rel_error_yscale": "linear",
-            "loss_yscale": str(args.loss_yscale),
-        },
+        "script": script,
+        "config": config,
         "case_paths": {
             f"n{int(n_total)}_repeat{int(repeat_idx):02d}_{'native' if int(pr_dim) == -1 else f'pr{int(pr_dim)}'}": str(path)
             for (n_total, pr_dim, repeat_idx), path in sorted(case_paths.items())
@@ -1108,40 +1123,26 @@ def write_summary(
         },
         "outputs": {key: str(value) for key, value in outputs.items()},
     }
+    if extra_payload:
+        payload.update(extra_payload)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return path
 
 
-def run(args: argparse.Namespace) -> dict[str, Path]:
-    validate_args(args)
-    output_dir = Path(args.output_dir).expanduser()
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    metrics = resolve_metric_names(args)
-    ground_truth = compute_baseline_ground_truth_rdms(args, metrics)
-    gt_svg_path, gt_png_path = plot_ground_truth_rdms(
-        ground_truth,
-        svg_path=output_dir / GROUND_TRUTH_RDMS_SVG_NAME,
-        png_path=output_dir / GROUND_TRUTH_RDMS_PNG_NAME,
-    )
-
-    native_template_npz = Path(str(ground_truth["native_npz"]))
-    case_paths: dict[tuple[int, int, int], Path] = {}
-    cache_hits: dict[tuple[int, int, int], bool] = {}
-    case_data: dict[tuple[int, int, int], dict[str, Any]] = {}
-    for n_total, pr_dim, repeat_idx in _unique_cases(args):
-        path, cache_hit = ensure_case_results(
-            args,
-            n_total=n_total,
-            pr_dim=pr_dim,
-            repeat_idx=int(repeat_idx),
-            native_template_npz=native_template_npz,
-        )
-        case = _repeat_case_key(int(n_total), pr_dim, int(repeat_idx))
-        case_paths[case] = Path(path)
-        cache_hits[case] = bool(cache_hit)
-        case_data[case] = _filter_case_metrics(_load_case_cache(Path(path)), metrics, path=Path(path))
-
+def finalize_sweep_outputs(
+    *,
+    args: argparse.Namespace,
+    output_dir: Path,
+    metrics: tuple[str, ...],
+    case_paths: dict[tuple[int, int, int], Path],
+    cache_hits: dict[tuple[int, int, int], bool],
+    case_data: dict[tuple[int, int, int], dict[str, Any]],
+    gt_svg_path: Path,
+    gt_png_path: Path,
+    summary_script: str = "bin/compare_mog5_pr_distance_sweeps.py",
+    summary_extra_config: dict[str, Any] | None = None,
+    summary_extra_payload: dict[str, Any] | None = None,
+) -> dict[str, Path]:
     flow_loss_data: dict[tuple[int, int, int, str], dict[str, Any]] = {}
     flow_loss_warnings: list[str] = []
     for n_total, pr_dim, repeat_idx in _unique_cases(args):
@@ -1215,6 +1216,9 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
         case_paths=case_paths,
         cache_hits=cache_hits,
         outputs=outputs,
+        script=summary_script,
+        extra_config=summary_extra_config,
+        extra_payload=summary_extra_payload,
     )
     outputs["summary_json"] = summary_path
     print(f"results_npz: {npz_path}", flush=True)
@@ -1246,6 +1250,48 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
         print(f"dataset_figure_png: {dataset_paths[1]}", flush=True)
     print(f"summary_json: {summary_path}", flush=True)
     return outputs
+
+
+def run(args: argparse.Namespace) -> dict[str, Path]:
+    validate_args(args)
+    output_dir = Path(args.output_dir).expanduser()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    metrics = resolve_metric_names(args)
+    ground_truth = compute_baseline_ground_truth_rdms(args, metrics)
+    gt_svg_path, gt_png_path = plot_ground_truth_rdms(
+        ground_truth,
+        svg_path=output_dir / GROUND_TRUTH_RDMS_SVG_NAME,
+        png_path=output_dir / GROUND_TRUTH_RDMS_PNG_NAME,
+    )
+
+    native_template_npz = Path(str(ground_truth["native_npz"]))
+    case_paths: dict[tuple[int, int, int], Path] = {}
+    cache_hits: dict[tuple[int, int, int], bool] = {}
+    case_data: dict[tuple[int, int, int], dict[str, Any]] = {}
+    for n_total, pr_dim, repeat_idx in _unique_cases(args):
+        path, cache_hit = ensure_case_results(
+            args,
+            n_total=n_total,
+            pr_dim=pr_dim,
+            repeat_idx=int(repeat_idx),
+            native_template_npz=native_template_npz,
+        )
+        case = _repeat_case_key(int(n_total), pr_dim, int(repeat_idx))
+        case_paths[case] = Path(path)
+        cache_hits[case] = bool(cache_hit)
+        case_data[case] = _filter_case_metrics(_load_case_cache(Path(path)), metrics, path=Path(path))
+
+    return finalize_sweep_outputs(
+        args=args,
+        output_dir=output_dir,
+        metrics=metrics,
+        case_paths=case_paths,
+        cache_hits=cache_hits,
+        case_data=case_data,
+        gt_svg_path=gt_svg_path,
+        gt_png_path=gt_png_path,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -204,7 +204,7 @@ def test_parser_defaults() -> None:
     repo_root = Path(__file__).resolve().parent.parent
     args = mod.build_parser().parse_args([])
 
-    assert args.n_list == [100, 550, 1000, 1550]
+    assert args.n_list == [50, 500, 1000, 1500, 2000, 3000]
     assert args.native_x_dim == 3
     assert args.pr_dim is None
     assert not hasattr(args, "pr_dim_list")
@@ -215,7 +215,8 @@ def test_parser_defaults() -> None:
     assert args.early_ema_alpha == pytest.approx(0.05)
     assert args.yscale == "linear"
     assert args.loss_yscale == "linear"
-    assert args.n_repeats == 5
+    assert args.n_repeats == 10
+    assert args.lr == pytest.approx(1e-3)
     assert args.output_dir == repo_root / "data" / "mog5_native_xdim3_distance_sweeps"
 
     native2_args = mod.build_parser().parse_args(["--native-x-dim", "2", "--pr-dim", "none"])
@@ -399,13 +400,18 @@ def test_mean_pair_error_curve_returns_raw_curve_values(tmp_path: Path) -> None:
     np.testing.assert_allclose(yvals, [11.0 / 3.0, 11.0 / 3.0])
 
 
-def test_plot_sweep_error_writes_per_metric_panel_grid(tmp_path: Path) -> None:
+def test_plot_sweep_error_writes_errorbar_style_panels(monkeypatch, tmp_path: Path) -> None:
     mod = _load_cli_module()
-    metrics = ("squared_euclidean", "cosine", "symmetric_kl")
+    metrics = ("symmetric_kl", "squared_euclidean", "mahalanobis_sq", "correlation", "cosine")
     args = mod.build_parser().parse_args(["--n-list", "100,200"])
     case_100 = mod._load_case_cache(_write_case_npz(tmp_path / "case_100.npz", offset=0.0, metrics=metrics))
     case_200 = mod._load_case_cache(_write_case_npz(tmp_path / "case_200.npz", offset=5.0, metrics=metrics))
     aggregate, _ = mod.aggregate_sweeps(args=args, case_data={(100, -1): case_100, (200, -1): case_200})
+
+    def fail_scatter(*args, **kwargs):
+        raise AssertionError("plot_sweep_error should use error bars instead of scatter points")
+
+    monkeypatch.setattr(mod.plt.Axes, "scatter", fail_scatter)
 
     abs_svg, abs_png = mod.plot_sweep_error(
         aggregate,
@@ -427,9 +433,17 @@ def test_plot_sweep_error_writes_per_metric_panel_grid(tmp_path: Path) -> None:
         assert path.stat().st_size > 0
     abs_text = abs_svg.read_text(encoding="utf-8")
     rel_text = rel_svg.read_text(encoding="utf-8")
-    expected_description = "layout=2x3;metrics=squared_euclidean,cosine,symmetric_kl;rows=classical+flow,flow_only"
+    expected_description = (
+        "layout=2x5;metrics=correlation,cosine,squared_euclidean,mahalanobis_sq,symmetric_kl;"
+        "rows=classical+flow,flow_only"
+    )
     assert expected_description in abs_text
     assert expected_description in rel_text
+    for title in ("Correlation", "Cosine", "Squared Euclidean", "Squared Mahalanobis", "Jeffreys divergence"):
+        assert title in abs_text
+    assert "errorbars=mean_sd" in abs_text
+    assert "points=repeats" not in abs_text
+    assert "N data points" in abs_text
     assert "Mean absolute error" in abs_text
     assert "Mean relative absolute error" in rel_text
 

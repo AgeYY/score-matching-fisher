@@ -137,7 +137,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--early-min-delta", type=float, default=1e-4)
     p.add_argument("--early-ema-alpha", type=float, default=0.05)
     p.add_argument("--batch-size", type=int, default=2048)
-    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--hidden-dim", type=int, default=256)
     p.add_argument("--depth", type=int, default=5)

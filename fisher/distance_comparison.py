@@ -71,7 +71,7 @@ class FlowComparisonConfig:
     early_min_delta: float = 1e-4
     early_ema_alpha: float = 0.05
     batch_size: int = 512
-    lr: float = 1e-4
+    lr: float = 1e-3
     weight_decay: float = 0.0
     hidden_dim: int = 256
     depth: int = 5

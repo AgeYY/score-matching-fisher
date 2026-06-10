@@ -82,7 +82,7 @@ def plot_mog5_native_scatter_covariance(
         plot_idx = np.arange(n, dtype=np.int64)
 
     colors = [plt.get_cmap("tab10")(i) for i in range(5)]
-    fig, ax = plt.subplots(figsize=(6.6, 6.0), constrained_layout=True)
+    fig, ax = plt.subplots(figsize=(6.6, 9.0), constrained_layout=True)
     for cls in range(5):
         mask = labels[plot_idx] == cls
         if np.any(mask):
