@@ -148,6 +148,115 @@ def pca_project(x: np.ndarray, n_components: int = 2) -> tuple[np.ndarray, np.nd
     return proj, x.mean(axis=0), basis
 
 
+def _project_covariances_to_basis(covariances: np.ndarray, basis: np.ndarray) -> np.ndarray:
+    """Project covariance matrices into the column space of ``basis``."""
+    cov = np.asarray(covariances, dtype=np.float64)
+    b = np.asarray(basis, dtype=np.float64)
+    if cov.ndim != 3 or int(cov.shape[1]) != int(cov.shape[2]):
+        raise ValueError(f"covariances must have shape (N, d, d); got {cov.shape}.")
+    if b.ndim != 2 or int(b.shape[0]) != int(cov.shape[1]):
+        raise ValueError(f"basis must have shape ({cov.shape[1]}, k); got {b.shape}.")
+    return np.einsum("ia,nij,jb->nab", b, cov, b)
+
+
+def _covariance_ellipse_parameters(cov_2d: np.ndarray) -> tuple[float, float, float]:
+    """Return Matplotlib ellipse width, height, and angle for a 2D 1-sigma covariance."""
+    cov = np.asarray(cov_2d, dtype=np.float64)
+    if cov.shape != (2, 2):
+        raise ValueError(f"cov_2d must have shape (2, 2); got {cov.shape}.")
+    vals, vecs = np.linalg.eigh(0.5 * (cov + cov.T))
+    order = np.argsort(vals)[::-1]
+    vals = np.maximum(vals[order], 0.0)
+    vecs = vecs[:, order]
+    angle = float(np.degrees(np.arctan2(vecs[1, 0], vecs[0, 0])))
+    width, height = 2.0 * np.sqrt(vals)
+    return float(width), float(height), angle
+
+
+def _draw_tuning_curves(ax_tune: "Axes", t: np.ndarray, mu: np.ndarray) -> None:
+    for j in range(int(mu.shape[1])):
+        ax_tune.plot(t[:, 0], mu[:, j], color="black", linewidth=2.0)
+    ax_tune.set_xlabel(r"$\theta$")
+    ax_tune.set_ylabel(r"Mean of $x|\theta$")
+    ax_tune.set_box_aspect(1)
+
+
+def _draw_pca_covariance_ellipses(
+    fig: plt.Figure,
+    ax_covariance: "Axes",
+    t: np.ndarray,
+    mu: np.ndarray,
+    dataset: ToyConditionalGaussianDataset
+    | ToyConditionalGMMNonGaussianDataset
+    | ToyCosSinPiecewiseNoiseDataset
+    | ToyLinearPiecewiseNoiseDataset,
+    *,
+    theta_norm: Normalize,
+    sm_theta: ScalarMappable,
+    n_covariance_ellipses: int = 10,
+    manifold_trajectory_linewidth: float = 4.0,
+) -> None:
+    mu_pc, mean_mu, basis_mu = pca_project(mu, n_components=2)
+    if int(mu_pc.shape[1]) < 2:
+        pad = 2 - int(mu_pc.shape[1])
+        mu_pc = np.concatenate([mu_pc, np.zeros((int(mu_pc.shape[0]), pad), dtype=np.float64)], axis=1)
+    th_line = np.asarray(t, dtype=np.float64).ravel()
+    if int(mu_pc.shape[0]) >= 2:
+        pts = mu_pc[:, :2]
+        segs = np.stack([pts[:-1], pts[1:]], axis=1)
+        seg_theta = 0.5 * (th_line[:-1] + th_line[1:])
+        lc_cov = LineCollection(
+            segs,
+            cmap="viridis",
+            norm=theta_norm,
+            array=seg_theta,
+            linewidth=float(manifold_trajectory_linewidth),
+            capstyle="round",
+            zorder=2,
+        )
+        ax_covariance.add_collection(lc_cov)
+    n_ell = max(0, int(n_covariance_ellipses))
+    if n_ell > 0 and hasattr(dataset, "covariance"):
+        theta_ell = np.linspace(float(dataset.theta_low), float(dataset.theta_high), n_ell, dtype=np.float64)[:, None]
+        mu_ell = np.asarray(dataset.tuning_curve(theta_ell), dtype=np.float64)
+        centers = (mu_ell - mean_mu) @ basis_mu
+        cov_ell = np.asarray(dataset.covariance(theta_ell), dtype=np.float64)
+        cov_pc = _project_covariances_to_basis(cov_ell, basis_mu[:, :2])
+        for center, cov2, th_val in zip(centers[:, :2], cov_pc, theta_ell[:, 0], strict=True):
+            width, height, angle = _covariance_ellipse_parameters(cov2)
+            color = sm_theta.to_rgba(float(th_val))
+            fill_color = (color[0], color[1], color[2], 0.2)
+            edge_color = (color[0], color[1], color[2], 0.9)
+            ax_covariance.add_patch(
+                Ellipse(
+                    xy=(float(center[0]), float(center[1])),
+                    width=width,
+                    height=height,
+                    angle=angle,
+                    facecolor=fill_color,
+                    edgecolor=edge_color,
+                    linestyle="--",
+                    linewidth=1.15,
+                    zorder=1,
+                )
+            )
+    ax_covariance.scatter(
+        mu_pc[:, 0],
+        mu_pc[:, 1],
+        c=th_line,
+        s=8,
+        alpha=0.45,
+        cmap="viridis",
+        norm=theta_norm,
+        zorder=3,
+    )
+    ax_covariance.set_aspect("equal", adjustable="datalim")
+    ax_covariance.set_axis_off()
+    ax_covariance.set_box_aspect(1)
+    cbar_cov = fig.colorbar(sm_theta, ax=ax_covariance, fraction=0.035, pad=0.02)
+    cbar_cov.set_label(r"$\theta$")
+
+
 def _moving_average_rows(y: np.ndarray, window: int) -> np.ndarray:
     """Per-column centered moving average along rows (same length as ``y``)."""
     arr = np.asarray(y, dtype=np.float64)
@@ -304,12 +413,15 @@ def plot_joint_and_tuning_on_axes(
     n_theta_grid: int = 500,
     smooth_mean_window: int = 0,
     manifold_trajectory_linewidth: float = 4.0,
+    ax_covariance: "Axes | None" = None,
+    n_covariance_ellipses: int = 10,
 ) -> None:
     """Draw tuning curves on ``ax_tune`` and manifold / samples on ``ax_manifold``.
 
     For ``x_dim >= 2``, ``ax_manifold`` shows the mean curve in its PCA plane as a ``theta``-colored
     polyline (``LineCollection``) plus light vertex markers, with sample projections overlaid in the
-    same basis. For ``x_dim == 1``, it overlays
+    same basis. When ``ax_covariance`` is provided, it shows the same PCA mean curve with projected
+    1-sigma covariance ellipses and no sample scatter. For ``x_dim == 1``, it overlays
     ``mu(theta)`` as a line and scatter ``(theta, x)``.
 
     ``theta`` and ``x`` should already reflect any scatter subsampling desired by the caller.
@@ -368,10 +480,7 @@ def plot_joint_and_tuning_on_axes(
     sm_theta = ScalarMappable(norm=theta_norm, cmap="viridis")
     sm_theta.set_array([])
 
-    for j in range(n_plot):
-        ax_tune.plot(t[:, 0], mu[:, j], color="black", linewidth=2.0)
-    ax_tune.set_xlabel(r"$\theta$")
-    ax_tune.set_ylabel(r"Mean of $x|\theta$")
+    _draw_tuning_curves(ax_tune, t, mu)
 
     if n_plot >= 2:
         mu_pc, mean_mu, basis_mu = pca_project(mu, n_components=2)
@@ -428,6 +537,18 @@ def plot_joint_and_tuning_on_axes(
         ax_manifold.set_box_aspect(1)
         cbar = fig.colorbar(sm_theta, ax=ax_manifold, fraction=0.035, pad=0.02)
         cbar.set_label(r"$\theta$")
+        if ax_covariance is not None:
+            _draw_pca_covariance_ellipses(
+                fig,
+                ax_covariance,
+                t,
+                mu,
+                dataset,
+                theta_norm=theta_norm,
+                sm_theta=sm_theta,
+                n_covariance_ellipses=int(n_covariance_ellipses),
+                manifold_trajectory_linewidth=float(manifold_trajectory_linewidth),
+            )
     else:
         th = theta_plot.ravel()
         ax_manifold.plot(t[:, 0], mu[:, 0], color="#4c78a8", linewidth=2.0, zorder=1)
@@ -445,8 +566,54 @@ def plot_joint_and_tuning_on_axes(
         ax_manifold.set_ylabel(r"$x_1$ / $\mu(\theta)$")
         ax_manifold.set_box_aspect(1)
         fig.colorbar(sm_theta, ax=ax_manifold, fraction=0.035, pad=0.02).set_label(r"$\theta$")
+        if ax_covariance is not None:
+            ax_covariance.set_axis_off()
 
     ax_tune.set_box_aspect(1)
+
+
+def plot_tuning_and_covariance_on_axes(
+    fig: plt.Figure,
+    ax_tune: "Axes",
+    ax_covariance: "Axes",
+    dataset: ToyConditionalGaussianDataset
+    | ToyConditionalGMMNonGaussianDataset
+    | ToyCosSinPiecewiseNoiseDataset
+    | ToyLinearPiecewiseNoiseDataset,
+    *,
+    n_theta_grid: int = 500,
+    n_covariance_ellipses: int = 10,
+    manifold_trajectory_linewidth: float = 4.0,
+) -> None:
+    """Draw scalar continuous tuning curves and the PCA covariance-ellipse panel."""
+    if str(getattr(dataset, "theta_type", "")) == "categorical":
+        raise ValueError("plot_tuning_and_covariance_on_axes requires a scalar continuous dataset.")
+    theta_dim = int(getattr(dataset, "theta_dim", 1))
+    if theta_dim != 1:
+        raise ValueError("plot_tuning_and_covariance_on_axes requires theta_dim == 1.")
+    x_dim = int(getattr(dataset, "x_dim", 0))
+    if x_dim < 2:
+        raise ValueError("plot_tuning_and_covariance_on_axes requires x_dim >= 2.")
+    t = np.linspace(float(dataset.theta_low), float(dataset.theta_high), int(n_theta_grid), dtype=np.float64)[:, None]
+    mu = np.asarray(dataset.tuning_curve(t), dtype=np.float64)
+    if mu.ndim != 2 or int(mu.shape[1]) < 2:
+        raise ValueError(f"Expected tuning curve shape (T, d>=2), got {mu.shape}.")
+
+    theta_norm = Normalize(vmin=float(dataset.theta_low), vmax=float(dataset.theta_high))
+    sm_theta = ScalarMappable(norm=theta_norm, cmap="viridis")
+    sm_theta.set_array([])
+    _draw_tuning_curves(ax_tune, t, mu)
+    _draw_pca_covariance_ellipses(
+        fig,
+        ax_covariance,
+        t,
+        mu,
+        dataset,
+        theta_norm=theta_norm,
+        sm_theta=sm_theta,
+        n_covariance_ellipses=int(n_covariance_ellipses),
+        manifold_trajectory_linewidth=float(manifold_trajectory_linewidth),
+    )
 
 
 def plot_joint_and_tuning(
@@ -461,11 +628,12 @@ def plot_joint_and_tuning(
     scatter_max_points: int | None = 400,
     scatter_subsample_seed: int = 0,
 ) -> None:
-    """Two panels: per-dim tuning curves, then PCA manifold with samples overlaid (or 1D overlay).
+    """Plot dataset diagnostics: tuning curves plus PCA/sample and covariance views.
 
-    When ``x_dim >= 2``, the right panel uses one ``pca_project`` on the dense mean curve ``mu``;
-    samples are projected with the same ``mean_mu`` and ``basis_mu``. A single colorbar maps
-    color to ``theta``.
+    When ``x_dim >= 2`` for scalar continuous datasets, this uses one ``pca_project`` on the dense
+    mean curve ``mu``; samples and covariance ellipses are projected with the same ``mean_mu`` and
+    ``basis_mu``. A colorbar maps color to ``theta``. One-dimensional, categorical, and native
+    two-dimensional-theta visualizations keep their previous layouts.
 
     The scatter uses at most ``scatter_max_points`` rows (uniform random subset without
     replacement when there are more rows). Pass ``None`` to plot every point. The tuning-curve
@@ -490,8 +658,8 @@ def plot_joint_and_tuning(
         _plot_joint_and_tuning_2d(theta_plot, x_plot, dataset, out_path)
         return
 
-    fig, (ax_tune, ax_manifold) = plt.subplots(1, 2, figsize=(9.0, 3.2), layout="constrained")
     if str(getattr(dataset, "theta_type", "")) == "categorical":
+        fig, (ax_tune, ax_manifold) = plt.subplots(1, 2, figsize=(9.0, 3.2), layout="constrained")
         k = int(getattr(dataset, "num_categories", theta_plot.shape[1] if np.asarray(theta_plot).ndim == 2 else 1))
         labels = _categorical_labels(theta_plot, k)
         cats = np.eye(k, dtype=np.float64)
@@ -538,6 +706,14 @@ def plot_joint_and_tuning(
         plt.close(fig)
         return
 
+    if x_plot.ndim == 2 and int(x_plot.shape[1]) >= 2:
+        fig, (ax_tune, ax_manifold, ax_covariance) = plt.subplots(
+            1, 3, figsize=(12.6, 3.2), layout="constrained"
+        )
+    else:
+        fig, (ax_tune, ax_manifold) = plt.subplots(1, 2, figsize=(9.0, 3.2), layout="constrained")
+        ax_covariance = None
+
     plot_joint_and_tuning_on_axes(
         fig,
         ax_tune,
@@ -546,6 +722,7 @@ def plot_joint_and_tuning(
         x_plot,
         dataset,
         mu_override=None,
+        ax_covariance=ax_covariance,
     )
 
     fig.savefig(out_path, dpi=180, bbox_inches="tight")

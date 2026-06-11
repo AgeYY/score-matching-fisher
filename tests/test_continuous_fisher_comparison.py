@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 
 import numpy as np
@@ -180,6 +181,26 @@ def test_parallel_representative_native_npz_uses_largest_native_case(tmp_path: P
     )
 
 
+def test_parallel_composite_fisher_example_uses_cached_case_closest_to_1550(tmp_path: Path) -> None:
+    mod = _load_parallel_module()
+    args = mod.build_parser().parse_args(
+        ["--n-list", "100,1500,5000", "--pr-dims", "none", "--output-dir", str(tmp_path / "sweep")]
+    )
+    tasks = mod.plan_cases(args)
+    for task in tasks:
+        if task.n_total in (100, 1500, 5000):
+            task.result_path.parent.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(
+                task.result_path,
+                theta_midpoints=np.asarray([[0.5]], dtype=np.float64),
+                flow_full_fisher=np.asarray([1.0], dtype=np.float64),
+            )
+
+    got = mod.composite_fisher_example_task(tasks, args)
+
+    assert got.n_total == 1500
+
+
 def test_parallel_run_records_representative_dataset_figure_paths(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -214,6 +235,25 @@ def test_parallel_run_records_representative_dataset_figure_paths(
 
     monkeypatch.setattr(mod, "plot_representative_dataset", fake_plot_representative_dataset)
 
+    def fake_plot_composite_figure(
+        *,
+        native_npz: Path,
+        representative_result_path: Path,
+        representative_n_total: int | None = None,
+        rows: list[dict[str, object]],
+        output_dir: Path,
+        yscale: str = "linear",
+    ):
+        calls["composite_native_npz"] = native_npz
+        calls["composite_result_path"] = representative_result_path
+        calls["composite_n_total"] = representative_n_total
+        calls["composite_rows"] = len(rows)
+        calls["composite_output_dir"] = output_dir
+        calls["composite_yscale"] = yscale
+        return output_dir / mod.COMPOSITE_SVG_NAME, output_dir / mod.COMPOSITE_PNG_NAME
+
+    monkeypatch.setattr(mod, "plot_composite_figure", fake_plot_composite_figure)
+
     outputs = mod.run(args)
     summary = json.loads(outputs["summary_json"].read_text(encoding="utf-8"))
 
@@ -222,5 +262,57 @@ def test_parallel_run_records_representative_dataset_figure_paths(
     assert calls["scatter_max_points"] == 500
     assert outputs["dataset_figure_svg"] == tmp_path / "sweep" / mod.DATASET_VIZ_SVG_NAME
     assert outputs["dataset_figure_png"] == tmp_path / "sweep" / mod.DATASET_VIZ_PNG_NAME
+    assert outputs["composite_svg"] == tmp_path / "sweep" / mod.COMPOSITE_SVG_NAME
+    assert outputs["composite_png"] == tmp_path / "sweep" / mod.COMPOSITE_PNG_NAME
+    assert calls["composite_native_npz"] == native_npz
+    assert calls["composite_result_path"] == task.result_path
+    assert calls["composite_n_total"] == 100
+    assert calls["composite_rows"] == 1
+    assert calls["composite_output_dir"] == tmp_path / "sweep"
+    assert calls["composite_yscale"] == "linear"
     assert summary["outputs"]["dataset_figure_svg"] == str(outputs["dataset_figure_svg"])
     assert summary["outputs"]["dataset_figure_png"] == str(outputs["dataset_figure_png"])
+    assert summary["outputs"]["composite_svg"] == str(outputs["composite_svg"])
+    assert summary["outputs"]["composite_png"] == str(outputs["composite_png"])
+
+
+def test_plot_composite_figure_writes_svg_and_png(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    mod = _load_parallel_module()
+    dataset = ToyConditionalGaussianRandampSqrtdDataset(theta_low=-2.0, theta_high=2.0, x_dim=3, seed=123)
+    monkeypatch.setattr(mod, "load_shared_dataset_npz", lambda path: SimpleNamespace(meta={}))
+    monkeypatch.setattr(mod, "build_dataset_from_meta", lambda meta: dataset)
+
+    theta_mid = np.linspace(-1.9, 1.9, 8, dtype=np.float64).reshape(-1, 1)
+    result_path = tmp_path / "continuous_pr_fisher_results.npz"
+    np.savez_compressed(
+        result_path,
+        theta_midpoints=theta_mid,
+        ground_truth_native_full_fisher=np.linspace(2.0, 3.0, 8, dtype=np.float64),
+        ground_truth_native_linear_fisher=np.linspace(1.5, 2.5, 8, dtype=np.float64),
+        classical_linear_fisher=np.linspace(1.4, 2.4, 8, dtype=np.float64),
+        classical_full_fisher=np.linspace(1.8, 2.8, 8, dtype=np.float64),
+        flow_linear_fisher=np.linspace(1.55, 2.55, 8, dtype=np.float64),
+        flow_full_fisher=np.linspace(1.95, 2.95, 8, dtype=np.float64),
+    )
+    rows = [
+        {"n_total": n, "pr_dim": "none", "repeat_idx": 0, "method": method, "mae_abs_error": err}
+        for n, scale in [(100, 1.0), (500, 0.6)]
+        for method, err in [
+            ("classical_linear", 0.4 * scale),
+            ("classical_full", 0.35 * scale),
+            ("flow_linear", 0.2 * scale),
+            ("flow_full", 0.15 * scale),
+        ]
+    ]
+
+    svg, png = mod.plot_composite_figure(
+        native_npz=tmp_path / "native.npz",
+        representative_result_path=result_path,
+        rows=rows,
+        output_dir=tmp_path,
+    )
+
+    assert svg.exists()
+    assert svg.stat().st_size > 0
+    assert png.exists()
+    assert png.stat().st_size > 0
