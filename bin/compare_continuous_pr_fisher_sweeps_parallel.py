@@ -23,6 +23,10 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from fisher.dataset_visualization import plot_joint_and_tuning
+from fisher.shared_dataset_io import load_shared_dataset_npz
+from fisher.shared_fisher_est import build_dataset_from_meta
+
 
 def _load_single_module() -> Any:
     path = _REPO_ROOT / "bin" / "compare_continuous_pr_fisher.py"
@@ -41,6 +45,8 @@ SWEEP_CSV_NAME = "continuous_pr_fisher_sweep_errors.csv"
 SWEEP_SUMMARY_NAME = "continuous_pr_fisher_sweep_summary.json"
 SWEEP_SVG_NAME = "continuous_pr_fisher_sweep_abs_error.svg"
 SWEEP_PNG_NAME = "continuous_pr_fisher_sweep_abs_error.png"
+DATASET_VIZ_PNG_NAME = "continuous_pr_fisher_representative_dataset.png"
+DATASET_VIZ_SVG_NAME = "continuous_pr_fisher_representative_dataset.svg"
 
 
 def _parse_int_list(value: str | list[int] | tuple[int, ...]) -> list[int]:
@@ -115,6 +121,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cpu-threads-per-job", default="auto")
     p.add_argument("--parallel-log-dir", type=Path, default=None)
     p.add_argument("--yscale", choices=("linear", "log"), default="linear")
+    p.add_argument("--skip-dataset-viz", action="store_true")
     original_parse_args = p.parse_args
 
     def parse_args(args=None, namespace=None):
@@ -232,6 +239,7 @@ def build_case_command(args: argparse.Namespace, task: CaseTask) -> list[str]:
         "cpu_threads_per_job",
         "parallel_log_dir",
         "yscale",
+        "skip_dataset_viz",
     }
     for action in parser._actions:
         dest = getattr(action, "dest", None)
@@ -331,7 +339,69 @@ def run_cases_parallel(tasks: list[CaseTask], args: argparse.Namespace) -> None:
         running = still
 
 
-def aggregate_results(tasks: list[CaseTask], output_dir: Path) -> tuple[Path, Path, Path, Path]:
+def representative_native_npz(tasks: list[CaseTask], args: argparse.Namespace) -> Path:
+    n_total = max(int(v) for v in args.n_list)
+    repeat_idx = 0
+    native_tasks = [
+        task
+        for task in tasks
+        if task.n_total == n_total and task.repeat_idx == repeat_idx and task.pr_dim is None
+    ]
+    if native_tasks:
+        task = native_tasks[0]
+    else:
+        candidates = [task for task in tasks if task.n_total == n_total and task.repeat_idx == repeat_idx]
+        if not candidates:
+            raise ValueError("No representative continuous sweep case is available.")
+        task = candidates[0]
+    return task.dataset_dir / f"{args.dataset_family}_xdim{int(args.native_x_dim)}_native.npz"
+
+
+def plot_representative_dataset(
+    native_npz: Path,
+    *,
+    output_dir: Path,
+    scatter_max_points: int = 500,
+) -> tuple[Path, Path]:
+    bundle = load_shared_dataset_npz(native_npz)
+    dataset = build_dataset_from_meta(dict(bundle.meta))
+    png_path = Path(output_dir) / DATASET_VIZ_PNG_NAME
+    svg_path = Path(output_dir) / DATASET_VIZ_SVG_NAME
+    plot_joint_and_tuning(
+        bundle.theta_all,
+        bundle.x_all,
+        dataset,
+        str(png_path),
+        scatter_max_points=int(scatter_max_points),
+    )
+    return svg_path, png_path
+
+
+def maybe_plot_representative_dataset(
+    tasks: list[CaseTask],
+    args: argparse.Namespace,
+    *,
+    output_dir: Path,
+) -> tuple[Path, Path] | None:
+    if bool(getattr(args, "skip_dataset_viz", False)):
+        return None
+    native_npz = representative_native_npz(tasks, args)
+    if not native_npz.is_file():
+        print(
+            f"[continuous-parallel] warning: skipped representative dataset figure; missing NPZ: {native_npz}",
+            flush=True,
+        )
+        return None
+    return plot_representative_dataset(native_npz, output_dir=output_dir, scatter_max_points=500)
+
+
+def aggregate_results(
+    tasks: list[CaseTask],
+    output_dir: Path,
+    *,
+    args: argparse.Namespace,
+    dataset_paths: tuple[Path, Path] | None = None,
+) -> tuple[Path, Path, Path, Path, Path]:
     rows: list[dict[str, Any]] = []
     n_values: list[int] = []
     pr_values: list[int] = []
@@ -378,6 +448,16 @@ def aggregate_results(tasks: list[CaseTask], output_dir: Path) -> tuple[Path, Pa
         methods=np.asarray(sorted(methods), dtype=str),
         mae_abs_error=np.asarray([r["mae_abs_error"] for r in rows], dtype=np.float64),
     )
+    svg_path, png_path = plot_sweep_errors(rows, out, yscale=str(args.yscale))
+    outputs: dict[str, str] = {
+        "sweep_npz": str(npz_path),
+        "sweep_csv": str(csv_path),
+        "sweep_svg": str(svg_path),
+        "sweep_png": str(png_path),
+    }
+    if dataset_paths is not None:
+        outputs["dataset_figure_svg"] = str(dataset_paths[0])
+        outputs["dataset_figure_png"] = str(dataset_paths[1])
     summary_path = out / SWEEP_SUMMARY_NAME
     summary_path.write_text(
         json.dumps(
@@ -386,14 +466,22 @@ def aggregate_results(tasks: list[CaseTask], output_dir: Path) -> tuple[Path, Pa
                 "methods": sorted(methods),
                 "csv": str(csv_path),
                 "npz": str(npz_path),
+                "config": {
+                    "n_list": [int(v) for v in args.n_list],
+                    "pr_dims": [None if v is None else int(v) for v in args.pr_dims],
+                    "n_repeats": int(args.n_repeats),
+                    "dataset_family": str(args.dataset_family),
+                    "native_x_dim": int(args.native_x_dim),
+                    "skip_dataset_viz": bool(getattr(args, "skip_dataset_viz", False)),
+                },
+                "outputs": outputs,
             },
             indent=2,
             sort_keys=True,
         )
         + "\n"
     )
-    svg_path, png_path = plot_sweep_errors(rows, out)
-    return npz_path, csv_path, summary_path, svg_path
+    return npz_path, csv_path, summary_path, svg_path, png_path
 
 
 def plot_sweep_errors(rows: list[dict[str, Any]], output_dir: Path, *, yscale: str = "linear") -> tuple[Path, Path]:
@@ -422,11 +510,33 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
     tasks = plan_cases(args)
     to_run, _ = select_tasks_to_run(tasks, args)
     run_cases_parallel(to_run, args)
-    npz_path, csv_path, summary_path, svg_path = aggregate_results(tasks, Path(args.output_dir))
+    output_dir = Path(args.output_dir)
+    dataset_paths = maybe_plot_representative_dataset(tasks, args, output_dir=output_dir)
+    npz_path, csv_path, summary_path, svg_path, png_path = aggregate_results(
+        tasks,
+        output_dir,
+        args=args,
+        dataset_paths=dataset_paths,
+    )
     print(f"sweep_npz: {npz_path}", flush=True)
     print(f"sweep_csv: {csv_path}", flush=True)
+    print(f"sweep_svg: {svg_path}", flush=True)
+    print(f"sweep_png: {png_path}", flush=True)
+    if dataset_paths is not None:
+        print(f"dataset_figure_svg: {dataset_paths[0]}", flush=True)
+        print(f"dataset_figure_png: {dataset_paths[1]}", flush=True)
     print(f"summary_json: {summary_path}", flush=True)
-    return {"sweep_npz": npz_path, "sweep_csv": csv_path, "summary_json": summary_path, "sweep_svg": svg_path}
+    outputs = {
+        "sweep_npz": npz_path,
+        "sweep_csv": csv_path,
+        "summary_json": summary_path,
+        "sweep_svg": svg_path,
+        "sweep_png": png_path,
+    }
+    if dataset_paths is not None:
+        outputs["dataset_figure_svg"] = dataset_paths[0]
+        outputs["dataset_figure_png"] = dataset_paths[1]
+    return outputs
 
 
 def main(argv: list[str] | None = None) -> int:

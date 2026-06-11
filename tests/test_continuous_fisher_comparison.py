@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -106,6 +107,9 @@ def test_parallel_parser_pr_dims_defaults_and_command(tmp_path: Path, monkeypatc
     assert default_args.native_x_dim == 3
     assert default_args.train_frac == pytest.approx(0.9)
     assert default_args.pr_dims == [None]
+    assert default_args.skip_dataset_viz is False
+    skip_viz_args = mod.build_parser().parse_args(["--skip-dataset-viz"])
+    assert skip_viz_args.skip_dataset_viz is True
     assert args.cpu_threads_per_job == 3
     tasks = mod.plan_cases(args)
     assert (tasks[0].n_total, tasks[0].pr_dim, tasks[0].repeat_idx, tasks[0].seed) == (100, None, 0, 7)
@@ -156,3 +160,67 @@ def test_parallel_cache_hit_and_visualization_only(tmp_path: Path) -> None:
     )
     with pytest.raises(FileNotFoundError):
         mod.select_tasks_to_run([missing], viz_args)
+
+
+def test_parallel_representative_native_npz_uses_largest_native_case(tmp_path: Path) -> None:
+    mod = _load_parallel_module()
+    args = mod.build_parser().parse_args(
+        ["--n-list", "1000,5000", "--pr-dims", "none", "--output-dir", str(tmp_path / "sweep")]
+    )
+    tasks = mod.plan_cases(args)
+
+    got = mod.representative_native_npz(tasks, args)
+
+    assert got == (
+        tmp_path
+        / "sweep"
+        / "n5000"
+        / "native"
+        / "randamp_gaussian_sqrtd_xdim3_native.npz"
+    )
+
+
+def test_parallel_run_records_representative_dataset_figure_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mod = _load_parallel_module()
+    args = mod.build_parser().parse_args(
+        ["--visualization-only", "--n-list", "100", "--pr-dims", "none", "--output-dir", str(tmp_path / "sweep")]
+    )
+    task = mod.plan_cases(args)[0]
+    task.result_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        task.result_path,
+        theta_midpoints=np.asarray([[0.5]], dtype=np.float64),
+        flow_full_fisher=np.asarray([1.0], dtype=np.float64),
+        flow_full_abs_error=np.asarray([0.25], dtype=np.float64),
+    )
+    native_npz = mod.representative_native_npz([task], args)
+    native_npz.parent.mkdir(parents=True, exist_ok=True)
+    native_npz.touch()
+
+    calls: dict[str, object] = {}
+
+    def fake_plot_representative_dataset(
+        native_path: Path,
+        *,
+        output_dir: Path,
+        scatter_max_points: int = 500,
+    ):
+        calls["native_path"] = native_path
+        calls["output_dir"] = output_dir
+        calls["scatter_max_points"] = int(scatter_max_points)
+        return output_dir / mod.DATASET_VIZ_SVG_NAME, output_dir / mod.DATASET_VIZ_PNG_NAME
+
+    monkeypatch.setattr(mod, "plot_representative_dataset", fake_plot_representative_dataset)
+
+    outputs = mod.run(args)
+    summary = json.loads(outputs["summary_json"].read_text(encoding="utf-8"))
+
+    assert calls["native_path"] == native_npz
+    assert calls["output_dir"] == tmp_path / "sweep"
+    assert calls["scatter_max_points"] == 500
+    assert outputs["dataset_figure_svg"] == tmp_path / "sweep" / mod.DATASET_VIZ_SVG_NAME
+    assert outputs["dataset_figure_png"] == tmp_path / "sweep" / mod.DATASET_VIZ_PNG_NAME
+    assert summary["outputs"]["dataset_figure_svg"] == str(outputs["dataset_figure_svg"])
+    assert summary["outputs"]["dataset_figure_png"] == str(outputs["dataset_figure_png"])
