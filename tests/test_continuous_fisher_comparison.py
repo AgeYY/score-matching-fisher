@@ -107,7 +107,7 @@ def test_parallel_parser_pr_dims_defaults_and_command(tmp_path: Path, monkeypatc
     assert args.pr_dims == [None, 30]
     default_args = mod.build_parser().parse_args([])
     assert default_args.native_x_dim == 4
-    assert default_args.train_frac == pytest.approx(0.9)
+    assert default_args.train_frac == pytest.approx(0.8)
     assert default_args.pr_dims == [None]
     assert default_args.skip_dataset_viz is False
     assert default_args.composite_smoothing == "kernel"
@@ -268,7 +268,7 @@ def test_parallel_representative_native_npz_uses_largest_native_case(tmp_path: P
     )
 
 
-def test_parallel_composite_fisher_example_uses_cached_case_closest_to_1550(tmp_path: Path) -> None:
+def test_parallel_composite_fisher_example_uses_cached_case_closest_to_5500(tmp_path: Path) -> None:
     mod = _load_parallel_module()
     args = mod.build_parser().parse_args(
         ["--n-list", "100,1500,5000", "--pr-dims", "none", "--output-dir", str(tmp_path / "sweep")]
@@ -285,7 +285,7 @@ def test_parallel_composite_fisher_example_uses_cached_case_closest_to_1550(tmp_
 
     got = mod.composite_fisher_example_task(tasks, args)
 
-    assert got.n_total == 1500
+    assert got.n_total == 5000
 
 
 def test_parallel_run_records_representative_dataset_figure_paths(

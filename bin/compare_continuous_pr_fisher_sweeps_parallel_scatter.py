@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run continuous PR Fisher sample-size sweeps in parallel across CUDA devices."""
+"""Run continuous PR Fisher sample-size sweeps and show per-repeat scatter points."""
 
 import argparse
 import csv
@@ -43,16 +43,16 @@ single = _load_single_module()
 SWEEP_NPZ_NAME = "continuous_pr_fisher_sweep_results.npz"
 SWEEP_CSV_NAME = "continuous_pr_fisher_sweep_errors.csv"
 SWEEP_SUMMARY_NAME = "continuous_pr_fisher_sweep_summary.json"
-SWEEP_SVG_NAME = "continuous_pr_fisher_sweep_abs_error.svg"
-SWEEP_PNG_NAME = "continuous_pr_fisher_sweep_abs_error.png"
+SWEEP_SVG_NAME = "continuous_pr_fisher_sweep_abs_error_scatter.svg"
+SWEEP_PNG_NAME = "continuous_pr_fisher_sweep_abs_error_scatter.png"
 DATASET_VIZ_PNG_NAME = "continuous_pr_fisher_representative_dataset.png"
 DATASET_VIZ_SVG_NAME = "continuous_pr_fisher_representative_dataset.svg"
-COMPOSITE_PNG_NAME = "continuous_pr_fisher_composite.png"
-COMPOSITE_SVG_NAME = "continuous_pr_fisher_composite.svg"
-COMPOSITE_GP_SMOOTHED_PNG_NAME = "continuous_pr_fisher_composite_gp_smoothed.png"
-COMPOSITE_GP_SMOOTHED_SVG_NAME = "continuous_pr_fisher_composite_gp_smoothed.svg"
-COMPOSITE_KERNEL_SMOOTHED_PNG_NAME = "continuous_pr_fisher_composite_kernel_smoothed.png"
-COMPOSITE_KERNEL_SMOOTHED_SVG_NAME = "continuous_pr_fisher_composite_kernel_smoothed.svg"
+COMPOSITE_PNG_NAME = "continuous_pr_fisher_composite_scatter.png"
+COMPOSITE_SVG_NAME = "continuous_pr_fisher_composite_scatter.svg"
+COMPOSITE_GP_SMOOTHED_PNG_NAME = "continuous_pr_fisher_composite_gp_smoothed_scatter.png"
+COMPOSITE_GP_SMOOTHED_SVG_NAME = "continuous_pr_fisher_composite_gp_smoothed_scatter.svg"
+COMPOSITE_KERNEL_SMOOTHED_PNG_NAME = "continuous_pr_fisher_composite_kernel_smoothed_scatter.png"
+COMPOSITE_KERNEL_SMOOTHED_SVG_NAME = "continuous_pr_fisher_composite_kernel_smoothed_scatter.svg"
 COMPOSITE_FISHER_EXAMPLE_N_TARGET = 5500
 
 
@@ -756,20 +756,28 @@ def _plot_composite_fisher_curves(
 def _plot_composite_error_vs_n(ax: Any, rows: list[dict[str, Any]], *, family: str, yscale: str) -> None:
     _, flow_method, classical_method = _fisher_family_methods(str(family))
     for method in (flow_method, classical_method):
-        ns, means, sds = _errorbar_series(rows, method=method, pr_dim="none")
-        if len(ns) == 0:
+        point_ns, point_vals, repeat_indices = _scatter_series(rows, method=method, pr_dim="none")
+        if len(point_ns) == 0:
             continue
-        ax.errorbar(
+        x_vals = _jittered_n_values(point_ns, repeat_indices)
+        ax.scatter(
+            x_vals,
+            point_vals,
+            color=METHOD_COLORS.get(method),
+            marker=METHOD_MARKERS.get(method) or "o",
+            s=28,
+            alpha=0.75,
+            edgecolors="none",
+            label=_method_label(method),
+        )
+        ns, means, _ = _errorbar_series(rows, method=method, pr_dim="none")
+        ax.plot(
             ns,
             means,
-            yerr=sds,
             color=METHOD_COLORS.get(method),
-            fmt=METHOD_LINESTYLES.get(method, "-"),
-            marker=METHOD_MARKERS.get(method) or "o",
-            linewidth=1.6,
-            elinewidth=1.1,
-            capsize=3.0,
-            label=_method_label(method),
+            linestyle=METHOD_LINESTYLES.get(method, "-"),
+            linewidth=1.2,
+            alpha=0.55,
         )
     ax.set_xlabel("number of data points")
     ax.set_ylabel("mean absolute Fisher error")
@@ -1155,14 +1163,76 @@ def _errorbar_series(
     return ns, np.asarray(means, dtype=np.float64), np.asarray(sds, dtype=np.float64)
 
 
+def _scatter_series(
+    rows: list[dict[str, Any]],
+    *,
+    method: str,
+    pr_dim: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    points: list[tuple[int, float, int]] = []
+    for row in rows:
+        if str(row["method"]) != str(method) or str(row["pr_dim"]) != str(pr_dim):
+            continue
+        value = float(row["mae_abs_error"])
+        if not np.isfinite(value):
+            continue
+        points.append((int(row["n_total"]), value, int(row["repeat_idx"])))
+    points.sort(key=lambda item: (item[0], item[2], item[1]))
+    if not points:
+        empty_i = np.asarray([], dtype=np.int64)
+        empty_f = np.asarray([], dtype=np.float64)
+        return empty_i, empty_f, empty_i
+    ns = np.asarray([p[0] for p in points], dtype=np.int64)
+    vals = np.asarray([p[1] for p in points], dtype=np.float64)
+    repeat_indices = np.asarray([p[2] for p in points], dtype=np.int64)
+    return ns, vals, repeat_indices
+
+
+def _jittered_n_values(ns: np.ndarray, repeat_indices: np.ndarray) -> np.ndarray:
+    x = np.asarray(ns, dtype=np.float64).reshape(-1)
+    repeats = np.asarray(repeat_indices, dtype=np.int64).reshape(-1)
+    if x.size == 0 or repeats.size != x.size:
+        return x
+    unique_ns = np.unique(x)
+    if unique_ns.size > 1:
+        diffs = np.diff(np.sort(unique_ns))
+        width = 0.10 * float(np.min(diffs[diffs > 0])) if np.any(diffs > 0) else 1.0
+    else:
+        width = max(1.0, 0.04 * float(unique_ns[0]))
+    unique_repeats = np.sort(np.unique(repeats))
+    if unique_repeats.size <= 1:
+        return x
+    offsets = np.linspace(-0.5 * width, 0.5 * width, int(unique_repeats.size), dtype=np.float64)
+    offset_by_repeat = {int(rep): float(offset) for rep, offset in zip(unique_repeats, offsets)}
+    return x + np.asarray([offset_by_repeat[int(rep)] for rep in repeats], dtype=np.float64)
+
+
 def plot_sweep_errors(rows: list[dict[str, Any]], output_dir: Path, *, yscale: str = "linear") -> tuple[Path, Path]:
     fig, ax = plt.subplots(figsize=(8.0, 5.0), layout="constrained")
     grouped: set[tuple[str, str]] = set()
     for row in rows:
         grouped.add((str(row["method"]), str(row["pr_dim"])))
     for method, pr_dim in sorted(grouped):
-        ns, means, sds = _errorbar_series(rows, method=method, pr_dim=pr_dim)
-        ax.errorbar(ns, means, yerr=sds, marker="o", linewidth=1.6, elinewidth=1.1, capsize=3.0, label=f"{method} {pr_dim}")
+        point_ns, point_vals, repeat_indices = _scatter_series(rows, method=method, pr_dim=pr_dim)
+        if len(point_ns) == 0:
+            continue
+        color = METHOD_COLORS.get(method)
+        scatter_kwargs = {"color": color} if color is not None else {}
+        scatter = ax.scatter(
+            _jittered_n_values(point_ns, repeat_indices),
+            point_vals,
+            marker="o",
+            s=28,
+            alpha=0.72,
+            edgecolors="none",
+            label=f"{method} {pr_dim}",
+            **scatter_kwargs,
+        )
+        line_color = color
+        if line_color is None and len(scatter.get_facecolors()) > 0:
+            line_color = scatter.get_facecolors()[0]
+        ns, means, _ = _errorbar_series(rows, method=method, pr_dim=pr_dim)
+        ax.plot(ns, means, color=line_color, linewidth=1.1, alpha=0.45)
     ax.set_xlabel("n_total")
     ax.set_ylabel("mean absolute Fisher error")
     ax.set_yscale(str(yscale))
@@ -1170,7 +1240,7 @@ def plot_sweep_errors(rows: list[dict[str, Any]], output_dir: Path, *, yscale: s
     ax.legend(fontsize=7)
     svg = Path(output_dir) / SWEEP_SVG_NAME
     png = Path(output_dir) / SWEEP_PNG_NAME
-    fig.savefig(svg, metadata={"Description": "lines=repeat_means;errorbars=mean_sd"})
+    fig.savefig(svg, metadata={"Description": "points=individual_repeats;jitter=repeat_idx;lines=repeat_means"})
     fig.savefig(png, dpi=180)
     plt.close(fig)
     return svg, png

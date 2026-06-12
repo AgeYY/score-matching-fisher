@@ -1036,7 +1036,7 @@ def test_affine_mixed_covariance_fisher_zero_a_closed_form() -> None:
     model = ScalarAffineIdentityCovModel(np.asarray([2.0, -1.0], dtype=np.float64))
     theta = np.asarray([0.0, 0.5, 1.0], dtype=np.float64).reshape(-1, 1)
 
-    got = fms.estimate_affine_mixed_covariance_fisher(
+    got = fms.estimate_affine_mixed_symmetric_kl_fisher(
         model=model,
         theta_all=theta,
         device=torch.device("cpu"),
@@ -1044,8 +1044,32 @@ def test_affine_mixed_covariance_fisher_zero_a_closed_form() -> None:
         ode_steps=4,
     )
 
+    expected_skl = np.asarray([1.25, 1.25], dtype=np.float64)
+    expected_matrix = np.asarray(
+        [
+            [0.0, 1.25, 0.0],
+            [1.25, 0.0, 1.25],
+            [0.0, 1.25, 0.0],
+        ],
+        dtype=np.float64,
+    )
+
+    np.testing.assert_allclose(got["adjacent_symmetric_kl"], expected_skl, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(got["symmetric_kl_matrix"], expected_matrix, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(got["canonical_metric_matrix"], expected_matrix, rtol=1e-12, atol=1e-12)
+    assert got["canonical_metric_name"] == "mixed_affine_symmetric_kl"
     np.testing.assert_allclose(got["fisher"], np.asarray([5.0, 5.0]), rtol=1e-12, atol=1e-12)
     np.testing.assert_allclose(got["mixed_covariance"], np.repeat(np.eye(2)[None, :, :], 2, axis=0))
+
+    compat = fms.estimate_affine_mixed_covariance_fisher(
+        model=model,
+        theta_all=theta,
+        device=torch.device("cpu"),
+        ridge=0.0,
+        ode_steps=4,
+    )
+    np.testing.assert_allclose(compat["fisher"], got["fisher"], rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(compat["symmetric_kl_matrix"], got["symmetric_kl_matrix"], rtol=1e-12, atol=1e-12)
 
 
 def test_adjacent_model_jeffreys_fisher_uses_only_adjacent_pairs(monkeypatch: pytest.MonkeyPatch) -> None:

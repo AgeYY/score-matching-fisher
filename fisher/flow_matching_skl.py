@@ -1657,19 +1657,21 @@ def estimate_adjacent_model_jeffreys_fisher(
 
 
 @torch.no_grad()
-def estimate_affine_mixed_covariance_fisher(
+def estimate_affine_mixed_symmetric_kl_fisher(
     *,
     model: nn.Module,
     theta_all: np.ndarray,
     device: torch.device,
     ridge: float = 1e-6,
     ode_steps: int = 64,
-) -> dict[str, np.ndarray]:
-    """Estimate linear Fisher for affine endpoint flows with mixed covariance.
+) -> dict[str, Any]:
+    """Estimate linear Fisher from mixed-affine symmetric KL.
 
     For each adjacent pair, this integrates ``dSigma/dt = A_bar Sigma +
     Sigma A_bar.T`` with ``A_bar(t)=0.5*(A(theta_i,t)+A(theta_j,t))`` and reads
-    out ``delta_mu.T inv(Sigma_bar + ridge I) delta_mu / dtheta**2``.
+    out the shared-covariance symmetric KL
+    ``delta_mu.T inv(Sigma_bar + ridge I) delta_mu``.  Dividing this adjacent
+    mixed-affine SKL by ``dtheta**2`` gives the linear Fisher estimate.
     """
 
     theta = _as_2d_float64(theta_all, name="theta_all")
@@ -1696,10 +1698,13 @@ def estimate_affine_mixed_covariance_fisher(
     model.eval()
     dtype = _model_floating_dtype(model)
     x_dim = int(getattr(model, "x_dim"))
+    n_theta = int(theta_s.shape[0])
     eye_np = np.eye(x_dim, dtype=np.float64)
-    fish = np.zeros(int(theta_s.shape[0]) - 1, dtype=np.float64)
-    mid_covs = np.zeros((int(theta_s.shape[0]) - 1, x_dim, x_dim), dtype=np.float64)
-    deltas = np.zeros((int(theta_s.shape[0]) - 1, x_dim), dtype=np.float64)
+    fish = np.zeros(n_theta - 1, dtype=np.float64)
+    adjacent_skl = np.zeros(n_theta - 1, dtype=np.float64)
+    skl_matrix = np.zeros((n_theta, n_theta), dtype=np.float64)
+    mid_covs = np.zeros((n_theta - 1, x_dim, x_dim), dtype=np.float64)
+    deltas = np.zeros((n_theta - 1, x_dim), dtype=np.float64)
 
     def _a_for(th: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         try:
@@ -1707,7 +1712,7 @@ def estimate_affine_mixed_covariance_fisher(
         except TypeError:
             return model.A(t)  # shared affine models
 
-    for i in range(int(theta_s.shape[0]) - 1):
+    for i in range(n_theta - 1):
         th_l = torch.from_numpy(theta_s[i : i + 1].astype(np.float32)).to(device=device, dtype=dtype)
         th_r = torch.from_numpy(theta_s[i + 1 : i + 2].astype(np.float32)).to(device=device, dtype=dtype)
         mu_l = model.endpoint_mean(th_l).detach().cpu().numpy().reshape(-1).astype(np.float64)
@@ -1724,7 +1729,11 @@ def estimate_affine_mixed_covariance_fisher(
             sigma = sigma + dt * (a_bar @ sigma + sigma @ a_bar.T)
             sigma = 0.5 * (sigma + sigma.T)
         cov = sigma + rr * eye_np
-        fish[i] = max(0.0, float(delta @ np.linalg.solve(cov, delta)) / float(dtheta[i] ** 2))
+        skl = max(0.0, float(delta @ np.linalg.solve(cov, delta)))
+        adjacent_skl[i] = skl
+        skl_matrix[i, i + 1] = skl
+        skl_matrix[i + 1, i] = skl
+        fish[i] = skl / float(dtheta[i] ** 2)
         mid_covs[i] = sigma
         deltas[i] = delta
 
@@ -1735,8 +1744,32 @@ def estimate_affine_mixed_covariance_fisher(
         "dtheta": dtheta.astype(np.float64),
         "delta_mu": deltas,
         "mixed_covariance": mid_covs,
+        "adjacent_symmetric_kl": adjacent_skl,
+        "symmetric_kl_matrix": skl_matrix,
+        "canonical_metric_matrix": skl_matrix.copy(),
+        "canonical_metric_name": "mixed_affine_symmetric_kl",
         "fisher": fish,
     }
+
+
+@torch.no_grad()
+def estimate_affine_mixed_covariance_fisher(
+    *,
+    model: nn.Module,
+    theta_all: np.ndarray,
+    device: torch.device,
+    ridge: float = 1e-6,
+    ode_steps: int = 64,
+) -> dict[str, Any]:
+    """Backward-compatible wrapper for mixed-affine SKL linear Fisher."""
+
+    return estimate_affine_mixed_symmetric_kl_fisher(
+        model=model,
+        theta_all=theta_all,
+        device=device,
+        ridge=float(ridge),
+        ode_steps=int(ode_steps),
+    )
 
 
 def estimate_model_symmetric_kl(

@@ -28,7 +28,7 @@ from fisher.flow_matching_skl import (
     FlowSKLResult,
     build_flow_skl_model,
     estimate_adjacent_model_jeffreys_fisher,
-    estimate_affine_mixed_covariance_fisher,
+    estimate_affine_mixed_symmetric_kl_fisher,
     train_flow_skl_model,
 )
 from fisher.shared_dataset_io import SharedDatasetBundle, load_shared_dataset_npz
@@ -486,7 +486,7 @@ def train_flow_fisher_curves(
             log_every=max(1, int(config.log_every)),
         )
         if method == METHOD_FLOW_LINEAR:
-            fd = estimate_affine_mixed_covariance_fisher(
+            fd = estimate_affine_mixed_symmetric_kl_fisher(
                 model=model,
                 theta_all=theta_grid,
                 device=device,
@@ -495,9 +495,9 @@ def train_flow_fisher_curves(
             )
             curves[method] = fd["fisher"]
             result = FlowSKLResult(
-                symmetric_kl_matrix=np.zeros((int(theta_grid.shape[0]), int(theta_grid.shape[0])), dtype=np.float64),
-                canonical_metric_matrix=np.zeros((int(theta_grid.shape[0]), int(theta_grid.shape[0])), dtype=np.float64),
-                canonical_metric_name="affine_mixed_covariance_linear_fisher",
+                symmetric_kl_matrix=np.asarray(fd["symmetric_kl_matrix"], dtype=np.float64),
+                canonical_metric_matrix=np.asarray(fd["canonical_metric_matrix"], dtype=np.float64),
+                canonical_metric_name=str(fd["canonical_metric_name"]),
                 fisher_theta_midpoints=fd["theta_midpoints"],
                 fisher_linear=fd["fisher"],
                 train_metadata=meta,
