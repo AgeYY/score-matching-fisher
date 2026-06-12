@@ -49,6 +49,10 @@ DATASET_VIZ_PNG_NAME = "continuous_pr_fisher_representative_dataset.png"
 DATASET_VIZ_SVG_NAME = "continuous_pr_fisher_representative_dataset.svg"
 COMPOSITE_PNG_NAME = "continuous_pr_fisher_composite.png"
 COMPOSITE_SVG_NAME = "continuous_pr_fisher_composite.svg"
+COMPOSITE_GP_SMOOTHED_PNG_NAME = "continuous_pr_fisher_composite_gp_smoothed.png"
+COMPOSITE_GP_SMOOTHED_SVG_NAME = "continuous_pr_fisher_composite_gp_smoothed.svg"
+COMPOSITE_KERNEL_SMOOTHED_PNG_NAME = "continuous_pr_fisher_composite_kernel_smoothed.png"
+COMPOSITE_KERNEL_SMOOTHED_SVG_NAME = "continuous_pr_fisher_composite_kernel_smoothed.svg"
 COMPOSITE_FISHER_EXAMPLE_N_TARGET = 1550
 
 
@@ -87,6 +91,14 @@ METHOD_MARKERS = {
     "flow_linear": "o",
     "flow_full": "o",
 }
+
+GP_SMOOTHED_ESTIMATOR_METHODS = (
+    "flow_full",
+    "classical_full",
+    "flow_linear",
+    "classical_linear",
+)
+SMOOTHED_ESTIMATOR_METHODS = GP_SMOOTHED_ESTIMATOR_METHODS
 
 
 def _parse_int_list(value: str | list[int] | tuple[int, ...]) -> list[int]:
@@ -128,6 +140,13 @@ def _positive_int(value: str | int) -> int:
     return out
 
 
+def _positive_float(value: str | float) -> float:
+    out = float(value)
+    if not np.isfinite(out) or out <= 0.0:
+        raise argparse.ArgumentTypeError("Expected a positive finite float.")
+    return out
+
+
 def _cpu_threads_auto(total_workers: int) -> int:
     return max(1, int(os.cpu_count() or 1) // max(1, int(total_workers)))
 
@@ -142,14 +161,18 @@ def _pr_label(pr_dim: int | None) -> str:
     return "native" if pr_dim is None else f"pr{int(pr_dim)}"
 
 
-def default_output_dir(*, dataset_family: str = "randamp_gaussian_sqrtd", native_x_dim: int = 3) -> Path:
+def repeat_seeds(args: argparse.Namespace) -> list[int]:
+    return [int(args.seed) + int(repeat_idx) for repeat_idx in range(int(args.n_repeats))]
+
+
+def default_output_dir(*, dataset_family: str = "randamp_gaussian_sqrtd", native_x_dim: int = 4) -> Path:
     return _REPO_ROOT / "data" / f"{dataset_family}_xdim{int(native_x_dim)}_pr_fisher_sweeps"
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = single.build_parser()
     p.description = __doc__
-    p.set_defaults(n_total=1000, output_dir=None, device="cuda")
+    p.set_defaults(n_total=1000, native_x_dim=4, output_dir=None, device="cuda")
     p.add_argument("--n-list", type=_parse_int_list, default=[50, 500, 1000, 1500, 2000, 3000])
     p.add_argument("--pr-dims", type=_parse_pr_dims, default=[None])
     p.add_argument("--n-repeats", type=_positive_int, default=1)
@@ -162,6 +185,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--parallel-log-dir", type=Path, default=None)
     p.add_argument("--yscale", choices=("linear", "log"), default="linear")
     p.add_argument("--skip-dataset-viz", action="store_true")
+    p.add_argument("--composite-smoothing", choices=("none", "gp", "kernel"), default="kernel")
+    p.add_argument("--kernel-smooth-bandwidth-grid", type=_positive_float, default=2.0)
     original_parse_args = p.parse_args
 
     def parse_args(args=None, namespace=None):
@@ -170,6 +195,7 @@ def build_parser() -> argparse.ArgumentParser:
         parsed.pr_dims = _parse_pr_dims(parsed.pr_dims)
         parsed.gpu_ids = _parse_gpu_ids(parsed.gpu_ids)
         parsed.jobs_per_gpu = _positive_int(parsed.jobs_per_gpu)
+        parsed.kernel_smooth_bandwidth_grid = _positive_float(parsed.kernel_smooth_bandwidth_grid)
         total_workers = len(parsed.gpu_ids) * int(parsed.jobs_per_gpu)
         parsed.cpu_threads_per_job = _resolve_cpu_threads(parsed.cpu_threads_per_job, total_workers)
         argv = sys.argv[1:] if args is None else list(args)
@@ -478,15 +504,232 @@ def _fisher_family_methods(family: str) -> tuple[str, str, str]:
     raise ValueError(f"Unknown Fisher family: {family!r}.")
 
 
-def _plot_composite_fisher_curves(ax: Any, result_path: Path, *, family: str) -> tuple[float, float]:
+def _gp_smooth_nonnegative_curve(theta_midpoints: np.ndarray, values: np.ndarray) -> np.ndarray:
+    """Smooth one Fisher curve with a deterministic Gaussian process."""
+    import warnings
+
+    from sklearn.exceptions import ConvergenceWarning
+    from sklearn.gaussian_process import GaussianProcessRegressor
+    from sklearn.gaussian_process.kernels import RBF, ConstantKernel, WhiteKernel
+
+    x = np.asarray(theta_midpoints, dtype=np.float64).reshape(-1, 1)
+    y = np.asarray(values, dtype=np.float64).reshape(-1)
+    if x.shape[0] != y.shape[0]:
+        raise ValueError(f"theta_midpoints and values must have the same length, got {x.shape[0]} and {y.shape[0]}.")
+    if y.size == 0:
+        return np.asarray(y, dtype=np.float64)
+
+    finite = np.isfinite(x[:, 0]) & np.isfinite(y)
+    if not np.any(finite):
+        return np.zeros_like(y, dtype=np.float64)
+    if np.count_nonzero(finite) < 2 or np.unique(x[finite, 0]).size < 2:
+        fill = float(np.nanmean(y[finite]))
+        return np.full_like(y, max(fill, 0.0), dtype=np.float64)
+
+    x_train = x[finite]
+    y_train = y[finite]
+    span = float(np.ptp(x_train[:, 0]))
+    length_scale = max(span / 4.0, 1e-6)
+    y_var = float(np.nanvar(y_train))
+    constant = max(y_var, 1e-6)
+    kernel = (
+        ConstantKernel(constant_value=constant, constant_value_bounds=(1e-6, 1e6))
+        * RBF(length_scale=length_scale, length_scale_bounds=(1e-6, 1e6))
+        + WhiteKernel(noise_level=max(1e-6 * constant, 1e-10), noise_level_bounds=(1e-10, 1e2))
+    )
+    gp = GaussianProcessRegressor(
+        kernel=kernel,
+        normalize_y=True,
+        n_restarts_optimizer=2,
+        random_state=0,
+    )
+    x_pred = x.copy()
+    bad_pred = ~np.isfinite(x_pred[:, 0])
+    if np.any(bad_pred):
+        x_pred[bad_pred, 0] = float(np.mean(x_train[:, 0]))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ConvergenceWarning)
+        gp.fit(x_train, y_train)
+        pred = np.asarray(gp.predict(x_pred), dtype=np.float64).reshape(-1)
+    pred = np.nan_to_num(pred, nan=0.0, posinf=0.0, neginf=0.0)
+    return np.clip(pred, 0.0, None)
+
+
+def _kernel_smooth_nonnegative_curve(
+    theta_midpoints: np.ndarray,
+    values: np.ndarray,
+    *,
+    bandwidth_grid: float = 2.0,
+) -> np.ndarray:
+    """Smooth one Fisher curve with Gaussian Nadaraya-Watson regression."""
+    x = np.asarray(theta_midpoints, dtype=np.float64).reshape(-1)
+    y = np.asarray(values, dtype=np.float64).reshape(-1)
+    if x.shape[0] != y.shape[0]:
+        raise ValueError(f"theta_midpoints and values must have the same length, got {x.shape[0]} and {y.shape[0]}.")
+    if y.size == 0:
+        return np.asarray(y, dtype=np.float64)
+
+    finite_x = np.isfinite(x)
+    finite = finite_x & np.isfinite(y)
+    if not np.any(finite):
+        return np.zeros_like(y, dtype=np.float64)
+
+    diffs = np.diff(x[finite_x])
+    positive_diffs = diffs[np.isfinite(diffs) & (diffs > 0.0)]
+    if positive_diffs.size == 0:
+        abs_diffs = np.abs(diffs[np.isfinite(diffs)])
+        positive_diffs = abs_diffs[abs_diffs > 0.0]
+    if positive_diffs.size == 0:
+        fill = float(np.nanmean(y[finite]))
+        return np.full_like(y, max(fill, 0.0), dtype=np.float64)
+
+    h = float(bandwidth_grid) * float(np.median(positive_diffs))
+    if not np.isfinite(h) or h <= 0.0:
+        raise ValueError(f"Kernel smoothing bandwidth must be positive and finite, got {h}.")
+
+    x_train = x[finite]
+    y_train = y[finite]
+    x_pred = x.copy()
+    bad_pred = ~np.isfinite(x_pred)
+    if np.any(bad_pred):
+        x_pred[bad_pred] = float(np.mean(x_train))
+
+    scaled = (x_pred[:, None] - x_train[None, :]) / h
+    weights = np.exp(-0.5 * scaled * scaled)
+    denom = np.sum(weights, axis=1)
+    pred = np.divide(
+        weights @ y_train,
+        denom,
+        out=np.zeros_like(x_pred, dtype=np.float64),
+        where=denom > 0.0,
+    )
+    pred = np.nan_to_num(pred, nan=0.0, posinf=0.0, neginf=0.0)
+    return np.clip(pred, 0.0, None)
+
+
+def _ground_truth_for_estimator_method(method: str) -> str:
+    name = str(method)
+    if name.endswith("_full"):
+        return "ground_truth_native_full"
+    if name.endswith("_linear"):
+        return "ground_truth_native_linear"
+    raise ValueError(f"Unknown Fisher estimator method: {method!r}.")
+
+
+def _smoothed_estimator_curve(
+    data: Any,
+    method: str,
+    *,
+    smoothing: str = "gp",
+    kernel_bandwidth_grid: float = 2.0,
+) -> np.ndarray:
+    key = f"{method}_fisher"
+    if key not in data.files:
+        raise KeyError(key)
+    mids = np.asarray(data["theta_midpoints"], dtype=np.float64).reshape(-1)
+    vals = np.asarray(data[key], dtype=np.float64).reshape(-1)
+    mode = str(smoothing)
+    if mode == "gp":
+        return _gp_smooth_nonnegative_curve(mids, vals)
+    if mode == "kernel":
+        return _kernel_smooth_nonnegative_curve(mids, vals, bandwidth_grid=float(kernel_bandwidth_grid))
+    if mode == "none":
+        return np.clip(np.nan_to_num(vals, nan=0.0, posinf=0.0, neginf=0.0), 0.0, None)
+    raise ValueError(f"Unknown estimator smoothing mode: {smoothing!r}.")
+
+
+def _smoothed_mae_abs_error_from_npz(
+    result_path: Path,
+    method: str,
+    *,
+    smoothing: str = "gp",
+    kernel_bandwidth_grid: float = 2.0,
+) -> float:
+    with np.load(result_path, allow_pickle=False) as data:
+        estimator = _smoothed_estimator_curve(
+            data,
+            str(method),
+            smoothing=str(smoothing),
+            kernel_bandwidth_grid=float(kernel_bandwidth_grid),
+        )
+        truth_method = _ground_truth_for_estimator_method(str(method))
+        truth_key = f"{truth_method}_fisher"
+        if truth_key not in data.files:
+            raise KeyError(truth_key)
+        truth = np.asarray(data[truth_key], dtype=np.float64).reshape(-1)
+    if estimator.shape != truth.shape:
+        raise ValueError(f"Smoothed estimator and ground truth have mismatched shapes: {estimator.shape} vs {truth.shape}.")
+    return float(np.nanmean(np.abs(estimator - truth)))
+
+
+def _smoothed_error_rows(
+    tasks: list[CaseTask],
+    *,
+    smoothing: str,
+    kernel_bandwidth_grid: float = 2.0,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for task in tasks:
+        with np.load(task.result_path, allow_pickle=False) as data:
+            available = set(data.files)
+        for method in SMOOTHED_ESTIMATOR_METHODS:
+            truth_method = _ground_truth_for_estimator_method(method)
+            if f"{method}_fisher" not in available or f"{truth_method}_fisher" not in available:
+                continue
+            mae = _smoothed_mae_abs_error_from_npz(
+                task.result_path,
+                method,
+                smoothing=str(smoothing),
+                kernel_bandwidth_grid=float(kernel_bandwidth_grid),
+            )
+            rows.append(
+                {
+                    "n_total": task.n_total,
+                    "pr_dim": "none" if task.pr_dim is None else int(task.pr_dim),
+                    "repeat_idx": task.repeat_idx,
+                    "repeat_seed": task.seed,
+                    "method": method,
+                    "mae_abs_error": mae,
+                    "result_path": str(task.result_path),
+                }
+            )
+    return rows
+
+
+def _gp_smoothed_error_rows(tasks: list[CaseTask]) -> list[dict[str, Any]]:
+    return _smoothed_error_rows(tasks, smoothing="gp")
+
+
+def _kernel_smoothed_error_rows(tasks: list[CaseTask], *, bandwidth_grid: float = 2.0) -> list[dict[str, Any]]:
+    return _smoothed_error_rows(tasks, smoothing="kernel", kernel_bandwidth_grid=float(bandwidth_grid))
+
+
+def _plot_composite_fisher_curves(
+    ax: Any,
+    result_path: Path,
+    *,
+    family: str,
+    gp_smooth_estimators: bool = False,
+    estimator_smoothing: str | None = None,
+    kernel_bandwidth_grid: float = 2.0,
+) -> tuple[float, float]:
     y_vals: list[np.ndarray] = []
     methods = _fisher_family_methods(str(family))
+    smoothing = str(estimator_smoothing) if estimator_smoothing is not None else ("gp" if bool(gp_smooth_estimators) else "none")
     with np.load(result_path, allow_pickle=False) as data:
         mids = np.asarray(data["theta_midpoints"], dtype=np.float64).reshape(-1)
         for name in methods:
             key = f"{name}_fisher"
             if key in data.files:
-                vals = np.asarray(data[key], dtype=np.float64).reshape(-1)
+                if smoothing != "none" and not name.startswith("ground_truth"):
+                    vals = _smoothed_estimator_curve(
+                        data,
+                        name,
+                        smoothing=smoothing,
+                        kernel_bandwidth_grid=float(kernel_bandwidth_grid),
+                    )
+                else:
+                    vals = np.asarray(data[key], dtype=np.float64).reshape(-1)
                 y_vals.append(vals[np.isfinite(vals)])
                 ax.plot(
                     mids,
@@ -511,25 +754,21 @@ def _plot_composite_fisher_curves(ax: Any, result_path: Path, *, family: str) ->
 
 
 def _plot_composite_error_vs_n(ax: Any, rows: list[dict[str, Any]], *, family: str, yscale: str) -> None:
-    grouped: dict[str, list[tuple[int, float]]] = {}
-    for row in rows:
-        if str(row["pr_dim"]) != "none":
-            continue
-        grouped.setdefault(str(row["method"]), []).append((int(row["n_total"]), float(row["mae_abs_error"])))
     _, flow_method, classical_method = _fisher_family_methods(str(family))
     for method in (flow_method, classical_method):
-        vals = grouped.get(method, [])
-        if not vals:
+        ns, means, sds = _errorbar_series(rows, method=method, pr_dim="none")
+        if len(ns) == 0:
             continue
-        ns = sorted({n for n, _ in vals})
-        means = [float(np.mean([err for n, err in vals if n == nn])) for nn in ns]
-        ax.plot(
+        ax.errorbar(
             ns,
             means,
+            yerr=sds,
             color=METHOD_COLORS.get(method),
-            linestyle=METHOD_LINESTYLES.get(method, "-"),
+            fmt=METHOD_LINESTYLES.get(method, "-"),
             marker=METHOD_MARKERS.get(method) or "o",
             linewidth=1.6,
+            elinewidth=1.1,
+            capsize=3.0,
             label=_method_label(method),
         )
     ax.set_xlabel("number of data points")
@@ -546,6 +785,11 @@ def plot_composite_figure(
     rows: list[dict[str, Any]],
     output_dir: Path,
     yscale: str = "linear",
+    gp_smooth_estimators: bool = False,
+    estimator_smoothing: str | None = None,
+    kernel_bandwidth_grid: float = 2.0,
+    svg_name: str = COMPOSITE_SVG_NAME,
+    png_name: str = COMPOSITE_PNG_NAME,
 ) -> tuple[Path, Path]:
     bundle = load_shared_dataset_npz(native_npz)
     dataset = build_dataset_from_meta(dict(bundle.meta))
@@ -556,8 +800,22 @@ def plot_composite_figure(
     plot_tuning_and_covariance_on_axes(fig, ax_tune, ax_cov, dataset)
     ax_tune.set_title("Tuning curves")
     ax_cov.set_title("PCA covariance ellipses")
-    full_ylim = _plot_composite_fisher_curves(ax_full_fisher, representative_result_path, family="full")
-    linear_ylim = _plot_composite_fisher_curves(ax_linear_fisher, representative_result_path, family="linear")
+    full_ylim = _plot_composite_fisher_curves(
+        ax_full_fisher,
+        representative_result_path,
+        family="full",
+        gp_smooth_estimators=bool(gp_smooth_estimators),
+        estimator_smoothing=estimator_smoothing,
+        kernel_bandwidth_grid=float(kernel_bandwidth_grid),
+    )
+    linear_ylim = _plot_composite_fisher_curves(
+        ax_linear_fisher,
+        representative_result_path,
+        family="linear",
+        gp_smooth_estimators=bool(gp_smooth_estimators),
+        estimator_smoothing=estimator_smoothing,
+        kernel_bandwidth_grid=float(kernel_bandwidth_grid),
+    )
     y_min = min(0.0, full_ylim[0], linear_ylim[0])
     y_max = max(full_ylim[1], linear_ylim[1])
     if not np.isfinite(y_max) or y_max <= y_min:
@@ -575,13 +833,59 @@ def plot_composite_figure(
     _plot_composite_error_vs_n(ax_linear_error, rows, family="linear", yscale=str(yscale))
     ax_full_error.set_title("Full Fisher error vs. data size")
     ax_linear_error.set_title("Linear Fisher error vs. data size")
-    svg = Path(output_dir) / COMPOSITE_SVG_NAME
-    png = Path(output_dir) / COMPOSITE_PNG_NAME
+    svg = Path(output_dir) / str(svg_name)
+    png = Path(output_dir) / str(png_name)
     svg.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(svg)
     fig.savefig(png, dpi=180)
     plt.close(fig)
     return svg, png
+
+
+def plot_composite_gp_smoothed_figure(
+    *,
+    native_npz: Path,
+    representative_result_path: Path,
+    representative_n_total: int | None = None,
+    rows: list[dict[str, Any]],
+    output_dir: Path,
+    yscale: str = "linear",
+) -> tuple[Path, Path]:
+    return plot_composite_figure(
+        native_npz=native_npz,
+        representative_result_path=representative_result_path,
+        representative_n_total=representative_n_total,
+        rows=rows,
+        output_dir=output_dir,
+        yscale=yscale,
+        gp_smooth_estimators=True,
+        svg_name=COMPOSITE_GP_SMOOTHED_SVG_NAME,
+        png_name=COMPOSITE_GP_SMOOTHED_PNG_NAME,
+    )
+
+
+def plot_composite_kernel_smoothed_figure(
+    *,
+    native_npz: Path,
+    representative_result_path: Path,
+    representative_n_total: int | None = None,
+    rows: list[dict[str, Any]],
+    output_dir: Path,
+    yscale: str = "linear",
+    bandwidth_grid: float = 2.0,
+) -> tuple[Path, Path]:
+    return plot_composite_figure(
+        native_npz=native_npz,
+        representative_result_path=representative_result_path,
+        representative_n_total=representative_n_total,
+        rows=rows,
+        output_dir=output_dir,
+        yscale=yscale,
+        estimator_smoothing="kernel",
+        kernel_bandwidth_grid=float(bandwidth_grid),
+        svg_name=COMPOSITE_KERNEL_SMOOTHED_SVG_NAME,
+        png_name=COMPOSITE_KERNEL_SMOOTHED_PNG_NAME,
+    )
 
 
 def maybe_plot_composite_figure(
@@ -612,17 +916,84 @@ def maybe_plot_composite_figure(
     )
 
 
+def maybe_plot_composite_gp_smoothed_figure(
+    tasks: list[CaseTask],
+    args: argparse.Namespace,
+    *,
+    output_dir: Path,
+    rows: list[dict[str, Any]],
+) -> tuple[Path, Path] | None:
+    if bool(getattr(args, "skip_dataset_viz", False)):
+        return None
+    task = composite_fisher_example_task(tasks, args)
+    native_npz = representative_native_npz(tasks, args)
+    if not native_npz.is_file() or not task.result_path.is_file():
+        print(
+            "[continuous-parallel] warning: skipped GP-smoothed composite figure; "
+            f"missing representative inputs: native_npz={native_npz} result={task.result_path}",
+            flush=True,
+        )
+        return None
+    return plot_composite_gp_smoothed_figure(
+        native_npz=native_npz,
+        representative_result_path=task.result_path,
+        representative_n_total=int(task.n_total),
+        rows=rows,
+        output_dir=output_dir,
+        yscale=str(args.yscale),
+    )
+
+
+def maybe_plot_composite_kernel_smoothed_figure(
+    tasks: list[CaseTask],
+    args: argparse.Namespace,
+    *,
+    output_dir: Path,
+    rows: list[dict[str, Any]],
+) -> tuple[Path, Path] | None:
+    if bool(getattr(args, "skip_dataset_viz", False)):
+        return None
+    task = composite_fisher_example_task(tasks, args)
+    native_npz = representative_native_npz(tasks, args)
+    if not native_npz.is_file() or not task.result_path.is_file():
+        print(
+            "[continuous-parallel] warning: skipped kernel-smoothed composite figure; "
+            f"missing representative inputs: native_npz={native_npz} result={task.result_path}",
+            flush=True,
+        )
+        return None
+    return plot_composite_kernel_smoothed_figure(
+        native_npz=native_npz,
+        representative_result_path=task.result_path,
+        representative_n_total=int(task.n_total),
+        rows=rows,
+        output_dir=output_dir,
+        yscale=str(args.yscale),
+        bandwidth_grid=float(args.kernel_smooth_bandwidth_grid),
+    )
+
+
 def aggregate_results(
     tasks: list[CaseTask],
     output_dir: Path,
     *,
     args: argparse.Namespace,
     dataset_paths: tuple[Path, Path] | None = None,
-) -> tuple[Path, Path, Path, Path, Path, tuple[Path, Path] | None]:
+) -> tuple[
+    Path,
+    Path,
+    Path,
+    Path,
+    Path,
+    tuple[Path, Path] | None,
+    tuple[Path, Path] | None,
+    tuple[Path, Path] | None,
+]:
     rows: list[dict[str, Any]] = []
     n_values: list[int] = []
     pr_values: list[int] = []
     repeat_values: list[int] = []
+    repeat_seed_values: list[int] = []
     methods: set[str] = set()
     abs_errors: dict[tuple[int, int, int, str], float] = {}
     for task in tasks:
@@ -641,6 +1012,7 @@ def aggregate_results(
                         "n_total": task.n_total,
                         "pr_dim": "none" if task.pr_dim is None else int(task.pr_dim),
                         "repeat_idx": task.repeat_idx,
+                        "repeat_seed": task.seed,
                         "method": method,
                         "mae_abs_error": mae,
                         "result_path": str(task.result_path),
@@ -649,24 +1021,57 @@ def aggregate_results(
                 n_values.append(task.n_total)
                 pr_values.append(pr_store)
                 repeat_values.append(task.repeat_idx)
+                repeat_seed_values.append(task.seed)
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     csv_path = out / SWEEP_CSV_NAME
     with csv_path.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=("n_total", "pr_dim", "repeat_idx", "method", "mae_abs_error", "result_path"))
+        writer = csv.DictWriter(
+            f,
+            fieldnames=("n_total", "pr_dim", "repeat_idx", "repeat_seed", "method", "mae_abs_error", "result_path"),
+        )
         writer.writeheader()
         writer.writerows(rows)
     npz_path = out / SWEEP_NPZ_NAME
+    repeat_seed_list = repeat_seeds(args)
     np.savez_compressed(
         npz_path,
         n_total=np.asarray(n_values, dtype=np.int64),
         pr_dim=np.asarray(pr_values, dtype=np.int64),
         repeat_idx=np.asarray(repeat_values, dtype=np.int64),
+        repeat_seed=np.asarray(repeat_seed_values, dtype=np.int64),
+        n_repeats=np.asarray(int(args.n_repeats), dtype=np.int64),
+        repeat_indices=np.arange(int(args.n_repeats), dtype=np.int64),
+        repeat_seeds=np.asarray(repeat_seed_list, dtype=np.int64),
         methods=np.asarray(sorted(methods), dtype=str),
         mae_abs_error=np.asarray([r["mae_abs_error"] for r in rows], dtype=np.float64),
     )
     svg_path, png_path = plot_sweep_errors(rows, out, yscale=str(args.yscale))
     composite_paths = maybe_plot_composite_figure(tasks, args, output_dir=out, rows=rows)
+    composite_gp_smoothed_paths: tuple[Path, Path] | None = None
+    composite_kernel_smoothed_paths: tuple[Path, Path] | None = None
+    composite_smoothing = str(getattr(args, "composite_smoothing", "gp"))
+    if composite_smoothing == "gp":
+        gp_smoothed_rows = _gp_smoothed_error_rows(tasks)
+        composite_gp_smoothed_paths = maybe_plot_composite_gp_smoothed_figure(
+            tasks,
+            args,
+            output_dir=out,
+            rows=gp_smoothed_rows,
+        )
+    elif composite_smoothing == "kernel":
+        kernel_smoothed_rows = _kernel_smoothed_error_rows(
+            tasks,
+            bandwidth_grid=float(args.kernel_smooth_bandwidth_grid),
+        )
+        composite_kernel_smoothed_paths = maybe_plot_composite_kernel_smoothed_figure(
+            tasks,
+            args,
+            output_dir=out,
+            rows=kernel_smoothed_rows,
+        )
+    elif composite_smoothing != "none":
+        raise ValueError(f"Unknown composite smoothing mode: {composite_smoothing!r}.")
     outputs: dict[str, str] = {
         "sweep_npz": str(npz_path),
         "sweep_csv": str(csv_path),
@@ -679,6 +1084,12 @@ def aggregate_results(
     if composite_paths is not None:
         outputs["composite_svg"] = str(composite_paths[0])
         outputs["composite_png"] = str(composite_paths[1])
+    if composite_gp_smoothed_paths is not None:
+        outputs["composite_gp_smoothed_svg"] = str(composite_gp_smoothed_paths[0])
+        outputs["composite_gp_smoothed_png"] = str(composite_gp_smoothed_paths[1])
+    if composite_kernel_smoothed_paths is not None:
+        outputs["composite_kernel_smoothed_svg"] = str(composite_kernel_smoothed_paths[0])
+        outputs["composite_kernel_smoothed_png"] = str(composite_kernel_smoothed_paths[1])
     summary_path = out / SWEEP_SUMMARY_NAME
     summary_path.write_text(
         json.dumps(
@@ -690,10 +1101,14 @@ def aggregate_results(
                 "config": {
                     "n_list": [int(v) for v in args.n_list],
                     "pr_dims": [None if v is None else int(v) for v in args.pr_dims],
+                    "seed": int(args.seed),
                     "n_repeats": int(args.n_repeats),
+                    "repeat_seeds": repeat_seed_list,
                     "dataset_family": str(args.dataset_family),
                     "native_x_dim": int(args.native_x_dim),
                     "skip_dataset_viz": bool(getattr(args, "skip_dataset_viz", False)),
+                    "composite_smoothing": composite_smoothing,
+                    "kernel_smooth_bandwidth_grid": float(args.kernel_smooth_bandwidth_grid),
                 },
                 "outputs": outputs,
             },
@@ -702,18 +1117,52 @@ def aggregate_results(
         )
         + "\n"
     )
-    return npz_path, csv_path, summary_path, svg_path, png_path, composite_paths
+    return (
+        npz_path,
+        csv_path,
+        summary_path,
+        svg_path,
+        png_path,
+        composite_paths,
+        composite_gp_smoothed_paths,
+        composite_kernel_smoothed_paths,
+    )
+
+
+def _errorbar_series(
+    rows: list[dict[str, Any]],
+    *,
+    method: str,
+    pr_dim: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    grouped: dict[int, list[float]] = {}
+    for row in rows:
+        if str(row["method"]) != str(method) or str(row["pr_dim"]) != str(pr_dim):
+            continue
+        grouped.setdefault(int(row["n_total"]), []).append(float(row["mae_abs_error"]))
+    ns = np.asarray(sorted(grouped), dtype=np.int64)
+    means: list[float] = []
+    sds: list[float] = []
+    for n_total in ns:
+        vals = np.asarray(grouped[int(n_total)], dtype=np.float64)
+        vals = vals[np.isfinite(vals)]
+        if vals.size == 0:
+            means.append(float("nan"))
+            sds.append(0.0)
+            continue
+        means.append(float(np.mean(vals)))
+        sds.append(float(np.std(vals, ddof=1)) if vals.size > 1 else 0.0)
+    return ns, np.asarray(means, dtype=np.float64), np.asarray(sds, dtype=np.float64)
 
 
 def plot_sweep_errors(rows: list[dict[str, Any]], output_dir: Path, *, yscale: str = "linear") -> tuple[Path, Path]:
     fig, ax = plt.subplots(figsize=(8.0, 5.0), layout="constrained")
-    grouped: dict[tuple[str, str], list[tuple[int, float]]] = {}
+    grouped: set[tuple[str, str]] = set()
     for row in rows:
-        grouped.setdefault((str(row["method"]), str(row["pr_dim"])), []).append((int(row["n_total"]), float(row["mae_abs_error"])))
-    for (method, pr_dim), vals in sorted(grouped.items()):
-        ns = sorted({v[0] for v in vals})
-        means = [float(np.mean([e for n, e in vals if n == nn])) for nn in ns]
-        ax.plot(ns, means, marker="o", label=f"{method} {pr_dim}")
+        grouped.add((str(row["method"]), str(row["pr_dim"])))
+    for method, pr_dim in sorted(grouped):
+        ns, means, sds = _errorbar_series(rows, method=method, pr_dim=pr_dim)
+        ax.errorbar(ns, means, yerr=sds, marker="o", linewidth=1.6, elinewidth=1.1, capsize=3.0, label=f"{method} {pr_dim}")
     ax.set_xlabel("n_total")
     ax.set_ylabel("mean absolute Fisher error")
     ax.set_yscale(str(yscale))
@@ -721,7 +1170,7 @@ def plot_sweep_errors(rows: list[dict[str, Any]], output_dir: Path, *, yscale: s
     ax.legend(fontsize=7)
     svg = Path(output_dir) / SWEEP_SVG_NAME
     png = Path(output_dir) / SWEEP_PNG_NAME
-    fig.savefig(svg)
+    fig.savefig(svg, metadata={"Description": "lines=repeat_means;errorbars=mean_sd"})
     fig.savefig(png, dpi=180)
     plt.close(fig)
     return svg, png
@@ -733,7 +1182,16 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
     run_cases_parallel(to_run, args)
     output_dir = Path(args.output_dir)
     dataset_paths = maybe_plot_representative_dataset(tasks, args, output_dir=output_dir)
-    npz_path, csv_path, summary_path, svg_path, png_path, composite_paths = aggregate_results(
+    (
+        npz_path,
+        csv_path,
+        summary_path,
+        svg_path,
+        png_path,
+        composite_paths,
+        composite_gp_smoothed_paths,
+        composite_kernel_smoothed_paths,
+    ) = aggregate_results(
         tasks,
         output_dir,
         args=args,
@@ -749,6 +1207,12 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
     if composite_paths is not None:
         print(f"composite_svg: {composite_paths[0]}", flush=True)
         print(f"composite_png: {composite_paths[1]}", flush=True)
+    if composite_gp_smoothed_paths is not None:
+        print(f"composite_gp_smoothed_svg: {composite_gp_smoothed_paths[0]}", flush=True)
+        print(f"composite_gp_smoothed_png: {composite_gp_smoothed_paths[1]}", flush=True)
+    if composite_kernel_smoothed_paths is not None:
+        print(f"composite_kernel_smoothed_svg: {composite_kernel_smoothed_paths[0]}", flush=True)
+        print(f"composite_kernel_smoothed_png: {composite_kernel_smoothed_paths[1]}", flush=True)
     print(f"summary_json: {summary_path}", flush=True)
     outputs = {
         "sweep_npz": npz_path,
@@ -763,6 +1227,12 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
     if composite_paths is not None:
         outputs["composite_svg"] = composite_paths[0]
         outputs["composite_png"] = composite_paths[1]
+    if composite_gp_smoothed_paths is not None:
+        outputs["composite_gp_smoothed_svg"] = composite_gp_smoothed_paths[0]
+        outputs["composite_gp_smoothed_png"] = composite_gp_smoothed_paths[1]
+    if composite_kernel_smoothed_paths is not None:
+        outputs["composite_kernel_smoothed_svg"] = composite_kernel_smoothed_paths[0]
+        outputs["composite_kernel_smoothed_png"] = composite_kernel_smoothed_paths[1]
     return outputs
 
 
