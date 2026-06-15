@@ -24,6 +24,17 @@ mamba run -n geo_diffusion python run_fisher.py decoder ... --device cuda
 
 - Default datasets and run outputs use `DATA_DIR = DATAROOT` from `global_setting.py` (override `DATAROOT` via `SCORE_MATCHING_FISHER_DATAROOT`). The repo `data/` path is a symlink to `DATAROOT` when present.
 
+### Repo-root `journal/` and `report/` (notes sibling)
+
+- Git tracks `journal` and `report` as symlinks into `../score-matching-fisher-note/score-matching-fisher-note-repo/`.
+- On **Windows**, default Git checkout (`core.symlinks=false`) leaves **plain text files** with the target path; IDE clicks open the stub instead of the notes tree. Fix after clone:
+
+```bash
+mamba run -n geo_diffusion python bin/setup_repo_symlinks.py
+```
+
+- Do **not** `git restore journal report` on Windows after fixing links — that restores the broken stubs. `git status` may show those paths as deleted; ignore unless you intend to change the symlink targets in Git.
+
 ### PR-autoencoder high-`x_dim` datasets
 
 - Generate low-dimensional `randamp_gaussian_sqrtd` with `bin/make_dataset.py`, then embed with `bin/project_dataset_pr_autoencoder.py` (see `docs/dataset_pr_autoencoder_workflow.md`). The `randamp_gaussian_sqrtd_pr_autoencoder` dataset-family token is removed.
