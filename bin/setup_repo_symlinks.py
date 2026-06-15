@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Create repo-root journal/ and report/ links into the sibling notes clone.
 
-Git stores these paths as symlinks (mode 120000). On Windows with
-``core.symlinks=false`` (the default), checkout leaves plain text files
-containing the relative target path. IDEs then open those files instead of
-the notes tree. Run this script after clone (or whenever links break):
+These paths are gitignored in the coding repo. Notes and report sources are
+versioned only in ``../score-matching-fisher-note/score-matching-fisher-note-repo/``.
+
+On Windows, default Git checkout can leave plain text stubs instead of links.
+Run after clone (or whenever links break):
 
     mamba run -n geo_diffusion python bin/setup_repo_symlinks.py
 """
@@ -12,37 +13,24 @@ the notes tree. Run this script after clone (or whenever links break):
 from __future__ import annotations
 
 import os
+import stat
 import subprocess
 import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-# Fallback when not run inside a git checkout (same targets as HEAD symlinks).
-DEFAULT_RELATIVE_TARGETS = {
+RELATIVE_TARGETS = {
     "journal": Path("../score-matching-fisher-note/score-matching-fisher-note-repo/journal"),
     "report": Path("../score-matching-fisher-note/score-matching-fisher-note-repo/report"),
 }
 
 
-def _git_symlink_target(name: str) -> Path:
-    try:
-        proc = subprocess.run(
-            ["git", "show", f"HEAD:{name}"],
-            cwd=REPO_ROOT,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except (OSError, subprocess.CalledProcessError):
-        return DEFAULT_RELATIVE_TARGETS[name]
-    target = proc.stdout.strip()
-    if not target:
-        return DEFAULT_RELATIVE_TARGETS[name]
-    target_path = Path(target)
-    if target_path.is_absolute():
-        return target_path
-    return (REPO_ROOT / target_path).resolve()
+def _target_path(name: str) -> Path:
+    target = RELATIVE_TARGETS[name]
+    if target.is_absolute():
+        return target.resolve()
+    return (REPO_ROOT / target).resolve()
 
 
 def _resolved_if_link(path: Path) -> Path | None:
@@ -64,24 +52,37 @@ def _is_plain_symlink_stub(path: Path) -> bool:
     return text.startswith("../") or text.startswith("./")
 
 
-def _remove_existing(link_path: Path) -> None:
+def _is_reparse_point(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    if sys.platform == "win32" and path.exists():
+        try:
+            return bool(path.lstat().st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+        except OSError:
+            return False
+    return False
+
+
+def _remove_existing_link(link_path: Path) -> None:
+    if link_path.is_file() and not link_path.is_symlink():
+        link_path.unlink()
+        return
     if link_path.is_symlink():
         link_path.unlink()
         return
-    if link_path.is_file():
-        link_path.unlink()
-        return
-    if link_path.is_dir():
-        # Junction or real directory.
+    if link_path.is_dir() and _is_reparse_point(link_path):
         if sys.platform == "win32":
             subprocess.run(
                 ["cmd", "/c", "rmdir", str(link_path)],
                 check=True,
             )
             return
-        raise SystemExit(
-            f"{link_path} is a real directory; move it aside and rerun this script."
-        )
+        link_path.unlink()
+        return
+    raise SystemExit(
+        f"Refusing to remove {link_path}: it is a real directory, not a link. "
+        "Move it aside manually if you really intend to replace it."
+    )
 
 
 def _create_dir_link(link_path: Path, target_path: Path) -> None:
@@ -96,7 +97,6 @@ def _create_dir_link(link_path: Path, target_path: Path) -> None:
     link_path.parent.mkdir(parents=True, exist_ok=True)
 
     if sys.platform == "win32":
-        # Prefer a directory symlink (matches git); fall back to a junction.
         try:
             os.symlink(target_path, link_path, target_is_directory=True)
             return
@@ -113,27 +113,19 @@ def _create_dir_link(link_path: Path, target_path: Path) -> None:
 
 def ensure_repo_symlinks() -> list[str]:
     created: list[str] = []
-    for name in DEFAULT_RELATIVE_TARGETS:
+    for name in RELATIVE_TARGETS:
         link_path = REPO_ROOT / name
-        target_path = _git_symlink_target(name)
+        target_path = _target_path(name)
 
         current = _resolved_if_link(link_path)
-        if current == target_path.resolve():
+        if current == target_path:
             print(f"[ok] {name}/ -> {target_path}")
             continue
 
         if link_path.exists() or link_path.is_symlink():
-            if link_path.is_dir() and current not in (None, target_path.resolve()):
-                _remove_existing(link_path)
-            elif _is_plain_symlink_stub(link_path) or link_path.is_file():
+            if _is_plain_symlink_stub(link_path):
                 print(f"[fix] replacing plain-text stub {name}")
-                _remove_existing(link_path)
-            elif link_path.is_symlink() or (
-                sys.platform == "win32" and link_path.is_dir()
-            ):
-                _remove_existing(link_path)
-            else:
-                raise SystemExit(f"Cannot replace existing path: {link_path}")
+            _remove_existing_link(link_path)
 
         _create_dir_link(link_path, target_path)
         print(f"[link] {name}/ -> {target_path}")
@@ -145,11 +137,7 @@ def ensure_repo_symlinks() -> list[str]:
 def main() -> None:
     created = ensure_repo_symlinks()
     if created:
-        print(
-            "\nDone. On Windows with git core.symlinks=false, "
-            "`git status` may list journal/report as deleted; "
-            "do not commit that — the working links are intentional."
-        )
+        print("\nDone. journal/ and report/ are gitignored in the coding repo.")
     else:
         print("\nAll repo symlinks already point at the notes tree.")
 

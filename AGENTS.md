@@ -26,14 +26,15 @@ mamba run -n geo_diffusion python run_fisher.py decoder ... --device cuda
 
 ### Repo-root `journal/` and `report/` (notes sibling)
 
-- Git tracks `journal` and `report` as symlinks into `../score-matching-fisher-note/score-matching-fisher-note-repo/`.
-- On **Windows**, default Git checkout (`core.symlinks=false`) leaves **plain text files** with the target path; IDE clicks open the stub instead of the notes tree. Fix after clone:
+- Markdown journal and LaTeX report live in the **sibling notes repo** (`../score-matching-fisher-note/score-matching-fisher-note-repo/`). The coding repo exposes them via local directory links `journal/` and `report/`.
+- **`journal/` and `report/` are gitignored** in this repo. Git must not track, checkout, restore, merge, or commit these paths here — version control for notes/report is only in the notes repo.
+- After clone (or if links break), create the links once:
 
 ```bash
 mamba run -n geo_diffusion python bin/setup_repo_symlinks.py
 ```
 
-- Do **not** `git restore journal report` on Windows after fixing links — that restores the broken stubs. `git status` may show those paths as deleted; ignore unless you intend to change the symlink targets in Git.
+- On Windows, never `git restore journal report` or `Remove-Item -Recurse journal report` in this repo — that can damage the notes tree through junctions.
 
 ### PR-autoencoder high-`x_dim` datasets
 
