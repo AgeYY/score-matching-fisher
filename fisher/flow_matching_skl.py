@@ -1010,6 +1010,7 @@ class CenteredSharedAffineLowRankFlowSKLModel(CenteredSharedAffineFlowSKLModel):
         divergence_estimator: str = "hutchinson",
         hutchinson_probes: int = 1,
         a_diag_jitter: float = 1e-3,
+        low_rank_basis: np.ndarray | torch.Tensor | None = None,
     ) -> None:
         if int(correction_rank) < 1:
             raise ValueError("correction_rank must be >= 1.")
@@ -1032,9 +1033,26 @@ class CenteredSharedAffineLowRankFlowSKLModel(CenteredSharedAffineFlowSKLModel):
         )
         self.velocity_family = "shared_affine_low_rank"
         self.correction_rank = int(correction_rank)
-        u_lin = nn.Linear(self.correction_rank, self.x_dim, bias=False)
-        nn.init.orthogonal_(u_lin.weight)
-        self.u_layer = parametrizations.orthogonal(u_lin, "weight", orthogonal_map="householder")
+        if low_rank_basis is None:
+            self.low_rank_basis_mode = "learned"
+            u_lin = nn.Linear(self.correction_rank, self.x_dim, bias=False)
+            nn.init.orthogonal_(u_lin.weight)
+            self.u_layer = parametrizations.orthogonal(u_lin, "weight", orthogonal_map="householder")
+        else:
+            basis = torch.as_tensor(low_rank_basis, dtype=torch.float32)
+            if basis.ndim != 2 or tuple(basis.shape) != (self.x_dim, self.correction_rank):
+                raise ValueError(
+                    "low_rank_basis must have shape "
+                    f"({self.x_dim}, {self.correction_rank}); got {tuple(basis.shape)}."
+                )
+            if not torch.isfinite(basis).all():
+                raise ValueError("low_rank_basis must contain only finite values.")
+            gram = basis.T @ basis
+            eye = torch.eye(self.correction_rank, dtype=basis.dtype)
+            if not torch.allclose(gram, eye, rtol=1e-4, atol=1e-5):
+                raise ValueError("low_rank_basis columns must be orthonormal.")
+            self.low_rank_basis_mode = "fixed"
+            self.register_buffer("fixed_u", basis.contiguous())
         self.h_net = _make_film_net(
             trunk_dim=self.correction_rank,
             theta_dim=self.theta_dim,
@@ -1048,6 +1066,8 @@ class CenteredSharedAffineLowRankFlowSKLModel(CenteredSharedAffineFlowSKLModel):
     def U(self) -> torch.Tensor:
         """Low-rank basis columns with shape ``[D, r]``."""
 
+        if self.low_rank_basis_mode == "fixed":
+            return self.fixed_u
         return self.u_layer.weight
 
     def _centered_inputs(
@@ -1111,6 +1131,7 @@ class CenteredSharedAffineLowRankScalarFlowSKLModel(CenteredSharedAffineLowRankF
         divergence_estimator: str = "hutchinson",
         hutchinson_probes: int = 1,
         a_diag_jitter: float = 1e-3,
+        low_rank_basis: np.ndarray | torch.Tensor | None = None,
     ) -> None:
         super().__init__(
             theta_dim=theta_dim,
@@ -1123,6 +1144,7 @@ class CenteredSharedAffineLowRankScalarFlowSKLModel(CenteredSharedAffineLowRankF
             divergence_estimator=divergence_estimator,
             hutchinson_probes=hutchinson_probes,
             a_diag_jitter=float(a_diag_jitter),
+            low_rank_basis=low_rank_basis,
         )
         self.velocity_family = "shared_affine_low_rank_scalar"
         self.a_net = _make_mlp(
@@ -1154,6 +1176,7 @@ class CenteredSharedAffineLowRankDiagFlowSKLModel(CenteredSharedAffineLowRankFlo
         divergence_estimator: str = "hutchinson",
         hutchinson_probes: int = 1,
         a_diag_jitter: float = 1e-3,
+        low_rank_basis: np.ndarray | torch.Tensor | None = None,
     ) -> None:
         super().__init__(
             theta_dim=theta_dim,
@@ -1166,6 +1189,7 @@ class CenteredSharedAffineLowRankDiagFlowSKLModel(CenteredSharedAffineLowRankFlo
             divergence_estimator=divergence_estimator,
             hutchinson_probes=hutchinson_probes,
             a_diag_jitter=float(a_diag_jitter),
+            low_rank_basis=low_rank_basis,
         )
         self.velocity_family = "shared_affine_low_rank_diag"
         self.a_net = _make_mlp(
@@ -1195,6 +1219,7 @@ def build_flow_skl_model(
     divergence_estimator: str = "hutchinson",
     hutchinson_probes: int = 1,
     shared_affine_a_diag_jitter: float = 1e-3,
+    low_rank_basis: np.ndarray | torch.Tensor | None = None,
 ) -> nn.Module:
     """Build a velocity-family model for flow-matching SKL estimation."""
 
@@ -1255,6 +1280,7 @@ def build_flow_skl_model(
             divergence_estimator=str(divergence_estimator),
             hutchinson_probes=int(hutchinson_probes),
             a_diag_jitter=float(shared_affine_a_diag_jitter),
+            low_rank_basis=low_rank_basis,
             **common,
         )
     if fam == "nonlinear":

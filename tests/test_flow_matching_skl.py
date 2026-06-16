@@ -866,6 +866,39 @@ def test_shared_affine_low_rank_forward_centers_low_rank_correction() -> None:
     torch.testing.assert_close(model(x, theta, t), expected, rtol=1e-12, atol=1e-12)
 
 
+def test_shared_affine_low_rank_can_use_fixed_oracle_basis() -> None:
+    basis = np.asarray([[1.0], [0.0]], dtype=np.float64)
+    model = build_flow_skl_model(
+        velocity_family="shared_affine_low_rank",
+        theta_dim=2,
+        x_dim=2,
+        hidden_dim=4,
+        depth=1,
+        low_rank_dim=1,
+        path_schedule="linear",
+        low_rank_basis=basis,
+    ).double()
+
+    assert model.low_rank_basis_mode == "fixed"
+    assert "fixed_u" in dict(model.named_buffers())
+    assert not any(name.startswith("u_layer") for name, _ in model.named_parameters())
+    torch.testing.assert_close(model.U, torch.as_tensor(basis, dtype=torch.float64))
+
+
+def test_shared_affine_low_rank_rejects_nonorthonormal_fixed_basis() -> None:
+    with pytest.raises(ValueError, match="orthonormal"):
+        build_flow_skl_model(
+            velocity_family="shared_affine_low_rank",
+            theta_dim=2,
+            x_dim=2,
+            hidden_dim=4,
+            depth=1,
+            low_rank_dim=1,
+            path_schedule="linear",
+            low_rank_basis=np.asarray([[2.0], [0.0]], dtype=np.float64),
+        )
+
+
 def test_shared_affine_low_rank_scalar_forward_includes_scalar_base_and_correction() -> None:
     model = build_flow_skl_model(
         velocity_family="shared_affine_low_rank_scalar",
