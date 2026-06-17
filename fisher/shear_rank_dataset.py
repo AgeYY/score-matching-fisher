@@ -83,8 +83,8 @@ def shear_symmetric_kl(a_values: np.ndarray, b_values: np.ndarray, *, nu: float)
 def _validate_config(*, x_dim: int, r_star: int, n_per_condition: int, train_frac: float) -> None:
     if int(x_dim) < 2:
         raise ValueError("x_dim must be >= 2.")
-    if int(r_star) < 2 or int(r_star) > int(x_dim) or int(r_star) % 2:
-        raise ValueError("r_star must be an even integer in [2, x_dim].")
+    if int(r_star) != 0 and (int(r_star) < 2 or int(r_star) > int(x_dim) or int(r_star) % 2):
+        raise ValueError("r_star must be 0 or an even integer in [2, x_dim].")
     if int(n_per_condition) < 2:
         raise ValueError("n_per_condition must be >= 2.")
     if not (0.0 < float(train_frac) < 1.0):

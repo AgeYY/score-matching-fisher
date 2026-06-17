@@ -66,6 +66,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output-dir", type=Path, default=Path(DATA_DIR) / "two_condition_shear_rank_skl")
     p.add_argument("--force", action="store_true", help="Rerun model cases even when cached NPZs exist.")
     p.add_argument(
+        "--dataset-only",
+        action="store_true",
+        help="Generate the dataset and combined dataset visualization only; skip all flow-matching training.",
+    )
+    p.add_argument(
+        "--plots-only",
+        action="store_true",
+        help="Regenerate figures from existing result files in --output-dir; skip all flow-matching training.",
+    )
+    p.add_argument(
         "--skip-null",
         action="store_true",
         help="Skip the null a0=a1 dataset branch; by default both sign_flip and null modes run.",
@@ -84,13 +94,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--n-seeds", type=int, default=1)
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--train-frac", type=float, default=0.8)
-    p.add_argument("--x-dim", type=int, default=4)
+    p.add_argument("--x-dim", type=int, default=2)
     p.add_argument("--r-star", type=int, default=2)
     p.add_argument("--amplitude", type=float, default=0.7)
     p.add_argument("--omega", type=float, default=2.5)
     p.add_argument("--q-seed", type=int, default=12345)
 
-    p.add_argument("--ranks", type=_parse_int_list, default=[0, 2, 4])
+    p.add_argument("--ranks", type=_parse_int_list, default=[0])
     p.add_argument("--no-full", action="store_true", help="Do not train the full nonlinear MLP model.")
 
     p.add_argument("--epochs", type=int, default=20000)
@@ -494,6 +504,11 @@ def _write_rows_csv(path: Path, rows: list[dict[str, Any]]) -> Path:
     return path
 
 
+def _read_rows_csv(path: Path) -> list[dict[str, Any]]:
+    with Path(path).open(newline="", encoding="utf-8") as f:
+        return [dict(row) for row in csv.DictReader(f)]
+
+
 def _aggregate(rows: list[dict[str, Any]], *, modes: list[str], n_list: list[int], specs: list[ModelSpec], n_seeds: int) -> dict[str, Any]:
     model_names = [s.name for s in specs]
     estimates = np.full((len(modes), len(n_list), int(n_seeds), len(specs)), np.nan, dtype=np.float64)
@@ -563,7 +578,7 @@ def _fixed_n_position(n_list: np.ndarray, fixed_n: int) -> int:
     return int(np.argmin(np.abs(n_arr - int(fixed_n))))
 
 
-def plot_dataset_geometry(path_base: Path, *, args: argparse.Namespace) -> tuple[Path, Path]:
+def _draw_dataset_geometry(ax: Any, *, args: argparse.Namespace) -> None:
     n_plot = min(max(max(int(n) for n in args.n_list), 200), 1000)
     dataset = generate_shear_rank_dataset(
         n_per_condition=n_plot,
@@ -584,18 +599,24 @@ def plot_dataset_geometry(path_base: Path, *, args: argparse.Namespace) -> tuple
     scale = math.sqrt(1.0 + amp * amp * nu)
     curve = amp * centered_cosine_feature(x_grid, omega=float(args.omega)) / scale
 
-    fig, ax = plt.subplots(figsize=(7.0, 5.2))
     for condition, color, label in ((0, "C0", "condition 0"), (1, "C1", "condition 1")):
         idx = np.flatnonzero(labels == condition)
         if idx.size > 500:
             idx = idx[:500]
         ax.scatter(hidden[idx, 1], hidden[idx, 0], s=8, alpha=0.35, color=color, label=label)
-    ax.plot(x_grid, -curve, color="C0", linewidth=2.0)
-    ax.plot(x_grid, curve, color="C1", linewidth=2.0)
+    if int(args.r_star) > 0:
+        ax.plot(x_grid, -curve, color="C0", linewidth=2.0)
+        ax.plot(x_grid, curve, color="C1", linewidth=2.0)
     ax.set_xlabel("hidden y2")
     ax.set_ylabel("hidden y1")
-    ax.set_title("Native nonlinear shear pair")
+    title = "Undistorted 2D Gaussian dataset" if int(args.r_star) == 0 else "Native nonlinear shear pair"
+    ax.set_title(title)
     ax.legend(frameon=False)
+
+
+def plot_dataset_geometry(path_base: Path, *, args: argparse.Namespace) -> tuple[Path, Path]:
+    fig, ax = plt.subplots(figsize=(7.0, 5.2))
+    _draw_dataset_geometry(ax, args=args)
     fig.tight_layout()
     svg = path_base.with_suffix(".svg")
     png = path_base.with_suffix(".png")
@@ -605,16 +626,15 @@ def plot_dataset_geometry(path_base: Path, *, args: argparse.Namespace) -> tuple
     return svg, png
 
 
-def plot_distance_vs_n(path_base: Path, aggregate: dict[str, Any]) -> tuple[Path, Path] | None:
+def _draw_distance_vs_n(ax: Any, aggregate: dict[str, Any]) -> bool:
     mode_i = _mode_position(aggregate, "sign_flip")
     if mode_i is None:
-        return None
+        return False
     n_list = np.asarray(aggregate["n_list"], dtype=np.int64)
     estimates = np.asarray(aggregate["estimates"], dtype=np.float64)[mode_i]
     truth = float(np.nanmean(np.asarray(aggregate["true_skl"], dtype=np.float64)[mode_i]))
     model_names = tuple(str(v) for v in aggregate["model_names"])
 
-    fig, ax = plt.subplots(figsize=(8.0, 5.2))
     for model_i, model in enumerate(model_names):
         vals = estimates[:, :, model_i]
         ax.errorbar(n_list, np.nanmean(vals, axis=1), yerr=_sem(vals, axis=1), marker="o", linewidth=1.5, label=model)
@@ -624,6 +644,14 @@ def plot_distance_vs_n(path_base: Path, aggregate: dict[str, Any]) -> tuple[Path
     ax.set_ylabel("estimated Jeffreys SKL")
     ax.set_title("Estimated distance vs sample size")
     ax.legend(frameon=False, fontsize=8, ncols=2)
+    return True
+
+
+def plot_distance_vs_n(path_base: Path, aggregate: dict[str, Any]) -> tuple[Path, Path] | None:
+    fig, ax = plt.subplots(figsize=(8.0, 5.2))
+    if not _draw_distance_vs_n(ax, aggregate):
+        plt.close(fig)
+        return None
     fig.tight_layout()
     svg = path_base.with_suffix(".svg")
     png = path_base.with_suffix(".png")
@@ -633,20 +661,27 @@ def plot_distance_vs_n(path_base: Path, aggregate: dict[str, Any]) -> tuple[Path
     return svg, png
 
 
-def plot_tradeoff(path_base: Path, aggregate: dict[str, Any], *, fixed_n: int) -> tuple[Path, Path] | None:
+def _draw_tradeoff(ax: Any, aggregate: dict[str, Any], *, fixed_n: int) -> bool:
     mode_i = _mode_position(aggregate, "sign_flip")
     if mode_i is None:
-        return None
+        return False
     n_pos = _fixed_n_position(np.asarray(aggregate["n_list"], dtype=np.int64), int(fixed_n))
     vals = np.asarray(aggregate["relative_errors"], dtype=np.float64)[mode_i, n_pos]
     labels = tuple(str(v) for v in aggregate["model_names"])
     x = np.arange(len(labels))
-    fig, ax = plt.subplots(figsize=(8.0, 5.0))
     ax.errorbar(x, np.nanmean(vals, axis=0), yerr=_sem(vals, axis=0), marker="o", linewidth=1.8)
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=35, ha="right")
     ax.set_ylabel("relative error")
     ax.set_title(f"Complexity tradeoff at N={int(np.asarray(aggregate['n_list'])[n_pos])}")
+    return True
+
+
+def plot_tradeoff(path_base: Path, aggregate: dict[str, Any], *, fixed_n: int) -> tuple[Path, Path] | None:
+    fig, ax = plt.subplots(figsize=(8.0, 5.0))
+    if not _draw_tradeoff(ax, aggregate, fixed_n=fixed_n):
+        plt.close(fig)
+        return None
     fig.tight_layout()
     svg = path_base.with_suffix(".svg")
     png = path_base.with_suffix(".png")
@@ -656,10 +691,10 @@ def plot_tradeoff(path_base: Path, aggregate: dict[str, Any], *, fixed_n: int) -
     return svg, png
 
 
-def plot_bias_variance(path_base: Path, aggregate: dict[str, Any], *, fixed_n: int) -> tuple[Path, Path] | None:
+def _draw_bias_variance(ax: Any, aggregate: dict[str, Any], *, fixed_n: int) -> bool:
     mode_i = _mode_position(aggregate, "sign_flip")
     if mode_i is None:
-        return None
+        return False
     n_pos = _fixed_n_position(np.asarray(aggregate["n_list"], dtype=np.int64), int(fixed_n))
     estimates = np.asarray(aggregate["estimates"], dtype=np.float64)[mode_i, n_pos]
     truth = float(np.nanmean(np.asarray(aggregate["true_skl"], dtype=np.float64)[mode_i, n_pos]))
@@ -671,7 +706,6 @@ def plot_bias_variance(path_base: Path, aggregate: dict[str, Any], *, fixed_n: i
         var[valid] = np.nanvar(estimates[:, valid], axis=0, ddof=1)
     labels = tuple(str(v) for v in aggregate["model_names"])
     x = np.arange(len(labels))
-    fig, ax = plt.subplots(figsize=(8.0, 5.0))
     ax.bar(x, bias2, label="bias^2")
     ax.bar(x, var, bottom=bias2, label="variance")
     ax.set_xticks(x)
@@ -679,6 +713,14 @@ def plot_bias_variance(path_base: Path, aggregate: dict[str, Any], *, fixed_n: i
     ax.set_ylabel("MSE components")
     ax.set_title(f"Bias-variance at N={int(np.asarray(aggregate['n_list'])[n_pos])}")
     ax.legend(frameon=False)
+    return True
+
+
+def plot_bias_variance(path_base: Path, aggregate: dict[str, Any], *, fixed_n: int) -> tuple[Path, Path] | None:
+    fig, ax = plt.subplots(figsize=(8.0, 5.0))
+    if not _draw_bias_variance(ax, aggregate, fixed_n=fixed_n):
+        plt.close(fig)
+        return None
     fig.tight_layout()
     svg = path_base.with_suffix(".svg")
     png = path_base.with_suffix(".png")
@@ -688,14 +730,13 @@ def plot_bias_variance(path_base: Path, aggregate: dict[str, Any], *, fixed_n: i
     return svg, png
 
 
-def plot_null_false_positive(path_base: Path, aggregate: dict[str, Any]) -> tuple[Path, Path] | None:
+def _draw_null_false_positive(ax: Any, aggregate: dict[str, Any]) -> bool:
     mode_i = _mode_position(aggregate, "null")
     if mode_i is None:
-        return None
+        return False
     n_list = np.asarray(aggregate["n_list"], dtype=np.int64)
     estimates = np.asarray(aggregate["estimates"], dtype=np.float64)[mode_i]
     model_names = tuple(str(v) for v in aggregate["model_names"])
-    fig, ax = plt.subplots(figsize=(8.0, 5.2))
     for model_i, model in enumerate(model_names):
         vals = estimates[:, :, model_i]
         ax.errorbar(n_list, np.nanmean(vals, axis=1), yerr=_sem(vals, axis=1), marker="o", linewidth=1.5, label=model)
@@ -704,7 +745,113 @@ def plot_null_false_positive(path_base: Path, aggregate: dict[str, Any]) -> tupl
     ax.set_ylabel("estimated Jeffreys SKL")
     ax.set_title("Null false-positive distance")
     ax.legend(frameon=False, fontsize=8, ncols=2)
+    return True
+
+
+def plot_null_false_positive(path_base: Path, aggregate: dict[str, Any]) -> tuple[Path, Path] | None:
+    fig, ax = plt.subplots(figsize=(8.0, 5.2))
+    if not _draw_null_false_positive(ax, aggregate):
+        plt.close(fig)
+        return None
     fig.tight_layout()
+    svg = path_base.with_suffix(".svg")
+    png = path_base.with_suffix(".png")
+    fig.savefig(svg)
+    fig.savefig(png, dpi=200)
+    plt.close(fig)
+    return svg, png
+
+
+def _model_sort_key(model: str) -> tuple[int, str]:
+    preferred = {"affine": 0, "rank_2": 1, "rank_4": 2, "rank_6": 3, "rank_8": 4, "full": 99}
+    return (preferred.get(str(model), 50), str(model))
+
+
+def _plot_loss_cell(ax: Any, result_npz: Path) -> bool:
+    if not Path(result_npz).is_file():
+        return False
+    with np.load(result_npz, allow_pickle=True) as data:
+        if "val_losses" not in data.files or "val_monitor_losses" not in data.files:
+            return False
+        val_losses = np.asarray(data["val_losses"], dtype=np.float64).reshape(-1)
+        val_ema = np.asarray(data["val_monitor_losses"], dtype=np.float64).reshape(-1)
+        best_epoch = int(np.asarray(data["best_epoch"]).reshape(-1)[0]) if "best_epoch" in data.files else -1
+    if val_losses.size == 0 or val_ema.size == 0:
+        return False
+    epochs = np.arange(1, val_losses.size + 1)
+    ax.plot(epochs, val_losses, color="0.70", linewidth=0.8, alpha=0.75, label="validation")
+    ax.plot(epochs[: val_ema.size], val_ema, color="C0", linewidth=1.8, label="EMA")
+    if 1 <= best_epoch <= val_losses.size:
+        ax.axvline(best_epoch, color="C3", linestyle="--", linewidth=1.0, alpha=0.85, label="best epoch")
+    return True
+
+
+def plot_combined(path_base: Path, rows: list[dict[str, Any]], *, args: argparse.Namespace) -> tuple[Path, Path]:
+    if not rows:
+        raise ValueError("Cannot plot combined loss curves without CSV rows.")
+    modes = tuple(dict.fromkeys(str(row["mode"]) for row in rows))
+    mode = "sign_flip" if "sign_flip" in modes else modes[0]
+    rows_for_mode = [row for row in rows if str(row["mode"]) == mode]
+    n_values = sorted({int(row["n_per_condition"]) for row in rows_for_mode})
+    model_names = sorted({str(row["model"]) for row in rows_for_mode}, key=_model_sort_key)
+    if not n_values or not model_names:
+        raise ValueError(f"No result rows available for mode {mode!r}.")
+
+    by_key: dict[tuple[str, int], dict[str, Any]] = {}
+    for row in rows_for_mode:
+        key = (str(row["model"]), int(row["n_per_condition"]))
+        by_key.setdefault(key, row)
+
+    n_rows = len(model_names)
+    n_cols = len(n_values)
+    fig_width = max(8.0, 3.1 * n_cols)
+    fig_height = max(3.2, 2.6 * n_rows)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(fig_width, fig_height), squeeze=False, sharex=False, sharey=False)
+    legend_handles = None
+    legend_labels = None
+    for row_i, model in enumerate(model_names):
+        for col_i, n_per_condition in enumerate(n_values):
+            ax = axes[row_i, col_i]
+            row = by_key.get((model, n_per_condition))
+            ok = False
+            if row is not None:
+                ok = _plot_loss_cell(ax, Path(str(row["result_npz"])))
+            if not ok:
+                ax.text(0.5, 0.5, "missing loss history", transform=ax.transAxes, ha="center", va="center")
+                ax.set_axis_off()
+                continue
+            ax.set_title(f"N={n_per_condition}")
+            if col_i == 0:
+                ax.set_ylabel(f"{model}\nvalidation loss")
+            if row_i == n_rows - 1:
+                ax.set_xlabel("epoch")
+            ax.grid(alpha=0.18, linewidth=0.6)
+            if legend_handles is None:
+                legend_handles, legend_labels = ax.get_legend_handles_labels()
+    if legend_handles is not None and legend_labels is not None:
+        fig.legend(legend_handles, legend_labels, loc="upper center", ncols=3, frameon=False, bbox_to_anchor=(0.5, 0.955))
+    fig.suptitle(
+        f"Validation loss curves by sample size ({mode}; x_dim={int(args.x_dim)}, r_star={int(args.r_star)})",
+        y=0.995,
+    )
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.90))
+    svg = path_base.with_suffix(".svg")
+    png = path_base.with_suffix(".png")
+    fig.savefig(svg)
+    fig.savefig(png, dpi=200)
+    plt.close(fig)
+    return svg, png
+
+
+def plot_dataset_only_combined(path_base: Path, *, args: argparse.Namespace) -> tuple[Path, Path]:
+    fig, ax = plt.subplots(figsize=(7.2, 6.2))
+    _draw_dataset_geometry(ax, args=args)
+    fig.suptitle(
+        f"Dataset check (x_dim={int(args.x_dim)}, r_star={int(args.r_star)}, "
+        f"N={','.join(str(int(v)) for v in args.n_list)})",
+        y=0.99,
+    )
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.96))
     svg = path_base.with_suffix(".svg")
     png = path_base.with_suffix(".png")
     fig.savefig(svg)
@@ -728,6 +875,77 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
         raise ValueError("--x-dim must be >= --r-star.")
     dev = require_device(str(args.device))
     output_dir = Path(args.output_dir).expanduser().resolve()
+    if bool(getattr(args, "plots_only", False)):
+        results_csv = output_dir / RESULTS_CSV_NAME
+        if not results_csv.is_file():
+            raise FileNotFoundError(f"--plots-only requires an existing CSV: {results_csv}")
+        summary_path = output_dir / SUMMARY_JSON_NAME
+        if summary_path.is_file():
+            with summary_path.open(encoding="utf-8") as f:
+                summary = json.load(f)
+            for key in ("x_dim", "r_star", "n_seeds"):
+                if key in summary:
+                    setattr(args, key, int(summary[key]))
+        else:
+            summary = {
+                "script": "bin/run_shear_rank_skl_experiment.py",
+                "device": str(dev),
+                "output_dir": str(output_dir),
+                "results_csv": str(results_csv),
+            }
+        rows = sorted(_read_rows_csv(results_csv), key=_row_sort_key)
+        combined = plot_combined(output_dir / "shear_rank_combined", rows, args=args)
+        summary.setdefault("figures", {})["combined"] = [str(combined[0]), str(combined[1])]
+        summary["plots_only_last_run"] = True
+        summary_json = _write_summary(summary_path, summary)
+        print(f"summary_json: {summary_json}", flush=True)
+        print(f"combined_figure: {combined[1]}", flush=True)
+        return {"summary_json": summary_json, "combined_png": combined[1]}
+
+    if bool(getattr(args, "dataset_only", False)):
+        seed = _seed_for_repeat(int(args.seed), 0)
+        n_per_condition = int(max(int(v) for v in args.n_list))
+        dataset = generate_shear_rank_dataset(
+            n_per_condition=n_per_condition,
+            x_dim=int(args.x_dim),
+            r_star=int(args.r_star),
+            amplitude=float(args.amplitude),
+            omega=float(args.omega),
+            seed=int(seed),
+            q_seed=int(args.q_seed),
+            train_frac=float(args.train_frac),
+            mode="sign_flip",
+        )
+        dataset_npz = output_dir / "dataset_check.npz"
+        save_shear_rank_dataset_npz(dataset_npz, dataset)
+        combined = plot_dataset_only_combined(output_dir / "shear_rank_combined", args=args)
+        summary_json = _write_summary(
+            output_dir / SUMMARY_JSON_NAME,
+            {
+                "script": "bin/run_shear_rank_skl_experiment.py",
+                "device": str(dev),
+                "dataset_only": True,
+                "output_dir": str(output_dir),
+                "dataset_npz": str(dataset_npz),
+                "n_per_condition": n_per_condition,
+                "n_list": [int(v) for v in args.n_list],
+                "n_seeds": int(args.n_seeds),
+                "seed": int(args.seed),
+                "mode": "sign_flip",
+                "x_dim": int(args.x_dim),
+                "r_star": int(args.r_star),
+                "amplitude": float(args.amplitude),
+                "omega": float(args.omega),
+                "train_frac": float(args.train_frac),
+                "true_skl": float(dataset.true_skl_matrix[0, 1]),
+                "figures": {"combined": [str(combined[0]), str(combined[1])]},
+            },
+        )
+        print(f"dataset_npz: {dataset_npz}", flush=True)
+        print(f"summary_json: {summary_json}", flush=True)
+        print(f"combined_figure: {combined[1]}", flush=True)
+        return {"dataset_npz": dataset_npz, "summary_json": summary_json, "combined_png": combined[1]}
+
     specs = model_specs([int(v) for v in args.ranks], include_full=not bool(args.no_full))
     modes = ["sign_flip"] + ([] if bool(args.skip_null) else ["null"])
     parallel_devices = _resolve_parallel_devices(str(getattr(args, "parallel_devices", "")))
@@ -757,6 +975,7 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
     results_csv = _write_rows_csv(output_dir / RESULTS_CSV_NAME, rows)
 
     figure_paths: dict[str, tuple[Path, Path] | None] = {
+        "combined": plot_combined(output_dir / "shear_rank_combined", rows, args=args),
         "dataset_geometry": plot_dataset_geometry(output_dir / "shear_rank_dataset_geometry", args=args),
         "distance_vs_n": plot_distance_vs_n(output_dir / "shear_rank_distance_vs_n", aggregate),
         "tradeoff": plot_tradeoff(output_dir / "shear_rank_tradeoff", aggregate, fixed_n=int(args.fixed_n)),
