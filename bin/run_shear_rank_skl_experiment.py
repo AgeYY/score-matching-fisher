@@ -78,7 +78,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--skip-null",
         action="store_true",
-        help="Skip the null a0=a1 dataset branch; by default both sign_flip and null modes run.",
+        default=True,
+        help="Skip the null a0=a1 dataset branch; this is the default for the focused shear diagnostic.",
+    )
+    p.add_argument(
+        "--include-null",
+        dest="skip_null",
+        action="store_false",
+        help="Include the null a0=a1 dataset branch.",
     )
     p.add_argument(
         "--parallel-devices",
@@ -90,29 +97,35 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    p.add_argument("--n-list", type=_parse_int_list, default=[50, 100, 500, 1000, 2000])
+    p.add_argument("--n-list", type=_parse_int_list, default=[100, 500, 1000, 2000, 3000, 4000, 5000])
     p.add_argument("--n-seeds", type=int, default=1)
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--train-frac", type=float, default=0.8)
     p.add_argument("--x-dim", type=int, default=2)
     p.add_argument("--r-star", type=int, default=2)
     p.add_argument("--amplitude", type=float, default=0.7)
+    p.add_argument(
+        "--mean-shift",
+        type=float,
+        default=0.0,
+        help="Condition mean separation along one hidden non-shear Gaussian coordinate.",
+    )
     p.add_argument("--omega", type=float, default=2.5)
     p.add_argument("--q-seed", type=int, default=12345)
 
     p.add_argument("--ranks", type=_parse_int_list, default=[0])
     p.add_argument("--no-full", action="store_true", help="Do not train the full nonlinear MLP model.")
 
-    p.add_argument("--epochs", type=int, default=20000)
+    p.add_argument("--epochs", type=int, default=50000)
     p.add_argument("--early-patience", type=int, default=1000)
     p.add_argument("--early-min-delta", type=float, default=1e-4)
-    p.add_argument("--early-ema-alpha", type=float, default=0.05)
+    p.add_argument("--early-ema-alpha", type=float, default=0.01)
     p.add_argument("--batch-size", type=int, default=2048)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--hidden-dim", type=int, default=256)
     p.add_argument("--depth", type=int, default=5)
-    p.add_argument("--path-schedule", choices=("cosine", "linear", "straight"), default="cosine")
+    p.add_argument("--path-schedule", choices=("cosine", "linear", "straight"), default="linear")
     p.add_argument("--t-eps", type=float, default=0.0005)
     p.add_argument("--quadrature-steps", type=int, default=64)
     p.add_argument("--divergence-estimator", choices=("hutchinson", "exact"), default="hutchinson")
@@ -123,7 +136,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ode-method", type=str, default="midpoint")
     p.add_argument("--solve-jitter", type=float, default=1e-6)
     p.add_argument("--max-grad-norm", type=float, default=10.0)
-    p.add_argument("--log-every", type=int, default=50)
+    p.add_argument("--log-every", type=int, default=200)
     p.add_argument("--fixed-n", type=int, default=1000, help="N value for tradeoff and bias/variance figures.")
     return p
 
@@ -328,6 +341,7 @@ def _run_dataset_case(
         x_dim=int(args.x_dim),
         r_star=int(args.r_star),
         amplitude=float(args.amplitude),
+        mean_shift=float(args.mean_shift),
         omega=float(args.omega),
         seed=int(seed),
         q_seed=int(args.q_seed),
@@ -551,6 +565,19 @@ def _write_aggregate_npz(path: Path, aggregate: dict[str, Any]) -> Path:
     return path
 
 
+def _read_aggregate_npz(path: Path) -> dict[str, Any]:
+    with np.load(path, allow_pickle=True) as data:
+        return {
+            "modes": tuple(str(v) for v in np.asarray(data["modes"]).tolist()),
+            "n_list": np.asarray(data["n_list"], dtype=np.int64),
+            "model_names": tuple(str(v) for v in np.asarray(data["model_names"]).tolist()),
+            "model_ranks": np.asarray(data["model_ranks"], dtype=np.int64),
+            "estimates": np.asarray(data["estimates"], dtype=np.float64),
+            "true_skl": np.asarray(data["true_skl"], dtype=np.float64),
+            "relative_errors": np.asarray(data["relative_errors"], dtype=np.float64),
+        }
+
+
 def _sem(arr: np.ndarray, axis: int) -> np.ndarray:
     values = np.asarray(arr, dtype=np.float64)
     count = np.sum(np.isfinite(values), axis=axis)
@@ -562,6 +589,20 @@ def _sem(arr: np.ndarray, axis: int) -> np.ndarray:
     valid = flat_count > 1
     if np.any(valid):
         out[valid] = np.nanstd(flat[:, valid], axis=0, ddof=1) / np.sqrt(flat_count[valid])
+    return out.reshape(out_shape)
+
+
+def _sd(arr: np.ndarray, axis: int) -> np.ndarray:
+    values = np.asarray(arr, dtype=np.float64)
+    count = np.sum(np.isfinite(values), axis=axis)
+    moved = np.moveaxis(values, axis, 0)
+    out_shape = moved.shape[1:]
+    flat = moved.reshape(moved.shape[0], -1)
+    out = np.zeros(flat.shape[1], dtype=np.float64)
+    flat_count = np.asarray(count).reshape(-1)
+    valid = flat_count > 1
+    if np.any(valid):
+        out[valid] = np.nanstd(flat[:, valid], axis=0, ddof=1)
     return out.reshape(out_shape)
 
 
@@ -585,6 +626,7 @@ def _draw_dataset_geometry(ax: Any, *, args: argparse.Namespace) -> None:
         x_dim=int(args.x_dim),
         r_star=int(args.r_star),
         amplitude=float(args.amplitude),
+        mean_shift=float(args.mean_shift),
         omega=float(args.omega),
         seed=int(args.seed),
         q_seed=int(args.q_seed),
@@ -593,6 +635,11 @@ def _draw_dataset_geometry(ax: Any, *, args: argparse.Namespace) -> None:
     )
     hidden = np.asarray(dataset.bundle.x_all, dtype=np.float64) @ np.asarray(dataset.q_matrix, dtype=np.float64)
     labels = np.argmax(np.asarray(dataset.bundle.theta_all, dtype=np.float64), axis=1)
+
+    axes = np.asarray(ax, dtype=object).reshape(-1)
+    shear_ax = axes[0]
+    shift_ax = axes[1] if axes.size > 1 else None
+
     x_grid = np.linspace(-3.0, 3.0, 400)
     nu = float(dataset.nu)
     amp = float(args.amplitude)
@@ -603,20 +650,38 @@ def _draw_dataset_geometry(ax: Any, *, args: argparse.Namespace) -> None:
         idx = np.flatnonzero(labels == condition)
         if idx.size > 500:
             idx = idx[:500]
-        ax.scatter(hidden[idx, 1], hidden[idx, 0], s=8, alpha=0.35, color=color, label=label)
+        shear_ax.scatter(hidden[idx, 1], hidden[idx, 0], s=8, alpha=0.35, color=color, label=label)
     if int(args.r_star) > 0:
-        ax.plot(x_grid, -curve, color="C0", linewidth=2.0)
-        ax.plot(x_grid, curve, color="C1", linewidth=2.0)
-    ax.set_xlabel("hidden y2")
-    ax.set_ylabel("hidden y1")
+        shear_ax.plot(x_grid, -curve, color="C0", linewidth=2.0)
+        shear_ax.plot(x_grid, curve, color="C1", linewidth=2.0)
+    shear_ax.set_xlabel("hidden y2")
+    shear_ax.set_ylabel("hidden y1")
     title = "Undistorted 2D Gaussian dataset" if int(args.r_star) == 0 else "Native nonlinear shear pair"
-    ax.set_title(title)
-    ax.legend(frameon=False)
+    shear_ax.set_title(title)
+    shear_ax.legend(frameon=False)
+
+    if shift_ax is not None:
+        observed = np.asarray(dataset.bundle.x_all, dtype=np.float64)
+        centered = observed - np.mean(observed, axis=0, keepdims=True)
+        _, _, vh = np.linalg.svd(centered, full_matrices=False)
+        pcs = centered @ vh[:2].T
+        for condition, color, label in ((0, "C0", "condition 0"), (1, "C1", "condition 1")):
+            idx = np.flatnonzero(labels == condition)
+            if idx.size > 500:
+                idx = idx[:500]
+            shift_ax.scatter(pcs[idx, 0], pcs[idx, 1], s=8, alpha=0.35, color=color, label=label)
+        shift_ax.set_xlabel("observed PC1")
+        shift_ax.set_ylabel("observed PC2")
+        shift_ax.set_title("Observed x PCA")
 
 
 def plot_dataset_geometry(path_base: Path, *, args: argparse.Namespace) -> tuple[Path, Path]:
-    fig, ax = plt.subplots(figsize=(7.0, 5.2))
-    _draw_dataset_geometry(ax, args=args)
+    if float(getattr(args, "mean_shift", 0.0)) != 0.0:
+        fig, axes = plt.subplots(1, 2, figsize=(12.0, 5.2))
+        _draw_dataset_geometry(axes, args=args)
+    else:
+        fig, ax = plt.subplots(figsize=(7.0, 5.2))
+        _draw_dataset_geometry(ax, args=args)
     fig.tight_layout()
     svg = path_base.with_suffix(".svg")
     png = path_base.with_suffix(".png")
@@ -637,12 +702,12 @@ def _draw_distance_vs_n(ax: Any, aggregate: dict[str, Any]) -> bool:
 
     for model_i, model in enumerate(model_names):
         vals = estimates[:, :, model_i]
-        ax.errorbar(n_list, np.nanmean(vals, axis=1), yerr=_sem(vals, axis=1), marker="o", linewidth=1.5, label=model)
+        ax.errorbar(n_list, np.nanmean(vals, axis=1), yerr=_sd(vals, axis=1), marker="o", linewidth=1.5, label=model)
     ax.axhline(truth, color="black", linestyle="--", linewidth=1.5, label="truth")
     ax.set_xscale("log")
     ax.set_xlabel("N per condition")
     ax.set_ylabel("estimated Jeffreys SKL")
-    ax.set_title("Estimated distance vs sample size")
+    ax.set_title("Estimated distance vs sample size (SD bars)")
     ax.legend(frameon=False, fontsize=8, ncols=2)
     return True
 
@@ -669,11 +734,88 @@ def _draw_tradeoff(ax: Any, aggregate: dict[str, Any], *, fixed_n: int) -> bool:
     vals = np.asarray(aggregate["relative_errors"], dtype=np.float64)[mode_i, n_pos]
     labels = tuple(str(v) for v in aggregate["model_names"])
     x = np.arange(len(labels))
-    ax.errorbar(x, np.nanmean(vals, axis=0), yerr=_sem(vals, axis=0), marker="o", linewidth=1.8)
+    ax.errorbar(x, np.nanmean(vals, axis=0), yerr=_sd(vals, axis=0), marker="o", linewidth=1.8)
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=35, ha="right")
     ax.set_ylabel("relative error")
-    ax.set_title(f"Complexity tradeoff at N={int(np.asarray(aggregate['n_list'])[n_pos])}")
+    ax.set_title(f"Complexity tradeoff at N={int(np.asarray(aggregate['n_list'])[n_pos])} (SD bars)")
+    return True
+
+
+def _draw_relative_error_vs_n(ax: Any, aggregate: dict[str, Any]) -> bool:
+    mode_i = _mode_position(aggregate, "sign_flip")
+    if mode_i is None:
+        return False
+    n_list = np.asarray(aggregate["n_list"], dtype=np.int64)
+    errors = np.asarray(aggregate["relative_errors"], dtype=np.float64)[mode_i]
+    model_names = tuple(str(v) for v in aggregate["model_names"])
+    for model_i, model in enumerate(model_names):
+        vals = errors[:, :, model_i]
+        color = f"C{model_i}"
+        for seed_i in range(vals.shape[1]):
+            finite = np.isfinite(vals[:, seed_i])
+            if np.any(finite):
+                ax.scatter(
+                    n_list[finite],
+                    vals[finite, seed_i],
+                    s=18,
+                    alpha=0.28,
+                    color=color,
+                    edgecolors="none",
+                )
+        ax.errorbar(
+            n_list,
+            np.nanmean(vals, axis=1),
+            yerr=_sd(vals, axis=1),
+            marker="o",
+            linewidth=1.8,
+            color=color,
+            label=model,
+        )
+    ax.set_xscale("log")
+    ax.set_xlabel("N per condition")
+    ax.set_ylabel("relative error")
+    ax.set_title("Relative error vs sample size (SD bars)")
+    ax.legend(frameon=False, fontsize=8, ncols=2)
+    return True
+
+
+def _draw_absolute_error_vs_n(ax: Any, aggregate: dict[str, Any]) -> bool:
+    mode_i = _mode_position(aggregate, "sign_flip")
+    if mode_i is None:
+        return False
+    n_list = np.asarray(aggregate["n_list"], dtype=np.int64)
+    estimates = np.asarray(aggregate["estimates"], dtype=np.float64)[mode_i]
+    truth = np.asarray(aggregate["true_skl"], dtype=np.float64)[mode_i]
+    model_names = tuple(str(v) for v in aggregate["model_names"])
+    for model_i, model in enumerate(model_names):
+        vals = np.abs(estimates[:, :, model_i] - truth)
+        color = f"C{model_i}"
+        for seed_i in range(vals.shape[1]):
+            finite = np.isfinite(vals[:, seed_i])
+            if np.any(finite):
+                ax.scatter(
+                    n_list[finite],
+                    vals[finite, seed_i],
+                    s=18,
+                    alpha=0.28,
+                    color=color,
+                    edgecolors="none",
+                )
+        ax.errorbar(
+            n_list,
+            np.nanmean(vals, axis=1),
+            yerr=_sd(vals, axis=1),
+            marker="o",
+            linewidth=1.8,
+            color=color,
+            label=model,
+        )
+    ax.set_xscale("log")
+    ax.set_xlabel("N per condition")
+    ax.set_ylabel("absolute error")
+    ax.set_title("Absolute error vs sample size (SD bars)")
+    ax.legend(frameon=False, fontsize=8, ncols=2)
     return True
 
 
@@ -739,11 +881,11 @@ def _draw_null_false_positive(ax: Any, aggregate: dict[str, Any]) -> bool:
     model_names = tuple(str(v) for v in aggregate["model_names"])
     for model_i, model in enumerate(model_names):
         vals = estimates[:, :, model_i]
-        ax.errorbar(n_list, np.nanmean(vals, axis=1), yerr=_sem(vals, axis=1), marker="o", linewidth=1.5, label=model)
+        ax.errorbar(n_list, np.nanmean(vals, axis=1), yerr=_sd(vals, axis=1), marker="o", linewidth=1.5, label=model)
     ax.set_xscale("log")
     ax.set_xlabel("N per condition")
     ax.set_ylabel("estimated Jeffreys SKL")
-    ax.set_title("Null false-positive distance")
+    ax.set_title("Null false-positive distance (SD bars)")
     ax.legend(frameon=False, fontsize=8, ncols=2)
     return True
 
@@ -786,7 +928,7 @@ def _plot_loss_cell(ax: Any, result_npz: Path) -> bool:
     return True
 
 
-def plot_combined(path_base: Path, rows: list[dict[str, Any]], *, args: argparse.Namespace) -> tuple[Path, Path]:
+def plot_combined(path_base: Path, aggregate: dict[str, Any], rows: list[dict[str, Any]], *, args: argparse.Namespace) -> tuple[Path, Path]:
     if not rows:
         raise ValueError("Cannot plot combined loss curves without CSV rows.")
     modes = tuple(dict.fromkeys(str(row["mode"]) for row in rows))
@@ -804,9 +946,62 @@ def plot_combined(path_base: Path, rows: list[dict[str, Any]], *, args: argparse
 
     n_rows = len(model_names)
     n_cols = len(n_values)
-    fig_width = max(8.0, 3.1 * n_cols)
-    fig_height = max(3.2, 2.6 * n_rows)
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(fig_width, fig_height), squeeze=False, sharex=False, sharey=False)
+    fig_width = max(14.0, 3.1 * n_cols)
+    fig_height = 8.2 + 2.5 * n_rows
+    fig = plt.figure(figsize=(fig_width, fig_height), layout="constrained")
+    summary_fig, loss_fig = fig.subfigures(2, 1, height_ratios=[1.35, max(1.0, 0.55 * n_rows)])
+
+    summary_grid = summary_fig.add_gridspec(2, 3)
+    geometry_axes = np.asarray(
+        [
+            summary_fig.add_subplot(summary_grid[0, 0]),
+            summary_fig.add_subplot(summary_grid[1, 0]),
+        ],
+        dtype=object,
+    )
+    _draw_dataset_geometry(geometry_axes, args=args)
+    geometry_axes[0].text(
+        0.01,
+        0.99,
+        "A",
+        transform=geometry_axes[0].transAxes,
+        va="top",
+        ha="left",
+        fontsize=12,
+        fontweight="bold",
+    )
+    summary_panels = (
+        ("B", "Estimated SKL", summary_fig.add_subplot(summary_grid[0, 1]), lambda ax: _draw_distance_vs_n(ax, aggregate)),
+        (
+            "C",
+            "Relative error",
+            summary_fig.add_subplot(summary_grid[0, 2]),
+            lambda ax: _draw_relative_error_vs_n(ax, aggregate),
+        ),
+        (
+            "D",
+            "Absolute error",
+            summary_fig.add_subplot(summary_grid[1, 1]),
+            lambda ax: _draw_absolute_error_vs_n(ax, aggregate),
+        ),
+        (
+            "E",
+            "Null false positive" if _mode_position(aggregate, "null") is not None else "Tradeoff",
+            summary_fig.add_subplot(summary_grid[1, 2]),
+            lambda ax: _draw_null_false_positive(ax, aggregate)
+            if _mode_position(aggregate, "null") is not None
+            else _draw_tradeoff(ax, aggregate, fixed_n=int(args.fixed_n)),
+        ),
+    )
+    for letter, title, ax, draw in summary_panels:
+        ok = bool(draw(ax))
+        if not ok:
+            ax.axis("off")
+            ax.set_title(f"{title}: unavailable")
+        ax.text(0.01, 0.99, letter, transform=ax.transAxes, va="top", ha="left", fontsize=12, fontweight="bold")
+    summary_fig.suptitle("Experiment summary panels", fontsize=13)
+
+    axes = np.asarray(loss_fig.subplots(n_rows, n_cols, squeeze=False, sharex=False, sharey=False))
     legend_handles = None
     legend_labels = None
     for row_i, model in enumerate(model_names):
@@ -829,12 +1024,16 @@ def plot_combined(path_base: Path, rows: list[dict[str, Any]], *, args: argparse
             if legend_handles is None:
                 legend_handles, legend_labels = ax.get_legend_handles_labels()
     if legend_handles is not None and legend_labels is not None:
-        fig.legend(legend_handles, legend_labels, loc="upper center", ncols=3, frameon=False, bbox_to_anchor=(0.5, 0.955))
+        loss_fig.legend(legend_handles, legend_labels, loc="upper center", ncols=3, frameon=False, bbox_to_anchor=(0.5, 0.98))
+    loss_fig.suptitle("Validation loss curves by sample size", fontsize=13, y=1.05)
     fig.suptitle(
-        f"Validation loss curves by sample size ({mode}; x_dim={int(args.x_dim)}, r_star={int(args.r_star)})",
-        y=0.995,
+        (
+            f"Two-condition shear-rank SKL experiment "
+            f"({mode}; x_dim={int(args.x_dim)}, r_star={int(args.r_star)}, "
+            f"A={float(args.amplitude):g}, mean_shift={float(args.mean_shift):g})"
+        ),
+        fontsize=15,
     )
-    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.90))
     svg = path_base.with_suffix(".svg")
     png = path_base.with_suffix(".png")
     fig.savefig(svg)
@@ -879,6 +1078,9 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
         results_csv = output_dir / RESULTS_CSV_NAME
         if not results_csv.is_file():
             raise FileNotFoundError(f"--plots-only requires an existing CSV: {results_csv}")
+        results_npz = output_dir / RESULTS_NPZ_NAME
+        if not results_npz.is_file():
+            raise FileNotFoundError(f"--plots-only requires an existing aggregate NPZ: {results_npz}")
         summary_path = output_dir / SUMMARY_JSON_NAME
         if summary_path.is_file():
             with summary_path.open(encoding="utf-8") as f:
@@ -894,7 +1096,8 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
                 "results_csv": str(results_csv),
             }
         rows = sorted(_read_rows_csv(results_csv), key=_row_sort_key)
-        combined = plot_combined(output_dir / "shear_rank_combined", rows, args=args)
+        aggregate = _read_aggregate_npz(results_npz)
+        combined = plot_combined(output_dir / "shear_rank_combined", aggregate, rows, args=args)
         summary.setdefault("figures", {})["combined"] = [str(combined[0]), str(combined[1])]
         summary["plots_only_last_run"] = True
         summary_json = _write_summary(summary_path, summary)
@@ -910,6 +1113,7 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
             x_dim=int(args.x_dim),
             r_star=int(args.r_star),
             amplitude=float(args.amplitude),
+            mean_shift=float(args.mean_shift),
             omega=float(args.omega),
             seed=int(seed),
             q_seed=int(args.q_seed),
@@ -975,7 +1179,7 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
     results_csv = _write_rows_csv(output_dir / RESULTS_CSV_NAME, rows)
 
     figure_paths: dict[str, tuple[Path, Path] | None] = {
-        "combined": plot_combined(output_dir / "shear_rank_combined", rows, args=args),
+        "combined": plot_combined(output_dir / "shear_rank_combined", aggregate, rows, args=args),
         "dataset_geometry": plot_dataset_geometry(output_dir / "shear_rank_dataset_geometry", args=args),
         "distance_vs_n": plot_distance_vs_n(output_dir / "shear_rank_distance_vs_n", aggregate),
         "tradeoff": plot_tradeoff(output_dir / "shear_rank_tradeoff", aggregate, fixed_n=int(args.fixed_n)),

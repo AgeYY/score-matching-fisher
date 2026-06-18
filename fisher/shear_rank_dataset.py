@@ -21,6 +21,8 @@ class ShearRankDataset:
     q_matrix: np.ndarray
     u_star: np.ndarray
     condition_shear_a: np.ndarray
+    condition_mean_offsets: np.ndarray
+    mean_shift_dim: int
     nu: float
     true_skl_matrix: np.ndarray
 
@@ -91,6 +93,21 @@ def _validate_config(*, x_dim: int, r_star: int, n_per_condition: int, train_fra
         raise ValueError("train_frac must be in (0, 1).")
 
 
+def _condition_mean_offsets(*, x_dim: int, r_star: int, mean_shift: float) -> tuple[np.ndarray, int]:
+    d = int(x_dim)
+    r = int(r_star)
+    shift = float(mean_shift)
+    offsets = np.zeros((2, d), dtype=np.float64)
+    if shift == 0.0:
+        return offsets, -1
+    if r >= d:
+        raise ValueError("mean_shift requires at least one non-shear dimension: x_dim must be > r_star.")
+    shift_dim = r
+    offsets[0, shift_dim] = -0.5 * shift
+    offsets[1, shift_dim] = 0.5 * shift
+    return offsets, shift_dim
+
+
 def _condition_a_values(*, mode: str, amplitude: float, q_pairs: int) -> np.ndarray:
     mode_norm = str(mode).strip().lower().replace("-", "_")
     amp = float(amplitude)
@@ -119,6 +136,7 @@ def generate_shear_rank_dataset(
     x_dim: int = 64,
     r_star: int = 8,
     amplitude: float = 0.7,
+    mean_shift: float = 0.0,
     omega: float = 2.5,
     seed: int = 7,
     q_seed: int | None = None,
@@ -145,6 +163,11 @@ def generate_shear_rank_dataset(
     q_matrix = random_orthogonal_matrix(d, seed=int(seed if q_seed is None else q_seed))
     nu = centered_cosine_nu(float(omega))
     a_by_condition = _condition_a_values(mode=mode, amplitude=float(amplitude), q_pairs=q_pairs)
+    mean_offsets, mean_shift_dim = _condition_mean_offsets(
+        x_dim=d,
+        r_star=r,
+        mean_shift=float(mean_shift),
+    )
 
     x_parts: list[np.ndarray] = []
     theta_parts: list[np.ndarray] = []
@@ -161,6 +184,7 @@ def generate_shear_rank_dataset(
             y[:, odd_col] = (
                 z[:, odd_col] + a * centered_cosine_feature(z[:, even_col], omega=float(omega))
             ) / scale
+        y += mean_offsets[condition].reshape(1, d)
         x_parts.append(y @ q_matrix.T)
         theta_parts.append(np.eye(2, dtype=np.float64)[np.full(n, condition, dtype=np.int64)])
         label_parts.append(np.full(n, condition, dtype=np.int64))
@@ -188,7 +212,7 @@ def generate_shear_rank_dataset(
         a_by_condition[0],
         a_by_condition[1],
         nu=nu,
-    )
+    ) + float(mean_shift) * float(mean_shift)
     meta: dict[str, Any] = {
         "version": SHARED_DATASET_NPZ_VERSION,
         "dataset_family": "two_condition_hidden_shear_rank",
@@ -205,6 +229,8 @@ def generate_shear_rank_dataset(
         "r_star": r,
         "q_pairs": q_pairs,
         "amplitude": float(amplitude),
+        "mean_shift": float(mean_shift),
+        "mean_shift_dim": int(mean_shift_dim),
         "omega": float(omega),
         "nu": float(nu),
         "mode": str(mode).strip().lower().replace("-", "_"),
@@ -226,6 +252,8 @@ def generate_shear_rank_dataset(
         q_matrix=q_matrix,
         u_star=q_matrix[:, :r].copy(),
         condition_shear_a=a_by_condition,
+        condition_mean_offsets=mean_offsets,
+        mean_shift_dim=int(mean_shift_dim),
         nu=float(nu),
         true_skl_matrix=true_skl,
     )
@@ -254,6 +282,8 @@ def save_shear_rank_dataset_npz(path: str | Path, dataset: ShearRankDataset) -> 
         orthogonal_Q=np.asarray(dataset.q_matrix, dtype=np.float64),
         u_star=np.asarray(dataset.u_star, dtype=np.float64),
         condition_shear_a=np.asarray(dataset.condition_shear_a, dtype=np.float64),
+        condition_mean_offsets=np.asarray(dataset.condition_mean_offsets, dtype=np.float64),
+        mean_shift_dim=np.asarray([dataset.mean_shift_dim], dtype=np.int64),
         nu=np.asarray([dataset.nu], dtype=np.float64),
         true_skl_matrix=np.asarray(dataset.true_skl_matrix, dtype=np.float64),
     )

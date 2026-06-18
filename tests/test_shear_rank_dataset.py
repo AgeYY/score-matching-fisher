@@ -62,12 +62,26 @@ def test_sign_flip_and_null_true_skl_formulas() -> None:
         train_frac=0.75,
         mode="null",
     )
+    shifted = generate_shear_rank_dataset(
+        n_per_condition=12,
+        x_dim=10,
+        r_star=8,
+        amplitude=amplitude,
+        mean_shift=1.25,
+        omega=omega,
+        seed=7,
+        q_seed=123,
+        train_frac=0.75,
+        mode="sign_flip",
+    )
 
     assert sign_flip.true_skl_matrix[0, 1] == pytest.approx(16.0 * nu * amplitude * amplitude)
     assert sign_flip.true_skl_matrix[0, 1] == pytest.approx(
         shear_symmetric_kl(sign_flip.condition_shear_a[0], sign_flip.condition_shear_a[1], nu=nu)
     )
     assert null.true_skl_matrix[0, 1] == pytest.approx(0.0)
+    assert shifted.mean_shift_dim == 8
+    assert shifted.true_skl_matrix[0, 1] == pytest.approx(sign_flip.true_skl_matrix[0, 1] + 1.25**2)
 
 
 def test_generated_rotation_and_shared_npz_extra_arrays(tmp_path: Path) -> None:
@@ -94,6 +108,8 @@ def test_generated_rotation_and_shared_npz_extra_arrays(tmp_path: Path) -> None:
     with np.load(out, allow_pickle=False) as data:
         assert "orthogonal_Q" in data.files
         assert "u_star" in data.files
+        assert "condition_mean_offsets" in data.files
+        assert "mean_shift_dim" in data.files
         assert "true_skl_matrix" in data.files
         np.testing.assert_allclose(data["u_star"], q[:, :8])
 
@@ -145,6 +161,7 @@ def test_cli_smoke_aggregates_mocked_model_results(monkeypatch: pytest.MonkeyPat
             "4",
             "--fixed-n",
             "4",
+            "--include-null",
         ]
     )
 
@@ -165,13 +182,18 @@ def test_cli_smoke_aggregates_mocked_model_results(monkeypatch: pytest.MonkeyPat
 def test_cli_defaults_and_parallel_device_parsing() -> None:
     mod = _load_cli_module()
     args = mod.build_parser().parse_args([])
-    assert args.n_list == [50, 100, 500, 1000, 2000]
+    assert args.n_list == [100, 500, 1000, 2000, 3000, 4000, 5000]
     assert args.n_seeds == 1
-    assert args.ranks == [0, 2, 4]
+    assert args.ranks == [0]
+    assert args.skip_null is True
+    assert args.epochs == 50000
+    assert args.early_patience == 1000
+    assert args.early_ema_alpha == 0.01
+    assert args.path_schedule == "linear"
+    assert args.log_every == 200
+    assert args.mean_shift == 0.0
     assert [spec.name for spec in mod.model_specs(args.ranks, include_full=not args.no_full)] == [
         "affine",
-        "rank_2",
-        "rank_4",
         "full",
     ]
     assert mod._resolve_parallel_devices("") == []
