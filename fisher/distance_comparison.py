@@ -91,6 +91,8 @@ class FlowComparisonConfig:
     radius: float = 1.0
     normalize_x: bool = False
     normalize_x_eps: float = 1e-8
+    endpoint_warmup_epochs: int = 0
+    endpoint_warmup_lr: float | None = None
 
 
 @dataclass(frozen=True)
@@ -614,6 +616,8 @@ def train_and_estimate_flow(
         ema_alpha=float(config.early_ema_alpha),
         max_grad_norm=float(config.max_grad_norm),
         log_every=max(1, int(config.log_every)),
+        endpoint_warmup_epochs=int(config.endpoint_warmup_epochs),
+        endpoint_warmup_lr=config.endpoint_warmup_lr,
     )
     return estimate_model_symmetric_kl(
         model=model,
@@ -657,10 +661,21 @@ def save_flow_result_npz(
     if pair is not None:
         fields["condition_pair"] = np.asarray(pair, dtype=np.int64)
     meta = dict(result.train_metadata)
-    for key in ("train_losses", "val_losses", "val_monitor_losses"):
+    for key in ("train_losses", "val_losses", "val_monitor_losses", "endpoint_warmup_losses", "endpoint_warmup_val_losses"):
         if key in meta:
             fields[key] = np.asarray(meta[key], dtype=np.float64)
-    for key in ("best_val_loss", "best_epoch", "stopped_epoch", "stopped_early", "early_ema_alpha"):
+    for key in (
+        "best_val_loss",
+        "best_epoch",
+        "stopped_epoch",
+        "stopped_early",
+        "early_ema_alpha",
+        "n_clipped_steps",
+        "n_total_steps",
+        "path_schedule",
+        "endpoint_warmup_epochs",
+        "endpoint_warmup_lr",
+    ):
         if key in meta:
             fields[key] = np.asarray([meta[key]])
     for key in ("flow_normalize_x", "flow_normalize_x_eps"):

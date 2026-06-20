@@ -140,11 +140,15 @@ def test_flow_skl_default_t_eps_is_small_endpoint_clamp() -> None:
     sig = inspect.signature(train_flow_skl_model)
     assert sig.parameters["t_eps"].default == pytest.approx(0.0005)
     assert sig.parameters["ema_alpha"].default == pytest.approx(0.05)
+    assert sig.parameters["endpoint_warmup_epochs"].default == 0
+    assert sig.parameters["endpoint_warmup_lr"].default is None
 
     mod = _load_run_flow_matching_skl_module()
     args = mod.build_parser().parse_args([])
     assert args.t_eps == pytest.approx(0.0005)
     assert args.early_ema_alpha == pytest.approx(0.05)
+    assert args.endpoint_warmup_epochs == 0
+    assert args.endpoint_warmup_lr is None
 
 
 def test_centered_fixed_radius_normalize_behavior_is_unchanged() -> None:

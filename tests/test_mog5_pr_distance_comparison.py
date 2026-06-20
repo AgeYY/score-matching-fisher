@@ -427,11 +427,17 @@ def test_train_and_estimate_flow_uses_model_jeffreys_readout(monkeypatch) -> Non
 def test_flow_comparison_config_normalize_x_defaults_are_opt_in() -> None:
     assert dc.FlowComparisonConfig().normalize_x is False
     assert dc.FlowComparisonConfig().normalize_x_eps == pytest.approx(1e-8)
+    assert dc.FlowComparisonConfig().endpoint_warmup_epochs == 0
+    assert dc.FlowComparisonConfig().endpoint_warmup_lr is None
 
 
 def test_flow_comparison_config_default_t_eps_is_small_endpoint_clamp() -> None:
     assert dc.FlowComparisonConfig().t_eps == 0.0005
     assert dc.FlowComparisonConfig().early_ema_alpha == 0.05
+    mod = _load_cli_module()
+    args = mod.build_parser().parse_args([])
+    assert args.endpoint_warmup_epochs == 0
+    assert args.endpoint_warmup_lr is None
 
 
 def test_save_flow_result_npz_persists_monitor_losses_and_ema_alpha(tmp_path: Path) -> None:
@@ -452,6 +458,12 @@ def test_save_flow_result_npz_persists_monitor_losses_and_ema_alpha(tmp_path: Pa
             "flow_normalize_x_mean": np.asarray([1.0, 2.0], dtype=np.float64),
             "flow_normalize_x_std": np.asarray([3.0, 4.0], dtype=np.float64),
             "flow_normalize_x_eps": 1e-6,
+            "n_clipped_steps": 1,
+            "n_total_steps": 2,
+            "endpoint_warmup_epochs": 3,
+            "endpoint_warmup_lr": 0.004,
+            "endpoint_warmup_losses": np.asarray([2.0, 1.0], dtype=np.float64),
+            "endpoint_warmup_val_losses": np.asarray([2.5, 1.5], dtype=np.float64),
         },
     )
     path = dc.save_flow_result_npz(
@@ -468,6 +480,12 @@ def test_save_flow_result_npz_persists_monitor_losses_and_ema_alpha(tmp_path: Pa
         assert float(data["early_ema_alpha"][0]) == pytest.approx(0.05)
         assert bool(data["flow_normalize_x"][0]) is True
         assert float(data["flow_normalize_x_eps"][0]) == pytest.approx(1e-6)
+        assert int(data["n_clipped_steps"][0]) == 1
+        assert int(data["n_total_steps"][0]) == 2
+        assert int(data["endpoint_warmup_epochs"][0]) == 3
+        assert float(data["endpoint_warmup_lr"][0]) == pytest.approx(0.004)
+        np.testing.assert_allclose(data["endpoint_warmup_losses"], [2.0, 1.0])
+        np.testing.assert_allclose(data["endpoint_warmup_val_losses"], [2.5, 1.5])
         np.testing.assert_allclose(data["flow_normalize_x_mean"], [1.0, 2.0])
         np.testing.assert_allclose(data["flow_normalize_x_std"], [3.0, 4.0])
 

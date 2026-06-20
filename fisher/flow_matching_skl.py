@@ -1296,6 +1296,32 @@ def _adamw_parameters(model: nn.Module) -> list[nn.Parameter]:
     return [p for p in model.parameters() if p.requires_grad]
 
 
+def _sample_fm_batch(
+    *,
+    path: Any,
+    model: nn.Module,
+    theta: torch.Tensor,
+    x1: torch.Tensor,
+    t_eps: float,
+) -> torch.Tensor:
+    bs = int(x1.shape[0])
+    t_raw = torch.rand(bs, device=x1.device, dtype=x1.dtype)
+    t = float(t_eps) + (1.0 - 2.0 * float(t_eps)) * t_raw
+    x0 = torch.randn_like(x1)
+    path_sample = path.sample(x_0=x0, x_1=x1, t=t)
+    return torch.mean((model(path_sample.x_t, theta, path_sample.t) - path_sample.dx_t) ** 2)
+
+
+def _endpoint_warmup_loss(model: nn.Module, theta: torch.Tensor, x1: torch.Tensor) -> torch.Tensor | None:
+    endpoint_mean = getattr(model, "endpoint_mean", None)
+    if not callable(endpoint_mean):
+        return None
+    pred = endpoint_mean(theta)
+    if not torch.is_tensor(pred) or tuple(pred.shape) != tuple(x1.shape):
+        return None
+    return torch.mean((pred - x1) ** 2)
+
+
 def train_flow_skl_model(
     *,
     model: nn.Module,
@@ -1316,6 +1342,8 @@ def train_flow_skl_model(
     ema_alpha: float = 0.05,
     max_grad_norm: float = 10.0,
     log_every: int = 50,
+    endpoint_warmup_epochs: int = 0,
+    endpoint_warmup_lr: float | None = None,
 ) -> dict[str, Any]:
     """Train a flow-SKL model and return training metadata."""
 
@@ -1332,6 +1360,11 @@ def train_flow_skl_model(
     alpha = float(ema_alpha)
     if not (0.0 < alpha <= 1.0):
         raise ValueError("ema_alpha must be in (0, 1].")
+    if int(endpoint_warmup_epochs) < 0:
+        raise ValueError("endpoint_warmup_epochs must be >= 0.")
+    warmup_lr = float(lr if endpoint_warmup_lr is None else endpoint_warmup_lr)
+    if int(endpoint_warmup_epochs) > 0 and warmup_lr <= 0.0:
+        raise ValueError("endpoint_warmup_lr must be > 0 when endpoint_warmup_epochs > 0.")
 
     th_tr = _as_2d_float64(theta_train, name="theta_train")
     x_tr = _as_2d_float64(x_train, name="x_train")
@@ -1359,6 +1392,50 @@ def train_flow_skl_model(
         model.set_path_schedule(path_schedule)  # type: ignore[attr-defined]
     opt = torch.optim.AdamW(_adamw_parameters(model), lr=float(lr), weight_decay=float(weight_decay))
 
+    endpoint_warmup_losses: list[float] = []
+    endpoint_warmup_val_losses: list[float] = []
+    if int(endpoint_warmup_epochs) > 0:
+        warmup_opt = torch.optim.AdamW(
+            _adamw_parameters(model),
+            lr=warmup_lr,
+            weight_decay=float(weight_decay),
+        )
+        for warm_epoch in range(1, int(endpoint_warmup_epochs) + 1):
+            model.train()
+            ep_losses: list[float] = []
+            for tb, x1b in train_loader:
+                tb = tb.to(device)
+                x1b = x1b.to(device)
+                loss = _endpoint_warmup_loss(model, tb, x1b)
+                if loss is None:
+                    ep_losses = []
+                    break
+                warmup_opt.zero_grad(set_to_none=True)
+                loss.backward()
+                if float(max_grad_norm) > 0.0:
+                    torch.nn.utils.clip_grad_norm_(_adamw_parameters(model), float(max_grad_norm))
+                warmup_opt.step()
+                ep_losses.append(float(loss.detach().cpu()))
+            if not ep_losses:
+                break
+            train_warm = float(np.mean(ep_losses))
+            endpoint_warmup_losses.append(train_warm)
+            model.eval()
+            val_warm_losses: list[float] = []
+            with torch.no_grad():
+                for batch in val_loader:
+                    tb, x1b = batch[0].to(device), batch[1].to(device)
+                    val_loss = _endpoint_warmup_loss(model, tb, x1b)
+                    if val_loss is not None:
+                        val_warm_losses.append(float(val_loss.detach().cpu()))
+            endpoint_warmup_val_losses.append(float(np.mean(val_warm_losses)) if val_warm_losses else float("nan"))
+            if warm_epoch == 1 or warm_epoch == int(endpoint_warmup_epochs) or warm_epoch % max(1, int(log_every)) == 0:
+                print(
+                    f"[flow-skl {fam} endpoint-warmup {warm_epoch:4d}/{int(endpoint_warmup_epochs)}] "
+                    f"train={train_warm:.6f} val={endpoint_warmup_val_losses[-1]:.6f}",
+                    flush=True,
+                )
+
     train_losses: list[float] = []
     val_losses: list[float] = []
     val_monitor_losses: list[float] = []
@@ -1378,12 +1455,13 @@ def train_flow_skl_model(
         for tb, x1b in train_loader:
             tb = tb.to(device)
             x1b = x1b.to(device)
-            bs = int(x1b.shape[0])
-            t_raw = torch.rand(bs, device=device, dtype=x1b.dtype)
-            t = te + (1.0 - 2.0 * te) * t_raw
-            x0b = torch.randn_like(x1b)
-            path_sample = path.sample(x_0=x0b, x_1=x1b, t=t)
-            loss = torch.mean((model(path_sample.x_t, tb, path_sample.t) - path_sample.dx_t) ** 2)
+            loss = _sample_fm_batch(
+                path=path,
+                model=model,
+                theta=tb,
+                x1=x1b,
+                t_eps=te,
+            )
             opt.zero_grad(set_to_none=True)
             loss.backward()
             n_total_steps += 1
@@ -1403,14 +1481,15 @@ def train_flow_skl_model(
             for tb, x1b in val_loader:
                 tb = tb.to(device)
                 x1b = x1b.to(device)
-                bs = int(x1b.shape[0])
-                t_raw = torch.rand(bs, device=device, dtype=x1b.dtype)
-                t = te + (1.0 - 2.0 * te) * t_raw
-                x0b = torch.randn_like(x1b)
-                path_sample = path.sample(x_0=x0b, x_1=x1b, t=t)
                 val_ep.append(
                     float(
-                        torch.mean((model(path_sample.x_t, tb, path_sample.t) - path_sample.dx_t) ** 2)
+                        _sample_fm_batch(
+                            path=path,
+                            model=model,
+                            theta=tb,
+                            x1=x1b,
+                            t_eps=te,
+                        )
                         .detach()
                         .cpu()
                     )
@@ -1463,6 +1542,10 @@ def train_flow_skl_model(
         "n_total_steps": int(n_total_steps),
         "path_schedule": schedule_name,
         "early_ema_alpha": float(alpha),
+        "endpoint_warmup_epochs": int(endpoint_warmup_epochs),
+        "endpoint_warmup_lr": warmup_lr,
+        "endpoint_warmup_losses": np.asarray(endpoint_warmup_losses, dtype=np.float64),
+        "endpoint_warmup_val_losses": np.asarray(endpoint_warmup_val_losses, dtype=np.float64),
     }
 
 

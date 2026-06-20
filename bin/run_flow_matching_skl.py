@@ -68,6 +68,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--early-patience", type=int, default=0)
     p.add_argument("--early-min-delta", type=float, default=1e-4)
     p.add_argument("--early-ema-alpha", type=float, default=0.05)
+    p.add_argument("--endpoint-warmup-epochs", type=int, default=0)
+    p.add_argument("--endpoint-warmup-lr", type=float, default=None)
     p.add_argument("--max-grad-norm", type=float, default=10.0)
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--solve-jitter", type=float, default=1e-6)
@@ -268,6 +270,8 @@ def main(argv: list[str] | None = None) -> int:
         ema_alpha=float(args.early_ema_alpha),
         max_grad_norm=float(args.max_grad_norm),
         log_every=max(1, int(args.log_every)),
+        endpoint_warmup_epochs=int(args.endpoint_warmup_epochs),
+        endpoint_warmup_lr=None if args.endpoint_warmup_lr is None else float(args.endpoint_warmup_lr),
     )
 
     result = estimate_model_symmetric_kl(

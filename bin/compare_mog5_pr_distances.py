@@ -136,6 +136,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--early-patience", type=int, default=1_000)
     p.add_argument("--early-min-delta", type=float, default=1e-4)
     p.add_argument("--early-ema-alpha", type=float, default=0.05)
+    p.add_argument(
+        "--endpoint-warmup-epochs",
+        type=int,
+        default=0,
+        help="Optional supervised endpoint-mean warmup epochs before flow matching.",
+    )
+    p.add_argument(
+        "--endpoint-warmup-lr",
+        type=float,
+        default=None,
+        help="Learning rate for --endpoint-warmup-epochs; defaults to --lr.",
+    )
     p.add_argument("--batch-size", type=int, default=2048)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=0.0)
@@ -258,6 +270,8 @@ def _flow_config_from_args(args: argparse.Namespace) -> FlowComparisonConfig:
         log_every=int(args.log_every),
         normalize_x=bool(args.flow_normalize_x),
         normalize_x_eps=float(args.flow_normalize_x_eps),
+        endpoint_warmup_epochs=int(args.endpoint_warmup_epochs),
+        endpoint_warmup_lr=None if args.endpoint_warmup_lr is None else float(args.endpoint_warmup_lr),
     )
 
 
