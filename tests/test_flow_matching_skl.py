@@ -268,7 +268,10 @@ def test_build_flow_skl_model_uses_mlp_heads_and_film_nonlinear_subnets() -> Non
             low_rank_dim=1,
             path_schedule="linear",
         )
-        assert getattr(model, "network_architecture") == "film"
+        if family == "condition_quadratic":
+            assert getattr(model, "network_architecture") == "quadratic_conditioned_mlp"
+        else:
+            assert getattr(model, "network_architecture") == "film"
         if family in (
             "translation",
             "translation_fixed_norm",
@@ -282,6 +285,14 @@ def test_build_flow_skl_model_uses_mlp_heads_and_film_nonlinear_subnets() -> Non
             assert model.net.trunk_dim == 3
             assert model.net.theta_dim == 2
             assert isinstance(model.net.theta_embedding, nn.Linear)
+        elif family == "condition_quadratic":
+            assert isinstance(model.b_net, nn.Sequential)
+            assert _first_linear_in_features(model.b_net) == 3
+            assert isinstance(model.a_net, nn.Sequential)
+            assert _first_linear_in_features(model.a_net) == 3
+            assert isinstance(model.q_net, nn.Sequential)
+            assert _first_linear_in_features(model.q_net) == 2
+            assert model.n_quadratic_features == 6
         else:
             assert isinstance(model.b_net, nn.Sequential)
             assert _first_linear_in_features(model.b_net) == 2

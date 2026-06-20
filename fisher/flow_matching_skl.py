@@ -33,6 +33,7 @@ VELOCITY_FAMILIES = (
     "condition_affine",
     "condition_affine_scalar",
     "condition_affine_diag",
+    "condition_quadratic",
     "shared_affine_low_rank",
     "shared_affine_low_rank_scalar",
     "shared_affine_low_rank_diag",
@@ -51,7 +52,7 @@ LOW_RANK_AFFINE_FAMILIES = {
     "shared_affine_low_rank_diag",
 }
 
-MC_ENDPOINT_FAMILIES = LOW_RANK_AFFINE_FAMILIES | {"nonlinear"}
+MC_ENDPOINT_FAMILIES = LOW_RANK_AFFINE_FAMILIES | {"condition_quadratic", "nonlinear"}
 
 
 @dataclass
@@ -994,6 +995,131 @@ class CenteredConditionAffineDiagFlowSKLModel(CenteredConditionAffineFlowSKLMode
         return _diag_batch_to_matrix(self.a_net(torch.cat([t, theta], dim=1)), x_dim=self.x_dim)
 
 
+class ConditionQuadraticFlowSKLModel(nn.Module):
+    """Condition-specific quadratic velocity with time-independent quadratic tensor.
+
+    The velocity is ``v(x, theta, t) = b(theta,t) + A(theta,t)x + Q(theta)[x,x]``.
+    The quadratic tensor is intentionally independent of ``t`` for the 2D toy
+    experiment, while the affine part can still vary over flow time.
+    """
+
+    def __init__(
+        self,
+        *,
+        theta_dim: int,
+        x_dim: int,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        divergence_estimator: str = "exact",
+        hutchinson_probes: int = 1,
+    ) -> None:
+        super().__init__()
+        if int(theta_dim) < 1:
+            raise ValueError("theta_dim must be >= 1.")
+        if int(x_dim) < 1:
+            raise ValueError("x_dim must be >= 1.")
+        if int(hidden_dim) < 1:
+            raise ValueError("hidden_dim must be >= 1.")
+        if int(depth) < 1:
+            raise ValueError("depth must be >= 1.")
+        self.velocity_family = "condition_quadratic"
+        self.theta_dim = int(theta_dim)
+        self.x_dim = int(x_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.depth = int(depth)
+        self.n_quadratic_features = self.x_dim * (self.x_dim + 1) // 2
+        self.b_max = 3.0
+        self.a_max = 3.0
+        self.q_max = 2.0
+        self.network_architecture = "quadratic_conditioned_mlp"
+        _set_divergence_controls(
+            self,
+            divergence_estimator=divergence_estimator,
+            hutchinson_probes=int(hutchinson_probes),
+        )
+        cond_dim = 1 + self.theta_dim
+        self.b_net = _make_mlp(
+            in_dim=cond_dim,
+            out_dim=self.x_dim,
+            hidden_dim=self.hidden_dim,
+            depth=self.depth,
+            final_gain=0.01,
+        )
+        self.a_net = _make_mlp(
+            in_dim=cond_dim,
+            out_dim=self.x_dim * self.x_dim,
+            hidden_dim=self.hidden_dim,
+            depth=self.depth,
+            final_gain=0.01,
+        )
+        self.q_net = _make_mlp(
+            in_dim=self.theta_dim,
+            out_dim=self.x_dim * self.n_quadratic_features,
+            hidden_dim=self.hidden_dim,
+            depth=self.depth,
+            final_gain=0.01,
+        )
+
+    def _quadratic_features(self, x: torch.Tensor) -> torch.Tensor:
+        feats: list[torch.Tensor] = []
+        for i in range(self.x_dim):
+            xi = x[:, i]
+            for j in range(i, self.x_dim):
+                feats.append(xi * x[:, j])
+        return torch.stack(feats, dim=1)
+
+    def b(self, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        t = _as_col_t(t)
+        theta = _expand_theta_to_batch(theta, batch=int(t.shape[0]))
+        t = _as_col_t(t, batch=int(theta.shape[0]))
+        raw = self.b_net(torch.cat([t, theta], dim=1))
+        return self.b_max * torch.tanh(raw / self.b_max)
+
+    def A(self, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        t = _as_col_t(t)
+        theta = _expand_theta_to_batch(theta, batch=int(t.shape[0]))
+        t = _as_col_t(t, batch=int(theta.shape[0]))
+        raw = self.a_net(torch.cat([t, theta], dim=1))
+        raw = self.a_max * torch.tanh(raw / self.a_max)
+        return raw.reshape(int(theta.shape[0]), self.x_dim, self.x_dim)
+
+    def Q(self, theta: torch.Tensor) -> torch.Tensor:
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        raw = self.q_net(theta)
+        raw = self.q_max * torch.tanh(raw / self.q_max)
+        return raw.reshape(int(theta.shape[0]), self.x_dim, self.n_quadratic_features)
+
+    def forward(self, x: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        theta = _expand_theta_to_batch(theta, batch=int(x.shape[0]))
+        t = _as_col_t(t, batch=int(x.shape[0]))
+        b = self.b(theta, t)
+        ax = _apply_matrix(self.A(theta, t), x)
+        q = self.Q(theta)
+        quad = torch.bmm(q, self._quadratic_features(x).unsqueeze(-1)).squeeze(-1)
+        return b + ax + quad
+
+    def log_prob_normalized(
+        self,
+        x_norm: torch.Tensor,
+        theta: torch.Tensor,
+        *,
+        solve_jitter: float = 1e-6,
+        quadrature_steps: int | None = None,
+        ode_steps: int = 32,
+        ode_method: str = "midpoint",
+    ) -> torch.Tensor:
+        return flow_endpoint_log_prob(
+            self,
+            x_norm,
+            theta,
+            solve_jitter=float(solve_jitter),
+            quadrature_steps=quadrature_steps,
+            ode_steps=int(ode_steps),
+            ode_method=str(ode_method),
+        )
+
+
 class CenteredSharedAffineLowRankFlowSKLModel(CenteredSharedAffineFlowSKLModel):
     """Centered shared-affine velocity plus ``U h(theta,t,U^T centered_x)``."""
 
@@ -1262,6 +1388,12 @@ def build_flow_skl_model(
         return condition_affine_classes[fam](
             quadrature_steps=int(quadrature_steps),
             path_schedule=path_schedule,
+            divergence_estimator=str(divergence_estimator),
+            hutchinson_probes=int(hutchinson_probes),
+            **common,
+        )
+    if fam == "condition_quadratic":
+        return ConditionQuadraticFlowSKLModel(
             divergence_estimator=str(divergence_estimator),
             hutchinson_probes=int(hutchinson_probes),
             **common,
