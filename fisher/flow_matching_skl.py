@@ -1685,6 +1685,83 @@ def _estimate_model_jeffreys(
     return out
 
 
+def _estimate_crossfit_model_jeffreys(
+    *,
+    model_1: nn.Module,
+    model_2: nn.Module,
+    theta_all: np.ndarray,
+    device: torch.device,
+    mc_jeffreys_sample: int,
+    ode_steps: int,
+    batch_size: int,
+    solve_jitter: float,
+    quadrature_steps: int | None,
+    ode_method: str = "midpoint",
+) -> np.ndarray:
+    theta = _as_2d_float64(theta_all, name="theta_all")
+    n_total = int(mc_jeffreys_sample)
+    if n_total < 1:
+        raise ValueError("mc_jeffreys_sample must be >= 1.")
+    counts = (n_total // 2, n_total - (n_total // 2))
+    k = int(theta.shape[0])
+    directed_sum = np.zeros((k, k), dtype=np.float64)
+    directed_count = np.zeros((k, k), dtype=np.float64)
+
+    for source_model, scorer_model, n_samples in (
+        (model_1, model_2, counts[0]),
+        (model_2, model_1, counts[1]),
+    ):
+        if int(n_samples) < 1:
+            continue
+        for i in range(k):
+            xi = sample_flow_endpoint(
+                model=source_model,
+                theta=theta[i : i + 1],
+                n_samples=int(n_samples),
+                device=device,
+                ode_steps=int(ode_steps),
+                ode_method=str(ode_method),
+            )
+            logp_i = _log_prob_model(
+                model=scorer_model,
+                x=xi,
+                theta=theta[i : i + 1],
+                device=device,
+                ode_steps=int(ode_steps),
+                ode_method=str(ode_method),
+                batch_size=int(batch_size),
+                solve_jitter=float(solve_jitter),
+                quadrature_steps=quadrature_steps,
+            )
+            for j in range(k):
+                if i == j:
+                    continue
+                logp_j = _log_prob_model(
+                    model=scorer_model,
+                    x=xi,
+                    theta=theta[j : j + 1],
+                    device=device,
+                    ode_steps=int(ode_steps),
+                    ode_method=str(ode_method),
+                    batch_size=int(batch_size),
+                    solve_jitter=float(solve_jitter),
+                    quadrature_steps=quadrature_steps,
+                )
+                directed_sum[i, j] += float(np.sum(logp_i - logp_j, dtype=np.float64))
+                directed_count[i, j] += float(n_samples)
+
+    directed = np.divide(
+        directed_sum,
+        directed_count,
+        out=np.zeros_like(directed_sum),
+        where=directed_count > 0.0,
+    )
+    out = directed + directed.T
+    out = np.maximum(out, 0.0)
+    np.fill_diagonal(out, 0.0)
+    return out
+
+
 def estimate_adjacent_model_jeffreys_fisher(
     *,
     model: nn.Module,
@@ -1938,6 +2015,79 @@ def estimate_model_symmetric_kl(
 
     meta = {} if train_metadata is None else dict(train_metadata)
     meta.setdefault("network_architecture", str(getattr(model, "network_architecture", "film")))
+
+    return FlowSKLResult(
+        symmetric_kl_matrix=skl.astype(np.float64, copy=False),
+        canonical_metric_matrix=canonical.astype(np.float64, copy=False),
+        canonical_metric_name=metric_name,
+        fisher_theta_midpoints=fisher_mid,
+        fisher_full=fisher_full,
+        fisher_linear=fisher_linear,
+        train_metadata=meta,
+    )
+
+
+def estimate_crossfit_model_symmetric_kl(
+    *,
+    model_1: nn.Module,
+    model_2: nn.Module,
+    theta_all: np.ndarray,
+    device: torch.device,
+    velocity_family: str | None = None,
+    radius: float | None = None,
+    mc_jeffreys_sample: int = 4096,
+    ode_steps: int = 64,
+    ode_method: str = "midpoint",
+    batch_size: int = 1024,
+    solve_jitter: float = 1e-6,
+    quadrature_steps: int | None = None,
+    fisher_kind: str = "none",
+    train_metadata: dict[str, Any] | None = None,
+) -> FlowSKLResult:
+    """Estimate symmetric KL by sampling one fitted model and scoring with the other."""
+
+    del radius
+    fam = _normalize_velocity_family(velocity_family or getattr(model_1, "velocity_family", ""))
+    theta = _as_2d_float64(theta_all, name="theta_all")
+    model_1.to(device)
+    model_2.to(device)
+    model_1.eval()
+    model_2.eval()
+
+    skl = _estimate_crossfit_model_jeffreys(
+        model_1=model_1,
+        model_2=model_2,
+        theta_all=theta,
+        device=device,
+        mc_jeffreys_sample=int(mc_jeffreys_sample),
+        ode_steps=int(ode_steps),
+        ode_method=str(ode_method),
+        batch_size=int(batch_size),
+        solve_jitter=float(solve_jitter),
+        quadrature_steps=quadrature_steps,
+    )
+    canonical = skl.copy()
+    metric_name = "crossfit_model_jeffreys_symmetric_kl"
+
+    fisher_mode = str(fisher_kind).strip().lower()
+    if fisher_mode not in ("none", "full", "linear", "both"):
+        raise ValueError("fisher_kind must be one of: none, full, linear, both.")
+    fisher_mid: np.ndarray | None = None
+    fisher_full: np.ndarray | None = None
+    fisher_linear: np.ndarray | None = None
+    if fisher_mode in ("full", "both"):
+        fd = estimate_scalar_fisher_from_skl(theta, skl)
+        fisher_mid = fd["theta_midpoints"]
+        fisher_full = fd["fisher"]
+    if fisher_mode in ("linear", "both"):
+        if fam in MC_ENDPOINT_FAMILIES:
+            raise ValueError("linear Fisher is unavailable for nonlinear endpoint families.")
+        fd = estimate_scalar_fisher_from_skl(theta, canonical)
+        fisher_mid = fd["theta_midpoints"]
+        fisher_linear = fd["fisher"]
+
+    meta = {} if train_metadata is None else dict(train_metadata)
+    meta.setdefault("network_architecture", str(getattr(model_1, "network_architecture", "film")))
 
     return FlowSKLResult(
         symmetric_kl_matrix=skl.astype(np.float64, copy=False),

@@ -21,6 +21,7 @@ from fisher.flow_matching_skl import (
     VELOCITY_FAMILIES,
     build_flow_skl_model,
     centered_radius_normalize,
+    estimate_crossfit_model_symmetric_kl,
     estimate_model_symmetric_kl,
     estimate_scalar_fisher_from_skl,
     flow_endpoint_log_prob,
@@ -629,6 +630,58 @@ def test_model_jeffreys_matches_translation_model_skl_with_deterministic_samples
     np.testing.assert_allclose(result.symmetric_kl_matrix, expected, rtol=1e-10, atol=1e-10)
     np.testing.assert_allclose(result.canonical_metric_matrix, expected, rtol=1e-10, atol=1e-10)
     assert result.canonical_metric_name == "model_jeffreys_symmetric_kl"
+
+
+def test_crossfit_model_jeffreys_cross_scores_likelihood_ratios(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DummyModel(nn.Module):
+        velocity_family = "translation"
+        network_architecture = "dummy"
+
+        def __init__(self, model_id: int) -> None:
+            super().__init__()
+            self.model_id = int(model_id)
+            self.x_dim = 1
+            self.weight = nn.Parameter(torch.zeros(()))
+
+    theta_eval = np.eye(2, dtype=np.float64)
+    model_1 = DummyModel(1)
+    model_2 = DummyModel(2)
+    match = {(1, 0): 21.0, (1, 1): 33.0, (2, 0): 15.0, (2, 1): 19.0}
+    mismatch = {(1, 0): 10.0, (1, 1): 20.0, (2, 0): 10.0, (2, 1): 12.0}
+
+    def fake_sample_flow_endpoint(*, model, theta, n_samples, **kwargs):
+        del kwargs
+        cond = int(np.argmax(np.asarray(theta, dtype=np.float64), axis=1)[0])
+        encoded = float(int(model.model_id) * 10 + cond)
+        return torch.full((int(n_samples), 1), encoded, dtype=torch.float32)
+
+    def fake_log_prob_model(*, model, x, theta, **kwargs):
+        del kwargs
+        cond = int(np.argmax(np.asarray(theta, dtype=np.float64), axis=1)[0])
+        encoded = int(round(float(x[0, 0].detach().cpu())))
+        generated_cond = encoded % 10
+        value = match[(int(model.model_id), generated_cond)] if cond == generated_cond else mismatch[(int(model.model_id), generated_cond)]
+        return np.full(int(x.shape[0]), value, dtype=np.float64)
+
+    monkeypatch.setattr(fms, "sample_flow_endpoint", fake_sample_flow_endpoint)
+    monkeypatch.setattr(fms, "_log_prob_model", fake_log_prob_model)
+    result = estimate_crossfit_model_symmetric_kl(
+        model_1=model_1,
+        model_2=model_2,
+        theta_all=theta_eval,
+        device=torch.device("cpu"),
+        velocity_family="translation",
+        mc_jeffreys_sample=4,
+        batch_size=2,
+    )
+
+    expected = np.asarray([[0.0, 18.0], [18.0, 0.0]], dtype=np.float64)
+    np.testing.assert_allclose(result.symmetric_kl_matrix, expected)
+    np.testing.assert_allclose(result.canonical_metric_matrix, expected)
+    assert result.canonical_metric_name == "crossfit_model_jeffreys_symmetric_kl"
+    assert result.train_metadata["network_architecture"] == "dummy"
 
 
 def test_x_independent_velocity_likelihood_has_zero_divergence() -> None:

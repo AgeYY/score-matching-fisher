@@ -20,6 +20,7 @@ from fisher.autoencoder_embedding import PRAutoencoderConfig, train_or_load_pr_a
 from fisher.flow_matching_skl import (
     FlowSKLResult,
     build_flow_skl_model,
+    estimate_crossfit_model_symmetric_kl,
     estimate_model_symmetric_kl,
     flow_skl_result_to_npz_dict,
     train_flow_skl_model,
@@ -93,6 +94,7 @@ class FlowComparisonConfig:
     normalize_x_eps: float = 1e-8
     endpoint_warmup_epochs: int = 0
     endpoint_warmup_lr: float | None = None
+    flow_skl_estimator: str = "single"
 
 
 @dataclass(frozen=True)
@@ -562,24 +564,27 @@ def velocity_family_for_metric(metric: str, config: FlowComparisonConfig) -> str
     return FLOW_VELOCITY_FAMILY_BY_METRIC[str(metric)]
 
 
-def train_and_estimate_flow(
+def _seed_flow_training(seed: int, device: torch.device) -> None:
+    torch.manual_seed(int(seed))
+    np.random.seed(int(seed))
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(int(seed))
+
+
+def _build_and_train_flow_model(
     *,
     theta_train: np.ndarray,
     x_train: np.ndarray,
     theta_val: np.ndarray,
     x_val: np.ndarray,
-    theta_eval: np.ndarray,
     velocity_family: str,
     device: torch.device,
     seed: int,
     config: FlowComparisonConfig,
-) -> FlowSKLResult:
-    """Train one flow model and return its endpoint metric matrix."""
+) -> tuple[torch.nn.Module, dict[str, Any]]:
+    """Build and train one flow model."""
 
-    torch.manual_seed(int(seed))
-    np.random.seed(int(seed))
-    if device.type == "cuda":
-        torch.cuda.manual_seed_all(int(seed))
+    _seed_flow_training(seed, device)
 
     theta_dim = int(theta_train.shape[1] if np.asarray(theta_train).ndim == 2 else 1)
     x_dim = int(x_train.shape[1] if np.asarray(x_train).ndim == 2 else 1)
@@ -619,8 +624,178 @@ def train_and_estimate_flow(
         endpoint_warmup_epochs=int(config.endpoint_warmup_epochs),
         endpoint_warmup_lr=config.endpoint_warmup_lr,
     )
+    return model, train_meta
+
+
+def train_and_estimate_flow(
+    *,
+    theta_train: np.ndarray,
+    x_train: np.ndarray,
+    theta_val: np.ndarray,
+    x_val: np.ndarray,
+    theta_eval: np.ndarray,
+    velocity_family: str,
+    device: torch.device,
+    seed: int,
+    config: FlowComparisonConfig,
+) -> FlowSKLResult:
+    """Train one flow model and return its endpoint metric matrix."""
+
+    model, train_meta = _build_and_train_flow_model(
+        theta_train=theta_train,
+        x_train=x_train,
+        theta_val=theta_val,
+        x_val=x_val,
+        velocity_family=str(velocity_family),
+        device=device,
+        seed=int(seed),
+        config=config,
+    )
     return estimate_model_symmetric_kl(
         model=model,
+        theta_all=theta_eval,
+        device=device,
+        velocity_family=str(velocity_family),
+        radius=float(config.radius),
+        mc_jeffreys_sample=int(config.mc_jeffreys_sample),
+        ode_steps=int(config.ode_steps),
+        ode_method=str(config.ode_method),
+        batch_size=int(config.batch_size),
+        solve_jitter=float(config.solve_jitter),
+        quadrature_steps=int(config.quadrature_steps),
+        fisher_kind="none",
+        train_metadata=train_meta,
+    )
+
+
+def _plain_random_half_split(n_rows: int, *, seed: int) -> tuple[np.ndarray, np.ndarray]:
+    n = int(n_rows)
+    if n < 2:
+        raise ValueError("crossfit2 requires at least two rows.")
+    rng = np.random.default_rng(int(seed))
+    perm = rng.permutation(n).astype(np.int64, copy=False)
+    n_first = n // 2
+    return perm[:n_first].astype(np.int64, copy=False), perm[n_first:].astype(np.int64, copy=False)
+
+
+def _validate_crossfit_fold_labels(theta: np.ndarray, *, folds: tuple[np.ndarray, np.ndarray], num_categories: int) -> None:
+    labels = labels_from_theta(theta, num_categories=int(num_categories))
+    expected = set(range(int(num_categories)))
+    for fold_idx, fold in enumerate(folds, start=1):
+        observed = set(int(v) for v in np.unique(labels[np.asarray(fold, dtype=np.int64)]))
+        missing = sorted(expected - observed)
+        if missing:
+            raise ValueError(
+                f"crossfit2 random half split fold {fold_idx} is missing categorical condition(s): {missing}. "
+                "Use a larger dataset or a different seed."
+            )
+
+
+def _prefix_average_curves(a: Any, b: Any) -> np.ndarray:
+    arr_a = np.asarray(a, dtype=np.float64).reshape(-1)
+    arr_b = np.asarray(b, dtype=np.float64).reshape(-1)
+    if arr_a.size == 0 or arr_b.size == 0:
+        return np.asarray([], dtype=np.float64)
+    n = min(int(arr_a.size), int(arr_b.size))
+    return 0.5 * (arr_a[:n] + arr_b[:n])
+
+
+def _crossfit_train_metadata(
+    *,
+    meta_1: dict[str, Any],
+    meta_2: dict[str, Any],
+    fold_1_idx: np.ndarray,
+    fold_2_idx: np.ndarray,
+) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "flow_skl_estimator": "crossfit2",
+        "crossfit_fold_1_idx": np.asarray(fold_1_idx, dtype=np.int64),
+        "crossfit_fold_2_idx": np.asarray(fold_2_idx, dtype=np.int64),
+        "model_1_train_losses": np.asarray(meta_1.get("train_losses", []), dtype=np.float64),
+        "model_1_val_losses": np.asarray(meta_1.get("val_losses", []), dtype=np.float64),
+        "model_1_val_monitor_losses": np.asarray(meta_1.get("val_monitor_losses", []), dtype=np.float64),
+        "model_2_train_losses": np.asarray(meta_2.get("train_losses", []), dtype=np.float64),
+        "model_2_val_losses": np.asarray(meta_2.get("val_losses", []), dtype=np.float64),
+        "model_2_val_monitor_losses": np.asarray(meta_2.get("val_monitor_losses", []), dtype=np.float64),
+        "train_losses": _prefix_average_curves(meta_1.get("train_losses", []), meta_2.get("train_losses", [])),
+        "val_losses": _prefix_average_curves(meta_1.get("val_losses", []), meta_2.get("val_losses", [])),
+        "val_monitor_losses": _prefix_average_curves(meta_1.get("val_monitor_losses", []), meta_2.get("val_monitor_losses", [])),
+    }
+    for model_idx, meta in ((1, meta_1), (2, meta_2)):
+        for key in (
+            "best_val_loss",
+            "best_epoch",
+            "stopped_epoch",
+            "stopped_early",
+            "early_ema_alpha",
+            "n_clipped_steps",
+            "n_total_steps",
+            "path_schedule",
+            "endpoint_warmup_epochs",
+            "endpoint_warmup_lr",
+            "network_architecture",
+        ):
+            if key in meta:
+                out[f"model_{model_idx}_{key}"] = meta[key]
+    for key in ("path_schedule", "early_ema_alpha", "endpoint_warmup_epochs", "endpoint_warmup_lr"):
+        if key in meta_1:
+            out[key] = meta_1[key]
+    for key in ("n_clipped_steps", "n_total_steps"):
+        if key in meta_1 or key in meta_2:
+            out[key] = int(meta_1.get(key, 0)) + int(meta_2.get(key, 0))
+    out["network_architecture"] = str(meta_1.get("network_architecture", meta_2.get("network_architecture", "film")))
+    return out
+
+
+def train_and_estimate_flow_crossfit(
+    *,
+    theta_all: np.ndarray,
+    x_all: np.ndarray,
+    theta_eval: np.ndarray,
+    velocity_family: str,
+    device: torch.device,
+    seed: int,
+    config: FlowComparisonConfig,
+    num_categories: int,
+) -> FlowSKLResult:
+    """Train two swapped-fold models and estimate cross-scored symmetric KL."""
+
+    theta = np.asarray(theta_all, dtype=np.float64)
+    x = np.asarray(x_all, dtype=np.float64)
+    if int(theta.shape[0]) != int(x.shape[0]):
+        raise ValueError("theta_all and x_all must have the same number of rows.")
+    fold_1_idx, fold_2_idx = _plain_random_half_split(int(theta.shape[0]), seed=int(seed))
+    _validate_crossfit_fold_labels(theta, folds=(fold_1_idx, fold_2_idx), num_categories=int(num_categories))
+
+    model_1, meta_1 = _build_and_train_flow_model(
+        theta_train=theta[fold_1_idx],
+        x_train=x[fold_1_idx],
+        theta_val=theta[fold_2_idx],
+        x_val=x[fold_2_idx],
+        velocity_family=str(velocity_family),
+        device=device,
+        seed=int(seed),
+        config=config,
+    )
+    model_2, meta_2 = _build_and_train_flow_model(
+        theta_train=theta[fold_2_idx],
+        x_train=x[fold_2_idx],
+        theta_val=theta[fold_1_idx],
+        x_val=x[fold_1_idx],
+        velocity_family=str(velocity_family),
+        device=device,
+        seed=int(seed) + 1,
+        config=config,
+    )
+    train_meta = _crossfit_train_metadata(
+        meta_1=meta_1,
+        meta_2=meta_2,
+        fold_1_idx=fold_1_idx,
+        fold_2_idx=fold_2_idx,
+    )
+    return estimate_crossfit_model_symmetric_kl(
+        model_1=model_1,
+        model_2=model_2,
         theta_all=theta_eval,
         device=device,
         velocity_family=str(velocity_family),
@@ -665,6 +840,19 @@ def save_flow_result_npz(
         if key in meta:
             fields[key] = np.asarray(meta[key], dtype=np.float64)
     for key in (
+        "model_1_train_losses",
+        "model_1_val_losses",
+        "model_1_val_monitor_losses",
+        "model_2_train_losses",
+        "model_2_val_losses",
+        "model_2_val_monitor_losses",
+    ):
+        if key in meta:
+            fields[key] = np.asarray(meta[key], dtype=np.float64)
+    for key in ("crossfit_fold_1_idx", "crossfit_fold_2_idx"):
+        if key in meta:
+            fields[key] = np.asarray(meta[key], dtype=np.int64)
+    for key in (
         "best_val_loss",
         "best_epoch",
         "stopped_epoch",
@@ -675,9 +863,27 @@ def save_flow_result_npz(
         "path_schedule",
         "endpoint_warmup_epochs",
         "endpoint_warmup_lr",
+        "flow_skl_estimator",
     ):
         if key in meta:
             fields[key] = np.asarray([meta[key]])
+    for model_idx in (1, 2):
+        for key in (
+            "best_val_loss",
+            "best_epoch",
+            "stopped_epoch",
+            "stopped_early",
+            "early_ema_alpha",
+            "n_clipped_steps",
+            "n_total_steps",
+            "path_schedule",
+            "endpoint_warmup_epochs",
+            "endpoint_warmup_lr",
+            "network_architecture",
+        ):
+            meta_key = f"model_{model_idx}_{key}"
+            if meta_key in meta:
+                fields[meta_key] = np.asarray([meta[meta_key]])
     for key in ("flow_normalize_x", "flow_normalize_x_eps"):
         if key in meta:
             fields[key] = np.asarray([meta[key]])
@@ -701,6 +907,11 @@ def flow_metric_matrices(
 
     meta = dict(bundle.meta)
     k = int(meta.get("num_categories", np.asarray(bundle.theta_all).shape[1]))
+    estimator = str(config.flow_skl_estimator).strip().lower()
+    if estimator not in ("single", "crossfit2"):
+        raise ValueError("flow_skl_estimator must be one of: single, crossfit2.")
+    x_all = np.asarray(bundle.x_all, dtype=np.float64)
+    theta_all = np.asarray(bundle.theta_all, dtype=np.float64)
     x_train_all = np.asarray(bundle.x_train, dtype=np.float64)
     x_val_all = np.asarray(bundle.x_validation, dtype=np.float64)
     theta_train_all = np.asarray(bundle.theta_train, dtype=np.float64)
@@ -712,7 +923,9 @@ def flow_metric_matrices(
     if bool(config.normalize_x):
         # One shared invertible x transform preserves true symmetric KL; no
         # log-Jacobian correction is needed for log-density ratios.
-        x_mean, x_std = _fit_shared_x_normalizer(x_train_all, eps=float(config.normalize_x_eps))
+        normalizer_source = x_all if estimator == "crossfit2" else x_train_all
+        x_mean, x_std = _fit_shared_x_normalizer(normalizer_source, eps=float(config.normalize_x_eps))
+        x_all_flow = _apply_shared_x_normalizer(x_all, mean=x_mean, std=x_std)
         x_train_flow = _apply_shared_x_normalizer(x_train_all, mean=x_mean, std=x_std)
         x_val_flow = _apply_shared_x_normalizer(x_val_all, mean=x_mean, std=x_std)
         normalize_meta.update(
@@ -722,8 +935,10 @@ def flow_metric_matrices(
             }
         )
     else:
+        x_all_flow = x_all
         x_train_flow = x_train_all
         x_val_flow = x_val_all
+    normalize_meta["flow_skl_estimator"] = estimator
     flow_dir = Path(output_dir)
     matrices: dict[str, np.ndarray] = {}
     paths: dict[str, Path] = {}
@@ -732,17 +947,29 @@ def flow_metric_matrices(
     for metric in tuple(str(m) for m in metrics):
         family = velocity_family_for_metric(metric, config)
         print(f"[distance-comparison] flow metric={metric} velocity_family={family}", flush=True)
-        result = train_and_estimate_flow(
-            theta_train=theta_train_all,
-            x_train=x_train_flow,
-            theta_val=theta_val_all,
-            x_val=x_val_flow,
-            theta_eval=theta_eval,
-            velocity_family=family,
-            device=device,
-            seed=int(seed),
-            config=config,
-        )
+        if estimator == "crossfit2":
+            result = train_and_estimate_flow_crossfit(
+                theta_all=theta_all,
+                x_all=x_all_flow,
+                theta_eval=theta_eval,
+                velocity_family=family,
+                device=device,
+                seed=int(seed),
+                config=config,
+                num_categories=k,
+            )
+        else:
+            result = train_and_estimate_flow(
+                theta_train=theta_train_all,
+                x_train=x_train_flow,
+                theta_val=theta_val_all,
+                x_val=x_val_flow,
+                theta_eval=theta_eval,
+                velocity_family=family,
+                device=device,
+                seed=int(seed),
+                config=config,
+            )
         result.train_metadata = {**dict(result.train_metadata), **normalize_meta}
         matrices[metric] = flow_skl_to_metric_readout(
             metric,

@@ -169,6 +169,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-grad-norm", type=float, default=10.0)
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument(
+        "--flow-skl-estimator",
+        choices=("single", "crossfit2"),
+        default="single",
+        help="Flow-SKL likelihood estimator: existing single-model estimator or two-fold cross-scored estimator.",
+    )
+    p.add_argument(
         "--flow-normalize-x",
         action="store_true",
         help="Fit one train-only affine normalizer on projected x and use normalized x for flow matching.",
@@ -272,6 +278,7 @@ def _flow_config_from_args(args: argparse.Namespace) -> FlowComparisonConfig:
         normalize_x_eps=float(args.flow_normalize_x_eps),
         endpoint_warmup_epochs=int(args.endpoint_warmup_epochs),
         endpoint_warmup_lr=None if args.endpoint_warmup_lr is None else float(args.endpoint_warmup_lr),
+        flow_skl_estimator=str(args.flow_skl_estimator),
     )
 
 

@@ -254,6 +254,41 @@ def test_flow_metric_mapping_and_mahalanobis_shared_assembly(monkeypatch, tmp_pa
     assert "mahalanobis_sq:0-1" not in paths
 
 
+def test_flow_metric_matrices_routes_crossfit_estimator(monkeypatch, tmp_path: Path) -> None:
+    bundle = _toy_bundle()
+    calls: list[dict[str, object]] = []
+
+    def fake_train_and_estimate_flow_crossfit(**kwargs):
+        calls.append(kwargs)
+        theta_eval = np.asarray(kwargs["theta_eval"], dtype=np.float64)
+        mat = np.zeros((int(theta_eval.shape[0]), int(theta_eval.shape[0])), dtype=np.float64)
+        mat[0, 1] = mat[1, 0] = 3.0
+        return FlowSKLResult(
+            symmetric_kl_matrix=mat,
+            canonical_metric_matrix=mat.copy(),
+            canonical_metric_name="crossfit_model_jeffreys_symmetric_kl",
+            train_metadata={"flow_skl_estimator": "crossfit2"},
+        )
+
+    monkeypatch.setattr(dc, "train_and_estimate_flow_crossfit", fake_train_and_estimate_flow_crossfit)
+    matrices, paths = dc.flow_metric_matrices(
+        bundle=bundle,
+        device=torch.device("cpu"),
+        output_dir=tmp_path,
+        config=dc.FlowComparisonConfig(epochs=1, flow_skl_estimator="crossfit2"),
+        metrics=(dc.METRIC_COSINE,),
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["velocity_family"] == "translation_fixed_norm"
+    np.testing.assert_allclose(calls[0]["theta_all"], bundle.theta_all)
+    np.testing.assert_allclose(calls[0]["x_all"], bundle.x_all)
+    assert matrices[dc.METRIC_COSINE][0, 1] == pytest.approx(1.5)
+    with np.load(paths[dc.METRIC_COSINE], allow_pickle=True) as data:
+        assert str(data["flow_skl_estimator"][0]) == "crossfit2"
+        assert str(data["canonical_metric_name"][0]) == "crossfit_model_jeffreys_symmetric_kl"
+
+
 def test_correlation_flow_routes_to_centered_fixed_norm(monkeypatch, tmp_path: Path) -> None:
     bundle = _toy_bundle()
     calls: list[dict[str, object]] = []
@@ -424,11 +459,80 @@ def test_train_and_estimate_flow_uses_model_jeffreys_readout(monkeypatch) -> Non
     assert result.canonical_metric_name == "model_jeffreys_symmetric_kl"
 
 
+def test_train_and_estimate_flow_crossfit_swaps_plain_random_halves(monkeypatch) -> None:
+    labels = np.asarray([0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2], dtype=np.int64)
+    theta_all = np.eye(3, dtype=np.float64)[labels]
+    x_all = np.arange(24, dtype=np.float64).reshape(12, 2)
+    train_calls: list[dict[str, object]] = []
+    estimate_calls: list[dict[str, object]] = []
+
+    class DummyModel(torch.nn.Module):
+        velocity_family = "translation"
+        x_dim = 2
+
+        def __init__(self, model_id: int) -> None:
+            super().__init__()
+            self.model_id = int(model_id)
+            self.weight = torch.nn.Parameter(torch.zeros(()))
+
+    def fake_build_and_train_flow_model(**kwargs):
+        train_calls.append(kwargs)
+        return DummyModel(len(train_calls)), {
+            "train_losses": np.asarray([float(len(train_calls)), 10.0], dtype=np.float64),
+            "val_losses": np.asarray([float(len(train_calls)) + 1.0, 20.0], dtype=np.float64),
+            "val_monitor_losses": np.asarray([float(len(train_calls)) + 2.0, 30.0], dtype=np.float64),
+            "best_epoch": len(train_calls),
+            "stopped_epoch": len(train_calls) + 1,
+            "stopped_early": False,
+            "network_architecture": "dummy",
+        }
+
+    def fake_estimate_crossfit_model_symmetric_kl(**kwargs):
+        estimate_calls.append(kwargs)
+        mat = np.zeros((3, 3), dtype=np.float64)
+        mat[0, 1] = mat[1, 0] = 7.0
+        return FlowSKLResult(
+            symmetric_kl_matrix=mat,
+            canonical_metric_matrix=mat.copy(),
+            canonical_metric_name="crossfit_model_jeffreys_symmetric_kl",
+            train_metadata=dict(kwargs["train_metadata"]),
+        )
+
+    monkeypatch.setattr(dc, "_build_and_train_flow_model", fake_build_and_train_flow_model)
+    monkeypatch.setattr(dc, "estimate_crossfit_model_symmetric_kl", fake_estimate_crossfit_model_symmetric_kl)
+
+    result = dc.train_and_estimate_flow_crossfit(
+        theta_all=theta_all,
+        x_all=x_all,
+        theta_eval=np.eye(3, dtype=np.float64),
+        velocity_family="translation",
+        device=torch.device("cpu"),
+        seed=0,
+        config=dc.FlowComparisonConfig(epochs=1),
+        num_categories=3,
+    )
+
+    fold_1, fold_2 = dc._plain_random_half_split(12, seed=0)
+    assert len(train_calls) == 2
+    np.testing.assert_allclose(train_calls[0]["theta_train"], theta_all[fold_1])
+    np.testing.assert_allclose(train_calls[0]["theta_val"], theta_all[fold_2])
+    np.testing.assert_allclose(train_calls[1]["theta_train"], theta_all[fold_2])
+    np.testing.assert_allclose(train_calls[1]["theta_val"], theta_all[fold_1])
+    assert estimate_calls
+    assert estimate_calls[0]["mc_jeffreys_sample"] == 4096
+    assert result.train_metadata["flow_skl_estimator"] == "crossfit2"
+    np.testing.assert_array_equal(result.train_metadata["crossfit_fold_1_idx"], fold_1)
+    np.testing.assert_array_equal(result.train_metadata["crossfit_fold_2_idx"], fold_2)
+    np.testing.assert_allclose(result.train_metadata["train_losses"], [1.5, 10.0])
+    assert result.canonical_metric_name == "crossfit_model_jeffreys_symmetric_kl"
+
+
 def test_flow_comparison_config_normalize_x_defaults_are_opt_in() -> None:
     assert dc.FlowComparisonConfig().normalize_x is False
     assert dc.FlowComparisonConfig().normalize_x_eps == pytest.approx(1e-8)
     assert dc.FlowComparisonConfig().endpoint_warmup_epochs == 0
     assert dc.FlowComparisonConfig().endpoint_warmup_lr is None
+    assert dc.FlowComparisonConfig().flow_skl_estimator == "single"
 
 
 def test_flow_comparison_config_default_t_eps_is_small_endpoint_clamp() -> None:
@@ -438,6 +542,9 @@ def test_flow_comparison_config_default_t_eps_is_small_endpoint_clamp() -> None:
     args = mod.build_parser().parse_args([])
     assert args.endpoint_warmup_epochs == 0
     assert args.endpoint_warmup_lr is None
+    assert args.flow_skl_estimator == "single"
+    crossfit_args = mod.build_parser().parse_args(["--flow-skl-estimator", "crossfit2"])
+    assert mod._flow_config_from_args(crossfit_args).flow_skl_estimator == "crossfit2"
 
 
 def test_save_flow_result_npz_persists_monitor_losses_and_ema_alpha(tmp_path: Path) -> None:
@@ -464,6 +571,17 @@ def test_save_flow_result_npz_persists_monitor_losses_and_ema_alpha(tmp_path: Pa
             "endpoint_warmup_lr": 0.004,
             "endpoint_warmup_losses": np.asarray([2.0, 1.0], dtype=np.float64),
             "endpoint_warmup_val_losses": np.asarray([2.5, 1.5], dtype=np.float64),
+            "flow_skl_estimator": "crossfit2",
+            "crossfit_fold_1_idx": np.asarray([0, 2, 4], dtype=np.int64),
+            "crossfit_fold_2_idx": np.asarray([1, 3, 5], dtype=np.int64),
+            "model_1_train_losses": np.asarray([1.0, 0.9], dtype=np.float64),
+            "model_1_val_losses": np.asarray([1.2, 1.1], dtype=np.float64),
+            "model_1_val_monitor_losses": np.asarray([1.3, 1.2], dtype=np.float64),
+            "model_2_train_losses": np.asarray([2.0, 1.9], dtype=np.float64),
+            "model_2_val_losses": np.asarray([2.2, 2.1], dtype=np.float64),
+            "model_2_val_monitor_losses": np.asarray([2.3, 2.2], dtype=np.float64),
+            "model_1_best_epoch": 4,
+            "model_2_best_epoch": 5,
         },
     )
     path = dc.save_flow_result_npz(
@@ -488,6 +606,13 @@ def test_save_flow_result_npz_persists_monitor_losses_and_ema_alpha(tmp_path: Pa
         np.testing.assert_allclose(data["endpoint_warmup_val_losses"], [2.5, 1.5])
         np.testing.assert_allclose(data["flow_normalize_x_mean"], [1.0, 2.0])
         np.testing.assert_allclose(data["flow_normalize_x_std"], [3.0, 4.0])
+        assert str(data["flow_skl_estimator"][0]) == "crossfit2"
+        np.testing.assert_array_equal(data["crossfit_fold_1_idx"], [0, 2, 4])
+        np.testing.assert_array_equal(data["crossfit_fold_2_idx"], [1, 3, 5])
+        np.testing.assert_allclose(data["model_1_train_losses"], [1.0, 0.9])
+        np.testing.assert_allclose(data["model_2_val_monitor_losses"], [2.3, 2.2])
+        assert int(data["model_1_best_epoch"][0]) == 4
+        assert int(data["model_2_best_epoch"][0]) == 5
 
 
 def test_save_flow_result_npz_persists_flow_readout(tmp_path: Path) -> None:
@@ -596,12 +721,14 @@ def test_cli_default_path_resolution_without_running_training() -> None:
     assert args.early_ema_alpha == 0.05
     assert args.flow_normalize_x is False
     assert args.flow_normalize_x_eps == pytest.approx(1e-8)
+    assert args.flow_skl_estimator == "single"
     assert mod._flow_config_from_args(args).mc_jeffreys_sample == 4096
     assert mod._flow_config_from_args(args).radius == 1.0
     assert mod._flow_config_from_args(args).t_eps == 0.0005
     assert mod._flow_config_from_args(args).early_ema_alpha == 0.05
     assert mod._flow_config_from_args(args).normalize_x is False
     assert mod._flow_config_from_args(args).normalize_x_eps == pytest.approx(1e-8)
+    assert mod._flow_config_from_args(args).flow_skl_estimator == "single"
     assert mod.resolve_dataset_dir(args) == repo_root / "data" / "mog_5native_xdim3_n1000"
     assert mod.resolve_output_dir(args) == repo_root / "data" / "mog_5native_xdim3_n1000" / "distance_comparison_flow_skl"
 
