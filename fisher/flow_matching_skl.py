@@ -996,11 +996,10 @@ class CenteredConditionAffineDiagFlowSKLModel(CenteredConditionAffineFlowSKLMode
 
 
 class ConditionQuadraticFlowSKLModel(nn.Module):
-    """Condition-specific quadratic velocity with time-independent quadratic tensor.
+    """Condition-specific quadratic velocity with time-dependent quadratic tensor.
 
-    The velocity is ``v(x, theta, t) = b(theta,t) + A(theta,t)x + Q(theta)[x,x]``.
-    The quadratic tensor is intentionally independent of ``t`` for the 2D toy
-    experiment, while the affine part can still vary over flow time.
+    The velocity is ``v(x, theta, t) = b(theta,t) + A(theta,t)x + Q(theta,t)[x,x]``.
+    The affine and quadratic parts can both vary over flow time.
     """
 
     def __init__(
@@ -1029,8 +1028,6 @@ class ConditionQuadraticFlowSKLModel(nn.Module):
         self.depth = int(depth)
         self.n_quadratic_features = self.x_dim * (self.x_dim + 1) // 2
         self.b_max = 3.0
-        self.a_max = 3.0
-        self.q_max = 2.0
         self.network_architecture = "quadratic_conditioned_mlp"
         _set_divergence_controls(
             self,
@@ -1053,7 +1050,7 @@ class ConditionQuadraticFlowSKLModel(nn.Module):
             final_gain=0.01,
         )
         self.q_net = _make_mlp(
-            in_dim=self.theta_dim,
+            in_dim=cond_dim,
             out_dim=self.x_dim * self.n_quadratic_features,
             hidden_dim=self.hidden_dim,
             depth=self.depth,
@@ -1080,14 +1077,13 @@ class ConditionQuadraticFlowSKLModel(nn.Module):
         theta = _expand_theta_to_batch(theta, batch=int(t.shape[0]))
         t = _as_col_t(t, batch=int(theta.shape[0]))
         raw = self.a_net(torch.cat([t, theta], dim=1))
-        raw = self.a_max * torch.tanh(raw / self.a_max)
         return raw.reshape(int(theta.shape[0]), self.x_dim, self.x_dim)
 
-    def Q(self, theta: torch.Tensor) -> torch.Tensor:
-        if theta.ndim == 1:
-            theta = theta.unsqueeze(-1)
-        raw = self.q_net(theta)
-        raw = self.q_max * torch.tanh(raw / self.q_max)
+    def Q(self, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        t = _as_col_t(t)
+        theta = _expand_theta_to_batch(theta, batch=int(t.shape[0]))
+        t = _as_col_t(t, batch=int(theta.shape[0]))
+        raw = self.q_net(torch.cat([t, theta], dim=1))
         return raw.reshape(int(theta.shape[0]), self.x_dim, self.n_quadratic_features)
 
     def forward(self, x: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
@@ -1095,7 +1091,7 @@ class ConditionQuadraticFlowSKLModel(nn.Module):
         t = _as_col_t(t, batch=int(x.shape[0]))
         b = self.b(theta, t)
         ax = _apply_matrix(self.A(theta, t), x)
-        q = self.Q(theta)
+        q = self.Q(theta, t)
         quad = torch.bmm(q, self._quadratic_features(x).unsqueeze(-1)).squeeze(-1)
         return b + ax + quad
 

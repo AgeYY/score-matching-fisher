@@ -291,7 +291,7 @@ def test_build_flow_skl_model_uses_mlp_heads_and_film_nonlinear_subnets() -> Non
             assert isinstance(model.a_net, nn.Sequential)
             assert _first_linear_in_features(model.a_net) == 3
             assert isinstance(model.q_net, nn.Sequential)
-            assert _first_linear_in_features(model.q_net) == 2
+            assert _first_linear_in_features(model.q_net) == 3
             assert model.n_quadratic_features == 6
         else:
             assert isinstance(model.b_net, nn.Sequential)

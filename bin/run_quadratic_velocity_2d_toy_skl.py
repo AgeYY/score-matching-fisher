@@ -16,9 +16,9 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, TensorDataset
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
@@ -32,7 +32,6 @@ from fisher.flow_matching_skl import (
     flow_skl_result_to_npz_dict,
     train_flow_skl_model,
 )
-from fisher.model_weight_ema import scalar_val_ema_update
 from fisher.shared_fisher_est import require_device
 
 
@@ -49,10 +48,8 @@ class ToyDataset:
     labels: np.ndarray
     train_idx: np.ndarray
     val_idx: np.ndarray
-    z_train: np.ndarray
     theta_train: np.ndarray
     x_train: np.ndarray
-    z_val: np.ndarray
     theta_val: np.ndarray
     x_val: np.ndarray
     true_skl: float
@@ -127,15 +124,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--x-dim", type=int, default=4, help="Even observed dimension; each adjacent pair is a quadratic shear.")
     p.add_argument("--train-frac", type=float, default=0.8)
     p.add_argument("--amplitude", type=float, default=0.5)
-    p.add_argument(
-        "--training-mode",
-        choices=("exact", "cfm"),
-        default="exact",
-        help=(
-            "exact trains on the analytic ODE path from the note; cfm uses the repository's "
-            "standard independent-endpoint conditional flow-matching objective."
-        ),
-    )
 
     p.add_argument("--epochs", type=int, default=3000)
     p.add_argument("--early-patience", type=int, default=500)
@@ -160,6 +148,29 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--plot-stat", choices=("median_iqr", "mean_sd"), default="median_iqr")
     p.add_argument("--plot-ymin", type=float, default=-0.35)
     p.add_argument("--plot-ymax", type=float, default=6.0)
+    p.add_argument(
+        "--plot-break-total-after",
+        type=int,
+        default=0,
+        help=(
+            "If positive and larger total sample sizes are present, break panel B's x-axis "
+            "after this total number of points."
+        ),
+    )
+    p.add_argument(
+        "--plot-loss-panels",
+        action="store_true",
+        help=(
+            "Also write a merged diagnostic figure with the SKL figure on top and "
+            "train/EMA-validation loss curves below."
+        ),
+    )
+    p.add_argument(
+        "--loss-curve-max-points",
+        type=int,
+        default=450,
+        help="Maximum plotted epoch points per loss curve after deterministic downsampling.",
+    )
     p.add_argument("--dataset-plot-n", type=int, default=1000)
     return p
 
@@ -234,10 +245,8 @@ def generate_quadratic_toy_dataset(
         labels=label_all,
         train_idx=train_idx,
         val_idx=val_idx,
-        z_train=z_all[train_idx],
         theta_train=theta_all[train_idx],
         x_train=x_all[train_idx],
-        z_val=z_all[val_idx],
         theta_val=theta_all[val_idx],
         x_val=x_all[val_idx],
         true_skl=true_quadratic_toy_skl(amp, x_dim=xd),
@@ -246,220 +255,6 @@ def generate_quadratic_toy_dataset(
 
 def _seed_for_repeat(base_seed: int, repeat_idx: int) -> int:
     return int(base_seed) + int(repeat_idx)
-
-
-def _as_2d_float32(value: np.ndarray, *, name: str) -> np.ndarray:
-    arr = np.asarray(value, dtype=np.float32)
-    if arr.ndim != 2:
-        raise ValueError(f"{name} must be a 2D array; got shape {arr.shape}.")
-    return np.ascontiguousarray(arr)
-
-
-def _exact_path_state_and_velocity(
-    z: torch.Tensor,
-    theta: torch.Tensor,
-    t: torch.Tensor,
-    *,
-    amplitude: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Analytic quadratic-toy flow path and velocity from the journal note."""
-
-    if z.ndim != 2 or int(z.shape[1]) < 2 or int(z.shape[1]) % 2 != 0:
-        raise ValueError(f"z must have shape (batch, even_x_dim>=2); got {tuple(z.shape)}.")
-    if theta.ndim != 2 or theta.shape[1] != 2:
-        raise ValueError(f"theta must have shape (batch, 2); got {tuple(theta.shape)}.")
-    if t.ndim == 1:
-        t_col = t[:, None]
-    elif t.ndim == 2 and t.shape[1] == 1:
-        t_col = t
-    else:
-        raise ValueError(f"t must have shape (batch,) or (batch, 1); got {tuple(t.shape)}.")
-
-    amp = float(amplitude)
-    lam = math.log(math.sqrt(1.0 + 2.0 * amp * amp))
-    a_c = amp * (theta[:, 1:2] - theta[:, 0:1])
-    decay = torch.exp(-float(lam) * t_col)
-
-    x_t = z.clone()
-    v_t = torch.zeros_like(z)
-    for first in range(0, int(z.shape[1]), 2):
-        second = first + 1
-        z_first = z[:, first : first + 1]
-        z_second = z[:, second : second + 1]
-        feature = z_second.square() - 1.0
-        x_t[:, first : first + 1] = decay * (z_first + a_c * t_col * feature)
-        x_t[:, second : second + 1] = z_second
-        v_t[:, first : first + 1] = -float(lam) * x_t[:, first : first + 1] + a_c * decay * feature
-    return x_t, t_col, v_t
-
-
-def train_flow_skl_model_exact_quadratic_toy(
-    *,
-    model: torch.nn.Module,
-    theta_train: np.ndarray,
-    z_train: np.ndarray,
-    theta_val: np.ndarray | None,
-    z_val: np.ndarray | None,
-    device: torch.device,
-    amplitude: float,
-    velocity_family: str,
-    epochs: int = 1000,
-    batch_size: int = 512,
-    lr: float = 1e-3,
-    weight_decay: float = 0.0,
-    t_eps: float = 0.0005,
-    patience: int = 0,
-    min_delta: float = 1e-4,
-    ema_alpha: float = 0.05,
-    max_grad_norm: float = 10.0,
-    log_every: int = 50,
-) -> dict[str, Any]:
-    """Train on the analytic ODE path from the 2D quadratic toy note."""
-
-    if int(epochs) < 1:
-        raise ValueError("epochs must be >= 1.")
-    if int(batch_size) < 1:
-        raise ValueError("batch_size must be >= 1.")
-    if float(lr) <= 0.0:
-        raise ValueError("lr must be > 0.")
-    te = float(t_eps)
-    if not (0.0 < te < 0.5):
-        raise ValueError("t_eps must be in (0, 0.5).")
-    alpha = float(ema_alpha)
-    if not (0.0 < alpha <= 1.0):
-        raise ValueError("ema_alpha must be in (0, 1].")
-
-    th_tr = _as_2d_float32(theta_train, name="theta_train")
-    z_tr = _as_2d_float32(z_train, name="z_train")
-    if theta_val is None or z_val is None:
-        th_va = th_tr
-        z_va = z_tr
-    else:
-        th_va = _as_2d_float32(theta_val, name="theta_val")
-        z_va = _as_2d_float32(z_val, name="z_val")
-    if th_tr.shape[0] < 1 or z_tr.shape[0] < 1 or th_va.shape[0] < 1 or z_va.shape[0] < 1:
-        raise ValueError("train and validation splits must be non-empty.")
-    if th_tr.shape[0] != z_tr.shape[0] or th_va.shape[0] != z_va.shape[0]:
-        raise ValueError("theta and z splits must have matching row counts.")
-    if th_tr.shape[1] != 2 or th_va.shape[1] != 2:
-        raise ValueError("theta splits must have shape (n, 2).")
-    _validate_x_dim(int(z_tr.shape[1]))
-    if z_tr.shape[1] != z_va.shape[1]:
-        raise ValueError("train and validation z splits must have the same x_dim.")
-
-    train_ds = TensorDataset(torch.from_numpy(th_tr), torch.from_numpy(z_tr))
-    val_ds = TensorDataset(torch.from_numpy(th_va), torch.from_numpy(z_va))
-    train_loader = DataLoader(train_ds, batch_size=int(batch_size), shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=int(batch_size), shuffle=False)
-
-    model.to(device)
-    opt = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=float(lr),
-        weight_decay=float(weight_decay),
-    )
-
-    train_losses: list[float] = []
-    val_losses: list[float] = []
-    val_monitor_losses: list[float] = []
-    val_ema: float | None = None
-    best_val = float("inf")
-    best_epoch = 0
-    best_state: dict[str, torch.Tensor] | None = None
-    patience_counter = 0
-    stopped_early = False
-    stopped_epoch = int(epochs)
-    n_clipped_steps = 0
-    n_total_steps = 0
-
-    for epoch in range(1, int(epochs) + 1):
-        model.train()
-        ep_losses: list[float] = []
-        for tb, zb in train_loader:
-            tb = tb.to(device)
-            zb = zb.to(device)
-            bs = int(zb.shape[0])
-            t_raw = torch.rand(bs, device=device, dtype=zb.dtype)
-            t = te + (1.0 - 2.0 * te) * t_raw
-            x_t, t_col, v_t = _exact_path_state_and_velocity(zb, tb, t, amplitude=float(amplitude))
-            loss = torch.mean((model(x_t, tb, t_col) - v_t) ** 2)
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            n_total_steps += 1
-            if float(max_grad_norm) > 0.0:
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    [p for p in model.parameters() if p.requires_grad],
-                    float(max_grad_norm),
-                )
-                if float(grad_norm) > float(max_grad_norm):
-                    n_clipped_steps += 1
-            opt.step()
-            ep_losses.append(float(loss.detach().cpu()))
-
-        train_loss = float(np.mean(ep_losses))
-        train_losses.append(train_loss)
-
-        model.eval()
-        val_ep: list[float] = []
-        with torch.no_grad():
-            for tb, zb in val_loader:
-                tb = tb.to(device)
-                zb = zb.to(device)
-                bs = int(zb.shape[0])
-                t_raw = torch.rand(bs, device=device, dtype=zb.dtype)
-                t = te + (1.0 - 2.0 * te) * t_raw
-                x_t, t_col, v_t = _exact_path_state_and_velocity(zb, tb, t, amplitude=float(amplitude))
-                val_ep.append(float(torch.mean((model(x_t, tb, t_col) - v_t) ** 2).detach().cpu()))
-        val_loss = float(np.mean(val_ep))
-        val_losses.append(val_loss)
-        val_ema = scalar_val_ema_update(val_ema, val_loss, alpha)
-        val_smooth = float(val_ema)
-        val_monitor_losses.append(val_smooth)
-
-        if val_smooth < best_val - float(min_delta):
-            best_val = val_smooth
-            best_epoch = int(epoch)
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            patience_counter = 0
-        else:
-            patience_counter += 1
-
-        if epoch == 1 or epoch % max(1, int(log_every)) == 0 or epoch == int(epochs):
-            print(
-                f"[quadratic-toy exact {velocity_family} {epoch:4d}/{int(epochs)}] "
-                f"train={train_loss:.6f} val={val_loss:.6f} val_smooth={val_smooth:.6f} "
-                f"best_smooth={best_val:.6f} best_epoch={best_epoch}",
-                flush=True,
-            )
-        if int(patience) > 0 and patience_counter >= int(patience):
-            stopped_early = True
-            stopped_epoch = int(epoch)
-            print(
-                f"[quadratic-toy exact {velocity_family} early-stop] epoch={epoch} "
-                f"best_epoch={best_epoch} best_smooth={best_val:.6f} patience={int(patience)}",
-                flush=True,
-            )
-            break
-
-    if best_state is not None:
-        model.load_state_dict(best_state)
-
-    return {
-        "velocity_family": str(velocity_family),
-        "network_architecture": str(getattr(model, "network_architecture", "film")),
-        "training_mode": "exact",
-        "train_losses": np.asarray(train_losses, dtype=np.float64),
-        "val_losses": np.asarray(val_losses, dtype=np.float64),
-        "val_monitor_losses": np.asarray(val_monitor_losses, dtype=np.float64),
-        "best_val_loss": float(best_val),
-        "best_epoch": int(best_epoch),
-        "stopped_epoch": int(stopped_epoch),
-        "stopped_early": bool(stopped_early),
-        "n_clipped_steps": int(n_clipped_steps),
-        "n_total_steps": int(n_total_steps),
-        "path_schedule": "analytic_quadratic_toy",
-        "early_ema_alpha": float(alpha),
-    }
 
 
 def _model_specs(model_names: list[str]) -> list[ModelSpec]:
@@ -505,7 +300,7 @@ def train_one_model(
     model = build_flow_skl_model(
         velocity_family=spec.velocity_family,
         theta_dim=2,
-        x_dim=int(dataset.z_train.shape[1]),
+        x_dim=int(dataset.x_train.shape[1]),
         hidden_dim=int(args.hidden_dim),
         depth=int(args.depth),
         quadrature_steps=int(args.quadrature_steps),
@@ -513,49 +308,27 @@ def train_one_model(
         divergence_estimator=str(args.divergence_estimator),
         hutchinson_probes=int(args.hutchinson_probes),
     ).to(device)
-    if str(args.training_mode) == "exact":
-        train_meta = train_flow_skl_model_exact_quadratic_toy(
-            model=model,
-            theta_train=dataset.theta_train,
-            z_train=dataset.z_train,
-            theta_val=dataset.theta_val,
-            z_val=dataset.z_val,
-            device=device,
-            amplitude=float(args.amplitude),
-            velocity_family=spec.velocity_family,
-            epochs=int(args.epochs),
-            batch_size=int(args.batch_size),
-            lr=float(args.lr),
-            weight_decay=float(args.weight_decay),
-            t_eps=float(args.t_eps),
-            patience=int(args.early_patience),
-            min_delta=float(args.early_min_delta),
-            ema_alpha=float(args.early_ema_alpha),
-            max_grad_norm=float(args.max_grad_norm),
-            log_every=max(1, int(args.log_every)),
-        )
-    else:
-        train_meta = train_flow_skl_model(
-            model=model,
-            theta_train=dataset.theta_train,
-            x_train=dataset.x_train,
-            theta_val=dataset.theta_val,
-            x_val=dataset.x_val,
-            device=device,
-            velocity_family=spec.velocity_family,
-            path_schedule=str(args.path_schedule),
-            epochs=int(args.epochs),
-            batch_size=int(args.batch_size),
-            lr=float(args.lr),
-            weight_decay=float(args.weight_decay),
-            t_eps=float(args.t_eps),
-            patience=int(args.early_patience),
-            min_delta=float(args.early_min_delta),
-            ema_alpha=float(args.early_ema_alpha),
-            max_grad_norm=float(args.max_grad_norm),
-            log_every=max(1, int(args.log_every)),
-        )
-        train_meta["training_mode"] = "cfm"
+    train_meta = train_flow_skl_model(
+        model=model,
+        theta_train=dataset.theta_train,
+        x_train=dataset.x_train,
+        theta_val=dataset.theta_val,
+        x_val=dataset.x_val,
+        device=device,
+        velocity_family=spec.velocity_family,
+        path_schedule=str(args.path_schedule),
+        epochs=int(args.epochs),
+        batch_size=int(args.batch_size),
+        lr=float(args.lr),
+        weight_decay=float(args.weight_decay),
+        t_eps=float(args.t_eps),
+        patience=int(args.early_patience),
+        min_delta=float(args.early_min_delta),
+        ema_alpha=float(args.early_ema_alpha),
+        max_grad_norm=float(args.max_grad_norm),
+        log_every=max(1, int(args.log_every)),
+    )
+    train_meta["training_mode"] = "cfm"
     theta_eval = np.eye(2, dtype=np.float64)
     result = estimate_model_symmetric_kl(
         model=model,
@@ -584,7 +357,7 @@ def train_one_model(
         {
             "model_name": np.asarray([spec.name]),
             "velocity_family": np.asarray([spec.velocity_family]),
-            "training_mode": np.asarray([str(args.training_mode)]),
+            "training_mode": np.asarray(["cfm"]),
             "theta_eval": theta_eval,
             "estimate_skl": np.asarray([estimate], dtype=np.float64),
             "true_skl": np.asarray([truth], dtype=np.float64),
@@ -819,6 +592,7 @@ def plot_distance(
     plot_stat: str = "median_iqr",
     plot_ymin: float | None = -0.35,
     plot_ymax: float | None = 6.0,
+    plot_break_total_after: int = 0,
 ) -> tuple[Path, Path]:
     n_list = np.asarray(aggregate["n_list"], dtype=np.int64)
     n_total = 2 * n_list
@@ -847,13 +621,31 @@ def plot_distance(
             "svg.fonttype": "none",
         }
     ):
-        fig, axes = plt.subplots(
-            1,
-            2,
-            figsize=(8.4, 3.85),
-            gridspec_kw={"width_ratios": [1.0, 1.55], "wspace": 0.26},
+        break_after = int(plot_break_total_after)
+        use_x_break = bool(
+            break_after > 0 and np.any(n_total <= break_after) and np.any(n_total > break_after)
         )
-        data_ax, ax = axes
+        if use_x_break:
+            fig = plt.figure(figsize=(10.8, 4.0))
+            outer = fig.add_gridspec(1, 2, width_ratios=[1.0, 2.18], wspace=0.27)
+            data_ax = fig.add_subplot(outer[0, 0])
+            inner = outer[0, 1].subgridspec(1, 2, width_ratios=[1.68, 0.58], wspace=0.055)
+            ax_left = fig.add_subplot(inner[0, 0])
+            ax_right = fig.add_subplot(inner[0, 1], sharey=ax_left)
+            plot_axes = (ax_left, ax_right)
+            plot_masks = (n_total <= break_after, n_total > break_after)
+        else:
+            fig, axes = plt.subplots(
+                1,
+                2,
+                figsize=(8.4, 3.85),
+                gridspec_kw={"width_ratios": [1.0, 1.55], "wspace": 0.26},
+            )
+            data_ax, ax_left = axes
+            ax_right = None
+            plot_axes = (ax_left,)
+            plot_masks = (np.ones_like(n_total, dtype=bool),)
+
         _plot_dataset_panel(
             data_ax,
             amplitude=float(amplitude),
@@ -872,44 +664,85 @@ def plot_distance(
                 suffix = "mean +/- SD"
             color = _MODEL_COLORS.get(model, f"C{model_i}")
             display = _MODEL_DISPLAY_NAMES.get(model, model)
-            label = f"{display} {suffix}"
-            if vals.shape[1] > 1:
-                for seed_i in range(vals.shape[1]):
-                    finite = np.isfinite(vals[:, seed_i])
-                    ax.scatter(
-                        n_total[finite],
-                        vals[finite, seed_i],
-                        s=10,
-                        alpha=0.18,
-                        color=color,
-                        edgecolors="none",
-                        rasterized=True,
-                    )
-            finite_y = np.isfinite(y)
-            ax.errorbar(
-                n_total[finite_y],
-                y[finite_y],
-                yerr=yerr[:, finite_y] if np.ndim(yerr) == 2 else yerr[finite_y],
-                marker="o",
-                markersize=3.4,
-                linewidth=1.35,
-                elinewidth=0.9,
-                capsize=2.3,
-                capthick=0.8,
-                color=color,
-                label=label,
+            label = display
+            for axis_i, (axis, mask) in enumerate(zip(plot_axes, plot_masks, strict=True)):
+                if vals.shape[1] > 1:
+                    for seed_i in range(vals.shape[1]):
+                        finite = mask & np.isfinite(vals[:, seed_i])
+                        if not np.any(finite):
+                            continue
+                        axis.scatter(
+                            n_total[finite],
+                            vals[finite, seed_i],
+                            s=10,
+                            alpha=0.18,
+                            color=color,
+                            edgecolors="none",
+                            rasterized=True,
+                        )
+                finite_y = mask & np.isfinite(y)
+                if not np.any(finite_y):
+                    continue
+                axis.errorbar(
+                    n_total[finite_y],
+                    y[finite_y],
+                    yerr=yerr[:, finite_y] if np.ndim(yerr) == 2 else yerr[finite_y],
+                    marker="o",
+                    markersize=3.4,
+                    linewidth=1.35,
+                    elinewidth=0.9,
+                    capsize=2.3,
+                    capthick=0.8,
+                    color=color,
+                    label=label if axis_i == 0 else "_nolegend_",
+                )
+
+        for axis_i, (axis, mask) in enumerate(zip(plot_axes, plot_masks, strict=True)):
+            axis.axhline(
+                truth,
+                color="black",
+                linestyle=(0, (4, 2)),
+                linewidth=1.0,
+                label=f"truth = {truth:.2f}" if axis_i == 0 else "_nolegend_",
             )
-        ax.axhline(truth, color="black", linestyle=(0, (4, 2)), linewidth=1.0, label=f"truth = {truth:.2f}")
-        ax.set_xscale("log")
-        ax.set_xticks(n_total)
-        ax.set_xticklabels([str(int(v)) for v in n_total], rotation=30, ha="right")
-        if plot_ymin is not None or plot_ymax is not None:
-            ax.set_ylim(plot_ymin, plot_ymax)
-        ax.set_xlabel("Total number of points")
-        ax.set_ylabel("Estimated symmetric KL")
-        ax.set_title("SKL estimate vs total sample size", pad=5)
-        ax.grid(False)
-        ax.legend(
+            axis.set_xscale("log")
+            axis.xaxis.set_minor_locator(mticker.NullLocator())
+            axis.xaxis.set_minor_formatter(mticker.NullFormatter())
+            ticks = n_total[mask]
+            axis.set_xticks(ticks)
+            tick_rotation = 0 if use_x_break and axis_i == 1 else 30
+            tick_ha = "center" if tick_rotation == 0 else "right"
+            axis.set_xticklabels([str(int(v)) for v in ticks], rotation=tick_rotation, ha=tick_ha)
+            if ticks.size:
+                lo = float(np.nanmin(ticks))
+                hi = float(np.nanmax(ticks))
+                if hi > lo:
+                    axis.set_xlim(lo / 1.12, hi * 1.12)
+                else:
+                    axis.set_xlim(lo / 1.35, hi * 1.35)
+            if plot_ymin is not None or plot_ymax is not None:
+                axis.set_ylim(plot_ymin, plot_ymax)
+            axis.grid(False)
+            axis.spines["bottom"].set_linewidth(1.8)
+            axis.spines["top"].set_visible(False)
+            axis.spines["right"].set_visible(False)
+            axis.tick_params(axis="both", width=1.8, length=4.5)
+
+        ax_left.set_xlabel("Total number of points")
+        ax_left.set_ylabel("Estimated symmetric KL")
+        ax_left.set_title("SKL estimate vs total sample size", pad=5)
+        ax_left.spines["left"].set_linewidth(1.8)
+        if use_x_break and ax_right is not None:
+            ax_right.spines["left"].set_visible(False)
+            ax_right.tick_params(axis="y", left=False, labelleft=False)
+            d = 0.014
+            kwargs = dict(color="black", clip_on=False, linewidth=1.2)
+            ax_left.plot((1 - d, 1 + d), (-d, +d), transform=ax_left.transAxes, **kwargs)
+            ax_left.plot((1 - d, 1 + d), (1 - d, 1 + d), transform=ax_left.transAxes, **kwargs)
+            ax_right.plot((-d, +d), (-d, +d), transform=ax_right.transAxes, **kwargs)
+            ax_right.plot((-d, +d), (1 - d, 1 + d), transform=ax_right.transAxes, **kwargs)
+
+        ax_left.legend(
             frameon=True,
             facecolor="white",
             edgecolor="none",
@@ -919,12 +752,7 @@ def plot_distance(
             borderaxespad=0.2,
             labelspacing=0.35,
         )
-        ax.spines["left"].set_linewidth(1.8)
-        ax.spines["bottom"].set_linewidth(1.8)
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-        ax.tick_params(axis="both", width=1.8, length=4.5)
-        for label, panel_ax in zip(("A", "B"), (data_ax, ax), strict=True):
+        for label, panel_ax in zip(("A", "B"), (data_ax, ax_left), strict=True):
             panel_ax.text(
                 -0.13,
                 1.04,
@@ -935,11 +763,224 @@ def plot_distance(
                 va="bottom",
                 ha="left",
             )
-        fig.subplots_adjust(left=0.065, right=0.995, bottom=0.26, top=0.88, wspace=0.30)
+        fig.subplots_adjust(left=0.065, right=0.995, bottom=0.26, top=0.88)
     svg = path_base.with_suffix(".svg")
     png = path_base.with_suffix(".png")
     fig.savefig(svg)
     fig.savefig(png, dpi=400)
+    plt.close(fig)
+    return svg, png
+
+
+def _median_loss_curve(curves: list[np.ndarray]) -> np.ndarray:
+    cleaned = [
+        np.asarray(curve, dtype=np.float64).reshape(-1)
+        for curve in curves
+        if np.asarray(curve, dtype=np.float64).size > 0
+    ]
+    if not cleaned:
+        return np.empty(0, dtype=np.float64)
+    max_len = max(int(curve.size) for curve in cleaned)
+    padded = np.full((len(cleaned), max_len), np.nan, dtype=np.float64)
+    for i, curve in enumerate(cleaned):
+        finite_curve = np.where(np.isfinite(curve) & (curve > 0.0), curve, np.nan)
+        padded[i, : finite_curve.size] = finite_curve
+    med = np.full(max_len, np.nan, dtype=np.float64)
+    for j in range(max_len):
+        finite = padded[:, j][np.isfinite(padded[:, j])]
+        if finite.size:
+            med[j] = float(np.median(finite))
+    return med
+
+
+def _downsample_curve(y: np.ndarray, *, max_points: int) -> tuple[np.ndarray, np.ndarray]:
+    arr = np.asarray(y, dtype=np.float64).reshape(-1)
+    finite = np.isfinite(arr) & (arr > 0.0)
+    if not np.any(finite):
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float64)
+    x = np.arange(1, arr.size + 1, dtype=np.int64)[finite]
+    vals = arr[finite]
+    maxp = max(2, int(max_points))
+    if vals.size > maxp:
+        idx = np.unique(np.linspace(0, vals.size - 1, maxp).astype(np.int64))
+        x = x[idx]
+        vals = vals[idx]
+    return x, vals
+
+
+def _loss_curves_for_rows(rows: list[dict[str, Any]], *, n_per_condition: int, model: str) -> tuple[np.ndarray, np.ndarray]:
+    train_curves: list[np.ndarray] = []
+    val_ema_curves: list[np.ndarray] = []
+    matching = [
+        row
+        for row in rows
+        if int(row["n_per_condition"]) == int(n_per_condition) and str(row["model"]) == str(model)
+    ]
+    matching.sort(key=lambda row: int(row["repeat_idx"]))
+    for row in matching:
+        result_path = Path(str(row.get("result_npz", ""))).expanduser()
+        if not result_path.is_file():
+            continue
+        with np.load(result_path, allow_pickle=False) as data:
+            if "train_losses" not in data.files or "val_monitor_losses" not in data.files:
+                continue
+            train_curves.append(np.asarray(data["train_losses"], dtype=np.float64))
+            val_ema_curves.append(np.asarray(data["val_monitor_losses"], dtype=np.float64))
+    return _median_loss_curve(train_curves), _median_loss_curve(val_ema_curves)
+
+
+def plot_distance_with_loss_panels(
+    path_base: Path,
+    *,
+    distance_png: Path,
+    rows: list[dict[str, Any]],
+    aggregate: dict[str, Any],
+    loss_curve_max_points: int = 450,
+) -> tuple[Path, Path]:
+    n_list = np.asarray(aggregate["n_list"], dtype=np.int64)
+    n_total = 2 * n_list
+    model_names = tuple(str(v) for v in aggregate["model_names"])
+    if not Path(distance_png).is_file():
+        raise FileNotFoundError(f"distance_png does not exist: {distance_png}")
+
+    loss_cache: dict[tuple[str, int], tuple[np.ndarray, np.ndarray]] = {}
+    row_limits: dict[str, tuple[float, float]] = {}
+    for model in model_names:
+        row_values: list[np.ndarray] = []
+        for n in n_list:
+            train_med, val_ema_med = _loss_curves_for_rows(rows, n_per_condition=int(n), model=model)
+            loss_cache[(model, int(n))] = (train_med, val_ema_med)
+            for curve in (train_med, val_ema_med):
+                finite = curve[np.isfinite(curve) & (curve > 0.0)]
+                if finite.size:
+                    row_values.append(finite)
+        if row_values:
+            vals = np.concatenate(row_values)
+            ymin = max(float(np.nanmin(vals)) / 1.45, 1e-8)
+            ymax = float(np.nanmax(vals)) * 1.45
+            if not math.isfinite(ymin) or not math.isfinite(ymax) or ymin >= ymax:
+                ymin, ymax = 1e-5, 1.0
+        else:
+            ymin, ymax = 1e-5, 1.0
+        row_limits[model] = (ymin, ymax)
+
+    with plt.rc_context(
+        {
+            "font.size": 9.0,
+            "axes.titlesize": 9.0,
+            "axes.labelsize": 9.0,
+            "xtick.labelsize": 7.0,
+            "ytick.labelsize": 7.0,
+            "legend.fontsize": 10.0,
+            "axes.linewidth": 0.7,
+            "xtick.major.width": 0.7,
+            "ytick.major.width": 0.7,
+            "xtick.major.size": 2.6,
+            "ytick.major.size": 2.6,
+            "pdf.fonttype": 42,
+            "ps.fonttype": 42,
+            "svg.fonttype": "none",
+        }
+    ):
+        fig = plt.figure(figsize=(22.0, 15.0))
+        outer = fig.add_gridspec(2, 1, height_ratios=[1.02, 1.0], hspace=0.18)
+        top_ax = fig.add_subplot(outer[0, 0])
+        top_img = plt.imread(str(distance_png))
+        top_ax.imshow(top_img)
+        top_ax.set_axis_off()
+
+        loss_grid = outer[1, 0].subgridspec(
+            len(model_names),
+            len(n_list),
+            wspace=0.13,
+            hspace=0.24,
+        )
+        axes: list[plt.Axes] = []
+        for model_i, model in enumerate(model_names):
+            color = _MODEL_COLORS.get(model, f"C{model_i}")
+            display = _MODEL_DISPLAY_NAMES.get(model, model)
+            ymin, ymax = row_limits[model]
+            for n_i, n in enumerate(n_list):
+                ax = fig.add_subplot(loss_grid[model_i, n_i])
+                axes.append(ax)
+                train_med, val_ema_med = loss_cache[(model, int(n))]
+                x_train, y_train = _downsample_curve(train_med, max_points=int(loss_curve_max_points))
+                x_val, y_val = _downsample_curve(val_ema_med, max_points=int(loss_curve_max_points))
+                if y_train.size:
+                    ax.plot(x_train, y_train, color="0.25", linewidth=0.85, label="train")
+                if y_val.size:
+                    ax.plot(
+                        x_val,
+                        y_val,
+                        color=color,
+                        linestyle=(0, (4, 2)),
+                        linewidth=0.95,
+                        label="val EMA",
+                    )
+                if not y_train.size and not y_val.size:
+                    ax.text(
+                        0.5,
+                        0.5,
+                        "not run",
+                        transform=ax.transAxes,
+                        color="0.45",
+                        ha="center",
+                        va="center",
+                        fontsize=8,
+                    )
+                ax.set_yscale("log")
+                ax.set_ylim(ymin, ymax)
+                ax.grid(False)
+                ax.spines["top"].set_visible(False)
+                ax.spines["right"].set_visible(False)
+                ax.xaxis.set_major_locator(mticker.MaxNLocator(3))
+                ax.yaxis.set_major_locator(mticker.LogLocator(base=10, numticks=4))
+                ax.yaxis.set_minor_locator(mticker.NullLocator())
+                if model_i == 0:
+                    ax.set_title(f"T={int(n_total[n_i])}\nN={int(n)}", pad=3)
+                if n_i == 0:
+                    ax.set_ylabel(f"{display}\nloss")
+                else:
+                    ax.tick_params(axis="y", labelleft=False)
+                if model_i == len(model_names) - 1:
+                    ax.set_xlabel("epoch")
+                else:
+                    ax.tick_params(axis="x", labelbottom=False)
+
+        legend_handles = [
+            plt.Line2D([0], [0], color="0.25", linewidth=1.2, label="training loss"),
+            plt.Line2D([0], [0], color="black", linestyle=(0, (4, 2)), linewidth=1.2, label="EMA validation loss"),
+        ]
+        fig.legend(
+            handles=legend_handles,
+            frameon=False,
+            loc="lower center",
+            ncol=2,
+            bbox_to_anchor=(0.5, 0.012),
+        )
+        fig.text(
+            0.022,
+            0.512,
+            "C",
+            fontsize=22,
+            fontweight="bold",
+            va="bottom",
+            ha="left",
+        )
+        fig.text(
+            0.5,
+            0.531,
+            "Loss curves by velocity class and sample size (median over repeats)",
+            fontsize=13,
+            ha="center",
+            va="bottom",
+        )
+        fig.subplots_adjust(left=0.035, right=0.995, bottom=0.065, top=0.995)
+
+    svg = path_base.with_suffix(".svg")
+    png = path_base.with_suffix(".png")
+    fig.savefig(svg)
+    fig.savefig(png, dpi=300)
     plt.close(fig)
     return svg, png
 
@@ -1026,7 +1067,18 @@ def main() -> None:
             plot_stat=str(args.plot_stat),
             plot_ymin=float(args.plot_ymin) if args.plot_ymin is not None else None,
             plot_ymax=float(args.plot_ymax) if args.plot_ymax is not None else None,
+            plot_break_total_after=int(args.plot_break_total_after),
         )
+        loss_figure: list[str] | None = None
+        if bool(args.plot_loss_panels):
+            loss_svg, loss_png = plot_distance_with_loss_panels(
+                output_dir / "quadratic_velocity_2d_toy_skl_vs_n_with_losses",
+                distance_png=png,
+                rows=rows,
+                aggregate=aggregate,
+                loss_curve_max_points=int(args.loss_curve_max_points),
+            )
+            loss_figure = [str(loss_svg), str(loss_png)]
         summary = {
             **existing_summary,
             "script": "bin/run_quadratic_velocity_2d_toy_skl.py",
@@ -1044,14 +1096,20 @@ def main() -> None:
             "plot_stat": str(args.plot_stat),
             "plot_ymin": float(args.plot_ymin) if args.plot_ymin is not None else None,
             "plot_ymax": float(args.plot_ymax) if args.plot_ymax is not None else None,
+            "plot_break_total_after": int(args.plot_break_total_after),
+            "plot_loss_panels": bool(args.plot_loss_panels),
+            "loss_curve_max_points": int(args.loss_curve_max_points),
             "dataset_plot_n": int(args.dataset_plot_n),
             "results_csv": str(results_csv),
             "results_npz": str(results_npz),
             "figure": [str(svg), str(png)],
+            "loss_figure": loss_figure,
             "rows_summary": _summarize_rows(rows),
         }
         print(f"summary_json: {_write_summary(summary_json, summary)}", flush=True)
         print(f"figure_png: {png}", flush=True)
+        if loss_figure is not None:
+            print(f"loss_figure_png: {loss_figure[1]}", flush=True)
         return
 
     rows: list[dict[str, Any]] = []
@@ -1108,7 +1166,7 @@ def main() -> None:
                         "seed": int(seed),
                         "model": spec.name,
                         "velocity_family": spec.velocity_family,
-                        "training_mode": str(args.training_mode),
+                        "training_mode": "cfm",
                         "estimate_skl": estimate,
                         "true_skl": truth,
                         "abs_error": abs(estimate - truth),
@@ -1133,7 +1191,18 @@ def main() -> None:
         plot_stat=str(args.plot_stat),
         plot_ymin=float(args.plot_ymin) if args.plot_ymin is not None else None,
         plot_ymax=float(args.plot_ymax) if args.plot_ymax is not None else None,
+        plot_break_total_after=int(args.plot_break_total_after),
     )
+    loss_figure = None
+    if bool(args.plot_loss_panels):
+        loss_svg, loss_png = plot_distance_with_loss_panels(
+            output_dir / "quadratic_velocity_2d_toy_skl_vs_n_with_losses",
+            distance_png=png,
+            rows=rows,
+            aggregate=aggregate,
+            loss_curve_max_points=int(args.loss_curve_max_points),
+        )
+        loss_figure = [str(loss_svg), str(loss_png)]
     summary = {
         "script": "bin/run_quadratic_velocity_2d_toy_skl.py",
         "output_dir": str(output_dir),
@@ -1147,21 +1216,27 @@ def main() -> None:
         "n_seeds": int(args.n_seeds),
         "seed": int(args.seed),
         "train_frac": float(args.train_frac),
-        "training_mode": str(args.training_mode),
+        "training_mode": "cfm",
         "models": [s.name for s in specs],
         "plot_stat": str(args.plot_stat),
         "plot_ymin": float(args.plot_ymin) if args.plot_ymin is not None else None,
         "plot_ymax": float(args.plot_ymax) if args.plot_ymax is not None else None,
+        "plot_break_total_after": int(args.plot_break_total_after),
+        "plot_loss_panels": bool(args.plot_loss_panels),
+        "loss_curve_max_points": int(args.loss_curve_max_points),
         "dataset_plot_n": int(args.dataset_plot_n),
         "results_csv": str(results_csv),
         "results_npz": str(results_npz),
         "figure": [str(svg), str(png)],
+        "loss_figure": loss_figure,
         "rows_summary": _summarize_rows(rows),
     }
     print(f"results_npz: {results_npz}", flush=True)
     print(f"results_csv: {results_csv}", flush=True)
     print(f"summary_json: {_write_summary(summary_json, summary)}", flush=True)
     print(f"figure_png: {png}", flush=True)
+    if loss_figure is not None:
+        print(f"loss_figure_png: {loss_figure[1]}", flush=True)
 
 
 if __name__ == "__main__":
