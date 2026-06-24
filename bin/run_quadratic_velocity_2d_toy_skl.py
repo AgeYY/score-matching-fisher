@@ -64,18 +64,21 @@ class ModelSpec:
 _ALL_MODEL_SPECS = {
     "affine": ModelSpec(name="affine", velocity_family="condition_affine"),
     "quadratic": ModelSpec(name="quadratic", velocity_family="condition_quadratic"),
+    "tanh": ModelSpec(name="tanh", velocity_family="condition_tanh"),
     "neural": ModelSpec(name="neural", velocity_family="nonlinear"),
 }
 
 _MODEL_DISPLAY_NAMES = {
     "affine": "Affine",
     "quadratic": "Quadratic",
+    "tanh": "Tanh",
     "neural": "Neural",
 }
 
 _MODEL_COLORS = {
     "affine": "#4C78A8",
     "quadratic": "#F58518",
+    "tanh": "#B279A2",
     "neural": "#54A24B",
 }
 
@@ -116,7 +119,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--models",
         type=_parse_model_list,
         default=["affine", "quadratic", "neural"],
-        help="Comma-separated subset/order of velocity classes to run: affine,quadratic,neural.",
+        help="Comma-separated subset/order of velocity classes to run: affine,quadratic,tanh,neural.",
     )
     p.add_argument("--n-list", type=_parse_int_list, default=[4, 5, 8, 10, 16, 30, 50, 100])
     p.add_argument("--n-seeds", type=int, default=10)

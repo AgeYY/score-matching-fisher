@@ -34,6 +34,7 @@ VELOCITY_FAMILIES = (
     "condition_affine_scalar",
     "condition_affine_diag",
     "condition_quadratic",
+    "condition_tanh",
     "shared_affine_low_rank",
     "shared_affine_low_rank_scalar",
     "shared_affine_low_rank_diag",
@@ -52,7 +53,7 @@ LOW_RANK_AFFINE_FAMILIES = {
     "shared_affine_low_rank_diag",
 }
 
-MC_ENDPOINT_FAMILIES = LOW_RANK_AFFINE_FAMILIES | {"condition_quadratic", "nonlinear"}
+MC_ENDPOINT_FAMILIES = LOW_RANK_AFFINE_FAMILIES | {"condition_quadratic", "condition_tanh", "nonlinear"}
 
 
 @dataclass
@@ -1116,6 +1117,95 @@ class ConditionQuadraticFlowSKLModel(nn.Module):
         )
 
 
+class ConditionTanhFlowSKLModel(nn.Module):
+    """Condition-specific rank-one tanh velocity with shared parameter trunk.
+
+    The velocity is ``v(x, theta, t) = b(theta,t) + u(theta,t) tanh(w(theta,t)^T x + d(theta,t))``.
+    """
+
+    def __init__(
+        self,
+        *,
+        theta_dim: int,
+        x_dim: int,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        divergence_estimator: str = "exact",
+        hutchinson_probes: int = 1,
+    ) -> None:
+        super().__init__()
+        if int(theta_dim) < 1:
+            raise ValueError("theta_dim must be >= 1.")
+        if int(x_dim) < 1:
+            raise ValueError("x_dim must be >= 1.")
+        if int(hidden_dim) < 1:
+            raise ValueError("hidden_dim must be >= 1.")
+        if int(depth) < 1:
+            raise ValueError("depth must be >= 1.")
+        self.velocity_family = "condition_tanh"
+        self.theta_dim = int(theta_dim)
+        self.x_dim = int(x_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.depth = int(depth)
+        self.network_architecture = "tanh_conditioned_shared_trunk"
+        _set_divergence_controls(
+            self,
+            divergence_estimator=divergence_estimator,
+            hutchinson_probes=int(hutchinson_probes),
+        )
+        self.trunk = _make_mlp(
+            in_dim=1 + self.theta_dim,
+            out_dim=self.hidden_dim,
+            hidden_dim=self.hidden_dim,
+            depth=self.depth,
+            final_gain=1.0,
+        )
+        self.b_head = nn.Linear(self.hidden_dim, self.x_dim)
+        self.u_head = nn.Linear(self.hidden_dim, self.x_dim)
+        self.w_head = nn.Linear(self.hidden_dim, self.x_dim)
+        self.d_head = nn.Linear(self.hidden_dim, 1)
+        for head in (self.b_head, self.u_head, self.w_head, self.d_head):
+            nn.init.xavier_uniform_(head.weight, gain=0.01)
+            nn.init.zeros_(head.bias)
+
+    def _trunk_features(self, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        t = _as_col_t(t)
+        theta = _expand_theta_to_batch(theta, batch=int(t.shape[0]))
+        t = _as_col_t(t, batch=int(theta.shape[0]))
+        return self.trunk(torch.cat([t, theta], dim=1))
+
+    def parameters_for(self, theta: torch.Tensor, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        h = self._trunk_features(theta, t)
+        return self.b_head(h), self.u_head(h), self.w_head(h), self.d_head(h)
+
+    def forward(self, x: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        theta = _expand_theta_to_batch(theta, batch=int(x.shape[0]))
+        t = _as_col_t(t, batch=int(x.shape[0]))
+        b, u, w, d = self.parameters_for(theta, t)
+        activation = torch.tanh(torch.sum(w * x, dim=1, keepdim=True) + d)
+        return b + u * activation
+
+    def log_prob_normalized(
+        self,
+        x_norm: torch.Tensor,
+        theta: torch.Tensor,
+        *,
+        solve_jitter: float = 1e-6,
+        quadrature_steps: int | None = None,
+        ode_steps: int = 32,
+        ode_method: str = "midpoint",
+    ) -> torch.Tensor:
+        return flow_endpoint_log_prob(
+            self,
+            x_norm,
+            theta,
+            solve_jitter=float(solve_jitter),
+            quadrature_steps=quadrature_steps,
+            ode_steps=int(ode_steps),
+            ode_method=str(ode_method),
+        )
+
+
 class CenteredSharedAffineLowRankFlowSKLModel(CenteredSharedAffineFlowSKLModel):
     """Centered shared-affine velocity plus ``U h(theta,t,U^T centered_x)``."""
 
@@ -1390,6 +1480,12 @@ def build_flow_skl_model(
         )
     if fam == "condition_quadratic":
         return ConditionQuadraticFlowSKLModel(
+            divergence_estimator=str(divergence_estimator),
+            hutchinson_probes=int(hutchinson_probes),
+            **common,
+        )
+    if fam == "condition_tanh":
+        return ConditionTanhFlowSKLModel(
             divergence_estimator=str(divergence_estimator),
             hutchinson_probes=int(hutchinson_probes),
             **common,

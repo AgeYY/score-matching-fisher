@@ -270,6 +270,8 @@ def test_build_flow_skl_model_uses_mlp_heads_and_film_nonlinear_subnets() -> Non
         )
         if family == "condition_quadratic":
             assert getattr(model, "network_architecture") == "quadratic_conditioned_mlp"
+        elif family == "condition_tanh":
+            assert getattr(model, "network_architecture") == "tanh_conditioned_shared_trunk"
         else:
             assert getattr(model, "network_architecture") == "film"
         if family in (
@@ -293,6 +295,21 @@ def test_build_flow_skl_model_uses_mlp_heads_and_film_nonlinear_subnets() -> Non
             assert isinstance(model.q_net, nn.Sequential)
             assert _first_linear_in_features(model.q_net) == 3
             assert model.n_quadratic_features == 6
+        elif family == "condition_tanh":
+            assert isinstance(model.trunk, nn.Sequential)
+            assert _first_linear_in_features(model.trunk) == 3
+            assert isinstance(model.b_head, nn.Linear)
+            assert isinstance(model.u_head, nn.Linear)
+            assert isinstance(model.w_head, nn.Linear)
+            assert isinstance(model.d_head, nn.Linear)
+            assert model.b_head.in_features == 4
+            assert model.u_head.in_features == 4
+            assert model.w_head.in_features == 4
+            assert model.d_head.in_features == 4
+            assert model.b_head.out_features == 3
+            assert model.u_head.out_features == 3
+            assert model.w_head.out_features == 3
+            assert model.d_head.out_features == 1
         else:
             assert isinstance(model.b_net, nn.Sequential)
             assert _first_linear_in_features(model.b_net) == 2
@@ -962,6 +979,49 @@ def test_shared_affine_low_rank_diag_forward_includes_diagonal_base_and_correcti
     u = model.U.detach()
     expected = b + centered * diag.reshape(1, -1) + (centered @ u) @ u.T
     torch.testing.assert_close(model(x, theta, t), expected, rtol=1e-12, atol=1e-12)
+
+
+def test_condition_tanh_forward_uses_shared_trunk_and_heads() -> None:
+    model = build_flow_skl_model(
+        velocity_family="condition_tanh",
+        theta_dim=2,
+        x_dim=2,
+        hidden_dim=5,
+        depth=1,
+        path_schedule="linear",
+        divergence_estimator="exact",
+    ).double()
+    assert type(model).__name__ == "ConditionTanhFlowSKLModel"
+    assert isinstance(model.trunk, nn.Sequential)
+    assert all(isinstance(getattr(model, name), nn.Linear) for name in ("b_head", "u_head", "w_head", "d_head"))
+
+    x = torch.tensor([[0.3, -0.4], [1.0, 0.5], [-0.2, 0.7]], dtype=torch.float64)
+    theta = torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 0.0]], dtype=torch.float64)
+    t = torch.tensor([[0.2], [0.5], [0.8]], dtype=torch.float64)
+    y = model(x, theta, t)
+    assert y.shape == x.shape
+    assert y.dtype == torch.float64
+
+    b, u, w, d = model.parameters_for(theta, t)
+    expected = b + u * torch.tanh(torch.sum(w * x, dim=1, keepdim=True) + d)
+    torch.testing.assert_close(y, expected, rtol=1e-12, atol=1e-12)
+
+
+def test_condition_tanh_endpoint_likelihood_is_finite() -> None:
+    model = build_flow_skl_model(
+        velocity_family="condition_tanh",
+        theta_dim=2,
+        x_dim=2,
+        hidden_dim=4,
+        depth=1,
+        path_schedule="linear",
+        divergence_estimator="exact",
+    )
+    x = torch.tensor([[0.1, -0.2], [0.4, 0.3]], dtype=torch.float32)
+    theta = torch.tensor([[1.0, 0.0], [0.0, 1.0]], dtype=torch.float32)
+    logp = flow_endpoint_log_prob(model, x, theta, ode_steps=2, ode_method="midpoint")
+    assert logp.shape == (2,)
+    assert torch.isfinite(logp).all()
 
 
 def test_shared_affine_families_report_model_jeffreys_without_endpoint_diagnostics(
