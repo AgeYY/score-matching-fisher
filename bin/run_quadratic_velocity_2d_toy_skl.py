@@ -24,7 +24,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from global_setting import DATA_DIR
+from global_setting import DATA_DIR, DEFAULT_DEVICE
 
 from fisher.flow_matching_skl import (
     build_flow_skl_model,
@@ -65,6 +65,7 @@ _ALL_MODEL_SPECS = {
     "affine": ModelSpec(name="affine", velocity_family="condition_affine"),
     "quadratic": ModelSpec(name="quadratic", velocity_family="condition_quadratic"),
     "tanh": ModelSpec(name="tanh", velocity_family="condition_tanh"),
+    "tanh_linear": ModelSpec(name="tanh_linear", velocity_family="condition_tanh_linear"),
     "neural": ModelSpec(name="neural", velocity_family="nonlinear"),
 }
 
@@ -72,6 +73,7 @@ _MODEL_DISPLAY_NAMES = {
     "affine": "Affine",
     "quadratic": "Quadratic",
     "tanh": "Tanh",
+    "tanh_linear": "Tanh + Linear",
     "neural": "Neural",
 }
 
@@ -79,6 +81,7 @@ _MODEL_COLORS = {
     "affine": "#4C78A8",
     "quadratic": "#F58518",
     "tanh": "#B279A2",
+    "tanh_linear": "#E45756",
     "neural": "#54A24B",
 }
 
@@ -107,7 +110,7 @@ def _parse_model_list(value: str) -> list[str]:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    p.add_argument("--device", type=str, default="cuda")
+    p.add_argument("--device", type=str, default=DEFAULT_DEVICE)
     p.add_argument(
         "--output-dir",
         type=Path,
@@ -119,7 +122,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--models",
         type=_parse_model_list,
         default=["affine", "quadratic", "neural"],
-        help="Comma-separated subset/order of velocity classes to run: affine,quadratic,tanh,neural.",
+        help="Comma-separated subset/order of velocity classes to run: affine,quadratic,tanh,tanh_linear,neural.",
     )
     p.add_argument("--n-list", type=_parse_int_list, default=[4, 5, 8, 10, 16, 30, 50, 100])
     p.add_argument("--n-seeds", type=int, default=10)

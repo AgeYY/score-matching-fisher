@@ -35,6 +35,7 @@ VELOCITY_FAMILIES = (
     "condition_affine_diag",
     "condition_quadratic",
     "condition_tanh",
+    "condition_tanh_linear",
     "shared_affine_low_rank",
     "shared_affine_low_rank_scalar",
     "shared_affine_low_rank_diag",
@@ -53,7 +54,12 @@ LOW_RANK_AFFINE_FAMILIES = {
     "shared_affine_low_rank_diag",
 }
 
-MC_ENDPOINT_FAMILIES = LOW_RANK_AFFINE_FAMILIES | {"condition_quadratic", "condition_tanh", "nonlinear"}
+MC_ENDPOINT_FAMILIES = LOW_RANK_AFFINE_FAMILIES | {
+    "condition_quadratic",
+    "condition_tanh",
+    "condition_tanh_linear",
+    "nonlinear",
+}
 
 
 @dataclass
@@ -1206,6 +1212,51 @@ class ConditionTanhFlowSKLModel(nn.Module):
         )
 
 
+class ConditionTanhLinearFlowSKLModel(ConditionTanhFlowSKLModel):
+    """Condition-specific rank-one tanh velocity plus shared time-dependent linear term."""
+
+    def __init__(
+        self,
+        *,
+        theta_dim: int,
+        x_dim: int,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        divergence_estimator: str = "exact",
+        hutchinson_probes: int = 1,
+    ) -> None:
+        super().__init__(
+            theta_dim=theta_dim,
+            x_dim=x_dim,
+            hidden_dim=hidden_dim,
+            depth=depth,
+            divergence_estimator=divergence_estimator,
+            hutchinson_probes=hutchinson_probes,
+        )
+        self.velocity_family = "condition_tanh_linear"
+        self.network_architecture = "tanh_linear_conditioned_shared_trunk"
+        self.a_net = _make_mlp(
+            in_dim=1,
+            out_dim=self.x_dim * self.x_dim,
+            hidden_dim=self.hidden_dim,
+            depth=self.depth,
+            final_gain=0.01,
+        )
+
+    def A(self, t: torch.Tensor) -> torch.Tensor:
+        t = _as_col_t(t)
+        raw = self.a_net(t)
+        return raw.reshape(int(t.shape[0]), self.x_dim, self.x_dim)
+
+    def forward(self, x: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        theta = _expand_theta_to_batch(theta, batch=int(x.shape[0]))
+        t = _as_col_t(t, batch=int(x.shape[0]))
+        b, u, w, d = self.parameters_for(theta, t)
+        activation = torch.tanh(torch.sum(w * x, dim=1, keepdim=True) + d)
+        ax = _apply_matrix(self.A(t), x)
+        return b + ax + u * activation
+
+
 class CenteredSharedAffineLowRankFlowSKLModel(CenteredSharedAffineFlowSKLModel):
     """Centered shared-affine velocity plus ``U h(theta,t,U^T centered_x)``."""
 
@@ -1486,6 +1537,12 @@ def build_flow_skl_model(
         )
     if fam == "condition_tanh":
         return ConditionTanhFlowSKLModel(
+            divergence_estimator=str(divergence_estimator),
+            hutchinson_probes=int(hutchinson_probes),
+            **common,
+        )
+    if fam == "condition_tanh_linear":
+        return ConditionTanhLinearFlowSKLModel(
             divergence_estimator=str(divergence_estimator),
             hutchinson_probes=int(hutchinson_probes),
             **common,
