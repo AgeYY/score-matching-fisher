@@ -30,6 +30,7 @@ from fisher.flow_matching_skl import (
     build_flow_skl_model,
     estimate_model_symmetric_kl,
     flow_skl_result_to_npz_dict,
+    sample_flow_endpoint,
     train_flow_skl_model,
 )
 from fisher.shared_fisher_est import require_device
@@ -59,11 +60,32 @@ class ToyDataset:
 class ModelSpec:
     name: str
     velocity_family: str
+    low_rank_axis: int | None = None
 
 
 _ALL_MODEL_SPECS = {
     "affine": ModelSpec(name="affine", velocity_family="condition_affine"),
     "quadratic": ModelSpec(name="quadratic", velocity_family="condition_quadratic"),
+    "low_rank_x1": ModelSpec(
+        name="low_rank_x1",
+        velocity_family="condition_fixed_input_low_rank",
+        low_rank_axis=0,
+    ),
+    "shared_low_rank_x1": ModelSpec(
+        name="shared_low_rank_x1",
+        velocity_family="shared_affine_low_rank",
+        low_rank_axis=0,
+    ),
+    "low_rank_x2": ModelSpec(
+        name="low_rank_x2",
+        velocity_family="condition_fixed_input_low_rank",
+        low_rank_axis=1,
+    ),
+    "shared_low_rank_x2": ModelSpec(
+        name="shared_low_rank_x2",
+        velocity_family="shared_affine_low_rank",
+        low_rank_axis=1,
+    ),
     "tanh": ModelSpec(name="tanh", velocity_family="condition_tanh"),
     "tanh_linear": ModelSpec(name="tanh_linear", velocity_family="condition_tanh_linear"),
     "neural": ModelSpec(name="neural", velocity_family="nonlinear"),
@@ -72,6 +94,10 @@ _ALL_MODEL_SPECS = {
 _MODEL_DISPLAY_NAMES = {
     "affine": "Affine",
     "quadratic": "Quadratic",
+    "low_rank_x1": "Low-rank x1 -> full",
+    "shared_low_rank_x1": "Shared low-rank U=e1",
+    "low_rank_x2": "Low-rank x2 -> full",
+    "shared_low_rank_x2": "Shared low-rank U=e2",
     "tanh": "Tanh",
     "tanh_linear": "Tanh + Linear",
     "neural": "Neural",
@@ -80,6 +106,10 @@ _MODEL_DISPLAY_NAMES = {
 _MODEL_COLORS = {
     "affine": "#4C78A8",
     "quadratic": "#F58518",
+    "low_rank_x1": "#72B7B2",
+    "shared_low_rank_x1": "#9D755D",
+    "low_rank_x2": "#72B7B2",
+    "shared_low_rank_x2": "#9D755D",
     "tanh": "#B279A2",
     "tanh_linear": "#E45756",
     "neural": "#54A24B",
@@ -122,7 +152,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--models",
         type=_parse_model_list,
         default=["affine", "quadratic", "neural"],
-        help="Comma-separated subset/order of velocity classes to run: affine,quadratic,tanh,tanh_linear,neural.",
+        help=(
+            "Comma-separated subset/order of velocity classes to run: "
+            "affine,quadratic,low_rank_x1,shared_low_rank_x1,"
+            "low_rank_x2,shared_low_rank_x2,tanh,tanh_linear,neural."
+        ),
     )
     p.add_argument("--n-list", type=_parse_int_list, default=[4, 5, 8, 10, 16, 30, 50, 100])
     p.add_argument("--n-seeds", type=int, default=10)
@@ -178,6 +212,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum plotted epoch points per loss curve after deterministic downsampling.",
     )
     p.add_argument("--dataset-plot-n", type=int, default=1000)
+    p.add_argument(
+        "--model-sample-plot-n",
+        type=int,
+        default=1000,
+        help="Generated endpoint samples per condition saved for the learned-flow sample panel.",
+    )
     return p
 
 
@@ -186,6 +226,16 @@ def _validate_x_dim(x_dim: int) -> int:
     if xd < 2 or xd % 2 != 0:
         raise ValueError("x_dim must be an even integer >= 2.")
     return xd
+
+
+def _fixed_axis_basis(*, x_dim: int, axis: int) -> np.ndarray:
+    xd = _validate_x_dim(int(x_dim))
+    ax = int(axis)
+    if xd != 2 or ax not in (0, 1):
+        raise ValueError("Fixed x-axis low-rank toy models require --x-dim 2 and axis in {0, 1}.")
+    basis = np.zeros((xd, 1), dtype=np.float64)
+    basis[ax, 0] = 1.0
+    return basis
 
 
 def true_quadratic_toy_skl(amplitude: float, *, x_dim: int = 2) -> float:
@@ -267,6 +317,25 @@ def _model_specs(model_names: list[str]) -> list[ModelSpec]:
     return [_ALL_MODEL_SPECS[str(name)] for name in model_names]
 
 
+def _model_spec_metadata(specs: list[ModelSpec]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for spec in specs:
+        meta: dict[str, Any] = {
+            "name": spec.name,
+            "velocity_family": spec.velocity_family,
+        }
+        if spec.low_rank_axis is not None:
+            meta.update(
+                {
+                    "low_rank_dim": 1,
+                    "low_rank_axis": int(spec.low_rank_axis),
+                    "low_rank_basis": _fixed_axis_basis(x_dim=2, axis=int(spec.low_rank_axis)).tolist(),
+                }
+            )
+        out.append(meta)
+    return out
+
+
 def _case_dir(output_dir: Path, *, n_per_condition: int, seed: int, model_name: str | None = None) -> Path:
     base = Path(output_dir) / f"N_{int(n_per_condition)}" / f"seed_{int(seed)}"
     return base if model_name is None else base / str(model_name)
@@ -278,6 +347,10 @@ def _load_case_result(path: Path) -> dict[str, Any]:
             "estimate": float(np.asarray(data["estimate_skl"]).reshape(-1)[0]),
             "true_skl": float(np.asarray(data["true_skl"]).reshape(-1)[0]),
             "relative_error": float(np.asarray(data["relative_error"]).reshape(-1)[0]),
+            "low_rank_dim": int(np.asarray(data["low_rank_dim"]).reshape(-1)[0]) if "low_rank_dim" in data.files else 0,
+            "low_rank_axis": int(np.asarray(data["low_rank_axis"]).reshape(-1)[0])
+            if "low_rank_axis" in data.files
+            else -1,
             "best_epoch": int(np.asarray(data["best_epoch"]).reshape(-1)[0]) if "best_epoch" in data.files else -1,
             "best_val_loss": float(np.asarray(data["best_val_loss"]).reshape(-1)[0])
             if "best_val_loss" in data.files
@@ -303,16 +376,25 @@ def train_one_model(
     if device.type == "cuda":
         torch.cuda.manual_seed_all(int(seed))
 
+    low_rank_basis = None
+    low_rank_dim = 1
+    low_rank_axis = spec.low_rank_axis
+    if low_rank_axis is not None:
+        low_rank_basis = _fixed_axis_basis(x_dim=int(dataset.x_train.shape[1]), axis=int(low_rank_axis))
+        low_rank_dim = int(low_rank_basis.shape[1])
+
     model = build_flow_skl_model(
         velocity_family=spec.velocity_family,
         theta_dim=2,
         x_dim=int(dataset.x_train.shape[1]),
         hidden_dim=int(args.hidden_dim),
         depth=int(args.depth),
+        low_rank_dim=low_rank_dim,
         quadrature_steps=int(args.quadrature_steps),
         path_schedule=str(args.path_schedule),
         divergence_estimator=str(args.divergence_estimator),
         hutchinson_probes=int(args.hutchinson_probes),
+        low_rank_basis=low_rank_basis,
     ).to(device)
     train_meta = train_flow_skl_model(
         model=model,
@@ -353,6 +435,25 @@ def train_one_model(
     estimate = float(result.symmetric_kl_matrix[0, 1])
     truth = float(dataset.true_skl)
     rel_error = abs(estimate - truth) / truth if truth > 0.0 else float("nan")
+    sample_plot_n = max(1, int(args.model_sample_plot_n))
+    torch.manual_seed(int(seed) + 1_000_003)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(int(seed) + 1_000_003)
+    sample_parts: list[np.ndarray] = []
+    sample_label_parts: list[np.ndarray] = []
+    for condition in range(theta_eval.shape[0]):
+        samples = sample_flow_endpoint(
+            model=model,
+            theta=theta_eval[condition : condition + 1],
+            n_samples=sample_plot_n,
+            device=device,
+            ode_steps=int(args.ode_steps),
+            ode_method=str(args.ode_method),
+        )
+        sample_parts.append(samples.detach().cpu().numpy().astype(np.float64))
+        sample_label_parts.append(np.full(sample_plot_n, condition, dtype=np.int64))
+    model_sample_x = np.vstack(sample_parts).astype(np.float64, copy=False)
+    model_sample_labels = np.concatenate(sample_label_parts).astype(np.int64, copy=False)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     fields = flow_skl_result_to_npz_dict(result)
@@ -368,8 +469,19 @@ def train_one_model(
             "estimate_skl": np.asarray([estimate], dtype=np.float64),
             "true_skl": np.asarray([truth], dtype=np.float64),
             "relative_error": np.asarray([rel_error], dtype=np.float64),
+            "model_sample_x": model_sample_x,
+            "model_sample_labels": model_sample_labels,
+            "model_sample_n_per_condition": np.asarray([sample_plot_n], dtype=np.int64),
         }
     )
+    if low_rank_basis is not None:
+        fields.update(
+            {
+                "low_rank_dim": np.asarray([low_rank_dim], dtype=np.int64),
+                "low_rank_axis": np.asarray([int(low_rank_axis)], dtype=np.int64),
+                "low_rank_basis": np.asarray(low_rank_basis, dtype=np.float64),
+            }
+        )
     for key in ("train_losses", "val_losses", "val_monitor_losses"):
         if key in result.train_metadata:
             fields[key] = np.asarray(result.train_metadata[key], dtype=np.float64)
@@ -383,6 +495,9 @@ def train_one_model(
         "relative_error": rel_error,
         "best_epoch": int(result.train_metadata.get("best_epoch", -1)),
         "best_val_loss": float(result.train_metadata.get("best_val_loss", float("nan"))),
+        "low_rank_dim": int(low_rank_dim) if low_rank_basis is not None else 0,
+        "low_rank_axis": int(low_rank_axis) if low_rank_basis is not None else -1,
+        "model_sample_n_per_condition": int(sample_plot_n),
     }
 
 
@@ -395,6 +510,8 @@ def _write_rows_csv(path: Path, rows: list[dict[str, Any]]) -> Path:
         "model",
         "velocity_family",
         "training_mode",
+        "low_rank_dim",
+        "low_rank_axis",
         "estimate_skl",
         "true_skl",
         "abs_error",
@@ -587,6 +704,96 @@ def _plot_dataset_panel(
     ax.legend(frameon=False, loc="upper right", handletextpad=0.3, borderaxespad=0.2)
 
 
+def _plot_learned_sample_panel(
+    ax: plt.Axes,
+    *,
+    result_npz: Path | None,
+) -> None:
+    colors = {0: _MODEL_COLORS["affine"], 1: _MODEL_COLORS["quadratic"]}
+    labels = {0: "condition 0", 1: "condition 1"}
+    title = "Learned flow samples"
+    samples: np.ndarray | None = None
+    sample_labels: np.ndarray | None = None
+    sample_n = 0
+    if result_npz is not None and Path(result_npz).is_file():
+        try:
+            with np.load(result_npz, allow_pickle=False) as data:
+                if "model_sample_x" in data.files and "model_sample_labels" in data.files:
+                    samples = np.asarray(data["model_sample_x"], dtype=np.float64)
+                    sample_labels = np.asarray(data["model_sample_labels"], dtype=np.int64)
+                    if "model_name" in data.files and "model_sample_n_per_condition" in data.files:
+                        model_name = str(np.asarray(data["model_name"]).reshape(-1)[0])
+                        sample_n = int(np.asarray(data["model_sample_n_per_condition"]).reshape(-1)[0])
+                        display = _MODEL_DISPLAY_NAMES.get(model_name, model_name)
+                        title = f"{display} samples"
+        except (OSError, ValueError):
+            samples = None
+            sample_labels = None
+    if samples is not None and sample_labels is not None and samples.ndim == 2 and samples.shape[1] >= 2:
+        for condition in (0, 1):
+            mask = sample_labels == condition
+            pts = samples[mask][:100]
+            if pts.size == 0:
+                continue
+            ax.scatter(
+                pts[:, 1],
+                pts[:, 0],
+                s=12,
+                alpha=0.34,
+                color=colors[condition],
+                edgecolors="none",
+                label=f"{labels[condition]} generated",
+                rasterized=True,
+            )
+        if sample_n > 0:
+            title = f"{title} (N={sample_n}/cond)"
+    else:
+        ax.text(
+            0.5,
+            0.5,
+            "samples unavailable",
+            transform=ax.transAxes,
+            color="0.45",
+            ha="center",
+            va="center",
+            fontsize=11,
+        )
+
+    ax.set_xlim(-3.2, 3.2)
+    ax.set_ylim(-4.2, 4.2)
+    ax.set_box_aspect(1.0)
+    ax.set_xlabel("")
+    ax.set_ylabel("")
+    ax.set_title(title, pad=5)
+    ax.grid(False)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.tick_params(axis="both", which="both", length=0)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    if samples is not None and sample_labels is not None:
+        ax.legend(frameon=False, loc="upper right", handletextpad=0.3, borderaxespad=0.2)
+
+
+def _select_model_sample_result_npz(rows: list[dict[str, Any]], aggregate: dict[str, Any]) -> Path | None:
+    if not rows:
+        return None
+    model_names = [str(v) for v in aggregate.get("model_names", ())]
+    preferred_model = model_names[0] if model_names else str(rows[0].get("model", ""))
+    candidates = [r for r in rows if str(r.get("model", "")) == preferred_model]
+    if not candidates:
+        candidates = rows
+    candidates = sorted(
+        candidates,
+        key=lambda r: (-int(r["n_per_condition"]), int(r["repeat_idx"]), str(r["model"])),
+    )
+    for row in candidates:
+        path = Path(str(row.get("result_npz", ""))).expanduser()
+        if path.is_file():
+            return path
+    return None
+
+
 def plot_distance(
     path_base: Path,
     aggregate: dict[str, Any],
@@ -599,6 +806,7 @@ def plot_distance(
     plot_ymin: float | None = -0.35,
     plot_ymax: float | None = 6.0,
     plot_break_total_after: int = 0,
+    model_sample_result_npz: Path | None = None,
 ) -> tuple[Path, Path]:
     n_list = np.asarray(aggregate["n_list"], dtype=np.int64)
     n_total = 2 * n_list
@@ -632,10 +840,11 @@ def plot_distance(
             break_after > 0 and np.any(n_total <= break_after) and np.any(n_total > break_after)
         )
         if use_x_break:
-            fig = plt.figure(figsize=(10.8, 4.0))
-            outer = fig.add_gridspec(1, 2, width_ratios=[1.0, 2.18], wspace=0.27)
+            fig = plt.figure(figsize=(13.8, 4.0))
+            outer = fig.add_gridspec(1, 3, width_ratios=[1.0, 1.0, 2.18], wspace=0.27)
             data_ax = fig.add_subplot(outer[0, 0])
-            inner = outer[0, 1].subgridspec(1, 2, width_ratios=[1.68, 0.58], wspace=0.055)
+            sample_ax = fig.add_subplot(outer[0, 1])
+            inner = outer[0, 2].subgridspec(1, 2, width_ratios=[1.68, 0.58], wspace=0.055)
             ax_left = fig.add_subplot(inner[0, 0])
             ax_right = fig.add_subplot(inner[0, 1], sharey=ax_left)
             plot_axes = (ax_left, ax_right)
@@ -643,11 +852,11 @@ def plot_distance(
         else:
             fig, axes = plt.subplots(
                 1,
-                2,
-                figsize=(8.4, 3.85),
-                gridspec_kw={"width_ratios": [1.0, 1.55], "wspace": 0.26},
+                3,
+                figsize=(11.2, 3.85),
+                gridspec_kw={"width_ratios": [1.0, 1.0, 1.55], "wspace": 0.26},
             )
-            data_ax, ax_left = axes
+            data_ax, sample_ax, ax_left = axes
             ax_right = None
             plot_axes = (ax_left,)
             plot_masks = (np.ones_like(n_total, dtype=bool),)
@@ -659,6 +868,7 @@ def plot_distance(
             seed=int(dataset_plot_seed),
             n_per_condition=int(dataset_plot_n),
         )
+        _plot_learned_sample_panel(sample_ax, result_npz=model_sample_result_npz)
         for model_i, model in enumerate(model_names):
             vals = estimates[:, :, model_i]
             if str(plot_stat) == "median_iqr":
@@ -758,7 +968,7 @@ def plot_distance(
             borderaxespad=0.2,
             labelspacing=0.35,
         )
-        for label, panel_ax in zip(("A", "B"), (data_ax, ax_left), strict=True):
+        for label, panel_ax in zip(("A", "B", "C"), (data_ax, sample_ax, ax_left), strict=True):
             panel_ax.text(
                 -0.13,
                 1.04,
@@ -769,7 +979,7 @@ def plot_distance(
                 va="bottom",
                 ha="left",
             )
-        fig.subplots_adjust(left=0.065, right=0.995, bottom=0.26, top=0.88)
+        fig.subplots_adjust(left=0.05, right=0.995, bottom=0.26, top=0.88)
     svg = path_base.with_suffix(".svg")
     png = path_base.with_suffix(".png")
     fig.savefig(svg)
@@ -1041,9 +1251,12 @@ def main() -> None:
     x_dim = _validate_x_dim(int(args.x_dim))
     device = require_device(args.device)
     output_dir = Path(args.output_dir).expanduser().resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
     selected_models = [str(v) for v in args.models]
     specs = _model_specs(selected_models)
+    for spec in specs:
+        if spec.low_rank_axis is not None:
+            _fixed_axis_basis(x_dim=x_dim, axis=int(spec.low_rank_axis))
+    output_dir.mkdir(parents=True, exist_ok=True)
     n_list = [int(v) for v in args.n_list]
     results_csv = output_dir / RESULTS_CSV_NAME
     results_npz = output_dir / RESULTS_NPZ_NAME
@@ -1063,6 +1276,7 @@ def main() -> None:
         plot_x_dim = _validate_x_dim(int(existing_summary.get("x_dim", x_dim)))
         truth = float(np.nanmean(np.asarray(aggregate["true_skl"], dtype=np.float64)))
         plot_amplitude = math.sqrt(truth / (8.0 * (plot_x_dim // 2))) if truth >= 0.0 else float(args.amplitude)
+        model_sample_result_npz = _select_model_sample_result_npz(rows, aggregate)
         svg, png = plot_distance(
             output_dir / "quadratic_velocity_2d_toy_skl_vs_n",
             aggregate,
@@ -1074,6 +1288,7 @@ def main() -> None:
             plot_ymin=float(args.plot_ymin) if args.plot_ymin is not None else None,
             plot_ymax=float(args.plot_ymax) if args.plot_ymax is not None else None,
             plot_break_total_after=int(args.plot_break_total_after),
+            model_sample_result_npz=model_sample_result_npz,
         )
         loss_figure: list[str] | None = None
         if bool(args.plot_loss_panels):
@@ -1099,6 +1314,7 @@ def main() -> None:
             "n_total_list": [int(2 * v) for v in np.asarray(aggregate["n_list"], dtype=np.int64).tolist()],
             "n_seeds": int(np.asarray(aggregate["estimates"]).shape[1]),
             "models": [str(v) for v in aggregate["model_names"]],
+            "model_specs": _model_spec_metadata(specs),
             "plot_stat": str(args.plot_stat),
             "plot_ymin": float(args.plot_ymin) if args.plot_ymin is not None else None,
             "plot_ymax": float(args.plot_ymax) if args.plot_ymax is not None else None,
@@ -1106,6 +1322,8 @@ def main() -> None:
             "plot_loss_panels": bool(args.plot_loss_panels),
             "loss_curve_max_points": int(args.loss_curve_max_points),
             "dataset_plot_n": int(args.dataset_plot_n),
+            "model_sample_plot_n": int(args.model_sample_plot_n),
+            "model_sample_panel_result_npz": str(model_sample_result_npz) if model_sample_result_npz is not None else None,
             "results_csv": str(results_csv),
             "results_npz": str(results_npz),
             "figure": [str(svg), str(png)],
@@ -1173,6 +1391,8 @@ def main() -> None:
                         "model": spec.name,
                         "velocity_family": spec.velocity_family,
                         "training_mode": "cfm",
+                        "low_rank_dim": int(vals.get("low_rank_dim", 0)),
+                        "low_rank_axis": int(vals.get("low_rank_axis", -1)),
                         "estimate_skl": estimate,
                         "true_skl": truth,
                         "abs_error": abs(estimate - truth),
@@ -1187,6 +1407,7 @@ def main() -> None:
     _write_rows_csv(results_csv, rows)
     aggregate = _aggregate(rows, n_list=n_list, specs=specs, n_seeds=int(args.n_seeds))
     _write_aggregate_npz(results_npz, aggregate)
+    model_sample_result_npz = _select_model_sample_result_npz(rows, aggregate)
     svg, png = plot_distance(
         output_dir / "quadratic_velocity_2d_toy_skl_vs_n",
         aggregate,
@@ -1198,6 +1419,7 @@ def main() -> None:
         plot_ymin=float(args.plot_ymin) if args.plot_ymin is not None else None,
         plot_ymax=float(args.plot_ymax) if args.plot_ymax is not None else None,
         plot_break_total_after=int(args.plot_break_total_after),
+        model_sample_result_npz=model_sample_result_npz,
     )
     loss_figure = None
     if bool(args.plot_loss_panels):
@@ -1224,6 +1446,7 @@ def main() -> None:
         "train_frac": float(args.train_frac),
         "training_mode": "cfm",
         "models": [s.name for s in specs],
+        "model_specs": _model_spec_metadata(specs),
         "plot_stat": str(args.plot_stat),
         "plot_ymin": float(args.plot_ymin) if args.plot_ymin is not None else None,
         "plot_ymax": float(args.plot_ymax) if args.plot_ymax is not None else None,
@@ -1231,6 +1454,8 @@ def main() -> None:
         "plot_loss_panels": bool(args.plot_loss_panels),
         "loss_curve_max_points": int(args.loss_curve_max_points),
         "dataset_plot_n": int(args.dataset_plot_n),
+        "model_sample_plot_n": int(args.model_sample_plot_n),
+        "model_sample_panel_result_npz": str(model_sample_result_npz) if model_sample_result_npz is not None else None,
         "results_csv": str(results_csv),
         "results_npz": str(results_npz),
         "figure": [str(svg), str(png)],

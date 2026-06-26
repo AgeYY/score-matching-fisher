@@ -36,6 +36,7 @@ VELOCITY_FAMILIES = (
     "condition_quadratic",
     "condition_tanh",
     "condition_tanh_linear",
+    "condition_fixed_input_low_rank",
     "shared_affine_low_rank",
     "shared_affine_low_rank_scalar",
     "shared_affine_low_rank_diag",
@@ -58,6 +59,7 @@ MC_ENDPOINT_FAMILIES = LOW_RANK_AFFINE_FAMILIES | {
     "condition_quadratic",
     "condition_tanh",
     "condition_tanh_linear",
+    "condition_fixed_input_low_rank",
     "nonlinear",
 }
 
@@ -1257,6 +1259,133 @@ class ConditionTanhLinearFlowSKLModel(ConditionTanhFlowSKLModel):
         return b + ax + u * activation
 
 
+class ConditionFixedInputLowRankFlowSKLModel(nn.Module):
+    """Condition-specific velocity with fixed low-rank input and full-dimensional correction."""
+
+    def __init__(
+        self,
+        *,
+        theta_dim: int,
+        x_dim: int,
+        correction_rank: int,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        divergence_estimator: str = "exact",
+        hutchinson_probes: int = 1,
+        low_rank_basis: np.ndarray | torch.Tensor | None = None,
+    ) -> None:
+        super().__init__()
+        if int(theta_dim) < 1:
+            raise ValueError("theta_dim must be >= 1.")
+        if int(x_dim) < 1:
+            raise ValueError("x_dim must be >= 1.")
+        if int(correction_rank) < 1:
+            raise ValueError("correction_rank must be >= 1.")
+        if int(correction_rank) > int(x_dim):
+            raise ValueError("correction_rank must be <= x_dim.")
+        if int(hidden_dim) < 1:
+            raise ValueError("hidden_dim must be >= 1.")
+        if int(depth) < 1:
+            raise ValueError("depth must be >= 1.")
+        if low_rank_basis is None:
+            raise ValueError("condition_fixed_input_low_rank requires fixed low_rank_basis.")
+
+        self.velocity_family = "condition_fixed_input_low_rank"
+        self.theta_dim = int(theta_dim)
+        self.x_dim = int(x_dim)
+        self.correction_rank = int(correction_rank)
+        self.hidden_dim = int(hidden_dim)
+        self.depth = int(depth)
+        self.network_architecture = "fixed_input_low_rank_conditioned_film"
+        _set_divergence_controls(
+            self,
+            divergence_estimator=divergence_estimator,
+            hutchinson_probes=int(hutchinson_probes),
+        )
+
+        basis = torch.as_tensor(low_rank_basis, dtype=torch.float32)
+        if basis.ndim != 2 or tuple(basis.shape) != (self.x_dim, self.correction_rank):
+            raise ValueError(
+                "low_rank_basis must have shape "
+                f"({self.x_dim}, {self.correction_rank}); got {tuple(basis.shape)}."
+            )
+        if not torch.isfinite(basis).all():
+            raise ValueError("low_rank_basis must contain only finite values.")
+        gram = basis.T @ basis
+        eye = torch.eye(self.correction_rank, dtype=basis.dtype)
+        if not torch.allclose(gram, eye, rtol=1e-4, atol=1e-5):
+            raise ValueError("low_rank_basis columns must be orthonormal.")
+        self.low_rank_basis_mode = "fixed"
+        self.register_buffer("fixed_u", basis.contiguous())
+
+        self.b_net = _make_mlp(
+            in_dim=1 + self.theta_dim,
+            out_dim=self.x_dim,
+            hidden_dim=self.hidden_dim,
+            depth=self.depth,
+            final_gain=0.01,
+        )
+        self.a_net = _make_mlp(
+            in_dim=1,
+            out_dim=self.x_dim * self.x_dim,
+            hidden_dim=self.hidden_dim,
+            depth=self.depth,
+            final_gain=0.01,
+        )
+        self.h_net = _make_film_net(
+            trunk_dim=self.correction_rank,
+            theta_dim=self.theta_dim,
+            out_dim=self.x_dim,
+            hidden_dim=self.hidden_dim,
+            depth=self.depth,
+            final_gain=0.0,
+        )
+
+    @property
+    def U(self) -> torch.Tensor:
+        """Fixed low-rank input basis columns with shape ``[D, r]``."""
+
+        return self.fixed_u
+
+    def b(self, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        t = _as_col_t(t)
+        theta = _expand_theta_to_batch(theta, batch=int(t.shape[0]))
+        t = _as_col_t(t, batch=int(theta.shape[0]))
+        return self.b_net(torch.cat([t, theta], dim=1))
+
+    def A(self, t: torch.Tensor) -> torch.Tensor:
+        t = _as_col_t(t)
+        raw = self.a_net(t)
+        return raw.reshape(int(t.shape[0]), self.x_dim, self.x_dim)
+
+    def forward(self, x: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        theta = _expand_theta_to_batch(theta, batch=int(x.shape[0]))
+        t = _as_col_t(t, batch=int(x.shape[0]))
+        z = x @ self.U
+        h = self.h_net(z, theta, t)
+        return self.b(theta, t) + _apply_matrix(self.A(t), x) + h
+
+    def log_prob_normalized(
+        self,
+        x_norm: torch.Tensor,
+        theta: torch.Tensor,
+        *,
+        solve_jitter: float = 1e-6,
+        quadrature_steps: int | None = None,
+        ode_steps: int = 32,
+        ode_method: str = "midpoint",
+    ) -> torch.Tensor:
+        return flow_endpoint_log_prob(
+            self,
+            x_norm,
+            theta,
+            solve_jitter=float(solve_jitter),
+            quadrature_steps=quadrature_steps,
+            ode_steps=int(ode_steps),
+            ode_method=str(ode_method),
+        )
+
+
 class CenteredSharedAffineLowRankFlowSKLModel(CenteredSharedAffineFlowSKLModel):
     """Centered shared-affine velocity plus ``U h(theta,t,U^T centered_x)``."""
 
@@ -1545,6 +1674,15 @@ def build_flow_skl_model(
         return ConditionTanhLinearFlowSKLModel(
             divergence_estimator=str(divergence_estimator),
             hutchinson_probes=int(hutchinson_probes),
+            **common,
+        )
+    if fam == "condition_fixed_input_low_rank":
+        rank = resolve_lxf_low_rank_dim(int(low_rank_dim), int(x_dim), log_prefix="[flow-skl] ")
+        return ConditionFixedInputLowRankFlowSKLModel(
+            correction_rank=rank,
+            divergence_estimator=str(divergence_estimator),
+            hutchinson_probes=int(hutchinson_probes),
+            low_rank_basis=low_rank_basis,
             **common,
         )
     low_rank_affine_classes = {

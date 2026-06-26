@@ -259,6 +259,9 @@ def _first_linear_in_features(module: nn.Sequential) -> int:
 
 def test_build_flow_skl_model_uses_mlp_heads_and_film_nonlinear_subnets() -> None:
     for family in VELOCITY_FAMILIES:
+        kwargs = {}
+        if family == "condition_fixed_input_low_rank":
+            kwargs["low_rank_basis"] = np.asarray([[0.0], [1.0], [0.0]], dtype=np.float64)
         model = build_flow_skl_model(
             velocity_family=family,
             theta_dim=2,
@@ -267,6 +270,7 @@ def test_build_flow_skl_model_uses_mlp_heads_and_film_nonlinear_subnets() -> Non
             depth=1,
             low_rank_dim=1,
             path_schedule="linear",
+            **kwargs,
         )
         if family == "condition_quadratic":
             assert getattr(model, "network_architecture") == "quadratic_conditioned_mlp"
@@ -274,6 +278,8 @@ def test_build_flow_skl_model_uses_mlp_heads_and_film_nonlinear_subnets() -> Non
             assert getattr(model, "network_architecture") == "tanh_conditioned_shared_trunk"
         elif family == "condition_tanh_linear":
             assert getattr(model, "network_architecture") == "tanh_linear_conditioned_shared_trunk"
+        elif family == "condition_fixed_input_low_rank":
+            assert getattr(model, "network_architecture") == "fixed_input_low_rank_conditioned_film"
         else:
             assert getattr(model, "network_architecture") == "film"
         if family in (
@@ -315,6 +321,16 @@ def test_build_flow_skl_model_uses_mlp_heads_and_film_nonlinear_subnets() -> Non
             if family == "condition_tanh_linear":
                 assert isinstance(model.a_net, nn.Sequential)
                 assert _first_linear_in_features(model.a_net) == 1
+        elif family == "condition_fixed_input_low_rank":
+            assert isinstance(model.b_net, nn.Sequential)
+            assert _first_linear_in_features(model.b_net) == 3
+            assert isinstance(model.a_net, nn.Sequential)
+            assert _first_linear_in_features(model.a_net) == 1
+            assert isinstance(model.h_net, fms._ConditionedFiLMNet)  # type: ignore[attr-defined]
+            assert model.h_net.trunk_dim == 1
+            assert model.h_net.out_dim == 3
+            assert model.h_net.theta_dim == 2
+            assert isinstance(model.h_net.theta_embedding, nn.Linear)
         else:
             assert isinstance(model.b_net, nn.Sequential)
             assert _first_linear_in_features(model.b_net) == 2
@@ -368,11 +384,15 @@ def test_build_flow_skl_model_constructs_restricted_velocity_families() -> None:
         "shared_affine_diag": "CenteredSharedAffineDiagFlowSKLModel",
         "condition_affine_scalar": "CenteredConditionAffineScalarFlowSKLModel",
         "condition_affine_diag": "CenteredConditionAffineDiagFlowSKLModel",
+        "condition_fixed_input_low_rank": "ConditionFixedInputLowRankFlowSKLModel",
         "shared_affine_low_rank_scalar": "CenteredSharedAffineLowRankScalarFlowSKLModel",
         "shared_affine_low_rank_diag": "CenteredSharedAffineLowRankDiagFlowSKLModel",
     }
     for family, class_name in expected.items():
         assert family in VELOCITY_FAMILIES
+        kwargs = {}
+        if family == "condition_fixed_input_low_rank":
+            kwargs["low_rank_basis"] = np.asarray([[0.0], [1.0], [0.0]], dtype=np.float64)
         model = build_flow_skl_model(
             velocity_family=family,
             theta_dim=2,
@@ -381,6 +401,7 @@ def test_build_flow_skl_model_constructs_restricted_velocity_families() -> None:
             depth=1,
             low_rank_dim=1,
             path_schedule="linear",
+            **kwargs,
         )
         assert model.velocity_family == family
         assert type(model).__name__ == class_name
@@ -916,6 +937,76 @@ def test_shared_affine_low_rank_can_use_fixed_oracle_basis() -> None:
     assert "fixed_u" in dict(model.named_buffers())
     assert not any(name.startswith("u_layer") for name, _ in model.named_parameters())
     torch.testing.assert_close(model.U, torch.as_tensor(basis, dtype=torch.float64))
+
+
+def test_condition_fixed_input_low_rank_can_use_fixed_x2_basis() -> None:
+    basis = np.asarray([[0.0], [1.0]], dtype=np.float64)
+    model = build_flow_skl_model(
+        velocity_family="condition_fixed_input_low_rank",
+        theta_dim=2,
+        x_dim=2,
+        hidden_dim=4,
+        depth=1,
+        low_rank_dim=1,
+        path_schedule="linear",
+        low_rank_basis=basis,
+    ).double()
+
+    assert model.low_rank_basis_mode == "fixed"
+    assert "fixed_u" in dict(model.named_buffers())
+    torch.testing.assert_close(model.U, torch.as_tensor(basis, dtype=torch.float64))
+
+
+def test_condition_fixed_input_low_rank_rejects_missing_or_nonorthonormal_basis() -> None:
+    with pytest.raises(ValueError, match="requires fixed low_rank_basis"):
+        build_flow_skl_model(
+            velocity_family="condition_fixed_input_low_rank",
+            theta_dim=2,
+            x_dim=2,
+            hidden_dim=4,
+            depth=1,
+            low_rank_dim=1,
+            path_schedule="linear",
+        )
+
+    with pytest.raises(ValueError, match="orthonormal"):
+        build_flow_skl_model(
+            velocity_family="condition_fixed_input_low_rank",
+            theta_dim=2,
+            x_dim=2,
+            hidden_dim=4,
+            depth=1,
+            low_rank_dim=1,
+            path_schedule="linear",
+            low_rank_basis=np.asarray([[0.0], [2.0]], dtype=np.float64),
+        )
+
+
+def test_condition_fixed_input_low_rank_can_move_x1_from_x2_coordinate() -> None:
+    class X1FromReducedNet(nn.Module):
+        def forward(self, trunk: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+            del theta, t
+            return torch.cat([trunk[:, :1], torch.zeros_like(trunk[:, :1])], dim=1)
+
+    model = build_flow_skl_model(
+        velocity_family="condition_fixed_input_low_rank",
+        theta_dim=2,
+        x_dim=2,
+        hidden_dim=4,
+        depth=1,
+        low_rank_dim=1,
+        path_schedule="linear",
+        low_rank_basis=np.asarray([[0.0], [1.0]], dtype=np.float64),
+    ).double()
+    model.b_net = ConstantNet(torch.zeros(2, dtype=torch.float64))
+    model.a_net = ConstantNet(torch.zeros(4, dtype=torch.float64))
+    model.h_net = X1FromReducedNet()
+
+    x = torch.tensor([[5.0, 2.0], [-3.0, -1.5]], dtype=torch.float64)
+    theta = torch.eye(2, dtype=torch.float64)
+    t = torch.tensor([[0.25], [0.75]], dtype=torch.float64)
+    expected = torch.tensor([[2.0, 0.0], [-1.5, 0.0]], dtype=torch.float64)
+    torch.testing.assert_close(model(x, theta, t), expected, rtol=1e-12, atol=1e-12)
 
 
 def test_shared_affine_low_rank_rejects_nonorthonormal_fixed_basis() -> None:
