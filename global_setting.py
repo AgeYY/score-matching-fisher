@@ -15,6 +15,21 @@ DATAROOT = os.environ.get(
 # Default datasets and run outputs live directly under DATAROOT (same tree as the repo `data/` symlink).
 DATA_DIR = DATAROOT
 
+# Local Stringer et al. 2019 mouse visual cortex dataset.
+# Override at runtime:
+# export SCORE_MATCHING_FISHER_STRINGER_DATA_DIR=/path/to/stringer-et-al-2019
+STRINGER_DATA_DIR = os.environ.get(
+    "SCORE_MATCHING_FISHER_STRINGER_DATA_DIR",
+    "/storage/zeyuan/stringer-et-al-2019",
+)
+
+# Canonical example recording session for quick Stringer experiments.
+# This is one full-field static grating session from database.npy.
+STRINGER_EXAMPLE_SESSION_FILE = os.environ.get(
+    "SCORE_MATCHING_FISHER_STRINGER_EXAMPLE_SESSION_FILE",
+    "gratings_static_GT1_2019_04_17_1.npy",
+)
+
 # Default execution device for training/evaluation scripts.
 # Override at runtime: export SCORE_MATCHING_FISHER_DEFAULT_DEVICE=cuda:0
 DEFAULT_DEVICE = os.environ.get("SCORE_MATCHING_FISHER_DEFAULT_DEVICE", "cuda:1")
