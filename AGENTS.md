@@ -1,5 +1,9 @@
 # AGENTS Instructions
 
+## Branch Purpose
+
+- The goal of this branch is to implement flow matching on different geometric base distributions, enabling new distance metrics.
+
 ## Runtime Environment (Mandatory)
 
 - Always run Python/code commands inside the `mamba` environment `geo_diffusion`.
