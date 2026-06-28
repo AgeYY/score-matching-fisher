@@ -33,6 +33,10 @@ VELOCITY_FAMILIES = (
     "condition_affine",
     "condition_affine_scalar",
     "condition_affine_diag",
+    "condition_quadratic",
+    "condition_tanh",
+    "condition_tanh_linear",
+    "condition_fixed_input_low_rank",
     "shared_affine_low_rank",
     "shared_affine_low_rank_scalar",
     "shared_affine_low_rank_diag",
@@ -51,7 +55,13 @@ LOW_RANK_AFFINE_FAMILIES = {
     "shared_affine_low_rank_diag",
 }
 
-MC_ENDPOINT_FAMILIES = LOW_RANK_AFFINE_FAMILIES | {"nonlinear"}
+MC_ENDPOINT_FAMILIES = LOW_RANK_AFFINE_FAMILIES | {
+    "condition_quadratic",
+    "condition_tanh",
+    "condition_tanh_linear",
+    "condition_fixed_input_low_rank",
+    "nonlinear",
+}
 
 
 @dataclass
@@ -994,6 +1004,388 @@ class CenteredConditionAffineDiagFlowSKLModel(CenteredConditionAffineFlowSKLMode
         return _diag_batch_to_matrix(self.a_net(torch.cat([t, theta], dim=1)), x_dim=self.x_dim)
 
 
+class ConditionQuadraticFlowSKLModel(nn.Module):
+    """Condition-specific quadratic velocity with time-dependent quadratic tensor.
+
+    The velocity is ``v(x, theta, t) = b(theta,t) + A(theta,t)x + Q(theta,t)[x,x]``.
+    The affine and quadratic parts can both vary over flow time.
+    """
+
+    def __init__(
+        self,
+        *,
+        theta_dim: int,
+        x_dim: int,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        divergence_estimator: str = "exact",
+        hutchinson_probes: int = 1,
+    ) -> None:
+        super().__init__()
+        if int(theta_dim) < 1:
+            raise ValueError("theta_dim must be >= 1.")
+        if int(x_dim) < 1:
+            raise ValueError("x_dim must be >= 1.")
+        if int(hidden_dim) < 1:
+            raise ValueError("hidden_dim must be >= 1.")
+        if int(depth) < 1:
+            raise ValueError("depth must be >= 1.")
+        self.velocity_family = "condition_quadratic"
+        self.theta_dim = int(theta_dim)
+        self.x_dim = int(x_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.depth = int(depth)
+        self.n_quadratic_features = self.x_dim * (self.x_dim + 1) // 2
+        self.b_max = 3.0
+        self.network_architecture = "quadratic_conditioned_mlp"
+        _set_divergence_controls(
+            self,
+            divergence_estimator=divergence_estimator,
+            hutchinson_probes=int(hutchinson_probes),
+        )
+        cond_dim = 1 + self.theta_dim
+        self.b_net = _make_mlp(
+            in_dim=cond_dim,
+            out_dim=self.x_dim,
+            hidden_dim=self.hidden_dim,
+            depth=self.depth,
+            final_gain=0.01,
+        )
+        self.a_net = _make_mlp(
+            in_dim=cond_dim,
+            out_dim=self.x_dim * self.x_dim,
+            hidden_dim=self.hidden_dim,
+            depth=self.depth,
+            final_gain=0.01,
+        )
+        self.q_net = _make_mlp(
+            in_dim=cond_dim,
+            out_dim=self.x_dim * self.n_quadratic_features,
+            hidden_dim=self.hidden_dim,
+            depth=self.depth,
+            final_gain=0.01,
+        )
+
+    def _quadratic_features(self, x: torch.Tensor) -> torch.Tensor:
+        feats: list[torch.Tensor] = []
+        for i in range(self.x_dim):
+            xi = x[:, i]
+            for j in range(i, self.x_dim):
+                feats.append(xi * x[:, j])
+        return torch.stack(feats, dim=1)
+
+    def b(self, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        t = _as_col_t(t)
+        theta = _expand_theta_to_batch(theta, batch=int(t.shape[0]))
+        t = _as_col_t(t, batch=int(theta.shape[0]))
+        raw = self.b_net(torch.cat([t, theta], dim=1))
+        return self.b_max * torch.tanh(raw / self.b_max)
+
+    def A(self, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        t = _as_col_t(t)
+        theta = _expand_theta_to_batch(theta, batch=int(t.shape[0]))
+        t = _as_col_t(t, batch=int(theta.shape[0]))
+        raw = self.a_net(torch.cat([t, theta], dim=1))
+        return raw.reshape(int(theta.shape[0]), self.x_dim, self.x_dim)
+
+    def Q(self, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        t = _as_col_t(t)
+        theta = _expand_theta_to_batch(theta, batch=int(t.shape[0]))
+        t = _as_col_t(t, batch=int(theta.shape[0]))
+        raw = self.q_net(torch.cat([t, theta], dim=1))
+        return raw.reshape(int(theta.shape[0]), self.x_dim, self.n_quadratic_features)
+
+    def forward(self, x: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        theta = _expand_theta_to_batch(theta, batch=int(x.shape[0]))
+        t = _as_col_t(t, batch=int(x.shape[0]))
+        b = self.b(theta, t)
+        ax = _apply_matrix(self.A(theta, t), x)
+        q = self.Q(theta, t)
+        quad = torch.bmm(q, self._quadratic_features(x).unsqueeze(-1)).squeeze(-1)
+        return b + ax + quad
+
+    def log_prob_normalized(
+        self,
+        x_norm: torch.Tensor,
+        theta: torch.Tensor,
+        *,
+        solve_jitter: float = 1e-6,
+        quadrature_steps: int | None = None,
+        ode_steps: int = 32,
+        ode_method: str = "midpoint",
+    ) -> torch.Tensor:
+        return flow_endpoint_log_prob(
+            self,
+            x_norm,
+            theta,
+            solve_jitter=float(solve_jitter),
+            quadrature_steps=quadrature_steps,
+            ode_steps=int(ode_steps),
+            ode_method=str(ode_method),
+        )
+
+
+class ConditionTanhFlowSKLModel(nn.Module):
+    """Condition-specific rank-one tanh velocity with shared parameter trunk.
+
+    The velocity is ``v(x, theta, t) = b(theta,t) + u(theta,t) tanh(w(theta,t)^T x + d(theta,t))``.
+    """
+
+    def __init__(
+        self,
+        *,
+        theta_dim: int,
+        x_dim: int,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        divergence_estimator: str = "exact",
+        hutchinson_probes: int = 1,
+    ) -> None:
+        super().__init__()
+        if int(theta_dim) < 1:
+            raise ValueError("theta_dim must be >= 1.")
+        if int(x_dim) < 1:
+            raise ValueError("x_dim must be >= 1.")
+        if int(hidden_dim) < 1:
+            raise ValueError("hidden_dim must be >= 1.")
+        if int(depth) < 1:
+            raise ValueError("depth must be >= 1.")
+        self.velocity_family = "condition_tanh"
+        self.theta_dim = int(theta_dim)
+        self.x_dim = int(x_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.depth = int(depth)
+        self.network_architecture = "tanh_conditioned_shared_trunk"
+        _set_divergence_controls(
+            self,
+            divergence_estimator=divergence_estimator,
+            hutchinson_probes=int(hutchinson_probes),
+        )
+        self.trunk = _make_mlp(
+            in_dim=1 + self.theta_dim,
+            out_dim=self.hidden_dim,
+            hidden_dim=self.hidden_dim,
+            depth=self.depth,
+            final_gain=1.0,
+        )
+        self.b_head = nn.Linear(self.hidden_dim, self.x_dim)
+        self.u_head = nn.Linear(self.hidden_dim, self.x_dim)
+        self.w_head = nn.Linear(self.hidden_dim, self.x_dim)
+        self.d_head = nn.Linear(self.hidden_dim, 1)
+        for head in (self.b_head, self.u_head, self.w_head, self.d_head):
+            nn.init.xavier_uniform_(head.weight, gain=0.01)
+            nn.init.zeros_(head.bias)
+
+    def _trunk_features(self, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        t = _as_col_t(t)
+        theta = _expand_theta_to_batch(theta, batch=int(t.shape[0]))
+        t = _as_col_t(t, batch=int(theta.shape[0]))
+        return self.trunk(torch.cat([t, theta], dim=1))
+
+    def parameters_for(self, theta: torch.Tensor, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        h = self._trunk_features(theta, t)
+        return self.b_head(h), self.u_head(h), self.w_head(h), self.d_head(h)
+
+    def forward(self, x: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        theta = _expand_theta_to_batch(theta, batch=int(x.shape[0]))
+        t = _as_col_t(t, batch=int(x.shape[0]))
+        b, u, w, d = self.parameters_for(theta, t)
+        activation = torch.tanh(torch.sum(w * x, dim=1, keepdim=True) + d)
+        return b + u * activation
+
+    def log_prob_normalized(
+        self,
+        x_norm: torch.Tensor,
+        theta: torch.Tensor,
+        *,
+        solve_jitter: float = 1e-6,
+        quadrature_steps: int | None = None,
+        ode_steps: int = 32,
+        ode_method: str = "midpoint",
+    ) -> torch.Tensor:
+        return flow_endpoint_log_prob(
+            self,
+            x_norm,
+            theta,
+            solve_jitter=float(solve_jitter),
+            quadrature_steps=quadrature_steps,
+            ode_steps=int(ode_steps),
+            ode_method=str(ode_method),
+        )
+
+
+class ConditionTanhLinearFlowSKLModel(ConditionTanhFlowSKLModel):
+    """Condition-specific rank-one tanh velocity plus shared time-dependent linear term."""
+
+    def __init__(
+        self,
+        *,
+        theta_dim: int,
+        x_dim: int,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        divergence_estimator: str = "exact",
+        hutchinson_probes: int = 1,
+    ) -> None:
+        super().__init__(
+            theta_dim=theta_dim,
+            x_dim=x_dim,
+            hidden_dim=hidden_dim,
+            depth=depth,
+            divergence_estimator=divergence_estimator,
+            hutchinson_probes=hutchinson_probes,
+        )
+        self.velocity_family = "condition_tanh_linear"
+        self.network_architecture = "tanh_linear_conditioned_shared_trunk"
+        self.a_net = _make_mlp(
+            in_dim=1,
+            out_dim=self.x_dim * self.x_dim,
+            hidden_dim=self.hidden_dim,
+            depth=self.depth,
+            final_gain=0.01,
+        )
+
+    def A(self, t: torch.Tensor) -> torch.Tensor:
+        t = _as_col_t(t)
+        raw = self.a_net(t)
+        return raw.reshape(int(t.shape[0]), self.x_dim, self.x_dim)
+
+    def forward(self, x: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        theta = _expand_theta_to_batch(theta, batch=int(x.shape[0]))
+        t = _as_col_t(t, batch=int(x.shape[0]))
+        b, u, w, d = self.parameters_for(theta, t)
+        activation = torch.tanh(torch.sum(w * x, dim=1, keepdim=True) + d)
+        ax = _apply_matrix(self.A(t), x)
+        return b + ax + u * activation
+
+
+class ConditionFixedInputLowRankFlowSKLModel(nn.Module):
+    """Condition-specific velocity with fixed low-rank input and full-dimensional correction."""
+
+    def __init__(
+        self,
+        *,
+        theta_dim: int,
+        x_dim: int,
+        correction_rank: int,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        divergence_estimator: str = "exact",
+        hutchinson_probes: int = 1,
+        low_rank_basis: np.ndarray | torch.Tensor | None = None,
+    ) -> None:
+        super().__init__()
+        if int(theta_dim) < 1:
+            raise ValueError("theta_dim must be >= 1.")
+        if int(x_dim) < 1:
+            raise ValueError("x_dim must be >= 1.")
+        if int(correction_rank) < 1:
+            raise ValueError("correction_rank must be >= 1.")
+        if int(correction_rank) > int(x_dim):
+            raise ValueError("correction_rank must be <= x_dim.")
+        if int(hidden_dim) < 1:
+            raise ValueError("hidden_dim must be >= 1.")
+        if int(depth) < 1:
+            raise ValueError("depth must be >= 1.")
+        if low_rank_basis is None:
+            raise ValueError("condition_fixed_input_low_rank requires fixed low_rank_basis.")
+
+        self.velocity_family = "condition_fixed_input_low_rank"
+        self.theta_dim = int(theta_dim)
+        self.x_dim = int(x_dim)
+        self.correction_rank = int(correction_rank)
+        self.hidden_dim = int(hidden_dim)
+        self.depth = int(depth)
+        self.network_architecture = "fixed_input_low_rank_conditioned_film"
+        _set_divergence_controls(
+            self,
+            divergence_estimator=divergence_estimator,
+            hutchinson_probes=int(hutchinson_probes),
+        )
+
+        basis = torch.as_tensor(low_rank_basis, dtype=torch.float32)
+        if basis.ndim != 2 or tuple(basis.shape) != (self.x_dim, self.correction_rank):
+            raise ValueError(
+                "low_rank_basis must have shape "
+                f"({self.x_dim}, {self.correction_rank}); got {tuple(basis.shape)}."
+            )
+        if not torch.isfinite(basis).all():
+            raise ValueError("low_rank_basis must contain only finite values.")
+        gram = basis.T @ basis
+        eye = torch.eye(self.correction_rank, dtype=basis.dtype)
+        if not torch.allclose(gram, eye, rtol=1e-4, atol=1e-5):
+            raise ValueError("low_rank_basis columns must be orthonormal.")
+        self.low_rank_basis_mode = "fixed"
+        self.register_buffer("fixed_u", basis.contiguous())
+
+        self.b_net = _make_mlp(
+            in_dim=1 + self.theta_dim,
+            out_dim=self.x_dim,
+            hidden_dim=self.hidden_dim,
+            depth=self.depth,
+            final_gain=0.01,
+        )
+        self.a_net = _make_mlp(
+            in_dim=1,
+            out_dim=self.x_dim * self.x_dim,
+            hidden_dim=self.hidden_dim,
+            depth=self.depth,
+            final_gain=0.01,
+        )
+        self.h_net = _make_film_net(
+            trunk_dim=self.correction_rank,
+            theta_dim=self.theta_dim,
+            out_dim=self.x_dim,
+            hidden_dim=self.hidden_dim,
+            depth=self.depth,
+            final_gain=0.0,
+        )
+
+    @property
+    def U(self) -> torch.Tensor:
+        """Fixed low-rank input basis columns with shape ``[D, r]``."""
+
+        return self.fixed_u
+
+    def b(self, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        t = _as_col_t(t)
+        theta = _expand_theta_to_batch(theta, batch=int(t.shape[0]))
+        t = _as_col_t(t, batch=int(theta.shape[0]))
+        return self.b_net(torch.cat([t, theta], dim=1))
+
+    def A(self, t: torch.Tensor) -> torch.Tensor:
+        t = _as_col_t(t)
+        raw = self.a_net(t)
+        return raw.reshape(int(t.shape[0]), self.x_dim, self.x_dim)
+
+    def forward(self, x: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        theta = _expand_theta_to_batch(theta, batch=int(x.shape[0]))
+        t = _as_col_t(t, batch=int(x.shape[0]))
+        z = x @ self.U
+        h = self.h_net(z, theta, t)
+        return self.b(theta, t) + _apply_matrix(self.A(t), x) + h
+
+    def log_prob_normalized(
+        self,
+        x_norm: torch.Tensor,
+        theta: torch.Tensor,
+        *,
+        solve_jitter: float = 1e-6,
+        quadrature_steps: int | None = None,
+        ode_steps: int = 32,
+        ode_method: str = "midpoint",
+    ) -> torch.Tensor:
+        return flow_endpoint_log_prob(
+            self,
+            x_norm,
+            theta,
+            solve_jitter=float(solve_jitter),
+            quadrature_steps=quadrature_steps,
+            ode_steps=int(ode_steps),
+            ode_method=str(ode_method),
+        )
+
+
 class CenteredSharedAffineLowRankFlowSKLModel(CenteredSharedAffineFlowSKLModel):
     """Centered shared-affine velocity plus ``U h(theta,t,U^T centered_x)``."""
 
@@ -1010,6 +1402,7 @@ class CenteredSharedAffineLowRankFlowSKLModel(CenteredSharedAffineFlowSKLModel):
         divergence_estimator: str = "hutchinson",
         hutchinson_probes: int = 1,
         a_diag_jitter: float = 1e-3,
+        low_rank_basis: np.ndarray | torch.Tensor | None = None,
     ) -> None:
         if int(correction_rank) < 1:
             raise ValueError("correction_rank must be >= 1.")
@@ -1032,9 +1425,26 @@ class CenteredSharedAffineLowRankFlowSKLModel(CenteredSharedAffineFlowSKLModel):
         )
         self.velocity_family = "shared_affine_low_rank"
         self.correction_rank = int(correction_rank)
-        u_lin = nn.Linear(self.correction_rank, self.x_dim, bias=False)
-        nn.init.orthogonal_(u_lin.weight)
-        self.u_layer = parametrizations.orthogonal(u_lin, "weight", orthogonal_map="householder")
+        if low_rank_basis is None:
+            self.low_rank_basis_mode = "learned"
+            u_lin = nn.Linear(self.correction_rank, self.x_dim, bias=False)
+            nn.init.orthogonal_(u_lin.weight)
+            self.u_layer = parametrizations.orthogonal(u_lin, "weight", orthogonal_map="householder")
+        else:
+            basis = torch.as_tensor(low_rank_basis, dtype=torch.float32)
+            if basis.ndim != 2 or tuple(basis.shape) != (self.x_dim, self.correction_rank):
+                raise ValueError(
+                    "low_rank_basis must have shape "
+                    f"({self.x_dim}, {self.correction_rank}); got {tuple(basis.shape)}."
+                )
+            if not torch.isfinite(basis).all():
+                raise ValueError("low_rank_basis must contain only finite values.")
+            gram = basis.T @ basis
+            eye = torch.eye(self.correction_rank, dtype=basis.dtype)
+            if not torch.allclose(gram, eye, rtol=1e-4, atol=1e-5):
+                raise ValueError("low_rank_basis columns must be orthonormal.")
+            self.low_rank_basis_mode = "fixed"
+            self.register_buffer("fixed_u", basis.contiguous())
         self.h_net = _make_film_net(
             trunk_dim=self.correction_rank,
             theta_dim=self.theta_dim,
@@ -1048,6 +1458,8 @@ class CenteredSharedAffineLowRankFlowSKLModel(CenteredSharedAffineFlowSKLModel):
     def U(self) -> torch.Tensor:
         """Low-rank basis columns with shape ``[D, r]``."""
 
+        if self.low_rank_basis_mode == "fixed":
+            return self.fixed_u
         return self.u_layer.weight
 
     def _centered_inputs(
@@ -1111,6 +1523,7 @@ class CenteredSharedAffineLowRankScalarFlowSKLModel(CenteredSharedAffineLowRankF
         divergence_estimator: str = "hutchinson",
         hutchinson_probes: int = 1,
         a_diag_jitter: float = 1e-3,
+        low_rank_basis: np.ndarray | torch.Tensor | None = None,
     ) -> None:
         super().__init__(
             theta_dim=theta_dim,
@@ -1123,6 +1536,7 @@ class CenteredSharedAffineLowRankScalarFlowSKLModel(CenteredSharedAffineLowRankF
             divergence_estimator=divergence_estimator,
             hutchinson_probes=hutchinson_probes,
             a_diag_jitter=float(a_diag_jitter),
+            low_rank_basis=low_rank_basis,
         )
         self.velocity_family = "shared_affine_low_rank_scalar"
         self.a_net = _make_mlp(
@@ -1154,6 +1568,7 @@ class CenteredSharedAffineLowRankDiagFlowSKLModel(CenteredSharedAffineLowRankFlo
         divergence_estimator: str = "hutchinson",
         hutchinson_probes: int = 1,
         a_diag_jitter: float = 1e-3,
+        low_rank_basis: np.ndarray | torch.Tensor | None = None,
     ) -> None:
         super().__init__(
             theta_dim=theta_dim,
@@ -1166,6 +1581,7 @@ class CenteredSharedAffineLowRankDiagFlowSKLModel(CenteredSharedAffineLowRankFlo
             divergence_estimator=divergence_estimator,
             hutchinson_probes=hutchinson_probes,
             a_diag_jitter=float(a_diag_jitter),
+            low_rank_basis=low_rank_basis,
         )
         self.velocity_family = "shared_affine_low_rank_diag"
         self.a_net = _make_mlp(
@@ -1195,6 +1611,7 @@ def build_flow_skl_model(
     divergence_estimator: str = "hutchinson",
     hutchinson_probes: int = 1,
     shared_affine_a_diag_jitter: float = 1e-3,
+    low_rank_basis: np.ndarray | torch.Tensor | None = None,
 ) -> nn.Module:
     """Build a velocity-family model for flow-matching SKL estimation."""
 
@@ -1241,6 +1658,33 @@ def build_flow_skl_model(
             hutchinson_probes=int(hutchinson_probes),
             **common,
         )
+    if fam == "condition_quadratic":
+        return ConditionQuadraticFlowSKLModel(
+            divergence_estimator=str(divergence_estimator),
+            hutchinson_probes=int(hutchinson_probes),
+            **common,
+        )
+    if fam == "condition_tanh":
+        return ConditionTanhFlowSKLModel(
+            divergence_estimator=str(divergence_estimator),
+            hutchinson_probes=int(hutchinson_probes),
+            **common,
+        )
+    if fam == "condition_tanh_linear":
+        return ConditionTanhLinearFlowSKLModel(
+            divergence_estimator=str(divergence_estimator),
+            hutchinson_probes=int(hutchinson_probes),
+            **common,
+        )
+    if fam == "condition_fixed_input_low_rank":
+        rank = resolve_lxf_low_rank_dim(int(low_rank_dim), int(x_dim), log_prefix="[flow-skl] ")
+        return ConditionFixedInputLowRankFlowSKLModel(
+            correction_rank=rank,
+            divergence_estimator=str(divergence_estimator),
+            hutchinson_probes=int(hutchinson_probes),
+            low_rank_basis=low_rank_basis,
+            **common,
+        )
     low_rank_affine_classes = {
         "shared_affine_low_rank": CenteredSharedAffineLowRankFlowSKLModel,
         "shared_affine_low_rank_scalar": CenteredSharedAffineLowRankScalarFlowSKLModel,
@@ -1255,6 +1699,7 @@ def build_flow_skl_model(
             divergence_estimator=str(divergence_estimator),
             hutchinson_probes=int(hutchinson_probes),
             a_diag_jitter=float(shared_affine_a_diag_jitter),
+            low_rank_basis=low_rank_basis,
             **common,
         )
     if fam == "nonlinear":

@@ -259,6 +259,9 @@ def _first_linear_in_features(module: nn.Sequential) -> int:
 
 def test_build_flow_skl_model_uses_mlp_heads_and_film_nonlinear_subnets() -> None:
     for family in VELOCITY_FAMILIES:
+        kwargs = {}
+        if family == "condition_fixed_input_low_rank":
+            kwargs["low_rank_basis"] = np.asarray([[0.0], [1.0], [0.0]], dtype=np.float64)
         model = build_flow_skl_model(
             velocity_family=family,
             theta_dim=2,
@@ -267,8 +270,18 @@ def test_build_flow_skl_model_uses_mlp_heads_and_film_nonlinear_subnets() -> Non
             depth=1,
             low_rank_dim=1,
             path_schedule="linear",
+            **kwargs,
         )
-        assert getattr(model, "network_architecture") == "film"
+        if family == "condition_quadratic":
+            assert getattr(model, "network_architecture") == "quadratic_conditioned_mlp"
+        elif family == "condition_tanh":
+            assert getattr(model, "network_architecture") == "tanh_conditioned_shared_trunk"
+        elif family == "condition_tanh_linear":
+            assert getattr(model, "network_architecture") == "tanh_linear_conditioned_shared_trunk"
+        elif family == "condition_fixed_input_low_rank":
+            assert getattr(model, "network_architecture") == "fixed_input_low_rank_conditioned_film"
+        else:
+            assert getattr(model, "network_architecture") == "film"
         if family in (
             "translation",
             "translation_fixed_norm",
@@ -282,6 +295,42 @@ def test_build_flow_skl_model_uses_mlp_heads_and_film_nonlinear_subnets() -> Non
             assert model.net.trunk_dim == 3
             assert model.net.theta_dim == 2
             assert isinstance(model.net.theta_embedding, nn.Linear)
+        elif family == "condition_quadratic":
+            assert isinstance(model.b_net, nn.Sequential)
+            assert _first_linear_in_features(model.b_net) == 3
+            assert isinstance(model.a_net, nn.Sequential)
+            assert _first_linear_in_features(model.a_net) == 3
+            assert isinstance(model.q_net, nn.Sequential)
+            assert _first_linear_in_features(model.q_net) == 3
+            assert model.n_quadratic_features == 6
+        elif family in ("condition_tanh", "condition_tanh_linear"):
+            assert isinstance(model.trunk, nn.Sequential)
+            assert _first_linear_in_features(model.trunk) == 3
+            assert isinstance(model.b_head, nn.Linear)
+            assert isinstance(model.u_head, nn.Linear)
+            assert isinstance(model.w_head, nn.Linear)
+            assert isinstance(model.d_head, nn.Linear)
+            assert model.b_head.in_features == 4
+            assert model.u_head.in_features == 4
+            assert model.w_head.in_features == 4
+            assert model.d_head.in_features == 4
+            assert model.b_head.out_features == 3
+            assert model.u_head.out_features == 3
+            assert model.w_head.out_features == 3
+            assert model.d_head.out_features == 1
+            if family == "condition_tanh_linear":
+                assert isinstance(model.a_net, nn.Sequential)
+                assert _first_linear_in_features(model.a_net) == 1
+        elif family == "condition_fixed_input_low_rank":
+            assert isinstance(model.b_net, nn.Sequential)
+            assert _first_linear_in_features(model.b_net) == 3
+            assert isinstance(model.a_net, nn.Sequential)
+            assert _first_linear_in_features(model.a_net) == 1
+            assert isinstance(model.h_net, fms._ConditionedFiLMNet)  # type: ignore[attr-defined]
+            assert model.h_net.trunk_dim == 1
+            assert model.h_net.out_dim == 3
+            assert model.h_net.theta_dim == 2
+            assert isinstance(model.h_net.theta_embedding, nn.Linear)
         else:
             assert isinstance(model.b_net, nn.Sequential)
             assert _first_linear_in_features(model.b_net) == 2
@@ -335,11 +384,15 @@ def test_build_flow_skl_model_constructs_restricted_velocity_families() -> None:
         "shared_affine_diag": "CenteredSharedAffineDiagFlowSKLModel",
         "condition_affine_scalar": "CenteredConditionAffineScalarFlowSKLModel",
         "condition_affine_diag": "CenteredConditionAffineDiagFlowSKLModel",
+        "condition_fixed_input_low_rank": "ConditionFixedInputLowRankFlowSKLModel",
         "shared_affine_low_rank_scalar": "CenteredSharedAffineLowRankScalarFlowSKLModel",
         "shared_affine_low_rank_diag": "CenteredSharedAffineLowRankDiagFlowSKLModel",
     }
     for family, class_name in expected.items():
         assert family in VELOCITY_FAMILIES
+        kwargs = {}
+        if family == "condition_fixed_input_low_rank":
+            kwargs["low_rank_basis"] = np.asarray([[0.0], [1.0], [0.0]], dtype=np.float64)
         model = build_flow_skl_model(
             velocity_family=family,
             theta_dim=2,
@@ -348,6 +401,7 @@ def test_build_flow_skl_model_constructs_restricted_velocity_families() -> None:
             depth=1,
             low_rank_dim=1,
             path_schedule="linear",
+            **kwargs,
         )
         assert model.velocity_family == family
         assert type(model).__name__ == class_name
@@ -866,6 +920,109 @@ def test_shared_affine_low_rank_forward_centers_low_rank_correction() -> None:
     torch.testing.assert_close(model(x, theta, t), expected, rtol=1e-12, atol=1e-12)
 
 
+def test_shared_affine_low_rank_can_use_fixed_oracle_basis() -> None:
+    basis = np.asarray([[1.0], [0.0]], dtype=np.float64)
+    model = build_flow_skl_model(
+        velocity_family="shared_affine_low_rank",
+        theta_dim=2,
+        x_dim=2,
+        hidden_dim=4,
+        depth=1,
+        low_rank_dim=1,
+        path_schedule="linear",
+        low_rank_basis=basis,
+    ).double()
+
+    assert model.low_rank_basis_mode == "fixed"
+    assert "fixed_u" in dict(model.named_buffers())
+    assert not any(name.startswith("u_layer") for name, _ in model.named_parameters())
+    torch.testing.assert_close(model.U, torch.as_tensor(basis, dtype=torch.float64))
+
+
+def test_condition_fixed_input_low_rank_can_use_fixed_x2_basis() -> None:
+    basis = np.asarray([[0.0], [1.0]], dtype=np.float64)
+    model = build_flow_skl_model(
+        velocity_family="condition_fixed_input_low_rank",
+        theta_dim=2,
+        x_dim=2,
+        hidden_dim=4,
+        depth=1,
+        low_rank_dim=1,
+        path_schedule="linear",
+        low_rank_basis=basis,
+    ).double()
+
+    assert model.low_rank_basis_mode == "fixed"
+    assert "fixed_u" in dict(model.named_buffers())
+    torch.testing.assert_close(model.U, torch.as_tensor(basis, dtype=torch.float64))
+
+
+def test_condition_fixed_input_low_rank_rejects_missing_or_nonorthonormal_basis() -> None:
+    with pytest.raises(ValueError, match="requires fixed low_rank_basis"):
+        build_flow_skl_model(
+            velocity_family="condition_fixed_input_low_rank",
+            theta_dim=2,
+            x_dim=2,
+            hidden_dim=4,
+            depth=1,
+            low_rank_dim=1,
+            path_schedule="linear",
+        )
+
+    with pytest.raises(ValueError, match="orthonormal"):
+        build_flow_skl_model(
+            velocity_family="condition_fixed_input_low_rank",
+            theta_dim=2,
+            x_dim=2,
+            hidden_dim=4,
+            depth=1,
+            low_rank_dim=1,
+            path_schedule="linear",
+            low_rank_basis=np.asarray([[0.0], [2.0]], dtype=np.float64),
+        )
+
+
+def test_condition_fixed_input_low_rank_can_move_x1_from_x2_coordinate() -> None:
+    class X1FromReducedNet(nn.Module):
+        def forward(self, trunk: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+            del theta, t
+            return torch.cat([trunk[:, :1], torch.zeros_like(trunk[:, :1])], dim=1)
+
+    model = build_flow_skl_model(
+        velocity_family="condition_fixed_input_low_rank",
+        theta_dim=2,
+        x_dim=2,
+        hidden_dim=4,
+        depth=1,
+        low_rank_dim=1,
+        path_schedule="linear",
+        low_rank_basis=np.asarray([[0.0], [1.0]], dtype=np.float64),
+    ).double()
+    model.b_net = ConstantNet(torch.zeros(2, dtype=torch.float64))
+    model.a_net = ConstantNet(torch.zeros(4, dtype=torch.float64))
+    model.h_net = X1FromReducedNet()
+
+    x = torch.tensor([[5.0, 2.0], [-3.0, -1.5]], dtype=torch.float64)
+    theta = torch.eye(2, dtype=torch.float64)
+    t = torch.tensor([[0.25], [0.75]], dtype=torch.float64)
+    expected = torch.tensor([[2.0, 0.0], [-1.5, 0.0]], dtype=torch.float64)
+    torch.testing.assert_close(model(x, theta, t), expected, rtol=1e-12, atol=1e-12)
+
+
+def test_shared_affine_low_rank_rejects_nonorthonormal_fixed_basis() -> None:
+    with pytest.raises(ValueError, match="orthonormal"):
+        build_flow_skl_model(
+            velocity_family="shared_affine_low_rank",
+            theta_dim=2,
+            x_dim=2,
+            hidden_dim=4,
+            depth=1,
+            low_rank_dim=1,
+            path_schedule="linear",
+            low_rank_basis=np.asarray([[2.0], [0.0]], dtype=np.float64),
+        )
+
+
 def test_shared_affine_low_rank_scalar_forward_includes_scalar_base_and_correction() -> None:
     model = build_flow_skl_model(
         velocity_family="shared_affine_low_rank_scalar",
@@ -918,6 +1075,93 @@ def test_shared_affine_low_rank_diag_forward_includes_diagonal_base_and_correcti
     u = model.U.detach()
     expected = b + centered * diag.reshape(1, -1) + (centered @ u) @ u.T
     torch.testing.assert_close(model(x, theta, t), expected, rtol=1e-12, atol=1e-12)
+
+
+def test_condition_tanh_forward_uses_shared_trunk_and_heads() -> None:
+    model = build_flow_skl_model(
+        velocity_family="condition_tanh",
+        theta_dim=2,
+        x_dim=2,
+        hidden_dim=5,
+        depth=1,
+        path_schedule="linear",
+        divergence_estimator="exact",
+    ).double()
+    assert type(model).__name__ == "ConditionTanhFlowSKLModel"
+    assert isinstance(model.trunk, nn.Sequential)
+    assert all(isinstance(getattr(model, name), nn.Linear) for name in ("b_head", "u_head", "w_head", "d_head"))
+
+    x = torch.tensor([[0.3, -0.4], [1.0, 0.5], [-0.2, 0.7]], dtype=torch.float64)
+    theta = torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 0.0]], dtype=torch.float64)
+    t = torch.tensor([[0.2], [0.5], [0.8]], dtype=torch.float64)
+    y = model(x, theta, t)
+    assert y.shape == x.shape
+    assert y.dtype == torch.float64
+
+    b, u, w, d = model.parameters_for(theta, t)
+    expected = b + u * torch.tanh(torch.sum(w * x, dim=1, keepdim=True) + d)
+    torch.testing.assert_close(y, expected, rtol=1e-12, atol=1e-12)
+
+
+def test_condition_tanh_endpoint_likelihood_is_finite() -> None:
+    model = build_flow_skl_model(
+        velocity_family="condition_tanh",
+        theta_dim=2,
+        x_dim=2,
+        hidden_dim=4,
+        depth=1,
+        path_schedule="linear",
+        divergence_estimator="exact",
+    )
+    x = torch.tensor([[0.1, -0.2], [0.4, 0.3]], dtype=torch.float32)
+    theta = torch.tensor([[1.0, 0.0], [0.0, 1.0]], dtype=torch.float32)
+    logp = flow_endpoint_log_prob(model, x, theta, ode_steps=2, ode_method="midpoint")
+    assert logp.shape == (2,)
+    assert torch.isfinite(logp).all()
+
+
+def test_condition_tanh_linear_forward_adds_shared_time_linear_term() -> None:
+    model = build_flow_skl_model(
+        velocity_family="condition_tanh_linear",
+        theta_dim=2,
+        x_dim=2,
+        hidden_dim=5,
+        depth=1,
+        path_schedule="linear",
+        divergence_estimator="exact",
+    ).double()
+    assert type(model).__name__ == "ConditionTanhLinearFlowSKLModel"
+    assert isinstance(model.trunk, nn.Sequential)
+    assert isinstance(model.a_net, nn.Sequential)
+
+    x = torch.tensor([[0.3, -0.4], [1.0, 0.5], [-0.2, 0.7]], dtype=torch.float64)
+    theta = torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 0.0]], dtype=torch.float64)
+    t = torch.tensor([[0.2], [0.5], [0.8]], dtype=torch.float64)
+    y = model(x, theta, t)
+    assert y.shape == x.shape
+    assert y.dtype == torch.float64
+
+    b, u, w, d = model.parameters_for(theta, t)
+    expected_tanh = b + u * torch.tanh(torch.sum(w * x, dim=1, keepdim=True) + d)
+    expected = expected_tanh + torch.bmm(model.A(t), x.unsqueeze(-1)).squeeze(-1)
+    torch.testing.assert_close(y, expected, rtol=1e-12, atol=1e-12)
+
+
+def test_condition_tanh_linear_endpoint_likelihood_is_finite() -> None:
+    model = build_flow_skl_model(
+        velocity_family="condition_tanh_linear",
+        theta_dim=2,
+        x_dim=2,
+        hidden_dim=4,
+        depth=1,
+        path_schedule="linear",
+        divergence_estimator="exact",
+    )
+    x = torch.tensor([[0.1, -0.2], [0.4, 0.3]], dtype=torch.float32)
+    theta = torch.tensor([[1.0, 0.0], [0.0, 1.0]], dtype=torch.float32)
+    logp = flow_endpoint_log_prob(model, x, theta, ode_steps=2, ode_method="midpoint")
+    assert logp.shape == (2,)
+    assert torch.isfinite(logp).all()
 
 
 def test_shared_affine_families_report_model_jeffreys_without_endpoint_diagnostics(
