@@ -1,5 +1,9 @@
 # AGENTS Instructions
 
+## Branch Purpose
+
+- The purpose of this branch is to compute Fisher information using the flow matching method and compare it to the classical method.
+
 ## Runtime Environment (Mandatory)
 
 - Always run Python/code commands inside the `mamba` environment `geo_diffusion`.
