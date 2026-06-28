@@ -20,6 +20,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from fisher.gaussian_x_flow import GaussianAffinePathSchedule, path_schedule_from_name
 from fisher.linear_x_flow import resolve_lxf_low_rank_dim
+from fisher.model_weight_ema import scalar_val_ema_update
 
 
 VELOCITY_FAMILIES = (
@@ -97,6 +98,134 @@ def _as_col_t(t: torch.Tensor, *, batch: int | None = None) -> torch.Tensor:
     if batch is not None and int(t.shape[0]) == 1 and int(batch) > 1:
         t = t.expand(int(batch), 1)
     return t
+
+
+class _FiLMResidualBlock(nn.Module):
+    """Residual hidden block modulated by a condition vector."""
+
+    def __init__(self, *, hidden_dim: int, cond_dim: int) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(int(hidden_dim))
+        self.film = nn.Linear(int(cond_dim), 2 * int(hidden_dim))
+        nn.init.zeros_(self.film.weight)
+        nn.init.zeros_(self.film.bias)
+        self.branch = _make_mlp(
+            in_dim=int(hidden_dim),
+            out_dim=int(hidden_dim),
+            hidden_dim=int(hidden_dim),
+            depth=1,
+            final_gain=0.01,
+        )
+
+    def forward(self, h: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        gamma, beta = self.film(cond).chunk(2, dim=1)
+        y = (1.0 + gamma) * self.norm(h) + beta
+        return h + self.branch(y)
+
+
+class _SinusoidalTimeEmbedding(nn.Module):
+    """Sinusoidal embedding for scalar time columns."""
+
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        if int(dim) < 1:
+            raise ValueError("dim must be >= 1.")
+        self.dim = int(dim)
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        t = _as_col_t(t)
+        half = self.dim // 2
+        if half == 0:
+            return t
+        freqs = torch.exp(
+            torch.arange(half, dtype=t.dtype, device=t.device)
+            * (-math.log(10000.0) / max(1, half - 1))
+        )
+        angles = t * freqs.reshape(1, half)
+        emb = torch.cat([torch.sin(angles), torch.cos(angles)], dim=1)
+        if self.dim % 2:
+            emb = torch.cat([emb, torch.zeros(int(t.shape[0]), 1, dtype=t.dtype, device=t.device)], dim=1)
+        return emb
+
+
+class _ConditionedFiLMNet(nn.Module):
+    """FiLM residual network conditioned on sinusoidal time and linear theta embeddings."""
+
+    def __init__(
+        self,
+        *,
+        trunk_dim: int,
+        theta_dim: int,
+        out_dim: int,
+        hidden_dim: int,
+        depth: int,
+        final_gain: float = 0.01,
+    ) -> None:
+        super().__init__()
+        if int(trunk_dim) < 1 or int(theta_dim) < 1 or int(out_dim) < 1 or int(hidden_dim) < 1:
+            raise ValueError("trunk_dim, theta_dim, out_dim, and hidden_dim must be >= 1.")
+        if int(depth) < 1:
+            raise ValueError("depth must be >= 1.")
+        self.network_architecture = "film"
+        self.trunk_dim = int(trunk_dim)
+        self.theta_dim = int(theta_dim)
+        self.out_dim = int(out_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.depth = int(depth)
+
+        self.trunk_proj = nn.Linear(self.trunk_dim, self.hidden_dim)
+        nn.init.xavier_uniform_(self.trunk_proj.weight, gain=float(nn.init.calculate_gain("relu")))
+        nn.init.zeros_(self.trunk_proj.bias)
+        self.activation = nn.SiLU()
+        self.time_embedding = _SinusoidalTimeEmbedding(self.hidden_dim)
+        self.theta_embedding = nn.Linear(self.theta_dim, self.hidden_dim)
+        nn.init.xavier_uniform_(self.theta_embedding.weight, gain=1.0)
+        nn.init.zeros_(self.theta_embedding.bias)
+        self.condition_mlp = _make_mlp(
+            in_dim=2 * self.hidden_dim,
+            out_dim=self.hidden_dim,
+            hidden_dim=self.hidden_dim,
+            depth=1,
+            final_gain=1.0,
+        )
+        self.blocks = nn.ModuleList(
+            [_FiLMResidualBlock(hidden_dim=self.hidden_dim, cond_dim=self.hidden_dim) for _ in range(self.depth)]
+        )
+        self.out = nn.Linear(self.hidden_dim, self.out_dim)
+        nn.init.xavier_uniform_(self.out.weight, gain=float(final_gain))
+        nn.init.zeros_(self.out.bias)
+
+    def forward(self, trunk: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        if trunk.ndim != 2 or int(trunk.shape[1]) != self.trunk_dim:
+            raise ValueError(f"FiLM trunk input must have shape [B, {self.trunk_dim}].")
+        theta = _expand_theta_to_batch(theta, batch=int(trunk.shape[0]))
+        if int(theta.shape[1]) != self.theta_dim:
+            raise ValueError(f"theta must have {self.theta_dim} features.")
+        t = _as_col_t(t, batch=int(trunk.shape[0]))
+        h = self.activation(self.trunk_proj(trunk))
+        cond = self.condition_mlp(torch.cat([self.time_embedding(t), self.theta_embedding(theta)], dim=1))
+        for block in self.blocks:
+            h = block(h, cond)
+        return self.out(h)
+
+
+def _make_film_net(
+    *,
+    trunk_dim: int,
+    theta_dim: int,
+    out_dim: int,
+    hidden_dim: int,
+    depth: int,
+    final_gain: float = 0.01,
+) -> _ConditionedFiLMNet:
+    return _ConditionedFiLMNet(
+        trunk_dim=int(trunk_dim),
+        theta_dim=int(theta_dim),
+        out_dim=int(out_dim),
+        hidden_dim=int(hidden_dim),
+        depth=int(depth),
+        final_gain=float(final_gain),
+    )
 
 
 def _make_mlp(
@@ -371,6 +500,7 @@ class TranslationFlowSKLModel(nn.Module):
             hutchinson_probes=int(hutchinson_probes),
         )
         self.set_path_schedule(path_schedule)
+        self.network_architecture = "film"
         self.mean_net = _make_mlp(
             in_dim=self.theta_dim,
             out_dim=self.x_dim,
@@ -421,8 +551,8 @@ class TranslationFlowSKLModel(nn.Module):
         )
 
 
-class ConditionalNonlinearXFlowMLP(nn.Module):
-    """Unconstrained conditional velocity with reverse-ODE likelihood."""
+class ConditionalNonlinearXFlowFiLM(nn.Module):
+    """Unconstrained FiLM conditional velocity with reverse-ODE likelihood."""
 
     def __init__(
         self,
@@ -443,8 +573,10 @@ class ConditionalNonlinearXFlowMLP(nn.Module):
             divergence_estimator=divergence_estimator,
             hutchinson_probes=int(hutchinson_probes),
         )
-        self.net = _make_mlp(
-            in_dim=self.x_dim + 1 + self.theta_dim,
+        self.network_architecture = "film"
+        self.net = _make_film_net(
+            trunk_dim=self.x_dim,
+            theta_dim=self.theta_dim,
             out_dim=self.x_dim,
             hidden_dim=int(hidden_dim),
             depth=int(depth),
@@ -455,7 +587,7 @@ class ConditionalNonlinearXFlowMLP(nn.Module):
         if theta.ndim == 1:
             theta = theta.unsqueeze(-1)
         t = _as_col_t(t, batch=int(x.shape[0]))
-        return self.net(torch.cat([x, t, theta], dim=1))
+        return self.net(x, theta, t)
 
     def log_prob_normalized(
         self,
@@ -476,6 +608,9 @@ class ConditionalNonlinearXFlowMLP(nn.Module):
             ode_steps=int(ode_steps),
             ode_method=str(ode_method),
         )
+
+
+ConditionalNonlinearXFlowMLP = ConditionalNonlinearXFlowFiLM
 
 
 class _CenteredAffineFlowSKLBase(nn.Module):
@@ -509,6 +644,7 @@ class _CenteredAffineFlowSKLBase(nn.Module):
         self.hidden_dim = int(hidden_dim)
         self.depth = int(depth)
         self.quadrature_steps = int(quadrature_steps)
+        self.network_architecture = "film"
         _set_divergence_controls(
             self,
             divergence_estimator=divergence_estimator,
@@ -733,7 +869,7 @@ class CenteredConditionAffineFlowSKLModel(_CenteredAffineFlowSKLBase):
         )
         self.velocity_family = "condition_affine"
         self.a_net = _make_mlp(
-            in_dim=self.theta_dim + 1,
+            in_dim=1 + self.theta_dim,
             out_dim=self.x_dim * self.x_dim,
             hidden_dim=self.hidden_dim,
             depth=self.depth,
@@ -803,7 +939,7 @@ class CenteredConditionAffineScalarFlowSKLModel(CenteredConditionAffineFlowSKLMo
         )
         self.velocity_family = "condition_affine_scalar"
         self.a_net = _make_mlp(
-            in_dim=self.theta_dim + 1,
+            in_dim=1 + self.theta_dim,
             out_dim=1,
             hidden_dim=self.hidden_dim,
             depth=self.depth,
@@ -844,7 +980,7 @@ class CenteredConditionAffineDiagFlowSKLModel(CenteredConditionAffineFlowSKLMode
         )
         self.velocity_family = "condition_affine_diag"
         self.a_net = _make_mlp(
-            in_dim=self.theta_dim + 1,
+            in_dim=1 + self.theta_dim,
             out_dim=self.x_dim,
             hidden_dim=self.hidden_dim,
             depth=self.depth,
@@ -899,8 +1035,9 @@ class CenteredSharedAffineLowRankFlowSKLModel(CenteredSharedAffineFlowSKLModel):
         u_lin = nn.Linear(self.correction_rank, self.x_dim, bias=False)
         nn.init.orthogonal_(u_lin.weight)
         self.u_layer = parametrizations.orthogonal(u_lin, "weight", orthogonal_map="householder")
-        self.h_net = _make_mlp(
-            in_dim=self.correction_rank + 1 + self.theta_dim,
+        self.h_net = _make_film_net(
+            trunk_dim=self.correction_rank,
+            theta_dim=self.theta_dim,
             out_dim=self.correction_rank,
             hidden_dim=self.hidden_dim,
             depth=self.depth,
@@ -931,7 +1068,10 @@ class CenteredSharedAffineLowRankFlowSKLModel(CenteredSharedAffineFlowSKLModel):
         a_part = _apply_matrix(self.A(t), centered)
         u_mat = self.U
         z = centered @ u_mat
-        h = self.h_net(torch.cat([z, t, theta], dim=1))
+        if isinstance(self.h_net, _ConditionedFiLMNet):
+            h = self.h_net(z, theta, t)
+        else:
+            h = self.h_net(torch.cat([z, t, theta], dim=1))
         return beta_dot * b + a_part + h @ u_mat.transpose(0, 1)
 
     def log_prob_normalized(
@@ -1118,7 +1258,7 @@ def build_flow_skl_model(
             **common,
         )
     if fam == "nonlinear":
-        return ConditionalNonlinearXFlowMLP(
+        return ConditionalNonlinearXFlowFiLM(
             divergence_estimator=str(divergence_estimator),
             hutchinson_probes=int(hutchinson_probes),
             **common,
@@ -1142,11 +1282,12 @@ def train_flow_skl_model(
     path_schedule: str | GaussianAffinePathSchedule = "cosine",
     epochs: int = 1000,
     batch_size: int = 512,
-    lr: float = 1e-3,
+    lr: float = 1e-4,
     weight_decay: float = 0.0,
     t_eps: float = 0.0005,
     patience: int = 0,
     min_delta: float = 1e-4,
+    ema_alpha: float = 0.05,
     max_grad_norm: float = 10.0,
     log_every: int = 50,
 ) -> dict[str, Any]:
@@ -1162,6 +1303,9 @@ def train_flow_skl_model(
     te = float(t_eps)
     if not (0.0 < te < 0.5):
         raise ValueError("t_eps must be in (0, 0.5).")
+    alpha = float(ema_alpha)
+    if not (0.0 < alpha <= 1.0):
+        raise ValueError("ema_alpha must be in (0, 1].")
 
     th_tr = _as_2d_float64(theta_train, name="theta_train")
     x_tr = _as_2d_float64(x_train, name="x_train")
@@ -1191,6 +1335,8 @@ def train_flow_skl_model(
 
     train_losses: list[float] = []
     val_losses: list[float] = []
+    val_monitor_losses: list[float] = []
+    val_ema: float | None = None
     best_val = float("inf")
     best_epoch = 0
     best_state: dict[str, torch.Tensor] | None = None
@@ -1245,9 +1391,12 @@ def train_flow_skl_model(
                 )
         val_loss = float(np.mean(val_ep))
         val_losses.append(val_loss)
+        val_ema = scalar_val_ema_update(val_ema, val_loss, alpha)
+        val_smooth = float(val_ema)
+        val_monitor_losses.append(val_smooth)
 
-        if val_loss < best_val - float(min_delta):
-            best_val = val_loss
+        if val_smooth < best_val - float(min_delta):
+            best_val = val_smooth
             best_epoch = int(epoch)
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             patience_counter = 0
@@ -1257,7 +1406,8 @@ def train_flow_skl_model(
         if epoch == 1 or epoch % max(1, int(log_every)) == 0 or epoch == int(epochs):
             print(
                 f"[flow-skl {fam} {epoch:4d}/{int(epochs)}] train={train_loss:.6f} "
-                f"val={val_loss:.6f} best={best_val:.6f} best_epoch={best_epoch}",
+                f"val={val_loss:.6f} val_smooth={val_smooth:.6f} "
+                f"best_smooth={best_val:.6f} best_epoch={best_epoch}",
                 flush=True,
             )
         if int(patience) > 0 and patience_counter >= int(patience):
@@ -1265,7 +1415,7 @@ def train_flow_skl_model(
             stopped_epoch = int(epoch)
             print(
                 f"[flow-skl {fam} early-stop] epoch={epoch} best_epoch={best_epoch} "
-                f"best={best_val:.6f} patience={int(patience)}",
+                f"best_smooth={best_val:.6f} patience={int(patience)}",
                 flush=True,
             )
             break
@@ -1275,8 +1425,10 @@ def train_flow_skl_model(
 
     return {
         "velocity_family": fam,
+        "network_architecture": str(getattr(model, "network_architecture", "film")),
         "train_losses": np.asarray(train_losses, dtype=np.float64),
         "val_losses": np.asarray(val_losses, dtype=np.float64),
+        "val_monitor_losses": np.asarray(val_monitor_losses, dtype=np.float64),
         "best_val_loss": float(best_val),
         "best_epoch": int(best_epoch),
         "stopped_epoch": int(stopped_epoch),
@@ -1284,6 +1436,7 @@ def train_flow_skl_model(
         "n_clipped_steps": int(n_clipped_steps),
         "n_total_steps": int(n_total_steps),
         "path_schedule": schedule_name,
+        "early_ema_alpha": float(alpha),
     }
 
 
@@ -1478,6 +1631,9 @@ def estimate_model_symmetric_kl(
         fisher_mid = fd["theta_midpoints"]
         fisher_linear = fd["fisher"]
 
+    meta = {} if train_metadata is None else dict(train_metadata)
+    meta.setdefault("network_architecture", str(getattr(model, "network_architecture", "film")))
+
     return FlowSKLResult(
         symmetric_kl_matrix=skl.astype(np.float64, copy=False),
         canonical_metric_matrix=canonical.astype(np.float64, copy=False),
@@ -1485,7 +1641,7 @@ def estimate_model_symmetric_kl(
         fisher_theta_midpoints=fisher_mid,
         fisher_full=fisher_full,
         fisher_linear=fisher_linear,
-        train_metadata={} if train_metadata is None else dict(train_metadata),
+        train_metadata=meta,
     )
 
 
@@ -1527,6 +1683,10 @@ def flow_skl_result_to_npz_dict(result: FlowSKLResult) -> dict[str, Any]:
         "symmetric_kl_matrix": result.symmetric_kl_matrix,
         "canonical_metric_matrix": result.canonical_metric_matrix,
         "canonical_metric_name": np.asarray([result.canonical_metric_name], dtype=object),
+        "network_architecture": np.asarray(
+            [str(result.train_metadata.get("network_architecture", "film"))],
+            dtype=object,
+        ),
     }
     if result.fisher_theta_midpoints is not None:
         out["fisher_theta_midpoints"] = result.fisher_theta_midpoints

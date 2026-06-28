@@ -3322,8 +3322,8 @@ def main(argv: list[str] | None = None) -> None:
     pr_out_resolved: Path | None = None
     meta_work = dict(native_bundle.meta)
     if pr_project:
-        if int(args.pr_dim) <= native_x_dim:
-            raise ValueError(f"--pr-dim must exceed native x_dim={native_x_dim}; got {args.pr_dim}.")
+        if int(args.pr_dim) < native_x_dim:
+            raise ValueError(f"--pr-dim must be >= native x_dim={native_x_dim}; got {args.pr_dim}.")
         pr_out = args.pr_output_npz
         if pr_out is None:
             pr_out = _default_pr_output_npz(native_npz, int(args.pr_dim), str(args.dataset_family))

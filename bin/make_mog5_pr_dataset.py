@@ -3,10 +3,12 @@
 
 This is a small orchestration wrapper around:
 
-1. ``bin/make_dataset.py`` for the native 2D ``random_mog_categorical`` NPZ.
+1. ``bin/make_dataset.py`` for the native ``random_mog_categorical`` NPZ.
 2. ``bin/project_dataset_pr_autoencoder.py`` for the higher-dimensional PR embedding.
 
-The default output directory is ``<repo-root>/data/mog_5pr{pr_dim}_n{n_total}/``.
+The default output directory is ``<repo-root>/data/mog_5native_xdim3_n{n_total}/``.
+Explicit native 2D runs keep the legacy ``mog_5native_n{n_total}`` and
+``mog_5pr{pr_dim}_n{n_total}`` names.
 Existing native and projected NPZs are reused by default after metadata validation; pass
 ``--force`` to rerun both stages.
 """
@@ -26,11 +28,13 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from global_setting import DATA_DIR
-from fisher.shared_dataset_io import SharedDatasetBundle, load_shared_dataset_npz
+from fisher.data import ToyCategoricalRandomMoGDataset
+from fisher.shared_dataset_io import SharedDatasetBundle, load_shared_dataset_npz, save_shared_dataset_npz
 
 DATASET_FAMILY = "random_mog_categorical"
 NUM_CATEGORIES = 5
 NATIVE_X_DIM = 2
+DEFAULT_NATIVE_X_DIM = 3
 
 
 Runner = Callable[[Sequence[str]], None]
@@ -50,8 +54,31 @@ def _repo_data_dir() -> Path:
     return data_dir
 
 
-def default_output_dir(*, n_total: int, pr_dim: int) -> Path:
-    return _repo_data_dir() / f"mog_5pr{int(pr_dim)}_n{int(n_total)}"
+def parse_pr_dim(value: str | int | None) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    text = str(value).strip()
+    if text.lower() in {"none", "null"}:
+        return None
+    try:
+        return int(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("--pr-dim must be an integer, 'none', or 'null'.") from exc
+
+
+def default_output_dir(*, n_total: int, pr_dim: int | None, native_x_dim: int = DEFAULT_NATIVE_X_DIM) -> Path:
+    native_x_dim = int(native_x_dim)
+    if native_x_dim < 2:
+        raise ValueError(f"--native-x-dim must be >= 2; got {native_x_dim}.")
+    if pr_dim is None:
+        if native_x_dim == NATIVE_X_DIM:
+            return _repo_data_dir() / f"mog_5native_n{int(n_total)}"
+        return _repo_data_dir() / f"mog_5native_xdim{native_x_dim}_n{int(n_total)}"
+    if native_x_dim == NATIVE_X_DIM:
+        return _repo_data_dir() / f"mog_5pr{int(pr_dim)}_n{int(n_total)}"
+    return _repo_data_dir() / f"mog_5native_xdim{native_x_dim}_pr{int(pr_dim)}_n{int(n_total)}"
 
 
 def native_npz_path(output_dir: Path) -> Path:
@@ -65,21 +92,38 @@ def projected_npz_path(output_dir: Path, *, pr_dim: int) -> Path:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
-            "Generate a fixed K=5 native 2D random_mog_categorical dataset and PR-autoencoder "
+            "Generate a fixed K=5 native random_mog_categorical dataset and PR-autoencoder "
             "embedding. Existing NPZs are validated and reused unless --force is passed."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--n-total", type=int, default=1_000, help="Total joint samples.")
-    p.add_argument("--pr-dim", type=int, default=5, help="Target PR-embedded x dimension; must be > 2.")
+    p.add_argument(
+        "--native-x-dim",
+        type=int,
+        default=DEFAULT_NATIVE_X_DIM,
+        help="Native random_mog_categorical x dimension before optional PR projection.",
+    )
+    p.add_argument(
+        "--pr-dim",
+        type=parse_pr_dim,
+        default=None,
+        help="Target PR-embedded x dimension; must be >= --native-x-dim. Use 'none' or 'null' for native mode.",
+    )
     p.add_argument("--seed", type=int, default=7, help="Dataset and PR-autoencoder seed.")
-    p.add_argument("--train-frac", type=float, default=0.7, help="Fraction of rows assigned to train_idx.")
+    p.add_argument("--train-frac", type=float, default=0.8, help="Fraction of rows assigned to train_idx.")
+    p.add_argument(
+        "--native-template-npz",
+        type=Path,
+        default=None,
+        help="Optional native MoG5 NPZ whose fixed component gains, means, and variances are reused.",
+    )
     p.add_argument("--device", type=str, default="cuda", help="Device passed to the PR projection script.")
     p.add_argument(
         "--output-dir",
         type=str,
         default=None,
-        help="Output directory. Defaults to <repo-root>/data/mog_5pr{pr_dim}_n{n_total}/.",
+        help="Output directory. Defaults to dimension-aware <repo-root>/data/mog_5... path.",
     )
     p.add_argument("--force", action="store_true", help="Regenerate both native and PR-embedded NPZs.")
     p.add_argument(
@@ -114,17 +158,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def resolve_output_dir(args: argparse.Namespace) -> Path:
     if args.output_dir is not None:
         return Path(args.output_dir)
-    return default_output_dir(n_total=int(args.n_total), pr_dim=int(args.pr_dim))
+    return default_output_dir(n_total=int(args.n_total), pr_dim=args.pr_dim, native_x_dim=int(args.native_x_dim))
 
 
 def validate_args(args: argparse.Namespace) -> None:
-    if int(args.pr_dim) <= NATIVE_X_DIM:
-        raise ValueError(f"--pr-dim must be > {NATIVE_X_DIM}; got {args.pr_dim}.")
+    native_x_dim = int(args.native_x_dim)
+    if native_x_dim < 2:
+        raise ValueError(f"--native-x-dim must be >= 2; got {args.native_x_dim}.")
+    if args.pr_dim is not None and int(args.pr_dim) < native_x_dim:
+        raise ValueError(f"--pr-dim must be >= native x_dim={native_x_dim}; got {args.pr_dim}.")
     if int(args.n_total) <= 0:
         raise ValueError(f"--n-total must be positive; got {args.n_total}.")
     tf = float(args.train_frac)
     if not (0.0 < tf <= 1.0):
         raise ValueError(f"--train-frac must be in (0, 1]; got {args.train_frac}.")
+    if args.native_template_npz is not None:
+        template = validate_native_npz(
+            Path(args.native_template_npz),
+            n_total=int(load_shared_dataset_npz(Path(args.native_template_npz)).x_all.shape[0]),
+            native_x_dim=native_x_dim,
+        )
+        meta = dict(template.meta)
+        for key in ("mog_component_gains", "mog_component_means", "mog_component_variances"):
+            if meta.get(key) is None:
+                raise ValueError(f"--native-template-npz is missing {key}.")
 
 
 def _labels_from_theta(theta: np.ndarray, *, num_categories: int = NUM_CATEGORIES) -> np.ndarray:
@@ -179,19 +236,27 @@ def _validate_common_npz(path: Path, *, n_total: int, expected_x_dim: int) -> Sh
     return bundle
 
 
-def validate_native_npz(path: Path, *, n_total: int) -> SharedDatasetBundle:
-    bundle = _validate_common_npz(path, n_total=n_total, expected_x_dim=NATIVE_X_DIM)
+def validate_native_npz(path: Path, *, n_total: int, native_x_dim: int = DEFAULT_NATIVE_X_DIM) -> SharedDatasetBundle:
+    bundle = _validate_common_npz(path, n_total=n_total, expected_x_dim=int(native_x_dim))
     if bool(bundle.meta.get("pr_autoencoder_embedded", False)):
-        raise ValueError(f"{path} is already PR-embedded; expected a native 2D NPZ.")
+        raise ValueError(f"{path} is already PR-embedded; expected a native NPZ.")
     return bundle
 
 
-def validate_projected_npz(path: Path, *, n_total: int, pr_dim: int) -> SharedDatasetBundle:
+def validate_projected_npz(
+    path: Path,
+    *,
+    n_total: int,
+    pr_dim: int,
+    native_x_dim: int = DEFAULT_NATIVE_X_DIM,
+) -> SharedDatasetBundle:
     bundle = _validate_common_npz(path, n_total=n_total, expected_x_dim=int(pr_dim))
     if not bool(bundle.meta.get("pr_autoencoder_embedded", False)):
         raise ValueError(f"{path} is not marked pr_autoencoder_embedded=True.")
-    if int(bundle.meta.get("pr_autoencoder_z_dim", -1)) != NATIVE_X_DIM:
-        raise ValueError(f"{path} has pr_autoencoder_z_dim={bundle.meta.get('pr_autoencoder_z_dim')!r}; expected 2.")
+    if int(bundle.meta.get("pr_autoencoder_z_dim", -1)) != int(native_x_dim):
+        raise ValueError(
+            f"{path} has pr_autoencoder_z_dim={bundle.meta.get('pr_autoencoder_z_dim')!r}; expected {int(native_x_dim)}."
+        )
     return bundle
 
 
@@ -204,7 +269,7 @@ def build_native_command(args: argparse.Namespace, native_npz: Path) -> list[str
         "--num-categories",
         str(NUM_CATEGORIES),
         "--x-dim",
-        str(NATIVE_X_DIM),
+        str(int(args.native_x_dim)),
         "--n-total",
         str(int(args.n_total)),
         "--train-frac",
@@ -263,30 +328,137 @@ def _remove_native_viz(output_dir: Path) -> None:
             path.unlink()
 
 
-def run(args: argparse.Namespace, *, runner: Runner = _run_command) -> tuple[Path, Path]:
+def write_native_from_template(args: argparse.Namespace, native_npz: Path) -> None:
+    template_path = Path(args.native_template_npz)
+    template = load_shared_dataset_npz(template_path)
+    meta_template = dict(template.meta)
+    if str(meta_template.get("dataset_family", "")) != DATASET_FAMILY:
+        raise ValueError(
+            f"--native-template-npz has dataset_family={meta_template.get('dataset_family')!r}; "
+            f"expected {DATASET_FAMILY!r}."
+        )
+    if int(meta_template.get("num_categories", -1)) != NUM_CATEGORIES:
+        raise ValueError(
+            f"--native-template-npz has num_categories={meta_template.get('num_categories')!r}; "
+            f"expected {NUM_CATEGORIES}."
+        )
+    if int(meta_template.get("x_dim", -1)) != int(args.native_x_dim):
+        raise ValueError(
+            f"--native-template-npz has x_dim={meta_template.get('x_dim')!r}; "
+            f"expected {int(args.native_x_dim)}."
+        )
+
+    gains = np.asarray(meta_template.get("mog_component_gains"), dtype=np.float64)
+    means = np.asarray(meta_template.get("mog_component_means"), dtype=np.float64)
+    variances = np.asarray(meta_template.get("mog_component_variances"), dtype=np.float64)
+    expected_shape = (NUM_CATEGORIES, int(args.native_x_dim))
+    for name, arr in (
+        ("mog_component_gains", gains),
+        ("mog_component_means", means),
+        ("mog_component_variances", variances),
+    ):
+        if arr.shape != expected_shape:
+            raise ValueError(f"--native-template-npz {name} has shape {arr.shape}; expected {expected_shape}.")
+
+    dataset = ToyCategoricalRandomMoGDataset(
+        x_dim=int(args.native_x_dim),
+        num_categories=NUM_CATEGORIES,
+        mog_a_low=float(meta_template.get("mog_a_low", 0.2)),
+        mog_a_high=float(meta_template.get("mog_a_high", 2.0)),
+        mog_sigma_base=float(meta_template.get("mog_sigma_base", 0.15)),
+        mog_alpha=float(meta_template.get("mog_alpha", 0.15)),
+        mog_eps=float(meta_template.get("mog_eps", 1e-5)),
+        mog_mean_min_dist=meta_template.get("mog_mean_min_dist", None),
+        mog_mean_max_attempts=int(meta_template.get("mog_mean_max_attempts", 10_000)),
+        mog_component_gains=gains,
+        mog_component_means=means,
+        mog_component_variances=variances,
+        seed=int(args.seed),
+    )
+    theta_all, x_all = dataset.sample_joint(int(args.n_total))
+    rng = np.random.default_rng(int(args.seed))
+    perm = rng.permutation(int(args.n_total))
+    if float(args.train_frac) >= 1.0:
+        n_train = int(args.n_total)
+    else:
+        n_train = int(float(args.train_frac) * int(args.n_total))
+        n_train = min(max(n_train, 1), int(args.n_total) - 1)
+    train_idx = perm[:n_train].astype(np.int64)
+    validation_idx = perm[n_train:].astype(np.int64)
+
+    meta = dict(meta_template)
+    meta.update(
+        {
+            "dataset_family": DATASET_FAMILY,
+            "theta_type": "categorical",
+            "theta_encoding": "one_hot",
+            "num_categories": NUM_CATEGORIES,
+            "x_dim": int(args.native_x_dim),
+            "n_total": int(args.n_total),
+            "train_frac": float(args.train_frac),
+            "seed": int(args.seed),
+            "pr_autoencoder_embedded": False,
+            "mog_component_gains": gains.tolist(),
+            "mog_component_means": means.tolist(),
+            "mog_component_variances": variances.tolist(),
+            "native_template_npz": str(template_path),
+        }
+    )
+    save_shared_dataset_npz(
+        native_npz,
+        meta=meta,
+        theta_all=theta_all,
+        x_all=x_all,
+        train_idx=train_idx,
+        validation_idx=validation_idx,
+        theta_train=theta_all[train_idx],
+        x_train=x_all[train_idx],
+        theta_validation=theta_all[validation_idx],
+        x_validation=x_all[validation_idx],
+    )
+
+
+def run(args: argparse.Namespace, *, runner: Runner = _run_command) -> tuple[Path, Path | None]:
     validate_args(args)
     output_dir = resolve_output_dir(args)
     native_npz = native_npz_path(output_dir)
-    projected_npz = projected_npz_path(output_dir, pr_dim=int(args.pr_dim))
+    projected_npz = None if args.pr_dim is None else projected_npz_path(output_dir, pr_dim=int(args.pr_dim))
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if native_npz.is_file() and not bool(args.force):
-        validate_native_npz(native_npz, n_total=int(args.n_total))
+        validate_native_npz(native_npz, n_total=int(args.n_total), native_x_dim=int(args.native_x_dim))
         print(f"[mog5-pr] Reusing native NPZ: {native_npz}", flush=True)
     else:
-        runner(build_native_command(args, native_npz))
-        if bool(args.skip_viz):
-            _remove_native_viz(output_dir)
-        validate_native_npz(native_npz, n_total=int(args.n_total))
+        if args.native_template_npz is None:
+            runner(build_native_command(args, native_npz))
+            if bool(args.skip_viz):
+                _remove_native_viz(output_dir)
+        else:
+            write_native_from_template(args, native_npz)
+        validate_native_npz(native_npz, n_total=int(args.n_total), native_x_dim=int(args.native_x_dim))
+
+    print(f"[mog5-pr] Native NPZ: {native_npz}", flush=True)
+    if projected_npz is None:
+        print("[mog5-pr] Native mode requested; skipping PR projection.", flush=True)
+        return native_npz, None
 
     if projected_npz.is_file() and not bool(args.force):
-        validate_projected_npz(projected_npz, n_total=int(args.n_total), pr_dim=int(args.pr_dim))
+        validate_projected_npz(
+            projected_npz,
+            n_total=int(args.n_total),
+            pr_dim=int(args.pr_dim),
+            native_x_dim=int(args.native_x_dim),
+        )
         print(f"[mog5-pr] Reusing projected NPZ: {projected_npz}", flush=True)
     else:
         runner(build_project_command(args, native_npz, projected_npz))
-        validate_projected_npz(projected_npz, n_total=int(args.n_total), pr_dim=int(args.pr_dim))
+        validate_projected_npz(
+            projected_npz,
+            n_total=int(args.n_total),
+            pr_dim=int(args.pr_dim),
+            native_x_dim=int(args.native_x_dim),
+        )
 
-    print(f"[mog5-pr] Native NPZ: {native_npz}", flush=True)
     print(f"[mog5-pr] Projected NPZ: {projected_npz}", flush=True)
     return native_npz, projected_npz
 

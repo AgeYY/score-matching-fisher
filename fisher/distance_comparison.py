@@ -69,11 +69,12 @@ class FlowComparisonConfig:
     epochs: int = 20_000
     early_patience: int = 1_000
     early_min_delta: float = 1e-4
+    early_ema_alpha: float = 0.05
     batch_size: int = 512
     lr: float = 1e-3
     weight_decay: float = 0.0
-    hidden_dim: int = 128
-    depth: int = 3
+    hidden_dim: int = 256
+    depth: int = 5
     low_rank_dim: int = 4
     path_schedule: str = "cosine"
     t_eps: float = 0.0005
@@ -88,6 +89,8 @@ class FlowComparisonConfig:
     max_grad_norm: float = 10.0
     log_every: int = 50
     radius: float = 1.0
+    normalize_x: bool = False
+    normalize_x_eps: float = 1e-8
 
 
 @dataclass(frozen=True)
@@ -100,6 +103,7 @@ class DistanceComparisonResult:
     ground_truth_matrices: dict[str, np.ndarray]
     rows: list[dict[str, Any]]
     flow_npz_paths: dict[str, Path] = field(default_factory=dict)
+    flow_velocity_families: dict[str, str] = field(default_factory=dict)
 
 
 def labels_from_theta(theta: np.ndarray, *, num_categories: int | None = None) -> np.ndarray:
@@ -416,45 +420,93 @@ def pr_autoencoder_ground_truth_matrices(
     seed: int = 7,
     batch_size: int = 8192,
     mahalanobis_ridge: float = 1e-6,
+    metrics: Iterable[str] = METRIC_NAMES,
 ) -> dict[str, np.ndarray]:
     """Monte Carlo projected-coordinate ground truth plus analytic native SKL."""
 
+    metric_tuple = tuple(str(m) for m in metrics)
+    projected_metrics = tuple(m for m in metric_tuple if m != METRIC_SYMMETRIC_KL)
     means = np.asarray(native_meta.get("mog_component_means"), dtype=np.float64)
     variances = np.asarray(native_meta.get("mog_component_variances"), dtype=np.float64)
     if means.ndim != 2 or variances.shape != means.shape:
         raise ValueError("native_meta must contain mog_component_means and mog_component_variances.")
     k, d = means.shape
-    n = int(samples_per_class)
-    if n < 2:
-        raise ValueError("samples_per_class must be at least 2.")
-    rng = np.random.default_rng(int(seed))
-    z_parts: list[np.ndarray] = []
-    labels = np.repeat(np.arange(k, dtype=np.int64), n)
-    for cls in range(k):
-        z = means[cls] + np.sqrt(variances[cls]) * rng.standard_normal(size=(n, d))
-        z_parts.append(z.astype(np.float64, copy=False))
-    z_all = np.vstack(z_parts)
-    h_all = encode_with_pr_autoencoder(
-        z_all,
-        projected_meta=projected_meta,
-        device=device,
-        cache_dir=cache_dir,
-        batch_size=int(batch_size),
-    )
-    out = classical_metric_matrices(
-        h_all,
-        labels,
-        num_categories=k,
-        metrics=(
-            METRIC_SQUARED_EUCLIDEAN,
-            METRIC_COSINE,
-            METRIC_CORRELATION,
-            METRIC_MAHALANOBIS_SQ,
-        ),
-        mahalanobis_ridge=float(mahalanobis_ridge),
-    )
-    out[METRIC_SYMMETRIC_KL] = analytic_diagonal_gaussian_skl_matrix(means, variances)
-    return out
+    out: dict[str, np.ndarray] = {}
+
+    if projected_metrics:
+        n = int(samples_per_class)
+        if n < 2:
+            raise ValueError("samples_per_class must be at least 2.")
+        rng = np.random.default_rng(int(seed))
+        z_parts: list[np.ndarray] = []
+        labels = np.repeat(np.arange(k, dtype=np.int64), n)
+        for cls in range(k):
+            z = means[cls] + np.sqrt(variances[cls]) * rng.standard_normal(size=(n, d))
+            z_parts.append(z.astype(np.float64, copy=False))
+        z_all = np.vstack(z_parts)
+        h_all = encode_with_pr_autoencoder(
+            z_all,
+            projected_meta=projected_meta,
+            device=device,
+            cache_dir=cache_dir,
+            batch_size=int(batch_size),
+        )
+        out.update(
+            classical_metric_matrices(
+                h_all,
+                labels,
+                num_categories=k,
+                metrics=projected_metrics,
+                mahalanobis_ridge=float(mahalanobis_ridge),
+            )
+        )
+    if METRIC_SYMMETRIC_KL in metric_tuple:
+        out[METRIC_SYMMETRIC_KL] = analytic_diagonal_gaussian_skl_matrix(means, variances)
+    return {metric: out[metric] for metric in metric_tuple}
+
+
+def native_mog_ground_truth_matrices(
+    *,
+    native_meta: dict[str, Any],
+    samples_per_class: int = 200_000,
+    seed: int = 7,
+    mahalanobis_ridge: float = 1e-6,
+    metrics: Iterable[str] = METRIC_NAMES,
+) -> dict[str, np.ndarray]:
+    """Monte Carlo native-coordinate MoG ground truth plus analytic native SKL."""
+
+    metric_tuple = tuple(str(m) for m in metrics)
+    sampled_metrics = tuple(m for m in metric_tuple if m != METRIC_SYMMETRIC_KL)
+    means = np.asarray(native_meta.get("mog_component_means"), dtype=np.float64)
+    variances = np.asarray(native_meta.get("mog_component_variances"), dtype=np.float64)
+    if means.ndim != 2 or variances.shape != means.shape:
+        raise ValueError("native_meta must contain mog_component_means and mog_component_variances.")
+    k, d = means.shape
+    out: dict[str, np.ndarray] = {}
+
+    if sampled_metrics:
+        n = int(samples_per_class)
+        if n < 2:
+            raise ValueError("samples_per_class must be at least 2.")
+        rng = np.random.default_rng(int(seed))
+        x_parts: list[np.ndarray] = []
+        labels = np.repeat(np.arange(k, dtype=np.int64), n)
+        for cls in range(k):
+            x = means[cls] + np.sqrt(variances[cls]) * rng.standard_normal(size=(n, d))
+            x_parts.append(x.astype(np.float64, copy=False))
+        x_all = np.vstack(x_parts)
+        out.update(
+            classical_metric_matrices(
+                x_all,
+                labels,
+                num_categories=k,
+                metrics=sampled_metrics,
+                mahalanobis_ridge=float(mahalanobis_ridge),
+            )
+        )
+    if METRIC_SYMMETRIC_KL in metric_tuple:
+        out[METRIC_SYMMETRIC_KL] = analytic_diagonal_gaussian_skl_matrix(means, variances)
+    return {metric: out[metric] for metric in metric_tuple}
 
 
 def _theta_eval_from_num_categories(num_categories: int) -> np.ndarray:
@@ -465,6 +517,28 @@ def _flow_npz_name(metric: str, pair: tuple[int, int] | None = None) -> str:
     if pair is None:
         return f"{metric}_flow_matching_skl_results.npz"
     return f"{metric}_pair_{int(pair[0])}_{int(pair[1])}_flow_matching_skl_results.npz"
+
+
+def _fit_shared_x_normalizer(x_train: np.ndarray, *, eps: float) -> tuple[np.ndarray, np.ndarray]:
+    """Fit one train-only affine x normalizer shared across all classes."""
+
+    x_arr = np.asarray(x_train, dtype=np.float64)
+    if x_arr.ndim == 1:
+        x_arr = x_arr.reshape(-1, 1)
+    if x_arr.ndim != 2:
+        raise ValueError("x_train must be 1D or 2D.")
+    eps_float = float(eps)
+    if not math.isfinite(eps_float) or eps_float <= 0.0:
+        raise ValueError("normalize_x_eps must be finite and positive.")
+    mean = np.mean(x_arr, axis=0, dtype=np.float64)
+    std = np.std(x_arr, axis=0, dtype=np.float64)
+    std = np.where(std < eps_float, 1.0, std).astype(np.float64, copy=False)
+    return mean.astype(np.float64, copy=False), std
+
+
+def _apply_shared_x_normalizer(x: np.ndarray, *, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
+    x_arr = np.asarray(x, dtype=np.float64)
+    return ((x_arr - mean) / std).astype(np.float64, copy=False)
 
 
 def flow_skl_to_metric_readout(metric: str, symmetric_kl_matrix: np.ndarray, *, radius: float) -> np.ndarray:
@@ -479,6 +553,11 @@ def flow_skl_to_metric_readout(metric: str, symmetric_kl_matrix: np.ndarray, *, 
         out = out / (2.0 * r * r)
     np.fill_diagonal(out, 0.0)
     return out
+
+
+def velocity_family_for_metric(metric: str, config: FlowComparisonConfig) -> str:
+    del config
+    return FLOW_VELOCITY_FAMILY_BY_METRIC[str(metric)]
 
 
 def train_and_estimate_flow(
@@ -532,6 +611,7 @@ def train_and_estimate_flow(
         t_eps=float(config.t_eps),
         patience=int(config.early_patience),
         min_delta=float(config.early_min_delta),
+        ema_alpha=float(config.early_ema_alpha),
         max_grad_norm=float(config.max_grad_norm),
         log_every=max(1, int(config.log_every)),
     )
@@ -560,6 +640,7 @@ def save_flow_result_npz(
     theta_eval: np.ndarray,
     velocity_family: str,
     pair: tuple[int, int] | None = None,
+    flow_metric_matrix: np.ndarray | None = None,
 ) -> Path:
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -571,15 +652,23 @@ def save_flow_result_npz(
             "theta_eval": np.asarray(theta_eval, dtype=np.float64),
         }
     )
+    if flow_metric_matrix is not None:
+        fields["flow_matching_matrix"] = np.asarray(flow_metric_matrix, dtype=np.float64)
     if pair is not None:
         fields["condition_pair"] = np.asarray(pair, dtype=np.int64)
     meta = dict(result.train_metadata)
-    for key in ("train_losses", "val_losses"):
+    for key in ("train_losses", "val_losses", "val_monitor_losses"):
         if key in meta:
             fields[key] = np.asarray(meta[key], dtype=np.float64)
-    for key in ("best_val_loss", "best_epoch", "stopped_epoch", "stopped_early"):
+    for key in ("best_val_loss", "best_epoch", "stopped_epoch", "stopped_early", "early_ema_alpha"):
         if key in meta:
             fields[key] = np.asarray([meta[key]])
+    for key in ("flow_normalize_x", "flow_normalize_x_eps"):
+        if key in meta:
+            fields[key] = np.asarray([meta[key]])
+    for key in ("flow_normalize_x_mean", "flow_normalize_x_std"):
+        if key in meta:
+            fields[key] = np.asarray(meta[key], dtype=np.float64)
     np.savez_compressed(out, **fields)
     return out
 
@@ -601,25 +690,45 @@ def flow_metric_matrices(
     x_val_all = np.asarray(bundle.x_validation, dtype=np.float64)
     theta_train_all = np.asarray(bundle.theta_train, dtype=np.float64)
     theta_val_all = np.asarray(bundle.theta_validation, dtype=np.float64)
+    normalize_meta: dict[str, Any] = {
+        "flow_normalize_x": bool(config.normalize_x),
+        "flow_normalize_x_eps": float(config.normalize_x_eps),
+    }
+    if bool(config.normalize_x):
+        # One shared invertible x transform preserves true symmetric KL; no
+        # log-Jacobian correction is needed for log-density ratios.
+        x_mean, x_std = _fit_shared_x_normalizer(x_train_all, eps=float(config.normalize_x_eps))
+        x_train_flow = _apply_shared_x_normalizer(x_train_all, mean=x_mean, std=x_std)
+        x_val_flow = _apply_shared_x_normalizer(x_val_all, mean=x_mean, std=x_std)
+        normalize_meta.update(
+            {
+                "flow_normalize_x_mean": x_mean,
+                "flow_normalize_x_std": x_std,
+            }
+        )
+    else:
+        x_train_flow = x_train_all
+        x_val_flow = x_val_all
     flow_dir = Path(output_dir)
     matrices: dict[str, np.ndarray] = {}
     paths: dict[str, Path] = {}
     theta_eval = _theta_eval_from_num_categories(k)
 
     for metric in tuple(str(m) for m in metrics):
-        family = FLOW_VELOCITY_FAMILY_BY_METRIC[metric]
+        family = velocity_family_for_metric(metric, config)
         print(f"[distance-comparison] flow metric={metric} velocity_family={family}", flush=True)
         result = train_and_estimate_flow(
             theta_train=theta_train_all,
-            x_train=x_train_all,
+            x_train=x_train_flow,
             theta_val=theta_val_all,
-            x_val=x_val_all,
+            x_val=x_val_flow,
             theta_eval=theta_eval,
             velocity_family=family,
             device=device,
             seed=int(seed),
             config=config,
         )
+        result.train_metadata = {**dict(result.train_metadata), **normalize_meta}
         matrices[metric] = flow_skl_to_metric_readout(
             metric,
             result.symmetric_kl_matrix,
@@ -631,6 +740,7 @@ def flow_metric_matrices(
             metric=metric,
             theta_eval=theta_eval,
             velocity_family=family,
+            flow_metric_matrix=matrices[metric],
         )
         paths[metric] = path
     return matrices, paths
@@ -643,9 +753,11 @@ def pair_rows(
     classical: dict[str, np.ndarray],
     flow_matching: dict[str, np.ndarray],
     ground_truth: dict[str, np.ndarray],
+    flow_velocity_families: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     label_tuple = tuple(str(v) for v in labels)
     pairs = pair_indices(len(label_tuple))
+    family_by_metric = FLOW_VELOCITY_FAMILY_BY_METRIC if flow_velocity_families is None else flow_velocity_families
     rows: list[dict[str, Any]] = []
     for metric in tuple(str(m) for m in metrics):
         cmat = np.asarray(classical[metric], dtype=np.float64)
@@ -664,7 +776,7 @@ def pair_rows(
                     "classical": cval,
                     "flow_matching": fval,
                     "ground_truth": gval,
-                    "flow_velocity_family": FLOW_VELOCITY_FAMILY_BY_METRIC[metric],
+                    "flow_velocity_family": family_by_metric[metric],
                     "abs_error_classical": abs(cval - gval),
                     "abs_error_flow": abs(fval - gval),
                 }
@@ -680,15 +792,22 @@ def assemble_comparison_result(
     flow_matching: dict[str, np.ndarray],
     ground_truth: dict[str, np.ndarray],
     flow_npz_paths: dict[str, Path] | None = None,
+    flow_velocity_families: dict[str, str] | None = None,
 ) -> DistanceComparisonResult:
     metric_tuple = tuple(str(m) for m in metrics)
     label_tuple = tuple(str(v) for v in condition_names)
+    family_by_metric = (
+        {m: FLOW_VELOCITY_FAMILY_BY_METRIC[m] for m in metric_tuple}
+        if flow_velocity_families is None
+        else {str(k): str(v) for k, v in flow_velocity_families.items()}
+    )
     rows = pair_rows(
         metrics=metric_tuple,
         labels=label_tuple,
         classical=classical,
         flow_matching=flow_matching,
         ground_truth=ground_truth,
+        flow_velocity_families=family_by_metric,
     )
     return DistanceComparisonResult(
         metrics=metric_tuple,
@@ -699,6 +818,7 @@ def assemble_comparison_result(
         ground_truth_matrices={m: np.asarray(ground_truth[m], dtype=np.float64) for m in metric_tuple},
         rows=rows,
         flow_npz_paths={} if flow_npz_paths is None else dict(flow_npz_paths),
+        flow_velocity_families={m: family_by_metric[m] for m in metric_tuple},
     )
 
 
@@ -767,7 +887,7 @@ def write_summary_json(
         c_err = np.asarray([abs(float(c[i, j]) - float(g[i, j])) for i, j in pairs], dtype=np.float64)
         f_err = np.asarray([abs(float(f[i, j]) - float(g[i, j])) for i, j in pairs], dtype=np.float64)
         metric_summary[metric] = {
-            "flow_velocity_family": FLOW_VELOCITY_FAMILY_BY_METRIC[metric],
+            "flow_velocity_family": result.flow_velocity_families.get(metric, FLOW_VELOCITY_FAMILY_BY_METRIC[metric]),
             "mean_abs_error_classical": float(np.mean(c_err)),
             "mean_abs_error_flow": float(np.mean(f_err)),
             "max_abs_error_classical": float(np.max(c_err)),

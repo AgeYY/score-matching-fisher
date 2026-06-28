@@ -139,10 +139,163 @@ def _patch_model_jeffreys(
 def test_flow_skl_default_t_eps_is_small_endpoint_clamp() -> None:
     sig = inspect.signature(train_flow_skl_model)
     assert sig.parameters["t_eps"].default == pytest.approx(0.0005)
+    assert sig.parameters["ema_alpha"].default == pytest.approx(0.05)
 
     mod = _load_run_flow_matching_skl_module()
     args = mod.build_parser().parse_args([])
     assert args.t_eps == pytest.approx(0.0005)
+    assert args.early_ema_alpha == pytest.approx(0.05)
+
+
+def test_centered_fixed_radius_normalize_behavior_is_unchanged() -> None:
+    raw = torch.tensor([[1.0, 2.0, 5.0], [3.0, 6.0, 9.0]], dtype=torch.float64)
+    got = centered_radius_normalize(raw, radius=2.0)
+    centered = raw - raw.mean(dim=1, keepdim=True)
+    expected = 2.0 * centered / torch.linalg.norm(centered, dim=1, keepdim=True)
+    torch.testing.assert_close(got, expected)
+
+
+def test_train_flow_skl_early_stopping_uses_ema_monitor(monkeypatch: pytest.MonkeyPatch) -> None:
+    monitor_values = [10.0, 9.0, 11.0, 12.0]
+    ema_calls: list[tuple[float | None, float, float]] = []
+
+    def fake_scalar_val_ema_update(prev: float | None, mean_val_loss: float, ema_alpha: float) -> float:
+        ema_calls.append((prev, float(mean_val_loss), float(ema_alpha)))
+        return monitor_values[len(ema_calls) - 1]
+
+    monkeypatch.setattr(fms, "scalar_val_ema_update", fake_scalar_val_ema_update)
+    model = build_flow_skl_model(
+        velocity_family="translation",
+        theta_dim=2,
+        x_dim=2,
+        hidden_dim=4,
+        depth=1,
+        path_schedule="linear",
+    )
+    theta = np.eye(2, dtype=np.float64)[[0, 1, 0, 1]]
+    x = np.array([[0.0, 0.0], [1.0, -1.0], [0.2, 0.1], [1.2, -0.8]], dtype=np.float64)
+
+    out = train_flow_skl_model(
+        model=model,
+        theta_train=theta,
+        x_train=x,
+        theta_val=theta,
+        x_val=x,
+        device=torch.device("cpu"),
+        velocity_family="translation",
+        path_schedule="linear",
+        epochs=10,
+        batch_size=2,
+        patience=2,
+        min_delta=0.0,
+        ema_alpha=0.25,
+        log_every=999,
+    )
+
+    np.testing.assert_allclose(out["val_monitor_losses"], monitor_values)
+    assert out["best_val_loss"] == pytest.approx(9.0)
+    assert out["best_epoch"] == 2
+    assert out["stopped_epoch"] == 4
+    assert out["stopped_early"] is True
+    assert out["early_ema_alpha"] == pytest.approx(0.25)
+    assert len(out["val_losses"]) == 4
+    assert [call[2] for call in ema_calls] == [pytest.approx(0.25)] * 4
+
+
+def test_train_flow_skl_rejects_invalid_ema_alpha() -> None:
+    model = build_flow_skl_model(
+        velocity_family="translation",
+        theta_dim=2,
+        x_dim=2,
+        hidden_dim=4,
+        depth=1,
+    )
+    theta = np.eye(2, dtype=np.float64)
+    x = np.zeros((2, 2), dtype=np.float64)
+    with pytest.raises(ValueError, match="ema_alpha"):
+        train_flow_skl_model(
+            model=model,
+            theta_train=theta,
+            x_train=x,
+            theta_val=theta,
+            x_val=x,
+            device=torch.device("cpu"),
+            velocity_family="translation",
+            ema_alpha=0.0,
+        )
+
+
+def test_conditioned_film_net_preserves_shape_dtype_and_uses_linear_theta_embedding() -> None:
+    torch.manual_seed(123)
+    net = fms._ConditionedFiLMNet(  # type: ignore[attr-defined]
+        trunk_dim=3,
+        theta_dim=2,
+        out_dim=2,
+        hidden_dim=5,
+        depth=2,
+        final_gain=0.01,
+    ).double()
+    x = torch.randn(4, 3, dtype=torch.float64)
+    theta = torch.randn(4, 2, dtype=torch.float64)
+    t = torch.rand(4, 1, dtype=torch.float64)
+    y = net(x, theta, t)
+    assert y.shape == (4, 2)
+    assert y.dtype == torch.float64
+    assert net.network_architecture == "film"
+    assert isinstance(net.theta_embedding, nn.Linear)
+    assert isinstance(net.condition_mlp, nn.Sequential)
+    for block in net.blocks:
+        assert isinstance(block.norm, nn.LayerNorm)
+        assert isinstance(block.branch, nn.Sequential)
+        torch.testing.assert_close(block.film.weight, torch.zeros_like(block.film.weight))
+        torch.testing.assert_close(block.film.bias, torch.zeros_like(block.film.bias))
+
+
+def _first_linear_in_features(module: nn.Sequential) -> int:
+    first = module[0]
+    assert isinstance(first, nn.Linear)
+    return int(first.in_features)
+
+
+def test_build_flow_skl_model_uses_mlp_heads_and_film_nonlinear_subnets() -> None:
+    for family in VELOCITY_FAMILIES:
+        model = build_flow_skl_model(
+            velocity_family=family,
+            theta_dim=2,
+            x_dim=3,
+            hidden_dim=4,
+            depth=1,
+            low_rank_dim=1,
+            path_schedule="linear",
+        )
+        assert getattr(model, "network_architecture") == "film"
+        if family in (
+            "translation",
+            "translation_fixed_norm",
+            "translation_centered_fixed_norm",
+        ):
+            assert isinstance(model.mean_net, nn.Sequential)
+            assert _first_linear_in_features(model.mean_net) == 2
+        elif family == "nonlinear":
+            assert type(model).__name__ == "ConditionalNonlinearXFlowFiLM"
+            assert isinstance(model.net, fms._ConditionedFiLMNet)  # type: ignore[attr-defined]
+            assert model.net.trunk_dim == 3
+            assert model.net.theta_dim == 2
+            assert isinstance(model.net.theta_embedding, nn.Linear)
+        else:
+            assert isinstance(model.b_net, nn.Sequential)
+            assert _first_linear_in_features(model.b_net) == 2
+            assert isinstance(model.a_net, nn.Sequential)
+            if family.startswith("condition_affine"):
+                assert _first_linear_in_features(model.a_net) == 3
+            else:
+                assert _first_linear_in_features(model.a_net) == 1
+            if "low_rank" in family:
+                assert isinstance(model.h_net, fms._ConditionedFiLMNet)  # type: ignore[attr-defined]
+                assert model.h_net.trunk_dim == 1
+                assert model.h_net.theta_dim == 2
+                assert isinstance(model.h_net.theta_embedding, nn.Linear)
+                assert all(isinstance(block.norm, nn.LayerNorm) for block in model.h_net.blocks)
 
 
 def _patch_table_b(model: nn.Module, table: torch.Tensor) -> None:
@@ -404,6 +557,7 @@ def test_translation_training_uses_flow_matching_forward_loss() -> None:
     )
 
     assert out["n_total_steps"] == 2
+    assert out["network_architecture"] == "film"
     assert calls
     assert all(c["t_ndim"] == 1 for c in calls)
 
@@ -832,6 +986,7 @@ def test_flow_skl_result_npz_omits_endpoint_distribution_fields() -> None:
     assert "endpoint_covariance" not in fields
     assert "endpoint_cov_or_diag" not in fields
     assert "endpoint_is_diag" not in fields
+    assert fields["network_architecture"][0] == "film"
 
 
 def test_scalar_fisher_finite_differences_use_model_jeffreys_matrix(
