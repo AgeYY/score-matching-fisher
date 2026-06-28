@@ -1576,6 +1576,202 @@ def _estimate_model_jeffreys(
     return out
 
 
+def estimate_adjacent_model_jeffreys_fisher(
+    *,
+    model: nn.Module,
+    theta_all: np.ndarray,
+    device: torch.device,
+    mc_jeffreys_sample: int = 4096,
+    ode_steps: int = 64,
+    ode_method: str = "midpoint",
+    batch_size: int = 1024,
+    solve_jitter: float = 1e-6,
+    quadrature_steps: int | None = None,
+) -> dict[str, np.ndarray]:
+    """Estimate scalar Fisher from adjacent model Jeffreys sums only.
+
+    The convention is the Jeffreys sum ``KL(theta_i||theta_j)+KL(theta_j||theta_i)``;
+    dividing an adjacent pair by ``dtheta**2`` estimates scalar Fisher.
+    """
+
+    theta = _as_2d_float64(theta_all, name="theta_all")
+    if int(theta.shape[1]) != 1:
+        raise ValueError("Scalar Fisher requires theta_all with one column.")
+    if int(theta.shape[0]) < 2:
+        raise ValueError("At least two theta points are required.")
+    order = np.argsort(theta[:, 0], kind="mergesort")
+    theta_s = theta[order]
+    dtheta = np.diff(theta_s[:, 0])
+    if np.any(dtheta <= 0.0):
+        raise ValueError("theta_all must contain strictly increasing unique scalar values after sorting.")
+    if int(mc_jeffreys_sample) < 1:
+        raise ValueError("mc_jeffreys_sample must be >= 1.")
+
+    model.to(device)
+    model.eval()
+    jeffreys = np.zeros(int(theta_s.shape[0]) - 1, dtype=np.float64)
+    for i in range(int(theta_s.shape[0]) - 1):
+        directed: list[float] = []
+        for a, b in ((i, i + 1), (i + 1, i)):
+            xa = sample_flow_endpoint(
+                model=model,
+                theta=theta_s[a : a + 1],
+                n_samples=int(mc_jeffreys_sample),
+                device=device,
+                ode_steps=int(ode_steps),
+                ode_method=str(ode_method),
+            )
+            logp_a = _log_prob_model(
+                model=model,
+                x=xa,
+                theta=theta_s[a : a + 1],
+                device=device,
+                ode_steps=int(ode_steps),
+                ode_method=str(ode_method),
+                batch_size=int(batch_size),
+                solve_jitter=float(solve_jitter),
+                quadrature_steps=quadrature_steps,
+            )
+            logp_b = _log_prob_model(
+                model=model,
+                x=xa,
+                theta=theta_s[b : b + 1],
+                device=device,
+                ode_steps=int(ode_steps),
+                ode_method=str(ode_method),
+                batch_size=int(batch_size),
+                solve_jitter=float(solve_jitter),
+                quadrature_steps=quadrature_steps,
+            )
+            directed.append(float(np.mean(logp_a - logp_b, dtype=np.float64)))
+        jeffreys[i] = max(0.0, float(directed[0] + directed[1]))
+
+    return {
+        "theta_midpoints": (0.5 * (theta_s[:-1, 0] + theta_s[1:, 0])).reshape(-1, 1).astype(np.float64),
+        "theta_left": theta_s[:-1].astype(np.float64),
+        "theta_right": theta_s[1:].astype(np.float64),
+        "dtheta": dtheta.astype(np.float64),
+        "adjacent_jeffreys": jeffreys,
+        "fisher": (jeffreys / (dtheta**2)).astype(np.float64),
+    }
+
+
+@torch.no_grad()
+def estimate_affine_mixed_symmetric_kl_fisher(
+    *,
+    model: nn.Module,
+    theta_all: np.ndarray,
+    device: torch.device,
+    ridge: float = 1e-6,
+    ode_steps: int = 64,
+) -> dict[str, Any]:
+    """Estimate linear Fisher from mixed-affine symmetric KL.
+
+    For each adjacent pair, this integrates ``dSigma/dt = A_bar Sigma +
+    Sigma A_bar.T`` with ``A_bar(t)=0.5*(A(theta_i,t)+A(theta_j,t))`` and reads
+    out the shared-covariance symmetric KL
+    ``delta_mu.T inv(Sigma_bar + ridge I) delta_mu``.  Dividing this adjacent
+    mixed-affine SKL by ``dtheta**2`` gives the linear Fisher estimate.
+    """
+
+    theta = _as_2d_float64(theta_all, name="theta_all")
+    if int(theta.shape[1]) != 1:
+        raise ValueError("Scalar Fisher requires theta_all with one column.")
+    if int(theta.shape[0]) < 2:
+        raise ValueError("At least two theta points are required.")
+    if not hasattr(model, "endpoint_mean") or not hasattr(model, "A"):
+        raise ValueError("Affine mixed-covariance Fisher requires model.endpoint_mean() and model.A().")
+    steps = int(ode_steps)
+    if steps < 1:
+        raise ValueError("ode_steps must be >= 1.")
+    rr = float(ridge)
+    if rr < 0.0 or not math.isfinite(rr):
+        raise ValueError("ridge must be finite and nonnegative.")
+
+    order = np.argsort(theta[:, 0], kind="mergesort")
+    theta_s = theta[order]
+    dtheta = np.diff(theta_s[:, 0])
+    if np.any(dtheta <= 0.0):
+        raise ValueError("theta_all must contain strictly increasing unique scalar values after sorting.")
+
+    model.to(device)
+    model.eval()
+    dtype = _model_floating_dtype(model)
+    x_dim = int(getattr(model, "x_dim"))
+    n_theta = int(theta_s.shape[0])
+    eye_np = np.eye(x_dim, dtype=np.float64)
+    fish = np.zeros(n_theta - 1, dtype=np.float64)
+    adjacent_skl = np.zeros(n_theta - 1, dtype=np.float64)
+    skl_matrix = np.zeros((n_theta, n_theta), dtype=np.float64)
+    mid_covs = np.zeros((n_theta - 1, x_dim, x_dim), dtype=np.float64)
+    deltas = np.zeros((n_theta - 1, x_dim), dtype=np.float64)
+
+    def _a_for(th: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        try:
+            return model.A(th, t)  # condition-specific affine models
+        except TypeError:
+            return model.A(t)  # shared affine models
+
+    for i in range(n_theta - 1):
+        th_l = torch.from_numpy(theta_s[i : i + 1].astype(np.float32)).to(device=device, dtype=dtype)
+        th_r = torch.from_numpy(theta_s[i + 1 : i + 2].astype(np.float32)).to(device=device, dtype=dtype)
+        mu_l = model.endpoint_mean(th_l).detach().cpu().numpy().reshape(-1).astype(np.float64)
+        mu_r = model.endpoint_mean(th_r).detach().cpu().numpy().reshape(-1).astype(np.float64)
+        delta = mu_r - mu_l
+        sigma = eye_np.copy()
+        dt = 1.0 / float(steps)
+        for step in range(steps):
+            t_val = (float(step) + 0.5) * dt
+            tt = torch.full((1, 1), t_val, dtype=dtype, device=device)
+            a_l = _a_for(th_l, tt)
+            a_r = _a_for(th_r, tt)
+            a_bar = (0.5 * (a_l + a_r)).detach().cpu().numpy().reshape(x_dim, x_dim).astype(np.float64)
+            sigma = sigma + dt * (a_bar @ sigma + sigma @ a_bar.T)
+            sigma = 0.5 * (sigma + sigma.T)
+        cov = sigma + rr * eye_np
+        skl = max(0.0, float(delta @ np.linalg.solve(cov, delta)))
+        adjacent_skl[i] = skl
+        skl_matrix[i, i + 1] = skl
+        skl_matrix[i + 1, i] = skl
+        fish[i] = skl / float(dtheta[i] ** 2)
+        mid_covs[i] = sigma
+        deltas[i] = delta
+
+    return {
+        "theta_midpoints": (0.5 * (theta_s[:-1, 0] + theta_s[1:, 0])).reshape(-1, 1).astype(np.float64),
+        "theta_left": theta_s[:-1].astype(np.float64),
+        "theta_right": theta_s[1:].astype(np.float64),
+        "dtheta": dtheta.astype(np.float64),
+        "delta_mu": deltas,
+        "mixed_covariance": mid_covs,
+        "adjacent_symmetric_kl": adjacent_skl,
+        "symmetric_kl_matrix": skl_matrix,
+        "canonical_metric_matrix": skl_matrix.copy(),
+        "canonical_metric_name": "mixed_affine_symmetric_kl",
+        "fisher": fish,
+    }
+
+
+@torch.no_grad()
+def estimate_affine_mixed_covariance_fisher(
+    *,
+    model: nn.Module,
+    theta_all: np.ndarray,
+    device: torch.device,
+    ridge: float = 1e-6,
+    ode_steps: int = 64,
+) -> dict[str, Any]:
+    """Backward-compatible wrapper for mixed-affine SKL linear Fisher."""
+
+    return estimate_affine_mixed_symmetric_kl_fisher(
+        model=model,
+        theta_all=theta_all,
+        device=device,
+        ridge=float(ridge),
+        ode_steps=int(ode_steps),
+    )
+
+
 def estimate_model_symmetric_kl(
     *,
     model: nn.Module,

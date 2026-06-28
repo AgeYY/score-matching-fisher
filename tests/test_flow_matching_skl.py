@@ -1012,3 +1012,96 @@ def test_scalar_fisher_finite_differences_use_model_jeffreys_matrix(
     np.testing.assert_allclose(result.fisher_full, expected_fisher, rtol=1e-6, atol=1e-6)
     fd = estimate_scalar_fisher_from_skl(theta, result.symmetric_kl_matrix)
     np.testing.assert_allclose(fd["fisher"], expected_fisher, rtol=1e-6, atol=1e-6)
+
+
+class ScalarAffineIdentityCovModel(nn.Module):
+    def __init__(self, slope: np.ndarray) -> None:
+        super().__init__()
+        self.velocity_family = "condition_affine"
+        self.x_dim = int(np.asarray(slope).size)
+        self.register_buffer("slope", torch.as_tensor(slope, dtype=torch.float32).reshape(1, -1))
+
+    def endpoint_mean(self, theta: torch.Tensor) -> torch.Tensor:
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        return theta.to(self.slope.dtype) @ self.slope
+
+    def A(self, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        del theta
+        batch = int(t.reshape(-1, 1).shape[0])
+        return torch.zeros(batch, self.x_dim, self.x_dim, dtype=self.slope.dtype, device=self.slope.device)
+
+
+def test_affine_mixed_covariance_fisher_zero_a_closed_form() -> None:
+    model = ScalarAffineIdentityCovModel(np.asarray([2.0, -1.0], dtype=np.float64))
+    theta = np.asarray([0.0, 0.5, 1.0], dtype=np.float64).reshape(-1, 1)
+
+    got = fms.estimate_affine_mixed_symmetric_kl_fisher(
+        model=model,
+        theta_all=theta,
+        device=torch.device("cpu"),
+        ridge=0.0,
+        ode_steps=4,
+    )
+
+    expected_skl = np.asarray([1.25, 1.25], dtype=np.float64)
+    expected_matrix = np.asarray(
+        [
+            [0.0, 1.25, 0.0],
+            [1.25, 0.0, 1.25],
+            [0.0, 1.25, 0.0],
+        ],
+        dtype=np.float64,
+    )
+
+    np.testing.assert_allclose(got["adjacent_symmetric_kl"], expected_skl, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(got["symmetric_kl_matrix"], expected_matrix, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(got["canonical_metric_matrix"], expected_matrix, rtol=1e-12, atol=1e-12)
+    assert got["canonical_metric_name"] == "mixed_affine_symmetric_kl"
+    np.testing.assert_allclose(got["fisher"], np.asarray([5.0, 5.0]), rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(got["mixed_covariance"], np.repeat(np.eye(2)[None, :, :], 2, axis=0))
+
+    compat = fms.estimate_affine_mixed_covariance_fisher(
+        model=model,
+        theta_all=theta,
+        device=torch.device("cpu"),
+        ridge=0.0,
+        ode_steps=4,
+    )
+    np.testing.assert_allclose(compat["fisher"], got["fisher"], rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(compat["symmetric_kl_matrix"], got["symmetric_kl_matrix"], rtol=1e-12, atol=1e-12)
+
+
+def test_adjacent_model_jeffreys_fisher_uses_only_adjacent_pairs(monkeypatch: pytest.MonkeyPatch) -> None:
+    class DummyModel(nn.Module):
+        x_dim = 1
+
+    calls: list[tuple[str, float]] = []
+
+    def fake_sample_flow_endpoint(*, model, theta, n_samples, device, ode_steps, ode_method):
+        del model, n_samples, device, ode_steps, ode_method
+        val = float(np.asarray(theta).reshape(-1)[0])
+        calls.append(("sample", val))
+        return torch.full((3, 1), val, dtype=torch.float32)
+
+    def fake_log_prob_model(*, model, x, theta, device, ode_steps, batch_size, solve_jitter, quadrature_steps, ode_method):
+        del model, x, device, ode_steps, batch_size, solve_jitter, quadrature_steps, ode_method
+        val = float(np.asarray(theta).reshape(-1)[0])
+        calls.append(("logp", val))
+        return np.full(3, -val, dtype=np.float64)
+
+    monkeypatch.setattr(fms, "sample_flow_endpoint", fake_sample_flow_endpoint)
+    monkeypatch.setattr(fms, "_log_prob_model", fake_log_prob_model)
+
+    theta = np.asarray([0.0, 2.0, 5.0], dtype=np.float64).reshape(-1, 1)
+    got = fms.estimate_adjacent_model_jeffreys_fisher(
+        model=DummyModel(),
+        theta_all=theta,
+        device=torch.device("cpu"),
+        mc_jeffreys_sample=3,
+    )
+
+    np.testing.assert_allclose(got["adjacent_jeffreys"], np.asarray([0.0, 0.0]))
+    np.testing.assert_allclose(got["fisher"], np.asarray([0.0, 0.0]))
+    sample_thetas = [val for kind, val in calls if kind == "sample"]
+    assert sample_thetas == [0.0, 2.0, 2.0, 5.0]
