@@ -1,5 +1,9 @@
 # AGENTS Instructions
 
+## Branch Purpose
+
+- The `flow-pipline-maha` branch is used to explore `new-metric`.
+
 ## Runtime Environment (Mandatory)
 
 - Always run Python/code commands inside the `mamba` environment `geo_diffusion`.
