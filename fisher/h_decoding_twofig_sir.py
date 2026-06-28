@@ -15,7 +15,7 @@ Example benchmark-1D PR-30D runs:
      --dataset-family randamp_gaussian_sqrtd \
      --theta-field-rows theta_path_integral,theta_flow,x_flow,linear_x_flow_t,contrastive,bin_gaussian \
      --n-list 80,200,400,600 \
-     --device cuda \
+     --device cuda:1 \
      --output-dir data/experiments/h_decoding_twofig_sir_pr30d_linearbench_<TAG>
 
    mamba run -n geo_diffusion python bin/study_h_decoding_twofig_sir.py \
@@ -23,7 +23,7 @@ Example benchmark-1D PR-30D runs:
      --dataset-family cosine_gaussian_sqrtd_rand_tune_additive \
      --theta-field-rows theta_path_integral,theta_flow,x_flow,linear_x_flow_t,contrastive,bin_gaussian \
      --n-list 80,200,400,600 \
-     --device cuda \
+     --device cuda:1 \
      --output-dir data/experiments/h_decoding_twofig_sir_pr30d_cosinebench_noise2x_alpha4x_<TAG>
 """
 

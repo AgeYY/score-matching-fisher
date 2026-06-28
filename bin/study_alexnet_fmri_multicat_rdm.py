@@ -15,7 +15,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from global_setting import DATA_DIR, ECOSET_VALIDATION_DIR
+from global_setting import DATA_DIR, DEFAULT_DEVICE, ECOSET_VALIDATION_DIR
 from fisher.alexnet_ecoset_catdog_decoding import EcosetValidationDirAction, ensure_sampled_images
 from fisher.alexnet_fmri_simulation import AlexNetFMRISimulator, FMRISimulationConfig, LayerKey
 
@@ -564,16 +564,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--noise-lambda", type=float, default=0.3)
     p.add_argument("--rdm-metric", choices=RDM_METRICS, default="correlation")
     p.add_argument("--seed", type=int, default=3)
-    p.add_argument("--device", default="cuda")
+    p.add_argument("--device", default=DEFAULT_DEVICE)
     p.add_argument("--force-export", action="store_true")
     return p
 
 
 def run(args: argparse.Namespace) -> dict[str, Path]:
-    if str(args.device) != "cuda":
-        raise ValueError("This project analysis requires --device cuda.")
+    device = torch.device(str(args.device))
+    if device.type != "cuda":
+        raise ValueError("This project analysis requires a CUDA --device.")
     if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is unavailable; AGENTS.md requires --device cuda for project runs.")
+        raise RuntimeError("CUDA is unavailable; AGENTS.md requires a CUDA device for project runs.")
 
     class_names = parse_classes(args.classes)
     layer_ids = parse_layers(args.layers)

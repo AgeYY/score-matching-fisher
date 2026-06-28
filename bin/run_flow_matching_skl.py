@@ -16,7 +16,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from global_setting import DATA_DIR
+from global_setting import DATA_DIR, DEFAULT_DEVICE
 
 from fisher.data import ToyCategoricalRandomMoGDataset
 from fisher.flow_matching_skl import (
@@ -36,7 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
     src = p.add_mutually_exclusive_group()
     src.add_argument("--dataset-npz", type=Path, default=None)
     src.add_argument("--toy", choices=("random_mog",), default=None)
-    p.add_argument("--device", type=str, default="cuda")
+    p.add_argument("--device", type=str, default=DEFAULT_DEVICE)
     p.add_argument("--path-schedule", choices=("cosine", "linear", "straight"), default="cosine")
     p.add_argument("--radius", type=float, default=1.0)
     p.add_argument("--fisher-kind", choices=("none", "full", "linear", "both"), default="none")

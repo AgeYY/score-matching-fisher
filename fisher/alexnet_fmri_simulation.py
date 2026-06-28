@@ -15,6 +15,7 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 import torch
 
+from global_setting import DEFAULT_DEVICE
 from fisher.alexnet_ecoset_model import load_alexnet_ecoset
 
 
@@ -94,7 +95,7 @@ class FMRISimulationConfig:
     rho: float = 0.5
     noise_lambda: float = 0.3
     seed: int = 0
-    device: str = "cuda"
+    device: str = DEFAULT_DEVICE
     cv_folds: int = 3
     max_iter: int = 1000
     hrf_duration: float = 32.0
@@ -378,9 +379,9 @@ class AlexNetFMRISimulator(FMRIBetaSimulator):
 
     def __init__(self, config: FMRISimulationConfig | None = None) -> None:
         super().__init__(config)
-        if self.config.device == "cuda" and not torch.cuda.is_available():
-            raise RuntimeError("CUDA is unavailable; AGENTS.md requires --device cuda for project runs.")
         self.device = torch.device(self.config.device)
+        if self.device.type == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("CUDA is unavailable; AGENTS.md requires a CUDA device for project runs.")
         self.model, self.preprocess = load_alexnet_ecoset(self.device)
 
     def extract_activations(

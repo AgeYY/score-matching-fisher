@@ -34,7 +34,7 @@ _repo_root = Path(__file__).resolve().parent.parent
 if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 
-import global_setting  # noqa: F401  # matplotlib rc
+import global_setting  # matplotlib rc and project defaults
 
 import matplotlib
 
@@ -378,7 +378,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         required=True,
         help="Target observation dimension after embedding (must be >= source x_dim / z_dim).",
     )
-    p.add_argument("--device", type=str, default="cuda")
+    p.add_argument("--device", type=str, default=global_setting.DEFAULT_DEVICE)
     p.add_argument(
         "--seed",
         type=int,
@@ -502,9 +502,9 @@ def main() -> None:
     validate_h_dim(h_dim=h_dim, z_dim=z_dim)
 
     device_name = str(args.device)
-    if device_name == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA requested (`--device cuda`) but CUDA is unavailable on this machine.")
     device = torch.device(device_name)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(f"CUDA requested (`--device {device_name}`) but CUDA is unavailable on this machine.")
 
     seed = int(args.seed) if args.seed is not None else int(meta["seed"])
     source_sha256 = _file_sha256(in_path)

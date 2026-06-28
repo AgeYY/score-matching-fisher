@@ -23,6 +23,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from global_setting import DEFAULT_CUDA_DEVICE_IDS, DEFAULT_DEVICE
 from fisher.dataset_visualization import plot_joint_and_tuning, plot_tuning_and_covariance_on_axes
 from fisher.shared_dataset_io import load_shared_dataset_npz
 from fisher.shared_fisher_est import build_dataset_from_meta
@@ -172,14 +173,14 @@ def default_output_dir(*, dataset_family: str = "randamp_gaussian_sqrtd", native
 def build_parser() -> argparse.ArgumentParser:
     p = single.build_parser()
     p.description = __doc__
-    p.set_defaults(n_total=1000, native_x_dim=4, output_dir=None, device="cuda")
+    p.set_defaults(n_total=1000, native_x_dim=4, output_dir=None, device=DEFAULT_DEVICE)
     p.add_argument("--n-list", type=_parse_int_list, default=[1500, 3500, 5500, 7500, 9500])
     p.add_argument("--pr-dims", type=_parse_pr_dims, default=[None])
     p.add_argument("--n-repeats", type=_positive_int, default=1)
     p.add_argument("--case-output-name", type=str, default="continuous_pr_fisher")
     p.add_argument("--force-comparison", action="store_true")
     p.add_argument("--visualization-only", action="store_true")
-    p.add_argument("--gpu-ids", type=_parse_gpu_ids, default=[0])
+    p.add_argument("--gpu-ids", type=_parse_gpu_ids, default=list(DEFAULT_CUDA_DEVICE_IDS))
     p.add_argument("--jobs-per-gpu", type=_positive_int, default=1)
     p.add_argument("--cpu-threads-per-job", default="auto")
     p.add_argument("--parallel-log-dir", type=Path, default=None)

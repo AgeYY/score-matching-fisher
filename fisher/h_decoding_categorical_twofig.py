@@ -38,7 +38,7 @@ import torch
 from sklearn.cross_decomposition import PLSRegression
 from sklearn.linear_model import LogisticRegression
 
-from global_setting import DATA_DIR
+from global_setting import DATA_DIR, DEFAULT_DEVICE
 
 from fisher import h_binned_visualization as vhb
 from fisher import h_decoding_convergence as conv
@@ -1747,7 +1747,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--n-list", type=str, default="80,200,400,600")
     p.add_argument("--n-ref", type=int, default=10000)
     p.add_argument("--run-seed", type=int, default=7)
-    p.add_argument("--device", type=str, default="cuda")
+    p.add_argument("--device", type=str, default=DEFAULT_DEVICE)
     p.add_argument(
         "--methods",
         type=str,
@@ -3282,8 +3282,9 @@ def main(argv: list[str] | None = None) -> None:
     methods = parse_methods(str(args.methods))
     if int(args.num_categories) < 2:
         raise ValueError("--num-categories must be >= 2.")
-    if (not bool(args.visualization_only)) and str(args.device).strip().lower() == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA is unavailable; use a CUDA machine or pass --device cuda when available.")
+    device = torch.device(str(args.device))
+    if (not bool(args.visualization_only)) and device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA is unavailable; use a CUDA machine or pass a CUDA --device when available.")
 
     ns = conv._parse_n_list(str(args.n_list))
     if not ns:

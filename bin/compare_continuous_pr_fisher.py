@@ -31,6 +31,7 @@ from fisher.continuous_fisher_comparison import (
     write_results_npz,
     write_summary_json,
 )
+from global_setting import DEFAULT_DEVICE
 from fisher.shared_dataset_io import load_shared_dataset_npz
 from fisher.shared_fisher_est import require_device
 
@@ -58,7 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--theta-grid-size", type=int, default=31)
     p.add_argument("--pr-dim", type=parse_pr_dim, default=None, help="Use 'none' for native mode or an integer PR h_dim.")
     p.add_argument("--seed", type=int, default=7)
-    p.add_argument("--device", type=str, default="cuda")
+    p.add_argument("--device", type=str, default=DEFAULT_DEVICE)
     p.add_argument("--dataset-dir", type=Path, default=None)
     p.add_argument("--output-dir", type=Path, default=None)
     p.add_argument("--force-dataset", action="store_true")

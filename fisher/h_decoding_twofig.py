@@ -752,13 +752,13 @@ def build_sir_first_parser() -> argparse.ArgumentParser:
         "--dataset-npz data/randamp_gaussian_sqrtd_xdim5/randamp_gaussian_sqrtd_xdim5_pr30d.npz "
         "--dataset-family randamp_gaussian_sqrtd "
         f"--theta-field-rows {SIR_FIRST_DEFAULT_ROWS} --n-list 80,200,400,600 "
-        "--device cuda --output-dir data/experiments/h_decoding_twofig_sir_pr30d_linearbench_<TAG>\n"
+        "--device cuda:1 --output-dir data/experiments/h_decoding_twofig_sir_pr30d_linearbench_<TAG>\n"
         "  mamba run -n geo_diffusion python bin/study_h_decoding_twofig_sir.py "
         "--dataset-npz data/cosine_sqrtd_rand_tune_additive_xdim5_noise2x_alpha4x/"
         "cosine_sqrtd_rand_tune_additive_xdim5_noise2x_alpha4x_pr30d.npz "
         "--dataset-family cosine_gaussian_sqrtd_rand_tune_additive "
         f"--theta-field-rows {SIR_FIRST_DEFAULT_ROWS} --n-list 80,200,400,600 "
-        "--device cuda --output-dir data/experiments/h_decoding_twofig_sir_pr30d_cosinebench_noise2x_alpha4x_<TAG>"
+        "--device cuda:1 --output-dir data/experiments/h_decoding_twofig_sir_pr30d_cosinebench_noise2x_alpha4x_<TAG>"
     )
     p.formatter_class = argparse.RawDescriptionHelpFormatter
     p.set_defaults(

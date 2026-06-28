@@ -147,7 +147,8 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError("--num-categories must be >= 2.")
     if int(args.n_eval) < 1:
         raise ValueError("--n-eval must be >= 1.")
-    if str(args.device).strip().lower() == "cuda" and not torch.cuda.is_available():
+    device = torch.device(str(args.device))
+    if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA is unavailable; bench_llr.py defaults to CUDA and will not switch to CPU.")
     if bool(args.visualization_only):
         raise ValueError("bench_llr.py does not support --visualization-only.")

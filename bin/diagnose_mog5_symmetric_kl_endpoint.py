@@ -24,7 +24,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from global_setting import DATA_DIR
+from global_setting import DATA_DIR, DEFAULT_DEVICE
 
 from fisher import flow_matching_skl as fms
 from fisher.distance_comparison import analytic_diagonal_gaussian_skl_matrix, labels_from_theta, pair_indices
@@ -95,7 +95,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--native-x-dim", type=int, default=3)
     p.add_argument("--pr-dim", type=parse_pr_dim, default=None, help="Use 'none' or 'null' for native mode.")
     p.add_argument("--seed", type=int, default=7)
-    p.add_argument("--device", type=str, default="cuda")
+    p.add_argument("--device", type=str, default=DEFAULT_DEVICE)
     p.add_argument("--dataset-dir", type=Path, default=None)
     p.add_argument("--native-template-npz", type=Path, default=None)
     p.add_argument("--force-dataset", action="store_true")

@@ -21,7 +21,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from global_setting import DATA_DIR, ECOSET_VALIDATION_DIR
+from global_setting import DATA_DIR, DEFAULT_DEVICE, ECOSET_VALIDATION_DIR
 from fisher.alexnet_ecoset_model import load_alexnet_ecoset
 
 
@@ -332,14 +332,15 @@ def ensure_sampled_images(
 def extract_representations(
     image_paths: Sequence[str | os.PathLike[str]],
     *,
-    device: str = "cuda",
+    device: str = DEFAULT_DEVICE,
     batch_size: int = 64,
     layers: Sequence[str] = ALEXNET_ECOSET_LAYERS,
 ) -> dict[str, np.ndarray]:
-    if str(device) != "cuda":
-        raise ValueError("This project analysis requires device='cuda'.")
+    dev = torch.device(str(device))
+    if dev.type != "cuda":
+        raise ValueError("This project analysis requires a CUDA device.")
     if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is unavailable; AGENTS.md requires --device cuda for project runs.")
+        raise RuntimeError("CUDA is unavailable; AGENTS.md requires a CUDA device for project runs.")
     model, transform = load_alexnet_ecoset(device)
     return extract_representations_from_model(
         model,
@@ -356,7 +357,7 @@ def extract_representations_from_model(
     transform,
     image_paths: Sequence[str | os.PathLike[str]],
     *,
-    device: str = "cuda",
+    device: str = DEFAULT_DEVICE,
     batch_size: int = 64,
     layers: Sequence[str] = ALEXNET_ECOSET_LAYERS,
 ) -> dict[str, np.ndarray]:
@@ -415,7 +416,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--test-size", type=float, default=0.2, help="Held-out stratified test fraction.")
     p.add_argument("--seed", type=int, default=0, help="Random seed for sampling, split, and classifier.")
     p.add_argument("--batch-size", type=int, default=64, help="Image batch size for AlexNet-EcoSet extraction.")
-    p.add_argument("--device", default="cuda", help="Execution device; this project run requires cuda.")
+    p.add_argument("--device", default=DEFAULT_DEVICE, help="Execution device; this project run requires CUDA.")
     p.add_argument(
         "--ecoset-validation-dir",
         "--hf-cache-dir",
@@ -440,10 +441,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run(args: argparse.Namespace) -> Path:
-    if str(args.device) != "cuda":
-        raise ValueError("This project analysis requires --device cuda.")
+    device = torch.device(str(args.device))
+    if device.type != "cuda":
+        raise ValueError("This project analysis requires a CUDA --device.")
     if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is unavailable; AGENTS.md requires --device cuda for project runs.")
+        raise RuntimeError("CUDA is unavailable; AGENTS.md requires a CUDA device for project runs.")
     classes = parse_classes(args.classes)
     validation_dir = getattr(args, "ecoset_validation_dir", getattr(args, "hf_cache_dir", None))
     samples = ensure_sampled_images(

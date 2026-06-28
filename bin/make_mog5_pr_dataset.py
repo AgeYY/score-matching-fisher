@@ -27,7 +27,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from global_setting import DATA_DIR
+from global_setting import DATA_DIR, DEFAULT_DEVICE
 from fisher.data import ToyCategoricalRandomMoGDataset
 from fisher.shared_dataset_io import SharedDatasetBundle, load_shared_dataset_npz, save_shared_dataset_npz
 
@@ -118,7 +118,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Optional native MoG5 NPZ whose fixed component gains, means, and variances are reused.",
     )
-    p.add_argument("--device", type=str, default="cuda", help="Device passed to the PR projection script.")
+    p.add_argument("--device", type=str, default=DEFAULT_DEVICE, help="Device passed to the PR projection script.")
     p.add_argument(
         "--output-dir",
         type=str,

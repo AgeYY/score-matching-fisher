@@ -15,6 +15,8 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from global_setting import DEFAULT_CUDA_DEVICE_IDS, DEFAULT_DEVICE
+
 
 def _load_sweep_module() -> Any:
     path = _REPO_ROOT / "bin" / "compare_mog5_pr_distance_sweeps.py"
@@ -61,11 +63,11 @@ def _resolve_cpu_threads(value: str | int, total_workers: int) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = sweep.build_parser()
     p.description = __doc__
-    p.set_defaults(device="cuda")
+    p.set_defaults(device=DEFAULT_DEVICE)
     p.add_argument(
         "--gpu-ids",
         type=_parse_gpu_ids,
-        default=[0, 1],
+        default=list(DEFAULT_CUDA_DEVICE_IDS),
         help="Comma-separated CUDA device ids used for parallel case workers.",
     )
     p.add_argument(

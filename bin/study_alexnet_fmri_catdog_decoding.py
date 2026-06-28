@@ -14,7 +14,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from global_setting import DATA_DIR, ECOSET_VALIDATION_DIR
+from global_setting import DATA_DIR, DEFAULT_DEVICE, ECOSET_VALIDATION_DIR
 from fisher.alexnet_ecoset_catdog_decoding import EcosetValidationDirAction, ensure_sampled_images
 from fisher.alexnet_fmri_simulation import (
     AlexNetFMRISimulator,
@@ -114,16 +114,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cv-folds", type=int, default=3)
     p.add_argument("--clf-max-iter", type=int, default=5000)
     p.add_argument("--seed", type=int, default=3)
-    p.add_argument("--device", default="cuda")
+    p.add_argument("--device", default=DEFAULT_DEVICE)
     p.add_argument("--force-export", action="store_true")
     return p
 
 
 def run(args: argparse.Namespace) -> Path:
-    if str(args.device) != "cuda":
-        raise ValueError("This project analysis requires --device cuda.")
+    device = torch.device(str(args.device))
+    if device.type != "cuda":
+        raise ValueError("This project analysis requires a CUDA --device.")
     if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is unavailable; AGENTS.md requires --device cuda for project runs.")
+        raise RuntimeError("CUDA is unavailable; AGENTS.md requires a CUDA device for project runs.")
 
     n_per_class = int(args.n_per_class)
     validation_dir = getattr(args, "ecoset_validation_dir", getattr(args, "hf_cache_dir", None))

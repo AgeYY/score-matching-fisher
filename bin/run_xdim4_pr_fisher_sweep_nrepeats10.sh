@@ -15,7 +15,7 @@ exec mamba run -n geo_diffusion python "${REPO_ROOT}/bin/compare_continuous_pr_f
   --train-frac 0.8 \
   --lr 1e-4 \
   --output-dir "${OUT_DIR}" \
-  --gpu-ids 0 \
+  --gpu-ids 1 \
   --jobs-per-gpu 1 \
-  --device cuda \
+  --device cuda:1 \
   2>&1 | tee "${LOG}"

@@ -109,6 +109,8 @@ def test_parallel_parser_pr_dims_defaults_and_command(tmp_path: Path, monkeypatc
     assert default_args.native_x_dim == 4
     assert default_args.train_frac == pytest.approx(0.8)
     assert default_args.pr_dims == [None]
+    assert default_args.gpu_ids == [1]
+    assert default_args.device == "cuda:1"
     assert default_args.skip_dataset_viz is False
     assert default_args.composite_smoothing == "kernel"
     assert default_args.kernel_smooth_bandwidth_grid == pytest.approx(2.0)

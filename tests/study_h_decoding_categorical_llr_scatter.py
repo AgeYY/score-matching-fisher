@@ -557,8 +557,9 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError("Raw binary LLR plotting requires exactly two categories.")
     if int(args.n_eval) < 2:
         raise ValueError("--n-eval must be >= 2.")
-    if str(args.device).strip().lower() == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA is unavailable; use a CUDA machine or pass --device cuda when available.")
+    device = torch.device(str(args.device))
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA is unavailable; use a CUDA machine or pass a CUDA --device when available.")
 
     if args.dataset_npz is None:
         args.dataset_npz = _MOG2PR5_NATIVE_NPZ

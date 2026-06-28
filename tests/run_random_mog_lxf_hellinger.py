@@ -15,6 +15,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from global_setting import DEFAULT_DEVICE
 from fisher.data import ToyCategoricalRandomMoGDataset
 from fisher.gaussian_x_flow import path_schedule_from_name
 from fisher.h_decoding_categorical_twofig import hellinger_gt_sq_category_matrix
@@ -36,7 +37,7 @@ def build_parser() -> argparse.ArgumentParser:
             "analytic endpoint Hellinger estimate."
         )
     )
-    p.add_argument("--device", type=str, default="cuda")
+    p.add_argument("--device", type=str, default=DEFAULT_DEVICE)
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--n-total", type=int, default=300)
     p.add_argument("--x-dim", type=int, default=2)
@@ -195,9 +196,9 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("--n-total must be large enough to split each category into train and validation.")
 
     requested_device = str(args.device).strip().lower()
-    if requested_device == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("--device cuda was requested, but CUDA is not available on this machine.")
     device = torch.device(requested_device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(f"--device {requested_device} was requested, but CUDA is not available on this machine.")
 
     np.random.seed(int(args.seed))
     torch.manual_seed(int(args.seed))

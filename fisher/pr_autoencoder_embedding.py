@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from global_setting import DEFAULT_DEVICE
 from fisher.autoencoder_embedding import PRAutoencoderConfig, InputAutoencoder, train_or_load_pr_autoencoder
 from fisher.shared_fisher_est import build_dataset_from_args
 
@@ -105,10 +106,10 @@ def build_randamp_gaussian_sqrtd_pr_autoencoder_dataset(ns: Any) -> PRAutoencode
     if h_dim < cfg.z_dim:
         raise ValueError(f"Target x_dim (h_dim) must be >= z_dim={cfg.z_dim}; got {h_dim}.")
 
-    device_name = str(getattr(ns, "device", "cuda"))
-    if device_name == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA requested (`--device cuda`) but CUDA is unavailable on this machine.")
+    device_name = str(getattr(ns, "device", DEFAULT_DEVICE))
     device = torch.device(device_name)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(f"CUDA requested (`--device {device_name}`) but CUDA is unavailable on this machine.")
 
     base_ns = _copy_namespace(ns)
     base_ns.dataset_family = "randamp_gaussian_sqrtd"

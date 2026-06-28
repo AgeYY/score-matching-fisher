@@ -442,7 +442,7 @@ def test_bench_llr_parser_n_eval_default_and_override() -> None:
 
     args = bench.build_parser().parse_args([])
     assert args.n_eval == 600
-    assert args.device == "cuda"
+    assert args.device == "cuda:1"
 
     args2 = bench.build_parser().parse_args(["--n-eval", "123", "--methods", "bin_gaussian"])
     assert args2.n_eval == 123
@@ -1547,7 +1547,7 @@ def test_cli_defaults_from_parser() -> None:
     assert int(ns.num_categories) == 2
     assert ns.n_list == "80,200,400,600"
     assert int(ns.n_ref) == 10000
-    assert str(ns.device) == "cuda"
+    assert str(ns.device) == "cuda:1"
 
 
 def test_cli_accepts_multi_rings_dataset_family() -> None:

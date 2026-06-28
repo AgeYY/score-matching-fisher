@@ -60,7 +60,7 @@ def test_multicat_rdm_cli_defaults() -> None:
     assert Path(args.output_dir) == _data_dir_path("ecoset", "alexnet_fmri_multicat_rdm")
     assert int(args.n_per_class) == 50
     assert args.rdm_metric == "correlation"
-    assert args.device == "cuda"
+    assert args.device == "cuda:1"
 
     euclidean_args = module.build_parser().parse_args(["--rdm-metric", "euclidean"])
     assert euclidean_args.rdm_metric == "euclidean"

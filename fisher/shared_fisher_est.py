@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from global_setting import SCORE_VAL_FRACTION
+from global_setting import DEFAULT_DEVICE, SCORE_VAL_FRACTION
 
 from fisher.data import (
     RANDAMP_SQRTD_VAR_MU_LAW_ADDITIVE,
@@ -138,10 +138,16 @@ from fisher.trainers import (
 )
 
 
-def require_device(name: str) -> torch.device:
-    if name == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA requested but unavailable. Per repo policy, do not fallback silently.")
-    return torch.device(name)
+def require_device(name: str = DEFAULT_DEVICE) -> torch.device:
+    dev = torch.device(str(name))
+    if dev.type == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA requested but unavailable. Per repo policy, do not fallback silently.")
+        if dev.index is not None and int(dev.index) >= torch.cuda.device_count():
+            raise RuntimeError(
+                f"Requested {dev}, but only {torch.cuda.device_count()} CUDA device(s) are visible."
+            )
+    return dev
 
 
 def normalize_theta_field_method(method: str) -> str:

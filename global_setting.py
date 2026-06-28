@@ -15,6 +15,26 @@ DATAROOT = os.environ.get(
 # Default datasets and run outputs live directly under DATAROOT (same tree as the repo `data/` symlink).
 DATA_DIR = DATAROOT
 
+# Default execution device for training/evaluation scripts.
+# Override at runtime: export SCORE_MATCHING_FISHER_DEFAULT_DEVICE=cuda:0
+DEFAULT_DEVICE = os.environ.get("SCORE_MATCHING_FISHER_DEFAULT_DEVICE", "cuda:1")
+
+
+def _default_cuda_device_id(device_name: str) -> int:
+    text = str(device_name).strip().lower()
+    if text == "cuda":
+        return 0
+    if text.startswith("cuda:"):
+        suffix = text.split(":", 1)[1]
+        if suffix.isdigit():
+            return int(suffix)
+    return 0
+
+
+# Default physical CUDA ids for subprocess launchers that use CUDA_VISIBLE_DEVICES.
+DEFAULT_CUDA_DEVICE_ID = _default_cuda_device_id(DEFAULT_DEVICE)
+DEFAULT_CUDA_DEVICE_IDS = [DEFAULT_CUDA_DEVICE_ID]
+
 # Local Hugging Face builder cache location for the EcoSet validation Arrow table.
 # Override at runtime:
 # export SCORE_MATCHING_FISHER_ECOSET_VALIDATION_DIR=/path/to/ecoset-validation.arrow

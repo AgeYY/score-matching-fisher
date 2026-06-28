@@ -25,7 +25,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from global_setting import DATA_DIR
+from global_setting import DATA_DIR, DEFAULT_DEVICE
 
 from fisher.flow_matching_skl import (
     build_flow_skl_model,
@@ -62,7 +62,7 @@ def _parse_int_list(value: str) -> list[int]:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    p.add_argument("--device", type=str, default="cuda")
+    p.add_argument("--device", type=str, default=DEFAULT_DEVICE)
     p.add_argument("--output-dir", type=Path, default=Path(DATA_DIR) / "two_condition_shear_rank_skl")
     p.add_argument("--force", action="store_true", help="Rerun model cases even when cached NPZs exist.")
     p.add_argument(

@@ -10,7 +10,7 @@ _repo_root = Path(__file__).resolve().parent.parent
 if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 
-from global_setting import DATA_DIR
+from global_setting import DATA_DIR, DEFAULT_DEVICE
 
 
 def _parse_mog_mean_min_dist_cli(s: str) -> float | None:
@@ -175,7 +175,7 @@ def add_dataset_arguments(p: argparse.ArgumentParser) -> None:
 
 
 def add_estimation_arguments(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--device", type=str, default="cuda")
+    p.add_argument("--device", type=str, default=DEFAULT_DEVICE)
     p.add_argument("--gt-mc-samples-per-bin", type=int, default=6000)
     p.add_argument(
         "--theta-field-method",

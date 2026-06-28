@@ -16,6 +16,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from global_setting import DEFAULT_DEVICE
 from fisher.distance_comparison import (
     METRIC_NAMES,
     FlowComparisonConfig,
@@ -87,7 +88,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="MoG5 PR embedded dimension. Use 'none' or 'null' for native mode.",
     )
     p.add_argument("--seed", type=int, default=7, help="Dataset, flow, and estimation seed.")
-    p.add_argument("--device", type=str, default="cuda", help="Execution device for PR GT encoding and flows.")
+    p.add_argument("--device", type=str, default=DEFAULT_DEVICE, help="Execution device for PR GT encoding and flows.")
     p.add_argument(
         "--native-template-npz",
         type=Path,
