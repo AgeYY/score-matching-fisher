@@ -203,6 +203,12 @@ def select_tasks_to_run(
 
 
 def _arg_to_cli_name(dest: str) -> str:
+    special = {
+        "optimizer_name": "--flow-optimizer",
+        "lr_scheduler": "--flow-lr-scheduler",
+    }
+    if str(dest) in special:
+        return special[str(dest)]
     return "--" + str(dest).replace("_", "-")
 
 

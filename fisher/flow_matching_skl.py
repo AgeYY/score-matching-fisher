@@ -1296,6 +1296,36 @@ def _adamw_parameters(model: nn.Module) -> list[nn.Parameter]:
     return [p for p in model.parameters() if p.requires_grad]
 
 
+def _build_flow_optimizer(
+    model: nn.Module,
+    *,
+    optimizer_name: str,
+    lr: float,
+    weight_decay: float,
+) -> torch.optim.Optimizer:
+    params = _adamw_parameters(model)
+    name = str(optimizer_name).strip().lower()
+    if name == "adamw":
+        return torch.optim.AdamW(params, lr=float(lr), weight_decay=float(weight_decay))
+    if name == "adam":
+        return torch.optim.Adam(params, lr=float(lr), weight_decay=float(weight_decay))
+    raise ValueError("flow optimizer must be one of {'adam', 'adamw'}.")
+
+
+def _build_flow_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+    *,
+    scheduler_name: str,
+    epochs: int,
+) -> torch.optim.lr_scheduler.LRScheduler | None:
+    name = str(scheduler_name).strip().lower()
+    if name == "none":
+        return None
+    if name == "cosine":
+        return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, int(epochs)))
+    raise ValueError("flow lr scheduler must be one of {'none', 'cosine'}.")
+
+
 def _sample_fm_batch(
     *,
     path: Any,
@@ -1336,6 +1366,8 @@ def train_flow_skl_model(
     batch_size: int = 512,
     lr: float = 1e-4,
     weight_decay: float = 0.0,
+    optimizer_name: str = "adamw",
+    lr_scheduler: str = "none",
     t_eps: float = 0.0005,
     patience: int = 0,
     min_delta: float = 1e-4,
@@ -1354,6 +1386,12 @@ def train_flow_skl_model(
         raise ValueError("batch_size must be >= 1.")
     if float(lr) <= 0.0:
         raise ValueError("lr must be > 0.")
+    opt_name = str(optimizer_name).strip().lower()
+    if opt_name not in {"adam", "adamw"}:
+        raise ValueError("optimizer_name must be one of {'adam', 'adamw'}.")
+    scheduler_name = str(lr_scheduler).strip().lower()
+    if scheduler_name not in {"none", "cosine"}:
+        raise ValueError("lr_scheduler must be one of {'none', 'cosine'}.")
     te = float(t_eps)
     if not (0.0 < te < 0.5):
         raise ValueError("t_eps must be in (0, 0.5).")
@@ -1390,13 +1428,20 @@ def train_flow_skl_model(
     schedule_name = path_name
     if hasattr(model, "set_path_schedule"):
         model.set_path_schedule(path_schedule)  # type: ignore[attr-defined]
-    opt = torch.optim.AdamW(_adamw_parameters(model), lr=float(lr), weight_decay=float(weight_decay))
+    opt = _build_flow_optimizer(
+        model,
+        optimizer_name=opt_name,
+        lr=float(lr),
+        weight_decay=float(weight_decay),
+    )
+    scheduler = _build_flow_lr_scheduler(opt, scheduler_name=scheduler_name, epochs=int(epochs))
 
     endpoint_warmup_losses: list[float] = []
     endpoint_warmup_val_losses: list[float] = []
     if int(endpoint_warmup_epochs) > 0:
-        warmup_opt = torch.optim.AdamW(
-            _adamw_parameters(model),
+        warmup_opt = _build_flow_optimizer(
+            model,
+            optimizer_name=opt_name,
             lr=warmup_lr,
             weight_decay=float(weight_decay),
         )
@@ -1439,6 +1484,7 @@ def train_flow_skl_model(
     train_losses: list[float] = []
     val_losses: list[float] = []
     val_monitor_losses: list[float] = []
+    lr_values: list[float] = []
     val_ema: float | None = None
     best_val = float("inf")
     best_epoch = 0
@@ -1474,6 +1520,7 @@ def train_flow_skl_model(
 
         train_loss = float(np.mean(ep_losses))
         train_losses.append(train_loss)
+        lr_values.append(float(opt.param_groups[0]["lr"]))
 
         model.eval()
         val_ep: list[float] = []
@@ -1524,6 +1571,8 @@ def train_flow_skl_model(
                 flush=True,
             )
             break
+        if scheduler is not None:
+            scheduler.step()
 
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -1541,6 +1590,10 @@ def train_flow_skl_model(
         "n_clipped_steps": int(n_clipped_steps),
         "n_total_steps": int(n_total_steps),
         "path_schedule": schedule_name,
+        "optimizer_name": opt_name,
+        "lr": float(lr),
+        "lr_scheduler": scheduler_name,
+        "lr_values": np.asarray(lr_values, dtype=np.float64),
         "early_ema_alpha": float(alpha),
         "endpoint_warmup_epochs": int(endpoint_warmup_epochs),
         "endpoint_warmup_lr": warmup_lr,

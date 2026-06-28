@@ -57,6 +57,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=0.0)
+    p.add_argument("--flow-optimizer", dest="optimizer_name", choices=("adamw", "adam"), default="adamw")
+    p.add_argument("--flow-lr-scheduler", dest="lr_scheduler", choices=("none", "cosine"), default="none")
     p.add_argument("--hidden-dim", type=int, default=128)
     p.add_argument("--depth", type=int, default=3)
     p.add_argument("--low-rank-dim", type=int, default=4)
@@ -264,6 +266,8 @@ def main(argv: list[str] | None = None) -> int:
         batch_size=int(args.batch_size),
         lr=float(args.lr),
         weight_decay=float(args.weight_decay),
+        optimizer_name=str(args.optimizer_name),
+        lr_scheduler=str(args.lr_scheduler),
         t_eps=float(args.t_eps),
         patience=int(args.early_patience),
         min_delta=float(args.early_min_delta),

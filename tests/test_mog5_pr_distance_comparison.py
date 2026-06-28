@@ -216,7 +216,7 @@ def test_flow_metric_mapping_and_mahalanobis_shared_assembly(monkeypatch, tmp_pa
         bundle=bundle,
         device=torch.device("cpu"),
         output_dir=tmp_path,
-        config=dc.FlowComparisonConfig(epochs=1, ode_method="rk4", radius=2.0),
+        config=dc.FlowComparisonConfig(epochs=1, ode_method="rk4", radius=2.0, flow_skl_estimator="single"),
         metrics=metrics,
     )
 
@@ -307,7 +307,7 @@ def test_correlation_flow_routes_to_centered_fixed_norm(monkeypatch, tmp_path: P
         bundle=bundle,
         device=torch.device("cpu"),
         output_dir=tmp_path,
-        config=dc.FlowComparisonConfig(epochs=1, radius=2.0),
+        config=dc.FlowComparisonConfig(epochs=1, radius=2.0, flow_skl_estimator="single"),
         metrics=(dc.METRIC_CORRELATION,),
     )
 
@@ -360,7 +360,12 @@ def test_flow_metric_matrices_normalizes_x_train_only_and_persists_metadata(monk
         )
 
     monkeypatch.setattr(dc, "train_and_estimate_flow", fake_train_and_estimate_flow)
-    config = dc.FlowComparisonConfig(epochs=1, normalize_x=True, normalize_x_eps=1e-6)
+    config = dc.FlowComparisonConfig(
+        epochs=1,
+        normalize_x=True,
+        normalize_x_eps=1e-6,
+        flow_skl_estimator="single",
+    )
 
     _, paths = dc.flow_metric_matrices(
         bundle=bundle,
@@ -416,6 +421,9 @@ def test_train_and_estimate_flow_uses_model_jeffreys_readout(monkeypatch) -> Non
             "stopped_epoch": 1,
             "stopped_early": False,
             "early_ema_alpha": kwargs["ema_alpha"],
+            "optimizer_name": kwargs["optimizer_name"],
+            "lr_scheduler": kwargs["lr_scheduler"],
+            "lr": kwargs["lr"],
         }
 
     def fake_estimate_model_symmetric_kl(**kwargs):
@@ -441,13 +449,21 @@ def test_train_and_estimate_flow_uses_model_jeffreys_readout(monkeypatch) -> Non
         velocity_family="translation",
         device=torch.device("cpu"),
         seed=123,
-        config=dc.FlowComparisonConfig(epochs=1, shared_affine_a_diag_jitter=2e-3, early_ema_alpha=0.2),
+        config=dc.FlowComparisonConfig(
+            epochs=1,
+            shared_affine_a_diag_jitter=2e-3,
+            early_ema_alpha=0.2,
+            optimizer_name="adam",
+            lr_scheduler="cosine",
+        ),
     )
 
     assert build_calls
     assert build_calls[0]["shared_affine_a_diag_jitter"] == 2e-3
     assert "corr_soft_eps" not in build_calls[0]
     assert train_calls
+    assert train_calls[0]["optimizer_name"] == "adam"
+    assert train_calls[0]["lr_scheduler"] == "cosine"
     assert train_calls[0]["ema_alpha"] == pytest.approx(0.2)
     assert estimate_calls
     call = estimate_calls[0]
@@ -532,17 +548,26 @@ def test_flow_comparison_config_normalize_x_defaults_are_opt_in() -> None:
     assert dc.FlowComparisonConfig().normalize_x_eps == pytest.approx(1e-8)
     assert dc.FlowComparisonConfig().endpoint_warmup_epochs == 0
     assert dc.FlowComparisonConfig().endpoint_warmup_lr is None
-    assert dc.FlowComparisonConfig().flow_skl_estimator == "single"
+    assert dc.FlowComparisonConfig().flow_skl_estimator == "crossfit2"
+    assert dc.FlowComparisonConfig().optimizer_name == "adamw"
+    assert dc.FlowComparisonConfig().lr_scheduler == "none"
 
 
-def test_flow_comparison_config_default_t_eps_is_small_endpoint_clamp() -> None:
-    assert dc.FlowComparisonConfig().t_eps == 0.0005
+def test_flow_comparison_config_default_t_eps_is_tuned_endpoint_clamp() -> None:
+    assert dc.FlowComparisonConfig().lr == 1e-4
+    assert dc.FlowComparisonConfig().path_schedule == "linear"
+    assert dc.FlowComparisonConfig().t_eps == 0.00005
     assert dc.FlowComparisonConfig().early_ema_alpha == 0.05
     mod = _load_cli_module()
     args = mod.build_parser().parse_args([])
     assert args.endpoint_warmup_epochs == 0
     assert args.endpoint_warmup_lr is None
-    assert args.flow_skl_estimator == "single"
+    assert args.lr == 1e-4
+    assert args.optimizer_name == "adamw"
+    assert args.lr_scheduler == "none"
+    assert args.path_schedule == "linear"
+    assert args.t_eps == 0.00005
+    assert args.flow_skl_estimator == "crossfit2"
     crossfit_args = mod.build_parser().parse_args(["--flow-skl-estimator", "crossfit2"])
     assert mod._flow_config_from_args(crossfit_args).flow_skl_estimator == "crossfit2"
 
@@ -561,6 +586,10 @@ def test_save_flow_result_npz_persists_monitor_losses_and_ema_alpha(tmp_path: Pa
             "stopped_epoch": 2,
             "stopped_early": False,
             "early_ema_alpha": 0.05,
+            "optimizer_name": "adam",
+            "lr": 0.0003,
+            "lr_scheduler": "cosine",
+            "lr_values": np.asarray([0.0003, 0.0002], dtype=np.float64),
             "flow_normalize_x": True,
             "flow_normalize_x_mean": np.asarray([1.0, 2.0], dtype=np.float64),
             "flow_normalize_x_std": np.asarray([3.0, 4.0], dtype=np.float64),
@@ -577,9 +606,11 @@ def test_save_flow_result_npz_persists_monitor_losses_and_ema_alpha(tmp_path: Pa
             "model_1_train_losses": np.asarray([1.0, 0.9], dtype=np.float64),
             "model_1_val_losses": np.asarray([1.2, 1.1], dtype=np.float64),
             "model_1_val_monitor_losses": np.asarray([1.3, 1.2], dtype=np.float64),
+            "model_1_lr_values": np.asarray([0.0003, 0.0002], dtype=np.float64),
             "model_2_train_losses": np.asarray([2.0, 1.9], dtype=np.float64),
             "model_2_val_losses": np.asarray([2.2, 2.1], dtype=np.float64),
             "model_2_val_monitor_losses": np.asarray([2.3, 2.2], dtype=np.float64),
+            "model_2_lr_values": np.asarray([0.0003, 0.0002], dtype=np.float64),
             "model_1_best_epoch": 4,
             "model_2_best_epoch": 5,
         },
@@ -596,6 +627,10 @@ def test_save_flow_result_npz_persists_monitor_losses_and_ema_alpha(tmp_path: Pa
         np.testing.assert_allclose(data["val_monitor_losses"], [4.0, 3.85])
         assert float(data["best_val_loss"][0]) == pytest.approx(3.85)
         assert float(data["early_ema_alpha"][0]) == pytest.approx(0.05)
+        assert str(data["optimizer_name"][0]) == "adam"
+        assert float(data["lr"][0]) == pytest.approx(0.0003)
+        assert str(data["lr_scheduler"][0]) == "cosine"
+        np.testing.assert_allclose(data["lr_values"], [0.0003, 0.0002])
         assert bool(data["flow_normalize_x"][0]) is True
         assert float(data["flow_normalize_x_eps"][0]) == pytest.approx(1e-6)
         assert int(data["n_clipped_steps"][0]) == 1
@@ -610,7 +645,9 @@ def test_save_flow_result_npz_persists_monitor_losses_and_ema_alpha(tmp_path: Pa
         np.testing.assert_array_equal(data["crossfit_fold_1_idx"], [0, 2, 4])
         np.testing.assert_array_equal(data["crossfit_fold_2_idx"], [1, 3, 5])
         np.testing.assert_allclose(data["model_1_train_losses"], [1.0, 0.9])
+        np.testing.assert_allclose(data["model_1_lr_values"], [0.0003, 0.0002])
         np.testing.assert_allclose(data["model_2_val_monitor_losses"], [2.3, 2.2])
+        np.testing.assert_allclose(data["model_2_lr_values"], [0.0003, 0.0002])
         assert int(data["model_1_best_epoch"][0]) == 4
         assert int(data["model_2_best_epoch"][0]) == 5
 
@@ -717,18 +754,26 @@ def test_cli_default_path_resolution_without_running_training() -> None:
     assert args.mc_jeffreys_sample == 4096
     assert args.radius == 1.0
     assert args.ode_method == "midpoint"
-    assert args.t_eps == 0.0005
+    assert args.lr == 1e-4
+    assert args.optimizer_name == "adamw"
+    assert args.lr_scheduler == "none"
+    assert args.path_schedule == "linear"
+    assert args.t_eps == 0.00005
     assert args.early_ema_alpha == 0.05
     assert args.flow_normalize_x is False
     assert args.flow_normalize_x_eps == pytest.approx(1e-8)
-    assert args.flow_skl_estimator == "single"
+    assert args.flow_skl_estimator == "crossfit2"
     assert mod._flow_config_from_args(args).mc_jeffreys_sample == 4096
     assert mod._flow_config_from_args(args).radius == 1.0
-    assert mod._flow_config_from_args(args).t_eps == 0.0005
+    assert mod._flow_config_from_args(args).lr == 1e-4
+    assert mod._flow_config_from_args(args).optimizer_name == "adamw"
+    assert mod._flow_config_from_args(args).lr_scheduler == "none"
+    assert mod._flow_config_from_args(args).path_schedule == "linear"
+    assert mod._flow_config_from_args(args).t_eps == 0.00005
     assert mod._flow_config_from_args(args).early_ema_alpha == 0.05
     assert mod._flow_config_from_args(args).normalize_x is False
     assert mod._flow_config_from_args(args).normalize_x_eps == pytest.approx(1e-8)
-    assert mod._flow_config_from_args(args).flow_skl_estimator == "single"
+    assert mod._flow_config_from_args(args).flow_skl_estimator == "crossfit2"
     assert mod.resolve_dataset_dir(args) == repo_root / "data" / "mog_5native_xdim3_n1000"
     assert mod.resolve_output_dir(args) == repo_root / "data" / "mog_5native_xdim3_n1000" / "distance_comparison_flow_skl"
 
@@ -973,10 +1018,18 @@ def test_mahalanobis_cli_defaults_match_full_cli_without_running_training() -> N
     assert args.mc_jeffreys_sample == full_args.mc_jeffreys_sample == 4096
     assert args.radius == full_args.radius == 1.0
     assert args.ode_method == full_args.ode_method == "midpoint"
-    assert args.t_eps == full_args.t_eps == 0.0005
+    assert args.lr == full_args.lr == 1e-4
+    assert args.optimizer_name == full_args.optimizer_name == "adamw"
+    assert args.lr_scheduler == full_args.lr_scheduler == "none"
+    assert args.path_schedule == full_args.path_schedule == "linear"
+    assert args.t_eps == full_args.t_eps == 0.00005
     assert mod._flow_config_from_args(args).mc_jeffreys_sample == 4096
     assert mod._flow_config_from_args(args).radius == 1.0
-    assert mod._flow_config_from_args(args).t_eps == 0.0005
+    assert mod._flow_config_from_args(args).lr == 1e-4
+    assert mod._flow_config_from_args(args).optimizer_name == "adamw"
+    assert mod._flow_config_from_args(args).lr_scheduler == "none"
+    assert mod._flow_config_from_args(args).path_schedule == "linear"
+    assert mod._flow_config_from_args(args).t_eps == 0.00005
     assert mod.resolve_dataset_dir(args) == repo_root / "data" / "mog_5native_xdim3_n1000"
     assert mod.resolve_output_dir(args) == repo_root / "data" / "mog_5native_xdim3_n1000" / "mahalanobis_comparison_flow_skl"
 

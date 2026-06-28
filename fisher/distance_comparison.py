@@ -72,13 +72,15 @@ class FlowComparisonConfig:
     early_min_delta: float = 1e-4
     early_ema_alpha: float = 0.05
     batch_size: int = 512
-    lr: float = 1e-3
+    lr: float = 1e-4
     weight_decay: float = 0.0
+    optimizer_name: str = "adamw"
+    lr_scheduler: str = "none"
     hidden_dim: int = 256
     depth: int = 5
     low_rank_dim: int = 4
-    path_schedule: str = "cosine"
-    t_eps: float = 0.0005
+    path_schedule: str = "linear"
+    t_eps: float = 0.00005
     quadrature_steps: int = 64
     mc_jeffreys_sample: int = 4096
     ode_steps: int = 64
@@ -94,7 +96,7 @@ class FlowComparisonConfig:
     normalize_x_eps: float = 1e-8
     endpoint_warmup_epochs: int = 0
     endpoint_warmup_lr: float | None = None
-    flow_skl_estimator: str = "single"
+    flow_skl_estimator: str = "crossfit2"
 
 
 @dataclass(frozen=True)
@@ -615,6 +617,8 @@ def _build_and_train_flow_model(
         batch_size=int(config.batch_size),
         lr=float(config.lr),
         weight_decay=float(config.weight_decay),
+        optimizer_name=str(config.optimizer_name),
+        lr_scheduler=str(config.lr_scheduler),
         t_eps=float(config.t_eps),
         patience=int(config.early_patience),
         min_delta=float(config.early_min_delta),
@@ -714,12 +718,15 @@ def _crossfit_train_metadata(
         "model_1_train_losses": np.asarray(meta_1.get("train_losses", []), dtype=np.float64),
         "model_1_val_losses": np.asarray(meta_1.get("val_losses", []), dtype=np.float64),
         "model_1_val_monitor_losses": np.asarray(meta_1.get("val_monitor_losses", []), dtype=np.float64),
+        "model_1_lr_values": np.asarray(meta_1.get("lr_values", []), dtype=np.float64),
         "model_2_train_losses": np.asarray(meta_2.get("train_losses", []), dtype=np.float64),
         "model_2_val_losses": np.asarray(meta_2.get("val_losses", []), dtype=np.float64),
         "model_2_val_monitor_losses": np.asarray(meta_2.get("val_monitor_losses", []), dtype=np.float64),
+        "model_2_lr_values": np.asarray(meta_2.get("lr_values", []), dtype=np.float64),
         "train_losses": _prefix_average_curves(meta_1.get("train_losses", []), meta_2.get("train_losses", [])),
         "val_losses": _prefix_average_curves(meta_1.get("val_losses", []), meta_2.get("val_losses", [])),
         "val_monitor_losses": _prefix_average_curves(meta_1.get("val_monitor_losses", []), meta_2.get("val_monitor_losses", [])),
+        "lr_values": _prefix_average_curves(meta_1.get("lr_values", []), meta_2.get("lr_values", [])),
     }
     for model_idx, meta in ((1, meta_1), (2, meta_2)):
         for key in (
@@ -731,13 +738,16 @@ def _crossfit_train_metadata(
             "n_clipped_steps",
             "n_total_steps",
             "path_schedule",
+            "optimizer_name",
+            "lr",
+            "lr_scheduler",
             "endpoint_warmup_epochs",
             "endpoint_warmup_lr",
             "network_architecture",
         ):
             if key in meta:
                 out[f"model_{model_idx}_{key}"] = meta[key]
-    for key in ("path_schedule", "early_ema_alpha", "endpoint_warmup_epochs", "endpoint_warmup_lr"):
+    for key in ("path_schedule", "optimizer_name", "lr", "lr_scheduler", "early_ema_alpha", "endpoint_warmup_epochs", "endpoint_warmup_lr"):
         if key in meta_1:
             out[key] = meta_1[key]
     for key in ("n_clipped_steps", "n_total_steps"):
@@ -836,16 +846,18 @@ def save_flow_result_npz(
     if pair is not None:
         fields["condition_pair"] = np.asarray(pair, dtype=np.int64)
     meta = dict(result.train_metadata)
-    for key in ("train_losses", "val_losses", "val_monitor_losses", "endpoint_warmup_losses", "endpoint_warmup_val_losses"):
+    for key in ("train_losses", "val_losses", "val_monitor_losses", "lr_values", "endpoint_warmup_losses", "endpoint_warmup_val_losses"):
         if key in meta:
             fields[key] = np.asarray(meta[key], dtype=np.float64)
     for key in (
         "model_1_train_losses",
         "model_1_val_losses",
         "model_1_val_monitor_losses",
+        "model_1_lr_values",
         "model_2_train_losses",
         "model_2_val_losses",
         "model_2_val_monitor_losses",
+        "model_2_lr_values",
     ):
         if key in meta:
             fields[key] = np.asarray(meta[key], dtype=np.float64)
@@ -861,6 +873,9 @@ def save_flow_result_npz(
         "n_clipped_steps",
         "n_total_steps",
         "path_schedule",
+        "optimizer_name",
+        "lr",
+        "lr_scheduler",
         "endpoint_warmup_epochs",
         "endpoint_warmup_lr",
         "flow_skl_estimator",
@@ -877,6 +892,9 @@ def save_flow_result_npz(
             "n_clipped_steps",
             "n_total_steps",
             "path_schedule",
+            "optimizer_name",
+            "lr",
+            "lr_scheduler",
             "endpoint_warmup_epochs",
             "endpoint_warmup_lr",
             "network_architecture",

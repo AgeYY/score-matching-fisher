@@ -141,6 +141,8 @@ def test_flow_skl_default_t_eps_is_small_endpoint_clamp() -> None:
     sig = inspect.signature(train_flow_skl_model)
     assert sig.parameters["t_eps"].default == pytest.approx(0.0005)
     assert sig.parameters["ema_alpha"].default == pytest.approx(0.05)
+    assert sig.parameters["optimizer_name"].default == "adamw"
+    assert sig.parameters["lr_scheduler"].default == "none"
     assert sig.parameters["endpoint_warmup_epochs"].default == 0
     assert sig.parameters["endpoint_warmup_lr"].default is None
 
@@ -148,6 +150,8 @@ def test_flow_skl_default_t_eps_is_small_endpoint_clamp() -> None:
     args = mod.build_parser().parse_args([])
     assert args.t_eps == pytest.approx(0.0005)
     assert args.early_ema_alpha == pytest.approx(0.05)
+    assert args.optimizer_name == "adamw"
+    assert args.lr_scheduler == "none"
     assert args.endpoint_warmup_epochs == 0
     assert args.endpoint_warmup_lr is None
 

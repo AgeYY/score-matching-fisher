@@ -149,14 +149,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Learning rate for --endpoint-warmup-epochs; defaults to --lr.",
     )
     p.add_argument("--batch-size", type=int, default=2048)
-    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=0.0)
+    p.add_argument("--flow-optimizer", dest="optimizer_name", choices=("adamw", "adam"), default="adamw")
+    p.add_argument("--flow-lr-scheduler", dest="lr_scheduler", choices=("none", "cosine"), default="none")
     p.add_argument("--hidden-dim", type=int, default=256)
     p.add_argument("--depth", type=int, default=5)
     p.add_argument("--low-rank-dim", type=int, default=4)
     p.add_argument("--radius", type=float, default=1.0, help="Fixed norm radius for cosine/correlation flow rows.")
-    p.add_argument("--path-schedule", choices=("cosine", "linear", "straight"), default="cosine")
-    p.add_argument("--t-eps", type=float, default=0.0005)
+    p.add_argument("--path-schedule", choices=("cosine", "linear", "straight"), default="linear")
+    p.add_argument("--t-eps", type=float, default=0.00005)
     p.add_argument("--quadrature-steps", type=int, default=64)
     p.add_argument("--mc-jeffreys-sample", dest="mc_jeffreys_sample", type=int, default=4096)
     p.add_argument("--mc-samples", dest="mc_jeffreys_sample", type=int, help=argparse.SUPPRESS)
@@ -171,7 +173,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--flow-skl-estimator",
         choices=("single", "crossfit2"),
-        default="single",
+        default="crossfit2",
         help="Flow-SKL likelihood estimator: existing single-model estimator or two-fold cross-scored estimator.",
     )
     p.add_argument(
@@ -258,6 +260,8 @@ def _flow_config_from_args(args: argparse.Namespace) -> FlowComparisonConfig:
         batch_size=int(args.batch_size),
         lr=float(args.lr),
         weight_decay=float(args.weight_decay),
+        optimizer_name=str(args.optimizer_name),
+        lr_scheduler=str(args.lr_scheduler),
         hidden_dim=int(args.hidden_dim),
         depth=int(args.depth),
         low_rank_dim=int(args.low_rank_dim),
