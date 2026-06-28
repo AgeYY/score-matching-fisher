@@ -68,11 +68,31 @@ def lxf_bin_likelihood_hellinger(
     h_sym = 0.5 * (h_directed_bin[:, bins] + h_directed_bin[:, bins].T)
     same_bin = bins[:, None] == bins[None, :]
     h_sym[same_bin] = 0.0
+
+    skl_directed_bin = -bin_delta_l
+    skl_directed_bin[np.arange(n), bins] = 0.0
+    skl_binned_directed = np.full((nb, nb), np.nan, dtype=np.float64)
+    for a in range(nb):
+        rows = np.flatnonzero(bins == a)
+        if rows.size == 0:
+            continue
+        for b in range(nb):
+            if counts[b] > 0:
+                skl_binned_directed[a, b] = float(np.mean(skl_directed_bin[rows, b], dtype=np.float64))
+        skl_binned_directed[a, a] = 0.0
+    skl_binned = 0.5 * (skl_binned_directed + skl_binned_directed.T)
+
+    skl_sym = 0.5 * (skl_directed_bin[:, bins] + skl_directed_bin[:, bins].T)
+    skl_sym[same_bin] = 0.0
     return {
         "bin_log_likelihood": bin_log_likelihood,
         "bin_delta_l": bin_delta_l,
         "h_directed_bin": h_directed_bin,
         "h_binned": h_binned,
         "h_sym": h_sym,
+        "skl_directed_bin": skl_directed_bin,
+        "skl_binned_directed": skl_binned_directed,
+        "skl_binned": skl_binned,
+        "skl_sym": skl_sym,
         "bin_counts": counts,
     }

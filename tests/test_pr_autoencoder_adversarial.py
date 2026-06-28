@@ -46,6 +46,26 @@ def test_categorical_labels_reject_non_integer_theta() -> None:
         mod._categorical_labels_from_theta(np.array([0.0, 0.5, 1.0]), num_categories=2)
 
 
+def test_categorical_empirical_embedded_mean_includes_last_category() -> None:
+    mod = _load_project_module()
+    k = 5
+    labels = np.array([0, 1, 2, 3, 4, 4, 4], dtype=np.float64)
+    x = np.stack(
+        [
+            labels,
+            labels + 10.0,
+        ],
+        axis=1,
+    )
+
+    t_emp, mu_emp = mod._categorical_empirical_embedded_mean(labels, x, k)
+
+    np.testing.assert_allclose(t_emp.ravel(), np.arange(k, dtype=np.float64))
+    np.testing.assert_allclose(mu_emp[:, 0], np.arange(k, dtype=np.float64))
+    np.testing.assert_allclose(mu_emp[4, 0], 4.0)
+    np.testing.assert_allclose(mu_emp[4, 1], 14.0)
+
+
 def test_project_parser_adversarial_defaults() -> None:
     mod = _load_project_module()
 
@@ -57,6 +77,15 @@ def test_project_parser_adversarial_defaults() -> None:
     assert args.pr_adv_ramp_epochs is None
     assert args.pr_adv_steps == 1
     assert args.pr_adv_train_samples == 0
+
+
+def test_project_h_dim_validation_allows_native_dim() -> None:
+    mod = _load_project_module()
+
+    mod.validate_h_dim(h_dim=2, z_dim=2)
+
+    with pytest.raises(ValueError, match="--h-dim must be >= latent z_dim=2"):
+        mod.validate_h_dim(h_dim=1, z_dim=2)
 
 
 def test_adversarial_cache_key_depends_on_source_sha() -> None:
@@ -136,6 +165,37 @@ def test_non_adversarial_training_does_not_require_labels_cpu(tmp_path: Path) ->
     )
 
     assert set(got.metrics) == {"loss", "recon", "pr"}
+
+
+def test_native_dim_pr_autoencoder_trains_and_preserves_shapes_cpu(tmp_path: Path) -> None:
+    cfg = PRAutoencoderConfig(
+        z_dim=2,
+        h_dim=2,
+        hidden1=8,
+        hidden2=8,
+        train_epochs=1,
+        train_samples=8,
+        train_batch_size=4,
+    )
+
+    got = train_or_load_pr_autoencoder(
+        config=cfg,
+        seed=5,
+        device=torch.device("cpu"),
+        cache_dir=tmp_path,
+        force_retrain=True,
+        logger=None,
+    )
+
+    x = torch.randn(5, 2)
+    with torch.no_grad():
+        h, z_hat = got.model(x)
+
+    assert got.loaded_from_cache is False
+    assert h.shape == (5, 2)
+    assert z_hat.shape == (5, 2)
+    assert got.metrics["loss"].shape == (1,)
+    assert np.all(np.isfinite(got.metrics["loss"]))
 
 
 def _balanced_binary_gaussian_data(

@@ -33,6 +33,7 @@ from fisher.data import (
 )
 from fisher.evaluation import evaluate_score_fisher, evaluate_score_fisher_with_prior, parse_sigma_alpha_list
 from fisher.h_matrix import HMatrixEstimator, HMatrixResult
+from fisher.llr_divergence import sym_kl_sample_from_delta_l
 from fisher.lxf_bin_likelihood_hellinger import lxf_bin_likelihood_hellinger
 from fisher.models import (
     ConditionalScore1D,
@@ -344,6 +345,7 @@ def _save_h_matrix_dsm_artifacts(
         h_payload["g_matrix"] = h_result.g_matrix
         h_payload["c_matrix"] = h_result.c_matrix
         h_payload["delta_l_matrix"] = h_result.delta_l_matrix
+        h_payload["skl_sym_matrix"] = sym_kl_sample_from_delta_l(h_result.delta_l_matrix)
         if h_result.theta_flow_log_post_matrix is not None:
             h_payload["theta_flow_log_post_matrix"] = h_result.theta_flow_log_post_matrix
         if h_result.theta_flow_log_prior_matrix is not None:

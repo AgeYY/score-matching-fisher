@@ -66,6 +66,10 @@ from fisher.contrastive_llr import (
     train_contrastive_soft_categorical_llr,
 )
 from fisher.h_matrix import HMatrixEstimator
+from fisher.llr_divergence import (
+    directed_kl_from_delta_l,
+    sym_kl_category_from_sample_directed,
+)
 from fisher.shared_dataset_io import SharedDatasetBundle, load_shared_dataset_npz
 from fisher.ctsm_models import (
     ToyBinaryTimeScoreNet,
@@ -543,6 +547,27 @@ def _hellinger_comparison_metrics_cat(est: np.ndarray, gt: np.ndarray) -> dict[s
         "hellinger_rmse_offdiag_cat": float(np.sqrt(np.nanmean(d**2))),
         "hellinger_bias_offdiag_cat": float(np.nanmean(d)),
         "hellinger_pearson_r_offdiag_cat": _pearson_r(e[m], g[m]),
+    }
+
+
+def _symmetric_kl_comparison_metrics_cat(est: np.ndarray, gt: np.ndarray) -> dict[str, float]:
+    e = np.asarray(est, dtype=np.float64)
+    g = np.asarray(gt, dtype=np.float64)
+    k = int(e.shape[0]) if e.ndim == 2 else 0
+    if g.shape != e.shape or e.ndim != 2 or k < 2:
+        return {
+            "symmetric_kl_mae_offdiag_cat": float("nan"),
+            "symmetric_kl_rmse_offdiag_cat": float("nan"),
+            "symmetric_kl_bias_offdiag_cat": float("nan"),
+            "symmetric_kl_pearson_r_offdiag_cat": float("nan"),
+        }
+    m = _hellinger_cat_offdiag_mask(k)
+    d = (e - g)[m]
+    return {
+        "symmetric_kl_mae_offdiag_cat": float(np.nanmean(np.abs(d))),
+        "symmetric_kl_rmse_offdiag_cat": float(np.sqrt(np.nanmean(d**2))),
+        "symmetric_kl_bias_offdiag_cat": float(np.nanmean(d)),
+        "symmetric_kl_pearson_r_offdiag_cat": _pearson_r(e[m], g[m]),
     }
 
 
@@ -3297,8 +3322,8 @@ def main(argv: list[str] | None = None) -> None:
     pr_out_resolved: Path | None = None
     meta_work = dict(native_bundle.meta)
     if pr_project:
-        if int(args.pr_dim) <= native_x_dim:
-            raise ValueError(f"--pr-dim must exceed native x_dim={native_x_dim}; got {args.pr_dim}.")
+        if int(args.pr_dim) < native_x_dim:
+            raise ValueError(f"--pr-dim must be >= native x_dim={native_x_dim}; got {args.pr_dim}.")
         pr_out = args.pr_output_npz
         if pr_out is None:
             pr_out = _default_pr_output_npz(native_npz, int(args.pr_dim), str(args.dataset_family))
@@ -3366,11 +3391,16 @@ def main(argv: list[str] | None = None) -> None:
     n_m = len(methods)
     n_cols = len(ns)
     h_sqrt_sweep = np.full((n_m, n_cols, k_cat, k_cat), np.nan, dtype=np.float64)
+    symmetric_kl_sweep = np.full((n_m, n_cols, k_cat, k_cat), np.nan, dtype=np.float64)
+    symmetric_kl_true_sweep = np.full((n_cols, k_cat, k_cat), np.nan, dtype=np.float64)
     wall_s = np.full((n_m, n_cols), np.nan, dtype=np.float64)
     corr_h = np.full((n_m, n_cols), np.nan, dtype=np.float64)
     nmse_h = np.full((n_m, n_cols), np.nan, dtype=np.float64)
+    corr_symmetric_kl = np.full((n_m, n_cols), np.nan, dtype=np.float64)
+    nmse_symmetric_kl = np.full((n_m, n_cols), np.nan, dtype=np.float64)
     llr_pearson_offdiag = np.full((n_m, n_cols), np.nan, dtype=np.float64)
     hellinger_pearson_offdiag_cat = np.full((n_m, n_cols), np.nan, dtype=np.float64)
+    symmetric_kl_pearson_offdiag_cat = np.full((n_m, n_cols), np.nan, dtype=np.float64)
     theta_flow_cate_num_valid_pairs = np.full((n_m, n_cols), -1, dtype=np.int64)
     theta_flow_cate_num_skipped_pairs = np.full((n_m, n_cols), -1, dtype=np.int64)
     theta_flow_cate_train_counts = np.full((n_m, n_cols, k_cat, k_cat, 2), -1, dtype=np.int64)
@@ -3385,7 +3415,9 @@ def main(argv: list[str] | None = None) -> None:
     scatter_deltas: dict[str, np.ndarray] = {}
     scatter_direct_llrs: dict[str, np.ndarray] = {}
     scatter_cat_h2: dict[str, np.ndarray] = {}
+    scatter_cat_symmetric_kl: dict[str, np.ndarray] = {}
     scatter_true_delta: np.ndarray | None = None
+    scatter_true_symmetric_kl_cat: np.ndarray | None = None
     scatter_bins: np.ndarray | None = None
     n_scatter = max(ns)
     out_dir = str(args.output_dir)
@@ -3421,6 +3453,12 @@ def main(argv: list[str] | None = None) -> None:
 
         true_c = compute_true_conditional_loglik_matrix(x_native_h, theta_h, native_meta)
         true_delta_l = HMatrixEstimator.compute_delta_l(true_c)
+        true_skl_cat = sym_kl_category_from_sample_directed(
+            directed_kl_from_delta_l(true_delta_l),
+            bins_h,
+            k_cat=k_cat,
+        )
+        symmetric_kl_true_sweep[j] = np.asarray(true_skl_cat, dtype=np.float64)
 
         decode_eval_x_all = x_h
         decode_eval_bins_all = bins_h
@@ -3482,11 +3520,19 @@ def main(argv: list[str] | None = None) -> None:
                     dtype=np.float64,
                 )
                 np.fill_diagonal(h_sqrt_sweep[i, j], 0.0)
+                skl_cat = sym_kl_category_from_sample_directed(
+                    directed_kl_from_delta_l(delta),
+                    bins_h,
+                    k_cat=k_cat,
+                )
+                symmetric_kl_sweep[i, j] = np.asarray(skl_cat, dtype=np.float64)
                 wall_s[i, j] = time.time() - t0
                 m_llr = dbg._llr_comparison_metrics(delta, true_delta_l)
                 llr_pearson_offdiag[i, j] = float(m_llr["llr_pearson_r_offdiag"])
                 m_h = dbg._hellinger_comparison_metrics_cat(bg_h2, hellinger_gt_sq)
                 hellinger_pearson_offdiag_cat[i, j] = float(m_h["hellinger_pearson_r_offdiag_cat"])
+                m_skl = _symmetric_kl_comparison_metrics_cat(skl_cat, true_skl_cat)
+                symmetric_kl_pearson_offdiag_cat[i, j] = float(m_skl["symmetric_kl_pearson_r_offdiag_cat"])
                 _save_method_training_loss_npz(loss_npz_path, method_name=method_name, result=result)
             else:
                 call_x_all = x_h
@@ -3511,7 +3557,16 @@ def main(argv: list[str] | None = None) -> None:
                     h_sqrt_sweep[i, j] = np.asarray(result["h_sqrt"], dtype=np.float64)
                     np.fill_diagonal(h_sqrt_sweep[i, j], 0.0)
                     h_cat_sq = np.asarray(result.get("h_cat_sq", np.square(h_sqrt_sweep[i, j])), dtype=np.float64)
-                    delta = np.full(np.asarray(true_delta_l, dtype=np.float64).shape, np.nan, dtype=np.float64)
+                    if "delta_l" in result:
+                        delta = np.asarray(result["delta_l"], dtype=np.float64)
+                        skl_cat = sym_kl_category_from_sample_directed(
+                            directed_kl_from_delta_l(delta),
+                            bins_h,
+                            k_cat=k_cat,
+                        )
+                        symmetric_kl_sweep[i, j] = np.asarray(skl_cat, dtype=np.float64)
+                    else:
+                        delta = np.full(np.asarray(true_delta_l, dtype=np.float64).shape, np.nan, dtype=np.float64)
                     theta_flow_cate_num_valid_pairs[i, j] = int(result.get("theta_flow_cate_num_valid_pairs", -1))
                     theta_flow_cate_num_skipped_pairs[i, j] = int(result.get("theta_flow_cate_num_skipped_pairs", -1))
                     if "theta_flow_cate_train_counts" in result:
@@ -3528,12 +3583,21 @@ def main(argv: list[str] | None = None) -> None:
                     h_cat_sq = h_sq_category_from_sample_directed(h_dir, bins_h, k_cat=k_cat)
                     h_sqrt_sweep[i, j] = np.sqrt(np.clip(h_cat_sq, 0.0, 1.0))
                     np.fill_diagonal(h_sqrt_sweep[i, j], 0.0)
+                    skl_cat = sym_kl_category_from_sample_directed(
+                        directed_kl_from_delta_l(delta),
+                        bins_h,
+                        k_cat=k_cat,
+                    )
+                    symmetric_kl_sweep[i, j] = np.asarray(skl_cat, dtype=np.float64)
                 wall_s[i, j] = time.time() - t0
 
                 m_llr = dbg._llr_comparison_metrics(delta, true_delta_l)
                 llr_pearson_offdiag[i, j] = float(m_llr["llr_pearson_r_offdiag"])
                 m_h = dbg._hellinger_comparison_metrics_cat(h_cat_sq, hellinger_gt_sq)
                 hellinger_pearson_offdiag_cat[i, j] = float(m_h["hellinger_pearson_r_offdiag_cat"])
+                if "delta_l" in result:
+                    m_skl = _symmetric_kl_comparison_metrics_cat(skl_cat, true_skl_cat)
+                    symmetric_kl_pearson_offdiag_cat[i, j] = float(m_skl["symmetric_kl_pearson_r_offdiag_cat"])
 
             corr_h[i, j] = vhb.matrix_corr_offdiag_pearson(
                 vhb.impute_offdiag_nan_mean(h_sqrt_sweep[i, j]),
@@ -3543,15 +3607,28 @@ def main(argv: list[str] | None = None) -> None:
                 vhb.impute_offdiag_nan_mean(h_sqrt_sweep[i, j]),
                 vhb.impute_offdiag_nan_mean(np.asarray(h_gt_sqrt, dtype=np.float64)),
             )
+            if np.any(np.isfinite(symmetric_kl_sweep[i, j])):
+                corr_symmetric_kl[i, j] = vhb.matrix_corr_offdiag_pearson(
+                    vhb.impute_offdiag_nan_mean(symmetric_kl_sweep[i, j]),
+                    vhb.impute_offdiag_nan_mean(np.asarray(true_skl_cat, dtype=np.float64)),
+                )
+                nmse_symmetric_kl[i, j] = _matrix_nmse_offdiag(
+                    vhb.impute_offdiag_nan_mean(symmetric_kl_sweep[i, j]),
+                    vhb.impute_offdiag_nan_mean(np.asarray(true_skl_cat, dtype=np.float64)),
+                )
 
             if int(n) == int(n_scatter):
                 scatter_true_delta = np.asarray(true_delta_l, dtype=np.float64).copy()
+                scatter_true_symmetric_kl_cat = np.asarray(true_skl_cat, dtype=np.float64).copy()
                 scatter_bins = np.asarray(bins_h, dtype=np.int64).reshape(-1).copy()
                 if method_name in {"bin_gaussian", "vae_bin_gaussian"}:
                     scatter_deltas[method_name] = np.asarray(delta, dtype=np.float64).copy()
                     scatter_cat_h2[method_name] = np.asarray(bg_h2, dtype=np.float64).copy()
+                    scatter_cat_symmetric_kl[method_name] = np.asarray(skl_cat, dtype=np.float64).copy()
                 elif "h_sqrt" in result:
                     scatter_cat_h2[method_name] = np.asarray(h_cat_sq, dtype=np.float64).copy()
+                    if "delta_l" in result:
+                        scatter_cat_symmetric_kl[method_name] = np.asarray(skl_cat, dtype=np.float64).copy()
                 else:
                     scatter_deltas[method_name] = np.asarray(delta, dtype=np.float64)
                     if method_name == "ctsm_v_binary" and "ctsm_binary_llr_1_minus_0" in result:
@@ -3560,6 +3637,7 @@ def main(argv: list[str] | None = None) -> None:
                             dtype=np.float64,
                         ).reshape(-1)
                     scatter_cat_h2[method_name] = np.asarray(h_cat_sq, dtype=np.float64).copy()
+                    scatter_cat_symmetric_kl[method_name] = np.asarray(skl_cat, dtype=np.float64).copy()
 
     decode_sweep = np.stack(decode_sweep_list, axis=0)
     corr_decode = np.full((n_cols,), np.nan, dtype=np.float64)
@@ -3632,6 +3710,13 @@ def main(argv: list[str] | None = None) -> None:
             metrics_by_method[name].update(
                 dbg._hellinger_comparison_metrics_cat(scatter_cat_h2[name], hellinger_gt_sq)
             )
+            if scatter_true_symmetric_kl_cat is not None and name in scatter_cat_symmetric_kl:
+                metrics_by_method[name].update(
+                    _symmetric_kl_comparison_metrics_cat(
+                        scatter_cat_symmetric_kl[name],
+                        scatter_true_symmetric_kl_cat,
+                    )
+                )
         if scatter_bins is None:
             raise RuntimeError("Pairwise raw LLR scatter requires saved scatter bin labels.")
         scatter_pair_labels, scatter_true_pairwise_llr = dbg._pairwise_delta_l_to_raw_llr(
@@ -3712,6 +3797,26 @@ def main(argv: list[str] | None = None) -> None:
                 }
             )
 
+    if scatter_true_symmetric_kl_cat is not None and scatter_cat_symmetric_kl:
+        skl_method_names = np.asarray(
+            [str(name) for name in methods if str(name) in scatter_cat_symmetric_kl],
+            dtype=object,
+        )
+        if skl_method_names.size > 0:
+            scatter_npz_payload.update(
+                {
+                    "scatter_true_symmetric_kl_category": np.asarray(
+                        scatter_true_symmetric_kl_cat,
+                        dtype=np.float64,
+                    ),
+                    "scatter_symmetric_kl_category_est": np.stack(
+                        [scatter_cat_symmetric_kl[str(name)] for name in skl_method_names],
+                        axis=0,
+                    ).astype(np.float64, copy=False),
+                    "scatter_symmetric_kl_method_names": skl_method_names,
+                }
+            )
+
     source_indices = np.asarray(perm[: int(args.n_ref)], dtype=np.int64)
     out_npz = os.path.join(out_dir, "h_decoding_categorical_twofig_results.npz")
     np.savez_compressed(
@@ -3728,12 +3833,17 @@ def main(argv: list[str] | None = None) -> None:
         decode_ref=np.asarray(decode_ref, dtype=np.float64),
         decode_sweep=np.asarray(decode_sweep, dtype=np.float64),
         h_sqrt_sweep=np.asarray(h_sqrt_sweep, dtype=np.float64),
+        symmetric_kl_sweep=np.asarray(symmetric_kl_sweep, dtype=np.float64),
+        symmetric_kl_true_sweep=np.asarray(symmetric_kl_true_sweep, dtype=np.float64),
         corr_h_vs_gt=np.asarray(corr_h, dtype=np.float64),
         nmse_h_vs_gt=np.asarray(nmse_h, dtype=np.float64),
+        corr_symmetric_kl_vs_true=np.asarray(corr_symmetric_kl, dtype=np.float64),
+        nmse_symmetric_kl_vs_true=np.asarray(nmse_symmetric_kl, dtype=np.float64),
         corr_decode_vs_ref=np.asarray(corr_decode, dtype=np.float64),
         nmse_decode_vs_ref=np.asarray(nmse_decode, dtype=np.float64),
         llr_pearson_offdiag=np.asarray(llr_pearson_offdiag, dtype=np.float64),
         hellinger_pearson_offdiag_cat=np.asarray(hellinger_pearson_offdiag_cat, dtype=np.float64),
+        symmetric_kl_pearson_offdiag_cat=np.asarray(symmetric_kl_pearson_offdiag_cat, dtype=np.float64),
         theta_flow_cate_num_valid_pairs=np.asarray(theta_flow_cate_num_valid_pairs, dtype=np.int64),
         theta_flow_cate_num_skipped_pairs=np.asarray(theta_flow_cate_num_skipped_pairs, dtype=np.int64),
         theta_flow_cate_train_counts=np.asarray(theta_flow_cate_train_counts, dtype=np.int64),
