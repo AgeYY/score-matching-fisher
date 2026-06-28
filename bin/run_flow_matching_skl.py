@@ -55,7 +55,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--epochs", type=int, default=1000)
     p.add_argument("--batch-size", type=int, default=512)
-    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--hidden-dim", type=int, default=128)
     p.add_argument("--depth", type=int, default=3)
@@ -67,6 +67,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--t-eps", type=float, default=0.0005)
     p.add_argument("--early-patience", type=int, default=0)
     p.add_argument("--early-min-delta", type=float, default=1e-4)
+    p.add_argument("--early-ema-alpha", type=float, default=0.05)
     p.add_argument("--max-grad-norm", type=float, default=10.0)
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--solve-jitter", type=float, default=1e-6)
@@ -264,6 +265,7 @@ def main(argv: list[str] | None = None) -> int:
         t_eps=float(args.t_eps),
         patience=int(args.early_patience),
         min_delta=float(args.early_min_delta),
+        ema_alpha=float(args.early_ema_alpha),
         max_grad_norm=float(args.max_grad_norm),
         log_every=max(1, int(args.log_every)),
     )
@@ -298,6 +300,8 @@ def main(argv: list[str] | None = None) -> int:
             "theta_eval": theta_eval.astype(np.float64),
             "train_losses": np.asarray(train_meta["train_losses"], dtype=np.float64),
             "val_losses": np.asarray(train_meta["val_losses"], dtype=np.float64),
+            "val_monitor_losses": np.asarray(train_meta["val_monitor_losses"], dtype=np.float64),
+            "early_ema_alpha": np.asarray([train_meta["early_ema_alpha"]], dtype=np.float64),
             "train_idx": np.asarray(bundle.train_idx, dtype=np.int64),
             "validation_idx": np.asarray(bundle.validation_idx, dtype=np.int64),
         }
@@ -309,6 +313,7 @@ def main(argv: list[str] | None = None) -> int:
         "script": "bin/run_flow_matching_skl.py",
         "dataset": dataset_label,
         "velocity_family": str(args.velocity_family),
+        "network_architecture": str(train_meta.get("network_architecture", "film")),
         "device": str(dev),
         "path_schedule": str(args.path_schedule),
         "ode_method": str(args.ode_method),
@@ -319,6 +324,7 @@ def main(argv: list[str] | None = None) -> int:
         "symmetric_kl_shape": list(result.symmetric_kl_matrix.shape),
         "best_epoch": int(train_meta["best_epoch"]),
         "best_val_loss": float(train_meta["best_val_loss"]),
+        "early_ema_alpha": float(train_meta["early_ema_alpha"]),
         "stopped_epoch": int(train_meta["stopped_epoch"]),
         "stopped_early": bool(train_meta["stopped_early"]),
         "output_dir": str(out_dir),

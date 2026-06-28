@@ -139,10 +139,163 @@ def _patch_model_jeffreys(
 def test_flow_skl_default_t_eps_is_small_endpoint_clamp() -> None:
     sig = inspect.signature(train_flow_skl_model)
     assert sig.parameters["t_eps"].default == pytest.approx(0.0005)
+    assert sig.parameters["ema_alpha"].default == pytest.approx(0.05)
 
     mod = _load_run_flow_matching_skl_module()
     args = mod.build_parser().parse_args([])
     assert args.t_eps == pytest.approx(0.0005)
+    assert args.early_ema_alpha == pytest.approx(0.05)
+
+
+def test_centered_fixed_radius_normalize_behavior_is_unchanged() -> None:
+    raw = torch.tensor([[1.0, 2.0, 5.0], [3.0, 6.0, 9.0]], dtype=torch.float64)
+    got = centered_radius_normalize(raw, radius=2.0)
+    centered = raw - raw.mean(dim=1, keepdim=True)
+    expected = 2.0 * centered / torch.linalg.norm(centered, dim=1, keepdim=True)
+    torch.testing.assert_close(got, expected)
+
+
+def test_train_flow_skl_early_stopping_uses_ema_monitor(monkeypatch: pytest.MonkeyPatch) -> None:
+    monitor_values = [10.0, 9.0, 11.0, 12.0]
+    ema_calls: list[tuple[float | None, float, float]] = []
+
+    def fake_scalar_val_ema_update(prev: float | None, mean_val_loss: float, ema_alpha: float) -> float:
+        ema_calls.append((prev, float(mean_val_loss), float(ema_alpha)))
+        return monitor_values[len(ema_calls) - 1]
+
+    monkeypatch.setattr(fms, "scalar_val_ema_update", fake_scalar_val_ema_update)
+    model = build_flow_skl_model(
+        velocity_family="translation",
+        theta_dim=2,
+        x_dim=2,
+        hidden_dim=4,
+        depth=1,
+        path_schedule="linear",
+    )
+    theta = np.eye(2, dtype=np.float64)[[0, 1, 0, 1]]
+    x = np.array([[0.0, 0.0], [1.0, -1.0], [0.2, 0.1], [1.2, -0.8]], dtype=np.float64)
+
+    out = train_flow_skl_model(
+        model=model,
+        theta_train=theta,
+        x_train=x,
+        theta_val=theta,
+        x_val=x,
+        device=torch.device("cpu"),
+        velocity_family="translation",
+        path_schedule="linear",
+        epochs=10,
+        batch_size=2,
+        patience=2,
+        min_delta=0.0,
+        ema_alpha=0.25,
+        log_every=999,
+    )
+
+    np.testing.assert_allclose(out["val_monitor_losses"], monitor_values)
+    assert out["best_val_loss"] == pytest.approx(9.0)
+    assert out["best_epoch"] == 2
+    assert out["stopped_epoch"] == 4
+    assert out["stopped_early"] is True
+    assert out["early_ema_alpha"] == pytest.approx(0.25)
+    assert len(out["val_losses"]) == 4
+    assert [call[2] for call in ema_calls] == [pytest.approx(0.25)] * 4
+
+
+def test_train_flow_skl_rejects_invalid_ema_alpha() -> None:
+    model = build_flow_skl_model(
+        velocity_family="translation",
+        theta_dim=2,
+        x_dim=2,
+        hidden_dim=4,
+        depth=1,
+    )
+    theta = np.eye(2, dtype=np.float64)
+    x = np.zeros((2, 2), dtype=np.float64)
+    with pytest.raises(ValueError, match="ema_alpha"):
+        train_flow_skl_model(
+            model=model,
+            theta_train=theta,
+            x_train=x,
+            theta_val=theta,
+            x_val=x,
+            device=torch.device("cpu"),
+            velocity_family="translation",
+            ema_alpha=0.0,
+        )
+
+
+def test_conditioned_film_net_preserves_shape_dtype_and_uses_linear_theta_embedding() -> None:
+    torch.manual_seed(123)
+    net = fms._ConditionedFiLMNet(  # type: ignore[attr-defined]
+        trunk_dim=3,
+        theta_dim=2,
+        out_dim=2,
+        hidden_dim=5,
+        depth=2,
+        final_gain=0.01,
+    ).double()
+    x = torch.randn(4, 3, dtype=torch.float64)
+    theta = torch.randn(4, 2, dtype=torch.float64)
+    t = torch.rand(4, 1, dtype=torch.float64)
+    y = net(x, theta, t)
+    assert y.shape == (4, 2)
+    assert y.dtype == torch.float64
+    assert net.network_architecture == "film"
+    assert isinstance(net.theta_embedding, nn.Linear)
+    assert isinstance(net.condition_mlp, nn.Sequential)
+    for block in net.blocks:
+        assert isinstance(block.norm, nn.LayerNorm)
+        assert isinstance(block.branch, nn.Sequential)
+        torch.testing.assert_close(block.film.weight, torch.zeros_like(block.film.weight))
+        torch.testing.assert_close(block.film.bias, torch.zeros_like(block.film.bias))
+
+
+def _first_linear_in_features(module: nn.Sequential) -> int:
+    first = module[0]
+    assert isinstance(first, nn.Linear)
+    return int(first.in_features)
+
+
+def test_build_flow_skl_model_uses_mlp_heads_and_film_nonlinear_subnets() -> None:
+    for family in VELOCITY_FAMILIES:
+        model = build_flow_skl_model(
+            velocity_family=family,
+            theta_dim=2,
+            x_dim=3,
+            hidden_dim=4,
+            depth=1,
+            low_rank_dim=1,
+            path_schedule="linear",
+        )
+        assert getattr(model, "network_architecture") == "film"
+        if family in (
+            "translation",
+            "translation_fixed_norm",
+            "translation_centered_fixed_norm",
+        ):
+            assert isinstance(model.mean_net, nn.Sequential)
+            assert _first_linear_in_features(model.mean_net) == 2
+        elif family == "nonlinear":
+            assert type(model).__name__ == "ConditionalNonlinearXFlowFiLM"
+            assert isinstance(model.net, fms._ConditionedFiLMNet)  # type: ignore[attr-defined]
+            assert model.net.trunk_dim == 3
+            assert model.net.theta_dim == 2
+            assert isinstance(model.net.theta_embedding, nn.Linear)
+        else:
+            assert isinstance(model.b_net, nn.Sequential)
+            assert _first_linear_in_features(model.b_net) == 2
+            assert isinstance(model.a_net, nn.Sequential)
+            if family.startswith("condition_affine"):
+                assert _first_linear_in_features(model.a_net) == 3
+            else:
+                assert _first_linear_in_features(model.a_net) == 1
+            if "low_rank" in family:
+                assert isinstance(model.h_net, fms._ConditionedFiLMNet)  # type: ignore[attr-defined]
+                assert model.h_net.trunk_dim == 1
+                assert model.h_net.theta_dim == 2
+                assert isinstance(model.h_net.theta_embedding, nn.Linear)
+                assert all(isinstance(block.norm, nn.LayerNorm) for block in model.h_net.blocks)
 
 
 def _patch_table_b(model: nn.Module, table: torch.Tensor) -> None:
@@ -404,6 +557,7 @@ def test_translation_training_uses_flow_matching_forward_loss() -> None:
     )
 
     assert out["n_total_steps"] == 2
+    assert out["network_architecture"] == "film"
     assert calls
     assert all(c["t_ndim"] == 1 for c in calls)
 
@@ -712,6 +866,39 @@ def test_shared_affine_low_rank_forward_centers_low_rank_correction() -> None:
     torch.testing.assert_close(model(x, theta, t), expected, rtol=1e-12, atol=1e-12)
 
 
+def test_shared_affine_low_rank_can_use_fixed_oracle_basis() -> None:
+    basis = np.asarray([[1.0], [0.0]], dtype=np.float64)
+    model = build_flow_skl_model(
+        velocity_family="shared_affine_low_rank",
+        theta_dim=2,
+        x_dim=2,
+        hidden_dim=4,
+        depth=1,
+        low_rank_dim=1,
+        path_schedule="linear",
+        low_rank_basis=basis,
+    ).double()
+
+    assert model.low_rank_basis_mode == "fixed"
+    assert "fixed_u" in dict(model.named_buffers())
+    assert not any(name.startswith("u_layer") for name, _ in model.named_parameters())
+    torch.testing.assert_close(model.U, torch.as_tensor(basis, dtype=torch.float64))
+
+
+def test_shared_affine_low_rank_rejects_nonorthonormal_fixed_basis() -> None:
+    with pytest.raises(ValueError, match="orthonormal"):
+        build_flow_skl_model(
+            velocity_family="shared_affine_low_rank",
+            theta_dim=2,
+            x_dim=2,
+            hidden_dim=4,
+            depth=1,
+            low_rank_dim=1,
+            path_schedule="linear",
+            low_rank_basis=np.asarray([[2.0], [0.0]], dtype=np.float64),
+        )
+
+
 def test_shared_affine_low_rank_scalar_forward_includes_scalar_base_and_correction() -> None:
     model = build_flow_skl_model(
         velocity_family="shared_affine_low_rank_scalar",
@@ -832,6 +1019,7 @@ def test_flow_skl_result_npz_omits_endpoint_distribution_fields() -> None:
     assert "endpoint_covariance" not in fields
     assert "endpoint_cov_or_diag" not in fields
     assert "endpoint_is_diag" not in fields
+    assert fields["network_architecture"][0] == "film"
 
 
 def test_scalar_fisher_finite_differences_use_model_jeffreys_matrix(
@@ -857,3 +1045,96 @@ def test_scalar_fisher_finite_differences_use_model_jeffreys_matrix(
     np.testing.assert_allclose(result.fisher_full, expected_fisher, rtol=1e-6, atol=1e-6)
     fd = estimate_scalar_fisher_from_skl(theta, result.symmetric_kl_matrix)
     np.testing.assert_allclose(fd["fisher"], expected_fisher, rtol=1e-6, atol=1e-6)
+
+
+class ScalarAffineIdentityCovModel(nn.Module):
+    def __init__(self, slope: np.ndarray) -> None:
+        super().__init__()
+        self.velocity_family = "condition_affine"
+        self.x_dim = int(np.asarray(slope).size)
+        self.register_buffer("slope", torch.as_tensor(slope, dtype=torch.float32).reshape(1, -1))
+
+    def endpoint_mean(self, theta: torch.Tensor) -> torch.Tensor:
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        return theta.to(self.slope.dtype) @ self.slope
+
+    def A(self, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        del theta
+        batch = int(t.reshape(-1, 1).shape[0])
+        return torch.zeros(batch, self.x_dim, self.x_dim, dtype=self.slope.dtype, device=self.slope.device)
+
+
+def test_affine_mixed_covariance_fisher_zero_a_closed_form() -> None:
+    model = ScalarAffineIdentityCovModel(np.asarray([2.0, -1.0], dtype=np.float64))
+    theta = np.asarray([0.0, 0.5, 1.0], dtype=np.float64).reshape(-1, 1)
+
+    got = fms.estimate_affine_mixed_symmetric_kl_fisher(
+        model=model,
+        theta_all=theta,
+        device=torch.device("cpu"),
+        ridge=0.0,
+        ode_steps=4,
+    )
+
+    expected_skl = np.asarray([1.25, 1.25], dtype=np.float64)
+    expected_matrix = np.asarray(
+        [
+            [0.0, 1.25, 0.0],
+            [1.25, 0.0, 1.25],
+            [0.0, 1.25, 0.0],
+        ],
+        dtype=np.float64,
+    )
+
+    np.testing.assert_allclose(got["adjacent_symmetric_kl"], expected_skl, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(got["symmetric_kl_matrix"], expected_matrix, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(got["canonical_metric_matrix"], expected_matrix, rtol=1e-12, atol=1e-12)
+    assert got["canonical_metric_name"] == "mixed_affine_symmetric_kl"
+    np.testing.assert_allclose(got["fisher"], np.asarray([5.0, 5.0]), rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(got["mixed_covariance"], np.repeat(np.eye(2)[None, :, :], 2, axis=0))
+
+    compat = fms.estimate_affine_mixed_covariance_fisher(
+        model=model,
+        theta_all=theta,
+        device=torch.device("cpu"),
+        ridge=0.0,
+        ode_steps=4,
+    )
+    np.testing.assert_allclose(compat["fisher"], got["fisher"], rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(compat["symmetric_kl_matrix"], got["symmetric_kl_matrix"], rtol=1e-12, atol=1e-12)
+
+
+def test_adjacent_model_jeffreys_fisher_uses_only_adjacent_pairs(monkeypatch: pytest.MonkeyPatch) -> None:
+    class DummyModel(nn.Module):
+        x_dim = 1
+
+    calls: list[tuple[str, float]] = []
+
+    def fake_sample_flow_endpoint(*, model, theta, n_samples, device, ode_steps, ode_method):
+        del model, n_samples, device, ode_steps, ode_method
+        val = float(np.asarray(theta).reshape(-1)[0])
+        calls.append(("sample", val))
+        return torch.full((3, 1), val, dtype=torch.float32)
+
+    def fake_log_prob_model(*, model, x, theta, device, ode_steps, batch_size, solve_jitter, quadrature_steps, ode_method):
+        del model, x, device, ode_steps, batch_size, solve_jitter, quadrature_steps, ode_method
+        val = float(np.asarray(theta).reshape(-1)[0])
+        calls.append(("logp", val))
+        return np.full(3, -val, dtype=np.float64)
+
+    monkeypatch.setattr(fms, "sample_flow_endpoint", fake_sample_flow_endpoint)
+    monkeypatch.setattr(fms, "_log_prob_model", fake_log_prob_model)
+
+    theta = np.asarray([0.0, 2.0, 5.0], dtype=np.float64).reshape(-1, 1)
+    got = fms.estimate_adjacent_model_jeffreys_fisher(
+        model=DummyModel(),
+        theta_all=theta,
+        device=torch.device("cpu"),
+        mc_jeffreys_sample=3,
+    )
+
+    np.testing.assert_allclose(got["adjacent_jeffreys"], np.asarray([0.0, 0.0]))
+    np.testing.assert_allclose(got["fisher"], np.asarray([0.0, 0.0]))
+    sample_thetas = [val for kind, val in calls if kind == "sample"]
+    assert sample_thetas == [0.0, 2.0, 2.0, 5.0]
