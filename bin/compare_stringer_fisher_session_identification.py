@@ -20,6 +20,7 @@ from fisher.stringer_dataset import list_stringer_sessions
 from fisher.stringer_session_identification import (
     ALL_DISTANCE_SUMMARY_PNG_NAME,
     ALL_DISTANCE_SUMMARY_SVG_NAME,
+    DIRECTION_A_TO_B,
     CURVES_CSV_NAME,
     DISTANCES,
     HEATMAPS_PNG_NAME,
@@ -144,11 +145,10 @@ def _load_visualization_result(output_dir: Path) -> IdentificationResult:
     for method in METHODS:
         for distance_name in DISTANCES:
             distances[method][distance_name] = {}
-            for direction in ("A_to_B", "B_to_A"):
-                distances[method][distance_name][direction] = np.asarray(
-                    data[f"{method}_{distance_name}_{direction}"],
-                    dtype=np.float64,
-                )
+            distances[method][distance_name][DIRECTION_A_TO_B] = np.asarray(
+                data[f"{method}_{distance_name}_{DIRECTION_A_TO_B}"],
+                dtype=np.float64,
+            )
     return IdentificationResult(
         session_keys=session_keys,
         theta_grid=np.asarray(data["theta_grid"], dtype=np.float64),

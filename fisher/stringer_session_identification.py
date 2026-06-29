@@ -46,6 +46,7 @@ DISTANCE_RMSE = "raw_rmse"
 DISTANCES = (DISTANCE_PRIMARY, DISTANCE_AREA_L2, DISTANCE_RMSE)
 HALF_A = "A"
 HALF_B = "B"
+DIRECTION_A_TO_B = "A_to_B"
 
 
 @dataclass(frozen=True)
@@ -643,53 +644,55 @@ def compute_identification(
         summary[method] = {}
         for dist_name in DISTANCES:
             distances[method][dist_name] = {}
-            for direction, q_label, c_label in (("A_to_B", HALF_A, HALF_B), ("B_to_A", HALF_B, HALF_A)):
-                mat = np.full((n, n), np.nan, dtype=np.float64)
-                for qi, q_key in enumerate(session_keys):
-                    for ci, c_key in enumerate(session_keys):
-                        mat[qi, ci] = curve_distance(
-                            by_half[q_label][q_key].curves[method],
-                            by_half[c_label][c_key].curves[method],
-                            theta_mid,
-                            distance=dist_name,
-                            eps=float(eps),
-                        )
-                distances[method][dist_name][direction] = mat
-                ranks = np.full(n, -1, dtype=np.int64)
-                tie_counts = np.full(n, 0, dtype=np.int64)
-                for qi, q_key in enumerate(session_keys):
-                    order = np.argsort(mat[qi], kind="mergesort")
-                    correct = session_keys.index(q_key)
-                    rank = int(np.flatnonzero(order == correct)[0]) + 1
-                    ranks[qi] = rank
-                    best = float(mat[qi, order[0]])
-                    tie_counts[qi] = int(np.sum(np.isclose(mat[qi], best, rtol=1e-12, atol=1e-12)))
-                    for candidate_rank, ci in enumerate(order, start=1):
-                        pair_rows.append(
-                            {
-                                "method": method,
-                                "distance": dist_name,
-                                "direction": direction,
-                                "query_half": q_label,
-                                "candidate_half": c_label,
-                                "query_session": q_key,
-                                "candidate_session": session_keys[int(ci)],
-                                "query_session_index": int(qi),
-                                "candidate_session_index": int(ci),
-                                "distance_value": float(mat[qi, int(ci)]),
-                                "rank": int(candidate_rank),
-                                "is_match": bool(int(ci) == correct),
-                                "best_tie_count_for_query": int(tie_counts[qi]),
-                            }
-                        )
-                summary[method][f"{dist_name}_{direction}"] = {
-                    "top1_accuracy": float(np.mean(ranks == 1)),
-                    "top2_accuracy": float(np.mean(ranks <= min(2, n))),
-                    "top3_accuracy": float(np.mean(ranks <= min(3, n))),
-                    "mean_reciprocal_rank": float(np.mean(1.0 / ranks.astype(np.float64))),
-                    "ranks": ranks.tolist(),
-                    "tie_counts": tie_counts.tolist(),
-                }
+            direction = DIRECTION_A_TO_B
+            q_label = HALF_A
+            c_label = HALF_B
+            mat = np.full((n, n), np.nan, dtype=np.float64)
+            for qi, q_key in enumerate(session_keys):
+                for ci, c_key in enumerate(session_keys):
+                    mat[qi, ci] = curve_distance(
+                        by_half[q_label][q_key].curves[method],
+                        by_half[c_label][c_key].curves[method],
+                        theta_mid,
+                        distance=dist_name,
+                        eps=float(eps),
+                    )
+            distances[method][dist_name][direction] = mat
+            ranks = np.full(n, -1, dtype=np.int64)
+            tie_counts = np.full(n, 0, dtype=np.int64)
+            for qi, q_key in enumerate(session_keys):
+                order = np.argsort(mat[qi], kind="mergesort")
+                correct = session_keys.index(q_key)
+                rank = int(np.flatnonzero(order == correct)[0]) + 1
+                ranks[qi] = rank
+                best = float(mat[qi, order[0]])
+                tie_counts[qi] = int(np.sum(np.isclose(mat[qi], best, rtol=1e-12, atol=1e-12)))
+                for candidate_rank, ci in enumerate(order, start=1):
+                    pair_rows.append(
+                        {
+                            "method": method,
+                            "distance": dist_name,
+                            "direction": direction,
+                            "query_half": q_label,
+                            "candidate_half": c_label,
+                            "query_session": q_key,
+                            "candidate_session": session_keys[int(ci)],
+                            "query_session_index": int(qi),
+                            "candidate_session_index": int(ci),
+                            "distance_value": float(mat[qi, int(ci)]),
+                            "rank": int(candidate_rank),
+                            "is_match": bool(int(ci) == correct),
+                            "best_tie_count_for_query": int(tie_counts[qi]),
+                        }
+                    )
+            summary[method][f"{dist_name}_{direction}"] = {
+                "top1_accuracy": float(np.mean(ranks == 1)),
+                "top2_accuracy": float(np.mean(ranks <= min(2, n))),
+                "top3_accuracy": float(np.mean(ranks <= min(3, n))),
+                "mean_reciprocal_rank": float(np.mean(1.0 / ranks.astype(np.float64))),
+                "ranks": ranks.tolist(),
+                "tie_counts": tie_counts.tolist(),
+            }
     return distances, pair_rows, summary
 
 
@@ -786,6 +789,9 @@ def run_session_identification(
         "methods": list(METHODS),
         "distances": list(DISTANCES),
         "primary_distance": DISTANCE_PRIMARY,
+        "identification_direction": DIRECTION_A_TO_B,
+        "query_half": HALF_A,
+        "reference_half": HALF_B,
         "orientation_period": float(period),
         "theta_grid_size": int(np.asarray(theta_grid).reshape(-1).shape[0]),
         "pca_fit_scope": "half",
@@ -906,19 +912,18 @@ def write_summary_json(path: Path, result: IdentificationResult, *, extra: dict[
 
 def plot_primary_heatmaps(path_svg: Path, path_png: Path, result: IdentificationResult) -> tuple[Path, Path]:
     labels = [str(i) for i in range(len(result.session_keys))]
-    fig, axes = plt.subplots(len(METHODS), 2, figsize=(10.0, 4.8 * len(METHODS)), layout="constrained")
-    axes_arr = np.asarray(axes).reshape(len(METHODS), 2)
+    fig, axes = plt.subplots(len(METHODS), 1, figsize=(5.6, 4.8 * len(METHODS)), layout="constrained")
+    axes_arr = np.asarray(axes).reshape(len(METHODS))
     for mi, method in enumerate(METHODS):
-        for di, direction in enumerate(("A_to_B", "B_to_A")):
-            ax = axes_arr[mi, di]
-            mat = result.distances[method][DISTANCE_PRIMARY][direction]
-            im = ax.imshow(mat, cmap="viridis")
-            ax.set_title(f"{method} {direction}")
-            ax.set_xlabel("candidate session")
-            ax.set_ylabel("query session")
-            ax.set_xticks(np.arange(len(labels)), labels=labels, rotation=45, ha="right")
-            ax.set_yticks(np.arange(len(labels)), labels=labels)
-            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        ax = axes_arr[mi]
+        mat = result.distances[method][DISTANCE_PRIMARY][DIRECTION_A_TO_B]
+        im = ax.imshow(mat, cmap="viridis")
+        ax.set_title(f"{method} {DIRECTION_A_TO_B}")
+        ax.set_xlabel("candidate B session")
+        ax.set_ylabel("query A session")
+        ax.set_xticks(np.arange(len(labels)), labels=labels, rotation=45, ha="right")
+        ax.set_yticks(np.arange(len(labels)), labels=labels)
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     path_svg = Path(path_svg)
     path_png = Path(path_png)
     path_svg.parent.mkdir(parents=True, exist_ok=True)
@@ -930,17 +935,15 @@ def plot_primary_heatmaps(path_svg: Path, path_png: Path, result: Identification
 
 def plot_ranks(path_svg: Path, path_png: Path, result: IdentificationResult) -> tuple[Path, Path]:
     x = np.arange(len(result.session_keys), dtype=np.float64)
-    width = 0.18
+    width = 0.35
     fig, ax = plt.subplots(figsize=(10.0, 5.2), layout="constrained")
     offsets = {
-        (METHOD_CLASSICAL_LINEAR, "A_to_B"): -1.5 * width,
-        (METHOD_CLASSICAL_LINEAR, "B_to_A"): -0.5 * width,
-        (METHOD_FLOW_LINEAR, "A_to_B"): 0.5 * width,
-        (METHOD_FLOW_LINEAR, "B_to_A"): 1.5 * width,
+        METHOD_CLASSICAL_LINEAR: -0.5 * width,
+        METHOD_FLOW_LINEAR: 0.5 * width,
     }
-    for (method, direction), offset in offsets.items():
-        ranks = result.summary["identification"][method][f"{DISTANCE_PRIMARY}_{direction}"]["ranks"]
-        ax.bar(x + offset, ranks, width=width, label=f"{method} {direction}")
+    for method, offset in offsets.items():
+        ranks = result.summary["identification"][method][f"{DISTANCE_PRIMARY}_{DIRECTION_A_TO_B}"]["ranks"]
+        ax.bar(x + offset, ranks, width=width, label=method)
     ax.axhline(1.0, color="black", linewidth=1.0, linestyle="--")
     ax.set_xlabel("session index")
     ax.set_ylabel("correct-pair rank")
@@ -964,43 +967,36 @@ def plot_all_distance_summary(path_svg: Path, path_png: Path, result: Identifica
     fig_height = max(12.0, 2.7 * n_rows)
     fig, axes = plt.subplots(
         n_rows,
-        4,
-        figsize=(18.0, fig_height),
+        3,
+        figsize=(14.0, fig_height),
         layout="constrained",
-        gridspec_kw={"width_ratios": [1.0, 1.0, 0.75, 0.75]},
+        gridspec_kw={"width_ratios": [1.0, 0.8, 0.8]},
     )
-    axes_arr = np.asarray(axes).reshape(n_rows, 4)
+    axes_arr = np.asarray(axes).reshape(n_rows, 3)
     x = np.arange(len(result.session_keys), dtype=np.float64)
     row = 0
     for method in METHODS:
         for distance_name in DISTANCES:
             row_axes = axes_arr[row]
             mats = result.distances[method][distance_name]
-            vmin = float(np.nanmin([np.nanmin(mats["A_to_B"]), np.nanmin(mats["B_to_A"])]))
-            vmax = float(np.nanmax([np.nanmax(mats["A_to_B"]), np.nanmax(mats["B_to_A"])]))
-            for col, direction in enumerate(("A_to_B", "B_to_A")):
-                ax = row_axes[col]
-                im = ax.imshow(mats[direction], cmap="viridis", vmin=vmin, vmax=vmax)
-                ax.set_title(f"{method}\n{distance_name} {direction}", fontsize=10)
-                ax.set_xlabel("candidate")
-                ax.set_ylabel("query")
-                ax.set_xticks(np.arange(len(labels)), labels=labels, rotation=45, ha="right")
-                ax.set_yticks(np.arange(len(labels)), labels=labels)
-                fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            mat = mats[DIRECTION_A_TO_B]
+            ax = row_axes[0]
+            im = ax.imshow(mat, cmap="viridis")
+            ax.set_title(f"{method}\n{distance_name} {DIRECTION_A_TO_B}", fontsize=10)
+            ax.set_xlabel("candidate B")
+            ax.set_ylabel("query A")
+            ax.set_xticks(np.arange(len(labels)), labels=labels, rotation=45, ha="right")
+            ax.set_yticks(np.arange(len(labels)), labels=labels)
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
-            rank_ax = row_axes[2]
-            metric_ax = row_axes[3]
-            width = 0.35
+            rank_ax = row_axes[1]
+            metric_ax = row_axes[2]
+            width = 0.6
             ranks_a = np.asarray(
-                result.summary["identification"][method][f"{distance_name}_A_to_B"]["ranks"],
+                result.summary["identification"][method][f"{distance_name}_{DIRECTION_A_TO_B}"]["ranks"],
                 dtype=np.float64,
             )
-            ranks_b = np.asarray(
-                result.summary["identification"][method][f"{distance_name}_B_to_A"]["ranks"],
-                dtype=np.float64,
-            )
-            rank_ax.bar(x - 0.5 * width, ranks_a, width=width, label="A->B")
-            rank_ax.bar(x + 0.5 * width, ranks_b, width=width, label="B->A")
+            rank_ax.bar(x, ranks_a, width=width, label=DIRECTION_A_TO_B)
             rank_ax.axhline(1.0, color="black", linewidth=0.9, linestyle="--")
             rank_ax.set_title("correct-pair rank", fontsize=10)
             rank_ax.set_xlabel("session")
@@ -1008,25 +1004,20 @@ def plot_all_distance_summary(path_svg: Path, path_png: Path, result: Identifica
             rank_ax.set_xticks(x, labels)
             rank_ax.set_ylim(0.5, len(result.session_keys) + 0.5)
             rank_ax.grid(True, axis="y", alpha=0.25)
-            rank_ax.legend(fontsize=7)
 
-            summary_a = result.summary["identification"][method][f"{distance_name}_A_to_B"]
-            summary_b = result.summary["identification"][method][f"{distance_name}_B_to_A"]
+            summary_a = result.summary["identification"][method][f"{distance_name}_{DIRECTION_A_TO_B}"]
             metric_names = ("top1_accuracy", "top2_accuracy", "top3_accuracy", "mean_reciprocal_rank")
             metric_labels = ("top1", "top2", "top3", "MRR")
             vals_a = [float(summary_a[name]) for name in metric_names]
-            vals_b = [float(summary_b[name]) for name in metric_names]
             mx = np.arange(len(metric_names), dtype=np.float64)
-            metric_ax.bar(mx - 0.5 * width, vals_a, width=width, label="A->B")
-            metric_ax.bar(mx + 0.5 * width, vals_b, width=width, label="B->A")
+            metric_ax.bar(mx, vals_a, width=width)
             metric_ax.set_title("identification scores", fontsize=10)
             metric_ax.set_ylim(0.0, 1.05)
             metric_ax.set_xticks(mx, metric_labels, rotation=25, ha="right")
             metric_ax.grid(True, axis="y", alpha=0.25)
-            metric_ax.legend(fontsize=7)
             row += 1
 
-    fig.suptitle("Stringer session identification across Fisher-curve distances", fontsize=16)
+    fig.suptitle("Stringer session identification across Fisher-curve distances (A queries, B reference)", fontsize=16)
     path_svg = Path(path_svg)
     path_png = Path(path_png)
     path_svg.parent.mkdir(parents=True, exist_ok=True)

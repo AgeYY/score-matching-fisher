@@ -16,6 +16,7 @@ from fisher.stringer_session_identification import (
     DISTANCE_AREA_L2,
     DISTANCE_PRIMARY,
     DISTANCE_RMSE,
+    DIRECTION_A_TO_B,
     HALF_A,
     HALF_B,
     DISTANCES,
@@ -156,6 +157,7 @@ def test_compute_identification_finds_synthetic_pairs() -> None:
         got = summary[method][f"{DISTANCE_PRIMARY}_A_to_B"]
         assert got["top1_accuracy"] == pytest.approx(1.0)
         assert got["ranks"] == [1, 1, 1]
+        assert f"{DISTANCE_PRIMARY}_B_to_A" not in summary[method]
 
 
 def test_plot_all_distance_summary_writes_files(tmp_path: Path) -> None:
@@ -169,17 +171,15 @@ def test_plot_all_distance_summary_writes_files(tmp_path: Path) -> None:
         for distance_name in DISTANCES:
             distances[method][distance_name] = {
                 "A_to_B": np.asarray([[0.1, 1.0], [0.8, 0.2]], dtype=np.float64),
-                "B_to_A": np.asarray([[0.2, 0.9], [0.7, 0.1]], dtype=np.float64),
             }
-            for direction in ("A_to_B", "B_to_A"):
-                summary["identification"][method][f"{distance_name}_{direction}"] = {
-                    "top1_accuracy": 1.0,
-                    "top2_accuracy": 1.0,
-                    "top3_accuracy": 1.0,
-                    "mean_reciprocal_rank": 1.0,
-                    "ranks": [1, 1],
-                    "tie_counts": [1, 1],
-                }
+            summary["identification"][method][f"{distance_name}_{DIRECTION_A_TO_B}"] = {
+                "top1_accuracy": 1.0,
+                "top2_accuracy": 1.0,
+                "top3_accuracy": 1.0,
+                "mean_reciprocal_rank": 1.0,
+                "ranks": [1, 1],
+                "tie_counts": [1, 1],
+            }
     result = IdentificationResult(
         session_keys=session_keys,
         theta_grid=grid,
@@ -209,17 +209,15 @@ def test_visualization_only_loader_reads_npz_and_summary(tmp_path: Path) -> None
         for distance_name in DISTANCES:
             distances[method][distance_name] = {
                 "A_to_B": np.eye(2, dtype=np.float64),
-                "B_to_A": np.eye(2, dtype=np.float64),
             }
-            for direction in ("A_to_B", "B_to_A"):
-                summary["identification"][method][f"{distance_name}_{direction}"] = {
-                    "top1_accuracy": 1.0,
-                    "top2_accuracy": 1.0,
-                    "top3_accuracy": 1.0,
-                    "mean_reciprocal_rank": 1.0,
-                    "ranks": [1, 1],
-                    "tie_counts": [1, 1],
-                }
+            summary["identification"][method][f"{distance_name}_{DIRECTION_A_TO_B}"] = {
+                "top1_accuracy": 1.0,
+                "top2_accuracy": 1.0,
+                "top3_accuracy": 1.0,
+                "mean_reciprocal_rank": 1.0,
+                "ranks": [1, 1],
+                "tie_counts": [1, 1],
+            }
     result = IdentificationResult(
         session_keys=session_keys,
         theta_grid=grid,
@@ -239,6 +237,7 @@ def test_visualization_only_loader_reads_npz_and_summary(tmp_path: Path) -> None
     for method in METHODS:
         for distance_name in (DISTANCE_PRIMARY, DISTANCE_AREA_L2, DISTANCE_RMSE):
             np.testing.assert_allclose(loaded.distances[method][distance_name]["A_to_B"], np.eye(2))
+            assert "B_to_A" not in loaded.distances[method][distance_name]
 
 
 def test_cli_defaults_match_session_identification_plan() -> None:
