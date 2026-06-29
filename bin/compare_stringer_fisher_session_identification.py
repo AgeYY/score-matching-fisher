@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -30,17 +31,32 @@ from fisher.stringer_session_identification import (
     RANKS_PNG_NAME,
     RANKS_SVG_NAME,
     RESULTS_NPZ_NAME,
+    SUBSAMPLE_CURVES_CSV_NAME,
+    SUBSAMPLE_PAIRS_CSV_NAME,
+    SUBSAMPLE_RESULTS_NPZ_NAME,
+    SUBSAMPLE_SUMMARY_JSON_NAME,
+    SUBSAMPLE_SUMMARY_PNG_NAME,
+    SUBSAMPLE_SUMMARY_SVG_NAME,
     SUMMARY_JSON_NAME,
     IdentificationResult,
+    SubsampleConvergenceResult,
+    load_subsample_results_npz,
     parse_optional_int,
+    parse_positive_int_list,
     plot_all_distance_summary,
     plot_primary_heatmaps,
     plot_ranks,
+    plot_subsample_convergence_summary,
+    run_a_subsample_convergence,
     run_session_identification,
     theta_grid_periodic,
     write_curves_csv,
     write_pairs_csv,
     write_results_npz,
+    write_subsample_curves_csv,
+    write_subsample_pairs_csv,
+    write_subsample_results_npz,
+    write_subsample_summary_json,
     write_summary_json,
 )
 from global_setting import DATA_DIR, DEFAULT_DEVICE
@@ -77,6 +93,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--force", action="store_true")
     p.add_argument("--skip-flow-npz", action="store_true")
     p.add_argument("--visualization-only", action="store_true")
+    p.add_argument("--subsample-a-convergence", action="store_true")
+    p.add_argument("--subsample-a-n-list", default="64,128,256,512,1024,2048")
+    p.add_argument("--subsample-a-repeats", type=int, default=1)
+    p.add_argument("--subsample-a-sampling", choices=("stratified", "uniform"), default="stratified")
 
     p.add_argument("--epochs", type=int, default=50000)
     p.add_argument("--early-patience", type=int, default=1000)
@@ -129,8 +149,6 @@ def flow_config_from_args(args: argparse.Namespace) -> ContinuousFlowConfig:
 
 
 def _load_visualization_result(output_dir: Path) -> IdentificationResult:
-    import json
-
     output_dir = Path(output_dir)
     results_path = output_dir / RESULTS_NPZ_NAME
     summary_path = output_dir / SUMMARY_JSON_NAME
@@ -161,6 +179,17 @@ def _load_visualization_result(output_dir: Path) -> IdentificationResult:
     )
 
 
+def _load_subsample_visualization_result(output_dir: Path) -> SubsampleConvergenceResult:
+    output_dir = Path(output_dir)
+    results_path = output_dir / SUBSAMPLE_RESULTS_NPZ_NAME
+    summary_path = output_dir / SUBSAMPLE_SUMMARY_JSON_NAME
+    if not results_path.is_file():
+        raise FileNotFoundError(f"Missing subsample results NPZ for visualization-only mode: {results_path}")
+    if not summary_path.is_file():
+        raise FileNotFoundError(f"Missing subsample summary JSON for visualization-only mode: {summary_path}")
+    return load_subsample_results_npz(results_path, json.loads(summary_path.read_text()))
+
+
 def validate_args(args: argparse.Namespace) -> None:
     if int(args.theta_grid_size) < 2:
         raise ValueError("--theta-grid-size must be >= 2.")
@@ -170,20 +199,36 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--train-frac must be in (0, 1).")
     if float(args.orientation_period) <= 0.0:
         raise ValueError("--orientation-period must be positive.")
+    if int(args.subsample_a_repeats) < 1:
+        raise ValueError("--subsample-a-repeats must be >= 1.")
+    n_values = parse_positive_int_list(str(args.subsample_a_n_list))
+    if bool(args.subsample_a_convergence) and any(int(n) < int(args.pca_dim) for n in n_values):
+        raise ValueError("--subsample-a-n-list values must be >= --pca-dim for fresh per-subset PCA.")
 
 
 def run(args: argparse.Namespace) -> dict[str, Path]:
     validate_args(args)
-    output_dir = (
-        Path(args.output_dir).expanduser()
-        if args.output_dir is not None
-        else default_output_dir(str(args.session_stimuli_type))
-    )
+    output_dir = Path(args.output_dir).expanduser() if args.output_dir is not None else default_output_dir(str(args.session_stimuli_type))
+    if bool(args.subsample_a_convergence) and args.output_dir is None:
+        output_dir = output_dir / "a_subsample_convergence"
     if not output_dir.is_absolute():
         output_dir = (_REPO_ROOT / output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if bool(args.visualization_only):
+        if bool(args.subsample_a_convergence):
+            subsample_result = _load_subsample_visualization_result(output_dir)
+            summary_svg, summary_png = plot_subsample_convergence_summary(
+                output_dir / SUBSAMPLE_SUMMARY_SVG_NAME,
+                output_dir / SUBSAMPLE_SUMMARY_PNG_NAME,
+                subsample_result,
+            )
+            print(f"subsample_summary_svg: {summary_svg}", flush=True)
+            return {
+                "output_dir": output_dir,
+                "subsample_summary_svg": summary_svg,
+                "subsample_summary_png": summary_png,
+            }
         result = _load_visualization_result(output_dir)
         heatmaps_svg, heatmaps_png = plot_primary_heatmaps(output_dir / HEATMAPS_SVG_NAME, output_dir / HEATMAPS_PNG_NAME, result)
         ranks_svg, ranks_png = plot_ranks(output_dir / RANKS_SVG_NAME, output_dir / RANKS_PNG_NAME, result)
@@ -226,6 +271,82 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
         flush=True,
     )
     grid = theta_grid_periodic(float(args.orientation_period), int(args.theta_grid_size))
+    if bool(args.subsample_a_convergence):
+        result_subsample = run_a_subsample_convergence(
+            sessions=sessions,
+            theta_grid=grid,
+            period=float(args.orientation_period),
+            pca_dim=int(args.pca_dim),
+            pca_random_state=int(args.pca_random_state),
+            pca_whiten=not bool(args.no_pca_whiten),
+            train_frac=float(args.train_frac),
+            seed=int(args.seed),
+            device=device,
+            flow_config=flow_config_from_args(args),
+            output_dir=output_dir,
+            n_values=parse_positive_int_list(str(args.subsample_a_n_list)),
+            repeats=int(args.subsample_a_repeats),
+            sampling=str(args.subsample_a_sampling),
+            force=bool(args.force),
+            save_flow_npz=not bool(args.skip_flow_npz),
+            classical_ridge=float(args.classical_linear_ridge),
+            classical_window_radius=args.classical_window_radius,
+            classical_min_endpoint_samples=int(args.classical_min_endpoint_samples),
+        )
+        results_npz = write_subsample_results_npz(output_dir / SUBSAMPLE_RESULTS_NPZ_NAME, result_subsample)
+        curves_csv = write_subsample_curves_csv(output_dir / SUBSAMPLE_CURVES_CSV_NAME, result_subsample.curve_rows)
+        pairs_csv = write_subsample_pairs_csv(output_dir / SUBSAMPLE_PAIRS_CSV_NAME, result_subsample.pair_rows)
+        summary_svg, summary_png = plot_subsample_convergence_summary(
+            output_dir / SUBSAMPLE_SUMMARY_SVG_NAME,
+            output_dir / SUBSAMPLE_SUMMARY_PNG_NAME,
+            result_subsample,
+        )
+        summary_json = write_subsample_summary_json(
+            output_dir / SUBSAMPLE_SUMMARY_JSON_NAME,
+            result_subsample,
+            extra={
+                "script": "bin/compare_stringer_fisher_session_identification.py",
+                "device": str(device),
+                "data_dir": None if args.data_dir is None else str(args.data_dir),
+                "session_stimuli_type": str(args.session_stimuli_type),
+                "max_sessions": None if args.max_sessions is None else int(args.max_sessions),
+                "output_dir": str(output_dir),
+                "results_npz": str(results_npz),
+                "curves_csv": str(curves_csv),
+                "pairs_csv": str(pairs_csv),
+                "subsample_summary_svg": str(summary_svg),
+                "subsample_summary_png": str(summary_png),
+                "flow_config": vars(flow_config_from_args(args)),
+                "classical_config": {
+                    "linear_ridge": float(args.classical_linear_ridge),
+                    "window_radius": args.classical_window_radius,
+                    "min_endpoint_samples": int(args.classical_min_endpoint_samples),
+                },
+                "seed": int(args.seed),
+                "train_frac": float(args.train_frac),
+                "pca_dim": int(args.pca_dim),
+                "pca_whiten": not bool(args.no_pca_whiten),
+                "pca_random_state": int(args.pca_random_state),
+            },
+        )
+        for label, path in (
+            ("results_npz", results_npz),
+            ("curves_csv", curves_csv),
+            ("pairs_csv", pairs_csv),
+            ("summary_json", summary_json),
+            ("subsample_summary_svg", summary_svg),
+        ):
+            print(f"{label}: {path}", flush=True)
+        return {
+            "output_dir": output_dir,
+            "results_npz": results_npz,
+            "curves_csv": curves_csv,
+            "pairs_csv": pairs_csv,
+            "summary_json": summary_json,
+            "subsample_summary_svg": summary_svg,
+            "subsample_summary_png": summary_png,
+        }
+
     result = run_session_identification(
         sessions=sessions,
         theta_grid=grid,

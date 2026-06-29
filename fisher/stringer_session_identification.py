@@ -38,6 +38,12 @@ RANKS_SVG_NAME = "stringer_session_identification_ranks.svg"
 RANKS_PNG_NAME = "stringer_session_identification_ranks.png"
 ALL_DISTANCE_SUMMARY_SVG_NAME = "stringer_session_identification_all_distance_summary.svg"
 ALL_DISTANCE_SUMMARY_PNG_NAME = "stringer_session_identification_all_distance_summary.png"
+SUBSAMPLE_RESULTS_NPZ_NAME = "stringer_session_identification_a_subsample_convergence_results.npz"
+SUBSAMPLE_CURVES_CSV_NAME = "stringer_session_identification_a_subsample_convergence_curves.csv"
+SUBSAMPLE_PAIRS_CSV_NAME = "stringer_session_identification_a_subsample_convergence_pairs.csv"
+SUBSAMPLE_SUMMARY_JSON_NAME = "stringer_session_identification_a_subsample_convergence_summary.json"
+SUBSAMPLE_SUMMARY_SVG_NAME = "stringer_session_identification_a_subsample_convergence_summary.svg"
+SUBSAMPLE_SUMMARY_PNG_NAME = "stringer_session_identification_a_subsample_convergence_summary.png"
 
 METHODS = (METHOD_CLASSICAL_LINEAR, METHOD_FLOW_LINEAR)
 DISTANCE_PRIMARY = "log_correlation"
@@ -95,6 +101,21 @@ class IdentificationResult:
     summary: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class SubsampleConvergenceResult:
+    session_keys: list[str]
+    theta_grid: np.ndarray
+    theta_midpoints: np.ndarray
+    n_values: list[int]
+    repeats: int
+    sampling: str
+    endpoint_result: IdentificationResult
+    subset_matrices: dict[str, dict[str, np.ndarray]]
+    pair_rows: list[dict[str, Any]]
+    curve_rows: list[dict[str, Any]]
+    summary: dict[str, Any]
+
+
 def parse_optional_int(value: str | int | None) -> int | None:
     if value is None:
         return None
@@ -106,6 +127,19 @@ def parse_optional_int(value: str | int | None) -> int | None:
     out = int(text)
     if out < 1:
         raise ValueError("integer value must be positive.")
+    return out
+
+
+def parse_positive_int_list(value: str | Iterable[int]) -> list[int]:
+    if isinstance(value, str):
+        parts = [p.strip() for p in value.split(",") if p.strip()]
+    else:
+        parts = [str(v).strip() for v in value]
+    if not parts:
+        raise ValueError("integer list must contain at least one value.")
+    out = sorted({int(p) for p in parts})
+    if any(v < 1 for v in out):
+        raise ValueError("integer list values must be positive.")
     return out
 
 
@@ -236,6 +270,82 @@ def stratified_half_split(
     if a.size + b.size != theta.size:
         raise RuntimeError("Internal error: stratified halves do not cover all trials.")
     return a, b
+
+
+def orientation_bin_ids(theta_all: np.ndarray, *, n_bins: int, period: float) -> np.ndarray:
+    theta = np.mod(np.asarray(theta_all, dtype=np.float64).reshape(-1), float(period))
+    if int(n_bins) < 1:
+        raise ValueError("n_bins must be >= 1.")
+    bin_id = np.floor(theta / float(period) * int(n_bins)).astype(np.int64)
+    return np.clip(bin_id, 0, int(n_bins) - 1)
+
+
+def stratified_bootstrap_indices(
+    theta_all: np.ndarray,
+    *,
+    n_samples: int,
+    n_bins: int,
+    period: float,
+    seed: int,
+) -> np.ndarray:
+    theta = np.asarray(theta_all, dtype=np.float64).reshape(-1)
+    n = int(n_samples)
+    if n < 1:
+        raise ValueError("n_samples must be >= 1.")
+    if theta.shape[0] < 1:
+        raise ValueError("theta_all must contain at least one observation.")
+    bin_id = orientation_bin_ids(theta, n_bins=int(n_bins), period=float(period))
+    counts = np.bincount(bin_id, minlength=int(n_bins)).astype(np.float64)
+    expected = n * counts / float(theta.shape[0])
+    per_bin = np.floor(expected).astype(np.int64)
+    remainder = n - int(np.sum(per_bin))
+    if remainder > 0:
+        order = np.argsort(-(expected - per_bin), kind="mergesort")
+        for b in order[:remainder]:
+            if counts[int(b)] > 0:
+                per_bin[int(b)] += 1
+    rng = np.random.default_rng(int(seed))
+    pieces: list[np.ndarray] = []
+    for b, take in enumerate(per_bin):
+        if int(take) <= 0:
+            continue
+        candidates = np.flatnonzero(bin_id == int(b))
+        if candidates.size == 0:
+            continue
+        pieces.append(rng.choice(candidates, size=int(take), replace=True).astype(np.int64))
+    if not pieces:
+        raise RuntimeError("Internal error: stratified bootstrap selected no samples.")
+    out = np.concatenate(pieces).astype(np.int64)
+    if out.size != n:
+        raise RuntimeError("Internal error: stratified bootstrap sample count mismatch.")
+    rng.shuffle(out)
+    return out
+
+
+def bootstrap_indices(
+    theta_all: np.ndarray,
+    *,
+    n_samples: int,
+    n_bins: int,
+    period: float,
+    seed: int,
+    sampling: str,
+) -> np.ndarray:
+    if str(sampling) == "stratified":
+        return stratified_bootstrap_indices(
+            theta_all,
+            n_samples=int(n_samples),
+            n_bins=int(n_bins),
+            period=float(period),
+            seed=int(seed),
+        )
+    if str(sampling) == "uniform":
+        theta = np.asarray(theta_all).reshape(-1)
+        if theta.shape[0] < 1:
+            raise ValueError("theta_all must contain at least one observation.")
+        rng = np.random.default_rng(int(seed))
+        return rng.integers(0, int(theta.shape[0]), size=int(n_samples), endpoint=False, dtype=np.int64)
+    raise ValueError(f"Unknown sampling mode {sampling!r}.")
 
 
 def fit_half_pca(
@@ -622,20 +732,23 @@ def curve_distance(
     raise ValueError(f"Unknown distance {distance!r}.")
 
 
-def compute_identification(
-    half_results: list[HalfCurveResult],
+def compute_query_reference_identification(
     *,
+    query_results: list[HalfCurveResult],
+    reference_results: list[HalfCurveResult],
     theta_mid: np.ndarray,
+    session_keys: list[str],
+    query_half: str,
+    candidate_half: str,
+    direction: str = DIRECTION_A_TO_B,
     eps: float = 1e-12,
+    row_extra: dict[str, Any] | None = None,
 ) -> tuple[dict[str, dict[str, dict[str, np.ndarray]]], list[dict[str, Any]], dict[str, Any]]:
-    session_keys = sorted({h.session_key for h in half_results})
     n = len(session_keys)
-    by_half = {
-        HALF_A: {h.session_key: h for h in half_results if h.half_label == HALF_A},
-        HALF_B: {h.session_key: h for h in half_results if h.half_label == HALF_B},
-    }
-    if any(set(by_half[label]) != set(session_keys) for label in (HALF_A, HALF_B)):
-        raise ValueError("Need exactly one A and one B half result per session.")
+    by_query = {h.session_key: h for h in query_results}
+    by_reference = {h.session_key: h for h in reference_results}
+    if set(by_query) != set(session_keys) or set(by_reference) != set(session_keys):
+        raise ValueError("Need exactly one query and one reference result per session.")
     distances: dict[str, dict[str, dict[str, np.ndarray]]] = {}
     pair_rows: list[dict[str, Any]] = []
     summary: dict[str, Any] = {}
@@ -644,15 +757,12 @@ def compute_identification(
         summary[method] = {}
         for dist_name in DISTANCES:
             distances[method][dist_name] = {}
-            direction = DIRECTION_A_TO_B
-            q_label = HALF_A
-            c_label = HALF_B
             mat = np.full((n, n), np.nan, dtype=np.float64)
             for qi, q_key in enumerate(session_keys):
                 for ci, c_key in enumerate(session_keys):
                     mat[qi, ci] = curve_distance(
-                        by_half[q_label][q_key].curves[method],
-                        by_half[c_label][c_key].curves[method],
+                        by_query[q_key].curves[method],
+                        by_reference[c_key].curves[method],
                         theta_mid,
                         distance=dist_name,
                         eps=float(eps),
@@ -668,23 +778,24 @@ def compute_identification(
                 best = float(mat[qi, order[0]])
                 tie_counts[qi] = int(np.sum(np.isclose(mat[qi], best, rtol=1e-12, atol=1e-12)))
                 for candidate_rank, ci in enumerate(order, start=1):
-                    pair_rows.append(
-                        {
-                            "method": method,
-                            "distance": dist_name,
-                            "direction": direction,
-                            "query_half": q_label,
-                            "candidate_half": c_label,
-                            "query_session": q_key,
-                            "candidate_session": session_keys[int(ci)],
-                            "query_session_index": int(qi),
-                            "candidate_session_index": int(ci),
-                            "distance_value": float(mat[qi, int(ci)]),
-                            "rank": int(candidate_rank),
-                            "is_match": bool(int(ci) == correct),
-                            "best_tie_count_for_query": int(tie_counts[qi]),
-                        }
-                    )
+                    row = {
+                        "method": method,
+                        "distance": dist_name,
+                        "direction": direction,
+                        "query_half": query_half,
+                        "candidate_half": candidate_half,
+                        "query_session": q_key,
+                        "candidate_session": session_keys[int(ci)],
+                        "query_session_index": int(qi),
+                        "candidate_session_index": int(ci),
+                        "distance_value": float(mat[qi, int(ci)]),
+                        "rank": int(candidate_rank),
+                        "is_match": bool(int(ci) == correct),
+                        "best_tie_count_for_query": int(tie_counts[qi]),
+                    }
+                    if row_extra:
+                        row.update(row_extra)
+                    pair_rows.append(row)
             summary[method][f"{dist_name}_{direction}"] = {
                 "top1_accuracy": float(np.mean(ranks == 1)),
                 "top2_accuracy": float(np.mean(ranks <= min(2, n))),
@@ -696,7 +807,32 @@ def compute_identification(
     return distances, pair_rows, summary
 
 
-def curve_rows_from_halves(half_results: list[HalfCurveResult]) -> list[dict[str, Any]]:
+def compute_identification(
+    half_results: list[HalfCurveResult],
+    *,
+    theta_mid: np.ndarray,
+    eps: float = 1e-12,
+) -> tuple[dict[str, dict[str, dict[str, np.ndarray]]], list[dict[str, Any]], dict[str, Any]]:
+    session_keys = sorted({h.session_key for h in half_results})
+    by_half = {
+        HALF_A: {h.session_key: h for h in half_results if h.half_label == HALF_A},
+        HALF_B: {h.session_key: h for h in half_results if h.half_label == HALF_B},
+    }
+    if any(set(by_half[label]) != set(session_keys) for label in (HALF_A, HALF_B)):
+        raise ValueError("Need exactly one A and one B half result per session.")
+    return compute_query_reference_identification(
+        query_results=list(by_half[HALF_A].values()),
+        reference_results=list(by_half[HALF_B].values()),
+        theta_mid=theta_mid,
+        session_keys=session_keys,
+        query_half=HALF_A,
+        candidate_half=HALF_B,
+        direction=DIRECTION_A_TO_B,
+        eps=float(eps),
+    )
+
+
+def curve_rows_from_halves(half_results: list[HalfCurveResult], *, row_extra: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for half in half_results:
         mids = half.theta_midpoints.reshape(-1)
@@ -704,23 +840,24 @@ def curve_rows_from_halves(half_results: list[HalfCurveResult]) -> list[dict[str
         for method in METHODS:
             curve = np.asarray(half.curves[method], dtype=np.float64).reshape(-1)
             for i, val in enumerate(curve):
-                rows.append(
-                    {
-                        "session_index": int(half.session_index),
-                        "session_key": half.session_key,
-                        "session_file": half.session_file,
-                        "half_label": half.half_label,
-                        "method": method,
-                        "theta_midpoint": float(mids[i]),
-                        "theta_left": float(grid[i]),
-                        "theta_right": float(grid[i + 1]),
-                        "fisher": float(val),
-                        "n_trials_half": int(half.n_trials),
-                        "n_neurons": int(half.n_neurons),
-                        "cache_path": str(half.cache_path),
-                        "flow_npz_path": "" if half.flow_npz_path is None else str(half.flow_npz_path),
-                    }
-                )
+                row = {
+                    "session_index": int(half.session_index),
+                    "session_key": half.session_key,
+                    "session_file": half.session_file,
+                    "half_label": half.half_label,
+                    "method": method,
+                    "theta_midpoint": float(mids[i]),
+                    "theta_left": float(grid[i]),
+                    "theta_right": float(grid[i + 1]),
+                    "fisher": float(val),
+                    "n_trials_half": int(half.n_trials),
+                    "n_neurons": int(half.n_neurons),
+                    "cache_path": str(half.cache_path),
+                    "flow_npz_path": "" if half.flow_npz_path is None else str(half.flow_npz_path),
+                }
+                if row_extra:
+                    row.update(row_extra)
+                rows.append(row)
     return rows
 
 
@@ -825,6 +962,281 @@ def run_session_identification(
     )
 
 
+def _metric_from_summary(summary: dict[str, Any], method: str, distance_name: str, metric_name: str) -> float:
+    return float(summary[method][f"{distance_name}_{DIRECTION_A_TO_B}"][metric_name])
+
+
+def run_a_subsample_convergence(
+    *,
+    sessions: list[StringerSessionInfo],
+    theta_grid: np.ndarray,
+    period: float,
+    pca_dim: int,
+    pca_random_state: int,
+    pca_whiten: bool,
+    train_frac: float,
+    seed: int,
+    device: torch.device,
+    flow_config: ContinuousFlowConfig,
+    output_dir: Path,
+    n_values: list[int],
+    repeats: int,
+    sampling: str,
+    force: bool = False,
+    save_flow_npz: bool = True,
+    classical_ridge: float = 1e-6,
+    classical_window_radius: float | None = None,
+    classical_min_endpoint_samples: int = 8,
+) -> SubsampleConvergenceResult:
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    n_list = parse_positive_int_list(n_values)
+    if int(repeats) < 1:
+        raise ValueError("repeats must be >= 1.")
+    if str(sampling) not in {"stratified", "uniform"}:
+        raise ValueError("sampling must be 'stratified' or 'uniform'.")
+    if any(int(n) < int(pca_dim) for n in n_list):
+        raise ValueError("All A subset sizes must be >= pca_dim for fresh per-subset PCA.")
+
+    n_bins = int(np.asarray(theta_grid).reshape(-1).shape[0] - 1)
+    session_keys = [Path(info.session_file).stem for info in sessions]
+    split_indices: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    full_a_results: list[HalfCurveResult] = []
+    reference_b_results: list[HalfCurveResult] = []
+
+    for session_index, info in enumerate(sessions):
+        session = load_stringer_session(info, orientation_period=float(period))
+        a_idx, b_idx = stratified_half_split(
+            session.grating_orientation,
+            n_bins=n_bins,
+            period=float(period),
+            seed=int(seed) + int(session_index),
+        )
+        session_key = session_keys[session_index]
+        theta_a = np.asarray(session.grating_orientation, dtype=np.float64).reshape(-1)[a_idx]
+        split_indices[session_key] = (a_idx, b_idx, theta_a)
+        full_a_results.append(
+            estimate_half_curves(
+                session_info=info,
+                session_index=session_index,
+                half_label=HALF_A,
+                half_indices=a_idx,
+                theta_grid=theta_grid,
+                period=float(period),
+                pca_dim=int(pca_dim),
+                pca_random_state=int(pca_random_state) + 100 * int(session_index),
+                pca_whiten=bool(pca_whiten),
+                train_frac=float(train_frac),
+                seed=int(seed) + 1000 * int(session_index),
+                device=device,
+                flow_config=flow_config,
+                output_dir=output_dir / "endpoint_full_a",
+                force=bool(force),
+                save_flow_npz=bool(save_flow_npz),
+                classical_ridge=float(classical_ridge),
+                classical_window_radius=classical_window_radius,
+                classical_min_endpoint_samples=int(classical_min_endpoint_samples),
+            )
+        )
+        reference_b_results.append(
+            estimate_half_curves(
+                session_info=info,
+                session_index=session_index,
+                half_label=HALF_B,
+                half_indices=b_idx,
+                theta_grid=theta_grid,
+                period=float(period),
+                pca_dim=int(pca_dim),
+                pca_random_state=int(pca_random_state) + 100 * int(session_index) + 1,
+                pca_whiten=bool(pca_whiten),
+                train_frac=float(train_frac),
+                seed=int(seed) + 1000 * int(session_index) + 1,
+                device=device,
+                flow_config=flow_config,
+                output_dir=output_dir / "reference_b",
+                force=bool(force),
+                save_flow_npz=bool(save_flow_npz),
+                classical_ridge=float(classical_ridge),
+                classical_window_radius=classical_window_radius,
+                classical_min_endpoint_samples=int(classical_min_endpoint_samples),
+            )
+        )
+
+    mids = theta_midpoints(theta_grid)
+    endpoint_distances, endpoint_pairs, endpoint_summary = compute_query_reference_identification(
+        query_results=full_a_results,
+        reference_results=reference_b_results,
+        theta_mid=mids,
+        session_keys=session_keys,
+        query_half=HALF_A,
+        candidate_half=HALF_B,
+        direction=DIRECTION_A_TO_B,
+        row_extra={"subset_n": "full", "repeat": -1, "sampling": "full_A"},
+    )
+    endpoint_curve_rows = curve_rows_from_halves(full_a_results + reference_b_results, row_extra={"subset_n": "full", "repeat": -1})
+    endpoint_result = IdentificationResult(
+        session_keys=session_keys,
+        theta_grid=np.asarray(theta_grid, dtype=np.float64),
+        theta_midpoints=mids,
+        half_results=full_a_results + reference_b_results,
+        distances=endpoint_distances,
+        pair_rows=endpoint_pairs,
+        curve_rows=endpoint_curve_rows,
+        summary={
+            "session_keys": session_keys,
+            "identification": endpoint_summary,
+            "identification_direction": DIRECTION_A_TO_B,
+            "query_half": HALF_A,
+            "reference_half": HALF_B,
+        },
+    )
+
+    subset_matrices: dict[str, dict[str, np.ndarray]] = {
+        method: {
+            distance_name: np.full((len(n_list), int(repeats), len(session_keys), len(session_keys)), np.nan, dtype=np.float64)
+            for distance_name in DISTANCES
+        }
+        for method in METHODS
+    }
+    pair_rows = list(endpoint_pairs)
+    curve_rows = list(endpoint_curve_rows)
+    per_run_summary: list[dict[str, Any]] = []
+
+    for ni, n_subset in enumerate(n_list):
+        for repeat in range(int(repeats)):
+            query_results: list[HalfCurveResult] = []
+            for session_index, info in enumerate(sessions):
+                session_key = session_keys[session_index]
+                a_idx, _b_idx, theta_a = split_indices[session_key]
+                local_idx = bootstrap_indices(
+                    theta_a,
+                    n_samples=int(n_subset),
+                    n_bins=n_bins,
+                    period=float(period),
+                    seed=int(seed) + 100000 * int(ni + 1) + 10000 * int(repeat + 1) + int(session_index),
+                    sampling=str(sampling),
+                )
+                subset_idx = a_idx[local_idx]
+                print(
+                    f"[stringer-identification] A subset session={session_key} n={n_subset} "
+                    f"repeat={repeat} sampling={sampling}",
+                    flush=True,
+                )
+                query_results.append(
+                    estimate_half_curves(
+                        session_info=info,
+                        session_index=session_index,
+                        half_label=HALF_A,
+                        half_indices=subset_idx,
+                        theta_grid=theta_grid,
+                        period=float(period),
+                        pca_dim=int(pca_dim),
+                        pca_random_state=int(pca_random_state)
+                        + 100000 * int(ni + 1)
+                        + 10000 * int(repeat + 1)
+                        + 100 * int(session_index),
+                        pca_whiten=bool(pca_whiten),
+                        train_frac=float(train_frac),
+                        seed=int(seed) + 200000 * int(ni + 1) + 10000 * int(repeat + 1) + int(session_index),
+                        device=device,
+                        flow_config=flow_config,
+                        output_dir=output_dir / "subset_a" / f"n_{int(n_subset):06d}" / f"repeat_{int(repeat):03d}",
+                        force=bool(force),
+                        save_flow_npz=bool(save_flow_npz),
+                        classical_ridge=float(classical_ridge),
+                        classical_window_radius=classical_window_radius,
+                        classical_min_endpoint_samples=int(classical_min_endpoint_samples),
+                    )
+                )
+            distances, rows, one_summary = compute_query_reference_identification(
+                query_results=query_results,
+                reference_results=reference_b_results,
+                theta_mid=mids,
+                session_keys=session_keys,
+                query_half=HALF_A,
+                candidate_half=HALF_B,
+                direction=DIRECTION_A_TO_B,
+                row_extra={"subset_n": int(n_subset), "repeat": int(repeat), "sampling": str(sampling)},
+            )
+            for method in METHODS:
+                for distance_name in DISTANCES:
+                    subset_matrices[method][distance_name][ni, repeat] = distances[method][distance_name][DIRECTION_A_TO_B]
+            pair_rows.extend(rows)
+            curve_rows.extend(
+                curve_rows_from_halves(
+                    query_results,
+                    row_extra={"subset_n": int(n_subset), "repeat": int(repeat), "sampling": str(sampling)},
+                )
+            )
+            per_run_summary.append({"subset_n": int(n_subset), "repeat": int(repeat), "identification": one_summary})
+
+    convergence: dict[str, dict[str, dict[str, Any]]] = {}
+    for method in METHODS:
+        convergence[method] = {}
+        for distance_name in DISTANCES:
+            top1 = np.full((len(n_list), int(repeats)), np.nan, dtype=np.float64)
+            top2 = np.full_like(top1, np.nan)
+            top3 = np.full_like(top1, np.nan)
+            mrr = np.full_like(top1, np.nan)
+            for row in per_run_summary:
+                ni = n_list.index(int(row["subset_n"]))
+                ri = int(row["repeat"])
+                summary = row["identification"]
+                top1[ni, ri] = _metric_from_summary(summary, method, distance_name, "top1_accuracy")
+                top2[ni, ri] = _metric_from_summary(summary, method, distance_name, "top2_accuracy")
+                top3[ni, ri] = _metric_from_summary(summary, method, distance_name, "top3_accuracy")
+                mrr[ni, ri] = _metric_from_summary(summary, method, distance_name, "mean_reciprocal_rank")
+            endpoint = endpoint_summary[method][f"{distance_name}_{DIRECTION_A_TO_B}"]
+            convergence[method][distance_name] = {
+                "n_values": list(map(int, n_list)),
+                "top1_by_repeat": top1.tolist(),
+                "top2_by_repeat": top2.tolist(),
+                "top3_by_repeat": top3.tolist(),
+                "mrr_by_repeat": mrr.tolist(),
+                "top1_mean": np.nanmean(top1, axis=1).tolist(),
+                "top2_mean": np.nanmean(top2, axis=1).tolist(),
+                "top3_mean": np.nanmean(top3, axis=1).tolist(),
+                "mrr_mean": np.nanmean(mrr, axis=1).tolist(),
+                "full_a": endpoint,
+            }
+
+    summary = {
+        "session_keys": session_keys,
+        "n_sessions": int(len(session_keys)),
+        "methods": list(METHODS),
+        "distances": list(DISTANCES),
+        "primary_distance": DISTANCE_PRIMARY,
+        "identification_direction": DIRECTION_A_TO_B,
+        "query_half": HALF_A,
+        "reference_half": HALF_B,
+        "experiment": "a_subsample_convergence",
+        "n_values": list(map(int, n_list)),
+        "repeats": int(repeats),
+        "sampling": str(sampling),
+        "orientation_period": float(period),
+        "theta_grid_size": int(np.asarray(theta_grid).reshape(-1).shape[0]),
+        "pca_fit_scope": "A subset or B half",
+        "pca_label_blind": True,
+        "pca_trial_averaging_before_fit": False,
+        "endpoint_identification": endpoint_summary,
+        "subsample_runs": per_run_summary,
+        "subsample_convergence": convergence,
+    }
+    return SubsampleConvergenceResult(
+        session_keys=session_keys,
+        theta_grid=np.asarray(theta_grid, dtype=np.float64),
+        theta_midpoints=mids,
+        n_values=list(map(int, n_list)),
+        repeats=int(repeats),
+        sampling=str(sampling),
+        endpoint_result=endpoint_result,
+        subset_matrices=subset_matrices,
+        pair_rows=pair_rows,
+        curve_rows=curve_rows,
+        summary=summary,
+    )
+
+
 def write_results_npz(path: Path, result: IdentificationResult) -> Path:
     fields: dict[str, Any] = {
         "session_keys": np.asarray(result.session_keys),
@@ -845,6 +1257,81 @@ def write_results_npz(path: Path, result: IdentificationResult) -> Path:
     return path
 
 
+def write_subsample_results_npz(path: Path, result: SubsampleConvergenceResult) -> Path:
+    fields: dict[str, Any] = {
+        "session_keys": np.asarray(result.session_keys),
+        "theta_grid": np.asarray(result.theta_grid, dtype=np.float64),
+        "theta_midpoints": np.asarray(result.theta_midpoints, dtype=np.float64),
+        "n_values": np.asarray(result.n_values, dtype=np.int64),
+        "repeats": np.asarray([int(result.repeats)], dtype=np.int64),
+        "sampling": np.asarray([str(result.sampling)]),
+    }
+    for method in METHODS:
+        for dist_name in DISTANCES:
+            fields[f"endpoint_{method}_{dist_name}_{DIRECTION_A_TO_B}"] = np.asarray(
+                result.endpoint_result.distances[method][dist_name][DIRECTION_A_TO_B],
+                dtype=np.float64,
+            )
+            fields[f"subset_{method}_{dist_name}_{DIRECTION_A_TO_B}"] = np.asarray(
+                result.subset_matrices[method][dist_name],
+                dtype=np.float64,
+            )
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(path, **fields)
+    return path
+
+
+def load_subsample_results_npz(path: Path, summary: dict[str, Any]) -> SubsampleConvergenceResult:
+    data = np.load(Path(path), allow_pickle=False)
+    session_keys = [str(v) for v in np.asarray(data["session_keys"]).reshape(-1)]
+    theta_grid = np.asarray(data["theta_grid"], dtype=np.float64)
+    mids = np.asarray(data["theta_midpoints"], dtype=np.float64)
+    n_values = [int(v) for v in np.asarray(data["n_values"], dtype=np.int64).reshape(-1)]
+    repeats = int(np.asarray(data["repeats"], dtype=np.int64).reshape(-1)[0])
+    sampling = str(np.asarray(data["sampling"]).reshape(-1)[0])
+    endpoint_distances: dict[str, dict[str, dict[str, np.ndarray]]] = {method: {} for method in METHODS}
+    subset_matrices: dict[str, dict[str, np.ndarray]] = {method: {} for method in METHODS}
+    for method in METHODS:
+        for dist_name in DISTANCES:
+            endpoint_distances[method][dist_name] = {
+                DIRECTION_A_TO_B: np.asarray(data[f"endpoint_{method}_{dist_name}_{DIRECTION_A_TO_B}"], dtype=np.float64)
+            }
+            subset_matrices[method][dist_name] = np.asarray(
+                data[f"subset_{method}_{dist_name}_{DIRECTION_A_TO_B}"],
+                dtype=np.float64,
+            )
+    endpoint_result = IdentificationResult(
+        session_keys=session_keys,
+        theta_grid=theta_grid,
+        theta_midpoints=mids,
+        half_results=[],
+        distances=endpoint_distances,
+        pair_rows=[],
+        curve_rows=[],
+        summary={
+            "identification": summary.get("endpoint_identification", {}),
+            "session_keys": session_keys,
+            "identification_direction": DIRECTION_A_TO_B,
+            "query_half": HALF_A,
+            "reference_half": HALF_B,
+        },
+    )
+    return SubsampleConvergenceResult(
+        session_keys=session_keys,
+        theta_grid=theta_grid,
+        theta_midpoints=mids,
+        n_values=n_values,
+        repeats=repeats,
+        sampling=sampling,
+        endpoint_result=endpoint_result,
+        subset_matrices=subset_matrices,
+        pair_rows=[],
+        curve_rows=[],
+        summary=summary,
+    )
+
+
 def write_csv(path: Path, rows: Iterable[dict[str, Any]], columns: tuple[str, ...]) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -861,6 +1348,31 @@ def write_curves_csv(path: Path, rows: Iterable[dict[str, Any]]) -> Path:
         path,
         rows,
         (
+            "session_index",
+            "session_key",
+            "session_file",
+            "half_label",
+            "method",
+            "theta_midpoint",
+            "theta_left",
+            "theta_right",
+            "fisher",
+            "n_trials_half",
+            "n_neurons",
+            "cache_path",
+            "flow_npz_path",
+        ),
+    )
+
+
+def write_subsample_curves_csv(path: Path, rows: Iterable[dict[str, Any]]) -> Path:
+    return write_csv(
+        path,
+        rows,
+        (
+            "subset_n",
+            "repeat",
+            "sampling",
             "session_index",
             "session_key",
             "session_file",
@@ -900,7 +1412,47 @@ def write_pairs_csv(path: Path, rows: Iterable[dict[str, Any]]) -> Path:
     )
 
 
+def write_subsample_pairs_csv(path: Path, rows: Iterable[dict[str, Any]]) -> Path:
+    return write_csv(
+        path,
+        rows,
+        (
+            "subset_n",
+            "repeat",
+            "sampling",
+            "method",
+            "distance",
+            "direction",
+            "query_half",
+            "candidate_half",
+            "query_session",
+            "candidate_session",
+            "query_session_index",
+            "candidate_session_index",
+            "distance_value",
+            "rank",
+            "is_match",
+            "best_tie_count_for_query",
+        ),
+    )
+
+
 def write_summary_json(path: Path, result: IdentificationResult, *, extra: dict[str, Any] | None = None) -> Path:
+    summary = dict(result.summary)
+    if extra:
+        summary.update(json_ready(extra))
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(json_ready(summary), indent=2, sort_keys=True) + "\n")
+    return path
+
+
+def write_subsample_summary_json(
+    path: Path,
+    result: SubsampleConvergenceResult,
+    *,
+    extra: dict[str, Any] | None = None,
+) -> Path:
     summary = dict(result.summary)
     if extra:
         summary.update(json_ready(extra))
@@ -1018,6 +1570,101 @@ def plot_all_distance_summary(path_svg: Path, path_png: Path, result: Identifica
             row += 1
 
     fig.suptitle("Stringer session identification across Fisher-curve distances (A queries, B reference)", fontsize=16)
+    path_svg = Path(path_svg)
+    path_png = Path(path_png)
+    path_svg.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path_svg)
+    fig.savefig(path_png, dpi=180)
+    plt.close(fig)
+    return path_svg, path_png
+
+
+def plot_subsample_convergence_summary(
+    path_svg: Path,
+    path_png: Path,
+    result: SubsampleConvergenceResult,
+) -> tuple[Path, Path]:
+    labels = [str(i) for i in range(len(result.session_keys))]
+    n_rows = len(METHODS) * len(DISTANCES)
+    fig_height = max(12.0, 2.8 * n_rows)
+    fig, axes = plt.subplots(
+        n_rows,
+        4,
+        figsize=(18.0, fig_height),
+        layout="constrained",
+        gridspec_kw={"width_ratios": [1.0, 0.85, 0.8, 1.25]},
+    )
+    axes_arr = np.asarray(axes).reshape(n_rows, 4)
+    session_x = np.arange(len(result.session_keys), dtype=np.float64)
+    metric_names = ("top1_accuracy", "top2_accuracy", "top3_accuracy", "mean_reciprocal_rank")
+    metric_labels = ("top1", "top2", "top3", "MRR")
+    topk_keys = ("top1", "top2", "top3")
+    topk_labels = ("top1", "top2", "top3")
+    topk_colors = ("tab:blue", "tab:orange", "tab:green")
+    x_labels = [str(n) for n in result.n_values] + ["full A"]
+    x = np.arange(len(x_labels), dtype=np.float64)
+
+    row = 0
+    for method in METHODS:
+        for distance_name in DISTANCES:
+            row_axes = axes_arr[row]
+            endpoint_mat = result.endpoint_result.distances[method][distance_name][DIRECTION_A_TO_B]
+            endpoint_summary = result.summary["endpoint_identification"][method][f"{distance_name}_{DIRECTION_A_TO_B}"]
+
+            heat_ax = row_axes[0]
+            im = heat_ax.imshow(endpoint_mat, cmap="viridis")
+            heat_ax.set_title(f"{method}\n{distance_name} full A -> B", fontsize=10)
+            heat_ax.set_xlabel("candidate B")
+            heat_ax.set_ylabel("query A")
+            heat_ax.set_xticks(np.arange(len(labels)), labels=labels, rotation=45, ha="right")
+            heat_ax.set_yticks(np.arange(len(labels)), labels=labels)
+            fig.colorbar(im, ax=heat_ax, fraction=0.046, pad=0.04)
+
+            rank_ax = row_axes[1]
+            ranks = np.asarray(endpoint_summary["ranks"], dtype=np.float64)
+            rank_ax.bar(session_x, ranks, width=0.65)
+            rank_ax.axhline(1.0, color="black", linewidth=0.9, linestyle="--")
+            rank_ax.set_title("full-A rank", fontsize=10)
+            rank_ax.set_xlabel("session")
+            rank_ax.set_ylabel("rank")
+            rank_ax.set_xticks(session_x, labels)
+            rank_ax.set_ylim(0.5, len(result.session_keys) + 0.5)
+            rank_ax.grid(True, axis="y", alpha=0.25)
+
+            bar_ax = row_axes[2]
+            vals = [float(endpoint_summary[name]) for name in metric_names]
+            mx = np.arange(len(metric_names), dtype=np.float64)
+            bar_ax.bar(mx, vals, width=0.65)
+            bar_ax.set_title("full-A scores", fontsize=10)
+            bar_ax.set_ylim(0.0, 1.05)
+            bar_ax.set_xticks(mx, metric_labels, rotation=25, ha="right")
+            bar_ax.grid(True, axis="y", alpha=0.25)
+
+            conv_ax = row_axes[3]
+            conv = result.summary["subsample_convergence"][method][distance_name]
+            for key, label, color in zip(topk_keys, topk_labels, topk_colors):
+                mean_vals = np.asarray(conv[f"{key}_mean"], dtype=np.float64)
+                full_val = float(conv["full_a"][f"{key}_accuracy"])
+                y = np.concatenate([mean_vals, np.asarray([full_val], dtype=np.float64)])
+                conv_ax.plot(x, y, marker="o", linewidth=1.6, color=color, label=label)
+                by_repeat = np.asarray(conv[f"{key}_by_repeat"], dtype=np.float64)
+                if by_repeat.ndim == 2 and by_repeat.shape[1] > 1:
+                    for ri in range(by_repeat.shape[1]):
+                        yr = np.concatenate([by_repeat[:, ri], np.asarray([full_val], dtype=np.float64)])
+                        conv_ax.plot(x, yr, color=color, alpha=0.18, linewidth=0.8)
+            conv_ax.set_title("top-k vs A subset size", fontsize=10)
+            conv_ax.set_xlabel("A subset size")
+            conv_ax.set_ylabel("accuracy")
+            conv_ax.set_ylim(0.0, 1.05)
+            conv_ax.set_xticks(x, x_labels, rotation=30, ha="right")
+            conv_ax.grid(True, axis="y", alpha=0.25)
+            conv_ax.legend(fontsize=8, loc="lower right")
+            row += 1
+
+    fig.suptitle(
+        "Stringer A-subset session identification convergence (A queries, fixed B reference)",
+        fontsize=16,
+    )
     path_svg = Path(path_svg)
     path_png = Path(path_png)
     path_svg.parent.mkdir(parents=True, exist_ok=True)
