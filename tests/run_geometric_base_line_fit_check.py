@@ -46,6 +46,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-test-plot-per-theta", type=int, default=500)
 
     p.add_argument("--path-schedule", choices=("linear", "straight", "cosine"), default="cosine")
+    p.add_argument("--source-pairing", choices=("random", "ot"), default="random")
+    p.add_argument("--ot-method", choices=("exact", "sinkhorn", "unbalanced", "partial"), default="sinkhorn")
+    p.add_argument("--ot-reg", type=float, default=0.05)
+    p.add_argument("--ot-reg-m", type=float, default=1.0)
+    p.add_argument("--ot-normalize-cost", action="store_true")
+    p.add_argument("--ot-num-threads", type=str, default="1")
     p.add_argument("--smooth-sigma", type=float, default=0.12)
     p.add_argument("--mc-skl-samples", type=int, default=1024)
     p.add_argument("--density-mc-samples", type=int, default=512)
@@ -354,6 +360,12 @@ def main(argv: list[str] | None = None) -> int:
         x_val=x_val,
         device=dev,
         path_schedule=str(args.path_schedule),
+        source_pairing=str(args.source_pairing),
+        ot_method=str(args.ot_method),
+        ot_reg=float(args.ot_reg),
+        ot_reg_m=float(args.ot_reg_m),
+        ot_normalize_cost=bool(args.ot_normalize_cost),
+        ot_num_threads=str(args.ot_num_threads),
         epochs=int(args.epochs),
         batch_size=int(args.batch_size),
         lr=float(args.lr),
@@ -416,6 +428,12 @@ def main(argv: list[str] | None = None) -> int:
         "hidden_dim": int(args.hidden_dim),
         "depth": int(args.depth),
         "path_schedule": str(args.path_schedule),
+        "source_pairing": str(args.source_pairing),
+        "ot_method": str(args.ot_method),
+        "ot_reg": float(args.ot_reg),
+        "ot_reg_m": float(args.ot_reg_m),
+        "ot_normalize_cost": bool(args.ot_normalize_cost),
+        "ot_num_threads": str(args.ot_num_threads),
         "t_eps": float(args.t_eps),
         "early_patience": int(args.early_patience),
         "early_min_delta": float(args.early_min_delta),

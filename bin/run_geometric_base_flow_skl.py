@@ -48,6 +48,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--train-frac", type=float, default=0.7)
 
     p.add_argument("--path-schedule", choices=("linear", "straight", "cosine"), default="cosine")
+    p.add_argument("--source-pairing", choices=("random", "ot"), default="random")
+    p.add_argument("--ot-method", choices=("exact", "sinkhorn", "unbalanced", "partial"), default="sinkhorn")
+    p.add_argument("--ot-reg", type=float, default=0.05)
+    p.add_argument("--ot-reg-m", type=float, default=1.0)
+    p.add_argument("--ot-normalize-cost", action="store_true")
+    p.add_argument("--ot-num-threads", type=str, default="1")
     p.add_argument("--fisher-kind", choices=("none", "full", "linear", "both"), default="none")
     p.add_argument("--smooth-sigma", type=float, default=0.12)
     p.add_argument("--mc-skl-samples", type=int, default=4096)
@@ -227,6 +233,12 @@ def main(argv: list[str] | None = None) -> int:
         x_val=x_val,
         device=dev,
         path_schedule=str(args.path_schedule),
+        source_pairing=str(args.source_pairing),
+        ot_method=str(args.ot_method),
+        ot_reg=float(args.ot_reg),
+        ot_reg_m=float(args.ot_reg_m),
+        ot_normalize_cost=bool(args.ot_normalize_cost),
+        ot_num_threads=str(args.ot_num_threads),
         epochs=int(args.epochs),
         batch_size=int(args.batch_size),
         lr=float(args.lr),
@@ -281,6 +293,12 @@ def main(argv: list[str] | None = None) -> int:
         "dataset": dataset_label,
         "device": str(dev),
         "path_schedule": str(args.path_schedule),
+        "source_pairing": str(args.source_pairing),
+        "ot_method": str(args.ot_method),
+        "ot_reg": float(args.ot_reg),
+        "ot_reg_m": float(args.ot_reg_m),
+        "ot_normalize_cost": bool(args.ot_normalize_cost),
+        "ot_num_threads": str(args.ot_num_threads),
         "ode_method": str(args.ode_method),
         "theta_eval_shape": list(theta_eval.shape),
         "theta_train_shape": list(theta_train.shape),

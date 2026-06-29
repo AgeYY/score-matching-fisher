@@ -45,6 +45,15 @@ def _load_line_fit_check_module():
     return mod
 
 
+def _load_ot_compare_module():
+    path = _REPO_ROOT / "tests" / "run_geometric_base_line_fit_ot_compare.py"
+    spec = importlib.util.spec_from_file_location("run_geometric_base_line_fit_ot_compare", path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 class IdentitySolver:
     def __init__(self, model: nn.Module) -> None:
         self.model = model
@@ -138,6 +147,58 @@ def test_training_loop_draws_source_from_base(monkeypatch: pytest.MonkeyPatch) -
         torch.testing.assert_close(x0[:, 1], torch.full((int(x0.shape[0]),), 123.0))
 
 
+def test_exact_ot_plan_sampler_matches_assignment_plan() -> None:
+    x0 = torch.tensor([[0.0, 0.0], [10.0, 0.0]], dtype=torch.float32)
+    x1 = torch.tensor([[9.0, 0.0], [1.0, 0.0]], dtype=torch.float32)
+
+    sampler = gb.MinibatchOTPlanSampler(method="exact")
+    pi, plan_cost = sampler.get_map(x0, x1)
+
+    np.testing.assert_allclose(pi, np.asarray([[0.0, 0.5], [0.5, 0.0]]), atol=1e-12)
+    assert plan_cost == pytest.approx(1.0)
+
+
+def test_ot_pair_source_to_target_batch_samples_plan_indices() -> None:
+    np.random.seed(0)
+    x0 = torch.tensor([[0.0, 0.0], [10.0, 0.0]], dtype=torch.float32)
+    x1 = torch.tensor([[9.0, 0.0], [1.0, 0.0]], dtype=torch.float32)
+
+    x0_ot, x1_ot, target_idx, plan_cost = gb._ot_pair_source_to_target_batch(x0, x1, ot_method="exact")
+
+    assert x0_ot.shape == x0.shape
+    assert x1_ot.shape == x1.shape
+    assert target_idx.shape == (2,)
+    for source, target in zip(x0_ot, x1_ot):
+        assert torch.sum((source - target) ** 2).item() == pytest.approx(1.0)
+    assert plan_cost == pytest.approx(1.0)
+
+
+def test_training_loop_records_ot_source_pairing() -> None:
+    base = LineSegmentBase(anchor=(0.0, 0.0), direction=(1.0, 0.0))
+    model = ConditionTimeAffineVelocity(theta_dim=1, x_dim=2, hidden_dim=4, depth=1)
+    theta = np.asarray([[0.0], [0.0], [1.0], [1.0]], dtype=np.float64)
+    x = np.asarray([[0.0, 0.0], [0.1, 0.0], [1.0, 0.2], [1.1, 0.3]], dtype=np.float64)
+
+    meta = train_geometric_base_affine_flow(
+        model=model,
+        base=base,
+        theta_train=theta,
+        x_train=x,
+        theta_val=theta,
+        x_val=x,
+        device=torch.device("cpu"),
+        epochs=1,
+        batch_size=2,
+        source_pairing="ot",
+        log_every=999,
+    )
+
+    assert meta["source_pairing"] == "ot"
+    assert meta["ot_method"] == "sinkhorn"
+    assert np.asarray(meta["train_pairing_costs"]).shape == (1,)
+    assert np.asarray(meta["val_pairing_costs"]).shape == (1,)
+
+
 def test_push_base_curve_zero_ode_leaves_points_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(gb, "_make_flow_ode_solver", lambda model: IdentitySolver(model))
     model = ConditionTimeAffineVelocity(theta_dim=1, x_dim=2, hidden_dim=4, depth=1)
@@ -210,6 +271,9 @@ def test_geometric_base_flow_skl_cli_defaults() -> None:
 
     assert args.toy is None
     assert args.path_schedule == "cosine"
+    assert args.source_pairing == "random"
+    assert args.ot_method == "sinkhorn"
+    assert args.ot_reg == pytest.approx(0.05)
     assert args.smooth_sigma == pytest.approx(0.12)
     assert args.mc_skl_samples == 4096
     assert args.density_mc_samples == 1024
@@ -222,6 +286,9 @@ def test_geometric_base_line_fit_check_defaults() -> None:
 
     assert args.theta_values == "0.7853981633974483,2.356194490192345"
     assert args.path_schedule == "cosine"
+    assert args.source_pairing == "random"
+    assert args.ot_method == "sinkhorn"
+    assert args.ot_reg == pytest.approx(0.05)
     assert args.epochs == 50000
     assert args.early_patience == 1000
     assert args.n_per_theta == 3000
@@ -261,3 +328,25 @@ def test_geometric_base_training_exposes_no_matched_source_path() -> None:
     assert data["theta_test_plot"].shape[1] == 2
     assert data["theta_test_plot_scalar"].shape[1] == 1
     assert data["theta_train"].shape[0] + data["theta_val"].shape[0] + data["theta_test"].shape[0] == 12
+
+
+def test_geometric_base_line_fit_ot_compare_defaults() -> None:
+    mod = _load_ot_compare_module()
+    args = mod.build_parser().parse_args([])
+    paths = mod.resolve_output_paths(args.output_dir)
+
+    assert args.path_schedule == "cosine"
+    assert args.run_method == "both"
+    assert args.ot_method == "sinkhorn"
+    assert args.ot_reg == pytest.approx(0.05)
+    assert args.epochs == 50000
+    assert args.early_patience == 1000
+    assert args.n_per_theta == 3000
+    assert args.max_test_plot_per_theta == 500
+    assert paths["png"].name == "geometric_base_line_fit_ot_compare.png"
+    assert paths["svg"].name == "geometric_base_line_fit_ot_compare.svg"
+    assert paths["summary"].name == "geometric_base_line_fit_ot_compare_summary.json"
+
+    assert mod._selected_methods("regular") == [("Regular CFM", "random")]
+    assert mod._selected_methods("ot") == [("OT-CFM", "ot")]
+    assert mod._selected_methods("both") == [("Regular CFM", "random"), ("OT-CFM", "ot")]

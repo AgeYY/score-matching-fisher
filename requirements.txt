@@ -13,6 +13,7 @@
 
 numpy
 scipy
+POT
 matplotlib
 scikit-learn
 pillow
