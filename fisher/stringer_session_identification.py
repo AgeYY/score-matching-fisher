@@ -44,6 +44,10 @@ SUBSAMPLE_PAIRS_CSV_NAME = "stringer_session_identification_a_subsample_converge
 SUBSAMPLE_SUMMARY_JSON_NAME = "stringer_session_identification_a_subsample_convergence_summary.json"
 SUBSAMPLE_SUMMARY_SVG_NAME = "stringer_session_identification_a_subsample_convergence_summary.svg"
 SUBSAMPLE_SUMMARY_PNG_NAME = "stringer_session_identification_a_subsample_convergence_summary.png"
+SUBSAMPLE_TOPK_ACCURACY_SVG_NAME = "stringer_session_identification_a_subsample_topk_accuracy.svg"
+SUBSAMPLE_TOPK_ACCURACY_PNG_NAME = "stringer_session_identification_a_subsample_topk_accuracy.png"
+SUBSAMPLE_LOGCORR_EXAMPLE_SVG_NAME = "stringer_session_identification_a_subsample_logcorr_example.svg"
+SUBSAMPLE_LOGCORR_EXAMPLE_PNG_NAME = "stringer_session_identification_a_subsample_logcorr_example.png"
 
 METHODS = (METHOD_CLASSICAL_LINEAR, METHOD_FLOW_LINEAR)
 DISTANCE_PRIMARY = "log_correlation"
@@ -53,6 +57,14 @@ DISTANCES = (DISTANCE_PRIMARY, DISTANCE_AREA_L2, DISTANCE_RMSE)
 HALF_A = "A"
 HALF_B = "B"
 DIRECTION_A_TO_B = "A_to_B"
+ASUBSAMPLE_TASK_ENDPOINT_FULL_A = "endpoint_full_a"
+ASUBSAMPLE_TASK_REFERENCE_B = "reference_b"
+ASUBSAMPLE_TASK_SUBSET_A = "subset_a"
+ASUBSAMPLE_TASK_KINDS = (
+    ASUBSAMPLE_TASK_ENDPOINT_FULL_A,
+    ASUBSAMPLE_TASK_REFERENCE_B,
+    ASUBSAMPLE_TASK_SUBSET_A,
+)
 
 
 @dataclass(frozen=True)
@@ -114,6 +126,62 @@ class SubsampleConvergenceResult:
     pair_rows: list[dict[str, Any]]
     curve_rows: list[dict[str, Any]]
     summary: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ASubsampleCurveTask:
+    kind: str
+    session_index: int
+    session_key: str
+    subset_n: int | None = None
+    repeat: int | None = None
+    n_index: int | None = None
+
+    @property
+    def label(self) -> str:
+        if self.kind == ASUBSAMPLE_TASK_ENDPOINT_FULL_A:
+            return f"endpoint_full_a_session{int(self.session_index):03d}"
+        if self.kind == ASUBSAMPLE_TASK_REFERENCE_B:
+            return f"reference_b_session{int(self.session_index):03d}"
+        if self.kind == ASUBSAMPLE_TASK_SUBSET_A:
+            if self.subset_n is None or self.repeat is None:
+                raise ValueError("subset_a tasks require subset_n and repeat.")
+            return f"subset_a_n{int(self.subset_n):06d}_repeat{int(self.repeat):03d}_session{int(self.session_index):03d}"
+        raise ValueError(f"Unknown A-subsample task kind {self.kind!r}.")
+
+    def to_json_dict(self) -> dict[str, Any]:
+        return {
+            "kind": str(self.kind),
+            "session_index": int(self.session_index),
+            "session_key": str(self.session_key),
+            "subset_n": None if self.subset_n is None else int(self.subset_n),
+            "repeat": None if self.repeat is None else int(self.repeat),
+            "n_index": None if self.n_index is None else int(self.n_index),
+        }
+
+    @classmethod
+    def from_json_dict(cls, payload: dict[str, Any]) -> "ASubsampleCurveTask":
+        return cls(
+            kind=str(payload["kind"]),
+            session_index=int(payload["session_index"]),
+            session_key=str(payload["session_key"]),
+            subset_n=None if payload.get("subset_n") is None else int(payload["subset_n"]),
+            repeat=None if payload.get("repeat") is None else int(payload["repeat"]),
+            n_index=None if payload.get("n_index") is None else int(payload["n_index"]),
+        )
+
+
+@dataclass(frozen=True)
+class ResolvedASubsampleCurveTask:
+    task: ASubsampleCurveTask
+    session_info: StringerSessionInfo
+    half_label: str
+    half_indices: np.ndarray
+    output_dir: Path
+    pca_random_state: int
+    seed: int
+    cache_path: Path
+    signature: str
 
 
 def parse_optional_int(value: str | int | None) -> int | None:
@@ -287,6 +355,7 @@ def stratified_bootstrap_indices(
     n_bins: int,
     period: float,
     seed: int,
+    replace: bool = True,
 ) -> np.ndarray:
     theta = np.asarray(theta_all, dtype=np.float64).reshape(-1)
     n = int(n_samples)
@@ -312,7 +381,12 @@ def stratified_bootstrap_indices(
         candidates = np.flatnonzero(bin_id == int(b))
         if candidates.size == 0:
             continue
-        pieces.append(rng.choice(candidates, size=int(take), replace=True).astype(np.int64))
+        if not bool(replace) and int(take) > int(candidates.size):
+            raise ValueError(
+                f"Cannot sample {int(take)} observations without replacement from orientation bin {int(b)} "
+                f"with only {int(candidates.size)} candidate(s)."
+            )
+        pieces.append(rng.choice(candidates, size=int(take), replace=bool(replace)).astype(np.int64))
     if not pieces:
         raise RuntimeError("Internal error: stratified bootstrap selected no samples.")
     out = np.concatenate(pieces).astype(np.int64)
@@ -330,7 +404,13 @@ def bootstrap_indices(
     period: float,
     seed: int,
     sampling: str,
+    replace: bool = True,
 ) -> np.ndarray:
+    theta = np.asarray(theta_all).reshape(-1)
+    if not bool(replace) and int(n_samples) > int(theta.shape[0]):
+        raise ValueError(
+            f"Cannot sample {int(n_samples)} observations without replacement from {int(theta.shape[0])} candidate(s)."
+        )
     if str(sampling) == "stratified":
         return stratified_bootstrap_indices(
             theta_all,
@@ -338,13 +418,15 @@ def bootstrap_indices(
             n_bins=int(n_bins),
             period=float(period),
             seed=int(seed),
+            replace=bool(replace),
         )
     if str(sampling) == "uniform":
-        theta = np.asarray(theta_all).reshape(-1)
         if theta.shape[0] < 1:
             raise ValueError("theta_all must contain at least one observation.")
         rng = np.random.default_rng(int(seed))
-        return rng.integers(0, int(theta.shape[0]), size=int(n_samples), endpoint=False, dtype=np.int64)
+        if bool(replace):
+            return rng.integers(0, int(theta.shape[0]), size=int(n_samples), endpoint=False, dtype=np.int64)
+        return rng.choice(int(theta.shape[0]), size=int(n_samples), replace=False).astype(np.int64)
     raise ValueError(f"Unknown sampling mode {sampling!r}.")
 
 
@@ -528,6 +610,50 @@ def config_signature(config: dict[str, Any]) -> str:
     return json.dumps(json_ready(config), sort_keys=True, separators=(",", ":"))
 
 
+def half_curve_cache_path(*, output_dir: Path, session_info: StringerSessionInfo, half_label: str) -> Path:
+    session_key = Path(session_info.session_file).stem
+    return Path(output_dir) / "half_curves" / f"{session_key}_{half_label}_curves.npz"
+
+
+def half_curve_signature(
+    *,
+    session_info: StringerSessionInfo,
+    session_index: int,
+    half_label: str,
+    half_indices: np.ndarray,
+    theta_grid: np.ndarray,
+    period: float,
+    pca_dim: int,
+    pca_random_state: int,
+    pca_whiten: bool,
+    train_frac: float,
+    seed: int,
+    flow_config: ContinuousFlowConfig,
+    classical_ridge: float,
+    classical_window_radius: float | None,
+    classical_min_endpoint_samples: int,
+) -> str:
+    return config_signature(
+        {
+            "session_file": str(session_info.session_file),
+            "session_index": int(session_index),
+            "half_label": str(half_label),
+            "half_indices": np.asarray(half_indices, dtype=np.int64).tolist(),
+            "theta_grid": np.asarray(theta_grid, dtype=np.float64).reshape(-1).tolist(),
+            "period": float(period),
+            "pca_dim": int(pca_dim),
+            "pca_random_state": int(pca_random_state),
+            "pca_whiten": bool(pca_whiten),
+            "train_frac": float(train_frac),
+            "seed": int(seed),
+            "flow_config": json_ready(vars(flow_config)),
+            "classical_ridge": float(classical_ridge),
+            "classical_window_radius": classical_window_radius,
+            "classical_min_endpoint_samples": int(classical_min_endpoint_samples),
+        }
+    )
+
+
 def save_half_cache(path: Path, *, result: HalfCurveResult, signature: str) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -604,25 +730,23 @@ def estimate_half_curves(
     classical_min_endpoint_samples: int,
 ) -> HalfCurveResult:
     session_key = Path(session_info.session_file).stem
-    cache_path = Path(output_dir) / "half_curves" / f"{session_key}_{half_label}_curves.npz"
-    signature = config_signature(
-        {
-            "session_file": str(session_info.session_file),
-            "session_index": int(session_index),
-            "half_label": str(half_label),
-            "half_indices": np.asarray(half_indices, dtype=np.int64).tolist(),
-            "theta_grid": np.asarray(theta_grid, dtype=np.float64).reshape(-1).tolist(),
-            "period": float(period),
-            "pca_dim": int(pca_dim),
-            "pca_random_state": int(pca_random_state),
-            "pca_whiten": bool(pca_whiten),
-            "train_frac": float(train_frac),
-            "seed": int(seed),
-            "flow_config": json_ready(vars(flow_config)),
-            "classical_ridge": float(classical_ridge),
-            "classical_window_radius": classical_window_radius,
-            "classical_min_endpoint_samples": int(classical_min_endpoint_samples),
-        }
+    cache_path = half_curve_cache_path(output_dir=output_dir, session_info=session_info, half_label=half_label)
+    signature = half_curve_signature(
+        session_info=session_info,
+        session_index=int(session_index),
+        half_label=str(half_label),
+        half_indices=half_indices,
+        theta_grid=theta_grid,
+        period=float(period),
+        pca_dim=int(pca_dim),
+        pca_random_state=int(pca_random_state),
+        pca_whiten=bool(pca_whiten),
+        train_frac=float(train_frac),
+        seed=int(seed),
+        flow_config=flow_config,
+        classical_ridge=float(classical_ridge),
+        classical_window_radius=classical_window_radius,
+        classical_min_endpoint_samples=int(classical_min_endpoint_samples),
     )
     cached = None if force else load_half_cache(cache_path, signature=signature)
     if cached is not None:
@@ -966,6 +1090,229 @@ def _metric_from_summary(summary: dict[str, Any], method: str, distance_name: st
     return float(summary[method][f"{distance_name}_{DIRECTION_A_TO_B}"][metric_name])
 
 
+def plan_a_subsample_curve_tasks(
+    *,
+    sessions: list[StringerSessionInfo],
+    n_values: list[int],
+    repeats: int,
+) -> list[ASubsampleCurveTask]:
+    n_list = parse_positive_int_list(n_values)
+    if int(repeats) < 1:
+        raise ValueError("repeats must be >= 1.")
+    session_keys = [Path(info.session_file).stem for info in sessions]
+    tasks: list[ASubsampleCurveTask] = []
+    for session_index, session_key in enumerate(session_keys):
+        tasks.append(
+            ASubsampleCurveTask(
+                kind=ASUBSAMPLE_TASK_ENDPOINT_FULL_A,
+                session_index=int(session_index),
+                session_key=str(session_key),
+            )
+        )
+    for session_index, session_key in enumerate(session_keys):
+        tasks.append(
+            ASubsampleCurveTask(
+                kind=ASUBSAMPLE_TASK_REFERENCE_B,
+                session_index=int(session_index),
+                session_key=str(session_key),
+            )
+        )
+    for n_index, n_subset in enumerate(n_list):
+        for repeat in range(int(repeats)):
+            for session_index, session_key in enumerate(session_keys):
+                tasks.append(
+                    ASubsampleCurveTask(
+                        kind=ASUBSAMPLE_TASK_SUBSET_A,
+                        session_index=int(session_index),
+                        session_key=str(session_key),
+                        subset_n=int(n_subset),
+                        repeat=int(repeat),
+                        n_index=int(n_index),
+                    )
+                )
+    return tasks
+
+
+def resolve_a_subsample_curve_task(
+    task: ASubsampleCurveTask,
+    *,
+    sessions: list[StringerSessionInfo],
+    theta_grid: np.ndarray,
+    period: float,
+    pca_dim: int,
+    pca_random_state: int,
+    pca_whiten: bool,
+    train_frac: float,
+    seed: int,
+    flow_config: ContinuousFlowConfig,
+    output_dir: Path,
+    n_values: list[int],
+    sampling: str,
+    replace: bool = True,
+    classical_ridge: float = 1e-6,
+    classical_window_radius: float | None = None,
+    classical_min_endpoint_samples: int = 8,
+) -> ResolvedASubsampleCurveTask:
+    if str(task.kind) not in ASUBSAMPLE_TASK_KINDS:
+        raise ValueError(f"Unknown A-subsample task kind {task.kind!r}.")
+    n_list = parse_positive_int_list(n_values)
+    if str(sampling) not in {"stratified", "uniform"}:
+        raise ValueError("sampling must be 'stratified' or 'uniform'.")
+    session_index = int(task.session_index)
+    if session_index < 0 or session_index >= len(sessions):
+        raise ValueError(f"session_index out of range: {session_index}")
+    info = sessions[session_index]
+    session_key = Path(info.session_file).stem
+    if str(task.session_key) != session_key:
+        raise ValueError(f"Task session_key {task.session_key!r} does not match session {session_key!r}.")
+
+    n_bins = int(np.asarray(theta_grid).reshape(-1).shape[0] - 1)
+    session = load_stringer_session(info, orientation_period=float(period))
+    a_idx, b_idx = stratified_half_split(
+        session.grating_orientation,
+        n_bins=n_bins,
+        period=float(period),
+        seed=int(seed) + session_index,
+    )
+    base_output_dir = Path(output_dir)
+    if task.kind == ASUBSAMPLE_TASK_ENDPOINT_FULL_A:
+        half_label = HALF_A
+        half_indices = a_idx
+        task_output_dir = base_output_dir / "endpoint_full_a"
+        task_pca_random_state = int(pca_random_state) + 100 * session_index
+        task_seed = int(seed) + 1000 * session_index
+    elif task.kind == ASUBSAMPLE_TASK_REFERENCE_B:
+        half_label = HALF_B
+        half_indices = b_idx
+        task_output_dir = base_output_dir / "reference_b"
+        task_pca_random_state = int(pca_random_state) + 100 * session_index + 1
+        task_seed = int(seed) + 1000 * session_index + 1
+    else:
+        if task.subset_n is None or task.repeat is None:
+            raise ValueError("subset_a tasks require subset_n and repeat.")
+        if int(task.subset_n) not in n_list:
+            raise ValueError(f"subset_n {task.subset_n} is not in n_values.")
+        n_index = int(task.n_index) if task.n_index is not None else int(n_list.index(int(task.subset_n)))
+        if n_list[n_index] != int(task.subset_n):
+            raise ValueError("subset_a task n_index does not match subset_n.")
+        theta_a = np.asarray(session.grating_orientation, dtype=np.float64).reshape(-1)[a_idx]
+        local_idx = bootstrap_indices(
+            theta_a,
+            n_samples=int(task.subset_n),
+            n_bins=n_bins,
+            period=float(period),
+            seed=int(seed) + 100000 * int(n_index + 1) + 10000 * int(task.repeat + 1) + session_index,
+            sampling=str(sampling),
+            replace=bool(replace),
+        )
+        half_label = HALF_A
+        half_indices = a_idx[local_idx]
+        task_output_dir = base_output_dir / "subset_a" / f"n_{int(task.subset_n):06d}" / f"repeat_{int(task.repeat):03d}"
+        task_pca_random_state = int(pca_random_state) + 100000 * int(n_index + 1) + 10000 * int(task.repeat + 1) + 100 * session_index
+        task_seed = int(seed) + 200000 * int(n_index + 1) + 10000 * int(task.repeat + 1) + session_index
+
+    cache_path = half_curve_cache_path(output_dir=task_output_dir, session_info=info, half_label=half_label)
+    signature = half_curve_signature(
+        session_info=info,
+        session_index=session_index,
+        half_label=half_label,
+        half_indices=half_indices,
+        theta_grid=theta_grid,
+        period=float(period),
+        pca_dim=int(pca_dim),
+        pca_random_state=int(task_pca_random_state),
+        pca_whiten=bool(pca_whiten),
+        train_frac=float(train_frac),
+        seed=int(task_seed),
+        flow_config=flow_config,
+        classical_ridge=float(classical_ridge),
+        classical_window_radius=classical_window_radius,
+        classical_min_endpoint_samples=int(classical_min_endpoint_samples),
+    )
+    return ResolvedASubsampleCurveTask(
+        task=task,
+        session_info=info,
+        half_label=half_label,
+        half_indices=np.asarray(half_indices, dtype=np.int64),
+        output_dir=task_output_dir,
+        pca_random_state=int(task_pca_random_state),
+        seed=int(task_seed),
+        cache_path=cache_path,
+        signature=signature,
+    )
+
+
+def a_subsample_curve_task_cache_hit(task: ASubsampleCurveTask, **kwargs: Any) -> bool:
+    resolved = resolve_a_subsample_curve_task(task, **kwargs)
+    return load_half_cache(resolved.cache_path, signature=resolved.signature) is not None
+
+
+def estimate_a_subsample_curve_task(
+    task: ASubsampleCurveTask,
+    *,
+    sessions: list[StringerSessionInfo],
+    theta_grid: np.ndarray,
+    period: float,
+    pca_dim: int,
+    pca_random_state: int,
+    pca_whiten: bool,
+    train_frac: float,
+    seed: int,
+    device: torch.device,
+    flow_config: ContinuousFlowConfig,
+    output_dir: Path,
+    n_values: list[int],
+    sampling: str,
+    replace: bool = True,
+    force: bool = False,
+    save_flow_npz: bool = True,
+    classical_ridge: float = 1e-6,
+    classical_window_radius: float | None = None,
+    classical_min_endpoint_samples: int = 8,
+) -> HalfCurveResult:
+    resolved = resolve_a_subsample_curve_task(
+        task,
+        sessions=sessions,
+        theta_grid=theta_grid,
+        period=float(period),
+        pca_dim=int(pca_dim),
+        pca_random_state=int(pca_random_state),
+        pca_whiten=bool(pca_whiten),
+        train_frac=float(train_frac),
+        seed=int(seed),
+        flow_config=flow_config,
+        output_dir=output_dir,
+        n_values=n_values,
+        sampling=str(sampling),
+        replace=bool(replace),
+        classical_ridge=float(classical_ridge),
+        classical_window_radius=classical_window_radius,
+        classical_min_endpoint_samples=int(classical_min_endpoint_samples),
+    )
+    print(f"[stringer-identification] worker task={task.label}", flush=True)
+    return estimate_half_curves(
+        session_info=resolved.session_info,
+        session_index=int(task.session_index),
+        half_label=resolved.half_label,
+        half_indices=resolved.half_indices,
+        theta_grid=theta_grid,
+        period=float(period),
+        pca_dim=int(pca_dim),
+        pca_random_state=int(resolved.pca_random_state),
+        pca_whiten=bool(pca_whiten),
+        train_frac=float(train_frac),
+        seed=int(resolved.seed),
+        device=device,
+        flow_config=flow_config,
+        output_dir=resolved.output_dir,
+        force=bool(force),
+        save_flow_npz=bool(save_flow_npz),
+        classical_ridge=float(classical_ridge),
+        classical_window_radius=classical_window_radius,
+        classical_min_endpoint_samples=int(classical_min_endpoint_samples),
+    )
+
+
 def run_a_subsample_convergence(
     *,
     sessions: list[StringerSessionInfo],
@@ -982,6 +1329,7 @@ def run_a_subsample_convergence(
     n_values: list[int],
     repeats: int,
     sampling: str,
+    replace: bool = True,
     force: bool = False,
     save_flow_npz: bool = True,
     classical_ridge: float = 1e-6,
@@ -1115,11 +1463,12 @@ def run_a_subsample_convergence(
                     period=float(period),
                     seed=int(seed) + 100000 * int(ni + 1) + 10000 * int(repeat + 1) + int(session_index),
                     sampling=str(sampling),
+                    replace=bool(replace),
                 )
                 subset_idx = a_idx[local_idx]
                 print(
                     f"[stringer-identification] A subset session={session_key} n={n_subset} "
-                    f"repeat={repeat} sampling={sampling}",
+                    f"repeat={repeat} sampling={sampling} replace={bool(replace)}",
                     flush=True,
                 )
                 query_results.append(
@@ -1213,6 +1562,8 @@ def run_a_subsample_convergence(
         "n_values": list(map(int, n_list)),
         "repeats": int(repeats),
         "sampling": str(sampling),
+        "subsample_replace": bool(replace),
+        "subsample_without_replacement": not bool(replace),
         "orientation_period": float(period),
         "theta_grid_size": int(np.asarray(theta_grid).reshape(-1).shape[0]),
         "pca_fit_scope": "A subset or B half",
@@ -1265,6 +1616,7 @@ def write_subsample_results_npz(path: Path, result: SubsampleConvergenceResult) 
         "n_values": np.asarray(result.n_values, dtype=np.int64),
         "repeats": np.asarray([int(result.repeats)], dtype=np.int64),
         "sampling": np.asarray([str(result.sampling)]),
+        "subsample_replace": np.asarray([bool(result.summary.get("subsample_replace", True))]),
     }
     for method in METHODS:
         for dist_name in DISTANCES:
@@ -1290,6 +1642,9 @@ def load_subsample_results_npz(path: Path, summary: dict[str, Any]) -> Subsample
     n_values = [int(v) for v in np.asarray(data["n_values"], dtype=np.int64).reshape(-1)]
     repeats = int(np.asarray(data["repeats"], dtype=np.int64).reshape(-1)[0])
     sampling = str(np.asarray(data["sampling"]).reshape(-1)[0])
+    if "subsample_replace" in data.files:
+        summary.setdefault("subsample_replace", bool(np.asarray(data["subsample_replace"]).reshape(-1)[0]))
+        summary.setdefault("subsample_without_replacement", not bool(np.asarray(data["subsample_replace"]).reshape(-1)[0]))
     endpoint_distances: dict[str, dict[str, dict[str, np.ndarray]]] = {method: {} for method in METHODS}
     subset_matrices: dict[str, dict[str, np.ndarray]] = {method: {} for method in METHODS}
     for method in METHODS:
@@ -1587,79 +1942,127 @@ def plot_subsample_convergence_summary(
     labels = [str(i) for i in range(len(result.session_keys))]
     n_rows = len(METHODS) * len(DISTANCES)
     fig_height = max(12.0, 2.8 * n_rows)
-    fig, axes = plt.subplots(
-        n_rows,
-        4,
-        figsize=(18.0, fig_height),
+    fig = plt.figure(
+        figsize=(28.0, fig_height),
         layout="constrained",
-        gridspec_kw={"width_ratios": [1.0, 0.85, 0.8, 1.25]},
     )
-    axes_arr = np.asarray(axes).reshape(n_rows, 4)
+    gs = fig.add_gridspec(n_rows, 6, width_ratios=[1.0, 0.85, 0.8, 1.25, 1.35, 1.35])
     session_x = np.arange(len(result.session_keys), dtype=np.float64)
     metric_names = ("top1_accuracy", "top2_accuracy", "top3_accuracy", "mean_reciprocal_rank")
     metric_labels = ("top1", "top2", "top3", "MRR")
     topk_keys = ("top1", "top2", "top3")
     topk_labels = ("top1", "top2", "top3")
     topk_colors = ("tab:blue", "tab:orange", "tab:green")
-    x_labels = [str(n) for n in result.n_values] + ["full A"]
+    method_labels = {
+        METHOD_CLASSICAL_LINEAR: "classical",
+        METHOD_FLOW_LINEAR: "flow matching",
+    }
+    method_colors = {
+        METHOD_CLASSICAL_LINEAR: "tab:orange",
+        METHOD_FLOW_LINEAR: "tab:blue",
+    }
+    n_sessions = max(1, len(result.session_keys))
+    chance_by_topk = {
+        "top1": 1.0 / float(n_sessions),
+        "top3": min(3, n_sessions) / float(n_sessions),
+    }
+    x_labels = [str(n) for n in result.n_values]
     x = np.arange(len(x_labels), dtype=np.float64)
+    old_x_labels = [str(n) for n in result.n_values] + ["full A"]
+    old_x = np.arange(len(old_x_labels), dtype=np.float64)
 
-    row = 0
-    for method in METHODS:
-        for distance_name in DISTANCES:
-            row_axes = axes_arr[row]
+    for distance_index, distance_name in enumerate(DISTANCES):
+        first_row = 2 * int(distance_index)
+        compare_axes = {
+            "top1": fig.add_subplot(gs[first_row : first_row + 2, 4]),
+            "top3": fig.add_subplot(gs[first_row : first_row + 2, 5]),
+        }
+        for method_offset, method in enumerate(METHODS):
+            row = first_row + int(method_offset)
             endpoint_mat = result.endpoint_result.distances[method][distance_name][DIRECTION_A_TO_B]
             endpoint_summary = result.summary["endpoint_identification"][method][f"{distance_name}_{DIRECTION_A_TO_B}"]
 
-            heat_ax = row_axes[0]
+            heat_ax = fig.add_subplot(gs[row, 0])
             im = heat_ax.imshow(endpoint_mat, cmap="viridis")
-            heat_ax.set_title(f"{method}\n{distance_name} full A -> B", fontsize=10)
+            heat_ax.set_title(f"{method}\n{distance_name} endpoint A -> B", fontsize=10)
             heat_ax.set_xlabel("candidate B")
             heat_ax.set_ylabel("query A")
             heat_ax.set_xticks(np.arange(len(labels)), labels=labels, rotation=45, ha="right")
             heat_ax.set_yticks(np.arange(len(labels)), labels=labels)
             fig.colorbar(im, ax=heat_ax, fraction=0.046, pad=0.04)
 
-            rank_ax = row_axes[1]
+            rank_ax = fig.add_subplot(gs[row, 1])
             ranks = np.asarray(endpoint_summary["ranks"], dtype=np.float64)
             rank_ax.bar(session_x, ranks, width=0.65)
             rank_ax.axhline(1.0, color="black", linewidth=0.9, linestyle="--")
-            rank_ax.set_title("full-A rank", fontsize=10)
+            rank_ax.set_title("endpoint rank", fontsize=10)
             rank_ax.set_xlabel("session")
             rank_ax.set_ylabel("rank")
             rank_ax.set_xticks(session_x, labels)
             rank_ax.set_ylim(0.5, len(result.session_keys) + 0.5)
             rank_ax.grid(True, axis="y", alpha=0.25)
 
-            bar_ax = row_axes[2]
+            bar_ax = fig.add_subplot(gs[row, 2])
             vals = [float(endpoint_summary[name]) for name in metric_names]
             mx = np.arange(len(metric_names), dtype=np.float64)
             bar_ax.bar(mx, vals, width=0.65)
-            bar_ax.set_title("full-A scores", fontsize=10)
+            bar_ax.set_title("endpoint scores", fontsize=10)
             bar_ax.set_ylim(0.0, 1.05)
             bar_ax.set_xticks(mx, metric_labels, rotation=25, ha="right")
             bar_ax.grid(True, axis="y", alpha=0.25)
 
-            conv_ax = row_axes[3]
             conv = result.summary["subsample_convergence"][method][distance_name]
+            conv_ax = fig.add_subplot(gs[row, 3])
             for key, label, color in zip(topk_keys, topk_labels, topk_colors):
                 mean_vals = np.asarray(conv[f"{key}_mean"], dtype=np.float64)
                 full_val = float(conv["full_a"][f"{key}_accuracy"])
                 y = np.concatenate([mean_vals, np.asarray([full_val], dtype=np.float64)])
-                conv_ax.plot(x, y, marker="o", linewidth=1.6, color=color, label=label)
+                conv_ax.plot(old_x, y, marker="o", linewidth=1.6, color=color, label=label)
                 by_repeat = np.asarray(conv[f"{key}_by_repeat"], dtype=np.float64)
                 if by_repeat.ndim == 2 and by_repeat.shape[1] > 1:
                     for ri in range(by_repeat.shape[1]):
                         yr = np.concatenate([by_repeat[:, ri], np.asarray([full_val], dtype=np.float64)])
-                        conv_ax.plot(x, yr, color=color, alpha=0.18, linewidth=0.8)
+                        conv_ax.plot(old_x, yr, color=color, alpha=0.18, linewidth=0.8)
             conv_ax.set_title("top-k vs A subset size", fontsize=10)
             conv_ax.set_xlabel("A subset size")
             conv_ax.set_ylabel("accuracy")
             conv_ax.set_ylim(0.0, 1.05)
-            conv_ax.set_xticks(x, x_labels, rotation=30, ha="right")
+            conv_ax.set_xticks(old_x, old_x_labels, rotation=30, ha="right")
             conv_ax.grid(True, axis="y", alpha=0.25)
             conv_ax.legend(fontsize=8, loc="lower right")
-            row += 1
+
+            for compare_key, compare_ax in compare_axes.items():
+                mean_vals = np.asarray(conv[f"{compare_key}_mean"], dtype=np.float64)
+                by_repeat = np.asarray(conv[f"{compare_key}_by_repeat"], dtype=np.float64)
+                if by_repeat.ndim == 2 and by_repeat.shape[1] > 1:
+                    sd_vals = np.nanstd(by_repeat, axis=1, ddof=1)
+                else:
+                    sd_vals = np.zeros_like(mean_vals, dtype=np.float64)
+                compare_ax.errorbar(
+                    x,
+                    mean_vals,
+                    yerr=sd_vals,
+                    marker="o",
+                    linewidth=1.8,
+                    capsize=3.0,
+                    color=method_colors[method],
+                    label=method_labels[method],
+                )
+        for compare_key, compare_ax in compare_axes.items():
+            compare_ax.axhline(
+                chance_by_topk[compare_key],
+                color="black",
+                linewidth=1.0,
+                linestyle="--",
+                label="chance",
+            )
+            compare_ax.set_title(f"{distance_name} {compare_key} vs A subset size", fontsize=11)
+            compare_ax.set_xlabel("A subset size")
+            compare_ax.set_ylabel(f"{compare_key} accuracy")
+            compare_ax.set_ylim(0.0, 1.05)
+            compare_ax.set_xticks(x, x_labels, rotation=30, ha="right")
+            compare_ax.grid(True, axis="y", alpha=0.25)
+            compare_ax.legend(fontsize=9, loc="lower right")
 
     fig.suptitle(
         "Stringer A-subset session identification convergence (A queries, fixed B reference)",
@@ -1670,5 +2073,281 @@ def plot_subsample_convergence_summary(
     path_svg.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path_svg)
     fig.savefig(path_png, dpi=180)
+    plt.close(fig)
+    return path_svg, path_png
+
+
+def plot_subsample_topk_accuracy(
+    path_svg: Path,
+    path_png: Path,
+    result: SubsampleConvergenceResult,
+) -> tuple[Path, Path]:
+    n_labels = [str(n) for n in result.n_values]
+    x = np.arange(len(n_labels), dtype=np.float64)
+    row_specs = (
+        ("top1", "top1 accuracy"),
+        ("top3", "top3 accuracy"),
+    )
+    method_labels = {
+        METHOD_CLASSICAL_LINEAR: "classical",
+        METHOD_FLOW_LINEAR: "flow matching",
+    }
+    method_colors = {
+        METHOD_CLASSICAL_LINEAR: "tab:orange",
+        METHOD_FLOW_LINEAR: "tab:blue",
+    }
+    n_sessions = max(1, len(result.session_keys))
+    chance_by_topk = {
+        "top1": 1.0 / float(n_sessions),
+        "top3": min(3, n_sessions) / float(n_sessions),
+    }
+
+    fig, axes = plt.subplots(
+        len(row_specs),
+        len(DISTANCES),
+        figsize=(11, 6.8),
+        sharex=True,
+        sharey=True,
+        layout="constrained",
+    )
+    for row_index, (topk_key, y_label) in enumerate(row_specs):
+        for col_index, distance_name in enumerate(DISTANCES):
+            ax = axes[row_index, col_index]
+            for method in METHODS:
+                conv = result.summary["subsample_convergence"][method][distance_name]
+                mean_vals = np.asarray(conv[f"{topk_key}_mean"], dtype=np.float64)
+                by_repeat = np.asarray(conv[f"{topk_key}_by_repeat"], dtype=np.float64)
+                if by_repeat.ndim == 2 and by_repeat.shape[1] > 1:
+                    sd_vals = np.nanstd(by_repeat, axis=1, ddof=1)
+                else:
+                    sd_vals = np.zeros_like(mean_vals, dtype=np.float64)
+                ax.errorbar(
+                    x,
+                    mean_vals,
+                    yerr=sd_vals,
+                    marker="o",
+                    linewidth=2.0,
+                    capsize=3.0,
+                    color=method_colors[method],
+                    label=method_labels[method],
+                )
+            ax.axhline(
+                chance_by_topk[topk_key],
+                color="black",
+                linewidth=1.0,
+                linestyle="--",
+                label="chance",
+            )
+            if row_index == 0:
+                ax.set_title(distance_name, fontsize=11)
+            if col_index == 0:
+                ax.set_ylabel(y_label)
+            ax.set_xlabel("A subset size")
+            ax.set_xticks(x, n_labels, rotation=25, ha="right")
+            ax.tick_params(axis="x", labelbottom=True)
+            ax.set_ylim(0.0, 1.05)
+            ax.grid(False)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            if row_index == 0 and col_index == 0:
+                ax.legend(loc="lower right", frameon=False, fontsize=9)
+
+    path_svg = Path(path_svg)
+    path_png = Path(path_png)
+    path_svg.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path_svg, bbox_inches="tight")
+    fig.savefig(path_png, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    return path_svg, path_png
+
+
+def zscore_log_fisher_curve(fisher: np.ndarray, *, tiny: float = 1e-12) -> np.ndarray:
+    values = np.asarray(fisher, dtype=np.float64).reshape(-1)
+    safe = np.where(np.isfinite(values) & (values > float(tiny)), values, float(tiny))
+    logged = np.log(safe)
+    mean = float(np.mean(logged))
+    sd = float(np.std(logged))
+    if not np.isfinite(sd) or sd <= 0.0:
+        return np.zeros_like(logged, dtype=np.float64)
+    return (logged - mean) / sd
+
+
+def select_logcorr_flow_advantage_example(
+    summary: dict[str, Any],
+    *,
+    n_subset: int = 1550,
+) -> dict[str, Any]:
+    session_keys = [str(v) for v in summary.get("session_keys", [])]
+    candidates: list[dict[str, Any]] = []
+    for run_summary in summary.get("subsample_runs", []):
+        if int(run_summary.get("subset_n")) != int(n_subset):
+            continue
+        identification = run_summary.get("identification", {})
+        classical = identification[METHOD_CLASSICAL_LINEAR][f"{DISTANCE_PRIMARY}_{DIRECTION_A_TO_B}"]
+        flow = identification[METHOD_FLOW_LINEAR][f"{DISTANCE_PRIMARY}_{DIRECTION_A_TO_B}"]
+        classical_ranks = [int(v) for v in classical["ranks"]]
+        flow_ranks = [int(v) for v in flow["ranks"]]
+        for session_index, (classical_rank, flow_rank) in enumerate(zip(classical_ranks, flow_ranks)):
+            if int(flow_rank) == 1 and int(classical_rank) > 1:
+                candidates.append(
+                    {
+                        "subset_n": int(n_subset),
+                        "repeat": int(run_summary["repeat"]),
+                        "session_index": int(session_index),
+                        "session_key": session_keys[int(session_index)],
+                        "classical_rank": int(classical_rank),
+                        "flow_rank": int(flow_rank),
+                    }
+                )
+    if not candidates:
+        raise ValueError(f"No flow-advantage log-correlation example found at A subset size {int(n_subset)}.")
+    candidates = sorted(candidates, key=lambda row: (int(row["repeat"]), int(row["session_index"])))
+    rng = np.random.default_rng(int(summary.get("seed", 0)))
+    return candidates[int(rng.integers(0, len(candidates)))]
+
+
+def _read_curve_rows_csv(path: Path) -> list[dict[str, str]]:
+    with Path(path).open(newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def _curve_from_rows(
+    rows: list[dict[str, str]],
+    *,
+    subset_n: int | str,
+    repeat: int,
+    session_index: int,
+    half_label: str,
+    method: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    subset_key = str(subset_n)
+    selected = [
+        row
+        for row in rows
+        if str(row.get("subset_n")) == subset_key
+        and int(row.get("repeat", 0)) == int(repeat)
+        and int(row.get("session_index", -1)) == int(session_index)
+        and str(row.get("half_label")) == str(half_label)
+        and str(row.get("method")) == str(method)
+    ]
+    if not selected:
+        raise ValueError(
+            "Missing curve rows for "
+            f"subset_n={subset_key} repeat={int(repeat)} session_index={int(session_index)} "
+            f"half={half_label} method={method}."
+        )
+    selected = sorted(selected, key=lambda row: float(row["theta_midpoint"]))
+    theta = np.asarray([float(row["theta_midpoint"]) for row in selected], dtype=np.float64)
+    fisher = np.asarray([float(row["fisher"]) for row in selected], dtype=np.float64)
+    return theta, fisher
+
+
+def _set_angle_ticks(ax: Any, period: float) -> None:
+    ticks = [0.0, 0.25 * float(period), 0.5 * float(period), 0.75 * float(period)]
+    labels = ["0", r"$\pi/4$", r"$\pi/2$", r"$3\pi/4$"] if math.isclose(float(period), math.pi) else None
+    ax.set_xticks(ticks, labels)
+
+
+def plot_subsample_logcorr_example(
+    path_svg: Path,
+    path_png: Path,
+    result: SubsampleConvergenceResult,
+    curves_csv_path: Path,
+    *,
+    n_subset: int = 1550,
+) -> tuple[Path, Path]:
+    curve_rows = _read_curve_rows_csv(curves_csv_path)
+    example = select_logcorr_flow_advantage_example(result.summary, n_subset=int(n_subset))
+    session_index = int(example["session_index"])
+    repeat = int(example["repeat"])
+    session_label = str(session_index)
+    method_labels = {
+        METHOD_CLASSICAL_LINEAR: "classical linear",
+        METHOD_FLOW_LINEAR: "flow matching",
+    }
+    method_ranks = {
+        METHOD_CLASSICAL_LINEAR: int(example["classical_rank"]),
+        METHOD_FLOW_LINEAR: int(example["flow_rank"]),
+    }
+
+    fig, axes = plt.subplots(
+        1,
+        3,
+        figsize=(13.2, 3.8),
+        layout="constrained",
+        gridspec_kw={"width_ratios": [1.0, 1.0, 1.15]},
+    )
+    for ax, method in zip(axes[:2], METHODS):
+        theta_a, fisher_a = _curve_from_rows(
+            curve_rows,
+            subset_n=int(n_subset),
+            repeat=repeat,
+            session_index=session_index,
+            half_label=HALF_A,
+            method=method,
+        )
+        theta_b, fisher_b = _curve_from_rows(
+            curve_rows,
+            subset_n="full",
+            repeat=-1,
+            session_index=session_index,
+            half_label=HALF_B,
+            method=method,
+        )
+        ax.plot(theta_b, zscore_log_fisher_curve(fisher_b), color="0.45", linewidth=2.0, linestyle="--", label="paired B")
+        ax.plot(theta_a, zscore_log_fisher_curve(fisher_a), color="black", linewidth=2.0, marker="o", markersize=3.2, label="A subset")
+        ax.set_title(f"{method_labels[method]}\nlog-corr rank {method_ranks[method]}", fontsize=11)
+        ax.set_xlabel("orientation angle (rad)")
+        ax.set_ylabel("z-score log Fisher")
+        _set_angle_ticks(ax, float(result.summary.get("orientation_period", math.pi)))
+        ax.grid(False)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+    axes[0].legend(loc="best", frameon=False, fontsize=9)
+
+    ax = axes[2]
+    n_labels = [str(n) for n in result.n_values]
+    x = np.arange(len(n_labels), dtype=np.float64)
+    method_colors = {
+        METHOD_CLASSICAL_LINEAR: "tab:orange",
+        METHOD_FLOW_LINEAR: "tab:blue",
+    }
+    method_short_labels = {
+        METHOD_CLASSICAL_LINEAR: "classical",
+        METHOD_FLOW_LINEAR: "flow matching",
+    }
+    for method in METHODS:
+        conv = result.summary["subsample_convergence"][method][DISTANCE_PRIMARY]
+        mean_vals = np.asarray(conv["top1_mean"], dtype=np.float64)
+        by_repeat = np.asarray(conv["top1_by_repeat"], dtype=np.float64)
+        sd_vals = np.nanstd(by_repeat, axis=1, ddof=1) if by_repeat.ndim == 2 and by_repeat.shape[1] > 1 else np.zeros_like(mean_vals)
+        ax.errorbar(
+            x,
+            mean_vals,
+            yerr=sd_vals,
+            marker="o",
+            linewidth=2.0,
+            capsize=3.0,
+            color=method_colors[method],
+            label=method_short_labels[method],
+        )
+    chance = 1.0 / float(max(1, len(result.session_keys)))
+    ax.axhline(chance, color="black", linewidth=1.0, linestyle="--", label="chance")
+    ax.set_title("log-correlation top1", fontsize=11)
+    ax.set_xlabel("A subset size")
+    ax.set_ylabel("top1 accuracy")
+    ax.set_xticks(x, n_labels, rotation=25, ha="right")
+    ax.set_ylim(0.0, 1.05)
+    ax.grid(False)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.legend(loc="upper left", frameon=False, fontsize=9)
+
+    fig.suptitle(f"Example session {session_label}, A subset n={int(n_subset)}, repeat={repeat}", fontsize=12)
+    path_svg = Path(path_svg)
+    path_png = Path(path_png)
+    path_svg.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path_svg, bbox_inches="tight")
+    fig.savefig(path_png, dpi=180, bbox_inches="tight")
     plt.close(fig)
     return path_svg, path_png

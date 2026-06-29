@@ -34,9 +34,13 @@ from fisher.stringer_session_identification import (
     SUBSAMPLE_CURVES_CSV_NAME,
     SUBSAMPLE_PAIRS_CSV_NAME,
     SUBSAMPLE_RESULTS_NPZ_NAME,
+    SUBSAMPLE_LOGCORR_EXAMPLE_PNG_NAME,
+    SUBSAMPLE_LOGCORR_EXAMPLE_SVG_NAME,
     SUBSAMPLE_SUMMARY_JSON_NAME,
     SUBSAMPLE_SUMMARY_PNG_NAME,
     SUBSAMPLE_SUMMARY_SVG_NAME,
+    SUBSAMPLE_TOPK_ACCURACY_PNG_NAME,
+    SUBSAMPLE_TOPK_ACCURACY_SVG_NAME,
     SUMMARY_JSON_NAME,
     IdentificationResult,
     SubsampleConvergenceResult,
@@ -47,6 +51,8 @@ from fisher.stringer_session_identification import (
     plot_primary_heatmaps,
     plot_ranks,
     plot_subsample_convergence_summary,
+    plot_subsample_logcorr_example,
+    plot_subsample_topk_accuracy,
     run_a_subsample_convergence,
     run_session_identification,
     theta_grid_periodic,
@@ -94,9 +100,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--skip-flow-npz", action="store_true")
     p.add_argument("--visualization-only", action="store_true")
     p.add_argument("--subsample-a-convergence", action="store_true")
-    p.add_argument("--subsample-a-n-list", default="64,128,256,512,1024,2048")
-    p.add_argument("--subsample-a-repeats", type=int, default=1)
+    p.add_argument("--subsample-a-n-list", default="200,650,1100,1550,2000")
+    p.add_argument("--subsample-a-repeats", type=int, default=5)
     p.add_argument("--subsample-a-sampling", choices=("stratified", "uniform"), default="stratified")
+    p.add_argument("--subsample-a-without-replacement", action=argparse.BooleanOptionalAction, default=True)
 
     p.add_argument("--epochs", type=int, default=50000)
     p.add_argument("--early-patience", type=int, default=1000)
@@ -223,11 +230,28 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
                 output_dir / SUBSAMPLE_SUMMARY_PNG_NAME,
                 subsample_result,
             )
+            topk_svg, topk_png = plot_subsample_topk_accuracy(
+                output_dir / SUBSAMPLE_TOPK_ACCURACY_SVG_NAME,
+                output_dir / SUBSAMPLE_TOPK_ACCURACY_PNG_NAME,
+                subsample_result,
+            )
+            logcorr_example_svg, logcorr_example_png = plot_subsample_logcorr_example(
+                output_dir / SUBSAMPLE_LOGCORR_EXAMPLE_SVG_NAME,
+                output_dir / SUBSAMPLE_LOGCORR_EXAMPLE_PNG_NAME,
+                subsample_result,
+                output_dir / SUBSAMPLE_CURVES_CSV_NAME,
+            )
             print(f"subsample_summary_svg: {summary_svg}", flush=True)
+            print(f"subsample_topk_accuracy_svg: {topk_svg}", flush=True)
+            print(f"subsample_logcorr_example_svg: {logcorr_example_svg}", flush=True)
             return {
                 "output_dir": output_dir,
                 "subsample_summary_svg": summary_svg,
                 "subsample_summary_png": summary_png,
+                "subsample_topk_accuracy_svg": topk_svg,
+                "subsample_topk_accuracy_png": topk_png,
+                "subsample_logcorr_example_svg": logcorr_example_svg,
+                "subsample_logcorr_example_png": logcorr_example_png,
             }
         result = _load_visualization_result(output_dir)
         heatmaps_svg, heatmaps_png = plot_primary_heatmaps(output_dir / HEATMAPS_SVG_NAME, output_dir / HEATMAPS_PNG_NAME, result)
@@ -287,12 +311,14 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
             n_values=parse_positive_int_list(str(args.subsample_a_n_list)),
             repeats=int(args.subsample_a_repeats),
             sampling=str(args.subsample_a_sampling),
+            replace=not bool(args.subsample_a_without_replacement),
             force=bool(args.force),
             save_flow_npz=not bool(args.skip_flow_npz),
             classical_ridge=float(args.classical_linear_ridge),
             classical_window_radius=args.classical_window_radius,
             classical_min_endpoint_samples=int(args.classical_min_endpoint_samples),
         )
+        result_subsample.summary.setdefault("seed", int(args.seed))
         results_npz = write_subsample_results_npz(output_dir / SUBSAMPLE_RESULTS_NPZ_NAME, result_subsample)
         curves_csv = write_subsample_curves_csv(output_dir / SUBSAMPLE_CURVES_CSV_NAME, result_subsample.curve_rows)
         pairs_csv = write_subsample_pairs_csv(output_dir / SUBSAMPLE_PAIRS_CSV_NAME, result_subsample.pair_rows)
@@ -300,6 +326,17 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
             output_dir / SUBSAMPLE_SUMMARY_SVG_NAME,
             output_dir / SUBSAMPLE_SUMMARY_PNG_NAME,
             result_subsample,
+        )
+        topk_svg, topk_png = plot_subsample_topk_accuracy(
+            output_dir / SUBSAMPLE_TOPK_ACCURACY_SVG_NAME,
+            output_dir / SUBSAMPLE_TOPK_ACCURACY_PNG_NAME,
+            result_subsample,
+        )
+        logcorr_example_svg, logcorr_example_png = plot_subsample_logcorr_example(
+            output_dir / SUBSAMPLE_LOGCORR_EXAMPLE_SVG_NAME,
+            output_dir / SUBSAMPLE_LOGCORR_EXAMPLE_PNG_NAME,
+            result_subsample,
+            curves_csv,
         )
         summary_json = write_subsample_summary_json(
             output_dir / SUBSAMPLE_SUMMARY_JSON_NAME,
@@ -316,6 +353,10 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
                 "pairs_csv": str(pairs_csv),
                 "subsample_summary_svg": str(summary_svg),
                 "subsample_summary_png": str(summary_png),
+                "subsample_topk_accuracy_svg": str(topk_svg),
+                "subsample_topk_accuracy_png": str(topk_png),
+                "subsample_logcorr_example_svg": str(logcorr_example_svg),
+                "subsample_logcorr_example_png": str(logcorr_example_png),
                 "flow_config": vars(flow_config_from_args(args)),
                 "classical_config": {
                     "linear_ridge": float(args.classical_linear_ridge),
@@ -327,6 +368,8 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
                 "pca_dim": int(args.pca_dim),
                 "pca_whiten": not bool(args.no_pca_whiten),
                 "pca_random_state": int(args.pca_random_state),
+                "subsample_replace": not bool(args.subsample_a_without_replacement),
+                "subsample_without_replacement": bool(args.subsample_a_without_replacement),
             },
         )
         for label, path in (
@@ -335,6 +378,8 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
             ("pairs_csv", pairs_csv),
             ("summary_json", summary_json),
             ("subsample_summary_svg", summary_svg),
+            ("subsample_topk_accuracy_svg", topk_svg),
+            ("subsample_logcorr_example_svg", logcorr_example_svg),
         ):
             print(f"{label}: {path}", flush=True)
         return {
@@ -345,6 +390,10 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
             "summary_json": summary_json,
             "subsample_summary_svg": summary_svg,
             "subsample_summary_png": summary_png,
+            "subsample_topk_accuracy_svg": topk_svg,
+            "subsample_topk_accuracy_png": topk_png,
+            "subsample_logcorr_example_svg": logcorr_example_svg,
+            "subsample_logcorr_example_png": logcorr_example_png,
         }
 
     result = run_session_identification(

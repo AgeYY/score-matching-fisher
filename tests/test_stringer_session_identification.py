@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from matplotlib.axes import Axes
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
@@ -33,15 +34,20 @@ from fisher.stringer_session_identification import (
     load_subsample_results_npz,
     plot_all_distance_summary,
     plot_subsample_convergence_summary,
+    plot_subsample_logcorr_example,
+    plot_subsample_topk_accuracy,
     parse_optional_int,
     parse_positive_int_list,
+    select_logcorr_flow_advantage_example,
     stratified_half_split,
     stratified_bootstrap_indices,
     theta_grid_periodic,
     theta_midpoints,
     write_results_npz,
+    write_subsample_curves_csv,
     write_subsample_results_npz,
     write_summary_json,
+    zscore_log_fisher_curve,
 )
 
 
@@ -111,6 +117,34 @@ def test_bootstrap_indices_uniform_is_deterministic_with_replacement() -> None:
     np.testing.assert_array_equal(a, b)
     assert a.shape == (20,)
     assert len(np.unique(a)) < a.shape[0]
+
+
+def test_stratified_bootstrap_indices_supports_without_replacement() -> None:
+    theta = np.concatenate(
+        [
+            np.full(10, 0.05),
+            np.full(20, 0.35 * np.pi),
+            np.full(30, 0.70 * np.pi),
+        ]
+    )
+
+    idx = stratified_bootstrap_indices(theta, n_samples=12, n_bins=4, period=float(np.pi), seed=5, replace=False)
+    got_bins = np.floor(theta[idx] / np.pi * 4).astype(int)
+
+    assert idx.shape == (12,)
+    assert np.unique(idx).shape[0] == idx.shape[0]
+    assert np.bincount(got_bins, minlength=4).tolist() == [2, 4, 6, 0]
+
+
+def test_bootstrap_indices_uniform_without_replacement_is_unique_and_bounded() -> None:
+    theta = np.linspace(0.0, np.pi, 5, endpoint=False)
+
+    idx = bootstrap_indices(theta, n_samples=5, n_bins=4, period=float(np.pi), seed=17, sampling="uniform", replace=False)
+
+    assert idx.shape == (5,)
+    assert sorted(idx.tolist()) == [0, 1, 2, 3, 4]
+    with pytest.raises(ValueError, match="without replacement"):
+        bootstrap_indices(theta, n_samples=6, n_bins=4, period=float(np.pi), seed=17, sampling="uniform", replace=False)
 
 
 def test_circular_endpoint_windows_wrap_zero_and_period() -> None:
@@ -291,14 +325,14 @@ def _subsample_result() -> SubsampleConvergenceResult:
             }
             convergence[method][distance_name] = {
                 "n_values": [64, 128],
-                "top1_by_repeat": [[0.5], [1.0]],
-                "top2_by_repeat": [[1.0], [1.0]],
-                "top3_by_repeat": [[1.0], [1.0]],
-                "mrr_by_repeat": [[0.75], [1.0]],
-                "top1_mean": [0.5, 1.0],
+                "top1_by_repeat": [[0.5, 1.0], [1.0, 1.0]],
+                "top2_by_repeat": [[1.0, 1.0], [1.0, 1.0]],
+                "top3_by_repeat": [[1.0, 1.0], [1.0, 1.0]],
+                "mrr_by_repeat": [[0.75, 1.0], [1.0, 1.0]],
+                "top1_mean": [0.75, 1.0],
                 "top2_mean": [1.0, 1.0],
                 "top3_mean": [1.0, 1.0],
-                "mrr_mean": [0.75, 1.0],
+                "mrr_mean": [0.875, 1.0],
                 "full_a": endpoint_summary["identification"][method][f"{distance_name}_{DIRECTION_A_TO_B}"],
             }
     endpoint = IdentificationResult(
@@ -316,7 +350,7 @@ def _subsample_result() -> SubsampleConvergenceResult:
         theta_grid=grid,
         theta_midpoints=theta_midpoints(grid),
         n_values=[64, 128],
-        repeats=1,
+        repeats=2,
         sampling="stratified",
         endpoint_result=endpoint,
         subset_matrices=subset_matrices,
@@ -329,10 +363,192 @@ def _subsample_result() -> SubsampleConvergenceResult:
     )
 
 
-def test_plot_subsample_convergence_summary_writes_files(tmp_path: Path) -> None:
+def test_plot_subsample_convergence_summary_writes_files(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     result = _subsample_result()
+    calls: list[dict[str, object]] = []
+    original_errorbar = Axes.errorbar
+
+    def spy_errorbar(self, x, y, *args, **kwargs):
+        calls.append(
+            {
+                "x": np.asarray(x, dtype=np.float64),
+                "y": np.asarray(y, dtype=np.float64),
+                "yerr": np.asarray(kwargs.get("yerr"), dtype=np.float64),
+                "label": kwargs.get("label"),
+            }
+        )
+        return original_errorbar(self, x, y, *args, **kwargs)
+
+    monkeypatch.setattr(Axes, "errorbar", spy_errorbar)
 
     svg, png = plot_subsample_convergence_summary(tmp_path / "subsample.svg", tmp_path / "subsample.png", result)
+
+    assert svg.is_file()
+    assert png.is_file()
+    assert len(calls) == len(DISTANCES) * len(METHODS) * 2
+    assert {call["label"] for call in calls} == {"classical", "flow matching"}
+    top1_calls = [call for call in calls if np.allclose(call["y"], [0.75, 1.0])]
+    top3_calls = [call for call in calls if np.allclose(call["y"], [1.0, 1.0])]
+    assert len(top1_calls) == len(DISTANCES) * len(METHODS)
+    assert len(top3_calls) == len(DISTANCES) * len(METHODS)
+    for call in calls:
+        np.testing.assert_array_equal(call["x"], [0.0, 1.0])
+    for call in top1_calls:
+        np.testing.assert_allclose(call["yerr"], [np.sqrt(0.125), 0.0])
+    for call in top3_calls:
+        np.testing.assert_allclose(call["yerr"], [0.0, 0.0])
+
+
+def test_plot_subsample_topk_accuracy_writes_two_row_figure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    result = _subsample_result()
+    calls: list[dict[str, object]] = []
+    original_errorbar = Axes.errorbar
+
+    def spy_errorbar(self, x, y, *args, **kwargs):
+        calls.append(
+            {
+                "x": np.asarray(x, dtype=np.float64),
+                "y": np.asarray(y, dtype=np.float64),
+                "yerr": np.asarray(kwargs.get("yerr"), dtype=np.float64),
+                "label": kwargs.get("label"),
+            }
+        )
+        return original_errorbar(self, x, y, *args, **kwargs)
+
+    monkeypatch.setattr(Axes, "errorbar", spy_errorbar)
+
+    svg, png = plot_subsample_topk_accuracy(tmp_path / "topk.svg", tmp_path / "topk.png", result)
+
+    assert svg.is_file()
+    assert png.is_file()
+    assert len(calls) == len(DISTANCES) * len(METHODS) * 2
+    assert {call["label"] for call in calls} == {"classical", "flow matching"}
+    top1_calls = [call for call in calls if np.allclose(call["y"], [0.75, 1.0])]
+    top3_calls = [call for call in calls if np.allclose(call["y"], [1.0, 1.0])]
+    assert len(top1_calls) == len(DISTANCES) * len(METHODS)
+    assert len(top3_calls) == len(DISTANCES) * len(METHODS)
+    for call in calls:
+        np.testing.assert_array_equal(call["x"], [0.0, 1.0])
+
+
+def _logcorr_example_result() -> SubsampleConvergenceResult:
+    base = _subsample_result()
+    summary = {
+        "session_keys": ["s0", "s1"],
+        "seed": 0,
+        "orientation_period": float(np.pi),
+        "subsample_runs": [
+            {
+                "subset_n": 1550,
+                "repeat": 0,
+                "identification": {
+                    METHOD_CLASSICAL_LINEAR: {
+                        f"{DISTANCE_PRIMARY}_{DIRECTION_A_TO_B}": {
+                            "top1_accuracy": 0.5,
+                            "top2_accuracy": 1.0,
+                            "top3_accuracy": 1.0,
+                            "mean_reciprocal_rank": 0.75,
+                            "ranks": [1, 2],
+                            "tie_counts": [1, 1],
+                        }
+                    },
+                    METHOD_FLOW_LINEAR: {
+                        f"{DISTANCE_PRIMARY}_{DIRECTION_A_TO_B}": {
+                            "top1_accuracy": 0.5,
+                            "top2_accuracy": 1.0,
+                            "top3_accuracy": 1.0,
+                            "mean_reciprocal_rank": 0.75,
+                            "ranks": [2, 1],
+                            "tie_counts": [1, 1],
+                        }
+                    },
+                },
+            }
+        ],
+        "subsample_convergence": {},
+    }
+    for method in METHODS:
+        summary["subsample_convergence"][method] = {}
+        for distance_name in DISTANCES:
+            summary["subsample_convergence"][method][distance_name] = {
+                "top1_by_repeat": [[0.5, 1.0], [1.0, 1.0]],
+                "top1_mean": [0.75, 1.0],
+            }
+    return SubsampleConvergenceResult(
+        session_keys=base.session_keys,
+        theta_grid=base.theta_grid,
+        theta_midpoints=base.theta_midpoints,
+        n_values=[1550, 2000],
+        repeats=2,
+        sampling=base.sampling,
+        endpoint_result=base.endpoint_result,
+        subset_matrices=base.subset_matrices,
+        pair_rows=[],
+        curve_rows=[],
+        summary=summary,
+    )
+
+
+def _write_logcorr_example_curves(path: Path) -> Path:
+    rows = []
+    theta_values = [0.1, 0.2, 0.3]
+    for method in METHODS:
+        for subset_n, repeat, half_label, values in (
+            (1550, 0, HALF_A, [1.0, 2.0, 4.0]),
+            ("full", -1, HALF_B, [1.5, 3.0, 6.0]),
+        ):
+            for theta, fisher in zip(theta_values, values):
+                rows.append(
+                    {
+                        "subset_n": subset_n,
+                        "repeat": repeat,
+                        "sampling": "stratified",
+                        "session_index": 1,
+                        "session_key": "s1",
+                        "session_file": "s1.npy",
+                        "half_label": half_label,
+                        "method": method,
+                        "theta_midpoint": theta,
+                        "theta_left": theta - 0.05,
+                        "theta_right": theta + 0.05,
+                        "fisher": fisher,
+                        "n_trials_half": 1550,
+                        "n_neurons": 10,
+                    }
+                )
+    return write_subsample_curves_csv(path, rows)
+
+
+def test_zscore_log_fisher_curve_handles_scale_and_degenerate_values() -> None:
+    z = zscore_log_fisher_curve(np.asarray([1.0, np.e, np.e**2], dtype=np.float64))
+
+    assert np.mean(z) == pytest.approx(0.0)
+    assert np.std(z) == pytest.approx(1.0)
+    np.testing.assert_allclose(zscore_log_fisher_curve(np.asarray([5.0, 5.0])), [0.0, 0.0])
+    np.testing.assert_allclose(zscore_log_fisher_curve(np.asarray([0.0, -1.0])), [0.0, 0.0])
+
+
+def test_select_logcorr_flow_advantage_example_uses_n1550_candidate() -> None:
+    result = _logcorr_example_result()
+
+    selected = select_logcorr_flow_advantage_example(result.summary, n_subset=1550)
+
+    assert selected["subset_n"] == 1550
+    assert selected["repeat"] == 0
+    assert selected["session_index"] == 1
+    assert selected["session_key"] == "s1"
+    assert selected["classical_rank"] == 2
+    assert selected["flow_rank"] == 1
+
+
+def test_plot_subsample_logcorr_example_writes_three_panel_figure(tmp_path: Path) -> None:
+    result = _logcorr_example_result()
+    curves_csv = _write_logcorr_example_curves(tmp_path / "curves.csv")
+
+    svg, png = plot_subsample_logcorr_example(tmp_path / "example.svg", tmp_path / "example.png", result, curves_csv)
 
     assert svg.is_file()
     assert png.is_file()
@@ -346,7 +562,10 @@ def test_subsample_results_npz_round_trip(tmp_path: Path) -> None:
 
     assert loaded.session_keys == result.session_keys
     assert loaded.n_values == [64, 128]
-    assert loaded.repeats == 1
+    assert loaded.repeats == 2
+    assert loaded.sampling == "stratified"
+    assert loaded.summary["subsample_replace"] is True
+    assert loaded.summary["subsample_without_replacement"] is False
     for method in METHODS:
         for distance_name in DISTANCES:
             np.testing.assert_allclose(
@@ -411,6 +630,10 @@ def test_cli_defaults_match_session_identification_plan() -> None:
     assert args.early_patience == 1000
     assert args.visualization_only is False
     assert args.subsample_a_convergence is False
-    assert args.subsample_a_n_list == "64,128,256,512,1024,2048"
-    assert args.subsample_a_repeats == 1
+    assert args.subsample_a_n_list == "200,650,1100,1550,2000"
+    assert args.subsample_a_repeats == 5
     assert args.subsample_a_sampling == "stratified"
+    assert args.subsample_a_without_replacement is True
+
+    with_replacement_args = mod.build_parser().parse_args(["--no-subsample-a-without-replacement"])
+    assert with_replacement_args.subsample_a_without_replacement is False
