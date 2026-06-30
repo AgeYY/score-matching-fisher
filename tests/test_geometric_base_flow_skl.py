@@ -21,6 +21,8 @@ from fisher.geometric_base_flow_skl import (
     ConditionTimeAffineVelocity,
     LineSegmentBase,
     estimate_smoothed_curve_symmetric_kl,
+    finetune_geometric_base_nll,
+    geometric_smoothed_curve_nll_loss,
     log_smoothed_curve_density,
     push_base_curve,
     train_geometric_base_affine_flow,
@@ -37,7 +39,7 @@ def _load_cli_module():
 
 
 def _load_line_fit_check_module():
-    path = _REPO_ROOT / "tests" / "run_geometric_base_line_fit_check.py"
+    path = _REPO_ROOT / "bin" / "run_geometric_base_line_fit_check.py"
     spec = importlib.util.spec_from_file_location("run_geometric_base_line_fit_check", path)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
@@ -183,6 +185,70 @@ def test_log_smoothed_curve_density_matches_logsumexp(monkeypatch: pytest.Monkey
     torch.testing.assert_close(got, expected)
 
 
+def test_geometric_smoothed_curve_nll_loss_matches_logsumexp(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gb, "_make_flow_ode_solver", lambda model: IdentitySolver(model))
+    model = ConditionTimeAffineVelocity(theta_dim=1, x_dim=2, hidden_dim=4, depth=1)
+    base = LineSegmentBase(anchor=(0.0, 0.0), direction=(1.0, 0.0))
+    x = torch.tensor([[0.0, 0.0], [1.0, 0.0]], dtype=torch.float32)
+    support_u = torch.tensor([[-1.0], [1.0]], dtype=torch.float32)
+    sigma_min = 1e-4
+    sigma = 0.5
+    raw_sigma = torch.tensor(math.log(math.expm1(sigma - sigma_min)), dtype=torch.float32)
+
+    got, got_sigma = geometric_smoothed_curve_nll_loss(
+        model=model,
+        base=base,
+        x=x,
+        theta=np.asarray([[0.0]], dtype=np.float64),
+        raw_sigma=raw_sigma,
+        sigma_min=sigma_min,
+        u_grid=support_u,
+        device=torch.device("cpu"),
+        ode_steps=2,
+    )
+
+    centers = torch.tensor([[-1.0, 0.0], [1.0, 0.0]], dtype=torch.float32)
+    log_norm = -0.5 * 2 * math.log(2.0 * math.pi * sigma * sigma)
+    sq = torch.sum((x[:, None, :] - centers[None, :, :]) ** 2, dim=-1)
+    log_prob = torch.logsumexp(log_norm - 0.5 * sq / (sigma * sigma), dim=1) - math.log(2.0)
+    torch.testing.assert_close(got, -log_prob.mean())
+    torch.testing.assert_close(got_sigma, torch.tensor(sigma, dtype=torch.float32))
+
+
+def test_geometric_base_nll_finetune_records_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gb, "_make_flow_ode_solver", lambda model: IdentitySolver(model))
+    model = ConditionTimeAffineVelocity(theta_dim=1, x_dim=2, hidden_dim=4, depth=1)
+    base = LineSegmentBase(anchor=(0.0, 0.0), direction=(1.0, 0.0))
+    theta = np.asarray([[1.0], [1.0], [1.0], [1.0]], dtype=np.float64)
+    x = np.asarray([[-0.4, 0.0], [-0.1, 0.0], [0.2, 0.0], [0.45, 0.0]], dtype=np.float64)
+
+    meta = finetune_geometric_base_nll(
+        model=model,
+        base=base,
+        theta_train=theta,
+        x_train=x,
+        theta_val=theta,
+        x_val=x,
+        condition_eval=np.asarray([[1.0]], dtype=np.float64),
+        device=torch.device("cpu"),
+        epochs=2,
+        batch_size=2,
+        lr=1e-3,
+        sigma_init=0.2,
+        n_particles=4,
+        ode_steps=2,
+        log_every=999,
+    )
+
+    assert meta["enabled"] is True
+    assert meta["epochs"] == 2
+    assert meta["selected_epoch"] == 2
+    assert np.asarray(meta["train_nll_losses"]).shape == (2,)
+    assert np.asarray(meta["val_nll_losses"]).shape == (2,)
+    assert np.asarray(meta["learned_sigmas"]).shape == (1,)
+    assert float(np.asarray(meta["learned_sigmas"])[0]) > 0.0
+
+
 def test_smoothed_curve_skl_identical_conditions_is_zero(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(gb, "_make_flow_ode_solver", lambda model: IdentitySolver(model))
     torch.manual_seed(0)
@@ -227,6 +293,13 @@ def test_geometric_base_line_fit_check_defaults() -> None:
     assert args.n_per_theta == 3000
     assert args.train_frac == pytest.approx(0.7)
     assert args.val_frac == pytest.approx(0.15)
+    assert args.nll_finetune is False
+    assert args.nll_epochs == 200
+    assert args.nll_batch_size == 0
+    assert args.nll_lr == pytest.approx(1e-4)
+    assert args.nll_particles == 128
+    assert args.nll_sigma_init == pytest.approx(0.1)
+    assert args.nll_checkpoint_selection == "last"
     assert args.max_test_plot_per_theta == 500
     assert args.smooth_sigma == pytest.approx(0.12)
     assert paths["png"].name == "geometric_base_line_fit_check.png"

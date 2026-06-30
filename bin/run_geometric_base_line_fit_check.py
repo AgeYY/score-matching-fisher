@@ -21,6 +21,7 @@ from global_setting import DATA_DIR, DEFAULT_DEVICE
 from fisher.geometric_base_flow_skl import (
     LineSegmentBase,
     estimate_smoothed_curve_symmetric_kl,
+    finetune_geometric_base_nll,
     push_base_curve,
     train_geometric_base_affine_flow,
 )
@@ -65,6 +66,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--early-ema-alpha", type=float, default=0.05)
     p.add_argument("--max-grad-norm", type=float, default=10.0)
     p.add_argument("--log-every", type=int, default=100)
+
+    p.add_argument("--nll-finetune", action="store_true")
+    p.add_argument("--nll-epochs", type=int, default=200)
+    p.add_argument("--nll-batch-size", type=int, default=0, help="0 reuses --batch-size.")
+    p.add_argument("--nll-lr", type=float, default=1e-4)
+    p.add_argument("--nll-weight-decay", type=float, default=0.0)
+    p.add_argument("--nll-particles", type=int, default=128)
+    p.add_argument("--nll-sigma-min", type=float, default=1e-4)
+    p.add_argument("--nll-sigma-init", type=float, default=0.1, help="0 reuses --target-sigma.")
+    p.add_argument("--nll-checkpoint-selection", choices=("last", "best"), default="last")
     return p
 
 
@@ -244,6 +255,7 @@ def _plot_overlay(
     train_losses: np.ndarray,
     val_losses: np.ndarray,
     val_monitor_losses: np.ndarray,
+    nll_metadata: dict[str, Any] | None,
 ) -> None:
     import matplotlib
 
@@ -305,6 +317,15 @@ def _plot_overlay(
     ax_loss.plot(epochs, val_losses, color="#f58518", linewidth=1.8, label="validation loss")
     if int(val_monitor_losses.size) == int(train_losses.size):
         ax_loss.plot(epochs, val_monitor_losses, color="#444444", linewidth=1.4, linestyle="--", label="validation EMA")
+    if nll_metadata is not None:
+        nll_train = np.asarray(nll_metadata["train_nll_losses"], dtype=np.float64)
+        nll_val = np.asarray(nll_metadata["val_nll_losses"], dtype=np.float64)
+        nll_epochs = np.arange(1, int(nll_train.size) + 1, dtype=np.int64)
+        ax_nll = ax_loss.twinx()
+        ax_nll.plot(nll_epochs, nll_train, color="#54a24b", linewidth=1.2, alpha=0.75, label="NLL train")
+        ax_nll.plot(nll_epochs, nll_val, color="#54a24b", linewidth=1.5, linestyle=":", label="NLL validation")
+        ax_nll.set_ylabel("NLL")
+        ax_nll.legend(frameon=False, loc="lower right", fontsize=9)
     ax_loss.set_xlabel("epoch")
     ax_loss.set_ylabel("FM loss")
     ax_loss.set_title("Training history")
@@ -365,6 +386,31 @@ def main(argv: list[str] | None = None) -> int:
         max_grad_norm=float(args.max_grad_norm),
         log_every=max(1, int(args.log_every)),
     )
+    nll_meta = None
+    if bool(args.nll_finetune):
+        nll_batch_size = int(args.nll_batch_size) if int(args.nll_batch_size) > 0 else int(args.batch_size)
+        nll_sigma_init = float(args.nll_sigma_init) if float(args.nll_sigma_init) > 0.0 else float(args.target_sigma)
+        nll_meta = finetune_geometric_base_nll(
+            model=model,
+            base=base,
+            theta_train=theta_train,
+            x_train=x_train,
+            theta_val=theta_val,
+            x_val=x_val,
+            condition_eval=condition_eval,
+            device=dev,
+            epochs=int(args.nll_epochs),
+            batch_size=nll_batch_size,
+            lr=float(args.nll_lr),
+            weight_decay=float(args.nll_weight_decay),
+            sigma_min=float(args.nll_sigma_min),
+            sigma_init=nll_sigma_init,
+            n_particles=int(args.nll_particles),
+            ode_steps=int(args.ode_steps),
+            ode_method=str(args.ode_method),
+            checkpoint_selection=str(args.nll_checkpoint_selection),
+            log_every=max(1, int(args.log_every)),
+        )
     result = estimate_smoothed_curve_symmetric_kl(
         model=model,
         base=base,
@@ -406,6 +452,7 @@ def main(argv: list[str] | None = None) -> int:
         train_losses=np.asarray(train_meta["train_losses"], dtype=np.float64),
         val_losses=np.asarray(train_meta["val_losses"], dtype=np.float64),
         val_monitor_losses=np.asarray(train_meta["val_monitor_losses"], dtype=np.float64),
+        nll_metadata=nll_meta,
     )
 
     training_parameters = {
@@ -436,9 +483,18 @@ def main(argv: list[str] | None = None) -> int:
         "density_mc_samples": int(args.density_mc_samples),
         "ode_steps": int(args.ode_steps),
         "ode_method": str(args.ode_method),
+        "nll_finetune": bool(args.nll_finetune),
+        "nll_epochs": int(args.nll_epochs),
+        "nll_batch_size": int(args.nll_batch_size) if int(args.nll_batch_size) > 0 else int(args.batch_size),
+        "nll_lr": float(args.nll_lr),
+        "nll_weight_decay": float(args.nll_weight_decay),
+        "nll_particles": int(args.nll_particles),
+        "nll_sigma_min": float(args.nll_sigma_min),
+        "nll_sigma_init": float(args.nll_sigma_init) if float(args.nll_sigma_init) > 0.0 else float(args.target_sigma),
+        "nll_checkpoint_selection": str(args.nll_checkpoint_selection),
     }
     summary = {
-        "script": "tests/run_geometric_base_line_fit_check.py",
+        "script": "bin/run_geometric_base_line_fit_check.py",
         "device": str(dev),
         "theta_values": theta_eval.reshape(-1),
         "theta_encoding": "one_hot",
@@ -456,6 +512,7 @@ def main(argv: list[str] | None = None) -> int:
         "best_val_loss": float(train_meta["best_val_loss"]),
         "stopped_epoch": int(train_meta["stopped_epoch"]),
         "stopped_early": bool(train_meta["stopped_early"]),
+        "nll_finetune_metadata": nll_meta,
         "png": paths["png"],
         "svg": paths["svg"],
         "summary": paths["summary"],
@@ -470,6 +527,13 @@ def main(argv: list[str] | None = None) -> int:
     print(f"skl: {skl_value:.12g}", flush=True)
     print(f"best_epoch: {int(train_meta['best_epoch'])}", flush=True)
     print(f"best_val_loss: {float(train_meta['best_val_loss']):.12g}", flush=True)
+    if nll_meta is not None:
+        print(
+            f"nll_selected_epoch: {int(nll_meta['selected_epoch'])} "
+            f"nll_selected_val_nll: {float(nll_meta['selected_val_nll']):.12g} "
+            f"learned_sigmas: {np.array2string(np.asarray(nll_meta['learned_sigmas'], dtype=np.float64), precision=6, separator=',')}",
+            flush=True,
+        )
     return 0
 
 

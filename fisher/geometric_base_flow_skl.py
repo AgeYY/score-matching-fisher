@@ -8,6 +8,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -154,6 +155,29 @@ class ConditionTimeAffineVelocity(nn.Module):
 
 def _adamw_parameters(model: nn.Module) -> list[nn.Parameter]:
     return [p for p in model.parameters() if p.requires_grad]
+
+
+def _inverse_softplus(value: float) -> float:
+    target = float(value)
+    if not math.isfinite(target) or target <= 0.0:
+        raise ValueError("value must be finite and positive.")
+    if target >= 20.0:
+        return target
+    return float(math.log(math.expm1(target)))
+
+
+def _condition_indices_from_rows(theta: np.ndarray, condition_eval: np.ndarray) -> np.ndarray:
+    th = _as_2d_float64(theta, name="theta")
+    cond = _as_2d_float64(condition_eval, name="condition_eval")
+    if th.shape[1] != cond.shape[1]:
+        raise ValueError("theta and condition_eval must have the same feature dimension.")
+    out = np.empty(int(th.shape[0]), dtype=np.int64)
+    for i, row in enumerate(th):
+        matches = np.flatnonzero(np.all(np.isclose(cond, row.reshape(1, -1), rtol=1e-8, atol=1e-8), axis=1))
+        if int(matches.size) != 1:
+            raise ValueError("Each theta row must match exactly one row of condition_eval.")
+        out[i] = int(matches[0])
+    return out
 
 
 def train_geometric_base_affine_flow(
@@ -326,8 +350,7 @@ def train_geometric_base_affine_flow(
     }
 
 
-@torch.no_grad()
-def push_base_curve(
+def _push_base_curve_ode(
     *,
     model: nn.Module,
     base: LineSegmentBase,
@@ -337,8 +360,9 @@ def push_base_curve(
     n_points: int | None = None,
     ode_steps: int = 64,
     ode_method: str = "midpoint",
+    enable_grad: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Push line-base points through the learned conditional ODE."""
+    """Push base points through the learned ODE, optionally preserving gradients."""
 
     steps = int(ode_steps)
     if steps < 1:
@@ -365,7 +389,6 @@ def push_base_curve(
         raise ValueError("theta must contain exactly one endpoint row.")
     theta_b = th.expand(int(x0.shape[0]), int(th.shape[1]))
     model.to(device)
-    model.eval()
     time_grid = torch.linspace(0.0, 1.0, steps + 1, dtype=dtype, device=device)
     solver = _make_flow_ode_solver(model)
     x1 = solver.sample(
@@ -374,10 +397,263 @@ def push_base_curve(
         method=str(ode_method),
         time_grid=time_grid,
         return_intermediates=False,
-        enable_grad=False,
+        enable_grad=bool(enable_grad),
         theta_cond=theta_b,
     )
     return x1, u_t
+
+
+def geometric_smoothed_curve_nll_loss(
+    *,
+    model: nn.Module,
+    base: LineSegmentBase,
+    x: torch.Tensor,
+    theta: np.ndarray | torch.Tensor,
+    raw_sigma: torch.Tensor,
+    sigma_min: float,
+    u_grid: torch.Tensor,
+    device: torch.device,
+    ode_steps: int = 64,
+    ode_method: str = "midpoint",
+    enable_grad: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Monte Carlo NLL for ``gamma_theta(U) + Normal(0, sigma^2 I)``."""
+
+    sigma_floor = float(sigma_min)
+    if not math.isfinite(sigma_floor) or sigma_floor <= 0.0:
+        raise ValueError("sigma_min must be finite and positive.")
+    if int(u_grid.shape[0]) < 1:
+        raise ValueError("u_grid must contain at least one particle.")
+    dtype = _model_floating_dtype(model)
+    if x.ndim == 1:
+        x = x.unsqueeze(0)
+    xb = x.to(device=device, dtype=dtype)
+    centers, _ = _push_base_curve_ode(
+        model=model,
+        base=base,
+        theta=theta,
+        device=device,
+        u=u_grid,
+        ode_steps=int(ode_steps),
+        ode_method=str(ode_method),
+        enable_grad=bool(enable_grad),
+    )
+    sigma = sigma_floor + F.softplus(raw_sigma.to(device=device, dtype=dtype))
+    d = int(xb.shape[1])
+    sq = torch.sum((xb[:, None, :] - centers[None, :, :]) ** 2, dim=-1)
+    log_kernel = -0.5 * sq / (sigma * sigma)
+    log_prob = torch.logsumexp(log_kernel, dim=1) - math.log(float(centers.shape[0]))
+    log_norm = -0.5 * float(d) * (math.log(2.0 * math.pi) + 2.0 * torch.log(sigma))
+    return -(log_norm + log_prob).mean(), sigma
+
+
+def finetune_geometric_base_nll(
+    *,
+    model: nn.Module,
+    base: LineSegmentBase,
+    theta_train: np.ndarray,
+    x_train: np.ndarray,
+    theta_val: np.ndarray | None,
+    x_val: np.ndarray | None,
+    condition_eval: np.ndarray,
+    device: torch.device,
+    epochs: int = 1000,
+    batch_size: int = 1024,
+    lr: float = 1e-4,
+    weight_decay: float = 0.0,
+    sigma_min: float = 1e-4,
+    sigma_init: float = 0.1,
+    n_particles: int = 512,
+    ode_steps: int = 64,
+    ode_method: str = "midpoint",
+    checkpoint_selection: str = "last",
+    log_every: int = 100,
+) -> dict[str, Any]:
+    """Fine-tune a geometric-base flow by endpoint mixture NLL."""
+
+    if int(base.ambient_dim) != int(getattr(model, "x_dim")):
+        raise ValueError("base ambient_dim must match model x_dim.")
+    if int(epochs) < 1:
+        raise ValueError("epochs must be >= 1.")
+    if int(batch_size) < 1:
+        raise ValueError("batch_size must be >= 1.")
+    if float(lr) <= 0.0:
+        raise ValueError("lr must be > 0.")
+    if float(weight_decay) < 0.0:
+        raise ValueError("weight_decay must be >= 0.")
+    if int(n_particles) < 1:
+        raise ValueError("n_particles must be >= 1.")
+    sigma_floor = float(sigma_min)
+    sigma_start = float(sigma_init)
+    if not math.isfinite(sigma_floor) or sigma_floor <= 0.0:
+        raise ValueError("sigma_min must be finite and positive.")
+    if not math.isfinite(sigma_start) or sigma_start <= sigma_floor:
+        raise ValueError("sigma_init must be finite and greater than sigma_min.")
+    selection = str(checkpoint_selection).strip().lower().replace("-", "_")
+    if selection not in ("last", "best"):
+        raise ValueError("checkpoint_selection must be one of: last, best.")
+
+    cond = _as_2d_float64(condition_eval, name="condition_eval")
+    th_tr = _as_2d_float64(theta_train, name="theta_train")
+    x_tr = _as_2d_float64(x_train, name="x_train")
+    if theta_val is None or x_val is None:
+        th_va = th_tr
+        x_va = x_tr
+    else:
+        th_va = _as_2d_float64(theta_val, name="theta_val")
+        x_va = _as_2d_float64(x_val, name="x_val")
+    if th_tr.shape[0] != x_tr.shape[0] or th_va.shape[0] != x_va.shape[0]:
+        raise ValueError("theta and x split lengths must match.")
+    if x_tr.shape[1] != base.ambient_dim or x_va.shape[1] != base.ambient_dim:
+        raise ValueError("x dimensions must match base ambient_dim.")
+    tr_idx = _condition_indices_from_rows(th_tr, cond)
+    va_idx = _condition_indices_from_rows(th_va, cond)
+
+    train_ds = TensorDataset(torch.from_numpy(tr_idx), torch.from_numpy(x_tr.astype(np.float32)))
+    val_ds = TensorDataset(torch.from_numpy(va_idx), torch.from_numpy(x_va.astype(np.float32)))
+    train_loader = DataLoader(train_ds, batch_size=int(batch_size), shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=int(batch_size), shuffle=False)
+
+    model.to(device)
+    dtype = _model_floating_dtype(model)
+    raw_init = _inverse_softplus(sigma_start - sigma_floor)
+    raw_sigma = nn.Parameter(torch.full((int(cond.shape[0]),), raw_init, dtype=dtype, device=device))
+    u_grid = base.sample_u(int(n_particles), device=device, dtype=dtype).detach()
+    cond_t = torch.from_numpy(cond.astype(np.float32)).to(device=device, dtype=dtype)
+    opt = torch.optim.AdamW(_adamw_parameters(model) + [raw_sigma], lr=float(lr), weight_decay=float(weight_decay))
+
+    train_losses: list[float] = []
+    val_losses: list[float] = []
+    best_val = float("inf")
+    best_epoch = 0
+    best_state: dict[str, torch.Tensor] | None = None
+    best_raw_sigma: torch.Tensor | None = None
+
+    def _batch_nll(cb: torch.Tensor, xb: torch.Tensor, *, enable_grad: bool) -> tuple[torch.Tensor, torch.Tensor]:
+        cb = cb.to(device=device, dtype=torch.long)
+        xb = xb.to(device=device, dtype=dtype)
+        total = torch.zeros((), dtype=dtype, device=device)
+        total_count = 0
+        sigma_values: list[torch.Tensor] = []
+        for cond_idx in torch.unique(cb, sorted=True):
+            mask = cb == cond_idx
+            count = int(torch.sum(mask).detach().cpu())
+            if count < 1:
+                continue
+            idx = int(cond_idx.detach().cpu())
+            loss_c, sigma_c = geometric_smoothed_curve_nll_loss(
+                model=model,
+                base=base,
+                x=xb[mask],
+                theta=cond_t[idx : idx + 1],
+                raw_sigma=raw_sigma[idx],
+                sigma_min=sigma_floor,
+                u_grid=u_grid,
+                device=device,
+                ode_steps=int(ode_steps),
+                ode_method=str(ode_method),
+                enable_grad=bool(enable_grad),
+            )
+            total = total + loss_c * float(count)
+            total_count += count
+            sigma_values.append(sigma_c.detach())
+        if total_count < 1:
+            raise RuntimeError("Encountered an empty NLL batch.")
+        return total / float(total_count), torch.stack(sigma_values) if sigma_values else raw_sigma.detach()
+
+    for epoch in range(1, int(epochs) + 1):
+        model.train()
+        ep_losses: list[float] = []
+        for cb, xb in train_loader:
+            loss, _sigmas = _batch_nll(cb, xb, enable_grad=True)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            ep_losses.append(float(loss.detach().cpu()))
+        train_loss = float(np.mean(ep_losses))
+        train_losses.append(train_loss)
+
+        model.eval()
+        val_ep: list[float] = []
+        with torch.no_grad():
+            for cb, xb in val_loader:
+                val_loss, _sigmas = _batch_nll(cb, xb, enable_grad=False)
+                val_ep.append(float(val_loss.detach().cpu()))
+        val_loss_f = float(np.mean(val_ep))
+        val_losses.append(val_loss_f)
+        if val_loss_f < best_val:
+            best_val = val_loss_f
+            best_epoch = int(epoch)
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            best_raw_sigma = raw_sigma.detach().cpu().clone()
+
+        if epoch == 1 or epoch % max(1, int(log_every)) == 0 or epoch == int(epochs):
+            sigmas = (sigma_floor + F.softplus(raw_sigma.detach())).detach().cpu().numpy()
+            print(
+                f"[geometric-base-nll {epoch:4d}/{int(epochs)}] train_nll={train_loss:.6f} "
+                f"val_nll={val_loss_f:.6f} best_val_nll={best_val:.6f} best_epoch={best_epoch} "
+                f"sigmas={np.array2string(sigmas, precision=5, separator=',')}",
+                flush=True,
+            )
+
+    selected_epoch = int(epochs)
+    selected_val = float(val_losses[-1])
+    if selection == "best" and best_state is not None and best_raw_sigma is not None:
+        model.load_state_dict(best_state)
+        raw_sigma.data.copy_(best_raw_sigma.to(device=device, dtype=dtype))
+        selected_epoch = int(best_epoch)
+        selected_val = float(best_val)
+
+    learned_sigmas = (sigma_floor + F.softplus(raw_sigma.detach())).detach().cpu().numpy().astype(np.float64)
+    return {
+        "enabled": True,
+        "epochs": int(epochs),
+        "batch_size": int(batch_size),
+        "lr": float(lr),
+        "weight_decay": float(weight_decay),
+        "sigma_min": float(sigma_floor),
+        "sigma_init": float(sigma_start),
+        "n_particles": int(n_particles),
+        "ode_steps": int(ode_steps),
+        "ode_method": str(ode_method),
+        "checkpoint_selection": selection,
+        "best_epoch": int(best_epoch),
+        "best_val_nll": float(best_val),
+        "selected_epoch": int(selected_epoch),
+        "selected_val_nll": float(selected_val),
+        "train_nll_losses": np.asarray(train_losses, dtype=np.float64),
+        "val_nll_losses": np.asarray(val_losses, dtype=np.float64),
+        "learned_sigmas": learned_sigmas,
+    }
+
+
+@torch.no_grad()
+def push_base_curve(
+    *,
+    model: nn.Module,
+    base: LineSegmentBase,
+    theta: np.ndarray | torch.Tensor,
+    device: torch.device,
+    u: np.ndarray | torch.Tensor | None = None,
+    n_points: int | None = None,
+    ode_steps: int = 64,
+    ode_method: str = "midpoint",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Push line-base points through the learned conditional ODE."""
+
+    model.to(device)
+    model.eval()
+    return _push_base_curve_ode(
+        model=model,
+        base=base,
+        theta=theta,
+        device=device,
+        u=u,
+        n_points=n_points,
+        ode_steps=int(ode_steps),
+        ode_method=str(ode_method),
+        enable_grad=False,
+    )
 
 
 @torch.no_grad()
