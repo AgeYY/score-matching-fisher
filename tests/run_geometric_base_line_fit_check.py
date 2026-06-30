@@ -92,8 +92,8 @@ def resolve_output_paths(output_dir: Path | None) -> dict[str, Path]:
 
 def _parse_theta_values(text: str) -> np.ndarray:
     vals = [float(part.strip()) for part in str(text).split(",") if part.strip()]
-    if len(vals) != 2:
-        raise ValueError("--theta-values must contain exactly two comma-separated values for this diagnostic.")
+    if len(vals) < 1:
+        raise ValueError("--theta-values must contain at least one comma-separated value for this diagnostic.")
     if not np.all(np.isfinite(vals)):
         raise ValueError("--theta-values must be finite.")
     return np.asarray(vals, dtype=np.float64).reshape(-1, 1)
@@ -101,8 +101,8 @@ def _parse_theta_values(text: str) -> np.ndarray:
 
 def _condition_one_hot(n_conditions: int) -> np.ndarray:
     count = int(n_conditions)
-    if count < 2:
-        raise ValueError("At least two conditions are required.")
+    if count < 1:
+        raise ValueError("At least one condition is required.")
     return np.eye(count, dtype=np.float64)
 
 

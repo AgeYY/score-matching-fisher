@@ -43,7 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--run-method", choices=("regular", "ot", "both"), default="both")
 
-    p.add_argument("--theta-values", type=str, default="0.7853981633974483,2.356194490192345")
+    p.add_argument("--theta-values", type=str, default="0.7853981633974483")
     p.add_argument("--ell", type=float, default=1.5)
     p.add_argument("--target-sigma", type=float, default=0.12)
     p.add_argument("--shift-x", type=float, default=0.0)
@@ -191,6 +191,10 @@ def _fit_one(
         [_angle_error_degrees(g, t) for g, t in zip(fitted_angles, target_angles)],
         dtype=np.float64,
     )
+    skl_value = None
+    if int(result.symmetric_kl_matrix.shape[0]) >= 2 and int(result.symmetric_kl_matrix.shape[1]) >= 2:
+        skl_value = float(result.symmetric_kl_matrix[0, 1])
+
     return {
         "method_name": str(method_name),
         "source_pairing": str(source_pairing),
@@ -198,7 +202,7 @@ def _fit_one(
         "model": model,
         "train_metadata": train_meta,
         "symmetric_kl_matrix": result.symmetric_kl_matrix,
-        "skl_value": float(result.symmetric_kl_matrix[0, 1]),
+        "skl_value": skl_value,
         "fitted_curves": fitted_curves,
         "target_angles_degrees": target_angles,
         "fitted_angles_degrees": fitted_angles,
@@ -259,10 +263,12 @@ def _plot_comparison(
                 label=f"fitted line {idx + 1} ({angle:.1f} deg, err {err:.1f})",
             )
         ax.plot(base_curve[:, 0], base_curve[:, 1], color="#2f2f2f", linewidth=2.0, linestyle="--", label="base line")
+        skl = method["skl_value"]
+        skl_text = "N/A" if skl is None else f"{float(skl):.4g}"
         ax.text(
             0.02,
             0.98,
-            f"SKL = {float(method['skl_value']):.4g}\nmean angle err = {float(method['mean_angle_error_degrees']):.2f} deg",
+            f"SKL = {skl_text}\nmean angle err = {float(method['mean_angle_error_degrees']):.2f} deg",
             transform=ax.transAxes,
             va="top",
             ha="left",
@@ -428,10 +434,12 @@ def main(argv: list[str] | None = None) -> int:
     print(f"svg: {paths['svg']}", flush=True)
     print(f"summary_json: {paths['summary']}", flush=True)
     for method in method_results:
+        skl = method["skl_value"]
+        skl_text = "N/A" if skl is None else f"{float(skl):.12g}"
         print(
             f"{method['method_name']}: pairing={method['source_pairing']} "
             f"ot_method={method['ot_method']} "
-            f"skl={float(method['skl_value']):.12g} "
+            f"skl={skl_text} "
             f"mean_angle_error={float(method['mean_angle_error_degrees']):.6g} "
             f"best_epoch={int(method['best_epoch'])} "
             f"best_val_loss={float(method['best_val_loss']):.12g}",
