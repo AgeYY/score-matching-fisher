@@ -25,6 +25,7 @@ from fisher.flow_matching_skl import CenteredConditionAffineFlowSKLModel
 from fisher.geometric_base_flow_skl import (
     LineSegmentBase,
     estimate_smoothed_curve_symmetric_kl,
+    finetune_geometric_base_nll,
     push_base_curve,
     train_geometric_base_affine_flow,
 )
@@ -83,6 +84,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--early-ema-alpha", type=float, default=0.05)
     p.add_argument("--max-grad-norm", type=float, default=10.0)
     p.add_argument("--log-every", type=int, default=100)
+
+    p.add_argument("--nll-finetune", action="store_true")
+    p.add_argument("--nll-epochs", type=int, default=1000)
+    p.add_argument("--nll-batch-size", type=int, default=0, help="0 reuses --batch-size.")
+    p.add_argument("--nll-lr", type=float, default=1e-4)
+    p.add_argument("--nll-weight-decay", type=float, default=0.0)
+    p.add_argument("--nll-particles", type=int, default=512)
+    p.add_argument("--nll-sigma-min", type=float, default=1e-4)
+    p.add_argument("--nll-sigma-init", type=float, default=0.0, help="0 reuses --target-sigma.")
+    p.add_argument("--nll-checkpoint-selection", choices=("last", "best"), default="last")
     return p
 
 
@@ -160,6 +171,31 @@ def _fit_one(
         max_grad_norm=float(args.max_grad_norm),
         log_every=max(1, int(args.log_every)),
     )
+    nll_meta = None
+    if bool(args.nll_finetune):
+        nll_batch_size = int(args.nll_batch_size) if int(args.nll_batch_size) > 0 else int(args.batch_size)
+        nll_sigma_init = float(args.nll_sigma_init) if float(args.nll_sigma_init) > 0.0 else float(args.target_sigma)
+        nll_meta = finetune_geometric_base_nll(
+            model=model,
+            base=base,
+            theta_train=np.asarray(data["theta_train"], dtype=np.float64),
+            x_train=np.asarray(data["x_train"], dtype=np.float64),
+            theta_val=np.asarray(data["theta_val"], dtype=np.float64),
+            x_val=np.asarray(data["x_val"], dtype=np.float64),
+            condition_eval=condition_eval,
+            device=device,
+            epochs=int(args.nll_epochs),
+            batch_size=nll_batch_size,
+            lr=float(args.nll_lr),
+            weight_decay=float(args.nll_weight_decay),
+            sigma_min=float(args.nll_sigma_min),
+            sigma_init=nll_sigma_init,
+            n_particles=int(args.nll_particles),
+            ode_steps=int(args.ode_steps),
+            ode_method=str(args.ode_method),
+            checkpoint_selection=str(args.nll_checkpoint_selection),
+            log_every=max(1, int(args.log_every)),
+        )
     result = estimate_smoothed_curve_symmetric_kl(
         model=model,
         base=base,
@@ -201,6 +237,7 @@ def _fit_one(
         "ot_method": str(train_meta.get("ot_method", args.ot_method)),
         "model": model,
         "train_metadata": train_meta,
+        "nll_finetune_metadata": nll_meta,
         "symmetric_kl_matrix": result.symmetric_kl_matrix,
         "skl_value": skl_value,
         "fitted_curves": fitted_curves,
@@ -289,6 +326,23 @@ def _plot_comparison(
         label = str(method["method_name"])
         ax_loss.plot(epochs, train_losses, linewidth=1.4, alpha=0.7, label=f"{label} train")
         ax_loss.plot(epochs, val_monitor, linewidth=1.8, linestyle="--", label=f"{label} val EMA")
+        nll_meta = method.get("nll_finetune_metadata")
+        if nll_meta is not None:
+            nll_train = np.asarray(nll_meta["train_nll_losses"], dtype=np.float64)
+            nll_val = np.asarray(nll_meta["val_nll_losses"], dtype=np.float64)
+            nll_epochs = np.arange(1, int(nll_train.size) + 1, dtype=np.int64)
+            ax_nll = ax_loss.twinx()
+            ax_nll.plot(nll_epochs, nll_train, linewidth=1.1, alpha=0.65, color="#54a24b", label=f"{label} NLL train")
+            ax_nll.plot(
+                nll_epochs,
+                nll_val,
+                linewidth=1.3,
+                linestyle=":",
+                color="#54a24b",
+                label=f"{label} NLL val",
+            )
+            ax_nll.set_ylabel("NLL")
+            ax_nll.legend(frameon=False, loc="lower right", fontsize=8)
     ax_loss.set_xlabel("epoch")
     ax_loss.set_ylabel("FM loss")
     ax_loss.set_title("Training history")
@@ -331,6 +385,7 @@ def _summary_for_method(method: dict[str, Any]) -> dict[str, Any]:
         "stopped_epoch": method["stopped_epoch"],
         "stopped_early": method["stopped_early"],
         "train_metadata": meta,
+        "nll_finetune_metadata": method["nll_finetune_metadata"],
     }
 
 
@@ -412,6 +467,15 @@ def main(argv: list[str] | None = None) -> int:
         "density_mc_samples": int(args.density_mc_samples),
         "ode_steps": int(args.ode_steps),
         "ode_method": str(args.ode_method),
+        "nll_finetune": bool(args.nll_finetune),
+        "nll_epochs": int(args.nll_epochs),
+        "nll_batch_size": int(args.nll_batch_size) if int(args.nll_batch_size) > 0 else int(args.batch_size),
+        "nll_lr": float(args.nll_lr),
+        "nll_weight_decay": float(args.nll_weight_decay),
+        "nll_particles": int(args.nll_particles),
+        "nll_sigma_min": float(args.nll_sigma_min),
+        "nll_sigma_init": float(args.nll_sigma_init) if float(args.nll_sigma_init) > 0.0 else float(args.target_sigma),
+        "nll_checkpoint_selection": str(args.nll_checkpoint_selection),
     }
     summary = {
         "script": "tests/run_geometric_base_line_fit_ot_compare.py",
@@ -445,6 +509,15 @@ def main(argv: list[str] | None = None) -> int:
             f"best_val_loss={float(method['best_val_loss']):.12g}",
             flush=True,
         )
+        nll_meta = method.get("nll_finetune_metadata")
+        if nll_meta is not None:
+            print(
+                f"{method['method_name']} NLL finetune: "
+                f"selected_epoch={int(nll_meta['selected_epoch'])} "
+                f"selected_val_nll={float(nll_meta['selected_val_nll']):.12g} "
+                f"learned_sigmas={np.array2string(np.asarray(nll_meta['learned_sigmas'], dtype=np.float64), precision=6, separator=',')}",
+                flush=True,
+            )
     return 0
 
 
