@@ -20,6 +20,7 @@ from fisher import geometric_base_flow_skl as gb
 from fisher.geometric_base_flow_skl import (
     ConditionTimeAffineVelocity,
     LineSegmentBase,
+    SquarePerimeterBase,
     estimate_smoothed_curve_symmetric_kl,
     finetune_geometric_base_nll,
     geometric_smoothed_curve_nll_loss,
@@ -41,6 +42,15 @@ def _load_cli_module():
 def _load_line_fit_check_module():
     path = _REPO_ROOT / "bin" / "run_geometric_base_line_fit_check.py"
     spec = importlib.util.spec_from_file_location("run_geometric_base_line_fit_check", path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _load_square_fit_check_module():
+    path = _REPO_ROOT / "bin" / "run_geometric_base_square_fit_check.py"
+    spec = importlib.util.spec_from_file_location("run_geometric_base_square_fit_check", path)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -96,6 +106,41 @@ def test_line_segment_base_samples_centered_line() -> None:
     assert torch.all(u <= 0.5)
     expected = torch.tensor([[1.0, -2.0]], dtype=torch.float64) + u * torch.tensor([[2.0, 0.5]], dtype=torch.float64)
     torch.testing.assert_close(x, expected)
+
+
+def test_square_perimeter_base_maps_unit_square_boundary() -> None:
+    base = SquarePerimeterBase(center=(0.0, 0.0), side_length=1.0)
+    u = torch.tensor([[0.0], [0.5], [1.0], [1.5], [2.0], [2.5], [3.0], [3.5], [4.0]], dtype=torch.float64)
+
+    got = base.points_from_u(u)
+    expected = torch.tensor(
+        [
+            [-0.5, -0.5],
+            [0.0, -0.5],
+            [0.5, -0.5],
+            [0.5, 0.0],
+            [0.5, 0.5],
+            [0.0, 0.5],
+            [-0.5, 0.5],
+            [-0.5, 0.0],
+            [-0.5, -0.5],
+        ],
+        dtype=torch.float64,
+    )
+    torch.testing.assert_close(got, expected)
+
+
+def test_square_perimeter_base_samples_on_boundary() -> None:
+    torch.manual_seed(0)
+    base = SquarePerimeterBase(center=(1.0, -2.0), side_length=2.0)
+    x, u = base.sample_with_u(128, device=torch.device("cpu"), dtype=torch.float64)
+
+    assert x.shape == (128, 2)
+    assert u.shape == (128, 1)
+    centered = x - torch.tensor([[1.0, -2.0]], dtype=torch.float64)
+    assert torch.all(u >= 0.0)
+    assert torch.all(u <= 4.0)
+    torch.testing.assert_close(torch.max(torch.abs(centered), dim=1).values, torch.ones(128, dtype=torch.float64))
 
 
 def test_condition_time_affine_velocity_is_affine_in_x() -> None:
@@ -294,7 +339,7 @@ def test_geometric_base_line_fit_check_defaults() -> None:
     assert args.train_frac == pytest.approx(0.7)
     assert args.val_frac == pytest.approx(0.15)
     assert args.nll_finetune is False
-    assert args.nll_epochs == 200
+    assert args.nll_epochs == 400
     assert args.nll_batch_size == 0
     assert args.nll_lr == pytest.approx(1e-4)
     assert args.nll_particles == 128
@@ -334,3 +379,31 @@ def test_geometric_base_training_exposes_no_matched_source_path() -> None:
     assert data["theta_test_plot"].shape[1] == 2
     assert data["theta_test_plot_scalar"].shape[1] == 1
     assert data["theta_train"].shape[0] + data["theta_val"].shape[0] + data["theta_test"].shape[0] == 12
+
+
+def test_geometric_base_square_fit_check_defaults() -> None:
+    mod = _load_square_fit_check_module()
+    args = mod.build_parser().parse_args([])
+    paths = mod.resolve_output_paths(args.output_dir)
+
+    assert args.theta_values == "0.0,0.7853981633974483"
+    assert args.side_length == pytest.approx(2.0)
+    assert args.base_side_length == pytest.approx(1.0)
+    assert args.target_sigma == pytest.approx(0.03)
+    assert args.path_schedule == "cosine"
+    assert args.epochs == 50000
+    assert args.early_patience == 1000
+    assert args.n_per_theta == 3000
+    assert args.nll_finetune is False
+    assert args.nll_epochs == 400
+    assert args.nll_particles == 128
+    assert args.nll_sigma_init == pytest.approx(0.1)
+    assert args.curve_points_per_edge == 100
+    assert paths["png"].name == "geometric_base_square_fit_check.png"
+    assert paths["svg"].name == "geometric_base_square_fit_check.svg"
+    assert paths["summary"].name == "geometric_base_square_fit_check_summary.json"
+    theta = mod._parse_theta_values(args.theta_values)
+    data = mod._make_noisy_square_data(args, theta)
+    np.testing.assert_allclose(data["condition_eval"], np.eye(2))
+    assert data["theta_encoding"] == "one_hot"
+    assert data["theta_train"].shape[1] == 2

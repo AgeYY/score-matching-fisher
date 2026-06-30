@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Quick visual check for affine geometric-base flow on noisy-line data."""
+"""Quick visual check for affine geometric-base flow on noisy square-boundary data."""
 
 from __future__ import annotations
 
@@ -18,15 +18,15 @@ if str(_REPO_ROOT) not in sys.path:
 
 from global_setting import DATA_DIR, DEFAULT_DEVICE
 
+from fisher.flow_matching_skl import CenteredConditionAffineFlowSKLModel
 from fisher.geometric_base_flow_skl import (
-    LineSegmentBase,
+    SquarePerimeterBase,
     estimate_smoothed_curve_symmetric_kl,
     finetune_geometric_base_nll,
     push_base_curve,
     train_geometric_base_affine_flow,
 )
-from fisher.noisy_line_dataset import NoisyLineDataset
-from fisher.flow_matching_skl import CenteredConditionAffineFlowSKLModel
+from fisher.noisy_square_dataset import NoisySquareBoundaryDataset
 from fisher.shared_fisher_est import require_device
 
 
@@ -36,15 +36,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output-dir", type=Path, default=None)
     p.add_argument("--seed", type=int, default=7)
 
-    p.add_argument("--theta-values", type=str, default="0.7853981633974483,2.356194490192345")
-    p.add_argument("--ell", type=float, default=1.5)
-    p.add_argument("--target-sigma", type=float, default=0.12)
-    p.add_argument("--shift-x", type=float, default=0.0)
-    p.add_argument("--shift-y", type=float, default=0.0)
+    p.add_argument("--theta-values", type=str, default="0.0,0.7853981633974483")
+    p.add_argument("--side-length", type=float, default=2.0, help="Target square edge length.")
+    p.add_argument("--base-side-length", type=float, default=1.0, help="Base square edge length.")
+    p.add_argument("--target-sigma", type=float, default=0.03)
+    p.add_argument("--center-x", type=float, default=0.0)
+    p.add_argument("--center-y", type=float, default=0.0)
     p.add_argument("--n-per-theta", type=int, default=3000)
     p.add_argument("--train-frac", type=float, default=0.7)
     p.add_argument("--val-frac", type=float, default=0.15)
-    p.add_argument("--max-test-plot-per-theta", type=int, default=500)
+    p.add_argument("--max-test-plot-per-theta", type=int, default=600)
 
     p.add_argument("--path-schedule", choices=("linear", "straight", "cosine"), default="cosine")
     p.add_argument("--smooth-sigma", type=float, default=0.12)
@@ -52,7 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--density-mc-samples", type=int, default=512)
     p.add_argument("--ode-steps", type=int, default=64)
     p.add_argument("--ode-method", type=str, default="midpoint")
-    p.add_argument("--curve-points", type=int, default=300)
+    p.add_argument("--curve-points-per-edge", type=int, default=100)
 
     p.add_argument("--epochs", type=int, default=50000)
     p.add_argument("--batch-size", type=int, default=256)
@@ -80,13 +81,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def resolve_output_paths(output_dir: Path | None) -> dict[str, Path]:
-    out_dir = Path(DATA_DIR) / "geometric_base_line_fit_check" if output_dir is None else Path(output_dir)
+    out_dir = Path(DATA_DIR) / "geometric_base_square_fit_check" if output_dir is None else Path(output_dir)
     out_dir = out_dir.expanduser().resolve()
     return {
         "output_dir": out_dir,
-        "png": out_dir / "geometric_base_line_fit_check.png",
-        "svg": out_dir / "geometric_base_line_fit_check.svg",
-        "summary": out_dir / "geometric_base_line_fit_check_summary.json",
+        "png": out_dir / "geometric_base_square_fit_check.png",
+        "svg": out_dir / "geometric_base_square_fit_check.svg",
+        "summary": out_dir / "geometric_base_square_fit_check_summary.json",
     }
 
 
@@ -138,11 +139,14 @@ def _split_indices(
     return train_idx.astype(np.int64), val_idx.astype(np.int64), test_idx.astype(np.int64)
 
 
-def _make_noisy_line_data(args: argparse.Namespace, theta_eval: np.ndarray) -> dict[str, Any]:
+def _make_noisy_square_data(args: argparse.Namespace, theta_eval: np.ndarray) -> dict[str, Any]:
     n_total = int(args.n_per_theta)
     max_plot = int(args.max_test_plot_per_theta)
     if max_plot < 1:
         raise ValueError("--max-test-plot-per-theta must be >= 1.")
+    condition_eval = _condition_one_hot(int(theta_eval.shape[0]))
+    split_rng = np.random.default_rng(int(args.seed) + 101)
+    plot_rng = np.random.default_rng(int(args.seed) + 202)
     theta_train_parts: list[np.ndarray] = []
     x_train_parts: list[np.ndarray] = []
     theta_val_parts: list[np.ndarray] = []
@@ -150,19 +154,17 @@ def _make_noisy_line_data(args: argparse.Namespace, theta_eval: np.ndarray) -> d
     theta_test_parts: list[np.ndarray] = []
     x_test_parts: list[np.ndarray] = []
     theta_test_plot_parts: list[np.ndarray] = []
-    x_test_plot_parts: list[np.ndarray] = []
     theta_test_plot_scalar_parts: list[np.ndarray] = []
+    x_test_plot_parts: list[np.ndarray] = []
     split_counts: dict[str, dict[str, int]] = {}
-    datasets: list[NoisyLineDataset] = []
-    condition_eval = _condition_one_hot(int(theta_eval.shape[0]))
-    split_rng = np.random.default_rng(int(args.seed) + 101)
-    plot_rng = np.random.default_rng(int(args.seed) + 202)
+    datasets: list[NoisySquareBoundaryDataset] = []
+
     for idx, theta_value in enumerate(theta_eval[:, 0]):
-        ds = NoisyLineDataset(
+        ds = NoisySquareBoundaryDataset(
             theta=float(theta_value),
-            ell=float(args.ell),
+            side_length=float(args.side_length),
             sigma=float(args.target_sigma),
-            shift=(float(args.shift_x), float(args.shift_y)),
+            center=(float(args.center_x), float(args.center_y)),
             seed=int(args.seed) + int(idx),
         )
         batch = ds.sample(n_total)
@@ -195,6 +197,7 @@ def _make_noisy_line_data(args: argparse.Namespace, theta_eval: np.ndarray) -> d
             "test_plotted": int(plot_idx.size),
         }
         datasets.append(ds)
+
     theta_train = np.concatenate(theta_train_parts, axis=0)
     x_train = np.concatenate(x_train_parts, axis=0)
     theta_val = np.concatenate(theta_val_parts, axis=0)
@@ -250,6 +253,7 @@ def _plot_overlay(
     x_plot: np.ndarray,
     theta_plot_scalar: np.ndarray,
     base_curve: np.ndarray,
+    target_curves: list[np.ndarray],
     fitted_curves: list[np.ndarray],
     skl_value: float,
     train_losses: np.ndarray,
@@ -266,7 +270,7 @@ def _plot_overlay(
     fig, (ax, ax_loss) = plt.subplots(
         1,
         2,
-        figsize=(11.6, 5.4),
+        figsize=(11.8, 5.5),
         gridspec_kw={"width_ratios": [1.12, 1.0]},
     )
     for idx, theta_value in enumerate(theta_eval[:, 0]):
@@ -275,28 +279,17 @@ def _plot_overlay(
         ax.scatter(
             x_plot[mask, 0],
             x_plot[mask, 1],
-            s=16,
+            s=14,
             alpha=0.48,
             color=color,
             linewidths=0,
             label=f"Test dataset {idx + 1}",
         )
-        curve = fitted_curves[idx]
-        ax.plot(
-            curve[:, 0],
-            curve[:, 1],
-            color=color,
-            linewidth=2.5,
-            label=f"fitted line {idx + 1}",
-        )
-    ax.plot(
-        base_curve[:, 0],
-        base_curve[:, 1],
-        color="#2f2f2f",
-        linewidth=2.0,
-        linestyle="--",
-        label="base line",
-    )
+        target = np.asarray(target_curves[idx], dtype=np.float64)
+        ax.plot(target[:, 0], target[:, 1], color=color, linewidth=1.2, linestyle=":", label=f"target square {idx + 1}")
+        curve = np.asarray(fitted_curves[idx], dtype=np.float64)
+        ax.plot(curve[:, 0], curve[:, 1], color=color, linewidth=2.4, label=f"fitted square {idx + 1}")
+    ax.plot(base_curve[:, 0], base_curve[:, 1], color="#2f2f2f", linewidth=2.0, linestyle="--", label="base square")
     ax.text(
         0.02,
         0.98,
@@ -309,8 +302,8 @@ def _plot_overlay(
     ax.set_aspect("equal", adjustable="box")
     ax.set_xlabel("x1")
     ax.set_ylabel("x2")
-    ax.set_title("Geometric-base affine flow line fit")
-    ax.legend(frameon=False, loc="best", fontsize=9)
+    ax.set_title("Geometric-base affine flow square fit")
+    ax.legend(frameon=False, loc="best", fontsize=8)
 
     epochs = np.arange(1, int(train_losses.size) + 1, dtype=np.int64)
     ax_loss.plot(epochs, train_losses, color="#4c78a8", linewidth=1.8, label="train loss")
@@ -325,13 +318,13 @@ def _plot_overlay(
         ax_nll.plot(nll_epochs, nll_train, color="#54a24b", linewidth=1.2, alpha=0.75, label="NLL train")
         ax_nll.plot(nll_epochs, nll_val, color="#54a24b", linewidth=1.5, linestyle=":", label="NLL validation")
         ax_nll.set_ylabel("NLL")
-        ax_nll.legend(frameon=False, loc="lower right", fontsize=9)
+        ax_nll.legend(frameon=False, loc="lower right", fontsize=8)
     ax_loss.set_xlabel("epoch")
     ax_loss.set_ylabel("FM loss")
     ax_loss.set_title("Training history")
     ax_loss.set_yscale("log")
     ax_loss.grid(alpha=0.25, linewidth=0.8)
-    ax_loss.legend(frameon=False, loc="best", fontsize=9)
+    ax_loss.legend(frameon=False, loc="best", fontsize=8)
 
     fig.tight_layout()
     png_path.parent.mkdir(parents=True, exist_ok=True)
@@ -351,14 +344,14 @@ def main(argv: list[str] | None = None) -> int:
     paths = resolve_output_paths(args.output_dir)
     paths["output_dir"].mkdir(parents=True, exist_ok=True)
     theta_eval = _parse_theta_values(str(args.theta_values))
-    data = _make_noisy_line_data(args, theta_eval)
+    data = _make_noisy_square_data(args, theta_eval)
     condition_eval = np.asarray(data["condition_eval"], dtype=np.float64)
     theta_train = np.asarray(data["theta_train"], dtype=np.float64)
     x_train = np.asarray(data["x_train"], dtype=np.float64)
     theta_val = np.asarray(data["theta_val"], dtype=np.float64)
     x_val = np.asarray(data["x_val"], dtype=np.float64)
 
-    base = LineSegmentBase(anchor=(0.0, 0.0), direction=(1.0, 0.0))
+    base = SquarePerimeterBase(center=(0.0, 0.0), side_length=float(args.base_side_length))
     model = CenteredConditionAffineFlowSKLModel(
         theta_dim=int(condition_eval.shape[1]),
         x_dim=2,
@@ -425,7 +418,8 @@ def main(argv: list[str] | None = None) -> int:
         train_metadata=train_meta,
     )
 
-    curve_u = torch.linspace(base.u_low, base.u_high, int(args.curve_points), dtype=torch.float32).reshape(-1, 1)
+    count = 4 * int(args.curve_points_per_edge) + 1
+    curve_u = torch.linspace(base.u_low, base.u_high, count, dtype=torch.float32).reshape(-1, 1)
     base_curve = base.points_from_u(curve_u).detach().cpu().numpy().astype(np.float64)
     fitted_curves: list[np.ndarray] = []
     for theta_row in condition_eval:
@@ -439,6 +433,7 @@ def main(argv: list[str] | None = None) -> int:
             ode_method=str(args.ode_method),
         )
         fitted_curves.append(curve.detach().cpu().numpy().astype(np.float64))
+    target_curves = [ds.boundary(points_per_edge=int(args.curve_points_per_edge)) for ds in data["datasets"]]
     skl_value = float(result.symmetric_kl_matrix[0, 1])
     _plot_overlay(
         png_path=paths["png"],
@@ -447,6 +442,7 @@ def main(argv: list[str] | None = None) -> int:
         x_plot=np.asarray(data["x_test_plot"], dtype=np.float64),
         theta_plot_scalar=np.asarray(data["theta_test_plot_scalar"], dtype=np.float64),
         base_curve=base_curve,
+        target_curves=target_curves,
         fitted_curves=fitted_curves,
         skl_value=skl_value,
         train_losses=np.asarray(train_meta["train_losses"], dtype=np.float64),
@@ -475,14 +471,16 @@ def main(argv: list[str] | None = None) -> int:
         "theta_values": theta_eval.reshape(-1),
         "theta_encoding": "one_hot",
         "condition_eval": condition_eval,
-        "ell": float(args.ell),
+        "side_length": float(args.side_length),
+        "base_side_length": float(args.base_side_length),
         "target_sigma": float(args.target_sigma),
-        "shift": [float(args.shift_x), float(args.shift_y)],
+        "center": [float(args.center_x), float(args.center_y)],
         "smooth_sigma": float(args.smooth_sigma),
         "mc_skl_samples": int(args.mc_skl_samples),
         "density_mc_samples": int(args.density_mc_samples),
         "ode_steps": int(args.ode_steps),
         "ode_method": str(args.ode_method),
+        "curve_points_per_edge": int(args.curve_points_per_edge),
         "nll_finetune": bool(args.nll_finetune),
         "nll_epochs": int(args.nll_epochs),
         "nll_batch_size": int(args.nll_batch_size) if int(args.nll_batch_size) > 0 else int(args.batch_size),
@@ -494,7 +492,7 @@ def main(argv: list[str] | None = None) -> int:
         "nll_checkpoint_selection": str(args.nll_checkpoint_selection),
     }
     summary = {
-        "script": "bin/run_geometric_base_line_fit_check.py",
+        "script": "bin/run_geometric_base_square_fit_check.py",
         "device": str(dev),
         "theta_values": theta_eval.reshape(-1),
         "theta_encoding": "one_hot",

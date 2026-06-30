@@ -91,6 +91,83 @@ class LineSegmentBase:
         return self.points_from_u(u), u
 
 
+@dataclass(frozen=True)
+class SquarePerimeterBase:
+    """Noiseless square-boundary base parameterized by perimeter coordinate ``u``."""
+
+    center: np.ndarray | tuple[float, float] = (0.0, 0.0)
+    side_length: float = 1.0
+    u_low: float = 0.0
+    u_high: float = 4.0
+    name: str = "square_perimeter"
+
+    def __post_init__(self) -> None:
+        center = np.asarray(self.center, dtype=np.float64).reshape(-1)
+        if center.shape != (2,):
+            raise ValueError("center must contain exactly two values.")
+        if not np.all(np.isfinite(center)):
+            raise ValueError("center must be finite.")
+        side = float(self.side_length)
+        if not math.isfinite(side) or side <= 0.0:
+            raise ValueError("side_length must be finite and positive.")
+        if not math.isfinite(float(self.u_low)) or not math.isfinite(float(self.u_high)):
+            raise ValueError("u bounds must be finite.")
+        if float(self.u_low) >= float(self.u_high):
+            raise ValueError("u_low must be < u_high.")
+        object.__setattr__(self, "center", center)
+        object.__setattr__(self, "side_length", side)
+        object.__setattr__(self, "u_low", float(self.u_low))
+        object.__setattr__(self, "u_high", float(self.u_high))
+
+    @property
+    def ambient_dim(self) -> int:
+        return 2
+
+    @property
+    def intrinsic_dim(self) -> int:
+        return 1
+
+    def sample_u(self, n: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        count = int(n)
+        if count < 1:
+            raise ValueError("n must be >= 1.")
+        return self.u_low + (self.u_high - self.u_low) * torch.rand(count, 1, device=device, dtype=dtype)
+
+    def points_from_u(self, u: torch.Tensor) -> torch.Tensor:
+        if u.ndim == 1:
+            u = u.unsqueeze(-1)
+        if u.ndim != 2 or int(u.shape[1]) != 1:
+            raise ValueError("u must have shape [N] or [N, 1].")
+        s = torch.remainder(u, 4.0)
+        h = 0.5 * float(self.side_length)
+        side = float(self.side_length)
+        x = torch.empty_like(s)
+        y = torch.empty_like(s)
+
+        m0 = s < 1.0
+        m1 = (s >= 1.0) & (s < 2.0)
+        m2 = (s >= 2.0) & (s < 3.0)
+        m3 = s >= 3.0
+        x[m0] = -h + side * s[m0]
+        y[m0] = -h
+        x[m1] = h
+        y[m1] = -h + side * (s[m1] - 1.0)
+        x[m2] = h - side * (s[m2] - 2.0)
+        y[m2] = h
+        x[m3] = -h
+        y[m3] = h - side * (s[m3] - 3.0)
+
+        center = torch.as_tensor(self.center, dtype=u.dtype, device=u.device).reshape(1, 2)
+        return torch.cat([x, y], dim=1) + center
+
+    def sample(self, n: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        return self.points_from_u(self.sample_u(int(n), device=device, dtype=dtype))
+
+    def sample_with_u(self, n: int, *, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+        u = self.sample_u(int(n), device=device, dtype=dtype)
+        return self.points_from_u(u), u
+
+
 def _make_mlp(*, in_dim: int, out_dim: int, hidden_dim: int, depth: int, final_gain: float = 0.01) -> nn.Sequential:
     if int(in_dim) < 1 or int(out_dim) < 1 or int(hidden_dim) < 1 or int(depth) < 1:
         raise ValueError("in_dim, out_dim, hidden_dim, and depth must be >= 1.")
@@ -178,6 +255,25 @@ def _condition_indices_from_rows(theta: np.ndarray, condition_eval: np.ndarray) 
             raise ValueError("Each theta row must match exactly one row of condition_eval.")
         out[i] = int(matches[0])
     return out
+
+
+def _geometric_base_metadata(base: Any) -> dict[str, Any]:
+    meta: dict[str, Any] = {
+        "base_name": str(getattr(base, "name", type(base).__name__)),
+        "base_u_low": float(getattr(base, "u_low")),
+        "base_u_high": float(getattr(base, "u_high")),
+        "base_ambient_dim": int(getattr(base, "ambient_dim")),
+        "base_intrinsic_dim": int(getattr(base, "intrinsic_dim", 1)),
+    }
+    if hasattr(base, "anchor"):
+        meta["base_anchor"] = np.asarray(getattr(base, "anchor"), dtype=np.float64)
+    if hasattr(base, "direction"):
+        meta["base_direction"] = np.asarray(getattr(base, "direction"), dtype=np.float64)
+    if hasattr(base, "center"):
+        meta["base_center"] = np.asarray(getattr(base, "center"), dtype=np.float64)
+    if hasattr(base, "side_length"):
+        meta["base_side_length"] = float(getattr(base, "side_length"))
+    return meta
 
 
 def train_geometric_base_affine_flow(
@@ -328,13 +424,8 @@ def train_geometric_base_affine_flow(
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    return {
+    meta = {
         "velocity_family": str(getattr(model, "velocity_family", "condition_time_affine_geometric_base")),
-        "base_name": str(base.name),
-        "base_anchor": np.asarray(base.anchor, dtype=np.float64),
-        "base_direction": np.asarray(base.direction, dtype=np.float64),
-        "base_u_low": float(base.u_low),
-        "base_u_high": float(base.u_high),
         "network_architecture": str(getattr(model, "network_architecture", "mlp")),
         "train_losses": np.asarray(train_losses, dtype=np.float64),
         "val_losses": np.asarray(val_losses, dtype=np.float64),
@@ -348,6 +439,8 @@ def train_geometric_base_affine_flow(
         "path_schedule": path_name,
         "early_ema_alpha": float(alpha),
     }
+    meta.update(_geometric_base_metadata(base))
+    return meta
 
 
 def _push_base_curve_ode(
@@ -873,6 +966,7 @@ def geometric_flow_result_to_npz_dict(result: FlowSKLResult) -> dict[str, Any]:
     for key in (
         "base_anchor",
         "base_direction",
+        "base_center",
         "train_losses",
         "val_losses",
         "val_monitor_losses",
@@ -882,6 +976,9 @@ def geometric_flow_result_to_npz_dict(result: FlowSKLResult) -> dict[str, Any]:
     for key in (
         "base_u_low",
         "base_u_high",
+        "base_ambient_dim",
+        "base_intrinsic_dim",
+        "base_side_length",
         "smooth_sigma",
         "mc_skl_samples",
         "density_mc_samples",
