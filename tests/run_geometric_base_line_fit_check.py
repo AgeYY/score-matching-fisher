@@ -75,6 +75,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--early-min-delta", type=float, default=1e-4)
     p.add_argument("--early-ema-alpha", type=float, default=0.05)
     p.add_argument("--max-grad-norm", type=float, default=10.0)
+    p.add_argument("--checkpoint-selection", choices=("best", "last"), default="best")
     p.add_argument("--log-every", type=int, default=100)
     return p
 
@@ -381,6 +382,7 @@ def main(argv: list[str] | None = None) -> int:
         min_delta=float(args.early_min_delta),
         ema_alpha=float(args.early_ema_alpha),
         max_grad_norm=float(args.max_grad_norm),
+        checkpoint_selection=str(args.checkpoint_selection),
         log_every=max(1, int(args.log_every)),
     )
     result = estimate_smoothed_curve_symmetric_kl(
@@ -446,6 +448,7 @@ def main(argv: list[str] | None = None) -> int:
         "early_min_delta": float(args.early_min_delta),
         "early_ema_alpha": float(args.early_ema_alpha),
         "max_grad_norm": float(args.max_grad_norm),
+        "checkpoint_selection": str(args.checkpoint_selection),
         "n_per_theta": int(args.n_per_theta),
         "train_frac": float(args.train_frac),
         "val_frac": float(args.val_frac),
@@ -481,6 +484,9 @@ def main(argv: list[str] | None = None) -> int:
         "best_val_loss": float(train_meta["best_val_loss"]),
         "stopped_epoch": int(train_meta["stopped_epoch"]),
         "stopped_early": bool(train_meta["stopped_early"]),
+        "checkpoint_selection": str(train_meta["checkpoint_selection"]),
+        "selected_epoch": int(train_meta["selected_epoch"]),
+        "selected_val_loss": float(train_meta["selected_val_loss"]),
         "png": paths["png"],
         "svg": paths["svg"],
         "summary": paths["summary"],
@@ -495,6 +501,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"skl: {skl_value:.12g}", flush=True)
     print(f"best_epoch: {int(train_meta['best_epoch'])}", flush=True)
     print(f"best_val_loss: {float(train_meta['best_val_loss']):.12g}", flush=True)
+    print(f"checkpoint_selection: {train_meta['checkpoint_selection']}", flush=True)
+    print(f"selected_epoch: {int(train_meta['selected_epoch'])}", flush=True)
+    print(f"selected_val_loss: {float(train_meta['selected_val_loss']):.12g}", flush=True)
     return 0
 
 

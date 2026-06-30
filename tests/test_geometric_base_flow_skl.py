@@ -233,8 +233,38 @@ def test_training_loop_records_ot_source_pairing() -> None:
     assert meta["source_pairing"] == "ot"
     assert meta["ot_method"] == "torch_sinkhorn"
     assert meta["ot_sinkhorn_iters"] == 100
+    assert meta["checkpoint_selection"] == "best"
+    assert meta["selected_epoch"] == meta["best_epoch"]
+    assert meta["selected_val_loss"] == pytest.approx(meta["best_val_loss"])
     assert np.asarray(meta["train_pairing_costs"]).shape == (1,)
     assert np.asarray(meta["val_pairing_costs"]).shape == (1,)
+
+
+def test_training_loop_can_keep_last_checkpoint() -> None:
+    base = LineSegmentBase(anchor=(0.0, 0.0), direction=(1.0, 0.0))
+    model = ConditionTimeAffineVelocity(theta_dim=1, x_dim=2, hidden_dim=4, depth=1)
+    theta = np.asarray([[0.0], [0.0], [1.0], [1.0]], dtype=np.float64)
+    x = np.asarray([[0.0, 0.0], [0.1, 0.0], [1.0, 0.2], [1.1, 0.3]], dtype=np.float64)
+
+    meta = train_geometric_base_affine_flow(
+        model=model,
+        base=base,
+        theta_train=theta,
+        x_train=x,
+        theta_val=theta,
+        x_val=x,
+        device=torch.device("cpu"),
+        epochs=2,
+        batch_size=2,
+        checkpoint_selection="last",
+        log_every=999,
+    )
+
+    assert meta["checkpoint_selection"] == "last"
+    assert meta["stopped_early"] is False
+    assert meta["stopped_epoch"] == 2
+    assert meta["selected_epoch"] == 2
+    assert meta["selected_val_loss"] == pytest.approx(np.asarray(meta["val_monitor_losses"])[-1])
 
 
 def test_push_base_curve_zero_ode_leaves_points_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -313,6 +343,7 @@ def test_geometric_base_flow_skl_cli_defaults() -> None:
     assert args.ot_method == "torch_sinkhorn"
     assert args.ot_reg == pytest.approx(0.05)
     assert args.ot_sinkhorn_iters == 100
+    assert args.checkpoint_selection == "best"
     assert args.smooth_sigma == pytest.approx(0.12)
     assert args.mc_skl_samples == 4096
     assert args.density_mc_samples == 1024
@@ -329,6 +360,7 @@ def test_geometric_base_line_fit_check_defaults() -> None:
     assert args.ot_method == "torch_sinkhorn"
     assert args.ot_reg == pytest.approx(0.05)
     assert args.ot_sinkhorn_iters == 100
+    assert args.checkpoint_selection == "best"
     assert mod.build_parser().parse_args(["--ot-method", "pot_sinkhorn"]).ot_method == "pot_sinkhorn"
     assert args.epochs == 50000
     assert args.early_patience == 1000
@@ -381,6 +413,7 @@ def test_geometric_base_line_fit_ot_compare_defaults() -> None:
     assert args.ot_method == "torch_sinkhorn"
     assert args.ot_reg == pytest.approx(0.05)
     assert args.ot_sinkhorn_iters == 100
+    assert args.checkpoint_selection == "best"
     assert mod.build_parser().parse_args(["--ot-method", "torch_sinkhorn"]).ot_method == "torch_sinkhorn"
     assert mod.build_parser().parse_args(["--ot-method", "pot_sinkhorn"]).ot_method == "pot_sinkhorn"
     assert args.epochs == 50000

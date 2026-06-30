@@ -82,6 +82,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--early-min-delta", type=float, default=1e-4)
     p.add_argument("--early-ema-alpha", type=float, default=0.05)
     p.add_argument("--max-grad-norm", type=float, default=10.0)
+    p.add_argument("--checkpoint-selection", choices=("best", "last"), default="best")
     p.add_argument("--log-every", type=int, default=100)
     return p
 
@@ -158,6 +159,7 @@ def _fit_one(
         min_delta=float(args.early_min_delta),
         ema_alpha=float(args.early_ema_alpha),
         max_grad_norm=float(args.max_grad_norm),
+        checkpoint_selection=str(args.checkpoint_selection),
         log_every=max(1, int(args.log_every)),
     )
     result = estimate_smoothed_curve_symmetric_kl(
@@ -212,6 +214,9 @@ def _fit_one(
         "best_val_loss": float(train_meta["best_val_loss"]),
         "stopped_epoch": int(train_meta["stopped_epoch"]),
         "stopped_early": bool(train_meta["stopped_early"]),
+        "checkpoint_selection": str(train_meta["checkpoint_selection"]),
+        "selected_epoch": int(train_meta["selected_epoch"]),
+        "selected_val_loss": float(train_meta["selected_val_loss"]),
     }
 
 
@@ -330,6 +335,9 @@ def _summary_for_method(method: dict[str, Any]) -> dict[str, Any]:
         "best_val_loss": method["best_val_loss"],
         "stopped_epoch": method["stopped_epoch"],
         "stopped_early": method["stopped_early"],
+        "checkpoint_selection": method["checkpoint_selection"],
+        "selected_epoch": method["selected_epoch"],
+        "selected_val_loss": method["selected_val_loss"],
         "train_metadata": meta,
     }
 
@@ -397,6 +405,7 @@ def main(argv: list[str] | None = None) -> int:
         "early_min_delta": float(args.early_min_delta),
         "early_ema_alpha": float(args.early_ema_alpha),
         "max_grad_norm": float(args.max_grad_norm),
+        "checkpoint_selection": str(args.checkpoint_selection),
         "n_per_theta": int(args.n_per_theta),
         "train_frac": float(args.train_frac),
         "val_frac": float(args.val_frac),
@@ -442,7 +451,10 @@ def main(argv: list[str] | None = None) -> int:
             f"skl={skl_text} "
             f"mean_angle_error={float(method['mean_angle_error_degrees']):.6g} "
             f"best_epoch={int(method['best_epoch'])} "
-            f"best_val_loss={float(method['best_val_loss']):.12g}",
+            f"best_val_loss={float(method['best_val_loss']):.12g} "
+            f"checkpoint={method['checkpoint_selection']} "
+            f"selected_epoch={int(method['selected_epoch'])} "
+            f"selected_val_loss={float(method['selected_val_loss']):.12g}",
             flush=True,
         )
     return 0

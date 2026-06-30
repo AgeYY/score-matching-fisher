@@ -197,6 +197,15 @@ def _resolve_ot_num_threads(num_threads: int | str) -> int | str:
     return value
 
 
+def _resolve_checkpoint_selection(checkpoint_selection: str) -> str:
+    key = str(checkpoint_selection).strip().lower().replace("-", "_")
+    if key in ("best", "best_validation", "best_val"):
+        return "best"
+    if key in ("last", "final"):
+        return "last"
+    raise ValueError("checkpoint_selection must be one of: best, last.")
+
+
 class MinibatchOTPlanSampler:
     """TorchCFM-style minibatch OT plan sampler using squared Euclidean costs."""
 
@@ -453,6 +462,7 @@ def train_geometric_base_affine_flow(
     ot_num_threads: int | str = 1,
     ot_sinkhorn_iters: int = 100,
     ot_replace: bool = True,
+    checkpoint_selection: str = "best",
 ) -> dict[str, Any]:
     """Train a conditional affine velocity from a geometric base to endpoint data."""
 
@@ -473,6 +483,7 @@ def train_geometric_base_affine_flow(
     pairing = _resolve_source_pairing(source_pairing)
     ot_method_resolved = _resolve_ot_method(ot_method)
     ot_num_threads_resolved = _resolve_ot_num_threads(ot_num_threads)
+    checkpoint_selection_resolved = _resolve_checkpoint_selection(checkpoint_selection)
     ot_sinkhorn_iters_resolved = int(ot_sinkhorn_iters)
     if ot_sinkhorn_iters_resolved < 1:
         raise ValueError("ot_sinkhorn_iters must be >= 1.")
@@ -625,8 +636,12 @@ def train_geometric_base_affine_flow(
             )
             break
 
-    if best_state is not None:
+    selected_epoch = int(stopped_epoch)
+    selected_val_loss = float(val_monitor_losses[-1]) if val_monitor_losses else float("nan")
+    if checkpoint_selection_resolved == "best" and best_state is not None:
         model.load_state_dict(best_state)
+        selected_epoch = int(best_epoch)
+        selected_val_loss = float(best_val)
 
     return {
         "velocity_family": str(getattr(model, "velocity_family", "condition_time_affine_geometric_base")),
@@ -643,6 +658,9 @@ def train_geometric_base_affine_flow(
         "best_epoch": int(best_epoch),
         "stopped_epoch": int(stopped_epoch),
         "stopped_early": bool(stopped_early),
+        "checkpoint_selection": checkpoint_selection_resolved,
+        "selected_epoch": int(selected_epoch),
+        "selected_val_loss": float(selected_val_loss),
         "n_clipped_steps": int(n_clipped_steps),
         "n_total_steps": int(n_total_steps),
         "path_schedule": path_name,
@@ -949,6 +967,9 @@ def geometric_flow_result_to_npz_dict(result: FlowSKLResult) -> dict[str, Any]:
         "best_epoch",
         "stopped_epoch",
         "stopped_early",
+        "checkpoint_selection",
+        "selected_epoch",
+        "selected_val_loss",
         "early_ema_alpha",
         "ot_reg",
         "ot_reg_m",
