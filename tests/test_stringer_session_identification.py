@@ -6,18 +6,21 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import torch
 from matplotlib.axes import Axes
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from fisher.continuous_fisher_comparison import METHOD_CLASSICAL_LINEAR, METHOD_FLOW_LINEAR
+from fisher.continuous_fisher_comparison import ContinuousFlowConfig, METHOD_CLASSICAL_LINEAR, METHOD_FLOW_LINEAR
 from fisher.stringer_session_identification import (
     DISTANCE_AREA_L2,
     DISTANCE_PRIMARY,
     DISTANCE_RMSE,
     DIRECTION_A_TO_B,
+    FLOW_ORIENTATION_ENCODING_PERIODIC_SINCOS,
+    FLOW_ORIENTATION_ENCODING_SCALAR,
     HALF_A,
     HALF_B,
     DISTANCES,
@@ -30,7 +33,10 @@ from fisher.stringer_session_identification import (
     compute_identification,
     compute_query_reference_identification,
     curve_distance,
+    encode_flow_orientation,
+    estimate_affine_mixed_symmetric_kl_fisher_for_conditions,
     fit_half_pca,
+    half_curve_signature,
     load_subsample_results_npz,
     plot_all_distance_summary,
     plot_subsample_convergence_summary,
@@ -75,6 +81,87 @@ def test_parse_positive_int_list_sorts_unique_values() -> None:
         parse_positive_int_list("")
     with pytest.raises(ValueError):
         parse_positive_int_list("0,1")
+
+
+def test_encode_flow_orientation_periodic_wraps_at_period() -> None:
+    period = float(np.pi)
+    theta = np.asarray([0.0, period, period / 4.0, period / 2.0], dtype=np.float64)
+
+    encoded = encode_flow_orientation(theta, period=period, encoding=FLOW_ORIENTATION_ENCODING_PERIODIC_SINCOS)
+
+    assert encoded.shape == (4, 2)
+    np.testing.assert_allclose(encoded[0], encoded[1], atol=1e-12)
+    np.testing.assert_allclose(encoded[2], [0.0, 1.0], atol=1e-12)
+    np.testing.assert_allclose(encoded[3], [-1.0, 0.0], atol=1e-12)
+
+
+def test_encode_flow_orientation_scalar_keeps_original_theta_column() -> None:
+    theta = np.asarray([0.0, 0.25, 0.5], dtype=np.float64)
+
+    encoded = encode_flow_orientation(theta, period=float(np.pi), encoding=FLOW_ORIENTATION_ENCODING_SCALAR)
+
+    assert encoded.shape == (3, 1)
+    np.testing.assert_allclose(encoded[:, 0], theta)
+
+
+def test_flow_orientation_encoding_changes_half_curve_cache_signature() -> None:
+    session_info = type("SessionInfo", (), {"session_file": "session_0.npy"})()
+    common = dict(
+        session_info=session_info,
+        session_index=0,
+        half_label=HALF_A,
+        half_indices=np.asarray([0, 1, 2], dtype=np.int64),
+        theta_grid=theta_grid_periodic(float(np.pi), 5),
+        period=float(np.pi),
+        pca_dim=2,
+        pca_random_state=0,
+        pca_whiten=True,
+        train_frac=0.8,
+        seed=1,
+        flow_config=ContinuousFlowConfig(epochs=3),
+        classical_ridge=1e-6,
+        classical_window_radius=None,
+        classical_min_endpoint_samples=1,
+    )
+
+    periodic = half_curve_signature(flow_orientation_encoding=FLOW_ORIENTATION_ENCODING_PERIODIC_SINCOS, **common)
+    scalar = half_curve_signature(flow_orientation_encoding=FLOW_ORIENTATION_ENCODING_SCALAR, **common)
+
+    assert periodic != scalar
+
+
+class _DummyAffineModel(torch.nn.Module):
+    x_dim = 1
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.zeros(()))
+
+    def endpoint_mean(self, condition: torch.Tensor) -> torch.Tensor:
+        return condition[:, :1]
+
+    def A(self, condition: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        del condition, t
+        return torch.zeros((1, 1, 1), dtype=self.weight.dtype, device=self.weight.device)
+
+
+def test_condition_fisher_readout_uses_scalar_theta_spacing_with_2d_conditions() -> None:
+    theta = np.asarray([0.0, 0.5], dtype=np.float64)
+    condition = np.asarray([[0.0, 1.0], [2.0, 0.0]], dtype=np.float64)
+
+    fd = estimate_affine_mixed_symmetric_kl_fisher_for_conditions(
+        model=_DummyAffineModel(),
+        theta_all=theta,
+        condition_all=condition,
+        device=torch.device("cpu"),
+        ode_steps=1,
+        ridge=0.0,
+    )
+
+    np.testing.assert_allclose(fd["condition_left"], condition[:1])
+    np.testing.assert_allclose(fd["condition_right"], condition[1:])
+    np.testing.assert_allclose(fd["adjacent_symmetric_kl"], [4.0])
+    np.testing.assert_allclose(fd["fisher"], [16.0])
 
 
 def test_stratified_half_split_is_complete_disjoint_and_balanced() -> None:
@@ -626,6 +713,7 @@ def test_cli_defaults_match_session_identification_plan() -> None:
     assert args.max_sessions is None
     assert args.theta_grid_size == 17
     assert args.pca_dim == 50
+    assert args.flow_orientation_encoding == FLOW_ORIENTATION_ENCODING_PERIODIC_SINCOS
     assert args.epochs == 50000
     assert args.early_patience == 1000
     assert args.visualization_only is False
@@ -637,3 +725,6 @@ def test_cli_defaults_match_session_identification_plan() -> None:
 
     with_replacement_args = mod.build_parser().parse_args(["--no-subsample-a-without-replacement"])
     assert with_replacement_args.subsample_a_without_replacement is False
+
+    scalar_args = mod.build_parser().parse_args(["--flow-orientation-encoding", FLOW_ORIENTATION_ENCODING_SCALAR])
+    assert scalar_args.flow_orientation_encoding == FLOW_ORIENTATION_ENCODING_SCALAR

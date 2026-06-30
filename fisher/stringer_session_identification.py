@@ -22,7 +22,6 @@ from fisher.distance_comparison import save_flow_result_npz
 from fisher.flow_matching_skl import (
     FlowSKLResult,
     build_flow_skl_model,
-    estimate_affine_mixed_symmetric_kl_fisher,
     train_flow_skl_model,
 )
 from fisher.shared_dataset_io import SharedDatasetBundle
@@ -57,6 +56,9 @@ DISTANCES = (DISTANCE_PRIMARY, DISTANCE_AREA_L2, DISTANCE_RMSE)
 HALF_A = "A"
 HALF_B = "B"
 DIRECTION_A_TO_B = "A_to_B"
+FLOW_ORIENTATION_ENCODING_SCALAR = "scalar"
+FLOW_ORIENTATION_ENCODING_PERIODIC_SINCOS = "periodic-sincos"
+FLOW_ORIENTATION_ENCODINGS = (FLOW_ORIENTATION_ENCODING_PERIODIC_SINCOS, FLOW_ORIENTATION_ENCODING_SCALAR)
 ASUBSAMPLE_TASK_ENDPOINT_FULL_A = "endpoint_full_a"
 ASUBSAMPLE_TASK_REFERENCE_B = "reference_b"
 ASUBSAMPLE_TASK_SUBSET_A = "subset_a"
@@ -481,6 +483,123 @@ def split_train_validation(n_total: int, *, train_frac: float, seed: int) -> tup
     return idx[:n_train], idx[n_train:]
 
 
+def normalize_flow_orientation_encoding(encoding: str) -> str:
+    enc = str(encoding).strip().lower()
+    if enc not in FLOW_ORIENTATION_ENCODINGS:
+        raise ValueError(f"flow_orientation_encoding must be one of {FLOW_ORIENTATION_ENCODINGS}, got {encoding!r}.")
+    return enc
+
+
+def encode_flow_orientation(theta: np.ndarray, *, period: float, encoding: str) -> np.ndarray:
+    enc = normalize_flow_orientation_encoding(encoding)
+    theta_col = np.asarray(theta, dtype=np.float64).reshape(-1, 1)
+    if enc == FLOW_ORIENTATION_ENCODING_SCALAR:
+        return theta_col
+    pp = float(period)
+    if pp <= 0.0 or not math.isfinite(pp):
+        raise ValueError("period must be finite and positive for periodic orientation encoding.")
+    phase = 2.0 * math.pi * np.mod(theta_col[:, 0], pp) / pp
+    return np.stack([np.cos(phase), np.sin(phase)], axis=1).astype(np.float64)
+
+
+def estimate_affine_mixed_symmetric_kl_fisher_for_conditions(
+    *,
+    model: torch.nn.Module,
+    theta_all: np.ndarray,
+    condition_all: np.ndarray,
+    device: torch.device,
+    ridge: float = 1e-6,
+    ode_steps: int = 64,
+) -> dict[str, Any]:
+    theta = np.asarray(theta_all, dtype=np.float64).reshape(-1, 1)
+    cond = np.asarray(condition_all, dtype=np.float64)
+    if cond.ndim == 1:
+        cond = cond.reshape(-1, 1)
+    if int(theta.shape[0]) != int(cond.shape[0]):
+        raise ValueError("theta_all and condition_all must have the same number of rows.")
+    if int(theta.shape[0]) < 2:
+        raise ValueError("At least two theta points are required.")
+    if not hasattr(model, "endpoint_mean") or not hasattr(model, "A"):
+        raise ValueError("Affine mixed-covariance Fisher requires model.endpoint_mean() and model.A().")
+    steps = int(ode_steps)
+    if steps < 1:
+        raise ValueError("ode_steps must be >= 1.")
+    rr = float(ridge)
+    if rr < 0.0 or not math.isfinite(rr):
+        raise ValueError("ridge must be finite and nonnegative.")
+
+    order = np.argsort(theta[:, 0], kind="mergesort")
+    theta_s = theta[order]
+    cond_s = cond[order]
+    dtheta = np.diff(theta_s[:, 0])
+    if np.any(dtheta <= 0.0):
+        raise ValueError("theta_all must contain strictly increasing unique scalar values after sorting.")
+
+    model.to(device)
+    model.eval()
+    try:
+        dtype = next(model.parameters()).dtype
+    except StopIteration:
+        dtype = torch.float32
+    if not dtype.is_floating_point:
+        dtype = torch.float32
+    x_dim = int(getattr(model, "x_dim"))
+    n_theta = int(theta_s.shape[0])
+    eye_np = np.eye(x_dim, dtype=np.float64)
+    fish = np.zeros(n_theta - 1, dtype=np.float64)
+    adjacent_skl = np.zeros(n_theta - 1, dtype=np.float64)
+    skl_matrix = np.zeros((n_theta, n_theta), dtype=np.float64)
+    mid_covs = np.zeros((n_theta - 1, x_dim, x_dim), dtype=np.float64)
+    deltas = np.zeros((n_theta - 1, x_dim), dtype=np.float64)
+
+    def _a_for(condition: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        try:
+            return model.A(condition, t)
+        except TypeError:
+            return model.A(t)
+
+    for i in range(n_theta - 1):
+        cond_l = torch.from_numpy(cond_s[i : i + 1].astype(np.float32)).to(device=device, dtype=dtype)
+        cond_r = torch.from_numpy(cond_s[i + 1 : i + 2].astype(np.float32)).to(device=device, dtype=dtype)
+        mu_l = model.endpoint_mean(cond_l).detach().cpu().numpy().reshape(-1).astype(np.float64)
+        mu_r = model.endpoint_mean(cond_r).detach().cpu().numpy().reshape(-1).astype(np.float64)
+        delta = mu_r - mu_l
+        sigma = eye_np.copy()
+        dt = 1.0 / float(steps)
+        for step in range(steps):
+            t_val = (float(step) + 0.5) * dt
+            tt = torch.full((1, 1), t_val, dtype=dtype, device=device)
+            a_l = _a_for(cond_l, tt)
+            a_r = _a_for(cond_r, tt)
+            a_bar = (0.5 * (a_l + a_r)).detach().cpu().numpy().reshape(x_dim, x_dim).astype(np.float64)
+            sigma = sigma + dt * (a_bar @ sigma + sigma @ a_bar.T)
+            sigma = 0.5 * (sigma + sigma.T)
+        cov = sigma + rr * eye_np
+        skl = max(0.0, float(delta @ np.linalg.solve(cov, delta)))
+        adjacent_skl[i] = skl
+        skl_matrix[i, i + 1] = skl
+        skl_matrix[i + 1, i] = skl
+        fish[i] = skl / float(dtheta[i] ** 2)
+        mid_covs[i] = sigma
+        deltas[i] = delta
+
+    return {
+        "theta_midpoints": (0.5 * (theta_s[:-1, 0] + theta_s[1:, 0])).reshape(-1, 1).astype(np.float64),
+        "theta_left": theta_s[:-1].astype(np.float64),
+        "theta_right": theta_s[1:].astype(np.float64),
+        "condition_left": cond_s[:-1].astype(np.float64),
+        "condition_right": cond_s[1:].astype(np.float64),
+        "dtheta": dtheta.astype(np.float64),
+        "delta_mu": deltas,
+        "mixed_covariance": mid_covs,
+        "adjacent_symmetric_kl": adjacent_skl,
+        "symmetric_kl_matrix": skl_matrix,
+        "canonical_metric_matrix": skl_matrix.copy(),
+        "canonical_metric_name": "mixed_affine_symmetric_kl",
+        "fisher": fish,
+    }
+
+
 def make_shared_bundle(
     *,
     theta_all: np.ndarray,
@@ -510,6 +629,8 @@ def train_flow_linear_curve(
     *,
     bundle: SharedDatasetBundle,
     theta_grid: np.ndarray,
+    period: float,
+    flow_orientation_encoding: str,
     device: torch.device,
     config: ContinuousFlowConfig,
     seed: int,
@@ -519,9 +640,13 @@ def train_flow_linear_curve(
     np.random.seed(int(seed))
     if device.type == "cuda":
         torch.cuda.manual_seed_all(int(seed))
+    encoding = normalize_flow_orientation_encoding(flow_orientation_encoding)
+    condition_train = encode_flow_orientation(bundle.theta_train, period=float(period), encoding=encoding)
+    condition_val = encode_flow_orientation(bundle.theta_validation, period=float(period), encoding=encoding)
+    condition_grid = encode_flow_orientation(theta_grid, period=float(period), encoding=encoding)
     model = build_flow_skl_model(
         velocity_family="condition_affine",
-        theta_dim=1,
+        theta_dim=int(condition_train.shape[1]),
         x_dim=int(np.asarray(bundle.x_train).shape[1]),
         hidden_dim=int(config.hidden_dim),
         depth=int(config.depth),
@@ -533,9 +658,9 @@ def train_flow_linear_curve(
     ).to(device)
     train_meta = train_flow_skl_model(
         model=model,
-        theta_train=np.asarray(bundle.theta_train, dtype=np.float64).reshape(-1, 1),
+        theta_train=condition_train,
         x_train=np.asarray(bundle.x_train, dtype=np.float64),
-        theta_val=np.asarray(bundle.theta_validation, dtype=np.float64).reshape(-1, 1),
+        theta_val=condition_val,
         x_val=np.asarray(bundle.x_validation, dtype=np.float64),
         device=device,
         velocity_family="condition_affine",
@@ -551,9 +676,18 @@ def train_flow_linear_curve(
         max_grad_norm=float(config.max_grad_norm),
         log_every=max(1, int(config.log_every)),
     )
-    fd = estimate_affine_mixed_symmetric_kl_fisher(
+    train_meta = dict(train_meta)
+    train_meta.update(
+        {
+            "flow_orientation_encoding": encoding,
+            "orientation_period": float(period),
+            "flow_condition_dim": int(condition_train.shape[1]),
+        }
+    )
+    fd = estimate_affine_mixed_symmetric_kl_fisher_for_conditions(
         model=model,
         theta_all=theta_grid,
+        condition_all=condition_grid,
         device=device,
         ridge=float(config.affine_ridge),
         ode_steps=int(config.ode_steps),
@@ -629,6 +763,7 @@ def half_curve_signature(
     train_frac: float,
     seed: int,
     flow_config: ContinuousFlowConfig,
+    flow_orientation_encoding: str,
     classical_ridge: float,
     classical_window_radius: float | None,
     classical_min_endpoint_samples: int,
@@ -647,6 +782,7 @@ def half_curve_signature(
             "train_frac": float(train_frac),
             "seed": int(seed),
             "flow_config": json_ready(vars(flow_config)),
+            "flow_orientation_encoding": normalize_flow_orientation_encoding(flow_orientation_encoding),
             "classical_ridge": float(classical_ridge),
             "classical_window_radius": classical_window_radius,
             "classical_min_endpoint_samples": int(classical_min_endpoint_samples),
@@ -722,6 +858,7 @@ def estimate_half_curves(
     seed: int,
     device: torch.device,
     flow_config: ContinuousFlowConfig,
+    flow_orientation_encoding: str,
     output_dir: Path,
     force: bool,
     save_flow_npz: bool,
@@ -744,6 +881,7 @@ def estimate_half_curves(
         train_frac=float(train_frac),
         seed=int(seed),
         flow_config=flow_config,
+        flow_orientation_encoding=flow_orientation_encoding,
         classical_ridge=float(classical_ridge),
         classical_window_radius=classical_window_radius,
         classical_min_endpoint_samples=int(classical_min_endpoint_samples),
@@ -797,6 +935,8 @@ def estimate_half_curves(
     flow, train_meta, flow_path = train_flow_linear_curve(
         bundle=bundle,
         theta_grid=theta_grid,
+        period=float(period),
+        flow_orientation_encoding=flow_orientation_encoding,
         device=device,
         config=flow_config,
         seed=int(seed),
@@ -998,6 +1138,7 @@ def run_session_identification(
     device: torch.device,
     flow_config: ContinuousFlowConfig,
     output_dir: Path,
+    flow_orientation_encoding: str = FLOW_ORIENTATION_ENCODING_PERIODIC_SINCOS,
     force: bool = False,
     save_flow_npz: bool = True,
     classical_ridge: float = 1e-6,
@@ -1031,6 +1172,7 @@ def run_session_identification(
                     seed=int(seed) + 1000 * int(session_index) + int(half_offset),
                     device=device,
                     flow_config=flow_config,
+                    flow_orientation_encoding=flow_orientation_encoding,
                     output_dir=output_dir,
                     force=bool(force),
                     save_flow_npz=bool(save_flow_npz),
@@ -1054,6 +1196,14 @@ def run_session_identification(
         "query_half": HALF_A,
         "reference_half": HALF_B,
         "orientation_period": float(period),
+        "flow_orientation_encoding": normalize_flow_orientation_encoding(flow_orientation_encoding),
+        "flow_condition_dim": int(
+            encode_flow_orientation(
+                np.asarray(theta_grid, dtype=np.float64).reshape(-1),
+                period=float(period),
+                encoding=flow_orientation_encoding,
+            ).shape[1]
+        ),
         "theta_grid_size": int(np.asarray(theta_grid).reshape(-1).shape[0]),
         "pca_fit_scope": "half",
         "pca_label_blind": True,
@@ -1148,6 +1298,7 @@ def resolve_a_subsample_curve_task(
     output_dir: Path,
     n_values: list[int],
     sampling: str,
+    flow_orientation_encoding: str = FLOW_ORIENTATION_ENCODING_PERIODIC_SINCOS,
     replace: bool = True,
     classical_ridge: float = 1e-6,
     classical_window_radius: float | None = None,
@@ -1225,6 +1376,7 @@ def resolve_a_subsample_curve_task(
         train_frac=float(train_frac),
         seed=int(task_seed),
         flow_config=flow_config,
+        flow_orientation_encoding=flow_orientation_encoding,
         classical_ridge=float(classical_ridge),
         classical_window_radius=classical_window_radius,
         classical_min_endpoint_samples=int(classical_min_endpoint_samples),
@@ -1263,6 +1415,7 @@ def estimate_a_subsample_curve_task(
     output_dir: Path,
     n_values: list[int],
     sampling: str,
+    flow_orientation_encoding: str = FLOW_ORIENTATION_ENCODING_PERIODIC_SINCOS,
     replace: bool = True,
     force: bool = False,
     save_flow_npz: bool = True,
@@ -1281,6 +1434,7 @@ def estimate_a_subsample_curve_task(
         train_frac=float(train_frac),
         seed=int(seed),
         flow_config=flow_config,
+        flow_orientation_encoding=flow_orientation_encoding,
         output_dir=output_dir,
         n_values=n_values,
         sampling=str(sampling),
@@ -1304,6 +1458,7 @@ def estimate_a_subsample_curve_task(
         seed=int(resolved.seed),
         device=device,
         flow_config=flow_config,
+        flow_orientation_encoding=flow_orientation_encoding,
         output_dir=resolved.output_dir,
         force=bool(force),
         save_flow_npz=bool(save_flow_npz),
@@ -1329,6 +1484,7 @@ def run_a_subsample_convergence(
     n_values: list[int],
     repeats: int,
     sampling: str,
+    flow_orientation_encoding: str = FLOW_ORIENTATION_ENCODING_PERIODIC_SINCOS,
     replace: bool = True,
     force: bool = False,
     save_flow_npz: bool = True,
@@ -1378,6 +1534,7 @@ def run_a_subsample_convergence(
                 seed=int(seed) + 1000 * int(session_index),
                 device=device,
                 flow_config=flow_config,
+                flow_orientation_encoding=flow_orientation_encoding,
                 output_dir=output_dir / "endpoint_full_a",
                 force=bool(force),
                 save_flow_npz=bool(save_flow_npz),
@@ -1401,6 +1558,7 @@ def run_a_subsample_convergence(
                 seed=int(seed) + 1000 * int(session_index) + 1,
                 device=device,
                 flow_config=flow_config,
+                flow_orientation_encoding=flow_orientation_encoding,
                 output_dir=output_dir / "reference_b",
                 force=bool(force),
                 save_flow_npz=bool(save_flow_npz),
@@ -1436,6 +1594,15 @@ def run_a_subsample_convergence(
             "identification_direction": DIRECTION_A_TO_B,
             "query_half": HALF_A,
             "reference_half": HALF_B,
+            "orientation_period": float(period),
+            "flow_orientation_encoding": normalize_flow_orientation_encoding(flow_orientation_encoding),
+            "flow_condition_dim": int(
+                encode_flow_orientation(
+                    np.asarray(theta_grid, dtype=np.float64).reshape(-1),
+                    period=float(period),
+                    encoding=flow_orientation_encoding,
+                ).shape[1]
+            ),
         },
     )
 
@@ -1489,6 +1656,7 @@ def run_a_subsample_convergence(
                         seed=int(seed) + 200000 * int(ni + 1) + 10000 * int(repeat + 1) + int(session_index),
                         device=device,
                         flow_config=flow_config,
+                        flow_orientation_encoding=flow_orientation_encoding,
                         output_dir=output_dir / "subset_a" / f"n_{int(n_subset):06d}" / f"repeat_{int(repeat):03d}",
                         force=bool(force),
                         save_flow_npz=bool(save_flow_npz),
@@ -1565,6 +1733,14 @@ def run_a_subsample_convergence(
         "subsample_replace": bool(replace),
         "subsample_without_replacement": not bool(replace),
         "orientation_period": float(period),
+        "flow_orientation_encoding": normalize_flow_orientation_encoding(flow_orientation_encoding),
+        "flow_condition_dim": int(
+            encode_flow_orientation(
+                np.asarray(theta_grid, dtype=np.float64).reshape(-1),
+                period=float(period),
+                encoding=flow_orientation_encoding,
+            ).shape[1]
+        ),
         "theta_grid_size": int(np.asarray(theta_grid).reshape(-1).shape[0]),
         "pca_fit_scope": "A subset or B half",
         "pca_label_blind": True,

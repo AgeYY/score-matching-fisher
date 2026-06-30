@@ -24,6 +24,8 @@ from fisher.stringer_session_identification import (
     DIRECTION_A_TO_B,
     CURVES_CSV_NAME,
     DISTANCES,
+    FLOW_ORIENTATION_ENCODINGS,
+    FLOW_ORIENTATION_ENCODING_PERIODIC_SINCOS,
     HEATMAPS_PNG_NAME,
     HEATMAPS_SVG_NAME,
     METHODS,
@@ -88,6 +90,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--device", type=str, default=DEFAULT_DEVICE)
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--orientation-period", type=float, default=float(np.pi))
+    p.add_argument(
+        "--flow-orientation-encoding",
+        choices=FLOW_ORIENTATION_ENCODINGS,
+        default=FLOW_ORIENTATION_ENCODING_PERIODIC_SINCOS,
+        help="Conditioning used by the flow model for Stringer orientation.",
+    )
     p.add_argument("--theta-grid-size", type=int, default=17)
     p.add_argument("--pca-dim", type=int, default=50)
     p.add_argument("--pca-random-state", type=int, default=0)
@@ -311,6 +319,7 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
             n_values=parse_positive_int_list(str(args.subsample_a_n_list)),
             repeats=int(args.subsample_a_repeats),
             sampling=str(args.subsample_a_sampling),
+            flow_orientation_encoding=str(args.flow_orientation_encoding),
             replace=not bool(args.subsample_a_without_replacement),
             force=bool(args.force),
             save_flow_npz=not bool(args.skip_flow_npz),
@@ -358,6 +367,7 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
                 "subsample_logcorr_example_svg": str(logcorr_example_svg),
                 "subsample_logcorr_example_png": str(logcorr_example_png),
                 "flow_config": vars(flow_config_from_args(args)),
+                "flow_orientation_encoding": str(args.flow_orientation_encoding),
                 "classical_config": {
                     "linear_ridge": float(args.classical_linear_ridge),
                     "window_radius": args.classical_window_radius,
@@ -408,6 +418,7 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
         device=device,
         flow_config=flow_config_from_args(args),
         output_dir=output_dir,
+        flow_orientation_encoding=str(args.flow_orientation_encoding),
         force=bool(args.force),
         save_flow_npz=not bool(args.skip_flow_npz),
         classical_ridge=float(args.classical_linear_ridge),
@@ -445,6 +456,7 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
             "all_distance_summary_svg": str(all_summary_svg),
             "all_distance_summary_png": str(all_summary_png),
             "flow_config": vars(flow_config_from_args(args)),
+            "flow_orientation_encoding": str(args.flow_orientation_encoding),
             "classical_config": {
                 "linear_ridge": float(args.classical_linear_ridge),
                 "window_radius": args.classical_window_radius,

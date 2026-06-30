@@ -73,6 +73,8 @@ def test_worker_and_aggregation_commands_use_logical_cuda_and_skip_parallel_flag
             "5",
             "--force",
             "--subsample-a-without-replacement",
+            "--flow-orientation-encoding",
+            "scalar",
         ]
     )
     task_json = tmp_path / "task.json"
@@ -94,6 +96,8 @@ def test_worker_and_aggregation_commands_use_logical_cuda_and_skip_parallel_flag
     assert "--force" not in aggregation
     assert "--subsample-a-without-replacement" in worker
     assert "--subsample-a-without-replacement" in aggregation
+    assert "--flow-orientation-encoding scalar" in worker_joined
+    assert "--flow-orientation-encoding scalar" in aggregation_joined
     assert "True" not in worker
     assert "False" not in worker
     assert "--epochs 7" in worker_joined
