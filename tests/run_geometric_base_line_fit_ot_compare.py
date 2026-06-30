@@ -45,7 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--theta-values", type=str, default="0.7853981633974483")
     p.add_argument("--ell", type=float, default=1.5)
-    p.add_argument("--target-sigma", type=float, default=0.12)
+    p.add_argument("--target-sigma", type=float, default=0.03)
     p.add_argument("--shift-x", type=float, default=0.0)
     p.add_argument("--shift-y", type=float, default=0.0)
     p.add_argument("--n-per-theta", type=int, default=3000)
