@@ -170,13 +170,15 @@ def _resolve_ot_method(ot_method: str) -> str:
     key = str(ot_method).strip().lower().replace("-", "_")
     if key in ("exact", "emd"):
         return "exact"
-    if key in ("sinkhorn", "entropic"):
-        return "sinkhorn"
+    if key in ("sinkhorn", "entropic", "torch_sinkhorn", "gpu_sinkhorn"):
+        return "torch_sinkhorn"
+    if key in ("pot_sinkhorn", "cpu_sinkhorn"):
+        return "pot_sinkhorn"
     if key in ("unbalanced", "unbalanced_sinkhorn"):
         return "unbalanced"
     if key in ("partial", "partial_wasserstein"):
         return "partial"
-    raise ValueError("ot_method must be one of: exact, sinkhorn, unbalanced, partial.")
+    raise ValueError("ot_method must be one of: exact, sinkhorn, torch_sinkhorn, pot_sinkhorn, unbalanced, partial.")
 
 
 def _resolve_ot_num_threads(num_threads: int | str) -> int | str:
@@ -206,6 +208,7 @@ class MinibatchOTPlanSampler:
         reg_m: float = 1.0,
         normalize_cost: bool = False,
         num_threads: int | str = 1,
+        sinkhorn_iters: int = 100,
         warn: bool = True,
     ) -> None:
         self.method = _resolve_ot_method(method)
@@ -213,11 +216,14 @@ class MinibatchOTPlanSampler:
         self.reg_m = float(reg_m)
         self.normalize_cost = bool(normalize_cost)
         self.num_threads = _resolve_ot_num_threads(num_threads)
+        self.sinkhorn_iters = int(sinkhorn_iters)
         self.warn = bool(warn)
         if self.reg <= 0.0:
             raise ValueError("ot_reg must be > 0.")
         if self.reg_m <= 0.0:
             raise ValueError("ot_reg_m must be > 0.")
+        if self.sinkhorn_iters < 1:
+            raise ValueError("ot_sinkhorn_iters must be >= 1.")
 
     def _pot_module(self):
         try:
@@ -240,7 +246,7 @@ class MinibatchOTPlanSampler:
         pi[row_ind, col_ind] = 1.0 / float(cost.shape[0])
         return pi
 
-    def get_map(self, x0: torch.Tensor, x1: torch.Tensor) -> tuple[np.ndarray, float]:
+    def _cost_matrix(self, x0: torch.Tensor, x1: torch.Tensor) -> torch.Tensor:
         if x0.ndim < 2 or x1.ndim < 2 or int(x0.shape[0]) < 1 or int(x1.shape[0]) < 1:
             raise ValueError("x0 and x1 must have shape [batch, ...] with non-empty batches.")
         x0_flat = x0.reshape(int(x0.shape[0]), -1) if x0.ndim > 2 else x0
@@ -253,7 +259,43 @@ class MinibatchOTPlanSampler:
                 cost_max = torch.max(cost_t)
                 if float(cost_max.detach().cpu()) > 0.0:
                     cost_t = cost_t / cost_max
-            cost = cost_t.detach().cpu().numpy().astype(np.float64, copy=False)
+        return cost_t
+
+    def get_torch_map(self, x0: torch.Tensor, x1: torch.Tensor) -> tuple[torch.Tensor, float]:
+        """Compute an entropic balanced OT plan on the input tensor device."""
+
+        cost_t = self._cost_matrix(x0, x1)
+        work_dtype = torch.float64 if cost_t.dtype == torch.float64 else torch.float32
+        cost = cost_t.to(dtype=work_dtype)
+        m, n = int(cost.shape[0]), int(cost.shape[1])
+        log_a = torch.full((m,), -math.log(float(m)), device=cost.device, dtype=work_dtype)
+        log_b = torch.full((n,), -math.log(float(n)), device=cost.device, dtype=work_dtype)
+        log_k = -cost / float(self.reg)
+        log_u = torch.zeros_like(log_a)
+        log_v = torch.zeros_like(log_b)
+        for _ in range(self.sinkhorn_iters):
+            log_u = log_a - torch.logsumexp(log_k + log_v.reshape(1, n), dim=1)
+            log_v = log_b - torch.logsumexp(log_k + log_u.reshape(m, 1), dim=0)
+        pi = torch.exp(log_u.reshape(m, 1) + log_k + log_v.reshape(1, n))
+        if not bool(torch.all(torch.isfinite(pi)).detach().cpu()):
+            if self.warn:
+                warnings.warn("Numerical errors in torch Sinkhorn plan, reverting to a uniform plan.", RuntimeWarning)
+            pi = torch.full_like(pi, 1.0 / float(m * n))
+        total_mass = torch.sum(pi)
+        if float(torch.abs(total_mass).detach().cpu()) < 1e-8:
+            if self.warn:
+                warnings.warn("Torch Sinkhorn plan has near-zero mass, reverting to a uniform plan.", RuntimeWarning)
+            pi = torch.full_like(pi, 1.0 / float(m * n))
+            total_mass = torch.sum(pi)
+        plan_cost = float((torch.sum(pi * cost) / torch.clamp(total_mass, min=1e-12)).detach().cpu())
+        return pi, plan_cost
+
+    def get_map(self, x0: torch.Tensor, x1: torch.Tensor) -> tuple[np.ndarray, float]:
+        if self.method == "torch_sinkhorn":
+            pi_t, plan_cost = self.get_torch_map(x0, x1)
+            return pi_t.detach().cpu().numpy().astype(np.float64, copy=False), plan_cost
+        cost_t = self._cost_matrix(x0, x1)
+        cost = cost_t.detach().cpu().numpy().astype(np.float64, copy=False)
 
         pot = self._pot_module()
         if pot is None:
@@ -268,7 +310,7 @@ class MinibatchOTPlanSampler:
             b = pot.unif(int(x1.shape[0]))
             if self.method == "exact":
                 pi = pot.emd(a, b, cost, numThreads=self.num_threads)
-            elif self.method == "sinkhorn":
+            elif self.method == "pot_sinkhorn":
                 pi = pot.sinkhorn(a, b, cost, reg=self.reg)
             elif self.method == "unbalanced":
                 pi = pot.unbalanced.sinkhorn_knopp_unbalanced(a, b, cost, reg=self.reg, reg_m=self.reg_m)
@@ -293,6 +335,20 @@ class MinibatchOTPlanSampler:
         choices = np.random.choice(int(pi.shape[0]) * int(pi.shape[1]), p=p, size=int(batch_size), replace=bool(replace))
         return np.divmod(choices, int(pi.shape[1]))
 
+    def sample_torch_map(
+        self,
+        pi: torch.Tensor,
+        batch_size: int,
+        *,
+        replace: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        p = pi.reshape(-1)
+        p = p / torch.sum(p)
+        choices = torch.multinomial(p, num_samples=int(batch_size), replacement=bool(replace))
+        rows = torch.div(choices, int(pi.shape[1]), rounding_mode="floor")
+        cols = torch.remainder(choices, int(pi.shape[1]))
+        return rows.to(dtype=torch.long), cols.to(dtype=torch.long)
+
     def sample_plan(
         self,
         x0: torch.Tensor,
@@ -300,6 +356,10 @@ class MinibatchOTPlanSampler:
         *,
         replace: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
+        if self.method == "torch_sinkhorn":
+            pi_t, plan_cost = self.get_torch_map(x0, x1)
+            i, j = self.sample_torch_map(pi_t, int(x0.shape[0]), replace=bool(replace))
+            return x0.index_select(0, i), x1.index_select(0, j), i, j, plan_cost
         pi, plan_cost = self.get_map(x0, x1)
         i_np, j_np = self.sample_map(pi, int(x0.shape[0]), replace=bool(replace))
         i = torch.as_tensor(i_np, device=x0.device, dtype=torch.long)
@@ -311,11 +371,12 @@ def _ot_pair_source_to_target_batch(
     x0: torch.Tensor,
     x1: torch.Tensor,
     *,
-    ot_method: str = "sinkhorn",
+    ot_method: str = "torch_sinkhorn",
     ot_reg: float = 0.05,
     ot_reg_m: float = 1.0,
     ot_normalize_cost: bool = False,
     ot_num_threads: int | str = 1,
+    ot_sinkhorn_iters: int = 100,
     ot_replace: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
     """Sample source-target pairs from a TorchCFM-style minibatch OT plan."""
@@ -328,6 +389,7 @@ def _ot_pair_source_to_target_batch(
         reg_m=float(ot_reg_m),
         normalize_cost=bool(ot_normalize_cost),
         num_threads=ot_num_threads,
+        sinkhorn_iters=int(ot_sinkhorn_iters),
     )
     x0_ot, x1_ot, _i, j, plan_cost = sampler.sample_plan(x0, x1, replace=bool(ot_replace))
     return x0_ot, x1_ot, j, plan_cost
@@ -343,6 +405,7 @@ def _pair_source_to_target_batch(
     ot_reg_m: float,
     ot_normalize_cost: bool,
     ot_num_threads: int | str,
+    ot_sinkhorn_iters: int,
     ot_replace: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, float | None]:
     pairing = _resolve_source_pairing(source_pairing)
@@ -356,6 +419,7 @@ def _pair_source_to_target_batch(
         ot_reg_m=float(ot_reg_m),
         ot_normalize_cost=bool(ot_normalize_cost),
         ot_num_threads=ot_num_threads,
+        ot_sinkhorn_iters=int(ot_sinkhorn_iters),
         ot_replace=bool(ot_replace),
     )
     return x0_ot, x1_ot, target_idx, plan_cost
@@ -382,11 +446,12 @@ def train_geometric_base_affine_flow(
     max_grad_norm: float = 10.0,
     log_every: int = 50,
     source_pairing: str = "random",
-    ot_method: str = "sinkhorn",
+    ot_method: str = "torch_sinkhorn",
     ot_reg: float = 0.05,
     ot_reg_m: float = 1.0,
     ot_normalize_cost: bool = False,
     ot_num_threads: int | str = 1,
+    ot_sinkhorn_iters: int = 100,
     ot_replace: bool = True,
 ) -> dict[str, Any]:
     """Train a conditional affine velocity from a geometric base to endpoint data."""
@@ -408,6 +473,9 @@ def train_geometric_base_affine_flow(
     pairing = _resolve_source_pairing(source_pairing)
     ot_method_resolved = _resolve_ot_method(ot_method)
     ot_num_threads_resolved = _resolve_ot_num_threads(ot_num_threads)
+    ot_sinkhorn_iters_resolved = int(ot_sinkhorn_iters)
+    if ot_sinkhorn_iters_resolved < 1:
+        raise ValueError("ot_sinkhorn_iters must be >= 1.")
 
     th_tr = _as_2d_float64(theta_train, name="theta_train")
     x_tr = _as_2d_float64(x_train, name="x_train")
@@ -470,6 +538,7 @@ def train_geometric_base_affine_flow(
                 ot_reg_m=float(ot_reg_m),
                 ot_normalize_cost=bool(ot_normalize_cost),
                 ot_num_threads=ot_num_threads_resolved,
+                ot_sinkhorn_iters=ot_sinkhorn_iters_resolved,
                 ot_replace=bool(ot_replace),
             )
             if target_idx is not None:
@@ -513,6 +582,7 @@ def train_geometric_base_affine_flow(
                     ot_reg_m=float(ot_reg_m),
                     ot_normalize_cost=bool(ot_normalize_cost),
                     ot_num_threads=ot_num_threads_resolved,
+                    ot_sinkhorn_iters=ot_sinkhorn_iters_resolved,
                     ot_replace=bool(ot_replace),
                 )
                 if target_idx is not None:
@@ -583,6 +653,7 @@ def train_geometric_base_affine_flow(
         "ot_reg_m": float(ot_reg_m),
         "ot_normalize_cost": bool(ot_normalize_cost),
         "ot_num_threads": ot_num_threads_resolved,
+        "ot_sinkhorn_iters": int(ot_sinkhorn_iters_resolved),
         "ot_replace": bool(ot_replace),
         "train_pairing_costs": np.asarray(train_pairing_costs, dtype=np.float64),
         "val_pairing_costs": np.asarray(val_pairing_costs, dtype=np.float64),
@@ -881,6 +952,7 @@ def geometric_flow_result_to_npz_dict(result: FlowSKLResult) -> dict[str, Any]:
         "early_ema_alpha",
         "ot_reg",
         "ot_reg_m",
+        "ot_sinkhorn_iters",
         "ot_normalize_cost",
         "ot_replace",
     ):

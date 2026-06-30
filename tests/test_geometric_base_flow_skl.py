@@ -158,6 +158,43 @@ def test_exact_ot_plan_sampler_matches_assignment_plan() -> None:
     assert plan_cost == pytest.approx(1.0)
 
 
+def test_torch_sinkhorn_plan_has_balanced_marginals() -> None:
+    x0 = torch.tensor([[0.0, 0.0], [10.0, 0.0]], dtype=torch.float32)
+    x1 = torch.tensor([[9.0, 0.0], [1.0, 0.0]], dtype=torch.float32)
+
+    sampler = gb.MinibatchOTPlanSampler(method="sinkhorn", reg=1.0, sinkhorn_iters=200)
+    pi, plan_cost = sampler.get_torch_map(x0, x1)
+
+    assert sampler.method == "torch_sinkhorn"
+    assert pi.device == x0.device
+    assert torch.all(torch.isfinite(pi))
+    assert torch.all(pi >= 0.0)
+    torch.testing.assert_close(torch.sum(pi), torch.tensor(1.0, dtype=pi.dtype), atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(torch.sum(pi, dim=1), torch.full((2,), 0.5, dtype=pi.dtype), atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(torch.sum(pi, dim=0), torch.full((2,), 0.5, dtype=pi.dtype), atol=1e-4, rtol=1e-4)
+    assert plan_cost == pytest.approx(1.0, abs=1e-3)
+
+
+def test_torch_sinkhorn_pair_sampler_keeps_indices_on_device() -> None:
+    torch.manual_seed(0)
+    x0 = torch.tensor([[0.0, 0.0], [10.0, 0.0]], dtype=torch.float32)
+    x1 = torch.tensor([[9.0, 0.0], [1.0, 0.0]], dtype=torch.float32)
+
+    x0_ot, x1_ot, target_idx, plan_cost = gb._ot_pair_source_to_target_batch(
+        x0,
+        x1,
+        ot_method="sinkhorn",
+        ot_reg=1.0,
+        ot_sinkhorn_iters=200,
+    )
+
+    assert x0_ot.device == x0.device
+    assert x1_ot.device == x1.device
+    assert target_idx.device == x1.device
+    assert target_idx.shape == (2,)
+    assert plan_cost == pytest.approx(1.0, abs=1e-3)
+
+
 def test_ot_pair_source_to_target_batch_samples_plan_indices() -> None:
     np.random.seed(0)
     x0 = torch.tensor([[0.0, 0.0], [10.0, 0.0]], dtype=torch.float32)
@@ -194,7 +231,8 @@ def test_training_loop_records_ot_source_pairing() -> None:
     )
 
     assert meta["source_pairing"] == "ot"
-    assert meta["ot_method"] == "sinkhorn"
+    assert meta["ot_method"] == "torch_sinkhorn"
+    assert meta["ot_sinkhorn_iters"] == 100
     assert np.asarray(meta["train_pairing_costs"]).shape == (1,)
     assert np.asarray(meta["val_pairing_costs"]).shape == (1,)
 
@@ -272,8 +310,9 @@ def test_geometric_base_flow_skl_cli_defaults() -> None:
     assert args.toy is None
     assert args.path_schedule == "cosine"
     assert args.source_pairing == "random"
-    assert args.ot_method == "sinkhorn"
+    assert args.ot_method == "torch_sinkhorn"
     assert args.ot_reg == pytest.approx(0.05)
+    assert args.ot_sinkhorn_iters == 100
     assert args.smooth_sigma == pytest.approx(0.12)
     assert args.mc_skl_samples == 4096
     assert args.density_mc_samples == 1024
@@ -287,8 +326,10 @@ def test_geometric_base_line_fit_check_defaults() -> None:
     assert args.theta_values == "0.7853981633974483,2.356194490192345"
     assert args.path_schedule == "cosine"
     assert args.source_pairing == "random"
-    assert args.ot_method == "sinkhorn"
+    assert args.ot_method == "torch_sinkhorn"
     assert args.ot_reg == pytest.approx(0.05)
+    assert args.ot_sinkhorn_iters == 100
+    assert mod.build_parser().parse_args(["--ot-method", "pot_sinkhorn"]).ot_method == "pot_sinkhorn"
     assert args.epochs == 50000
     assert args.early_patience == 1000
     assert args.n_per_theta == 3000
@@ -337,11 +378,16 @@ def test_geometric_base_line_fit_ot_compare_defaults() -> None:
 
     assert args.path_schedule == "cosine"
     assert args.run_method == "both"
-    assert args.ot_method == "sinkhorn"
+    assert args.ot_method == "torch_sinkhorn"
     assert args.ot_reg == pytest.approx(0.05)
+    assert args.ot_sinkhorn_iters == 100
+    assert mod.build_parser().parse_args(["--ot-method", "torch_sinkhorn"]).ot_method == "torch_sinkhorn"
+    assert mod.build_parser().parse_args(["--ot-method", "pot_sinkhorn"]).ot_method == "pot_sinkhorn"
     assert args.epochs == 50000
     assert args.early_patience == 1000
     assert args.n_per_theta == 3000
+    assert args.batch_size == 1024
+    assert args.lr == pytest.approx(1e-3)
     assert args.max_test_plot_per_theta == 500
     assert paths["png"].name == "geometric_base_line_fit_ot_compare.png"
     assert paths["svg"].name == "geometric_base_line_fit_ot_compare.svg"
