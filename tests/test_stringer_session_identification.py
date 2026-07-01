@@ -529,7 +529,7 @@ def _logcorr_example_result() -> SubsampleConvergenceResult:
         "orientation_period": float(np.pi),
         "subsample_runs": [
             {
-                "subset_n": 1550,
+                "subset_n": 650,
                 "repeat": 0,
                 "identification": {
                     METHOD_CLASSICAL_LINEAR: {
@@ -568,7 +568,7 @@ def _logcorr_example_result() -> SubsampleConvergenceResult:
         session_keys=base.session_keys,
         theta_grid=base.theta_grid,
         theta_midpoints=base.theta_midpoints,
-        n_values=[1550, 2000],
+        n_values=[650, 2000],
         repeats=2,
         sampling=base.sampling,
         endpoint_result=base.endpoint_result,
@@ -584,7 +584,7 @@ def _write_logcorr_example_curves(path: Path) -> Path:
     theta_values = [0.1, 0.2, 0.3]
     for method in METHODS:
         for subset_n, repeat, half_label, values in (
-            (1550, 0, HALF_A, [1.0, 2.0, 4.0]),
+            (650, 0, HALF_A, [1.0, 2.0, 4.0]),
             ("full", -1, HALF_B, [1.5, 3.0, 6.0]),
         ):
             for theta, fisher in zip(theta_values, values):
@@ -602,7 +602,7 @@ def _write_logcorr_example_curves(path: Path) -> Path:
                         "theta_left": theta - 0.05,
                         "theta_right": theta + 0.05,
                         "fisher": fisher,
-                        "n_trials_half": 1550,
+                        "n_trials_half": 650,
                         "n_neurons": 10,
                     }
                 )
@@ -618,12 +618,12 @@ def test_zscore_log_fisher_curve_handles_scale_and_degenerate_values() -> None:
     np.testing.assert_allclose(zscore_log_fisher_curve(np.asarray([0.0, -1.0])), [0.0, 0.0])
 
 
-def test_select_logcorr_flow_advantage_example_uses_n1550_candidate() -> None:
+def test_select_logcorr_flow_advantage_example_uses_n650_candidate() -> None:
     result = _logcorr_example_result()
 
-    selected = select_logcorr_flow_advantage_example(result.summary, n_subset=1550)
+    selected = select_logcorr_flow_advantage_example(result.summary, n_subset=650)
 
-    assert selected["subset_n"] == 1550
+    assert selected["subset_n"] == 650
     assert selected["repeat"] == 0
     assert selected["session_index"] == 1
     assert selected["session_key"] == "s1"

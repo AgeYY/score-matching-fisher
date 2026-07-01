@@ -2351,7 +2351,7 @@ def zscore_log_fisher_curve(fisher: np.ndarray, *, tiny: float = 1e-12) -> np.nd
 def select_logcorr_flow_advantage_example(
     summary: dict[str, Any],
     *,
-    n_subset: int = 1550,
+    n_subset: int = 650,
 ) -> dict[str, Any]:
     session_keys = [str(v) for v in summary.get("session_keys", [])]
     candidates: list[dict[str, Any]] = []
@@ -2430,7 +2430,7 @@ def plot_subsample_logcorr_example(
     result: SubsampleConvergenceResult,
     curves_csv_path: Path,
     *,
-    n_subset: int = 1550,
+    n_subset: int = 650,
 ) -> tuple[Path, Path]:
     curve_rows = _read_curve_rows_csv(curves_csv_path)
     example = select_logcorr_flow_advantage_example(result.summary, n_subset=int(n_subset))
