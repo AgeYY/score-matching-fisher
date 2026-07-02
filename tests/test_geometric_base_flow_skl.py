@@ -76,6 +76,29 @@ class FakePath:
         return types.SimpleNamespace(x_t=(1.0 - t_col) * x_0 + t_col * x_1, dx_t=x_1 - x_0, t=t)
 
 
+class ConstantTranslationAffineVelocity(nn.Module):
+    velocity_family = "constant_translation_affine"
+    network_architecture = "test_constant"
+
+    def __init__(self, shift: tuple[float, float] = (0.0, 0.0)) -> None:
+        super().__init__()
+        self.x_dim = 2
+        self.register_buffer("shift", torch.tensor(shift, dtype=torch.float32))
+
+    def affine_params(self, theta: torch.Tensor, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        del t
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        batch = int(theta.shape[0])
+        a = torch.zeros(batch, 2, 2, dtype=theta.dtype, device=theta.device)
+        b = self.shift.to(device=theta.device, dtype=theta.dtype).reshape(1, 2).expand(batch, 2)
+        return a, b
+
+    def forward(self, x: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        del theta, t
+        return self.shift.to(device=x.device, dtype=x.dtype).reshape(1, 2).expand_as(x)
+
+
 class SentinelBase:
     name = "sentinel_base"
     ambient_dim = 2
@@ -204,6 +227,48 @@ def test_push_base_curve_zero_ode_leaves_points_unchanged(monkeypatch: pytest.Mo
     torch.testing.assert_close(got_u, u)
 
 
+def test_push_base_curve_affine_map_zero_velocity_leaves_points_unchanged() -> None:
+    model = ConstantTranslationAffineVelocity((0.0, 0.0))
+    base = LineSegmentBase(anchor=(0.0, 0.0), direction=(1.0, 0.0))
+    u = torch.tensor([[-0.5], [0.0], [0.5]], dtype=torch.float32)
+
+    got, got_u = gb._push_base_curve_affine_map(
+        model=model,
+        base=base,
+        theta=np.asarray([[0.0], [1.0]], dtype=np.float64),
+        device=torch.device("cpu"),
+        u=u,
+        ode_steps=4,
+        ode_method="midpoint",
+    )
+
+    expected = torch.tensor(
+        [[[-0.5, 0.0], [0.0, 0.0], [0.5, 0.0]], [[-0.5, 0.0], [0.0, 0.0], [0.5, 0.0]]],
+        dtype=torch.float32,
+    )
+    torch.testing.assert_close(got, expected)
+    torch.testing.assert_close(got_u, u)
+
+
+def test_push_base_curve_affine_map_constant_translation() -> None:
+    model = ConstantTranslationAffineVelocity((1.25, -0.5))
+    base = LineSegmentBase(anchor=(0.0, 0.0), direction=(1.0, 0.0))
+    u = torch.tensor([[-0.5], [0.0], [0.5]], dtype=torch.float32)
+
+    got, _ = gb._push_base_curve_affine_map(
+        model=model,
+        base=base,
+        theta=np.asarray([[0.0]], dtype=np.float64),
+        device=torch.device("cpu"),
+        u=u,
+        ode_steps=5,
+        ode_method="euler",
+    )
+
+    expected = torch.tensor([[[0.75, -0.5], [1.25, -0.5], [1.75, -0.5]]], dtype=torch.float32)
+    torch.testing.assert_close(got, expected)
+
+
 def test_log_smoothed_curve_density_matches_logsumexp(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(gb, "_make_flow_ode_solver", lambda model: IdentitySolver(model))
     model = ConditionTimeAffineVelocity(theta_dim=1, x_dim=2, hidden_dim=4, depth=1)
@@ -260,7 +325,50 @@ def test_geometric_smoothed_curve_nll_loss_matches_logsumexp(monkeypatch: pytest
     torch.testing.assert_close(got_sigma, torch.tensor(sigma, dtype=torch.float32))
 
 
-def test_geometric_base_nll_finetune_records_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_affine_map_nll_matches_particle_ode_for_constant_translation() -> None:
+    model = ConstantTranslationAffineVelocity((0.25, -0.1))
+    base = LineSegmentBase(anchor=(0.0, 0.0), direction=(1.0, 0.0))
+    x = torch.tensor([[0.0, 0.0], [1.0, -0.1]], dtype=torch.float32)
+    support_u = torch.tensor([[-1.0], [0.0], [1.0]], dtype=torch.float32)
+    sigma_min = 1e-4
+    sigma = 0.5
+    raw_sigma = torch.tensor(math.log(math.expm1(sigma - sigma_min)), dtype=torch.float32)
+
+    particle, particle_sigma = geometric_smoothed_curve_nll_loss(
+        model=model,
+        base=base,
+        x=x,
+        theta=np.asarray([[0.0]], dtype=np.float64),
+        raw_sigma=raw_sigma,
+        sigma_min=sigma_min,
+        u_grid=support_u,
+        device=torch.device("cpu"),
+        ode_steps=4,
+        ode_method="midpoint",
+        endpoint_solver="particle-ode",
+    )
+    fast, fast_sigma = geometric_smoothed_curve_nll_loss(
+        model=model,
+        base=base,
+        x=x,
+        theta=np.asarray([[0.0]], dtype=np.float64),
+        raw_sigma=raw_sigma,
+        sigma_min=sigma_min,
+        u_grid=support_u,
+        device=torch.device("cpu"),
+        ode_steps=4,
+        ode_method="midpoint",
+        endpoint_solver="affine-map",
+    )
+
+    torch.testing.assert_close(fast, particle)
+    torch.testing.assert_close(fast_sigma, particle_sigma)
+
+
+def test_geometric_base_nll_finetune_records_metadata_and_checkpoints(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     monkeypatch.setattr(gb, "_make_flow_ode_solver", lambda model: IdentitySolver(model))
     model = ConditionTimeAffineVelocity(theta_dim=1, x_dim=2, hidden_dim=4, depth=1)
     base = LineSegmentBase(anchor=(0.0, 0.0), direction=(1.0, 0.0))
@@ -282,6 +390,9 @@ def test_geometric_base_nll_finetune_records_metadata(monkeypatch: pytest.Monkey
         sigma_init=0.2,
         n_particles=4,
         ode_steps=2,
+        save_checkpoints=True,
+        checkpoint_dir=tmp_path / "nll_checkpoints",
+        checkpoint_every=1,
         log_every=999,
     )
 
@@ -292,6 +403,54 @@ def test_geometric_base_nll_finetune_records_metadata(monkeypatch: pytest.Monkey
     assert np.asarray(meta["val_nll_losses"]).shape == (2,)
     assert np.asarray(meta["learned_sigmas"]).shape == (1,)
     assert float(np.asarray(meta["learned_sigmas"])[0]) > 0.0
+    assert meta["save_checkpoints"] is True
+    assert meta["checkpoint_every"] == 1
+    checkpoint_paths = [Path(p) for p in meta["checkpoint_paths"]]
+    assert [p.name for p in checkpoint_paths] == ["nll_epoch_000001.pt", "nll_epoch_000002.pt"]
+    for path in checkpoint_paths:
+        assert path.is_file()
+    checkpoint = torch.load(checkpoint_paths[-1], map_location="cpu", weights_only=False)
+    assert checkpoint["epoch"] == 2
+    assert "model_state_dict" in checkpoint
+    assert "optimizer_state_dict" in checkpoint
+    assert checkpoint["raw_sigma"].shape == (1,)
+    assert np.asarray(checkpoint["train_nll_losses"]).shape == (2,)
+    assert np.asarray(checkpoint["val_nll_losses"]).shape == (2,)
+    assert np.asarray(checkpoint["learned_sigmas"]).shape == (1,)
+    assert checkpoint["config"]["n_particles"] == 4
+    assert checkpoint["config"]["nll_endpoint_solver"] == "particle_ode"
+    assert checkpoint["config"]["checkpoint_every"] == 1
+
+
+def test_geometric_base_nll_finetune_records_affine_map_solver() -> None:
+    torch.manual_seed(0)
+    model = ConditionTimeAffineVelocity(theta_dim=1, x_dim=2, hidden_dim=4, depth=1)
+    base = LineSegmentBase(anchor=(0.0, 0.0), direction=(1.0, 0.0))
+    theta = np.asarray([[1.0], [1.0], [1.0], [1.0]], dtype=np.float64)
+    x = np.asarray([[-0.4, 0.0], [-0.1, 0.0], [0.2, 0.0], [0.45, 0.0]], dtype=np.float64)
+
+    meta = finetune_geometric_base_nll(
+        model=model,
+        base=base,
+        theta_train=theta,
+        x_train=x,
+        theta_val=theta,
+        x_val=x,
+        condition_eval=np.asarray([[1.0]], dtype=np.float64),
+        device=torch.device("cpu"),
+        epochs=1,
+        batch_size=2,
+        lr=1e-3,
+        sigma_init=0.2,
+        n_particles=4,
+        ode_steps=2,
+        nll_endpoint_solver="affine-map",
+        log_every=999,
+    )
+
+    assert meta["nll_endpoint_solver"] == "affine_map"
+    assert np.asarray(meta["train_nll_losses"]).shape == (1,)
+    assert np.asarray(meta["val_nll_losses"]).shape == (1,)
 
 
 def test_smoothed_curve_skl_identical_conditions_is_zero(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -339,11 +498,12 @@ def test_geometric_base_line_fit_check_defaults() -> None:
     assert args.train_frac == pytest.approx(0.7)
     assert args.val_frac == pytest.approx(0.15)
     assert args.nll_finetune is False
-    assert args.nll_epochs == 400
+    assert args.nll_epochs == 2000
     assert args.nll_batch_size == 0
     assert args.nll_lr == pytest.approx(1e-4)
     assert args.nll_particles == 128
     assert args.nll_sigma_init == pytest.approx(0.1)
+    assert args.nll_endpoint_solver == "particle-ode"
     assert args.nll_checkpoint_selection == "last"
     assert args.max_test_plot_per_theta == 500
     assert args.smooth_sigma == pytest.approx(0.12)
@@ -389,15 +549,20 @@ def test_geometric_base_square_fit_check_defaults() -> None:
     assert args.theta_values == "0.0,0.7853981633974483"
     assert args.side_length == pytest.approx(2.0)
     assert args.base_side_length == pytest.approx(1.0)
-    assert args.target_sigma == pytest.approx(0.03)
+    assert args.target_sigma == pytest.approx(0.2)
     assert args.path_schedule == "cosine"
     assert args.epochs == 50000
     assert args.early_patience == 1000
     assert args.n_per_theta == 3000
     assert args.nll_finetune is False
-    assert args.nll_epochs == 400
+    assert args.nll_epochs == 2000
     assert args.nll_particles == 128
     assert args.nll_sigma_init == pytest.approx(0.1)
+    assert args.nll_endpoint_solver == "particle-ode"
+    assert args.nll_checkpoint_selection == "last"
+    assert args.nll_save_checkpoints is True
+    assert args.nll_checkpoint_every == 0
+    assert args.nll_checkpoint_dir is None
     assert args.curve_points_per_edge == 100
     assert paths["png"].name == "geometric_base_square_fit_check.png"
     assert paths["svg"].name == "geometric_base_square_fit_check.svg"
@@ -407,3 +572,16 @@ def test_geometric_base_square_fit_check_defaults() -> None:
     np.testing.assert_allclose(data["condition_eval"], np.eye(2))
     assert data["theta_encoding"] == "one_hot"
     assert data["theta_train"].shape[1] == 2
+
+
+def test_geometric_base_square_fit_check_allows_single_condition() -> None:
+    mod = _load_square_fit_check_module()
+    args = mod.build_parser().parse_args(["--theta-values", "0.7853981633974483", "--n-per-theta", "12"])
+    theta = mod._parse_theta_values(args.theta_values)
+    data = mod._make_noisy_square_data(args, theta)
+
+    assert theta.shape == (1, 1)
+    np.testing.assert_allclose(data["condition_eval"], np.ones((1, 1)))
+    assert data["theta_train"].shape[1] == 1
+    assert data["theta_val"].shape[1] == 1
+    assert data["theta_test"].shape[1] == 1

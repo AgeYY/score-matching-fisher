@@ -209,7 +209,7 @@ def test_parser_defaults() -> None:
     assert args.pr_dim is None
     assert not hasattr(args, "pr_dim_list")
     assert args.n_total == 100000
-    assert args.device == "cuda:1"
+    assert args.device == "cuda:0"
     assert args.metric == "all"
     assert mod.resolve_metric_names(args) == ALL_METRICS
     assert args.early_ema_alpha == pytest.approx(0.05)

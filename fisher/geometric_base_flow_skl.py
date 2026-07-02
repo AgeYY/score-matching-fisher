@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -28,6 +29,7 @@ from fisher.model_weight_ema import scalar_val_ema_update
 
 
 SMOOTHED_LINE_CURVE_METRIC = "smoothed_line_curve_symmetric_kl"
+NLL_ENDPOINT_SOLVERS = ("particle_ode", "affine_map")
 
 
 @dataclass(frozen=True)
@@ -257,6 +259,13 @@ def _condition_indices_from_rows(theta: np.ndarray, condition_eval: np.ndarray) 
     return out
 
 
+def _normalize_nll_endpoint_solver(value: str) -> str:
+    solver = str(value).strip().lower().replace("-", "_")
+    if solver not in NLL_ENDPOINT_SOLVERS:
+        raise ValueError(f"nll_endpoint_solver must be one of {NLL_ENDPOINT_SOLVERS}; got {value!r}.")
+    return solver
+
+
 def _geometric_base_metadata(base: Any) -> dict[str, Any]:
     meta: dict[str, Any] = {
         "base_name": str(getattr(base, "name", type(base).__name__)),
@@ -286,7 +295,7 @@ def train_geometric_base_affine_flow(
     x_val: np.ndarray | None,
     device: torch.device,
     path_schedule: str | GaussianAffinePathSchedule = "cosine",
-    epochs: int = 1000,
+    epochs: int = 2000,
     batch_size: int = 512,
     lr: float = 1e-4,
     weight_decay: float = 0.0,
@@ -496,6 +505,100 @@ def _push_base_curve_ode(
     return x1, u_t
 
 
+def _velocity_affine_params(model: nn.Module, theta: torch.Tensor, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    if hasattr(model, "affine_params"):
+        return model.affine_params(theta, t)
+    if hasattr(model, "A") and hasattr(model, "b") and hasattr(model, "_beta_beta_dot"):
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        t = _as_col_t(t, batch=int(theta.shape[0]))
+        try:
+            a = model.A(theta, t)
+        except TypeError:
+            a = model.A(t)
+        b_endpoint = model.b(theta)
+        beta, beta_dot = model._beta_beta_dot(t, batch=int(theta.shape[0]))
+        intercept = beta_dot * b_endpoint - _apply_matrix(a, beta * b_endpoint)
+        return a, intercept
+    raise ValueError(
+        "affine_map NLL endpoint solver requires either affine_params(theta, t) "
+        "or the centered affine A/b/_beta_beta_dot interface."
+    )
+
+
+def _affine_state_rhs(model: nn.Module, theta: torch.Tensor, t: torch.Tensor, p: torch.Tensor, q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    a, b = _velocity_affine_params(model, theta, t)
+    dp = torch.bmm(a, p)
+    dq = _apply_matrix(a, q) + b
+    return dp, dq
+
+
+def _push_base_curve_affine_map(
+    *,
+    model: nn.Module,
+    base: LineSegmentBase,
+    theta: np.ndarray | torch.Tensor,
+    device: torch.device,
+    u: np.ndarray | torch.Tensor | None = None,
+    n_points: int | None = None,
+    ode_steps: int = 64,
+    ode_method: str = "midpoint",
+    enable_grad: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Push base points by integrating the affine map, not individual particles."""
+
+    steps = int(ode_steps)
+    if steps < 1:
+        raise ValueError("ode_steps must be >= 1.")
+    method = str(ode_method).strip().lower()
+    if method not in ("euler", "midpoint"):
+        raise ValueError("affine_map NLL endpoint solver currently supports only euler and midpoint ODE methods.")
+    dtype = _model_floating_dtype(model)
+    if u is None:
+        if n_points is None:
+            raise ValueError("Either u or n_points must be supplied.")
+        u_t = base.sample_u(int(n_points), device=device, dtype=dtype)
+    else:
+        u_t = torch.as_tensor(u, dtype=dtype, device=device)
+        if u_t.ndim == 1:
+            u_t = u_t.unsqueeze(-1)
+    x0 = base.points_from_u(u_t)
+    if torch.is_tensor(theta):
+        th = theta.to(device=device, dtype=dtype)
+    else:
+        th = torch.from_numpy(_as_2d_float64(np.asarray(theta), name="theta").astype(np.float32)).to(device=device, dtype=dtype)
+    if th.ndim == 1:
+        th = th.unsqueeze(0)
+    if th.ndim != 2 or int(th.shape[0]) < 1:
+        raise ValueError("theta must contain one or more endpoint rows.")
+    if int(base.ambient_dim) != int(getattr(model, "x_dim")):
+        raise ValueError("base ambient_dim must match model x_dim.")
+
+    model.to(device)
+    c = int(th.shape[0])
+    d = int(base.ambient_dim)
+    dt = 1.0 / float(steps)
+    with torch.set_grad_enabled(bool(enable_grad)):
+        p = torch.eye(d, dtype=dtype, device=device).reshape(1, d, d).expand(c, d, d).clone()
+        q = torch.zeros(c, d, dtype=dtype, device=device)
+        for step in range(steps):
+            t0 = torch.full((c, 1), float(step) * dt, dtype=dtype, device=device)
+            if method == "euler":
+                dp, dq = _affine_state_rhs(model, th, t0, p, q)
+                p = p + dt * dp
+                q = q + dt * dq
+            else:
+                dp0, dq0 = _affine_state_rhs(model, th, t0, p, q)
+                p_mid = p + 0.5 * dt * dp0
+                q_mid = q + 0.5 * dt * dq0
+                t_mid = torch.full((c, 1), (float(step) + 0.5) * dt, dtype=dtype, device=device)
+                dp_mid, dq_mid = _affine_state_rhs(model, th, t_mid, p_mid, q_mid)
+                p = p + dt * dp_mid
+                q = q + dt * dq_mid
+        centers = torch.einsum("cij,mj->cmi", p, x0) + q[:, None, :]
+    return centers, u_t
+
+
 def geometric_smoothed_curve_nll_loss(
     *,
     model: nn.Module,
@@ -509,6 +612,7 @@ def geometric_smoothed_curve_nll_loss(
     ode_steps: int = 64,
     ode_method: str = "midpoint",
     enable_grad: bool = True,
+    endpoint_solver: str = "particle_ode",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Monte Carlo NLL for ``gamma_theta(U) + Normal(0, sigma^2 I)``."""
 
@@ -521,16 +625,32 @@ def geometric_smoothed_curve_nll_loss(
     if x.ndim == 1:
         x = x.unsqueeze(0)
     xb = x.to(device=device, dtype=dtype)
-    centers, _ = _push_base_curve_ode(
-        model=model,
-        base=base,
-        theta=theta,
-        device=device,
-        u=u_grid,
-        ode_steps=int(ode_steps),
-        ode_method=str(ode_method),
-        enable_grad=bool(enable_grad),
-    )
+    solver = _normalize_nll_endpoint_solver(endpoint_solver)
+    if solver == "particle_ode":
+        centers, _ = _push_base_curve_ode(
+            model=model,
+            base=base,
+            theta=theta,
+            device=device,
+            u=u_grid,
+            ode_steps=int(ode_steps),
+            ode_method=str(ode_method),
+            enable_grad=bool(enable_grad),
+        )
+    else:
+        centers_by_condition, _ = _push_base_curve_affine_map(
+            model=model,
+            base=base,
+            theta=theta,
+            device=device,
+            u=u_grid,
+            ode_steps=int(ode_steps),
+            ode_method=str(ode_method),
+            enable_grad=bool(enable_grad),
+        )
+        if int(centers_by_condition.shape[0]) != 1:
+            raise ValueError("geometric_smoothed_curve_nll_loss expects exactly one theta row.")
+        centers = centers_by_condition[0]
     sigma = sigma_floor + F.softplus(raw_sigma.to(device=device, dtype=dtype))
     d = int(xb.shape[1])
     sq = torch.sum((xb[:, None, :] - centers[None, :, :]) ** 2, dim=-1)
@@ -556,10 +676,14 @@ def finetune_geometric_base_nll(
     weight_decay: float = 0.0,
     sigma_min: float = 1e-4,
     sigma_init: float = 0.1,
-    n_particles: int = 512,
+    n_particles: int = 128,
     ode_steps: int = 64,
     ode_method: str = "midpoint",
+    nll_endpoint_solver: str = "particle_ode",
     checkpoint_selection: str = "last",
+    save_checkpoints: bool = False,
+    checkpoint_dir: str | Path | None = None,
+    checkpoint_every: int = 0,
     log_every: int = 100,
 ) -> dict[str, Any]:
     """Fine-tune a geometric-base flow by endpoint mixture NLL."""
@@ -576,6 +700,7 @@ def finetune_geometric_base_nll(
         raise ValueError("weight_decay must be >= 0.")
     if int(n_particles) < 1:
         raise ValueError("n_particles must be >= 1.")
+    endpoint_solver = _normalize_nll_endpoint_solver(nll_endpoint_solver)
     sigma_floor = float(sigma_min)
     sigma_start = float(sigma_init)
     if not math.isfinite(sigma_floor) or sigma_floor <= 0.0:
@@ -585,6 +710,15 @@ def finetune_geometric_base_nll(
     selection = str(checkpoint_selection).strip().lower().replace("-", "_")
     if selection not in ("last", "best"):
         raise ValueError("checkpoint_selection must be one of: last, best.")
+    ckpt_every = int(checkpoint_every)
+    if ckpt_every < 0:
+        raise ValueError("checkpoint_every must be >= 0.")
+    log_interval = max(1, int(log_every))
+    if ckpt_every == 0:
+        ckpt_every = log_interval
+    ckpt_dir = Path(checkpoint_dir).expanduser().resolve() if checkpoint_dir is not None else None
+    if bool(save_checkpoints) and ckpt_dir is None:
+        raise ValueError("checkpoint_dir is required when save_checkpoints=True.")
 
     cond = _as_2d_float64(condition_eval, name="condition_eval")
     th_tr = _as_2d_float64(theta_train, name="theta_train")
@@ -621,8 +755,9 @@ def finetune_geometric_base_nll(
     best_epoch = 0
     best_state: dict[str, torch.Tensor] | None = None
     best_raw_sigma: torch.Tensor | None = None
+    checkpoint_paths: list[str] = []
 
-    def _batch_nll(cb: torch.Tensor, xb: torch.Tensor, *, enable_grad: bool) -> tuple[torch.Tensor, torch.Tensor]:
+    def _batch_nll_particle_ode(cb: torch.Tensor, xb: torch.Tensor, *, enable_grad: bool) -> tuple[torch.Tensor, torch.Tensor]:
         cb = cb.to(device=device, dtype=torch.long)
         xb = xb.to(device=device, dtype=dtype)
         total = torch.zeros((), dtype=dtype, device=device)
@@ -646,6 +781,7 @@ def finetune_geometric_base_nll(
                 ode_steps=int(ode_steps),
                 ode_method=str(ode_method),
                 enable_grad=bool(enable_grad),
+                endpoint_solver="particle_ode",
             )
             total = total + loss_c * float(count)
             total_count += count
@@ -653,6 +789,72 @@ def finetune_geometric_base_nll(
         if total_count < 1:
             raise RuntimeError("Encountered an empty NLL batch.")
         return total / float(total_count), torch.stack(sigma_values) if sigma_values else raw_sigma.detach()
+
+    def _batch_nll_affine_map(cb: torch.Tensor, xb: torch.Tensor, *, enable_grad: bool) -> tuple[torch.Tensor, torch.Tensor]:
+        cb = cb.to(device=device, dtype=torch.long)
+        xb = xb.to(device=device, dtype=dtype)
+        unique_idx, inverse = torch.unique(cb, sorted=True, return_inverse=True)
+        if int(unique_idx.numel()) < 1:
+            raise RuntimeError("Encountered an empty NLL batch.")
+        centers_by_condition, _ = _push_base_curve_affine_map(
+            model=model,
+            base=base,
+            theta=cond_t.index_select(0, unique_idx),
+            device=device,
+            u=u_grid,
+            ode_steps=int(ode_steps),
+            ode_method=str(ode_method),
+            enable_grad=bool(enable_grad),
+        )
+        centers = centers_by_condition.index_select(0, inverse)
+        sigma = sigma_floor + F.softplus(raw_sigma.index_select(0, cb))
+        d = int(xb.shape[1])
+        sq = torch.sum((xb[:, None, :] - centers) ** 2, dim=-1)
+        log_kernel = -0.5 * sq / (sigma[:, None] * sigma[:, None])
+        log_prob = torch.logsumexp(log_kernel, dim=1) - math.log(float(u_grid.shape[0]))
+        log_norm = -0.5 * float(d) * (math.log(2.0 * math.pi) + 2.0 * torch.log(sigma))
+        return -(log_norm + log_prob).mean(), (sigma_floor + F.softplus(raw_sigma.index_select(0, unique_idx))).detach()
+
+    def _batch_nll(cb: torch.Tensor, xb: torch.Tensor, *, enable_grad: bool) -> tuple[torch.Tensor, torch.Tensor]:
+        if endpoint_solver == "particle_ode":
+            return _batch_nll_particle_ode(cb, xb, enable_grad=enable_grad)
+        return _batch_nll_affine_map(cb, xb, enable_grad=enable_grad)
+
+    def _save_checkpoint(epoch: int, train_loss: float, val_loss: float) -> None:
+        if not bool(save_checkpoints) or ckpt_dir is None:
+            return
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        learned = (sigma_floor + F.softplus(raw_sigma.detach())).detach().cpu()
+        payload = {
+            "epoch": int(epoch),
+            "model_state_dict": {k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
+            "raw_sigma": raw_sigma.detach().cpu().clone(),
+            "optimizer_state_dict": opt.state_dict(),
+            "train_nll_losses": np.asarray(train_losses, dtype=np.float64),
+            "val_nll_losses": np.asarray(val_losses, dtype=np.float64),
+            "train_nll": float(train_loss),
+            "val_nll": float(val_loss),
+            "best_epoch": int(best_epoch),
+            "best_val_nll": float(best_val),
+            "learned_sigmas": learned.numpy().astype(np.float64),
+            "config": {
+                "epochs": int(epochs),
+                "batch_size": int(batch_size),
+                "lr": float(lr),
+                "weight_decay": float(weight_decay),
+                "sigma_min": float(sigma_floor),
+                "sigma_init": float(sigma_start),
+                "n_particles": int(n_particles),
+                "ode_steps": int(ode_steps),
+                "ode_method": str(ode_method),
+                "nll_endpoint_solver": endpoint_solver,
+                "checkpoint_selection": selection,
+                "checkpoint_every": int(ckpt_every),
+            },
+        }
+        path = ckpt_dir / f"nll_epoch_{int(epoch):06d}.pt"
+        torch.save(payload, path)
+        checkpoint_paths.append(str(path))
 
     for epoch in range(1, int(epochs) + 1):
         model.train()
@@ -680,7 +882,10 @@ def finetune_geometric_base_nll(
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             best_raw_sigma = raw_sigma.detach().cpu().clone()
 
-        if epoch == 1 or epoch % max(1, int(log_every)) == 0 or epoch == int(epochs):
+        if bool(save_checkpoints) and (epoch % ckpt_every == 0 or epoch == int(epochs)):
+            _save_checkpoint(epoch, train_loss, val_loss_f)
+
+        if epoch == 1 or epoch % log_interval == 0 or epoch == int(epochs):
             sigmas = (sigma_floor + F.softplus(raw_sigma.detach())).detach().cpu().numpy()
             print(
                 f"[geometric-base-nll {epoch:4d}/{int(epochs)}] train_nll={train_loss:.6f} "
@@ -709,7 +914,12 @@ def finetune_geometric_base_nll(
         "n_particles": int(n_particles),
         "ode_steps": int(ode_steps),
         "ode_method": str(ode_method),
+        "nll_endpoint_solver": endpoint_solver,
         "checkpoint_selection": selection,
+        "save_checkpoints": bool(save_checkpoints),
+        "checkpoint_dir": str(ckpt_dir) if ckpt_dir is not None else None,
+        "checkpoint_every": int(ckpt_every),
+        "checkpoint_paths": checkpoint_paths,
         "best_epoch": int(best_epoch),
         "best_val_nll": float(best_val),
         "selected_epoch": int(selected_epoch),

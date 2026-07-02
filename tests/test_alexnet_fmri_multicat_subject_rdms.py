@@ -48,7 +48,7 @@ def test_subject_rdm_cli_defaults() -> None:
     assert int(args.n_per_class) == 50
     assert int(args.n_voxels) == 100
     assert args.rdm_metric == "correlation"
-    assert args.device == "cuda:1"
+    assert args.device == "cuda:0"
 
 
 def test_compute_subject_noise_free_rdms_shapes() -> None:

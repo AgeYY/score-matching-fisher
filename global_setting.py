@@ -16,8 +16,8 @@ DATAROOT = os.environ.get(
 DATA_DIR = DATAROOT
 
 # Default execution device for training/evaluation scripts.
-# Override at runtime: export SCORE_MATCHING_FISHER_DEFAULT_DEVICE=cuda:0
-DEFAULT_DEVICE = os.environ.get("SCORE_MATCHING_FISHER_DEFAULT_DEVICE", "cuda:1")
+# Override at runtime: export SCORE_MATCHING_FISHER_DEFAULT_DEVICE=cuda:1
+DEFAULT_DEVICE = os.environ.get("SCORE_MATCHING_FISHER_DEFAULT_DEVICE", "cuda:0")
 
 
 def _default_cuda_device_id(device_name: str) -> int:

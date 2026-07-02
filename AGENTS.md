@@ -7,21 +7,21 @@
 ## Runtime Environment (Mandatory)
 
 - Always run Python/code commands inside the `mamba` environment `geo_diffusion`.
-- Default execution device is CUDA device 1 (`--device cuda:1`) for training/evaluation scripts.
+- Default execution device is CUDA device 0 (`--device cuda:0`) for training/evaluation scripts.
 
 ## Standard Command Pattern
 
 Use this pattern for all project runs:
 
 ```bash
-mamba run -n geo_diffusion python <script>.py ... --device cuda:1
+mamba run -n geo_diffusion python <script>.py ... --device cuda:0
 ```
 
 For the unified CLI:
 
 ```bash
-mamba run -n geo_diffusion python run_fisher.py score ... --device cuda:1
-mamba run -n geo_diffusion python run_fisher.py decoder ... --device cuda:1
+mamba run -n geo_diffusion python run_fisher.py score ... --device cuda:0
+mamba run -n geo_diffusion python run_fisher.py decoder ... --device cuda:0
 ```
 
 ## Data layout
@@ -72,7 +72,7 @@ When polling until a long-running process finishes, **do not** use a loop like:
 **Preferred:** capture the PID when starting, then `wait` or poll the PID only:
 
 ```bash
-mamba run -n geo_diffusion python bin/some_script.py ... --device cuda:1 &
+mamba run -n geo_diffusion python bin/some_script.py ... --device cuda:0 &
 pid=$!
 wait "${pid}"
 # or: while kill -0 "${pid}" 2>/dev/null; do sleep 30; done

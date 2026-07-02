@@ -39,7 +39,7 @@ def test_parser_defaults_and_output_path_naming() -> None:
 
     assert args.seed == 7
     assert args.train_frac == 0.8
-    assert args.device == "cuda:1"
+    assert args.device == "cuda:0"
     assert args.force is False
     assert args.use_cache is False
     assert args.skip_viz is False
@@ -152,7 +152,7 @@ def test_command_construction_for_native_and_pr(monkeypatch: pytest.MonkeyPatch,
 
     assert _flag_value(projected, "--h-dim") == "9"
     assert "--allow-non-randamp-sqrtd" in projected
-    assert _flag_value(projected, "--device") == "cuda:1"
+    assert _flag_value(projected, "--device") == "cuda:0"
     assert _flag_value(projected, "--seed") == "7"
     assert "--use-cache" in projected
     assert "--skip-viz" in projected

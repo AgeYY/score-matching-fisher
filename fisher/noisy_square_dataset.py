@@ -57,7 +57,7 @@ class NoisySquareBoundaryDataset:
 
     theta: float = math.pi / 4.0
     side_length: float = 1.0
-    sigma: float = 0.03
+    sigma: float = 0.2
     center: tuple[float, float] = (0.0, 0.0)
     seed: int = 7
 
@@ -121,7 +121,7 @@ def generate_noisy_square_boundary_batch(
     num: int,
     theta: float = math.pi / 4.0,
     side_length: float = 1.0,
-    sigma: float = 0.03,
+    sigma: float = 0.2,
     center: tuple[float, float] = (0.0, 0.0),
     seed: int | None = None,
     rng: np.random.Generator | None = None,
