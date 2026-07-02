@@ -76,6 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--nll-particles", type=int, default=128)
     p.add_argument("--nll-sigma-min", type=float, default=1e-4)
     p.add_argument("--nll-sigma-init", type=float, default=0.1, help="0 reuses --target-sigma.")
+    p.add_argument("--nll-sigma-mode", choices=("fixed", "learned"), default="fixed")
     p.add_argument("--nll-endpoint-solver", choices=("particle-ode", "affine-map"), default="particle-ode")
     p.add_argument("--nll-checkpoint-selection", choices=("last", "best"), default="last")
     p.add_argument("--nll-save-checkpoints", action=argparse.BooleanOptionalAction, default=True)
@@ -412,6 +413,7 @@ def main(argv: list[str] | None = None) -> int:
             ode_steps=int(args.ode_steps),
             ode_method=str(args.ode_method),
             nll_endpoint_solver=str(args.nll_endpoint_solver),
+            sigma_mode=str(args.nll_sigma_mode),
             checkpoint_selection=str(args.nll_checkpoint_selection),
             save_checkpoints=bool(args.nll_save_checkpoints),
             checkpoint_dir=nll_checkpoint_dir,
@@ -506,6 +508,7 @@ def main(argv: list[str] | None = None) -> int:
         "nll_particles": int(args.nll_particles),
         "nll_sigma_min": float(args.nll_sigma_min),
         "nll_sigma_init": float(args.nll_sigma_init) if float(args.nll_sigma_init) > 0.0 else float(args.target_sigma),
+        "nll_sigma_mode": str(args.nll_sigma_mode),
         "nll_endpoint_solver": str(args.nll_endpoint_solver),
         "nll_checkpoint_selection": str(args.nll_checkpoint_selection),
         "nll_save_checkpoints": bool(args.nll_save_checkpoints),

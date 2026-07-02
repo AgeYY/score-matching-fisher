@@ -30,6 +30,7 @@ from fisher.model_weight_ema import scalar_val_ema_update
 
 SMOOTHED_LINE_CURVE_METRIC = "smoothed_line_curve_symmetric_kl"
 NLL_ENDPOINT_SOLVERS = ("particle_ode", "affine_map")
+NLL_SIGMA_MODES = ("fixed", "learned")
 
 
 @dataclass(frozen=True)
@@ -264,6 +265,13 @@ def _normalize_nll_endpoint_solver(value: str) -> str:
     if solver not in NLL_ENDPOINT_SOLVERS:
         raise ValueError(f"nll_endpoint_solver must be one of {NLL_ENDPOINT_SOLVERS}; got {value!r}.")
     return solver
+
+
+def _normalize_nll_sigma_mode(value: str) -> str:
+    mode = str(value).strip().lower().replace("-", "_")
+    if mode not in NLL_SIGMA_MODES:
+        raise ValueError(f"sigma_mode must be one of {NLL_SIGMA_MODES}; got {value!r}.")
+    return mode
 
 
 def _geometric_base_metadata(base: Any) -> dict[str, Any]:
@@ -680,6 +688,7 @@ def finetune_geometric_base_nll(
     ode_steps: int = 64,
     ode_method: str = "midpoint",
     nll_endpoint_solver: str = "particle_ode",
+    sigma_mode: str = "fixed",
     checkpoint_selection: str = "last",
     save_checkpoints: bool = False,
     checkpoint_dir: str | Path | None = None,
@@ -701,6 +710,7 @@ def finetune_geometric_base_nll(
     if int(n_particles) < 1:
         raise ValueError("n_particles must be >= 1.")
     endpoint_solver = _normalize_nll_endpoint_solver(nll_endpoint_solver)
+    sigma_mode_norm = _normalize_nll_sigma_mode(sigma_mode)
     sigma_floor = float(sigma_min)
     sigma_start = float(sigma_init)
     if not math.isfinite(sigma_floor) or sigma_floor <= 0.0:
@@ -744,10 +754,16 @@ def finetune_geometric_base_nll(
     model.to(device)
     dtype = _model_floating_dtype(model)
     raw_init = _inverse_softplus(sigma_start - sigma_floor)
-    raw_sigma = nn.Parameter(torch.full((int(cond.shape[0]),), raw_init, dtype=dtype, device=device))
+    raw_sigma = nn.Parameter(
+        torch.full((int(cond.shape[0]),), raw_init, dtype=dtype, device=device),
+        requires_grad=sigma_mode_norm == "learned",
+    )
     u_grid = base.sample_u(int(n_particles), device=device, dtype=dtype).detach()
     cond_t = torch.from_numpy(cond.astype(np.float32)).to(device=device, dtype=dtype)
-    opt = torch.optim.AdamW(_adamw_parameters(model) + [raw_sigma], lr=float(lr), weight_decay=float(weight_decay))
+    opt_params = _adamw_parameters(model)
+    if sigma_mode_norm == "learned":
+        opt_params = opt_params + [raw_sigma]
+    opt = torch.optim.AdamW(opt_params, lr=float(lr), weight_decay=float(weight_decay))
 
     train_losses: list[float] = []
     val_losses: list[float] = []
@@ -848,6 +864,7 @@ def finetune_geometric_base_nll(
                 "ode_steps": int(ode_steps),
                 "ode_method": str(ode_method),
                 "nll_endpoint_solver": endpoint_solver,
+                "sigma_mode": sigma_mode_norm,
                 "checkpoint_selection": selection,
                 "checkpoint_every": int(ckpt_every),
             },
@@ -915,6 +932,7 @@ def finetune_geometric_base_nll(
         "ode_steps": int(ode_steps),
         "ode_method": str(ode_method),
         "nll_endpoint_solver": endpoint_solver,
+        "sigma_mode": sigma_mode_norm,
         "checkpoint_selection": selection,
         "save_checkpoints": bool(save_checkpoints),
         "checkpoint_dir": str(ckpt_dir) if ckpt_dir is not None else None,

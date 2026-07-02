@@ -388,6 +388,7 @@ def test_geometric_base_nll_finetune_records_metadata_and_checkpoints(
         batch_size=2,
         lr=1e-3,
         sigma_init=0.2,
+        sigma_mode="learned",
         n_particles=4,
         ode_steps=2,
         save_checkpoints=True,
@@ -402,7 +403,7 @@ def test_geometric_base_nll_finetune_records_metadata_and_checkpoints(
     assert np.asarray(meta["train_nll_losses"]).shape == (2,)
     assert np.asarray(meta["val_nll_losses"]).shape == (2,)
     assert np.asarray(meta["learned_sigmas"]).shape == (1,)
-    assert float(np.asarray(meta["learned_sigmas"])[0]) > 0.0
+    assert meta["sigma_mode"] == "learned"
     assert meta["save_checkpoints"] is True
     assert meta["checkpoint_every"] == 1
     checkpoint_paths = [Path(p) for p in meta["checkpoint_paths"]]
@@ -419,6 +420,7 @@ def test_geometric_base_nll_finetune_records_metadata_and_checkpoints(
     assert np.asarray(checkpoint["learned_sigmas"]).shape == (1,)
     assert checkpoint["config"]["n_particles"] == 4
     assert checkpoint["config"]["nll_endpoint_solver"] == "particle_ode"
+    assert checkpoint["config"]["sigma_mode"] == "learned"
     assert checkpoint["config"]["checkpoint_every"] == 1
 
 
@@ -449,8 +451,40 @@ def test_geometric_base_nll_finetune_records_affine_map_solver() -> None:
     )
 
     assert meta["nll_endpoint_solver"] == "affine_map"
+    assert meta["sigma_mode"] == "fixed"
+    np.testing.assert_allclose(np.asarray(meta["learned_sigmas"]), np.asarray([0.2]), rtol=1e-6, atol=1e-6)
     assert np.asarray(meta["train_nll_losses"]).shape == (1,)
     assert np.asarray(meta["val_nll_losses"]).shape == (1,)
+
+
+def test_geometric_base_nll_finetune_learned_sigma_mode_records_mode() -> None:
+    torch.manual_seed(0)
+    model = ConditionTimeAffineVelocity(theta_dim=1, x_dim=2, hidden_dim=4, depth=1)
+    base = LineSegmentBase(anchor=(0.0, 0.0), direction=(1.0, 0.0))
+    theta = np.asarray([[1.0], [1.0], [1.0], [1.0]], dtype=np.float64)
+    x = np.asarray([[-0.4, 0.0], [-0.1, 0.0], [0.2, 0.0], [0.45, 0.0]], dtype=np.float64)
+
+    meta = finetune_geometric_base_nll(
+        model=model,
+        base=base,
+        theta_train=theta,
+        x_train=x,
+        theta_val=theta,
+        x_val=x,
+        condition_eval=np.asarray([[1.0]], dtype=np.float64),
+        device=torch.device("cpu"),
+        epochs=1,
+        batch_size=2,
+        lr=1e-3,
+        sigma_init=0.2,
+        sigma_mode="learned",
+        n_particles=4,
+        ode_steps=2,
+        log_every=999,
+    )
+
+    assert meta["sigma_mode"] == "learned"
+    assert np.asarray(meta["learned_sigmas"]).shape == (1,)
 
 
 def test_smoothed_curve_skl_identical_conditions_is_zero(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -503,6 +537,7 @@ def test_geometric_base_line_fit_check_defaults() -> None:
     assert args.nll_lr == pytest.approx(1e-4)
     assert args.nll_particles == 128
     assert args.nll_sigma_init == pytest.approx(0.1)
+    assert args.nll_sigma_mode == "fixed"
     assert args.nll_endpoint_solver == "particle-ode"
     assert args.nll_checkpoint_selection == "last"
     assert args.max_test_plot_per_theta == 500
@@ -558,6 +593,7 @@ def test_geometric_base_square_fit_check_defaults() -> None:
     assert args.nll_epochs == 2000
     assert args.nll_particles == 128
     assert args.nll_sigma_init == pytest.approx(0.1)
+    assert args.nll_sigma_mode == "fixed"
     assert args.nll_endpoint_solver == "particle-ode"
     assert args.nll_checkpoint_selection == "last"
     assert args.nll_save_checkpoints is True
