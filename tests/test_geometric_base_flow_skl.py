@@ -19,6 +19,7 @@ if str(_REPO_ROOT) not in sys.path:
 from fisher import geometric_base_flow_skl as gb
 from fisher.geometric_base_flow_skl import (
     ConditionTimeAffineVelocity,
+    HalfCircleBase,
     LineSegmentBase,
     SquarePerimeterBase,
     estimate_smoothed_curve_symmetric_kl,
@@ -51,6 +52,15 @@ def _load_line_fit_check_module():
 def _load_square_fit_check_module():
     path = _REPO_ROOT / "bin" / "run_geometric_base_square_fit_check.py"
     spec = importlib.util.spec_from_file_location("run_geometric_base_square_fit_check", path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _load_half_circle_fit_check_module():
+    path = _REPO_ROOT / "bin" / "run_geometric_base_half_circle_fit_check.py"
+    spec = importlib.util.spec_from_file_location("run_geometric_base_half_circle_fit_check", path)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -129,6 +139,29 @@ def test_line_segment_base_samples_centered_line() -> None:
     assert torch.all(u <= 0.5)
     expected = torch.tensor([[1.0, -2.0]], dtype=torch.float64) + u * torch.tensor([[2.0, 0.5]], dtype=torch.float64)
     torch.testing.assert_close(x, expected)
+
+
+def test_half_circle_base_maps_unit_upper_arc() -> None:
+    base = HalfCircleBase(center=(0.0, 0.0), radius=1.0)
+    u = torch.tensor([[0.0], [0.5], [1.0]], dtype=torch.float64)
+
+    got = base.points_from_u(u)
+    expected = torch.tensor([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]], dtype=torch.float64)
+    torch.testing.assert_close(got, expected, atol=1e-15, rtol=1e-15)
+
+
+def test_half_circle_base_samples_on_upper_arc() -> None:
+    torch.manual_seed(0)
+    base = HalfCircleBase(center=(1.0, -2.0), radius=2.0)
+    x, u = base.sample_with_u(128, device=torch.device("cpu"), dtype=torch.float64)
+
+    assert x.shape == (128, 2)
+    assert u.shape == (128, 1)
+    centered = x - torch.tensor([[1.0, -2.0]], dtype=torch.float64)
+    assert torch.all(u >= 0.0)
+    assert torch.all(u <= 1.0)
+    assert torch.all(centered[:, 1] >= 0.0)
+    torch.testing.assert_close(torch.linalg.norm(centered, dim=1), 2.0 * torch.ones(128, dtype=torch.float64))
 
 
 def test_square_perimeter_base_maps_unit_square_boundary() -> None:
@@ -585,3 +618,42 @@ def test_geometric_base_square_fit_check_allows_single_condition() -> None:
     assert data["theta_train"].shape[1] == 1
     assert data["theta_val"].shape[1] == 1
     assert data["theta_test"].shape[1] == 1
+
+
+def test_geometric_base_half_circle_fit_check_defaults() -> None:
+    mod = _load_half_circle_fit_check_module()
+    args = mod.build_parser().parse_args([])
+    paths = mod.resolve_output_paths(args.output_dir)
+
+    assert args.condition_values == "0.0,1.0"
+    assert args.radius == pytest.approx(1.0)
+    assert args.base_radius == pytest.approx(1.0)
+    assert args.target_sigma == pytest.approx(0.2)
+    assert args.left_center_x == pytest.approx(-1.0)
+    assert args.left_center_y == pytest.approx(0.0)
+    assert args.right_center_x == pytest.approx(1.0)
+    assert args.right_center_y == pytest.approx(0.0)
+    assert args.path_schedule == "cosine"
+    assert args.epochs == 50000
+    assert args.early_patience == 1000
+    assert args.n_per_condition == 3000
+    assert args.nll_finetune is False
+    assert args.nll_epochs == 2000
+    assert args.nll_particles == 128
+    assert args.nll_sigma_init == pytest.approx(0.1)
+    assert args.nll_endpoint_solver == "particle-ode"
+    assert args.nll_checkpoint_selection == "last"
+    assert args.nll_save_checkpoints is True
+    assert args.nll_checkpoint_every == 0
+    assert args.nll_checkpoint_dir is None
+    assert args.curve_points == 300
+    assert paths["png"].name == "geometric_base_half_circle_fit_check.png"
+    assert paths["svg"].name == "geometric_base_half_circle_fit_check.svg"
+    assert paths["summary"].name == "geometric_base_half_circle_fit_check_summary.json"
+    condition_values = mod._parse_condition_values(args.condition_values)
+    data = mod._make_noisy_half_circle_data(args, condition_values)
+    np.testing.assert_allclose(data["condition_eval"], np.eye(2))
+    assert data["theta_encoding"] == "one_hot"
+    assert data["theta_train"].shape[1] == 2
+    assert data["datasets"][0].arc == "upper"
+    assert data["datasets"][1].arc == "lower"

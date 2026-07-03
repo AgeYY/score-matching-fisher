@@ -94,6 +94,66 @@ class LineSegmentBase:
 
 
 @dataclass(frozen=True)
+class HalfCircleBase:
+    """Noiseless upper half-circle base parameterized by ``u in [0, 1]``."""
+
+    center: np.ndarray | tuple[float, float] = (0.0, 0.0)
+    radius: float = 1.0
+    u_low: float = 0.0
+    u_high: float = 1.0
+    name: str = "half_circle"
+
+    def __post_init__(self) -> None:
+        center = np.asarray(self.center, dtype=np.float64).reshape(-1)
+        if center.shape != (2,):
+            raise ValueError("center must contain exactly two values.")
+        if not np.all(np.isfinite(center)):
+            raise ValueError("center must be finite.")
+        radius = float(self.radius)
+        if not math.isfinite(radius) or radius <= 0.0:
+            raise ValueError("radius must be finite and positive.")
+        if not math.isfinite(float(self.u_low)) or not math.isfinite(float(self.u_high)):
+            raise ValueError("u bounds must be finite.")
+        if float(self.u_low) >= float(self.u_high):
+            raise ValueError("u_low must be < u_high.")
+        object.__setattr__(self, "center", center)
+        object.__setattr__(self, "radius", radius)
+        object.__setattr__(self, "u_low", float(self.u_low))
+        object.__setattr__(self, "u_high", float(self.u_high))
+
+    @property
+    def ambient_dim(self) -> int:
+        return 2
+
+    @property
+    def intrinsic_dim(self) -> int:
+        return 1
+
+    def sample_u(self, n: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        count = int(n)
+        if count < 1:
+            raise ValueError("n must be >= 1.")
+        return self.u_low + (self.u_high - self.u_low) * torch.rand(count, 1, device=device, dtype=dtype)
+
+    def points_from_u(self, u: torch.Tensor) -> torch.Tensor:
+        if u.ndim == 1:
+            u = u.unsqueeze(-1)
+        if u.ndim != 2 or int(u.shape[1]) != 1:
+            raise ValueError("u must have shape [N] or [N, 1].")
+        theta = math.pi * u
+        radius = float(self.radius)
+        center = torch.as_tensor(self.center, dtype=u.dtype, device=u.device).reshape(1, 2)
+        return torch.cat([radius * torch.cos(theta), radius * torch.sin(theta)], dim=1) + center
+
+    def sample(self, n: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        return self.points_from_u(self.sample_u(int(n), device=device, dtype=dtype))
+
+    def sample_with_u(self, n: int, *, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+        u = self.sample_u(int(n), device=device, dtype=dtype)
+        return self.points_from_u(u), u
+
+
+@dataclass(frozen=True)
 class SquarePerimeterBase:
     """Noiseless square-boundary base parameterized by perimeter coordinate ``u``."""
 
