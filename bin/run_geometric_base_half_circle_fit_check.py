@@ -18,9 +18,9 @@ if str(_REPO_ROOT) not in sys.path:
 
 from global_setting import DATA_DIR, DEFAULT_DEVICE
 
-from fisher.flow_matching_skl import CenteredConditionAffineFlowSKLModel
 from fisher.geometric_base_flow_skl import (
     HalfCircleBase,
+    build_geometric_base_velocity_model,
     estimate_smoothed_curve_symmetric_kl,
     finetune_geometric_base_nll,
     push_base_curve,
@@ -63,6 +63,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--hidden-dim", type=int, default=64)
     p.add_argument("--depth", type=int, default=2)
+    p.add_argument(
+        "--velocity-family",
+        choices=("lie-affine-2d", "lie-similarity-2d", "centered-affine"),
+        default="lie-affine-2d",
+    )
     p.add_argument("--t-eps", type=float, default=0.0005)
     p.add_argument("--early-patience", type=int, default=1000)
     p.add_argument("--early-min-delta", type=float, default=1e-4)
@@ -83,6 +88,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--nll-save-checkpoints", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--nll-checkpoint-every", type=int, default=0, help="0 reuses --log-every.")
     p.add_argument("--nll-checkpoint-dir", type=Path, default=None)
+    p.add_argument("--nll-resume-checkpoint", type=Path, default=None)
     return p
 
 
@@ -363,7 +369,8 @@ def main(argv: list[str] | None = None) -> int:
     x_val = np.asarray(data["x_val"], dtype=np.float64)
 
     base = HalfCircleBase(center=(0.0, 0.0), radius=float(args.base_radius))
-    model = CenteredConditionAffineFlowSKLModel(
+    model = build_geometric_base_velocity_model(
+        velocity_family=str(args.velocity_family),
         theta_dim=int(condition_eval.shape[1]),
         x_dim=2,
         hidden_dim=int(args.hidden_dim),
@@ -422,6 +429,7 @@ def main(argv: list[str] | None = None) -> int:
             save_checkpoints=bool(args.nll_save_checkpoints),
             checkpoint_dir=nll_checkpoint_dir,
             checkpoint_every=int(args.nll_checkpoint_every),
+            resume_checkpoint=args.nll_resume_checkpoint,
             log_every=max(1, int(args.log_every)),
         )
     result = estimate_smoothed_curve_symmetric_kl(
@@ -477,6 +485,7 @@ def main(argv: list[str] | None = None) -> int:
         "weight_decay": float(args.weight_decay),
         "hidden_dim": int(args.hidden_dim),
         "depth": int(args.depth),
+        "velocity_family": str(args.velocity_family),
         "path_schedule": str(args.path_schedule),
         "t_eps": float(args.t_eps),
         "early_patience": int(args.early_patience),
@@ -521,6 +530,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.nll_checkpoint_dir is not None
             else str(paths["output_dir"] / "nll_checkpoints")
         ),
+        "nll_resume_checkpoint": None if args.nll_resume_checkpoint is None else str(Path(args.nll_resume_checkpoint).expanduser().resolve()),
     }
     summary = {
         "script": "bin/run_geometric_base_half_circle_fit_check.py",

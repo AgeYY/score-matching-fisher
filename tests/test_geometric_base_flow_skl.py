@@ -19,9 +19,12 @@ if str(_REPO_ROOT) not in sys.path:
 from fisher import geometric_base_flow_skl as gb
 from fisher.geometric_base_flow_skl import (
     ConditionTimeAffineVelocity,
+    ConditionTimeLieAffine2DVelocity,
+    ConditionTimeLieSimilarity2DVelocity,
     HalfCircleBase,
     LineSegmentBase,
     SquarePerimeterBase,
+    build_geometric_base_velocity_model,
     estimate_smoothed_curve_symmetric_kl,
     finetune_geometric_base_nll,
     geometric_smoothed_curve_nll_loss,
@@ -214,6 +217,97 @@ def test_condition_time_affine_velocity_is_affine_in_x() -> None:
     assert b.shape == (1, 2)
 
 
+def test_condition_time_lie_affine_2d_velocity_uses_lie_basis_and_center() -> None:
+    model = ConditionTimeLieAffine2DVelocity(theta_dim=2, x_dim=2, hidden_dim=4, depth=1)
+    with torch.no_grad():
+        for p in model.parameters():
+            p.zero_()
+        model.net[-1].bias.copy_(torch.tensor([1.0, -2.0, 0.3, 0.4, 0.5, -0.2, 2.0, -1.0]))
+    theta = torch.tensor([[1.0, 0.0]], dtype=torch.float32)
+    t = torch.tensor([[0.4]], dtype=torch.float32)
+    x = torch.tensor([[3.0, 5.0]], dtype=torch.float32)
+
+    v, a, c = model.lie_params(theta, t)
+    got_a, got_b = model.affine_params(theta, t)
+    got = model(x, theta, t)
+
+    expected_v = torch.tensor([[1.0, -2.0]], dtype=torch.float32)
+    expected_a = torch.tensor([[[0.9, -0.5], [0.1, -0.1]]], dtype=torch.float32)
+    expected_c = torch.tensor([[2.0, -1.0]], dtype=torch.float32)
+    expected_b = expected_v - torch.bmm(expected_a, expected_c.unsqueeze(-1)).squeeze(-1)
+    expected = expected_v + torch.bmm(expected_a, (x - expected_c).unsqueeze(-1)).squeeze(-1)
+
+    torch.testing.assert_close(v, expected_v)
+    torch.testing.assert_close(a, expected_a)
+    torch.testing.assert_close(c, expected_c)
+    torch.testing.assert_close(got_a, expected_a)
+    torch.testing.assert_close(got_b, expected_b)
+    torch.testing.assert_close(got, expected)
+
+
+def test_condition_time_lie_affine_2d_velocity_rejects_non_2d() -> None:
+    with pytest.raises(ValueError, match="x_dim == 2"):
+        ConditionTimeLieAffine2DVelocity(theta_dim=1, x_dim=3)
+
+
+def test_condition_time_lie_similarity_2d_velocity_has_no_strain_terms() -> None:
+    model = ConditionTimeLieSimilarity2DVelocity(theta_dim=2, x_dim=2, hidden_dim=4, depth=1)
+    with torch.no_grad():
+        for p in model.parameters():
+            p.zero_()
+        model.net[-1].bias.copy_(torch.tensor([1.0, -2.0, 0.3, 0.4, 2.0, -1.0]))
+    theta = torch.tensor([[1.0, 0.0]], dtype=torch.float32)
+    t = torch.tensor([[0.4]], dtype=torch.float32)
+    x = torch.tensor([[3.0, 5.0]], dtype=torch.float32)
+
+    v, a, c = model.lie_params(theta, t)
+    got_a, got_b = model.affine_params(theta, t)
+    got = model(x, theta, t)
+
+    expected_v = torch.tensor([[1.0, -2.0]], dtype=torch.float32)
+    expected_a = torch.tensor([[[0.4, -0.3], [0.3, 0.4]]], dtype=torch.float32)
+    expected_c = torch.tensor([[2.0, -1.0]], dtype=torch.float32)
+    expected_b = expected_v - torch.bmm(expected_a, expected_c.unsqueeze(-1)).squeeze(-1)
+    expected = expected_v + torch.bmm(expected_a, (x - expected_c).unsqueeze(-1)).squeeze(-1)
+
+    torch.testing.assert_close(v, expected_v)
+    torch.testing.assert_close(a, expected_a)
+    torch.testing.assert_close(c, expected_c)
+    torch.testing.assert_close(got_a[:, 0, 0], got_a[:, 1, 1])
+    torch.testing.assert_close(got_a[:, 0, 1], -got_a[:, 1, 0])
+    torch.testing.assert_close(got_b, expected_b)
+    torch.testing.assert_close(got, expected)
+
+
+def test_condition_time_lie_similarity_2d_velocity_rejects_non_2d() -> None:
+    with pytest.raises(ValueError, match="x_dim == 2"):
+        ConditionTimeLieSimilarity2DVelocity(theta_dim=1, x_dim=3)
+
+
+def test_build_geometric_base_velocity_model_selects_lie_default_and_centered_fallback() -> None:
+    lie = build_geometric_base_velocity_model(theta_dim=2, x_dim=2, hidden_dim=4, depth=1)
+    similarity = build_geometric_base_velocity_model(
+        velocity_family="lie-similarity-2d",
+        theta_dim=2,
+        x_dim=2,
+        hidden_dim=4,
+        depth=1,
+    )
+    centered = build_geometric_base_velocity_model(
+        velocity_family="centered-affine",
+        theta_dim=2,
+        x_dim=2,
+        hidden_dim=4,
+        depth=1,
+    )
+
+    assert isinstance(lie, ConditionTimeLieAffine2DVelocity)
+    assert getattr(lie, "velocity_family") == "lie_affine_2d"
+    assert isinstance(similarity, ConditionTimeLieSimilarity2DVelocity)
+    assert getattr(similarity, "velocity_family") == "lie_similarity_2d"
+    assert getattr(centered, "velocity_family") == "condition_affine"
+
+
 def test_training_loop_draws_source_from_base(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_path = FakePath()
     monkeypatch.setattr(gb, "_make_flow_matching_affine_path", lambda path_schedule: (fake_path, "linear"))
@@ -398,6 +492,33 @@ def test_affine_map_nll_matches_particle_ode_for_constant_translation() -> None:
     torch.testing.assert_close(fast_sigma, particle_sigma)
 
 
+def test_affine_map_nll_supports_lie_affine_velocity() -> None:
+    model = ConditionTimeLieAffine2DVelocity(theta_dim=2, x_dim=2, hidden_dim=4, depth=1)
+    base = LineSegmentBase(anchor=(0.0, 0.0), direction=(1.0, 0.0))
+    x = torch.tensor([[0.0, 0.0], [1.0, 0.0]], dtype=torch.float32)
+    support_u = torch.tensor([[0.0], [1.0]], dtype=torch.float32)
+    sigma_min = 1e-4
+    sigma = 0.5
+    raw_sigma = torch.tensor(math.log(math.expm1(sigma - sigma_min)), dtype=torch.float32)
+
+    got, got_sigma = geometric_smoothed_curve_nll_loss(
+        model=model,
+        base=base,
+        x=x,
+        theta=np.asarray([[1.0, 0.0]], dtype=np.float64),
+        raw_sigma=raw_sigma,
+        sigma_min=sigma_min,
+        u_grid=support_u,
+        device=torch.device("cpu"),
+        ode_steps=2,
+        ode_method="midpoint",
+        endpoint_solver="affine-map",
+    )
+
+    assert torch.isfinite(got)
+    torch.testing.assert_close(got_sigma, torch.tensor(sigma, dtype=torch.float32))
+
+
 def test_geometric_base_nll_finetune_records_metadata_and_checkpoints(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -486,6 +607,68 @@ def test_geometric_base_nll_finetune_records_affine_map_solver() -> None:
     assert np.asarray(meta["val_nll_losses"]).shape == (1,)
 
 
+def test_geometric_base_nll_finetune_resumes_from_checkpoint(tmp_path: Path) -> None:
+    base = LineSegmentBase(anchor=(0.0, 0.0), direction=(1.0, 0.0))
+    theta = np.asarray([[1.0], [1.0], [1.0], [1.0]], dtype=np.float64)
+    x = np.asarray([[-0.4, 0.0], [-0.1, 0.0], [0.2, 0.0], [0.45, 0.0]], dtype=np.float64)
+    ckpt_dir = tmp_path / "nll_checkpoints"
+
+    model = ConditionTimeLieAffine2DVelocity(theta_dim=1, x_dim=2, hidden_dim=4, depth=1)
+    first = finetune_geometric_base_nll(
+        model=model,
+        base=base,
+        theta_train=theta,
+        x_train=x,
+        theta_val=theta,
+        x_val=x,
+        condition_eval=np.asarray([[1.0]], dtype=np.float64),
+        device=torch.device("cpu"),
+        epochs=2,
+        batch_size=2,
+        lr=1e-3,
+        sigma_init=0.2,
+        n_particles=4,
+        ode_steps=2,
+        nll_endpoint_solver="affine-map",
+        save_checkpoints=True,
+        checkpoint_dir=ckpt_dir,
+        checkpoint_every=1,
+        log_every=999,
+    )
+    resume_path = Path(first["checkpoint_paths"][-1])
+    assert resume_path.name == "nll_epoch_000002.pt"
+
+    resumed_model = ConditionTimeLieAffine2DVelocity(theta_dim=1, x_dim=2, hidden_dim=4, depth=1)
+    resumed = finetune_geometric_base_nll(
+        model=resumed_model,
+        base=base,
+        theta_train=theta,
+        x_train=x,
+        theta_val=theta,
+        x_val=x,
+        condition_eval=np.asarray([[1.0]], dtype=np.float64),
+        device=torch.device("cpu"),
+        epochs=3,
+        batch_size=2,
+        lr=1e-3,
+        sigma_init=0.2,
+        n_particles=4,
+        ode_steps=2,
+        nll_endpoint_solver="affine-map",
+        save_checkpoints=True,
+        checkpoint_dir=ckpt_dir,
+        checkpoint_every=1,
+        resume_checkpoint=resume_path,
+        log_every=999,
+    )
+
+    assert resumed["start_epoch"] == 2
+    assert resumed["resume_checkpoint"] == str(resume_path.resolve())
+    assert np.asarray(resumed["train_nll_losses"]).shape == (3,)
+    assert np.asarray(resumed["val_nll_losses"]).shape == (3,)
+    assert Path(resumed["checkpoint_paths"][-1]).name == "nll_epoch_000003.pt"
+
+
 def test_smoothed_curve_skl_identical_conditions_is_zero(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(gb, "_make_flow_ode_solver", lambda model: IdentitySolver(model))
     torch.manual_seed(0)
@@ -525,6 +708,9 @@ def test_geometric_base_line_fit_check_defaults() -> None:
 
     assert args.theta_values == "0.7853981633974483,2.356194490192345"
     assert args.path_schedule == "cosine"
+    assert args.velocity_family == "lie-affine-2d"
+    assert mod.build_parser().parse_args(["--velocity-family", "lie-similarity-2d"]).velocity_family == "lie-similarity-2d"
+    assert mod.build_parser().parse_args(["--velocity-family", "centered-affine"]).velocity_family == "centered-affine"
     assert args.epochs == 50000
     assert args.early_patience == 1000
     assert args.n_per_theta == 3000
@@ -538,6 +724,7 @@ def test_geometric_base_line_fit_check_defaults() -> None:
     assert args.nll_sigma_init == pytest.approx(0.1)
     assert args.nll_endpoint_solver == "particle-ode"
     assert args.nll_checkpoint_selection == "last"
+    assert args.nll_resume_checkpoint is None
     assert args.max_test_plot_per_theta == 500
     assert args.smooth_sigma == pytest.approx(0.12)
     assert paths["png"].name == "geometric_base_line_fit_check.png"
@@ -584,6 +771,9 @@ def test_geometric_base_square_fit_check_defaults() -> None:
     assert args.base_side_length == pytest.approx(1.0)
     assert args.target_sigma == pytest.approx(0.2)
     assert args.path_schedule == "cosine"
+    assert args.velocity_family == "lie-affine-2d"
+    assert mod.build_parser().parse_args(["--velocity-family", "lie-similarity-2d"]).velocity_family == "lie-similarity-2d"
+    assert mod.build_parser().parse_args(["--velocity-family", "centered-affine"]).velocity_family == "centered-affine"
     assert args.epochs == 50000
     assert args.early_patience == 1000
     assert args.n_per_theta == 3000
@@ -596,6 +786,7 @@ def test_geometric_base_square_fit_check_defaults() -> None:
     assert args.nll_save_checkpoints is True
     assert args.nll_checkpoint_every == 0
     assert args.nll_checkpoint_dir is None
+    assert args.nll_resume_checkpoint is None
     assert args.curve_points_per_edge == 100
     assert paths["png"].name == "geometric_base_square_fit_check.png"
     assert paths["svg"].name == "geometric_base_square_fit_check.svg"
@@ -634,6 +825,9 @@ def test_geometric_base_half_circle_fit_check_defaults() -> None:
     assert args.right_center_x == pytest.approx(1.0)
     assert args.right_center_y == pytest.approx(0.0)
     assert args.path_schedule == "cosine"
+    assert args.velocity_family == "lie-affine-2d"
+    assert mod.build_parser().parse_args(["--velocity-family", "lie-similarity-2d"]).velocity_family == "lie-similarity-2d"
+    assert mod.build_parser().parse_args(["--velocity-family", "centered-affine"]).velocity_family == "centered-affine"
     assert args.epochs == 50000
     assert args.early_patience == 1000
     assert args.n_per_condition == 3000
@@ -646,6 +840,7 @@ def test_geometric_base_half_circle_fit_check_defaults() -> None:
     assert args.nll_save_checkpoints is True
     assert args.nll_checkpoint_every == 0
     assert args.nll_checkpoint_dir is None
+    assert args.nll_resume_checkpoint is None
     assert args.curve_points == 300
     assert paths["png"].name == "geometric_base_half_circle_fit_check.png"
     assert paths["svg"].name == "geometric_base_half_circle_fit_check.svg"

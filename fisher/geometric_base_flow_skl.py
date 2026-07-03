@@ -14,6 +14,7 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from fisher.flow_matching_skl import (
+    CenteredConditionAffineFlowSKLModel,
     FlowSKLResult,
     _apply_matrix,
     _as_2d_float64,
@@ -30,6 +31,7 @@ from fisher.model_weight_ema import scalar_val_ema_update
 
 SMOOTHED_LINE_CURVE_METRIC = "smoothed_line_curve_symmetric_kl"
 NLL_ENDPOINT_SOLVERS = ("particle_ode", "affine_map")
+GEOMETRIC_BASE_VELOCITY_FAMILIES = ("lie_affine_2d", "lie_similarity_2d", "centered_affine")
 
 
 @dataclass(frozen=True)
@@ -290,6 +292,165 @@ class ConditionTimeAffineVelocity(nn.Module):
         theta = _expand_theta_to_batch(theta, batch=int(x.shape[0]))
         a, b = self.affine_params(theta, t)
         return _apply_matrix(a, x) + b
+
+
+class ConditionTimeLieAffine2DVelocity(nn.Module):
+    """2D affine velocity in translation, rotation, scale, and strain coordinates."""
+
+    velocity_family = "lie_affine_2d"
+    network_architecture = "mlp_lie_affine_2d"
+
+    def __init__(
+        self,
+        *,
+        theta_dim: int,
+        x_dim: int = 2,
+        hidden_dim: int = 128,
+        depth: int = 3,
+    ) -> None:
+        super().__init__()
+        if int(theta_dim) < 1:
+            raise ValueError("theta_dim must be >= 1.")
+        if int(x_dim) != 2:
+            raise ValueError("ConditionTimeLieAffine2DVelocity requires x_dim == 2.")
+        self.theta_dim = int(theta_dim)
+        self.x_dim = 2
+        self.hidden_dim = int(hidden_dim)
+        self.depth = int(depth)
+        self.net = _make_mlp(
+            in_dim=1 + self.theta_dim,
+            out_dim=8,
+            hidden_dim=self.hidden_dim,
+            depth=self.depth,
+            final_gain=0.01,
+        )
+
+    def lie_params(self, theta: torch.Tensor, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        t = _as_col_t(t, batch=int(theta.shape[0]))
+        out = self.net(torch.cat([t, theta], dim=1))
+        v = out[:, 0:2]
+        omega = out[:, 2]
+        lam = out[:, 3]
+        alpha = out[:, 4]
+        gamma = out[:, 5]
+        c = out[:, 6:8]
+        a = torch.empty(int(out.shape[0]), 2, 2, dtype=out.dtype, device=out.device)
+        a[:, 0, 0] = lam + alpha
+        a[:, 0, 1] = -omega + gamma
+        a[:, 1, 0] = omega + gamma
+        a[:, 1, 1] = lam - alpha
+        return v, a, c
+
+    def affine_params(self, theta: torch.Tensor, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        v, a, c = self.lie_params(theta, t)
+        return a, v - _apply_matrix(a, c)
+
+    def forward(self, x: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        theta = _expand_theta_to_batch(theta, batch=int(x.shape[0]))
+        v, a, c = self.lie_params(theta, t)
+        return v + _apply_matrix(a, x - c)
+
+
+class ConditionTimeLieSimilarity2DVelocity(nn.Module):
+    """2D affine velocity with translation, rotation, uniform scaling, and learned center."""
+
+    velocity_family = "lie_similarity_2d"
+    network_architecture = "mlp_lie_similarity_2d"
+
+    def __init__(
+        self,
+        *,
+        theta_dim: int,
+        x_dim: int = 2,
+        hidden_dim: int = 128,
+        depth: int = 3,
+    ) -> None:
+        super().__init__()
+        if int(theta_dim) < 1:
+            raise ValueError("theta_dim must be >= 1.")
+        if int(x_dim) != 2:
+            raise ValueError("ConditionTimeLieSimilarity2DVelocity requires x_dim == 2.")
+        self.theta_dim = int(theta_dim)
+        self.x_dim = 2
+        self.hidden_dim = int(hidden_dim)
+        self.depth = int(depth)
+        self.net = _make_mlp(
+            in_dim=1 + self.theta_dim,
+            out_dim=6,
+            hidden_dim=self.hidden_dim,
+            depth=self.depth,
+            final_gain=0.01,
+        )
+
+    def lie_params(self, theta: torch.Tensor, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        t = _as_col_t(t, batch=int(theta.shape[0]))
+        out = self.net(torch.cat([t, theta], dim=1))
+        v = out[:, 0:2]
+        omega = out[:, 2]
+        lam = out[:, 3]
+        c = out[:, 4:6]
+        a = torch.empty(int(out.shape[0]), 2, 2, dtype=out.dtype, device=out.device)
+        a[:, 0, 0] = lam
+        a[:, 0, 1] = -omega
+        a[:, 1, 0] = omega
+        a[:, 1, 1] = lam
+        return v, a, c
+
+    def affine_params(self, theta: torch.Tensor, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        v, a, c = self.lie_params(theta, t)
+        return a, v - _apply_matrix(a, c)
+
+    def forward(self, x: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        theta = _expand_theta_to_batch(theta, batch=int(x.shape[0]))
+        v, a, c = self.lie_params(theta, t)
+        return v + _apply_matrix(a, x - c)
+
+
+def _normalize_geometric_base_velocity_family(value: str) -> str:
+    family = str(value).strip().lower().replace("-", "_")
+    if family not in GEOMETRIC_BASE_VELOCITY_FAMILIES:
+        allowed = ", ".join(GEOMETRIC_BASE_VELOCITY_FAMILIES)
+        raise ValueError(f"velocity_family must be one of {allowed}; got {value!r}.")
+    return family
+
+
+def build_geometric_base_velocity_model(
+    *,
+    velocity_family: str = "lie_affine_2d",
+    theta_dim: int,
+    x_dim: int,
+    hidden_dim: int = 128,
+    depth: int = 3,
+    path_schedule: str | GaussianAffinePathSchedule = "cosine",
+) -> nn.Module:
+    """Construct a geometric-base affine velocity model."""
+
+    family = _normalize_geometric_base_velocity_family(velocity_family)
+    if family == "lie_affine_2d":
+        return ConditionTimeLieAffine2DVelocity(
+            theta_dim=int(theta_dim),
+            x_dim=int(x_dim),
+            hidden_dim=int(hidden_dim),
+            depth=int(depth),
+        )
+    if family == "lie_similarity_2d":
+        return ConditionTimeLieSimilarity2DVelocity(
+            theta_dim=int(theta_dim),
+            x_dim=int(x_dim),
+            hidden_dim=int(hidden_dim),
+            depth=int(depth),
+        )
+    return CenteredConditionAffineFlowSKLModel(
+        theta_dim=int(theta_dim),
+        x_dim=int(x_dim),
+        hidden_dim=int(hidden_dim),
+        depth=int(depth),
+        path_schedule=path_schedule,
+    )
 
 
 def _adamw_parameters(model: nn.Module) -> list[nn.Parameter]:
@@ -744,6 +905,7 @@ def finetune_geometric_base_nll(
     save_checkpoints: bool = False,
     checkpoint_dir: str | Path | None = None,
     checkpoint_every: int = 0,
+    resume_checkpoint: str | Path | None = None,
     log_every: int = 100,
 ) -> dict[str, Any]:
     """Fine-tune a geometric-base flow by endpoint mixture NLL."""
@@ -816,6 +978,40 @@ def finetune_geometric_base_nll(
     best_state: dict[str, torch.Tensor] | None = None
     best_raw_sigma: torch.Tensor | None = None
     checkpoint_paths: list[str] = []
+    resume_path = Path(resume_checkpoint).expanduser().resolve() if resume_checkpoint is not None else None
+    start_epoch = 0
+    if resume_path is not None:
+        if not resume_path.is_file():
+            raise FileNotFoundError(f"resume_checkpoint does not exist: {resume_path}")
+        checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
+        if "model_state_dict" not in checkpoint or "raw_sigma" not in checkpoint:
+            raise ValueError("resume_checkpoint must contain model_state_dict and raw_sigma.")
+        start_epoch = int(checkpoint.get("epoch", 0))
+        if start_epoch < 1:
+            raise ValueError("resume_checkpoint epoch must be >= 1.")
+        if start_epoch >= int(epochs):
+            raise ValueError("epochs must be greater than the checkpoint epoch when resuming.")
+        model.load_state_dict(checkpoint["model_state_dict"])
+        raw_resume = torch.as_tensor(checkpoint["raw_sigma"], dtype=dtype, device=device)
+        if tuple(raw_resume.shape) != tuple(raw_sigma.shape):
+            raise ValueError("resume_checkpoint raw_sigma shape does not match condition_eval.")
+        raw_sigma.data.copy_(raw_resume)
+        if "u_grid" in checkpoint:
+            u_resume = torch.as_tensor(checkpoint["u_grid"], dtype=dtype, device=device)
+            if tuple(u_resume.shape) != tuple(u_grid.shape):
+                raise ValueError("resume_checkpoint u_grid shape does not match n_particles.")
+            u_grid = u_resume.detach()
+        if "optimizer_state_dict" in checkpoint:
+            opt.load_state_dict(checkpoint["optimizer_state_dict"])
+        train_losses = [float(v) for v in np.asarray(checkpoint.get("train_nll_losses", []), dtype=np.float64).reshape(-1)]
+        val_losses = [float(v) for v in np.asarray(checkpoint.get("val_nll_losses", []), dtype=np.float64).reshape(-1)]
+        if len(train_losses) != start_epoch or len(val_losses) != start_epoch:
+            raise ValueError("resume_checkpoint loss history length must match checkpoint epoch.")
+        best_val = float(checkpoint.get("best_val_nll", min(val_losses) if val_losses else float("inf")))
+        default_best_epoch = int(np.argmin(val_losses)) + 1 if val_losses else start_epoch
+        best_epoch = int(checkpoint.get("best_epoch", default_best_epoch))
+        best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        best_raw_sigma = raw_sigma.detach().cpu().clone()
 
     def _batch_nll_particle_ode(cb: torch.Tensor, xb: torch.Tensor, *, enable_grad: bool) -> tuple[torch.Tensor, torch.Tensor]:
         cb = cb.to(device=device, dtype=torch.long)
@@ -889,6 +1085,7 @@ def finetune_geometric_base_nll(
             "epoch": int(epoch),
             "model_state_dict": {k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
             "raw_sigma": raw_sigma.detach().cpu().clone(),
+            "u_grid": u_grid.detach().cpu().clone(),
             "optimizer_state_dict": opt.state_dict(),
             "train_nll_losses": np.asarray(train_losses, dtype=np.float64),
             "val_nll_losses": np.asarray(val_losses, dtype=np.float64),
@@ -910,13 +1107,14 @@ def finetune_geometric_base_nll(
                 "nll_endpoint_solver": endpoint_solver,
                 "checkpoint_selection": selection,
                 "checkpoint_every": int(ckpt_every),
+                "resume_checkpoint": str(resume_path) if resume_path is not None else None,
             },
         }
         path = ckpt_dir / f"nll_epoch_{int(epoch):06d}.pt"
         torch.save(payload, path)
         checkpoint_paths.append(str(path))
 
-    for epoch in range(1, int(epochs) + 1):
+    for epoch in range(start_epoch + 1, int(epochs) + 1):
         model.train()
         ep_losses: list[float] = []
         for cb, xb in train_loader:
@@ -980,6 +1178,8 @@ def finetune_geometric_base_nll(
         "checkpoint_dir": str(ckpt_dir) if ckpt_dir is not None else None,
         "checkpoint_every": int(ckpt_every),
         "checkpoint_paths": checkpoint_paths,
+        "resume_checkpoint": str(resume_path) if resume_path is not None else None,
+        "start_epoch": int(start_epoch),
         "best_epoch": int(best_epoch),
         "best_val_nll": float(best_val),
         "selected_epoch": int(selected_epoch),

@@ -20,13 +20,13 @@ from global_setting import DATA_DIR, DEFAULT_DEVICE
 
 from fisher.geometric_base_flow_skl import (
     LineSegmentBase,
+    build_geometric_base_velocity_model,
     estimate_smoothed_curve_symmetric_kl,
     finetune_geometric_base_nll,
     push_base_curve,
     train_geometric_base_affine_flow,
 )
 from fisher.noisy_line_dataset import NoisyLineDataset
-from fisher.flow_matching_skl import CenteredConditionAffineFlowSKLModel
 from fisher.shared_fisher_est import require_device
 
 
@@ -60,6 +60,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--hidden-dim", type=int, default=64)
     p.add_argument("--depth", type=int, default=2)
+    p.add_argument(
+        "--velocity-family",
+        choices=("lie-affine-2d", "lie-similarity-2d", "centered-affine"),
+        default="lie-affine-2d",
+    )
     p.add_argument("--t-eps", type=float, default=0.0005)
     p.add_argument("--early-patience", type=int, default=1000)
     p.add_argument("--early-min-delta", type=float, default=1e-4)
@@ -77,6 +82,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--nll-sigma-init", type=float, default=0.1, help="0 reuses --target-sigma.")
     p.add_argument("--nll-endpoint-solver", choices=("particle-ode", "affine-map"), default="particle-ode")
     p.add_argument("--nll-checkpoint-selection", choices=("last", "best"), default="last")
+    p.add_argument("--nll-resume-checkpoint", type=Path, default=None)
     return p
 
 
@@ -360,7 +366,8 @@ def main(argv: list[str] | None = None) -> int:
     x_val = np.asarray(data["x_val"], dtype=np.float64)
 
     base = LineSegmentBase(anchor=(0.0, 0.0), direction=(1.0, 0.0))
-    model = CenteredConditionAffineFlowSKLModel(
+    model = build_geometric_base_velocity_model(
+        velocity_family=str(args.velocity_family),
         theta_dim=int(condition_eval.shape[1]),
         x_dim=2,
         hidden_dim=int(args.hidden_dim),
@@ -411,6 +418,7 @@ def main(argv: list[str] | None = None) -> int:
             ode_method=str(args.ode_method),
             nll_endpoint_solver=str(args.nll_endpoint_solver),
             checkpoint_selection=str(args.nll_checkpoint_selection),
+            resume_checkpoint=args.nll_resume_checkpoint,
             log_every=max(1, int(args.log_every)),
         )
     result = estimate_smoothed_curve_symmetric_kl(
@@ -464,6 +472,7 @@ def main(argv: list[str] | None = None) -> int:
         "weight_decay": float(args.weight_decay),
         "hidden_dim": int(args.hidden_dim),
         "depth": int(args.depth),
+        "velocity_family": str(args.velocity_family),
         "path_schedule": str(args.path_schedule),
         "t_eps": float(args.t_eps),
         "early_patience": int(args.early_patience),
@@ -495,6 +504,7 @@ def main(argv: list[str] | None = None) -> int:
         "nll_sigma_init": float(args.nll_sigma_init) if float(args.nll_sigma_init) > 0.0 else float(args.target_sigma),
         "nll_endpoint_solver": str(args.nll_endpoint_solver),
         "nll_checkpoint_selection": str(args.nll_checkpoint_selection),
+        "nll_resume_checkpoint": None if args.nll_resume_checkpoint is None else str(Path(args.nll_resume_checkpoint).expanduser().resolve()),
     }
     summary = {
         "script": "bin/run_geometric_base_line_fit_check.py",
