@@ -19,11 +19,13 @@ if str(_REPO_ROOT) not in sys.path:
 from global_setting import DATA_DIR, DEFAULT_DEVICE
 
 from fisher.geometric_base_flow_skl import (
+    NoisyGeometricBase,
     SquarePerimeterBase,
     build_geometric_base_velocity_model,
     estimate_smoothed_curve_symmetric_kl,
     finetune_geometric_base_nll,
     push_base_curve,
+    push_initial_points,
     train_geometric_base_affine_flow,
 )
 from fisher.noisy_square_dataset import NoisySquareBoundaryDataset
@@ -39,6 +41,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--theta-values", type=str, default="0.0,0.7853981633974483")
     p.add_argument("--side-length", type=float, default=2.0, help="Target square edge length.")
     p.add_argument("--base-side-length", type=float, default=1.0, help="Base square edge length.")
+    p.add_argument("--base-noise-sigma", type=float, default=0.0)
     p.add_argument("--target-sigma", type=float, default=0.2)
     p.add_argument("--center-x", type=float, default=0.0)
     p.add_argument("--center-y", type=float, default=0.0)
@@ -54,6 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ode-steps", type=int, default=64)
     p.add_argument("--ode-method", type=str, default="midpoint")
     p.add_argument("--curve-points-per-edge", type=int, default=100)
+    p.add_argument("--generated-samples-per-condition", type=int, default=600)
 
     p.add_argument("--epochs", type=int, default=50000)
     p.add_argument("--batch-size", type=int, default=256)
@@ -263,8 +267,10 @@ def _plot_overlay(
     x_plot: np.ndarray,
     theta_plot_scalar: np.ndarray,
     base_curve: np.ndarray,
+    base_samples: np.ndarray | None,
     target_curves: list[np.ndarray],
     fitted_curves: list[np.ndarray],
+    generated_samples: list[np.ndarray] | None,
     skl_value: float | None,
     train_losses: np.ndarray,
     val_losses: np.ndarray,
@@ -283,6 +289,17 @@ def _plot_overlay(
         figsize=(11.8, 5.5),
         gridspec_kw={"width_ratios": [1.12, 1.0]},
     )
+    if base_samples is not None:
+        samples = np.asarray(base_samples, dtype=np.float64)
+        ax.scatter(
+            samples[:, 0],
+            samples[:, 1],
+            s=10,
+            alpha=0.28,
+            color="#2f2f2f",
+            linewidths=0,
+            label="base samples",
+        )
     for idx, theta_value in enumerate(theta_eval[:, 0]):
         mask = np.isclose(theta_plot_scalar[:, 0], float(theta_value))
         color = colors[idx % len(colors)]
@@ -299,12 +316,24 @@ def _plot_overlay(
         ax.plot(target[:, 0], target[:, 1], color=color, linewidth=1.2, linestyle=":", label=f"target square {idx + 1}")
         curve = np.asarray(fitted_curves[idx], dtype=np.float64)
         ax.plot(curve[:, 0], curve[:, 1], color=color, linewidth=2.4, label=f"fitted square {idx + 1}")
+        if generated_samples is not None:
+            gen = np.asarray(generated_samples[idx], dtype=np.float64)
+            ax.scatter(
+                gen[:, 0],
+                gen[:, 1],
+                s=12,
+                alpha=0.4,
+                marker="x",
+                color=color,
+                linewidths=0.8,
+                label=f"generated samples {idx + 1}",
+            )
     ax.plot(base_curve[:, 0], base_curve[:, 1], color="#2f2f2f", linewidth=2.0, linestyle="--", label="base square")
     if skl_value is not None:
         ax.text(
             0.02,
             0.98,
-            f"SKL = {skl_value:.4g}",
+            f"curve SKL = {skl_value:.4g}",
             transform=ax.transAxes,
             va="top",
             ha="left",
@@ -362,7 +391,17 @@ def main(argv: list[str] | None = None) -> int:
     theta_val = np.asarray(data["theta_val"], dtype=np.float64)
     x_val = np.asarray(data["x_val"], dtype=np.float64)
 
-    base = SquarePerimeterBase(center=(0.0, 0.0), side_length=float(args.base_side_length))
+    base_noise_sigma = float(args.base_noise_sigma)
+    if not np.isfinite(base_noise_sigma) or base_noise_sigma < 0.0:
+        raise ValueError("--base-noise-sigma must be finite and nonnegative.")
+    generated_sample_count = int(args.generated_samples_per_condition)
+    if generated_sample_count < 1:
+        raise ValueError("--generated-samples-per-condition must be >= 1.")
+
+    clean_base = SquarePerimeterBase(center=(0.0, 0.0), side_length=float(args.base_side_length))
+    base = clean_base
+    if base_noise_sigma > 0.0:
+        base = NoisyGeometricBase(clean_base, sigma=base_noise_sigma)
     model = build_geometric_base_velocity_model(
         velocity_family=str(args.velocity_family),
         theta_dim=int(condition_eval.shape[1]),
@@ -445,7 +484,10 @@ def main(argv: list[str] | None = None) -> int:
     count = 4 * int(args.curve_points_per_edge) + 1
     curve_u = torch.linspace(base.u_low, base.u_high, count, dtype=torch.float32).reshape(-1, 1)
     base_curve = base.points_from_u(curve_u).detach().cpu().numpy().astype(np.float64)
+    base_samples_t = base.sample(generated_sample_count, device=dev, dtype=torch.float32)
+    base_samples = base_samples_t.detach().cpu().numpy().astype(np.float64)
     fitted_curves: list[np.ndarray] = []
+    generated_samples: list[np.ndarray] = []
     for theta_row in condition_eval:
         curve, _ = push_base_curve(
             model=model,
@@ -457,6 +499,15 @@ def main(argv: list[str] | None = None) -> int:
             ode_method=str(args.ode_method),
         )
         fitted_curves.append(curve.detach().cpu().numpy().astype(np.float64))
+        pushed = push_initial_points(
+            model=model,
+            x0=base_samples_t,
+            theta=theta_row.reshape(1, -1),
+            device=dev,
+            ode_steps=int(args.ode_steps),
+            ode_method=str(args.ode_method),
+        )
+        generated_samples.append(pushed.detach().cpu().numpy().astype(np.float64))
     target_curves = [ds.boundary(points_per_edge=int(args.curve_points_per_edge)) for ds in data["datasets"]]
     skl_matrix = result.symmetric_kl_matrix if result is not None else None
     skl_value = float(skl_matrix[0, 1]) if skl_matrix is not None else None
@@ -467,8 +518,10 @@ def main(argv: list[str] | None = None) -> int:
         x_plot=np.asarray(data["x_test_plot"], dtype=np.float64),
         theta_plot_scalar=np.asarray(data["theta_test_plot_scalar"], dtype=np.float64),
         base_curve=base_curve,
+        base_samples=base_samples,
         target_curves=target_curves,
         fitted_curves=fitted_curves,
+        generated_samples=generated_samples,
         skl_value=skl_value,
         train_losses=np.asarray(train_meta["train_losses"], dtype=np.float64),
         val_losses=np.asarray(train_meta["val_losses"], dtype=np.float64),
@@ -499,6 +552,8 @@ def main(argv: list[str] | None = None) -> int:
         "condition_eval": condition_eval,
         "side_length": float(args.side_length),
         "base_side_length": float(args.base_side_length),
+        "base_distribution": "noisy_square" if base_noise_sigma > 0.0 else "clean_square",
+        "base_noise_sigma": base_noise_sigma,
         "target_sigma": float(args.target_sigma),
         "center": [float(args.center_x), float(args.center_y)],
         "smooth_sigma": float(args.smooth_sigma),
@@ -507,6 +562,7 @@ def main(argv: list[str] | None = None) -> int:
         "ode_steps": int(args.ode_steps),
         "ode_method": str(args.ode_method),
         "curve_points_per_edge": int(args.curve_points_per_edge),
+        "generated_samples_per_condition": generated_sample_count,
         "nll_finetune": bool(args.nll_finetune),
         "nll_epochs": int(args.nll_epochs),
         "nll_batch_size": int(args.nll_batch_size) if int(args.nll_batch_size) > 0 else int(args.batch_size),
@@ -546,6 +602,8 @@ def main(argv: list[str] | None = None) -> int:
         "stopped_epoch": int(train_meta["stopped_epoch"]),
         "stopped_early": bool(train_meta["stopped_early"]),
         "nll_finetune_metadata": nll_meta,
+        "base_samples_shape": list(base_samples.shape),
+        "generated_sample_shapes": [list(arr.shape) for arr in generated_samples],
         "png": paths["png"],
         "svg": paths["svg"],
         "summary": paths["summary"],

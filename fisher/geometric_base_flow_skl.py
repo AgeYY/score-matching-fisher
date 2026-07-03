@@ -232,6 +232,60 @@ class SquarePerimeterBase:
         return self.points_from_u(u), u
 
 
+@dataclass(frozen=True)
+class NoisyGeometricBase:
+    """Add isotropic ambient Gaussian noise to a geometric base sampler."""
+
+    base: Any
+    sigma: float = 0.0
+    name: str = "noisy_geometric_base"
+
+    def __post_init__(self) -> None:
+        sig = float(self.sigma)
+        if not math.isfinite(sig) or sig < 0.0:
+            raise ValueError("sigma must be finite and nonnegative.")
+        if not hasattr(self.base, "sample_u") or not hasattr(self.base, "points_from_u"):
+            raise ValueError("base must expose sample_u and points_from_u.")
+        object.__setattr__(self, "sigma", sig)
+        if self.name == "noisy_geometric_base":
+            object.__setattr__(self, "name", f"noisy_{getattr(self.base, 'name', type(self.base).__name__)}")
+
+    @property
+    def ambient_dim(self) -> int:
+        return int(getattr(self.base, "ambient_dim"))
+
+    @property
+    def intrinsic_dim(self) -> int:
+        return int(getattr(self.base, "intrinsic_dim", 1))
+
+    @property
+    def u_low(self) -> float:
+        return float(getattr(self.base, "u_low"))
+
+    @property
+    def u_high(self) -> float:
+        return float(getattr(self.base, "u_high"))
+
+    def sample_u(self, n: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        return self.base.sample_u(int(n), device=device, dtype=dtype)
+
+    def points_from_u(self, u: torch.Tensor) -> torch.Tensor:
+        return self.base.points_from_u(u)
+
+    def sample(self, n: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        x = self.points_from_u(self.sample_u(int(n), device=device, dtype=dtype))
+        if self.sigma == 0.0:
+            return x
+        return x + self.sigma * torch.randn_like(x)
+
+    def sample_with_u(self, n: int, *, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+        u = self.sample_u(int(n), device=device, dtype=dtype)
+        x = self.points_from_u(u)
+        if self.sigma > 0.0:
+            x = x + self.sigma * torch.randn_like(x)
+        return x, u
+
+
 def _make_mlp(*, in_dim: int, out_dim: int, hidden_dim: int, depth: int, final_gain: float = 0.01) -> nn.Sequential:
     if int(in_dim) < 1 or int(out_dim) < 1 or int(hidden_dim) < 1 or int(depth) < 1:
         raise ValueError("in_dim, out_dim, hidden_dim, and depth must be >= 1.")
@@ -495,6 +549,9 @@ def _geometric_base_metadata(base: Any) -> dict[str, Any]:
         "base_ambient_dim": int(getattr(base, "ambient_dim")),
         "base_intrinsic_dim": int(getattr(base, "intrinsic_dim", 1)),
     }
+    if isinstance(base, NoisyGeometricBase):
+        meta["base_noise_sigma"] = float(base.sigma)
+        meta["base_inner_name"] = str(getattr(base.base, "name", type(base.base).__name__))
     if hasattr(base, "anchor"):
         meta["base_anchor"] = np.asarray(getattr(base, "anchor"), dtype=np.float64)
     if hasattr(base, "direction"):
@@ -504,6 +561,18 @@ def _geometric_base_metadata(base: Any) -> dict[str, Any]:
     if hasattr(base, "side_length"):
         meta["base_side_length"] = float(getattr(base, "side_length"))
     return meta
+
+
+def _as_torch_x0(x0: np.ndarray | torch.Tensor, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    if torch.is_tensor(x0):
+        out = x0.to(device=device, dtype=dtype)
+    else:
+        out = torch.from_numpy(_as_2d_float64(np.asarray(x0), name="x0").astype(np.float32)).to(device=device, dtype=dtype)
+    if out.ndim == 1:
+        out = out.unsqueeze(0)
+    if out.ndim != 2:
+        raise ValueError("x0 must have shape [N, D].")
+    return out
 
 
 def train_geometric_base_affine_flow(
@@ -1216,6 +1285,55 @@ def push_base_curve(
         ode_steps=int(ode_steps),
         ode_method=str(ode_method),
         enable_grad=False,
+    )
+
+
+@torch.no_grad()
+def push_initial_points(
+    *,
+    model: nn.Module,
+    x0: np.ndarray | torch.Tensor,
+    theta: np.ndarray | torch.Tensor,
+    device: torch.device,
+    ode_steps: int = 64,
+    ode_method: str = "midpoint",
+) -> torch.Tensor:
+    """Push arbitrary initial ambient points through the learned conditional ODE."""
+
+    steps = int(ode_steps)
+    if steps < 1:
+        raise ValueError("ode_steps must be >= 1.")
+    method = str(ode_method).strip()
+    if not method:
+        raise ValueError("ode_method must be non-empty.")
+    dtype = _model_floating_dtype(model)
+    x0_t = _as_torch_x0(x0, device=device, dtype=dtype)
+    if int(x0_t.shape[1]) != int(getattr(model, "x_dim")):
+        raise ValueError("x0 dimension must match model x_dim.")
+    if torch.is_tensor(theta):
+        theta_t = theta.to(device=device, dtype=dtype)
+    else:
+        theta_t = torch.from_numpy(_as_2d_float64(np.asarray(theta), name="theta").astype(np.float32)).to(device=device, dtype=dtype)
+    if theta_t.ndim == 1:
+        theta_t = theta_t.unsqueeze(0)
+    if theta_t.ndim != 2:
+        raise ValueError("theta must have shape [1, theta_dim].")
+    if int(theta_t.shape[0]) != 1:
+        raise ValueError("theta must contain exactly one endpoint row.")
+
+    model.to(device)
+    model.eval()
+    theta_b = theta_t.expand(int(x0_t.shape[0]), int(theta_t.shape[1]))
+    time_grid = torch.linspace(0.0, 1.0, steps + 1, dtype=dtype, device=device)
+    solver = _make_flow_ode_solver(model)
+    return solver.sample(
+        x_init=x0_t,
+        step_size=None,
+        method=method,
+        time_grid=time_grid,
+        return_intermediates=False,
+        enable_grad=False,
+        theta_cond=theta_b,
     )
 
 

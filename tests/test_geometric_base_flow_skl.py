@@ -23,6 +23,7 @@ from fisher.geometric_base_flow_skl import (
     ConditionTimeLieSimilarity2DVelocity,
     HalfCircleBase,
     LineSegmentBase,
+    NoisyGeometricBase,
     SquarePerimeterBase,
     build_geometric_base_velocity_model,
     estimate_smoothed_curve_symmetric_kl,
@@ -30,6 +31,7 @@ from fisher.geometric_base_flow_skl import (
     geometric_smoothed_curve_nll_loss,
     log_smoothed_curve_density,
     push_base_curve,
+    push_initial_points,
     train_geometric_base_affine_flow,
 )
 
@@ -165,6 +167,35 @@ def test_half_circle_base_samples_on_upper_arc() -> None:
     assert torch.all(u <= 1.0)
     assert torch.all(centered[:, 1] >= 0.0)
     torch.testing.assert_close(torch.linalg.norm(centered, dim=1), 2.0 * torch.ones(128, dtype=torch.float64))
+
+
+def test_noisy_geometric_base_zero_sigma_matches_clean_geometry() -> None:
+    torch.manual_seed(0)
+    clean = HalfCircleBase(center=(0.25, -0.5), radius=1.5)
+    noisy = NoisyGeometricBase(clean, sigma=0.0)
+
+    x, u = noisy.sample_with_u(128, device=torch.device("cpu"), dtype=torch.float64)
+
+    torch.testing.assert_close(x, clean.points_from_u(u))
+    assert noisy.ambient_dim == clean.ambient_dim
+    assert noisy.intrinsic_dim == clean.intrinsic_dim
+    assert noisy.u_low == pytest.approx(clean.u_low)
+    assert noisy.u_high == pytest.approx(clean.u_high)
+
+
+def test_noisy_geometric_base_adds_ambient_noise_only() -> None:
+    torch.manual_seed(0)
+    clean = HalfCircleBase(center=(0.0, 0.0), radius=1.0)
+    noisy = NoisyGeometricBase(clean, sigma=0.1)
+    u = torch.tensor([[0.0], [0.5], [1.0]], dtype=torch.float64)
+
+    torch.testing.assert_close(noisy.points_from_u(u), clean.points_from_u(u))
+    x, got_u = noisy.sample_with_u(512, device=torch.device("cpu"), dtype=torch.float64)
+    clean_x = clean.points_from_u(got_u)
+
+    assert x.shape == clean_x.shape
+    assert float(torch.mean(torch.linalg.norm(x - clean_x, dim=1))) > 0.05
+    assert "half_circle" in noisy.name
 
 
 def test_square_perimeter_base_maps_unit_square_boundary() -> None:
@@ -352,6 +383,22 @@ def test_push_base_curve_zero_ode_leaves_points_unchanged(monkeypatch: pytest.Mo
 
     torch.testing.assert_close(got, torch.tensor([[-0.5, 0.0], [0.0, 0.0], [0.5, 0.0]], dtype=torch.float32))
     torch.testing.assert_close(got_u, u)
+
+
+def test_push_initial_points_constant_translation() -> None:
+    model = ConstantTranslationAffineVelocity((0.25, -0.5))
+    x0 = torch.tensor([[0.0, 0.0], [1.0, 2.0]], dtype=torch.float32)
+
+    got = push_initial_points(
+        model=model,
+        x0=x0,
+        theta=np.asarray([[0.0]], dtype=np.float64),
+        device=torch.device("cpu"),
+        ode_steps=4,
+        ode_method="midpoint",
+    )
+
+    torch.testing.assert_close(got, x0 + torch.tensor([[0.25, -0.5]], dtype=torch.float32))
 
 
 def test_push_base_curve_affine_map_zero_velocity_leaves_points_unchanged() -> None:
@@ -769,6 +816,7 @@ def test_geometric_base_square_fit_check_defaults() -> None:
     assert args.theta_values == "0.0,0.7853981633974483"
     assert args.side_length == pytest.approx(2.0)
     assert args.base_side_length == pytest.approx(1.0)
+    assert args.base_noise_sigma == pytest.approx(0.0)
     assert args.target_sigma == pytest.approx(0.2)
     assert args.path_schedule == "cosine"
     assert args.velocity_family == "lie-affine-2d"
@@ -788,6 +836,8 @@ def test_geometric_base_square_fit_check_defaults() -> None:
     assert args.nll_checkpoint_dir is None
     assert args.nll_resume_checkpoint is None
     assert args.curve_points_per_edge == 100
+    assert args.generated_samples_per_condition == 600
+    assert mod.build_parser().parse_args(["--base-noise-sigma", "0.1"]).base_noise_sigma == pytest.approx(0.1)
     assert paths["png"].name == "geometric_base_square_fit_check.png"
     assert paths["svg"].name == "geometric_base_square_fit_check.svg"
     assert paths["summary"].name == "geometric_base_square_fit_check_summary.json"
@@ -819,6 +869,7 @@ def test_geometric_base_half_circle_fit_check_defaults() -> None:
     assert args.condition_values == "0.0,1.0"
     assert args.radius == pytest.approx(1.0)
     assert args.base_radius == pytest.approx(1.0)
+    assert args.base_noise_sigma == pytest.approx(0.0)
     assert args.target_sigma == pytest.approx(0.2)
     assert args.left_center_x == pytest.approx(-1.0)
     assert args.left_center_y == pytest.approx(0.0)
@@ -842,6 +893,8 @@ def test_geometric_base_half_circle_fit_check_defaults() -> None:
     assert args.nll_checkpoint_dir is None
     assert args.nll_resume_checkpoint is None
     assert args.curve_points == 300
+    assert args.generated_samples_per_condition == 600
+    assert mod.build_parser().parse_args(["--base-noise-sigma", "0.1"]).base_noise_sigma == pytest.approx(0.1)
     assert paths["png"].name == "geometric_base_half_circle_fit_check.png"
     assert paths["svg"].name == "geometric_base_half_circle_fit_check.svg"
     assert paths["summary"].name == "geometric_base_half_circle_fit_check_summary.json"
