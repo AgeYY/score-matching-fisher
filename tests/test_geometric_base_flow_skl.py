@@ -21,14 +21,19 @@ from fisher.geometric_base_flow_skl import (
     ConditionTimeAffineVelocity,
     ConditionTimeLieAffine2DVelocity,
     ConditionTimeLieSimilarity2DVelocity,
+    ConditionTimeLieSimilarity3DVelocity,
+    HalfCircle3DBase,
     HalfCircleBase,
     LineSegmentBase,
     NoisyGeometricBase,
     SquarePerimeterBase,
     build_geometric_base_velocity_model,
     estimate_smoothed_curve_symmetric_kl,
+    finetune_geometric_base_cnf_likelihood,
     finetune_geometric_base_nll,
+    geometric_base_cnf_log_prob,
     geometric_smoothed_curve_nll_loss,
+    log_noisy_geometric_base_density,
     log_smoothed_curve_density,
     push_base_curve,
     push_initial_points,
@@ -66,6 +71,15 @@ def _load_square_fit_check_module():
 def _load_half_circle_fit_check_module():
     path = _REPO_ROOT / "bin" / "run_geometric_base_half_circle_fit_check.py"
     spec = importlib.util.spec_from_file_location("run_geometric_base_half_circle_fit_check", path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _load_half_circle_3d_fit_check_module():
+    path = _REPO_ROOT / "bin" / "run_geometric_base_half_circle_3d_fit_check.py"
+    spec = importlib.util.spec_from_file_location("run_geometric_base_half_circle_3d_fit_check", path)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -114,6 +128,30 @@ class ConstantTranslationAffineVelocity(nn.Module):
         return self.shift.to(device=x.device, dtype=x.dtype).reshape(1, 2).expand_as(x)
 
 
+class ConstantScalingAffineVelocity(nn.Module):
+    velocity_family = "constant_scaling_affine"
+    network_architecture = "test_constant_scaling"
+
+    def __init__(self, lam: float = 0.0) -> None:
+        super().__init__()
+        self.x_dim = 2
+        self.register_buffer("lam", torch.tensor(float(lam), dtype=torch.float32))
+
+    def affine_params(self, theta: torch.Tensor, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        del t
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        batch = int(theta.shape[0])
+        lam = self.lam.to(device=theta.device, dtype=theta.dtype)
+        a = torch.eye(2, dtype=theta.dtype, device=theta.device).reshape(1, 2, 2).expand(batch, 2, 2).clone() * lam
+        b = torch.zeros(batch, 2, dtype=theta.dtype, device=theta.device)
+        return a, b
+
+    def forward(self, x: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        del theta, t
+        return self.lam.to(device=x.device, dtype=x.dtype) * x
+
+
 class SentinelBase:
     name = "sentinel_base"
     ambient_dim = 2
@@ -153,6 +191,18 @@ def test_half_circle_base_maps_unit_upper_arc() -> None:
     got = base.points_from_u(u)
     expected = torch.tensor([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]], dtype=torch.float64)
     torch.testing.assert_close(got, expected, atol=1e-15, rtol=1e-15)
+
+
+def test_half_circle_3d_base_maps_unit_upper_arc_in_xy_plane() -> None:
+    base = HalfCircle3DBase(center=(1.0, -2.0, 0.5), radius=2.0)
+    u = torch.tensor([[0.0], [0.5], [1.0]], dtype=torch.float64)
+
+    got = base.points_from_u(u)
+    expected = torch.tensor([[3.0, -2.0, 0.5], [1.0, 0.0, 0.5], [-1.0, -2.0, 0.5]], dtype=torch.float64)
+
+    assert base.ambient_dim == 3
+    assert base.intrinsic_dim == 1
+    torch.testing.assert_close(got, expected, atol=1e-12, rtol=1e-12)
 
 
 def test_half_circle_base_samples_on_upper_arc() -> None:
@@ -315,6 +365,42 @@ def test_condition_time_lie_similarity_2d_velocity_rejects_non_2d() -> None:
         ConditionTimeLieSimilarity2DVelocity(theta_dim=1, x_dim=3)
 
 
+def test_condition_time_lie_similarity_3d_velocity_uses_skew_rotation_and_scale() -> None:
+    model = ConditionTimeLieSimilarity3DVelocity(theta_dim=2, x_dim=3, hidden_dim=4, depth=1)
+    with torch.no_grad():
+        for p in model.parameters():
+            p.zero_()
+        model.net[-1].bias.copy_(
+            torch.tensor([1.0, -2.0, 0.5, 0.2, -0.3, 0.4, 0.7, 2.0, -1.0, 0.25], dtype=torch.float32)
+        )
+    theta = torch.tensor([[1.0, 0.0]], dtype=torch.float32)
+    t = torch.tensor([[0.4]], dtype=torch.float32)
+    x = torch.tensor([[3.0, 5.0, -2.0]], dtype=torch.float32)
+
+    v, a, c = model.lie_params(theta, t)
+    got_a, got_b = model.affine_params(theta, t)
+    got = model(x, theta, t)
+
+    expected_v = torch.tensor([[1.0, -2.0, 0.5]], dtype=torch.float32)
+    expected_a = torch.tensor([[[0.7, -0.4, -0.3], [0.4, 0.7, -0.2], [0.3, 0.2, 0.7]]], dtype=torch.float32)
+    expected_c = torch.tensor([[2.0, -1.0, 0.25]], dtype=torch.float32)
+    expected_b = expected_v - torch.bmm(expected_a, expected_c.unsqueeze(-1)).squeeze(-1)
+    expected = expected_v + torch.bmm(expected_a, (x - expected_c).unsqueeze(-1)).squeeze(-1)
+
+    torch.testing.assert_close(v, expected_v)
+    torch.testing.assert_close(a, expected_a)
+    torch.testing.assert_close(c, expected_c)
+    torch.testing.assert_close(got_a, expected_a)
+    torch.testing.assert_close(got_b, expected_b)
+    torch.testing.assert_close(got, expected)
+    torch.testing.assert_close(torch.diagonal(got_a, dim1=-2, dim2=-1).sum(dim=1), torch.tensor([2.1]))
+
+
+def test_condition_time_lie_similarity_3d_velocity_rejects_non_3d() -> None:
+    with pytest.raises(ValueError, match="x_dim == 3"):
+        ConditionTimeLieSimilarity3DVelocity(theta_dim=1, x_dim=2)
+
+
 def test_build_geometric_base_velocity_model_selects_lie_default_and_centered_fallback() -> None:
     lie = build_geometric_base_velocity_model(theta_dim=2, x_dim=2, hidden_dim=4, depth=1)
     similarity = build_geometric_base_velocity_model(
@@ -331,11 +417,20 @@ def test_build_geometric_base_velocity_model_selects_lie_default_and_centered_fa
         hidden_dim=4,
         depth=1,
     )
+    similarity3d = build_geometric_base_velocity_model(
+        velocity_family="lie-similarity-3d",
+        theta_dim=2,
+        x_dim=3,
+        hidden_dim=4,
+        depth=1,
+    )
 
     assert isinstance(lie, ConditionTimeLieAffine2DVelocity)
     assert getattr(lie, "velocity_family") == "lie_affine_2d"
     assert isinstance(similarity, ConditionTimeLieSimilarity2DVelocity)
     assert getattr(similarity, "velocity_family") == "lie_similarity_2d"
+    assert isinstance(similarity3d, ConditionTimeLieSimilarity3DVelocity)
+    assert getattr(similarity3d, "velocity_family") == "lie_similarity_3d"
     assert getattr(centered, "velocity_family") == "condition_affine"
 
 
@@ -467,6 +562,105 @@ def test_log_smoothed_curve_density_matches_logsumexp(monkeypatch: pytest.Monkey
     sq = torch.sum((x[:, None, :] - centers[None, :, :]) ** 2, dim=-1)
     expected = torch.logsumexp(log_norm - 0.5 * sq / (sigma * sigma), dim=1) - math.log(2.0)
     torch.testing.assert_close(got, expected)
+
+
+def test_log_noisy_geometric_base_density_matches_logsumexp() -> None:
+    clean = LineSegmentBase(anchor=(0.0, 0.0), direction=(1.0, 0.0), u_low=-1.0, u_high=1.0)
+    base = NoisyGeometricBase(clean, sigma=0.5)
+    x = torch.tensor([[0.0, 0.0], [1.0, 0.0]], dtype=torch.float32)
+    support_u = torch.tensor([[-1.0], [1.0]], dtype=torch.float32)
+
+    got = log_noisy_geometric_base_density(x, base=base, support_u=support_u)
+
+    centers = clean.points_from_u(support_u)
+    log_norm = -0.5 * 2 * math.log(2.0 * math.pi * 0.5 * 0.5)
+    sq = torch.sum((x[:, None, :] - centers[None, :, :]) ** 2, dim=-1)
+    expected = torch.logsumexp(log_norm - 0.5 * sq / (0.5 * 0.5), dim=1) - math.log(2.0)
+    torch.testing.assert_close(got, expected)
+
+
+def test_geometric_base_cnf_log_prob_zero_velocity_is_base_density() -> None:
+    model = ConstantTranslationAffineVelocity((0.0, 0.0))
+    clean = LineSegmentBase(anchor=(0.0, 0.0), direction=(1.0, 0.0), u_low=-1.0, u_high=1.0)
+    base = NoisyGeometricBase(clean, sigma=0.5)
+    x = torch.tensor([[0.0, 0.0], [1.0, 0.0]], dtype=torch.float32)
+    support_u = torch.tensor([[-1.0], [1.0]], dtype=torch.float32)
+
+    got = geometric_base_cnf_log_prob(
+        model=model,
+        base=base,
+        x=x,
+        theta=torch.tensor([[0.0]], dtype=torch.float32).expand(2, 1),
+        support_u=support_u,
+        device=torch.device("cpu"),
+        ode_steps=2,
+    )
+    expected = log_noisy_geometric_base_density(x, base=base, support_u=support_u)
+
+    torch.testing.assert_close(got, expected)
+
+
+def test_geometric_base_cnf_log_prob_constant_translation() -> None:
+    model = ConstantTranslationAffineVelocity((0.25, -0.5))
+    clean = LineSegmentBase(anchor=(0.0, 0.0), direction=(1.0, 0.0), u_low=-1.0, u_high=1.0)
+    base = NoisyGeometricBase(clean, sigma=0.5)
+    x = torch.tensor([[0.25, -0.5], [1.25, -0.5]], dtype=torch.float32)
+    support_u = torch.tensor([[-1.0], [1.0]], dtype=torch.float32)
+
+    got = geometric_base_cnf_log_prob(
+        model=model,
+        base=base,
+        x=x,
+        theta=torch.tensor([[0.0]], dtype=torch.float32).expand(2, 1),
+        support_u=support_u,
+        device=torch.device("cpu"),
+        ode_steps=4,
+    )
+    expected = log_noisy_geometric_base_density(x - torch.tensor([[0.25, -0.5]], dtype=torch.float32), base=base, support_u=support_u)
+
+    torch.testing.assert_close(got, expected)
+
+
+def test_geometric_base_cnf_log_prob_scaling_uses_backward_divergence_sign() -> None:
+    lam = 0.1
+    model = ConstantScalingAffineVelocity(lam)
+    clean = LineSegmentBase(anchor=(0.0, 0.0), direction=(1.0, 0.0), u_low=-1.0, u_high=1.0)
+    base = NoisyGeometricBase(clean, sigma=0.5)
+    x = torch.tensor([[1.0, 0.0]], dtype=torch.float32)
+    support_u = torch.tensor([[-1.0], [1.0]], dtype=torch.float32)
+
+    got = geometric_base_cnf_log_prob(
+        model=model,
+        base=base,
+        x=x,
+        theta=torch.tensor([[0.0]], dtype=torch.float32),
+        support_u=support_u,
+        device=torch.device("cpu"),
+        ode_steps=1,
+        ode_method="euler",
+    )
+    expected_z0 = (1.0 - lam) * x
+    expected = log_noisy_geometric_base_density(expected_z0, base=base, support_u=support_u) - 2.0 * lam
+
+    torch.testing.assert_close(got, expected)
+
+
+def test_geometric_base_cnf_log_prob_requires_noisy_base() -> None:
+    model = ConstantTranslationAffineVelocity((0.0, 0.0))
+    clean = LineSegmentBase(anchor=(0.0, 0.0), direction=(1.0, 0.0), u_low=-1.0, u_high=1.0)
+    x = torch.tensor([[0.0, 0.0]], dtype=torch.float32)
+    support_u = torch.tensor([[-1.0], [1.0]], dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="requires NoisyGeometricBase"):
+        geometric_base_cnf_log_prob(
+            model=model,
+            base=clean,  # type: ignore[arg-type]
+            x=x,
+            theta=torch.tensor([[0.0]], dtype=torch.float32),
+            support_u=support_u,
+            device=torch.device("cpu"),
+            ode_steps=1,
+        )
 
 
 def test_geometric_smoothed_curve_nll_loss_matches_logsumexp(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -716,6 +910,63 @@ def test_geometric_base_nll_finetune_resumes_from_checkpoint(tmp_path: Path) -> 
     assert Path(resumed["checkpoint_paths"][-1]).name == "nll_epoch_000003.pt"
 
 
+def test_geometric_base_cnf_likelihood_finetune_records_metadata() -> None:
+    torch.manual_seed(0)
+    model = ConditionTimeAffineVelocity(theta_dim=1, x_dim=2, hidden_dim=4, depth=1)
+    clean = LineSegmentBase(anchor=(0.0, 0.0), direction=(1.0, 0.0), u_low=-1.0, u_high=1.0)
+    base = NoisyGeometricBase(clean, sigma=0.5)
+    theta = np.asarray([[1.0], [1.0], [1.0], [1.0]], dtype=np.float64)
+    x = np.asarray([[-0.4, 0.0], [-0.1, 0.0], [0.2, 0.0], [0.45, 0.0]], dtype=np.float64)
+
+    meta = finetune_geometric_base_cnf_likelihood(
+        model=model,
+        base=base,
+        theta_train=theta,
+        x_train=x,
+        theta_val=theta,
+        x_val=x,
+        condition_eval=np.asarray([[1.0]], dtype=np.float64),
+        device=torch.device("cpu"),
+        epochs=1,
+        batch_size=2,
+        lr=1e-3,
+        density_points=4,
+        ode_steps=2,
+        checkpoint_selection="best",
+        log_every=999,
+    )
+
+    assert meta["enabled"] is True
+    assert meta["epochs"] == 1
+    assert meta["density_points"] == 4
+    assert meta["base_noise_sigma"] == pytest.approx(0.5)
+    assert meta["checkpoint_selection"] == "best"
+    assert meta["selected_epoch"] == 1
+    assert np.asarray(meta["train_nll_losses"]).shape == (1,)
+    assert np.asarray(meta["val_nll_losses"]).shape == (1,)
+
+
+def test_geometric_base_cnf_likelihood_finetune_requires_noisy_base() -> None:
+    model = ConstantTranslationAffineVelocity((0.0, 0.0))
+    base = LineSegmentBase(anchor=(0.0, 0.0), direction=(1.0, 0.0))
+    theta = np.asarray([[1.0], [1.0]], dtype=np.float64)
+    x = np.asarray([[0.0, 0.0], [0.1, 0.0]], dtype=np.float64)
+
+    with pytest.raises(ValueError, match="requires NoisyGeometricBase"):
+        finetune_geometric_base_cnf_likelihood(
+            model=model,
+            base=base,  # type: ignore[arg-type]
+            theta_train=theta,
+            x_train=x,
+            theta_val=theta,
+            x_val=x,
+            condition_eval=np.asarray([[1.0]], dtype=np.float64),
+            device=torch.device("cpu"),
+            epochs=1,
+            batch_size=1,
+        )
+
+
 def test_smoothed_curve_skl_identical_conditions_is_zero(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(gb, "_make_flow_ode_solver", lambda model: IdentitySolver(model))
     torch.manual_seed(0)
@@ -748,12 +999,13 @@ def test_geometric_base_flow_skl_cli_defaults() -> None:
     assert args.density_mc_samples == 1024
 
 
-def test_geometric_base_line_fit_check_defaults() -> None:
+def test_geometric_base_line_fit_check_defaults(tmp_path: Path) -> None:
     mod = _load_line_fit_check_module()
     args = mod.build_parser().parse_args([])
     paths = mod.resolve_output_paths(args.output_dir)
 
     assert args.theta_values == "0.7853981633974483,2.356194490192345"
+    assert args.base_noise_sigma == pytest.approx(0.0)
     assert args.path_schedule == "cosine"
     assert args.velocity_family == "lie-affine-2d"
     assert mod.build_parser().parse_args(["--velocity-family", "lie-similarity-2d"]).velocity_family == "lie-similarity-2d"
@@ -772,8 +1024,17 @@ def test_geometric_base_line_fit_check_defaults() -> None:
     assert args.nll_endpoint_solver == "particle-ode"
     assert args.nll_checkpoint_selection == "last"
     assert args.nll_resume_checkpoint is None
+    assert args.nf_likelihood_finetune is False
+    assert args.nf_epochs == 1000
+    assert args.nf_batch_size == 0
+    assert args.nf_lr == pytest.approx(1e-4)
+    assert args.nf_weight_decay == pytest.approx(0.0)
+    assert args.nf_density_points == 512
+    assert args.nf_checkpoint_selection == "last"
     assert args.max_test_plot_per_theta == 500
+    assert args.generated_samples_per_theta == 500
     assert args.smooth_sigma == pytest.approx(0.12)
+    assert mod.build_parser().parse_args(["--base-noise-sigma", "0.1"]).base_noise_sigma == pytest.approx(0.1)
     assert paths["png"].name == "geometric_base_line_fit_check.png"
     assert paths["svg"].name == "geometric_base_line_fit_check.svg"
     assert paths["summary"].name == "geometric_base_line_fit_check_summary.json"
@@ -782,6 +1043,10 @@ def test_geometric_base_line_fit_check_defaults() -> None:
     np.testing.assert_allclose(data["condition_eval"], np.eye(2))
     assert data["theta_encoding"] == "one_hot"
     assert data["theta_train"].shape[1] == 2
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        mod.main(["--nll-finetune", "--nf-likelihood-finetune"])
+    with pytest.raises(ValueError, match="base-noise-sigma > 0"):
+        mod.main(["--device", "cpu", "--output-dir", str(tmp_path / "line"), "--nf-likelihood-finetune", "--n-per-theta", "3"])
 
 
 def test_geometric_base_training_exposes_no_matched_source_path() -> None:
@@ -808,7 +1073,7 @@ def test_geometric_base_training_exposes_no_matched_source_path() -> None:
     assert data["theta_train"].shape[0] + data["theta_val"].shape[0] + data["theta_test"].shape[0] == 12
 
 
-def test_geometric_base_square_fit_check_defaults() -> None:
+def test_geometric_base_square_fit_check_defaults(tmp_path: Path) -> None:
     mod = _load_square_fit_check_module()
     args = mod.build_parser().parse_args([])
     paths = mod.resolve_output_paths(args.output_dir)
@@ -835,6 +1100,13 @@ def test_geometric_base_square_fit_check_defaults() -> None:
     assert args.nll_checkpoint_every == 0
     assert args.nll_checkpoint_dir is None
     assert args.nll_resume_checkpoint is None
+    assert args.nf_likelihood_finetune is False
+    assert args.nf_epochs == 1000
+    assert args.nf_batch_size == 0
+    assert args.nf_lr == pytest.approx(1e-4)
+    assert args.nf_weight_decay == pytest.approx(0.0)
+    assert args.nf_density_points == 512
+    assert args.nf_checkpoint_selection == "last"
     assert args.curve_points_per_edge == 100
     assert args.generated_samples_per_condition == 600
     assert mod.build_parser().parse_args(["--base-noise-sigma", "0.1"]).base_noise_sigma == pytest.approx(0.1)
@@ -846,6 +1118,10 @@ def test_geometric_base_square_fit_check_defaults() -> None:
     np.testing.assert_allclose(data["condition_eval"], np.eye(2))
     assert data["theta_encoding"] == "one_hot"
     assert data["theta_train"].shape[1] == 2
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        mod.main(["--nll-finetune", "--nf-likelihood-finetune"])
+    with pytest.raises(ValueError, match="base-noise-sigma > 0"):
+        mod.main(["--device", "cpu", "--output-dir", str(tmp_path / "square"), "--nf-likelihood-finetune", "--n-per-theta", "3"])
 
 
 def test_geometric_base_square_fit_check_allows_single_condition() -> None:
@@ -861,7 +1137,7 @@ def test_geometric_base_square_fit_check_allows_single_condition() -> None:
     assert data["theta_test"].shape[1] == 1
 
 
-def test_geometric_base_half_circle_fit_check_defaults() -> None:
+def test_geometric_base_half_circle_fit_check_defaults(tmp_path: Path) -> None:
     mod = _load_half_circle_fit_check_module()
     args = mod.build_parser().parse_args([])
     paths = mod.resolve_output_paths(args.output_dir)
@@ -892,6 +1168,13 @@ def test_geometric_base_half_circle_fit_check_defaults() -> None:
     assert args.nll_checkpoint_every == 0
     assert args.nll_checkpoint_dir is None
     assert args.nll_resume_checkpoint is None
+    assert args.nf_likelihood_finetune is False
+    assert args.nf_epochs == 1000
+    assert args.nf_batch_size == 0
+    assert args.nf_lr == pytest.approx(1e-4)
+    assert args.nf_weight_decay == pytest.approx(0.0)
+    assert args.nf_density_points == 512
+    assert args.nf_checkpoint_selection == "last"
     assert args.curve_points == 300
     assert args.generated_samples_per_condition == 600
     assert mod.build_parser().parse_args(["--base-noise-sigma", "0.1"]).base_noise_sigma == pytest.approx(0.1)
@@ -905,3 +1188,54 @@ def test_geometric_base_half_circle_fit_check_defaults() -> None:
     assert data["theta_train"].shape[1] == 2
     assert data["datasets"][0].arc == "upper"
     assert data["datasets"][1].arc == "lower"
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        mod.main(["--nll-finetune", "--nf-likelihood-finetune"])
+    with pytest.raises(ValueError, match="base-noise-sigma > 0"):
+        mod.main(["--device", "cpu", "--output-dir", str(tmp_path / "half_circle"), "--nf-likelihood-finetune", "--n-per-condition", "3"])
+
+
+def test_geometric_base_half_circle_3d_fit_check_defaults(tmp_path: Path) -> None:
+    mod = _load_half_circle_3d_fit_check_module()
+    args = mod.build_parser().parse_args([])
+    paths = mod.resolve_output_paths(args.output_dir)
+
+    assert args.condition_values == "0.0,1.0"
+    assert args.radius == pytest.approx(1.0)
+    assert args.base_radius == pytest.approx(1.0)
+    assert args.base_noise_sigma == pytest.approx(0.1)
+    assert args.target_sigma == pytest.approx(0.2)
+    assert args.left_center_x == pytest.approx(-1.0)
+    assert args.left_center_y == pytest.approx(0.0)
+    assert args.left_center_z == pytest.approx(0.0)
+    assert args.right_center_x == pytest.approx(1.0)
+    assert args.right_center_y == pytest.approx(0.0)
+    assert args.right_center_z == pytest.approx(0.0)
+    assert args.path_schedule == "cosine"
+    assert args.velocity_family == "lie-similarity-3d"
+    assert mod.build_parser().parse_args(["--velocity-family", "centered-affine"]).velocity_family == "centered-affine"
+    assert args.epochs == 50000
+    assert args.early_patience == 1000
+    assert args.n_per_condition == 3000
+    assert args.nf_likelihood_finetune is False
+    assert args.nf_epochs == 500
+    assert args.nf_batch_size == 0
+    assert args.nf_lr == pytest.approx(1e-4)
+    assert args.nf_weight_decay == pytest.approx(0.0)
+    assert args.nf_density_points == 512
+    assert args.nf_checkpoint_selection == "last"
+    assert args.curve_points == 300
+    assert args.generated_samples_per_condition == 600
+    assert paths["png"].name == "geometric_base_half_circle_3d_fit_check.png"
+    assert paths["svg"].name == "geometric_base_half_circle_3d_fit_check.svg"
+    assert paths["summary"].name == "geometric_base_half_circle_3d_fit_check_summary.json"
+    condition_values = mod._parse_condition_values(args.condition_values)
+    small_args = mod.build_parser().parse_args(["--n-per-condition", "12", "--max-test-plot-per-condition", "2"])
+    data = mod._make_noisy_half_circle_3d_data(small_args, condition_values)
+    np.testing.assert_allclose(data["condition_eval"], np.eye(2))
+    assert data["theta_encoding"] == "one_hot"
+    assert data["theta_train"].shape[1] == 2
+    assert data["x_train"].shape[1] == 3
+    assert data["target_curves"][0].shape[1] == 3
+    assert data["arcs"] == ["upper", "lower"]
+    with pytest.raises(ValueError, match="base-noise-sigma"):
+        mod.main(["--device", "cpu", "--output-dir", str(tmp_path / "half_circle_3d"), "--base-noise-sigma", "0.0", "--n-per-condition", "3"])

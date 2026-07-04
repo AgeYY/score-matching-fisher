@@ -23,6 +23,7 @@ from fisher.geometric_base_flow_skl import (
     SquarePerimeterBase,
     build_geometric_base_velocity_model,
     estimate_smoothed_curve_symmetric_kl,
+    finetune_geometric_base_cnf_likelihood,
     finetune_geometric_base_nll,
     push_base_curve,
     push_initial_points,
@@ -91,6 +92,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--nll-checkpoint-every", type=int, default=0, help="0 reuses --log-every.")
     p.add_argument("--nll-checkpoint-dir", type=Path, default=None)
     p.add_argument("--nll-resume-checkpoint", type=Path, default=None)
+
+    p.add_argument("--nf-likelihood-finetune", action="store_true")
+    p.add_argument("--nf-epochs", type=int, default=1000)
+    p.add_argument("--nf-batch-size", type=int, default=0, help="0 reuses --batch-size.")
+    p.add_argument("--nf-lr", type=float, default=1e-4)
+    p.add_argument("--nf-weight-decay", type=float, default=0.0)
+    p.add_argument("--nf-density-points", type=int, default=512)
+    p.add_argument("--nf-checkpoint-selection", choices=("last", "best"), default="last")
     return p
 
 
@@ -276,6 +285,7 @@ def _plot_overlay(
     val_losses: np.ndarray,
     val_monitor_losses: np.ndarray,
     nll_metadata: dict[str, Any] | None,
+    nf_likelihood_metadata: dict[str, Any] | None,
 ) -> None:
     import matplotlib
 
@@ -359,6 +369,15 @@ def _plot_overlay(
         ax_nll.plot(nll_epochs, nll_val, color="#54a24b", linewidth=1.5, linestyle=":", label="NLL validation")
         ax_nll.set_ylabel("NLL")
         ax_nll.legend(frameon=False, loc="lower right", fontsize=8)
+    if nf_likelihood_metadata is not None:
+        nf_train = np.asarray(nf_likelihood_metadata["train_nll_losses"], dtype=np.float64)
+        nf_val = np.asarray(nf_likelihood_metadata["val_nll_losses"], dtype=np.float64)
+        nf_epochs = np.arange(1, int(nf_train.size) + 1, dtype=np.int64)
+        ax_nf = ax_loss.twinx()
+        ax_nf.plot(nf_epochs, nf_train, color="#b279a2", linewidth=1.2, alpha=0.75, label="NF train NLL")
+        ax_nf.plot(nf_epochs, nf_val, color="#b279a2", linewidth=1.5, linestyle=":", label="NF validation NLL")
+        ax_nf.set_ylabel("NF NLL")
+        ax_nf.legend(frameon=False, loc="lower right", fontsize=8)
     ax_loss.set_xlabel("epoch")
     ax_loss.set_ylabel("FM loss")
     ax_loss.set_title("Training history")
@@ -375,6 +394,8 @@ def _plot_overlay(
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if bool(args.nll_finetune) and bool(args.nf_likelihood_finetune):
+        raise ValueError("--nll-finetune and --nf-likelihood-finetune are mutually exclusive.")
     dev = require_device(str(args.device))
     torch.manual_seed(int(args.seed))
     np.random.seed(int(args.seed))
@@ -394,6 +415,8 @@ def main(argv: list[str] | None = None) -> int:
     base_noise_sigma = float(args.base_noise_sigma)
     if not np.isfinite(base_noise_sigma) or base_noise_sigma < 0.0:
         raise ValueError("--base-noise-sigma must be finite and nonnegative.")
+    if bool(args.nf_likelihood_finetune) and base_noise_sigma <= 0.0:
+        raise ValueError("--nf-likelihood-finetune requires --base-noise-sigma > 0.")
     generated_sample_count = int(args.generated_samples_per_condition)
     if generated_sample_count < 1:
         raise ValueError("--generated-samples-per-condition must be >= 1.")
@@ -465,6 +488,28 @@ def main(argv: list[str] | None = None) -> int:
             resume_checkpoint=args.nll_resume_checkpoint,
             log_every=max(1, int(args.log_every)),
         )
+    nf_likelihood_meta = None
+    if bool(args.nf_likelihood_finetune):
+        nf_batch_size = int(args.nf_batch_size) if int(args.nf_batch_size) > 0 else int(args.batch_size)
+        nf_likelihood_meta = finetune_geometric_base_cnf_likelihood(
+            model=model,
+            base=base,
+            theta_train=theta_train,
+            x_train=x_train,
+            theta_val=theta_val,
+            x_val=x_val,
+            condition_eval=condition_eval,
+            device=dev,
+            epochs=int(args.nf_epochs),
+            batch_size=nf_batch_size,
+            lr=float(args.nf_lr),
+            weight_decay=float(args.nf_weight_decay),
+            density_points=int(args.nf_density_points),
+            ode_steps=int(args.ode_steps),
+            ode_method=str(args.ode_method),
+            checkpoint_selection=str(args.nf_checkpoint_selection),
+            log_every=max(1, int(args.log_every)),
+        )
     result = None
     if int(condition_eval.shape[0]) >= 2:
         result = estimate_smoothed_curve_symmetric_kl(
@@ -527,6 +572,7 @@ def main(argv: list[str] | None = None) -> int:
         val_losses=np.asarray(train_meta["val_losses"], dtype=np.float64),
         val_monitor_losses=np.asarray(train_meta["val_monitor_losses"], dtype=np.float64),
         nll_metadata=nll_meta,
+        nf_likelihood_metadata=nf_likelihood_meta,
     )
 
     training_parameters = {
@@ -581,6 +627,13 @@ def main(argv: list[str] | None = None) -> int:
             else str(paths["output_dir"] / "nll_checkpoints")
         ),
         "nll_resume_checkpoint": None if args.nll_resume_checkpoint is None else str(Path(args.nll_resume_checkpoint).expanduser().resolve()),
+        "nf_likelihood_finetune": bool(args.nf_likelihood_finetune),
+        "nf_epochs": int(args.nf_epochs),
+        "nf_batch_size": int(args.nf_batch_size) if int(args.nf_batch_size) > 0 else int(args.batch_size),
+        "nf_lr": float(args.nf_lr),
+        "nf_weight_decay": float(args.nf_weight_decay),
+        "nf_density_points": int(args.nf_density_points),
+        "nf_checkpoint_selection": str(args.nf_checkpoint_selection),
     }
     summary = {
         "script": "bin/run_geometric_base_square_fit_check.py",
@@ -602,6 +655,7 @@ def main(argv: list[str] | None = None) -> int:
         "stopped_epoch": int(train_meta["stopped_epoch"]),
         "stopped_early": bool(train_meta["stopped_early"]),
         "nll_finetune_metadata": nll_meta,
+        "nf_likelihood_finetune_metadata": nf_likelihood_meta,
         "base_samples_shape": list(base_samples.shape),
         "generated_sample_shapes": [list(arr.shape) for arr in generated_samples],
         "png": paths["png"],
@@ -626,6 +680,12 @@ def main(argv: list[str] | None = None) -> int:
             f"nll_selected_epoch: {int(nll_meta['selected_epoch'])} "
             f"nll_selected_val_nll: {float(nll_meta['selected_val_nll']):.12g} "
             f"learned_sigmas: {np.array2string(np.asarray(nll_meta['learned_sigmas'], dtype=np.float64), precision=6, separator=',')}",
+            flush=True,
+        )
+    if nf_likelihood_meta is not None:
+        print(
+            f"nf_selected_epoch: {int(nf_likelihood_meta['selected_epoch'])} "
+            f"nf_selected_val_nll: {float(nf_likelihood_meta['selected_val_nll']):.12g}",
             flush=True,
         )
     return 0

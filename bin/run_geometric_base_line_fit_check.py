@@ -20,10 +20,13 @@ from global_setting import DATA_DIR, DEFAULT_DEVICE
 
 from fisher.geometric_base_flow_skl import (
     LineSegmentBase,
+    NoisyGeometricBase,
     build_geometric_base_velocity_model,
     estimate_smoothed_curve_symmetric_kl,
+    finetune_geometric_base_cnf_likelihood,
     finetune_geometric_base_nll,
     push_base_curve,
+    push_initial_points,
     train_geometric_base_affine_flow,
 )
 from fisher.noisy_line_dataset import NoisyLineDataset
@@ -38,6 +41,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--theta-values", type=str, default="0.7853981633974483,2.356194490192345")
     p.add_argument("--ell", type=float, default=1.5)
+    p.add_argument("--base-noise-sigma", type=float, default=0.0)
     p.add_argument("--target-sigma", type=float, default=0.12)
     p.add_argument("--shift-x", type=float, default=0.0)
     p.add_argument("--shift-y", type=float, default=0.0)
@@ -53,6 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ode-steps", type=int, default=64)
     p.add_argument("--ode-method", type=str, default="midpoint")
     p.add_argument("--curve-points", type=int, default=300)
+    p.add_argument("--generated-samples-per-theta", type=int, default=500)
 
     p.add_argument("--epochs", type=int, default=50000)
     p.add_argument("--batch-size", type=int, default=256)
@@ -83,6 +88,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--nll-endpoint-solver", choices=("particle-ode", "affine-map"), default="particle-ode")
     p.add_argument("--nll-checkpoint-selection", choices=("last", "best"), default="last")
     p.add_argument("--nll-resume-checkpoint", type=Path, default=None)
+
+    p.add_argument("--nf-likelihood-finetune", action="store_true")
+    p.add_argument("--nf-epochs", type=int, default=1000)
+    p.add_argument("--nf-batch-size", type=int, default=0, help="0 reuses --batch-size.")
+    p.add_argument("--nf-lr", type=float, default=1e-4)
+    p.add_argument("--nf-weight-decay", type=float, default=0.0)
+    p.add_argument("--nf-density-points", type=int, default=512)
+    p.add_argument("--nf-checkpoint-selection", choices=("last", "best"), default="last")
     return p
 
 
@@ -257,12 +270,15 @@ def _plot_overlay(
     x_plot: np.ndarray,
     theta_plot_scalar: np.ndarray,
     base_curve: np.ndarray,
+    base_samples: np.ndarray | None,
     fitted_curves: list[np.ndarray],
+    generated_samples: list[np.ndarray] | None,
     skl_value: float,
     train_losses: np.ndarray,
     val_losses: np.ndarray,
     val_monitor_losses: np.ndarray,
     nll_metadata: dict[str, Any] | None,
+    nf_likelihood_metadata: dict[str, Any] | None,
 ) -> None:
     import matplotlib
 
@@ -276,6 +292,17 @@ def _plot_overlay(
         figsize=(11.6, 5.4),
         gridspec_kw={"width_ratios": [1.12, 1.0]},
     )
+    if base_samples is not None:
+        samples = np.asarray(base_samples, dtype=np.float64)
+        ax.scatter(
+            samples[:, 0],
+            samples[:, 1],
+            s=10,
+            alpha=0.28,
+            color="#2f2f2f",
+            linewidths=0,
+            label="base samples",
+        )
     for idx, theta_value in enumerate(theta_eval[:, 0]):
         mask = np.isclose(theta_plot_scalar[:, 0], float(theta_value))
         color = colors[idx % len(colors)]
@@ -296,6 +323,18 @@ def _plot_overlay(
             linewidth=2.5,
             label=f"fitted line {idx + 1}",
         )
+        if generated_samples is not None:
+            gen = np.asarray(generated_samples[idx], dtype=np.float64)
+            ax.scatter(
+                gen[:, 0],
+                gen[:, 1],
+                s=12,
+                alpha=0.4,
+                marker="x",
+                color=color,
+                linewidths=0.8,
+                label=f"generated samples {idx + 1}",
+            )
     ax.plot(
         base_curve[:, 0],
         base_curve[:, 1],
@@ -307,7 +346,7 @@ def _plot_overlay(
     ax.text(
         0.02,
         0.98,
-        f"SKL = {skl_value:.4g}",
+        f"curve SKL = {skl_value:.4g}",
         transform=ax.transAxes,
         va="top",
         ha="left",
@@ -333,6 +372,15 @@ def _plot_overlay(
         ax_nll.plot(nll_epochs, nll_val, color="#54a24b", linewidth=1.5, linestyle=":", label="NLL validation")
         ax_nll.set_ylabel("NLL")
         ax_nll.legend(frameon=False, loc="lower right", fontsize=9)
+    if nf_likelihood_metadata is not None:
+        nf_train = np.asarray(nf_likelihood_metadata["train_nll_losses"], dtype=np.float64)
+        nf_val = np.asarray(nf_likelihood_metadata["val_nll_losses"], dtype=np.float64)
+        nf_epochs = np.arange(1, int(nf_train.size) + 1, dtype=np.int64)
+        ax_nf = ax_loss.twinx()
+        ax_nf.plot(nf_epochs, nf_train, color="#b279a2", linewidth=1.2, alpha=0.75, label="NF train NLL")
+        ax_nf.plot(nf_epochs, nf_val, color="#b279a2", linewidth=1.5, linestyle=":", label="NF validation NLL")
+        ax_nf.set_ylabel("NF NLL")
+        ax_nf.legend(frameon=False, loc="lower right", fontsize=9)
     ax_loss.set_xlabel("epoch")
     ax_loss.set_ylabel("FM loss")
     ax_loss.set_title("Training history")
@@ -349,6 +397,8 @@ def _plot_overlay(
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if bool(args.nll_finetune) and bool(args.nf_likelihood_finetune):
+        raise ValueError("--nll-finetune and --nf-likelihood-finetune are mutually exclusive.")
     dev = require_device(str(args.device))
     torch.manual_seed(int(args.seed))
     np.random.seed(int(args.seed))
@@ -365,7 +415,19 @@ def main(argv: list[str] | None = None) -> int:
     theta_val = np.asarray(data["theta_val"], dtype=np.float64)
     x_val = np.asarray(data["x_val"], dtype=np.float64)
 
-    base = LineSegmentBase(anchor=(0.0, 0.0), direction=(1.0, 0.0))
+    base_noise_sigma = float(args.base_noise_sigma)
+    if not np.isfinite(base_noise_sigma) or base_noise_sigma < 0.0:
+        raise ValueError("--base-noise-sigma must be finite and nonnegative.")
+    if bool(args.nf_likelihood_finetune) and base_noise_sigma <= 0.0:
+        raise ValueError("--nf-likelihood-finetune requires --base-noise-sigma > 0.")
+    generated_sample_count = int(args.generated_samples_per_theta)
+    if generated_sample_count < 1:
+        raise ValueError("--generated-samples-per-theta must be >= 1.")
+
+    clean_base = LineSegmentBase(anchor=(0.0, 0.0), direction=(1.0, 0.0))
+    base = clean_base
+    if base_noise_sigma > 0.0:
+        base = NoisyGeometricBase(clean_base, sigma=base_noise_sigma)
     model = build_geometric_base_velocity_model(
         velocity_family=str(args.velocity_family),
         theta_dim=int(condition_eval.shape[1]),
@@ -421,6 +483,28 @@ def main(argv: list[str] | None = None) -> int:
             resume_checkpoint=args.nll_resume_checkpoint,
             log_every=max(1, int(args.log_every)),
         )
+    nf_likelihood_meta = None
+    if bool(args.nf_likelihood_finetune):
+        nf_batch_size = int(args.nf_batch_size) if int(args.nf_batch_size) > 0 else int(args.batch_size)
+        nf_likelihood_meta = finetune_geometric_base_cnf_likelihood(
+            model=model,
+            base=base,
+            theta_train=theta_train,
+            x_train=x_train,
+            theta_val=theta_val,
+            x_val=x_val,
+            condition_eval=condition_eval,
+            device=dev,
+            epochs=int(args.nf_epochs),
+            batch_size=nf_batch_size,
+            lr=float(args.nf_lr),
+            weight_decay=float(args.nf_weight_decay),
+            density_points=int(args.nf_density_points),
+            ode_steps=int(args.ode_steps),
+            ode_method=str(args.ode_method),
+            checkpoint_selection=str(args.nf_checkpoint_selection),
+            log_every=max(1, int(args.log_every)),
+        )
     result = estimate_smoothed_curve_symmetric_kl(
         model=model,
         base=base,
@@ -437,7 +521,10 @@ def main(argv: list[str] | None = None) -> int:
 
     curve_u = torch.linspace(base.u_low, base.u_high, int(args.curve_points), dtype=torch.float32).reshape(-1, 1)
     base_curve = base.points_from_u(curve_u).detach().cpu().numpy().astype(np.float64)
+    base_samples_t = base.sample(generated_sample_count, device=dev, dtype=torch.float32)
+    base_samples = base_samples_t.detach().cpu().numpy().astype(np.float64)
     fitted_curves: list[np.ndarray] = []
+    generated_samples: list[np.ndarray] = []
     for theta_row in condition_eval:
         curve, _ = push_base_curve(
             model=model,
@@ -449,6 +536,15 @@ def main(argv: list[str] | None = None) -> int:
             ode_method=str(args.ode_method),
         )
         fitted_curves.append(curve.detach().cpu().numpy().astype(np.float64))
+        pushed = push_initial_points(
+            model=model,
+            x0=base_samples_t,
+            theta=theta_row.reshape(1, -1),
+            device=dev,
+            ode_steps=int(args.ode_steps),
+            ode_method=str(args.ode_method),
+        )
+        generated_samples.append(pushed.detach().cpu().numpy().astype(np.float64))
     skl_value = float(result.symmetric_kl_matrix[0, 1])
     _plot_overlay(
         png_path=paths["png"],
@@ -457,12 +553,15 @@ def main(argv: list[str] | None = None) -> int:
         x_plot=np.asarray(data["x_test_plot"], dtype=np.float64),
         theta_plot_scalar=np.asarray(data["theta_test_plot_scalar"], dtype=np.float64),
         base_curve=base_curve,
+        base_samples=base_samples,
         fitted_curves=fitted_curves,
+        generated_samples=generated_samples,
         skl_value=skl_value,
         train_losses=np.asarray(train_meta["train_losses"], dtype=np.float64),
         val_losses=np.asarray(train_meta["val_losses"], dtype=np.float64),
         val_monitor_losses=np.asarray(train_meta["val_monitor_losses"], dtype=np.float64),
         nll_metadata=nll_meta,
+        nf_likelihood_metadata=nf_likelihood_meta,
     )
 
     training_parameters = {
@@ -487,6 +586,8 @@ def main(argv: list[str] | None = None) -> int:
         "theta_encoding": "one_hot",
         "condition_eval": condition_eval,
         "ell": float(args.ell),
+        "base_distribution": "noisy_line" if base_noise_sigma > 0.0 else "clean_line",
+        "base_noise_sigma": base_noise_sigma,
         "target_sigma": float(args.target_sigma),
         "shift": [float(args.shift_x), float(args.shift_y)],
         "smooth_sigma": float(args.smooth_sigma),
@@ -494,6 +595,7 @@ def main(argv: list[str] | None = None) -> int:
         "density_mc_samples": int(args.density_mc_samples),
         "ode_steps": int(args.ode_steps),
         "ode_method": str(args.ode_method),
+        "generated_samples_per_theta": generated_sample_count,
         "nll_finetune": bool(args.nll_finetune),
         "nll_epochs": int(args.nll_epochs),
         "nll_batch_size": int(args.nll_batch_size) if int(args.nll_batch_size) > 0 else int(args.batch_size),
@@ -505,6 +607,13 @@ def main(argv: list[str] | None = None) -> int:
         "nll_endpoint_solver": str(args.nll_endpoint_solver),
         "nll_checkpoint_selection": str(args.nll_checkpoint_selection),
         "nll_resume_checkpoint": None if args.nll_resume_checkpoint is None else str(Path(args.nll_resume_checkpoint).expanduser().resolve()),
+        "nf_likelihood_finetune": bool(args.nf_likelihood_finetune),
+        "nf_epochs": int(args.nf_epochs),
+        "nf_batch_size": int(args.nf_batch_size) if int(args.nf_batch_size) > 0 else int(args.batch_size),
+        "nf_lr": float(args.nf_lr),
+        "nf_weight_decay": float(args.nf_weight_decay),
+        "nf_density_points": int(args.nf_density_points),
+        "nf_checkpoint_selection": str(args.nf_checkpoint_selection),
     }
     summary = {
         "script": "bin/run_geometric_base_line_fit_check.py",
@@ -526,6 +635,9 @@ def main(argv: list[str] | None = None) -> int:
         "stopped_epoch": int(train_meta["stopped_epoch"]),
         "stopped_early": bool(train_meta["stopped_early"]),
         "nll_finetune_metadata": nll_meta,
+        "nf_likelihood_finetune_metadata": nf_likelihood_meta,
+        "base_samples_shape": list(base_samples.shape),
+        "generated_sample_shapes": [list(arr.shape) for arr in generated_samples],
         "png": paths["png"],
         "svg": paths["svg"],
         "summary": paths["summary"],
@@ -545,6 +657,12 @@ def main(argv: list[str] | None = None) -> int:
             f"nll_selected_epoch: {int(nll_meta['selected_epoch'])} "
             f"nll_selected_val_nll: {float(nll_meta['selected_val_nll']):.12g} "
             f"learned_sigmas: {np.array2string(np.asarray(nll_meta['learned_sigmas'], dtype=np.float64), precision=6, separator=',')}",
+            flush=True,
+        )
+    if nf_likelihood_meta is not None:
+        print(
+            f"nf_selected_epoch: {int(nf_likelihood_meta['selected_epoch'])} "
+            f"nf_selected_val_nll: {float(nf_likelihood_meta['selected_val_nll']):.12g}",
             flush=True,
         )
     return 0
