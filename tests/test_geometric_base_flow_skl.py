@@ -27,6 +27,7 @@ from fisher.geometric_base_flow_skl import (
     LineSegmentBase,
     NoisyGeometricBase,
     SquarePerimeterBase,
+    StandardNormalBase,
     build_geometric_base_velocity_model,
     estimate_smoothed_curve_symmetric_kl,
     finetune_geometric_base_cnf_likelihood,
@@ -253,6 +254,18 @@ def test_noisy_geometric_base_adds_ambient_noise_only() -> None:
     assert x.shape == clean_x.shape
     assert float(torch.mean(torch.linalg.norm(x - clean_x, dim=1))) > 0.05
     assert "half_circle" in noisy.name
+
+
+def test_standard_normal_base_samples_full_dimensional_points() -> None:
+    torch.manual_seed(0)
+    base = StandardNormalBase(ambient_dim=3)
+    x = base.sample(128, device=torch.device("cpu"), dtype=torch.float64)
+
+    assert base.ambient_dim == 3
+    assert base.intrinsic_dim == 3
+    assert base.name == "standard_normal"
+    assert x.shape == (128, 3)
+    assert x.dtype == torch.float64
 
 
 def test_square_perimeter_base_maps_unit_square_boundary() -> None:
@@ -888,6 +901,27 @@ def test_unified_geometric_base_fit_check_velocity_validation() -> None:
         mod.validate_dataset_velocity(mod.build_parser().parse_args(["--dataset", "two-square", "--velocity-family", "lie-similarity-3d"]))
     with pytest.raises(ValueError, match="base-noise-sigma"):
         mod.validate_dataset_velocity(mod.build_parser().parse_args(["--dataset", "two-square", "--base-noise-sigma", "0.0"]))
+
+
+def test_unified_geometric_base_fit_check_base_geometry_override() -> None:
+    mod = _load_unified_fit_check_module()
+
+    args = mod.build_parser().parse_args(["--dataset", "two-square", "--base-geometry", "standard-normal", "--base-noise-sigma", "0.0"])
+    assert mod.validate_dataset_velocity(args) == "lie-affine-2d"
+    data = mod.make_geometric_dataset(args)
+    base = mod.make_base(args, dataset_kind=str(data["dataset_kind"]), ambient_dim=int(data["ambient_dim"]))
+    assert isinstance(base, StandardNormalBase)
+    assert base.ambient_dim == 2
+
+    inferred_args = mod.build_parser().parse_args(["--dataset", "two-square"])
+    inferred_data = mod.make_geometric_dataset(inferred_args)
+    inferred_base = mod.make_base(
+        inferred_args,
+        dataset_kind=str(inferred_data["dataset_kind"]),
+        ambient_dim=int(inferred_data["ambient_dim"]),
+    )
+    assert isinstance(inferred_base, NoisyGeometricBase)
+    assert isinstance(inferred_base.base, SquarePerimeterBase)
 
 
 def test_geometric_base_fit_check_wrappers_route_to_unified_datasets() -> None:

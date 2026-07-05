@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from fisher.flow_matching_skl import (
     CenteredConditionAffineFlowSKLModel,
+    ConditionalNonlinearXFlowFiLM,
     FlowSKLResult,
     _apply_matrix,
     _as_2d_float64,
@@ -30,7 +31,14 @@ from fisher.model_weight_ema import scalar_val_ema_update
 
 
 SMOOTHED_LINE_CURVE_METRIC = "smoothed_line_curve_symmetric_kl"
-GEOMETRIC_BASE_VELOCITY_FAMILIES = ("lie_affine_2d", "lie_similarity_2d", "lie_similarity_3d", "centered_affine")
+PUSHED_BASE_DISTRIBUTION_METRIC = "pushed_base_distribution_symmetric_kl"
+GEOMETRIC_BASE_VELOCITY_FAMILIES = (
+    "lie_affine_2d",
+    "lie_similarity_2d",
+    "lie_similarity_3d",
+    "centered_affine",
+    "unconstrained",
+)
 NF_CHECKPOINT_SELECTIONS = ("last", "best")
 
 
@@ -347,6 +355,30 @@ class NoisyGeometricBase:
         return x, u
 
 
+@dataclass(frozen=True)
+class StandardNormalBase:
+    """Full-dimensional standard normal base distribution."""
+
+    ambient_dim: int
+    name: str = "standard_normal"
+
+    def __post_init__(self) -> None:
+        dim = int(self.ambient_dim)
+        if dim < 1:
+            raise ValueError("ambient_dim must be >= 1.")
+        object.__setattr__(self, "ambient_dim", dim)
+
+    @property
+    def intrinsic_dim(self) -> int:
+        return int(self.ambient_dim)
+
+    def sample(self, n: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        count = int(n)
+        if count < 1:
+            raise ValueError("n must be >= 1.")
+        return torch.randn(count, int(self.ambient_dim), device=device, dtype=dtype)
+
+
 def _make_mlp(*, in_dim: int, out_dim: int, hidden_dim: int, depth: int, final_gain: float = 0.01) -> nn.Sequential:
     if int(in_dim) < 1 or int(out_dim) < 1 or int(hidden_dim) < 1 or int(depth) < 1:
         raise ValueError("in_dim, out_dim, hidden_dim, and depth must be >= 1.")
@@ -631,12 +663,19 @@ def build_geometric_base_velocity_model(
             hidden_dim=int(hidden_dim),
             depth=int(depth),
         )
-    return CenteredConditionAffineFlowSKLModel(
+    if family == "centered_affine":
+        return CenteredConditionAffineFlowSKLModel(
+            theta_dim=int(theta_dim),
+            x_dim=int(x_dim),
+            hidden_dim=int(hidden_dim),
+            depth=int(depth),
+            path_schedule=path_schedule,
+        )
+    return ConditionalNonlinearXFlowFiLM(
         theta_dim=int(theta_dim),
         x_dim=int(x_dim),
         hidden_dim=int(hidden_dim),
         depth=int(depth),
-        path_schedule=path_schedule,
     )
 
 
@@ -677,14 +716,19 @@ def _inverse_softplus_scalar(value: float) -> float:
 def _geometric_base_metadata(base: Any) -> dict[str, Any]:
     meta: dict[str, Any] = {
         "base_name": str(getattr(base, "name", type(base).__name__)),
-        "base_u_low": float(getattr(base, "u_low")),
-        "base_u_high": float(getattr(base, "u_high")),
         "base_ambient_dim": int(getattr(base, "ambient_dim")),
         "base_intrinsic_dim": int(getattr(base, "intrinsic_dim", 1)),
+        "base_has_geometry_coordinate": bool(hasattr(base, "sample_u") and hasattr(base, "points_from_u")),
     }
+    if hasattr(base, "u_low"):
+        meta["base_u_low"] = float(getattr(base, "u_low"))
+    if hasattr(base, "u_high"):
+        meta["base_u_high"] = float(getattr(base, "u_high"))
     if isinstance(base, NoisyGeometricBase):
         meta["base_noise_sigma"] = float(base.sigma)
         meta["base_inner_name"] = str(getattr(base.base, "name", type(base.base).__name__))
+    if isinstance(base, StandardNormalBase):
+        meta["base_distribution"] = "standard_normal"
     if hasattr(base, "anchor"):
         meta["base_anchor"] = np.asarray(getattr(base, "anchor"), dtype=np.float64)
     if hasattr(base, "direction"):
@@ -716,6 +760,11 @@ def _require_noisy_geometric_base(base: Any) -> NoisyGeometricBase:
     return base
 
 
+def _standard_normal_base_log_prob(x: torch.Tensor) -> torch.Tensor:
+    flat = x.reshape(int(x.shape[0]), -1)
+    return -0.5 * (torch.sum(flat * flat, dim=1) + float(flat.shape[1]) * math.log(2.0 * math.pi))
+
+
 def _base_u_grid(base: Any, n_points: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     count = int(n_points)
     if count < 1:
@@ -743,6 +792,7 @@ def train_geometric_base_affine_flow(
     ema_alpha: float = 0.05,
     max_grad_norm: float = 10.0,
     log_every: int = 50,
+    return_checkpoint_states: bool = False,
 ) -> dict[str, Any]:
     """Train a conditional affine velocity from a geometric base to endpoint data."""
 
@@ -868,6 +918,8 @@ def train_geometric_base_affine_flow(
             )
             break
 
+    last_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
     if best_state is not None:
         model.load_state_dict(best_state)
 
@@ -887,6 +939,13 @@ def train_geometric_base_affine_flow(
         "early_ema_alpha": float(alpha),
     }
     meta.update(_geometric_base_metadata(base))
+    if bool(return_checkpoint_states):
+        meta["_checkpoint_states"] = {
+            "best_model_state_dict": best_state if best_state is not None else last_state,
+            "last_model_state_dict": last_state,
+            "best_epoch": int(best_epoch),
+            "last_epoch": int(stopped_epoch),
+        }
     return meta
 
 
@@ -974,6 +1033,42 @@ def _affine_velocity_and_divergence(
     return _apply_matrix(a, x) + b, torch.diagonal(a, dim1=-2, dim2=-1).sum(dim=1)
 
 
+def _velocity_and_divergence(
+    model: nn.Module,
+    x: torch.Tensor,
+    theta: torch.Tensor,
+    t: torch.Tensor,
+    *,
+    create_graph: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return velocity and exact divergence, using affine trace when available."""
+
+    try:
+        return _affine_velocity_and_divergence(model, x, theta, t)
+    except ValueError:
+        pass
+
+    with torch.enable_grad():
+        if not x.requires_grad:
+            x_req = x.detach().requires_grad_(True)
+        else:
+            x_req = x.requires_grad_(True)
+        theta_req = _expand_theta_to_batch(theta, batch=int(x_req.shape[0]))
+        t_req = _as_col_t(t, batch=int(x_req.shape[0]))
+        vel = model(x_req, theta_req, t_req)
+        div = torch.zeros(int(x_req.shape[0]), dtype=x_req.dtype, device=x_req.device)
+        for dim in range(int(x_req.shape[1])):
+            grad_dim = torch.autograd.grad(
+                vel[:, dim].sum(),
+                x_req,
+                create_graph=bool(create_graph),
+                retain_graph=True,
+                allow_unused=False,
+            )[0][:, dim]
+            div = div + grad_dim
+        return vel, div
+
+
 def log_noisy_geometric_base_density(
     x: torch.Tensor,
     *,
@@ -1021,10 +1116,10 @@ def log_noisy_geometric_base_density(
 def geometric_base_cnf_log_prob(
     *,
     model: nn.Module,
-    base: NoisyGeometricBase,
+    base: NoisyGeometricBase | StandardNormalBase,
     x: torch.Tensor,
     theta: torch.Tensor,
-    support_u: torch.Tensor,
+    support_u: torch.Tensor | None = None,
     device: torch.device,
     ode_steps: int = 64,
     ode_method: str = "midpoint",
@@ -1033,7 +1128,14 @@ def geometric_base_cnf_log_prob(
 ) -> torch.Tensor:
     """CNF log-likelihood by integrating target data backward to a noisy geometric base."""
 
-    noisy_base = _require_noisy_geometric_base(base)
+    if not isinstance(base, (NoisyGeometricBase, StandardNormalBase)):
+        raise ValueError("CNF likelihood requires NoisyGeometricBase or StandardNormalBase.")
+    if isinstance(base, NoisyGeometricBase):
+        noisy_base: NoisyGeometricBase | None = _require_noisy_geometric_base(base)
+        if support_u is None:
+            raise ValueError("support_u is required for NoisyGeometricBase CNF likelihood.")
+    else:
+        noisy_base = None
     steps = int(ode_steps)
     if steps < 1:
         raise ValueError("ode_steps must be >= 1.")
@@ -1046,13 +1148,17 @@ def geometric_base_cnf_log_prob(
         xb = xb.unsqueeze(0)
     if xb.ndim != 2:
         raise ValueError("x must have shape [N, D].")
-    if int(xb.shape[1]) != int(noisy_base.ambient_dim) or int(xb.shape[1]) != int(getattr(model, "x_dim")):
+    if int(xb.shape[1]) != int(base.ambient_dim) or int(xb.shape[1]) != int(getattr(model, "x_dim")):
         raise ValueError("x dimension must match base and model x_dim.")
     th = theta.to(device=device, dtype=dtype)
     th = _expand_theta_to_batch(th, batch=int(xb.shape[0]))
-    u = support_u.to(device=device, dtype=dtype)
-    if u.ndim == 1:
-        u = u.unsqueeze(-1)
+    u: torch.Tensor | None
+    if support_u is None:
+        u = None
+    else:
+        u = support_u.to(device=device, dtype=dtype)
+        if u.ndim == 1:
+            u = u.unsqueeze(-1)
 
     model.to(device)
     dt = -1.0 / float(steps)
@@ -1062,23 +1168,28 @@ def geometric_base_cnf_log_prob(
         for step in range(steps):
             t0 = torch.full((int(xb.shape[0]), 1), 1.0 + float(step) * dt, dtype=dtype, device=device)
             if method == "euler":
-                vel, div = _affine_velocity_and_divergence(model, z, th, t0)
+                vel, div = _velocity_and_divergence(model, z, th, t0, create_graph=bool(enable_grad))
                 z = z + dt * vel
                 log_det = log_det + dt * div
             else:
-                vel0, _div0 = _affine_velocity_and_divergence(model, z, th, t0)
+                vel0, _div0 = _velocity_and_divergence(model, z, th, t0, create_graph=bool(enable_grad))
                 z_mid = z + 0.5 * dt * vel0
                 t_mid = torch.full((int(xb.shape[0]), 1), 1.0 + (float(step) + 0.5) * dt, dtype=dtype, device=device)
-                vel_mid, div_mid = _affine_velocity_and_divergence(model, z_mid, th, t_mid)
+                vel_mid, div_mid = _velocity_and_divergence(model, z_mid, th, t_mid, create_graph=bool(enable_grad))
                 z = z + dt * vel_mid
                 log_det = log_det + dt * div_mid
-        return log_noisy_geometric_base_density(z, base=noisy_base, support_u=u, sigma=base_sigma) + log_det
+        if noisy_base is not None:
+            assert u is not None
+            base_log_prob = log_noisy_geometric_base_density(z, base=noisy_base, support_u=u, sigma=base_sigma)
+        else:
+            base_log_prob = _standard_normal_base_log_prob(z)
+        return base_log_prob + log_det
 
 
 def finetune_geometric_base_cnf_likelihood(
     *,
     model: nn.Module,
-    base: NoisyGeometricBase,
+    base: NoisyGeometricBase | StandardNormalBase,
     theta_train: np.ndarray,
     x_train: np.ndarray,
     theta_val: np.ndarray | None,
@@ -1096,11 +1207,16 @@ def finetune_geometric_base_cnf_likelihood(
     learn_base_noise: bool = True,
     sigma_min: float = 1e-4,
     log_every: int = 100,
+    return_checkpoint_states: bool = False,
 ) -> dict[str, Any]:
     """Fine-tune a geometric-base flow by exact affine-CNF likelihood."""
 
-    noisy_base = _require_noisy_geometric_base(base)
-    if int(noisy_base.ambient_dim) != int(getattr(model, "x_dim")):
+    if not isinstance(base, (NoisyGeometricBase, StandardNormalBase)):
+        raise ValueError("Normalizing-flow likelihood fine-tuning requires NoisyGeometricBase or StandardNormalBase.")
+    noisy_base = base if isinstance(base, NoisyGeometricBase) else None
+    if noisy_base is not None:
+        _require_noisy_geometric_base(noisy_base)
+    if int(base.ambient_dim) != int(getattr(model, "x_dim")):
         raise ValueError("base ambient_dim must match model x_dim.")
     if int(epochs) < 1:
         raise ValueError("epochs must be >= 1.")
@@ -1115,7 +1231,7 @@ def finetune_geometric_base_cnf_likelihood(
     sigma_floor = float(sigma_min)
     if not math.isfinite(sigma_floor) or sigma_floor <= 0.0:
         raise ValueError("sigma_min must be finite and positive.")
-    if bool(learn_base_noise) and float(noisy_base.sigma) <= sigma_floor:
+    if noisy_base is not None and bool(learn_base_noise) and float(noisy_base.sigma) <= sigma_floor:
         raise ValueError("base.sigma must be greater than sigma_min when learn_base_noise=True.")
     selection = _normalize_nf_checkpoint_selection(checkpoint_selection)
     log_interval = max(1, int(log_every))
@@ -1131,7 +1247,7 @@ def finetune_geometric_base_cnf_likelihood(
         x_va = _as_2d_float64(x_val, name="x_val")
     if th_tr.shape[0] != x_tr.shape[0] or th_va.shape[0] != x_va.shape[0]:
         raise ValueError("theta and x split lengths must match.")
-    if x_tr.shape[1] != noisy_base.ambient_dim or x_va.shape[1] != noisy_base.ambient_dim:
+    if x_tr.shape[1] != int(base.ambient_dim) or x_va.shape[1] != int(base.ambient_dim):
         raise ValueError("x dimensions must match base ambient_dim.")
     tr_idx = _condition_indices_from_rows(th_tr, cond)
     va_idx = _condition_indices_from_rows(th_va, cond)
@@ -1143,10 +1259,10 @@ def finetune_geometric_base_cnf_likelihood(
 
     model.to(device)
     dtype = _model_floating_dtype(model)
-    support_u = _base_u_grid(noisy_base, int(density_points), device=device, dtype=dtype).detach()
+    support_u = _base_u_grid(noisy_base, int(density_points), device=device, dtype=dtype).detach() if noisy_base is not None else None
     cond_t = torch.from_numpy(cond.astype(np.float32)).to(device=device, dtype=dtype)
     model_params = _adamw_parameters(model)
-    if bool(learn_base_noise):
+    if noisy_base is not None and bool(learn_base_noise):
         raw_init = _inverse_softplus_scalar(float(noisy_base.sigma) - sigma_floor)
         raw_sigma = nn.Parameter(torch.full((int(cond.shape[0]),), raw_init, dtype=dtype, device=device))
         opt = torch.optim.AdamW(
@@ -1169,7 +1285,8 @@ def finetune_geometric_base_cnf_likelihood(
 
     def _current_sigmas() -> torch.Tensor:
         if raw_sigma is None:
-            return torch.full((int(cond.shape[0]),), float(noisy_base.sigma), dtype=dtype, device=device)
+            sigma = 0.0 if noisy_base is None else float(noisy_base.sigma)
+            return torch.full((int(cond.shape[0]),), sigma, dtype=dtype, device=device)
         return sigma_floor + F.softplus(raw_sigma)
 
     def _batch_nll(cb: torch.Tensor, xb: torch.Tensor, *, enable_grad: bool) -> torch.Tensor:
@@ -1179,7 +1296,7 @@ def finetune_geometric_base_cnf_likelihood(
         sigma_b = _current_sigmas().index_select(0, cb) if raw_sigma is not None else None
         log_prob = geometric_base_cnf_log_prob(
             model=model,
-            base=noisy_base,
+            base=base,
             x=xb,
             theta=theta_b,
             support_u=support_u,
@@ -1227,6 +1344,10 @@ def finetune_geometric_base_cnf_likelihood(
                 flush=True,
             )
 
+    last_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    last_raw_sigma = raw_sigma.detach().cpu().clone() if raw_sigma is not None else None
+    last_sigmas = _current_sigmas().detach().cpu().numpy().astype(np.float64)
+
     selected_epoch = int(epochs)
     selected_val = float(val_losses[-1])
     if selection == "best" and best_state is not None:
@@ -1239,21 +1360,22 @@ def finetune_geometric_base_cnf_likelihood(
     if best_raw_sigma is not None:
         best_sigmas = (sigma_floor + F.softplus(best_raw_sigma.to(device=device, dtype=dtype))).detach().cpu().numpy().astype(np.float64)
     else:
-        best_sigmas = np.full((int(cond.shape[0]),), float(noisy_base.sigma), dtype=np.float64)
+        sigma = 0.0 if noisy_base is None else float(noisy_base.sigma)
+        best_sigmas = np.full((int(cond.shape[0]),), sigma, dtype=np.float64)
 
-    return {
+    meta = {
         "enabled": True,
         "epochs": int(epochs),
         "batch_size": int(batch_size),
         "lr": float(lr),
         "weight_decay": float(weight_decay),
         "density_points": int(density_points),
-        "base_noise_sigma": float(noisy_base.sigma),
-        "base_noise_sigma_init": float(noisy_base.sigma),
-        "learn_base_noise": bool(learn_base_noise),
+        "base_name": str(getattr(base, "name", type(base).__name__)),
+        "base_distribution": "standard_normal" if noisy_base is None else "noisy_geometric",
+        "base_noise_sigma": 0.0 if noisy_base is None else float(noisy_base.sigma),
+        "base_noise_sigma_init": 0.0 if noisy_base is None else float(noisy_base.sigma),
+        "learn_base_noise": bool(learn_base_noise) and noisy_base is not None,
         "sigma_min": float(sigma_floor),
-        "selected_base_noise_sigmas": selected_sigmas,
-        "best_base_noise_sigmas": best_sigmas,
         "ode_steps": int(ode_steps),
         "ode_method": str(ode_method),
         "checkpoint_selection": selection,
@@ -1264,6 +1386,22 @@ def finetune_geometric_base_cnf_likelihood(
         "train_nll_losses": np.asarray(train_losses, dtype=np.float64),
         "val_nll_losses": np.asarray(val_losses, dtype=np.float64),
     }
+    if noisy_base is not None:
+        meta["selected_base_noise_sigmas"] = selected_sigmas
+        meta["best_base_noise_sigmas"] = best_sigmas
+        meta["last_base_noise_sigmas"] = last_sigmas
+    if bool(return_checkpoint_states):
+        meta["_checkpoint_states"] = {
+            "best_model_state_dict": best_state if best_state is not None else last_state,
+            "last_model_state_dict": last_state,
+            "best_raw_sigma": best_raw_sigma,
+            "last_raw_sigma": last_raw_sigma,
+            "best_base_noise_sigmas": best_sigmas,
+            "last_base_noise_sigmas": last_sigmas,
+            "best_epoch": int(best_epoch),
+            "last_epoch": int(epochs),
+        }
+    return meta
 
 
 
@@ -1541,6 +1679,115 @@ def estimate_smoothed_curve_symmetric_kl(
         symmetric_kl_matrix=skl.astype(np.float64, copy=False),
         canonical_metric_matrix=skl.astype(np.float64, copy=True),
         canonical_metric_name=SMOOTHED_LINE_CURVE_METRIC,
+        fisher_theta_midpoints=fisher_mid,
+        fisher_full=fisher_full,
+        fisher_linear=fisher_linear,
+        train_metadata=meta,
+    )
+
+
+@torch.no_grad()
+def estimate_pushed_base_symmetric_kl(
+    *,
+    model: nn.Module,
+    base: NoisyGeometricBase | StandardNormalBase,
+    theta_all: np.ndarray,
+    device: torch.device,
+    mc_skl_samples: int = 4096,
+    density_mc_samples: int = 1024,
+    ode_steps: int = 64,
+    ode_method: str = "midpoint",
+    batch_size: int = 1024,
+    fisher_kind: str = "none",
+    train_metadata: dict[str, Any] | None = None,
+) -> FlowSKLResult:
+    """Estimate pairwise SKL between pushed-forward full base distributions."""
+
+    theta = _as_2d_float64(theta_all, name="theta_all")
+    if int(mc_skl_samples) < 1:
+        raise ValueError("mc_skl_samples must be >= 1.")
+    if int(density_mc_samples) < 1:
+        raise ValueError("density_mc_samples must be >= 1.")
+    bs = int(batch_size)
+    if bs < 1:
+        raise ValueError("batch_size must be >= 1.")
+    model.to(device)
+    model.eval()
+    dtype = _model_floating_dtype(model)
+    k_theta = int(theta.shape[0])
+    directed = np.zeros((k_theta, k_theta), dtype=np.float64)
+    support_u = None
+    if isinstance(base, NoisyGeometricBase):
+        support_u = _base_u_grid(base, int(density_mc_samples), device=device, dtype=dtype).detach()
+
+    def _log_prob_batches(x_eval: torch.Tensor, theta_row: np.ndarray) -> torch.Tensor:
+        outs: list[torch.Tensor] = []
+        theta_np = np.asarray(theta_row, dtype=np.float64).reshape(1, -1)
+        for start in range(0, int(x_eval.shape[0]), bs):
+            xb = x_eval[start : start + bs]
+            theta_b = torch.from_numpy(theta_np.astype(np.float32)).to(device=device, dtype=dtype).expand(int(xb.shape[0]), -1)
+            outs.append(
+                geometric_base_cnf_log_prob(
+                    model=model,
+                    base=base,
+                    x=xb,
+                    theta=theta_b,
+                    support_u=support_u,
+                    device=device,
+                    ode_steps=int(ode_steps),
+                    ode_method=str(ode_method),
+                    enable_grad=False,
+                )
+            )
+        return torch.cat(outs, dim=0)
+
+    for i in range(k_theta):
+        x0 = base.sample(int(mc_skl_samples), device=device, dtype=dtype)
+        xi = push_initial_points(
+            model=model,
+            x0=x0,
+            theta=theta[i : i + 1],
+            device=device,
+            ode_steps=int(ode_steps),
+            ode_method=str(ode_method),
+        )
+        logp_i = _log_prob_batches(xi, theta[i : i + 1])
+        for j in range(k_theta):
+            if i == j:
+                continue
+            logp_j = _log_prob_batches(xi, theta[j : j + 1])
+            directed[i, j] = float(torch.mean(logp_i - logp_j).detach().cpu())
+
+    skl = np.maximum(directed + directed.T, 0.0)
+    np.fill_diagonal(skl, 0.0)
+    fisher_mode = str(fisher_kind).strip().lower()
+    if fisher_mode not in ("none", "full", "linear", "both"):
+        raise ValueError("fisher_kind must be one of: none, full, linear, both.")
+    fisher_mid: np.ndarray | None = None
+    fisher_full: np.ndarray | None = None
+    fisher_linear: np.ndarray | None = None
+    if fisher_mode in ("full", "both", "linear"):
+        fd = estimate_scalar_fisher_from_skl(theta, skl)
+        fisher_mid = fd["theta_midpoints"]
+        if fisher_mode in ("full", "both"):
+            fisher_full = fd["fisher"]
+        if fisher_mode in ("linear", "both"):
+            fisher_linear = fd["fisher"]
+
+    meta = {} if train_metadata is None else dict(train_metadata)
+    meta.update(
+        {
+            "canonical_metric_name": PUSHED_BASE_DISTRIBUTION_METRIC,
+            "mc_skl_samples": int(mc_skl_samples),
+            "density_mc_samples": int(density_mc_samples),
+            "ode_steps": int(ode_steps),
+            "ode_method": str(ode_method),
+        }
+    )
+    return FlowSKLResult(
+        symmetric_kl_matrix=skl.astype(np.float64, copy=False),
+        canonical_metric_matrix=skl.astype(np.float64, copy=True),
+        canonical_metric_name=PUSHED_BASE_DISTRIBUTION_METRIC,
         fisher_theta_midpoints=fisher_mid,
         fisher_full=fisher_full,
         fisher_linear=fisher_linear,

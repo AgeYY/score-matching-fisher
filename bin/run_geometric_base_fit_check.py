@@ -25,7 +25,9 @@ from fisher.geometric_base_flow_skl import (
     LineSegmentBase,
     NoisyGeometricBase,
     SquarePerimeterBase,
+    StandardNormalBase,
     build_geometric_base_velocity_model,
+    estimate_pushed_base_symmetric_kl,
     estimate_smoothed_curve_symmetric_kl,
     finetune_geometric_base_cnf_likelihood,
     push_base_curve,
@@ -48,7 +50,14 @@ DATASET_CHOICES = (
     "two-half-circle-3d",
     "one-half-circle-3d",
 )
-VELOCITY_CHOICES = ("lie-affine-2d", "lie-similarity-2d", "lie-similarity-3d")
+VELOCITY_CHOICES = (
+    "lie-affine-2d",
+    "lie-similarity-2d",
+    "lie-similarity-3d",
+    "centered-affine",
+    "unconstrained",
+)
+BASE_GEOMETRY_CHOICES = ("none", "line", "square", "half-circle", "half-circle-3d", "standard-normal")
 DATASET_DEFAULT_TARGET_SIGMA = {
     "two-line": 0.12,
     "one-line": 0.12,
@@ -116,6 +125,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ell", type=float, default=1.5)
     p.add_argument("--side-length", type=float, default=2.0)
     p.add_argument("--base-side-length", type=float, default=1.0)
+    p.add_argument("--base-geometry", choices=BASE_GEOMETRY_CHOICES, default="none")
     p.add_argument("--radius", type=float, default=1.0)
     p.add_argument("--base-radius", type=float, default=1.0)
     p.add_argument("--base-angle-deg", type=float, default=0.0)
@@ -214,6 +224,14 @@ def _normalize_velocity_family(value: str) -> str:
         "3d similarity": "lie-similarity-3d",
         "similarity-3d": "lie-similarity-3d",
         "lie-similarity-3d": "lie-similarity-3d",
+        "centered-affine": "centered-affine",
+        "centered affine": "centered-affine",
+        "centered-condition-affine": "centered-affine",
+        "condition-affine": "centered-affine",
+        "unconstrained": "unconstrained",
+        "nonlinear": "unconstrained",
+        "film": "unconstrained",
+        "mlp": "unconstrained",
     }
     if key not in aliases:
         raise ValueError(f"--velocity-family must be one of {VELOCITY_CHOICES}; got {value!r}.")
@@ -223,18 +241,21 @@ def _normalize_velocity_family(value: str) -> str:
 def validate_dataset_velocity(args: argparse.Namespace) -> str:
     dataset = str(args.dataset)
     velocity = _normalize_velocity_family(str(args.velocity_family))
+    base_geometry = str(args.base_geometry).strip().lower().replace("_", "-")
     is_3d_dataset = dataset.endswith("-3d")
-    if is_3d_dataset and velocity != "lie-similarity-3d":
-        raise ValueError("3D half-circle datasets require --velocity-family lie-similarity-3d.")
+    if is_3d_dataset and velocity in ("lie-affine-2d", "lie-similarity-2d"):
+        raise ValueError("3D half-circle datasets require a 3D-capable velocity family.")
     if velocity == "lie-similarity-3d" and not is_3d_dataset:
         raise ValueError("--velocity-family lie-similarity-3d is only valid for 3D half-circle datasets.")
-    if not is_3d_dataset and velocity not in ("lie-affine-2d", "lie-similarity-2d"):
+    if not is_3d_dataset and velocity not in ("lie-affine-2d", "lie-similarity-2d", "centered-affine", "unconstrained"):
         raise ValueError("2D datasets require a 2D velocity family.")
-    if bool(args.nf_likelihood_finetune) and float(args.base_noise_sigma) <= 0.0:
+    uses_noisy_geometric_base = base_geometry != "standard-normal"
+    if bool(args.nf_likelihood_finetune) and uses_noisy_geometric_base and float(args.base_noise_sigma) <= 0.0:
         raise ValueError("--base-noise-sigma must be > 0 when --nf-likelihood-finetune is enabled.")
     if (
         bool(args.nf_likelihood_finetune)
         and bool(args.nf_learn_base_noise)
+        and uses_noisy_geometric_base
         and float(args.base_noise_sigma) <= float(args.nf_sigma_min)
     ):
         raise ValueError("--base-noise-sigma must be greater than --nf-sigma-min when --nf-learn-base-noise is enabled.")
@@ -539,25 +560,58 @@ def make_geometric_dataset(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def make_base(args: argparse.Namespace, *, dataset_kind: str) -> NoisyGeometricBase:
+def _infer_base_geometry(dataset_kind: str) -> str:
+    if dataset_kind == "line":
+        return "line"
+    if dataset_kind == "square":
+        return "square"
+    if dataset_kind == "half_circle":
+        return "half-circle"
+    if dataset_kind == "half_circle_3d":
+        return "half-circle-3d"
+    raise ValueError(f"Unsupported dataset_kind: {dataset_kind!r}.")
+
+
+def make_base(args: argparse.Namespace, *, dataset_kind: str, ambient_dim: int) -> NoisyGeometricBase | StandardNormalBase:
+    requested = str(args.base_geometry).strip().lower().replace("_", "-")
+    geometry = _infer_base_geometry(dataset_kind) if requested == "none" else requested
+    if geometry not in BASE_GEOMETRY_CHOICES or geometry == "none":
+        raise ValueError(f"--base-geometry must be one of {BASE_GEOMETRY_CHOICES}; got {args.base_geometry!r}.")
+    if geometry == "standard-normal":
+        return StandardNormalBase(ambient_dim=int(ambient_dim))
     noise = float(args.base_noise_sigma)
     if not math.isfinite(noise) or noise < 0.0:
         raise ValueError("--base-noise-sigma must be finite and nonnegative.")
-    if dataset_kind == "line":
+    if geometry == "line":
         clean: Any = LineSegmentBase(anchor=(0.0, 0.0), direction=(1.0, 0.0), u_low=-0.5, u_high=0.5)
-    elif dataset_kind == "square":
+    elif geometry == "square":
         clean = SquarePerimeterBase(center=(0.0, 0.0), side_length=float(args.base_side_length))
-    elif dataset_kind == "half_circle":
+    elif geometry == "half-circle":
         clean = RotatedGeometricBase(HalfCircleBase(center=(0.0, 0.0), radius=float(args.base_radius)), angle_degrees=float(args.base_angle_deg))
-    elif dataset_kind == "half_circle_3d":
+    elif geometry == "half-circle-3d":
         clean = HalfCircle3DBase(center=(0.0, 0.0, 0.0), radius=float(args.base_radius))
     else:
-        raise ValueError(f"Unsupported dataset_kind: {dataset_kind!r}.")
-    return NoisyGeometricBase(clean, sigma=noise)
+        raise ValueError(f"Unsupported base geometry: {geometry!r}.")
+    base = NoisyGeometricBase(clean, sigma=noise)
+    if int(base.ambient_dim) != int(ambient_dim):
+        raise ValueError(
+            f"--base-geometry {geometry!r} has ambient_dim={int(base.ambient_dim)}, "
+            f"but dataset {dataset_kind!r} has ambient_dim={int(ambient_dim)}."
+        )
+    return base
 
 
-def resolve_output_paths(output_dir: Path | None, *, dataset: str, velocity_family: str, nf_likelihood: bool) -> dict[str, Path]:
-    tag = f"{dataset}__{velocity_family}__{'nf' if nf_likelihood else 'fm'}"
+def resolve_output_paths(
+    output_dir: Path | None,
+    *,
+    dataset: str,
+    velocity_family: str,
+    nf_likelihood: bool,
+    base_geometry: str = "none",
+) -> dict[str, Path]:
+    base = str(base_geometry).strip().lower().replace("_", "-")
+    base_tag = "" if base == "none" else f"__base-{base}"
+    tag = f"{dataset}__{velocity_family}{base_tag}__{'nf' if nf_likelihood else 'fm'}"
     out_dir = Path(DATA_DIR) / "geometric_base_fit_check" / tag if output_dir is None else Path(output_dir)
     out_dir = out_dir.expanduser().resolve()
     return {
@@ -565,6 +619,9 @@ def resolve_output_paths(output_dir: Path | None, *, dataset: str, velocity_fami
         "png": out_dir / "geometric_base_fit_check.png",
         "svg": out_dir / "geometric_base_fit_check.svg",
         "summary": out_dir / "geometric_base_fit_check_summary.json",
+        "model": out_dir / "geometric_base_fit_check_model.pt",
+        "model_best": out_dir / "geometric_base_fit_check_model_best.pt",
+        "model_last": out_dir / "geometric_base_fit_check_model_last.pt",
     }
 
 
@@ -809,13 +866,19 @@ def main(argv: list[str] | None = None) -> int:
         torch.cuda.manual_seed_all(int(args.seed))
 
     data = make_geometric_dataset(args)
-    base = make_base(args, dataset_kind=str(data["dataset_kind"]))
+    base = make_base(args, dataset_kind=str(data["dataset_kind"]), ambient_dim=int(data["ambient_dim"]))
     condition_eval = np.asarray(data["condition_eval"], dtype=np.float64)
     theta_train = np.asarray(data["theta_train"], dtype=np.float64)
     x_train = np.asarray(data["x_train"], dtype=np.float64)
     theta_val = np.asarray(data["theta_val"], dtype=np.float64)
     x_val = np.asarray(data["x_val"], dtype=np.float64)
-    paths = resolve_output_paths(args.output_dir, dataset=str(args.dataset), velocity_family=velocity_family, nf_likelihood=bool(args.nf_likelihood_finetune))
+    paths = resolve_output_paths(
+        args.output_dir,
+        dataset=str(args.dataset),
+        velocity_family=velocity_family,
+        nf_likelihood=bool(args.nf_likelihood_finetune),
+        base_geometry=str(args.base_geometry),
+    )
     paths["output_dir"].mkdir(parents=True, exist_ok=True)
 
     generated_sample_count = int(args.generated_samples_per_condition)
@@ -848,8 +911,11 @@ def main(argv: list[str] | None = None) -> int:
         ema_alpha=float(args.early_ema_alpha),
         max_grad_norm=float(args.max_grad_norm),
         log_every=max(1, int(args.log_every)),
+        return_checkpoint_states=True,
     )
+    fm_checkpoint_states = train_meta.pop("_checkpoint_states", None)
     nf_likelihood_meta = None
+    nf_checkpoint_states = None
     if bool(args.nf_likelihood_finetune):
         nf_batch_size = int(args.nf_batch_size) if int(args.nf_batch_size) > 0 else int(args.batch_size)
         nf_likelihood_meta = finetune_geometric_base_cnf_likelihood(
@@ -872,26 +938,47 @@ def main(argv: list[str] | None = None) -> int:
             learn_base_noise=bool(args.nf_learn_base_noise),
             sigma_min=float(args.nf_sigma_min),
             log_every=max(1, int(args.log_every)),
+            return_checkpoint_states=True,
+        )
+        nf_checkpoint_states = nf_likelihood_meta.pop("_checkpoint_states", None)
+
+    has_base_geometry_coordinate = hasattr(base, "sample_u") and hasattr(base, "points_from_u")
+    if has_base_geometry_coordinate:
+        result = estimate_smoothed_curve_symmetric_kl(
+            model=model,
+            base=base,  # type: ignore[arg-type]
+            theta_all=condition_eval,
+            device=dev,
+            smooth_sigma=float(args.smooth_sigma),
+            mc_skl_samples=int(args.mc_skl_samples),
+            density_mc_samples=int(args.density_mc_samples),
+            ode_steps=int(args.ode_steps),
+            ode_method=str(args.ode_method),
+            batch_size=int(args.batch_size),
+            train_metadata=train_meta,
+        )
+    else:
+        result = estimate_pushed_base_symmetric_kl(
+            model=model,
+            base=base,  # type: ignore[arg-type]
+            theta_all=condition_eval,
+            device=dev,
+            mc_skl_samples=int(args.mc_skl_samples),
+            density_mc_samples=int(args.density_mc_samples),
+            ode_steps=int(args.ode_steps),
+            ode_method=str(args.ode_method),
+            batch_size=int(args.batch_size),
+            train_metadata=train_meta,
         )
 
-    result = estimate_smoothed_curve_symmetric_kl(
-        model=model,
-        base=base,
-        theta_all=condition_eval,
-        device=dev,
-        smooth_sigma=float(args.smooth_sigma),
-        mc_skl_samples=int(args.mc_skl_samples),
-        density_mc_samples=int(args.density_mc_samples),
-        ode_steps=int(args.ode_steps),
-        ode_method=str(args.ode_method),
-        batch_size=int(args.batch_size),
-        train_metadata=train_meta,
-    )
-
-    curve_u = torch.linspace(base.u_low, base.u_high, int(args.curve_points), dtype=torch.float32).reshape(-1, 1)
-    if str(data["dataset_kind"]) == "square":
-        curve_u = torch.linspace(base.u_low, base.u_high, 4 * int(args.curve_points_per_edge) + 1, dtype=torch.float32).reshape(-1, 1)
-    base_curve = base.points_from_u(curve_u).detach().cpu().numpy().astype(np.float64)
+    curve_u = None
+    if has_base_geometry_coordinate:
+        curve_u = torch.linspace(base.u_low, base.u_high, int(args.curve_points), dtype=torch.float32).reshape(-1, 1)
+        if str(getattr(base, "base", base).__class__.__name__) == "SquarePerimeterBase" or str(data["dataset_kind"]) == "square":
+            curve_u = torch.linspace(base.u_low, base.u_high, 4 * int(args.curve_points_per_edge) + 1, dtype=torch.float32).reshape(-1, 1)
+        base_curve = base.points_from_u(curve_u).detach().cpu().numpy().astype(np.float64)
+    else:
+        base_curve = np.empty((0, int(data["ambient_dim"])), dtype=np.float64)
     base_samples_t = base.sample(generated_sample_count, device=dev, dtype=torch.float32)
     base_samples = base_samples_t.detach().cpu().numpy().astype(np.float64)
     fitted_curves: list[np.ndarray] = []
@@ -900,24 +987,27 @@ def main(argv: list[str] | None = None) -> int:
     if nf_likelihood_meta is not None and "selected_base_noise_sigmas" in nf_likelihood_meta:
         selected_base_sigmas = np.asarray(nf_likelihood_meta["selected_base_noise_sigmas"], dtype=np.float64).reshape(-1)
     for condition_idx, theta_row in enumerate(condition_eval):
-        curve, _ = push_base_curve(
-            model=model,
-            base=base,
-            theta=theta_row.reshape(1, -1),
-            device=dev,
-            u=curve_u,
-            ode_steps=int(args.ode_steps),
-            ode_method=str(args.ode_method),
-        )
-        fitted_curves.append(curve.detach().cpu().numpy().astype(np.float64))
-        if selected_base_sigmas is not None:
+        if has_base_geometry_coordinate and curve_u is not None:
+            curve, _ = push_base_curve(
+                model=model,
+                base=base,  # type: ignore[arg-type]
+                theta=theta_row.reshape(1, -1),
+                device=dev,
+                u=curve_u,
+                ode_steps=int(args.ode_steps),
+                ode_method=str(args.ode_method),
+            )
+            fitted_curves.append(curve.detach().cpu().numpy().astype(np.float64))
+        else:
+            fitted_curves.append(np.empty((0, int(data["ambient_dim"])), dtype=np.float64))
+        if selected_base_sigmas is not None and has_base_geometry_coordinate:
             u_gen = base.sample_u(generated_sample_count, device=dev, dtype=torch.float32)
             x0_gen = base.points_from_u(u_gen)
             sigma_gen = float(selected_base_sigmas[int(condition_idx)])
             if sigma_gen > 0.0:
                 x0_gen = x0_gen + sigma_gen * torch.randn_like(x0_gen)
         else:
-            x0_gen = base_samples_t
+            x0_gen = base.sample(generated_sample_count, device=dev, dtype=torch.float32)
         pushed = push_initial_points(
             model=model,
             x0=x0_gen,
@@ -965,6 +1055,9 @@ def main(argv: list[str] | None = None) -> int:
         "hidden_dim": int(args.hidden_dim),
         "depth": int(args.depth),
         "velocity_family": velocity_family,
+        "base_geometry": str(args.base_geometry),
+        "base_name": str(getattr(base, "name", type(base).__name__)),
+        "base_has_geometry_coordinate": bool(has_base_geometry_coordinate),
         "path_schedule": str(args.path_schedule),
         "t_eps": float(args.t_eps),
         "early_patience": int(args.early_patience),
@@ -1002,6 +1095,9 @@ def main(argv: list[str] | None = None) -> int:
         "device": str(dev),
         "dataset": str(args.dataset),
         "velocity_family": velocity_family,
+        "base_geometry": str(args.base_geometry),
+        "base_name": str(getattr(base, "name", type(base).__name__)),
+        "base_has_geometry_coordinate": bool(has_base_geometry_coordinate),
         "condition_values": np.asarray(data["condition_values"], dtype=np.float64).reshape(-1),
         "theta_encoding": "one_hot",
         "condition_eval": condition_eval,
@@ -1012,6 +1108,7 @@ def main(argv: list[str] | None = None) -> int:
         "test_shape": list(np.asarray(data["theta_test"], dtype=np.float64).shape),
         "target_sigma": float(data["target_sigma"]),
         "symmetric_kl_matrix": result.symmetric_kl_matrix,
+        "canonical_metric_name": result.canonical_metric_name,
         "skl_value": skl_value,
         "best_epoch": int(train_meta["best_epoch"]),
         "best_val_loss": float(train_meta["best_val_loss"]),
@@ -1023,7 +1120,45 @@ def main(argv: list[str] | None = None) -> int:
         "png": paths["png"],
         "svg": paths["svg"],
         "summary": paths["summary"],
+        "model": paths["model"],
+        "model_best": paths["model_best"],
+        "model_last": paths["model_last"],
     }
+    checkpoint_common = {
+        "training_parameters": _jsonable(training_parameters),
+        "train_metadata": _jsonable(train_meta),
+        "nf_likelihood_finetune_metadata": _jsonable(nf_likelihood_meta),
+        "summary": _jsonable(summary),
+    }
+    torch.save({"checkpoint_kind": "selected", "model_state_dict": model.state_dict(), **checkpoint_common}, paths["model"])
+    state_source = nf_checkpoint_states if nf_checkpoint_states is not None else fm_checkpoint_states
+    if state_source is None:
+        state_source = {
+            "best_model_state_dict": {k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
+            "last_model_state_dict": {k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
+            "best_epoch": int(train_meta["best_epoch"]),
+            "last_epoch": int(train_meta["stopped_epoch"]),
+        }
+    torch.save(
+        {
+            "checkpoint_kind": "best",
+            "model_state_dict": state_source["best_model_state_dict"],
+            "checkpoint_epoch": int(state_source.get("best_epoch", train_meta["best_epoch"])),
+            "base_noise_sigmas": _jsonable(state_source.get("best_base_noise_sigmas")),
+            **checkpoint_common,
+        },
+        paths["model_best"],
+    )
+    torch.save(
+        {
+            "checkpoint_kind": "last",
+            "model_state_dict": state_source["last_model_state_dict"],
+            "checkpoint_epoch": int(state_source.get("last_epoch", train_meta["stopped_epoch"])),
+            "base_noise_sigmas": _jsonable(state_source.get("last_base_noise_sigmas")),
+            **checkpoint_common,
+        },
+        paths["model_last"],
+    )
     with open(paths["summary"], "w", encoding="utf-8") as f:
         json.dump(_jsonable(summary), f, indent=2, sort_keys=True)
         f.write("\n")
@@ -1031,6 +1166,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"png: {paths['png']}", flush=True)
     print(f"svg: {paths['svg']}", flush=True)
     print(f"summary_json: {paths['summary']}", flush=True)
+    print(f"model: {paths['model']}", flush=True)
+    print(f"model_best: {paths['model_best']}", flush=True)
+    print(f"model_last: {paths['model_last']}", flush=True)
     print(f"skl: {skl_value:.12g}", flush=True)
     print(f"best_epoch: {int(train_meta['best_epoch'])}", flush=True)
     print(f"best_val_loss: {float(train_meta['best_val_loss']):.12g}", flush=True)
