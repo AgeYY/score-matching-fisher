@@ -544,6 +544,25 @@ def test_log_noisy_geometric_base_density_matches_logsumexp() -> None:
     torch.testing.assert_close(got, expected)
 
 
+def test_log_noisy_geometric_base_density_accepts_explicit_sigma() -> None:
+    clean = LineSegmentBase(anchor=(0.0, 0.0), direction=(1.0, 0.0), u_low=-1.0, u_high=1.0)
+    base = NoisyGeometricBase(clean, sigma=0.5)
+    x = torch.tensor([[0.0, 0.0], [1.0, 0.0]], dtype=torch.float32)
+    support_u = torch.tensor([[-1.0], [1.0]], dtype=torch.float32)
+    sigma = torch.tensor([0.25, 0.75], dtype=torch.float32, requires_grad=True)
+
+    got = log_noisy_geometric_base_density(x, base=base, support_u=support_u, sigma=sigma)
+
+    centers = clean.points_from_u(support_u)
+    sq = torch.sum((x[:, None, :] - centers[None, :, :]) ** 2, dim=-1)
+    log_norm = -0.5 * 2 * (math.log(2.0 * math.pi) + 2.0 * torch.log(sigma))
+    expected = torch.logsumexp(log_norm[:, None] - 0.5 * sq / (sigma[:, None] * sigma[:, None]), dim=1) - math.log(2.0)
+    torch.testing.assert_close(got, expected)
+    (-got.mean()).backward()
+    assert sigma.grad is not None
+    assert torch.all(torch.isfinite(sigma.grad))
+
+
 def test_geometric_base_cnf_log_prob_zero_velocity_is_base_density() -> None:
     model = ConstantTranslationAffineVelocity((0.0, 0.0))
     clean = LineSegmentBase(anchor=(0.0, 0.0), direction=(1.0, 0.0), u_low=-1.0, u_high=1.0)
@@ -658,10 +677,45 @@ def test_geometric_base_cnf_likelihood_finetune_records_metadata() -> None:
     assert meta["epochs"] == 1
     assert meta["density_points"] == 4
     assert meta["base_noise_sigma"] == pytest.approx(0.5)
+    assert meta["base_noise_sigma_init"] == pytest.approx(0.5)
+    assert meta["learn_base_noise"] is True
+    assert meta["sigma_min"] == pytest.approx(1e-4)
     assert meta["checkpoint_selection"] == "best"
     assert meta["selected_epoch"] == 1
+    assert np.asarray(meta["selected_base_noise_sigmas"]).shape == (1,)
+    assert np.asarray(meta["best_base_noise_sigmas"]).shape == (1,)
+    assert float(np.asarray(meta["selected_base_noise_sigmas"])[0]) > 0.0
     assert np.asarray(meta["train_nll_losses"]).shape == (1,)
     assert np.asarray(meta["val_nll_losses"]).shape == (1,)
+
+
+def test_geometric_base_cnf_likelihood_finetune_can_keep_fixed_noise() -> None:
+    torch.manual_seed(0)
+    model = ConditionTimeAffineVelocity(theta_dim=1, x_dim=2, hidden_dim=4, depth=1)
+    clean = LineSegmentBase(anchor=(0.0, 0.0), direction=(1.0, 0.0), u_low=-1.0, u_high=1.0)
+    base = NoisyGeometricBase(clean, sigma=0.5)
+    theta = np.asarray([[1.0], [1.0]], dtype=np.float64)
+    x = np.asarray([[-0.4, 0.0], [0.45, 0.0]], dtype=np.float64)
+
+    meta = finetune_geometric_base_cnf_likelihood(
+        model=model,
+        base=base,
+        theta_train=theta,
+        x_train=x,
+        theta_val=theta,
+        x_val=x,
+        condition_eval=np.asarray([[1.0]], dtype=np.float64),
+        device=torch.device("cpu"),
+        epochs=1,
+        batch_size=1,
+        density_points=4,
+        ode_steps=1,
+        learn_base_noise=False,
+        log_every=999,
+    )
+
+    assert meta["learn_base_noise"] is False
+    np.testing.assert_allclose(meta["selected_base_noise_sigmas"], np.asarray([0.5]))
 
 
 def test_geometric_base_cnf_likelihood_finetune_requires_noisy_base() -> None:
@@ -738,6 +792,9 @@ def test_unified_geometric_base_fit_check_defaults() -> None:
     assert args.nf_weight_decay == pytest.approx(0.0)
     assert args.nf_density_points == 512
     assert args.nf_checkpoint_selection == "last"
+    assert args.nf_learn_base_noise is True
+    assert mod.build_parser().parse_args(["--no-nf-learn-base-noise"]).nf_learn_base_noise is False
+    assert args.nf_sigma_min == pytest.approx(1e-4)
     assert args.max_test_plot_per_condition == 600
     assert args.generated_samples_per_condition == 600
     assert args.smooth_sigma == pytest.approx(0.12)

@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 from fisher.flow_matching_skl import (
@@ -664,6 +665,15 @@ def _normalize_nf_checkpoint_selection(value: str) -> str:
     return selection
 
 
+def _inverse_softplus_scalar(value: float) -> float:
+    val = float(value)
+    if not math.isfinite(val) or val <= 0.0:
+        raise ValueError("inverse softplus input must be finite and positive.")
+    if val > 20.0:
+        return val
+    return math.log(math.expm1(val))
+
+
 def _geometric_base_metadata(base: Any) -> dict[str, Any]:
     meta: dict[str, Any] = {
         "base_name": str(getattr(base, "name", type(base).__name__)),
@@ -969,6 +979,7 @@ def log_noisy_geometric_base_density(
     *,
     base: NoisyGeometricBase,
     support_u: torch.Tensor,
+    sigma: float | torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Log-density of ``base.points_from_u(U) + Normal(0, sigma^2 I)`` on a fixed support grid."""
 
@@ -983,11 +994,28 @@ def log_noisy_geometric_base_density(
     centers = noisy_base.points_from_u(support_u.to(device=xb.device, dtype=xb.dtype))
     if int(xb.shape[1]) != int(centers.shape[1]):
         raise ValueError("x dimension must match base ambient_dim.")
-    sigma = torch.as_tensor(float(noisy_base.sigma), dtype=xb.dtype, device=xb.device)
+    if sigma is None:
+        sigma_t = torch.as_tensor(float(noisy_base.sigma), dtype=xb.dtype, device=xb.device)
+    elif torch.is_tensor(sigma):
+        sigma_t = sigma.to(dtype=xb.dtype, device=xb.device)
+    else:
+        sigma_t = torch.as_tensor(sigma, dtype=xb.dtype, device=xb.device)
+    if sigma_t.ndim > 1:
+        raise ValueError("sigma must be scalar or have shape [N].")
+    if sigma_t.ndim == 1 and int(sigma_t.shape[0]) != int(xb.shape[0]):
+        raise ValueError("vector sigma must have one value per x row.")
+    if bool(torch.any(sigma_t <= 0.0).detach().cpu()):
+        raise ValueError("sigma must be positive.")
     d = int(xb.shape[1])
     sq = torch.sum((xb[:, None, :] - centers[None, :, :]) ** 2, dim=-1)
-    log_norm = -0.5 * float(d) * (math.log(2.0 * math.pi) + 2.0 * torch.log(sigma))
-    return torch.logsumexp(log_norm - 0.5 * sq / (sigma * sigma), dim=1) - math.log(float(centers.shape[0]))
+    if sigma_t.ndim == 0:
+        log_norm = -0.5 * float(d) * (math.log(2.0 * math.pi) + 2.0 * torch.log(sigma_t))
+        log_kernel = log_norm - 0.5 * sq / (sigma_t * sigma_t)
+    else:
+        sig = sigma_t.reshape(-1, 1)
+        log_norm = -0.5 * float(d) * (math.log(2.0 * math.pi) + 2.0 * torch.log(sigma_t))
+        log_kernel = log_norm.reshape(-1, 1) - 0.5 * sq / (sig * sig)
+    return torch.logsumexp(log_kernel, dim=1) - math.log(float(centers.shape[0]))
 
 
 def geometric_base_cnf_log_prob(
@@ -1001,6 +1029,7 @@ def geometric_base_cnf_log_prob(
     ode_steps: int = 64,
     ode_method: str = "midpoint",
     enable_grad: bool = True,
+    base_sigma: float | torch.Tensor | None = None,
 ) -> torch.Tensor:
     """CNF log-likelihood by integrating target data backward to a noisy geometric base."""
 
@@ -1043,7 +1072,7 @@ def geometric_base_cnf_log_prob(
                 vel_mid, div_mid = _affine_velocity_and_divergence(model, z_mid, th, t_mid)
                 z = z + dt * vel_mid
                 log_det = log_det + dt * div_mid
-        return log_noisy_geometric_base_density(z, base=noisy_base, support_u=u) + log_det
+        return log_noisy_geometric_base_density(z, base=noisy_base, support_u=u, sigma=base_sigma) + log_det
 
 
 def finetune_geometric_base_cnf_likelihood(
@@ -1064,6 +1093,8 @@ def finetune_geometric_base_cnf_likelihood(
     ode_steps: int = 64,
     ode_method: str = "midpoint",
     checkpoint_selection: str = "last",
+    learn_base_noise: bool = True,
+    sigma_min: float = 1e-4,
     log_every: int = 100,
 ) -> dict[str, Any]:
     """Fine-tune a geometric-base flow by exact affine-CNF likelihood."""
@@ -1081,6 +1112,11 @@ def finetune_geometric_base_cnf_likelihood(
         raise ValueError("weight_decay must be >= 0.")
     if int(density_points) < 1:
         raise ValueError("density_points must be >= 1.")
+    sigma_floor = float(sigma_min)
+    if not math.isfinite(sigma_floor) or sigma_floor <= 0.0:
+        raise ValueError("sigma_min must be finite and positive.")
+    if bool(learn_base_noise) and float(noisy_base.sigma) <= sigma_floor:
+        raise ValueError("base.sigma must be greater than sigma_min when learn_base_noise=True.")
     selection = _normalize_nf_checkpoint_selection(checkpoint_selection)
     log_interval = max(1, int(log_every))
 
@@ -1109,18 +1145,38 @@ def finetune_geometric_base_cnf_likelihood(
     dtype = _model_floating_dtype(model)
     support_u = _base_u_grid(noisy_base, int(density_points), device=device, dtype=dtype).detach()
     cond_t = torch.from_numpy(cond.astype(np.float32)).to(device=device, dtype=dtype)
-    opt = torch.optim.AdamW(_adamw_parameters(model), lr=float(lr), weight_decay=float(weight_decay))
+    model_params = _adamw_parameters(model)
+    if bool(learn_base_noise):
+        raw_init = _inverse_softplus_scalar(float(noisy_base.sigma) - sigma_floor)
+        raw_sigma = nn.Parameter(torch.full((int(cond.shape[0]),), raw_init, dtype=dtype, device=device))
+        opt = torch.optim.AdamW(
+            [
+                {"params": model_params, "weight_decay": float(weight_decay)},
+                {"params": [raw_sigma], "weight_decay": 0.0},
+            ],
+            lr=float(lr),
+        )
+    else:
+        raw_sigma = None
+        opt = torch.optim.AdamW(model_params, lr=float(lr), weight_decay=float(weight_decay))
 
     train_losses: list[float] = []
     val_losses: list[float] = []
     best_val = float("inf")
     best_epoch = 0
     best_state: dict[str, torch.Tensor] | None = None
+    best_raw_sigma: torch.Tensor | None = None
+
+    def _current_sigmas() -> torch.Tensor:
+        if raw_sigma is None:
+            return torch.full((int(cond.shape[0]),), float(noisy_base.sigma), dtype=dtype, device=device)
+        return sigma_floor + F.softplus(raw_sigma)
 
     def _batch_nll(cb: torch.Tensor, xb: torch.Tensor, *, enable_grad: bool) -> torch.Tensor:
         cb = cb.to(device=device, dtype=torch.long)
         xb = xb.to(device=device, dtype=dtype)
         theta_b = cond_t.index_select(0, cb)
+        sigma_b = _current_sigmas().index_select(0, cb) if raw_sigma is not None else None
         log_prob = geometric_base_cnf_log_prob(
             model=model,
             base=noisy_base,
@@ -1131,6 +1187,7 @@ def finetune_geometric_base_cnf_likelihood(
             ode_steps=int(ode_steps),
             ode_method=str(ode_method),
             enable_grad=bool(enable_grad),
+            base_sigma=sigma_b,
         )
         return -torch.mean(log_prob)
 
@@ -1157,11 +1214,16 @@ def finetune_geometric_base_cnf_likelihood(
             best_val = val_loss
             best_epoch = int(epoch)
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            best_raw_sigma = raw_sigma.detach().cpu().clone() if raw_sigma is not None else None
 
         if epoch == 1 or epoch % log_interval == 0 or epoch == int(epochs):
+            sigma_msg = ""
+            if raw_sigma is not None:
+                sigmas = _current_sigmas().detach().cpu().numpy()
+                sigma_msg = f" sigmas={np.array2string(sigmas, precision=5, separator=',')}"
             print(
                 f"[geometric-base-cnf {epoch:4d}/{int(epochs)}] train_nll={train_loss:.6f} "
-                f"val_nll={val_loss:.6f} best_val_nll={best_val:.6f} best_epoch={best_epoch}",
+                f"val_nll={val_loss:.6f} best_val_nll={best_val:.6f} best_epoch={best_epoch}{sigma_msg}",
                 flush=True,
             )
 
@@ -1169,8 +1231,15 @@ def finetune_geometric_base_cnf_likelihood(
     selected_val = float(val_losses[-1])
     if selection == "best" and best_state is not None:
         model.load_state_dict(best_state)
+        if raw_sigma is not None and best_raw_sigma is not None:
+            raw_sigma.data.copy_(best_raw_sigma.to(device=device, dtype=dtype))
         selected_epoch = int(best_epoch)
         selected_val = float(best_val)
+    selected_sigmas = _current_sigmas().detach().cpu().numpy().astype(np.float64)
+    if best_raw_sigma is not None:
+        best_sigmas = (sigma_floor + F.softplus(best_raw_sigma.to(device=device, dtype=dtype))).detach().cpu().numpy().astype(np.float64)
+    else:
+        best_sigmas = np.full((int(cond.shape[0]),), float(noisy_base.sigma), dtype=np.float64)
 
     return {
         "enabled": True,
@@ -1180,6 +1249,11 @@ def finetune_geometric_base_cnf_likelihood(
         "weight_decay": float(weight_decay),
         "density_points": int(density_points),
         "base_noise_sigma": float(noisy_base.sigma),
+        "base_noise_sigma_init": float(noisy_base.sigma),
+        "learn_base_noise": bool(learn_base_noise),
+        "sigma_min": float(sigma_floor),
+        "selected_base_noise_sigmas": selected_sigmas,
+        "best_base_noise_sigmas": best_sigmas,
         "ode_steps": int(ode_steps),
         "ode_method": str(ode_method),
         "checkpoint_selection": selection,

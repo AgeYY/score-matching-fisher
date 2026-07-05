@@ -166,6 +166,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--nf-weight-decay", type=float, default=0.0)
     p.add_argument("--nf-density-points", type=int, default=512)
     p.add_argument("--nf-checkpoint-selection", choices=("last", "best"), default="last")
+    p.add_argument("--nf-learn-base-noise", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--nf-sigma-min", type=float, default=1e-4)
     return p
 
 
@@ -230,6 +232,12 @@ def validate_dataset_velocity(args: argparse.Namespace) -> str:
         raise ValueError("2D datasets require a 2D velocity family.")
     if bool(args.nf_likelihood_finetune) and float(args.base_noise_sigma) <= 0.0:
         raise ValueError("--base-noise-sigma must be > 0 when --nf-likelihood-finetune is enabled.")
+    if (
+        bool(args.nf_likelihood_finetune)
+        and bool(args.nf_learn_base_noise)
+        and float(args.base_noise_sigma) <= float(args.nf_sigma_min)
+    ):
+        raise ValueError("--base-noise-sigma must be greater than --nf-sigma-min when --nf-learn-base-noise is enabled.")
     return velocity
 
 
@@ -861,6 +869,8 @@ def main(argv: list[str] | None = None) -> int:
             ode_steps=int(args.ode_steps),
             ode_method=str(args.ode_method),
             checkpoint_selection=str(args.nf_checkpoint_selection),
+            learn_base_noise=bool(args.nf_learn_base_noise),
+            sigma_min=float(args.nf_sigma_min),
             log_every=max(1, int(args.log_every)),
         )
 
@@ -886,7 +896,10 @@ def main(argv: list[str] | None = None) -> int:
     base_samples = base_samples_t.detach().cpu().numpy().astype(np.float64)
     fitted_curves: list[np.ndarray] = []
     generated_samples: list[np.ndarray] = []
-    for theta_row in condition_eval:
+    selected_base_sigmas = None
+    if nf_likelihood_meta is not None and "selected_base_noise_sigmas" in nf_likelihood_meta:
+        selected_base_sigmas = np.asarray(nf_likelihood_meta["selected_base_noise_sigmas"], dtype=np.float64).reshape(-1)
+    for condition_idx, theta_row in enumerate(condition_eval):
         curve, _ = push_base_curve(
             model=model,
             base=base,
@@ -897,9 +910,17 @@ def main(argv: list[str] | None = None) -> int:
             ode_method=str(args.ode_method),
         )
         fitted_curves.append(curve.detach().cpu().numpy().astype(np.float64))
+        if selected_base_sigmas is not None:
+            u_gen = base.sample_u(generated_sample_count, device=dev, dtype=torch.float32)
+            x0_gen = base.points_from_u(u_gen)
+            sigma_gen = float(selected_base_sigmas[int(condition_idx)])
+            if sigma_gen > 0.0:
+                x0_gen = x0_gen + sigma_gen * torch.randn_like(x0_gen)
+        else:
+            x0_gen = base_samples_t
         pushed = push_initial_points(
             model=model,
-            x0=base_samples_t,
+            x0=x0_gen,
             theta=theta_row.reshape(1, -1),
             device=dev,
             ode_steps=int(args.ode_steps),
@@ -973,6 +994,8 @@ def main(argv: list[str] | None = None) -> int:
         "nf_weight_decay": float(args.nf_weight_decay),
         "nf_density_points": int(args.nf_density_points),
         "nf_checkpoint_selection": str(args.nf_checkpoint_selection),
+        "nf_learn_base_noise": bool(args.nf_learn_base_noise),
+        "nf_sigma_min": float(args.nf_sigma_min),
     }
     summary = {
         "script": "bin/run_geometric_base_fit_check.py",
@@ -1017,6 +1040,9 @@ def main(argv: list[str] | None = None) -> int:
             f"nf_selected_val_nll: {float(nf_likelihood_meta['selected_val_nll']):.12g}",
             flush=True,
         )
+        if "selected_base_noise_sigmas" in nf_likelihood_meta:
+            sigmas = np.asarray(nf_likelihood_meta["selected_base_noise_sigmas"], dtype=np.float64)
+            print(f"nf_selected_base_noise_sigmas: {np.array2string(sigmas, precision=6, separator=',')}", flush=True)
     return 0
 
 
