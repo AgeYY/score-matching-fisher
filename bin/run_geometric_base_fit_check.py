@@ -159,8 +159,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-grad-norm", type=float, default=10.0)
     p.add_argument("--log-every", type=int, default=100)
 
-    p.add_argument("--nf-likelihood-finetune", action="store_true")
-    p.add_argument("--nf-epochs", type=int, default=1000)
+    p.add_argument("--nf-likelihood-finetune", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--nf-epochs", type=int, default=500)
     p.add_argument("--nf-batch-size", type=int, default=0, help="0 reuses --batch-size.")
     p.add_argument("--nf-lr", type=float, default=1e-4)
     p.add_argument("--nf-weight-decay", type=float, default=0.0)
@@ -596,6 +596,112 @@ def _set_3d_equal_axes(ax: Any, arrays: list[np.ndarray]) -> None:
     ax.set_zlim(center[2] - radius, center[2] + radius)
 
 
+def _plot_loss_history(
+    ax_loss: Any,
+    *,
+    train_losses: np.ndarray,
+    val_losses: np.ndarray,
+    val_monitor_losses: np.ndarray,
+    nf_likelihood_metadata: dict[str, Any] | None,
+) -> None:
+    epochs = np.arange(1, int(train_losses.size) + 1, dtype=np.int64)
+    ax_loss.plot(epochs, train_losses, color="#4c78a8", linewidth=1.8, label="FM train loss")
+    ax_loss.plot(epochs, val_losses, color="#f58518", linewidth=1.8, label="FM validation loss")
+    if int(val_monitor_losses.size) == int(train_losses.size):
+        ax_loss.plot(epochs, val_monitor_losses, color="#444444", linewidth=1.4, linestyle="--", label="FM validation EMA")
+    if nf_likelihood_metadata is not None:
+        nf_train = np.asarray(nf_likelihood_metadata["train_nll_losses"], dtype=np.float64)
+        nf_val = np.asarray(nf_likelihood_metadata["val_nll_losses"], dtype=np.float64)
+        nf_epochs = np.arange(1, int(nf_train.size) + 1, dtype=np.int64)
+        ax_nf = ax_loss.twinx()
+        ax_nf.plot(nf_epochs, nf_train, color="#b279a2", linewidth=1.2, alpha=0.75, label="NF train NLL")
+        ax_nf.plot(nf_epochs, nf_val, color="#b279a2", linewidth=1.5, linestyle=":", label="NF validation NLL")
+        ax_nf.set_ylabel("NF NLL")
+        ax_nf.legend(frameon=False, loc="lower right", fontsize=8)
+    ax_loss.set_xlabel("epoch")
+    ax_loss.set_ylabel("FM loss")
+    ax_loss.set_title("Training history")
+    ax_loss.set_yscale("log")
+    ax_loss.grid(alpha=0.25, linewidth=0.8)
+    ax_loss.legend(frameon=False, loc="best", fontsize=8)
+
+
+def _plot_two_line_overlay(
+    *,
+    png_path: Path,
+    svg_path: Path,
+    condition_values: np.ndarray,
+    x_plot: np.ndarray,
+    theta_plot_scalar: np.ndarray,
+    base_curve: np.ndarray,
+    base_samples: np.ndarray,
+    fitted_curves: list[np.ndarray],
+    generated_samples: list[np.ndarray],
+    skl_value: float,
+    train_losses: np.ndarray,
+    val_losses: np.ndarray,
+    val_monitor_losses: np.ndarray,
+    nf_likelihood_metadata: dict[str, Any] | None,
+) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    colors = ["#4c78a8", "#f58518"]
+    fig, axes = plt.subplots(1, 3, figsize=(15.0, 4.8))
+    ax_target, ax_fit, ax_loss = axes
+    all_arrays = [x_plot, base_samples, base_curve, *generated_samples, *fitted_curves]
+
+    for idx, condition_value in enumerate(condition_values[:, 0]):
+        mask = np.isclose(theta_plot_scalar[:, 0], float(condition_value))
+        color = colors[idx % len(colors)]
+        ax_target.scatter(
+            x_plot[mask, 0],
+            x_plot[mask, 1],
+            s=16,
+            alpha=0.62,
+            color=color,
+            linewidths=0,
+            label=f"Dataset {idx + 1}",
+        )
+    ax_target.set_title("Target data")
+    ax_target.set_xlabel("x1")
+    ax_target.set_ylabel("x2")
+    ax_target.legend(frameon=False, loc="best", fontsize=8)
+    _set_2d_equal_axes(ax_target, all_arrays)
+
+    ax_fit.scatter(base_samples[:, 0], base_samples[:, 1], s=10, alpha=0.22, color="#2f2f2f", linewidths=0, label="base samples")
+    ax_fit.plot(base_curve[:, 0], base_curve[:, 1], color="#2f2f2f", linewidth=1.8, linestyle="--", label="base mean")
+    for idx, condition_value in enumerate(condition_values[:, 0]):
+        del condition_value
+        color = colors[idx % len(colors)]
+        gen = np.asarray(generated_samples[idx], dtype=np.float64)
+        curve = np.asarray(fitted_curves[idx], dtype=np.float64)
+        ax_fit.scatter(gen[:, 0], gen[:, 1], s=13, alpha=0.36, color=color, linewidths=0, label=f"fitted samples {idx + 1}")
+        ax_fit.plot(curve[:, 0], curve[:, 1], color=color, linewidth=2.5, label=f"fitted mean {idx + 1}")
+    ax_fit.text(0.02, 0.98, f"SKL = {skl_value:.4g}", transform=ax_fit.transAxes, va="top", ha="left", fontsize=12)
+    ax_fit.set_title("Fitted distribution")
+    ax_fit.set_xlabel("x1")
+    ax_fit.set_ylabel("x2")
+    ax_fit.legend(frameon=False, loc="best", fontsize=7)
+    _set_2d_equal_axes(ax_fit, all_arrays)
+
+    _plot_loss_history(
+        ax_loss,
+        train_losses=train_losses,
+        val_losses=val_losses,
+        val_monitor_losses=val_monitor_losses,
+        nf_likelihood_metadata=nf_likelihood_metadata,
+    )
+
+    fig.tight_layout()
+    png_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(png_path, dpi=180)
+    fig.savefig(svg_path)
+    plt.close(fig)
+
+
 def _plot_overlay(
     *,
     png_path: Path,
@@ -670,26 +776,13 @@ def _plot_overlay(
     ax.set_title(f"{dataset} with {velocity_family}")
     ax.legend(frameon=False, loc="best", fontsize=7)
 
-    epochs = np.arange(1, int(train_losses.size) + 1, dtype=np.int64)
-    ax_loss.plot(epochs, train_losses, color="#4c78a8", linewidth=1.8, label="FM train loss")
-    ax_loss.plot(epochs, val_losses, color="#f58518", linewidth=1.8, label="FM validation loss")
-    if int(val_monitor_losses.size) == int(train_losses.size):
-        ax_loss.plot(epochs, val_monitor_losses, color="#444444", linewidth=1.4, linestyle="--", label="FM validation EMA")
-    if nf_likelihood_metadata is not None:
-        nf_train = np.asarray(nf_likelihood_metadata["train_nll_losses"], dtype=np.float64)
-        nf_val = np.asarray(nf_likelihood_metadata["val_nll_losses"], dtype=np.float64)
-        nf_epochs = np.arange(1, int(nf_train.size) + 1, dtype=np.int64)
-        ax_nf = ax_loss.twinx()
-        ax_nf.plot(nf_epochs, nf_train, color="#b279a2", linewidth=1.2, alpha=0.75, label="NF train NLL")
-        ax_nf.plot(nf_epochs, nf_val, color="#b279a2", linewidth=1.5, linestyle=":", label="NF validation NLL")
-        ax_nf.set_ylabel("NF NLL")
-        ax_nf.legend(frameon=False, loc="lower right", fontsize=8)
-    ax_loss.set_xlabel("epoch")
-    ax_loss.set_ylabel("FM loss")
-    ax_loss.set_title("Training history")
-    ax_loss.set_yscale("log")
-    ax_loss.grid(alpha=0.25, linewidth=0.8)
-    ax_loss.legend(frameon=False, loc="best", fontsize=8)
+    _plot_loss_history(
+        ax_loss,
+        train_losses=train_losses,
+        val_losses=val_losses,
+        val_monitor_losses=val_monitor_losses,
+        nf_likelihood_metadata=nf_likelihood_metadata,
+    )
 
     fig.tight_layout()
     png_path.parent.mkdir(parents=True, exist_ok=True)
@@ -814,26 +907,32 @@ def main(argv: list[str] | None = None) -> int:
         )
         generated_samples.append(pushed.detach().cpu().numpy().astype(np.float64))
     skl_value = float(result.symmetric_kl_matrix[0, 1]) if int(condition_eval.shape[0]) > 1 else 0.0
-    _plot_overlay(
-        png_path=paths["png"],
-        svg_path=paths["svg"],
-        dataset=str(args.dataset),
-        velocity_family=velocity_family,
-        condition_values=np.asarray(data["condition_values"], dtype=np.float64),
-        condition_labels=list(data["condition_labels"]),
-        x_plot=np.asarray(data["x_test_plot"], dtype=np.float64),
-        theta_plot_scalar=np.asarray(data["theta_test_plot_scalar"], dtype=np.float64),
-        base_curve=base_curve,
-        base_samples=base_samples,
-        target_curves=[np.asarray(arr, dtype=np.float64) for arr in data["target_curves"]],
-        fitted_curves=fitted_curves,
-        generated_samples=generated_samples,
-        skl_value=skl_value,
-        train_losses=np.asarray(train_meta["train_losses"], dtype=np.float64),
-        val_losses=np.asarray(train_meta["val_losses"], dtype=np.float64),
-        val_monitor_losses=np.asarray(train_meta["val_monitor_losses"], dtype=np.float64),
-        nf_likelihood_metadata=nf_likelihood_meta,
-    )
+    plot_common = {
+        "png_path": paths["png"],
+        "svg_path": paths["svg"],
+        "condition_values": np.asarray(data["condition_values"], dtype=np.float64),
+        "x_plot": np.asarray(data["x_test_plot"], dtype=np.float64),
+        "theta_plot_scalar": np.asarray(data["theta_test_plot_scalar"], dtype=np.float64),
+        "base_curve": base_curve,
+        "base_samples": base_samples,
+        "fitted_curves": fitted_curves,
+        "generated_samples": generated_samples,
+        "skl_value": skl_value,
+        "train_losses": np.asarray(train_meta["train_losses"], dtype=np.float64),
+        "val_losses": np.asarray(train_meta["val_losses"], dtype=np.float64),
+        "val_monitor_losses": np.asarray(train_meta["val_monitor_losses"], dtype=np.float64),
+        "nf_likelihood_metadata": nf_likelihood_meta,
+    }
+    if str(args.dataset) == "two-line":
+        _plot_two_line_overlay(**plot_common)
+    else:
+        _plot_overlay(
+            dataset=str(args.dataset),
+            velocity_family=velocity_family,
+            condition_labels=list(data["condition_labels"]),
+            target_curves=[np.asarray(arr, dtype=np.float64) for arr in data["target_curves"]],
+            **plot_common,
+        )
 
     training_parameters = {
         "dataset": str(args.dataset),

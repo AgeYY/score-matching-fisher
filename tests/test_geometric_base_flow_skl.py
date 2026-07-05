@@ -720,7 +720,7 @@ def test_geometric_base_flow_skl_cli_defaults() -> None:
 def test_unified_geometric_base_fit_check_defaults() -> None:
     mod = _load_unified_fit_check_module()
     args = mod.build_parser().parse_args([])
-    paths = mod.resolve_output_paths(None, dataset=args.dataset, velocity_family=mod.validate_dataset_velocity(args), nf_likelihood=False)
+    paths = mod.resolve_output_paths(None, dataset=args.dataset, velocity_family=mod.validate_dataset_velocity(args), nf_likelihood=True)
 
     assert args.dataset == "two-line"
     assert args.velocity_family == "lie-affine-2d"
@@ -730,8 +730,9 @@ def test_unified_geometric_base_fit_check_defaults() -> None:
     assert args.epochs == 50000
     assert args.early_patience == 1000
     assert args.n_per_condition == 3000
-    assert args.nf_likelihood_finetune is False
-    assert args.nf_epochs == 1000
+    assert args.nf_likelihood_finetune is True
+    assert mod.build_parser().parse_args(["--no-nf-likelihood-finetune"]).nf_likelihood_finetune is False
+    assert args.nf_epochs == 500
     assert args.nf_batch_size == 0
     assert args.nf_lr == pytest.approx(1e-4)
     assert args.nf_weight_decay == pytest.approx(0.0)
@@ -829,9 +830,7 @@ def test_unified_geometric_base_fit_check_velocity_validation() -> None:
     with pytest.raises(ValueError, match="only valid for 3D half-circle"):
         mod.validate_dataset_velocity(mod.build_parser().parse_args(["--dataset", "two-square", "--velocity-family", "lie-similarity-3d"]))
     with pytest.raises(ValueError, match="base-noise-sigma"):
-        mod.validate_dataset_velocity(
-            mod.build_parser().parse_args(["--dataset", "two-square", "--nf-likelihood-finetune", "--base-noise-sigma", "0.0"])
-        )
+        mod.validate_dataset_velocity(mod.build_parser().parse_args(["--dataset", "two-square", "--base-noise-sigma", "0.0"]))
 
 
 def test_geometric_base_fit_check_wrappers_route_to_unified_datasets() -> None:
