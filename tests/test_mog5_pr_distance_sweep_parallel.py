@@ -108,9 +108,9 @@ def test_parser_defaults_and_cpu_auto(monkeypatch: pytest.MonkeyPatch) -> None:
 
     args = mod.build_parser().parse_args([])
 
-    assert args.gpu_ids == [1]
+    assert args.gpu_ids == [0]
     assert args.jobs_per_gpu == 1
-    assert args.device == "cuda:1"
+    assert args.device == "cuda:0"
     assert args.cpu_threads_per_job == 16
     assert args.parallel_log_dir == args.output_dir / "parallel_logs"
 

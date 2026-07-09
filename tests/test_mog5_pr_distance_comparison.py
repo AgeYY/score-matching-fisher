@@ -567,7 +567,7 @@ def test_cli_default_path_resolution_without_running_training() -> None:
     assert args.native_x_dim == 3
     assert args.pr_dim is None
     assert args.seed == 7
-    assert args.device == "cuda:1"
+    assert args.device == "cuda:0"
     assert args.metric == "all"
     assert mod.resolve_metric_names(args) == dc.METRIC_NAMES
     assert args.gt_samples_per_class == 100_000
@@ -823,7 +823,7 @@ def test_mahalanobis_cli_defaults_match_full_cli_without_running_training() -> N
     assert args.n_total == full_args.n_total == 1_000
     assert args.pr_dim == full_args.pr_dim is None
     assert args.seed == full_args.seed == 7
-    assert args.device == full_args.device == "cuda:1"
+    assert args.device == full_args.device == "cuda:0"
     assert args.gt_samples_per_class == full_args.gt_samples_per_class == 100_000
     assert args.mc_jeffreys_sample == full_args.mc_jeffreys_sample == 4096
     assert args.radius == full_args.radius == 1.0
