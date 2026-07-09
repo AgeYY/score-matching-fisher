@@ -957,7 +957,7 @@ def _push_base_curve_ode(
     device: torch.device,
     u: np.ndarray | torch.Tensor | None = None,
     n_points: int | None = None,
-    ode_steps: int = 64,
+    ode_steps: int = 32,
     ode_method: str = "midpoint",
     enable_grad: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1121,7 +1121,7 @@ def geometric_base_cnf_log_prob(
     theta: torch.Tensor,
     support_u: torch.Tensor | None = None,
     device: torch.device,
-    ode_steps: int = 64,
+    ode_steps: int = 32,
     ode_method: str = "midpoint",
     enable_grad: bool = True,
     base_sigma: float | torch.Tensor | None = None,
@@ -1201,11 +1201,13 @@ def finetune_geometric_base_cnf_likelihood(
     lr: float = 1e-4,
     weight_decay: float = 0.0,
     density_points: int = 512,
-    ode_steps: int = 64,
+    ode_steps: int = 32,
     ode_method: str = "midpoint",
     checkpoint_selection: str = "last",
     learn_base_noise: bool = True,
+    initial_base_noise_sigmas: np.ndarray | torch.Tensor | list[float] | None = None,
     sigma_min: float = 1e-4,
+    epoch_offset: int = 0,
     log_every: int = 100,
     return_checkpoint_states: bool = False,
 ) -> dict[str, Any]:
@@ -1233,6 +1235,9 @@ def finetune_geometric_base_cnf_likelihood(
         raise ValueError("sigma_min must be finite and positive.")
     if noisy_base is not None and bool(learn_base_noise) and float(noisy_base.sigma) <= sigma_floor:
         raise ValueError("base.sigma must be greater than sigma_min when learn_base_noise=True.")
+    offset = int(epoch_offset)
+    if offset < 0:
+        raise ValueError("epoch_offset must be >= 0.")
     selection = _normalize_nf_checkpoint_selection(checkpoint_selection)
     log_interval = max(1, int(log_every))
 
@@ -1262,9 +1267,21 @@ def finetune_geometric_base_cnf_likelihood(
     support_u = _base_u_grid(noisy_base, int(density_points), device=device, dtype=dtype).detach() if noisy_base is not None else None
     cond_t = torch.from_numpy(cond.astype(np.float32)).to(device=device, dtype=dtype)
     model_params = _adamw_parameters(model)
+    init_sigmas_meta: np.ndarray | None = None
     if noisy_base is not None and bool(learn_base_noise):
-        raw_init = _inverse_softplus_scalar(float(noisy_base.sigma) - sigma_floor)
-        raw_sigma = nn.Parameter(torch.full((int(cond.shape[0]),), raw_init, dtype=dtype, device=device))
+        if initial_base_noise_sigmas is None:
+            init_sigmas = np.full((int(cond.shape[0]),), float(noisy_base.sigma), dtype=np.float64)
+        elif torch.is_tensor(initial_base_noise_sigmas):
+            init_sigmas = initial_base_noise_sigmas.detach().cpu().numpy().astype(np.float64, copy=False).reshape(-1)
+        else:
+            init_sigmas = np.asarray(initial_base_noise_sigmas, dtype=np.float64).reshape(-1)
+        if int(init_sigmas.shape[0]) != int(cond.shape[0]):
+            raise ValueError("initial_base_noise_sigmas must contain one value per condition.")
+        if not np.all(np.isfinite(init_sigmas)) or np.any(init_sigmas <= sigma_floor):
+            raise ValueError("initial_base_noise_sigmas must be finite and greater than sigma_min.")
+        init_sigmas_meta = init_sigmas.astype(np.float64, copy=True)
+        raw_init = [_inverse_softplus_scalar(float(sig) - sigma_floor) for sig in init_sigmas]
+        raw_sigma = nn.Parameter(torch.tensor(raw_init, dtype=dtype, device=device))
         opt = torch.optim.AdamW(
             [
                 {"params": model_params, "weight_decay": float(weight_decay)},
@@ -1309,6 +1326,7 @@ def finetune_geometric_base_cnf_likelihood(
         return -torch.mean(log_prob)
 
     for epoch in range(1, int(epochs) + 1):
+        total_epoch = offset + int(epoch)
         model.train()
         ep_losses: list[float] = []
         for cb, xb in train_loader:
@@ -1329,7 +1347,7 @@ def finetune_geometric_base_cnf_likelihood(
         val_losses.append(val_loss)
         if val_loss < best_val:
             best_val = val_loss
-            best_epoch = int(epoch)
+            best_epoch = int(total_epoch)
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             best_raw_sigma = raw_sigma.detach().cpu().clone() if raw_sigma is not None else None
 
@@ -1339,7 +1357,7 @@ def finetune_geometric_base_cnf_likelihood(
                 sigmas = _current_sigmas().detach().cpu().numpy()
                 sigma_msg = f" sigmas={np.array2string(sigmas, precision=5, separator=',')}"
             print(
-                f"[geometric-base-cnf {epoch:4d}/{int(epochs)}] train_nll={train_loss:.6f} "
+                f"[geometric-base-cnf {total_epoch:4d}/{offset + int(epochs)}] train_nll={train_loss:.6f} "
                 f"val_nll={val_loss:.6f} best_val_nll={best_val:.6f} best_epoch={best_epoch}{sigma_msg}",
                 flush=True,
             )
@@ -1348,7 +1366,7 @@ def finetune_geometric_base_cnf_likelihood(
     last_raw_sigma = raw_sigma.detach().cpu().clone() if raw_sigma is not None else None
     last_sigmas = _current_sigmas().detach().cpu().numpy().astype(np.float64)
 
-    selected_epoch = int(epochs)
+    selected_epoch = offset + int(epochs)
     selected_val = float(val_losses[-1])
     if selection == "best" and best_state is not None:
         model.load_state_dict(best_state)
@@ -1366,6 +1384,8 @@ def finetune_geometric_base_cnf_likelihood(
     meta = {
         "enabled": True,
         "epochs": int(epochs),
+        "epoch_offset": int(offset),
+        "total_epochs": int(offset + int(epochs)),
         "batch_size": int(batch_size),
         "lr": float(lr),
         "weight_decay": float(weight_decay),
@@ -1374,6 +1394,7 @@ def finetune_geometric_base_cnf_likelihood(
         "base_distribution": "standard_normal" if noisy_base is None else "noisy_geometric",
         "base_noise_sigma": 0.0 if noisy_base is None else float(noisy_base.sigma),
         "base_noise_sigma_init": 0.0 if noisy_base is None else float(noisy_base.sigma),
+        "initial_base_noise_sigmas": init_sigmas_meta,
         "learn_base_noise": bool(learn_base_noise) and noisy_base is not None,
         "sigma_min": float(sigma_floor),
         "ode_steps": int(ode_steps),
@@ -1399,7 +1420,7 @@ def finetune_geometric_base_cnf_likelihood(
             "best_base_noise_sigmas": best_sigmas,
             "last_base_noise_sigmas": last_sigmas,
             "best_epoch": int(best_epoch),
-            "last_epoch": int(epochs),
+            "last_epoch": int(offset + int(epochs)),
         }
     return meta
 
@@ -1415,7 +1436,7 @@ def push_base_curve(
     device: torch.device,
     u: np.ndarray | torch.Tensor | None = None,
     n_points: int | None = None,
-    ode_steps: int = 64,
+    ode_steps: int = 32,
     ode_method: str = "midpoint",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Push line-base points through the learned conditional ODE."""
@@ -1442,7 +1463,7 @@ def push_initial_points(
     x0: np.ndarray | torch.Tensor,
     theta: np.ndarray | torch.Tensor,
     device: torch.device,
-    ode_steps: int = 64,
+    ode_steps: int = 32,
     ode_method: str = "midpoint",
 ) -> torch.Tensor:
     """Push arbitrary initial ambient points through the learned conditional ODE."""
@@ -1493,7 +1514,7 @@ def sample_smoothed_curve(
     n_samples: int,
     smooth_sigma: float,
     device: torch.device,
-    ode_steps: int = 64,
+    ode_steps: int = 32,
     ode_method: str = "midpoint",
 ) -> torch.Tensor:
     """Sample from ``gamma_theta(U) + Normal(0, sigma^2 I)``."""
@@ -1523,7 +1544,7 @@ def log_smoothed_curve_density(
     smooth_sigma: float,
     density_mc_samples: int,
     device: torch.device,
-    ode_steps: int = 64,
+    ode_steps: int = 32,
     ode_method: str = "midpoint",
     batch_size: int = 1024,
     support_u: torch.Tensor | np.ndarray | None = None,
@@ -1586,7 +1607,7 @@ def estimate_smoothed_curve_symmetric_kl(
     smooth_sigma: float = 0.12,
     mc_skl_samples: int = 4096,
     density_mc_samples: int = 1024,
-    ode_steps: int = 64,
+    ode_steps: int = 32,
     ode_method: str = "midpoint",
     batch_size: int = 1024,
     fisher_kind: str = "none",
@@ -1693,9 +1714,10 @@ def estimate_pushed_base_symmetric_kl(
     base: NoisyGeometricBase | StandardNormalBase,
     theta_all: np.ndarray,
     device: torch.device,
+    base_noise_sigmas: np.ndarray | torch.Tensor | list[float] | None = None,
     mc_skl_samples: int = 4096,
     density_mc_samples: int = 1024,
-    ode_steps: int = 64,
+    ode_steps: int = 32,
     ode_method: str = "midpoint",
     batch_size: int = 1024,
     fisher_kind: str = "none",
@@ -1717,12 +1739,32 @@ def estimate_pushed_base_symmetric_kl(
     k_theta = int(theta.shape[0])
     directed = np.zeros((k_theta, k_theta), dtype=np.float64)
     support_u = None
+    sigma_by_condition: np.ndarray | None = None
     if isinstance(base, NoisyGeometricBase):
         support_u = _base_u_grid(base, int(density_mc_samples), device=device, dtype=dtype).detach()
+        if base_noise_sigmas is not None:
+            if torch.is_tensor(base_noise_sigmas):
+                sigma_by_condition = base_noise_sigmas.detach().cpu().numpy().astype(np.float64, copy=False).reshape(-1)
+            else:
+                sigma_by_condition = np.asarray(base_noise_sigmas, dtype=np.float64).reshape(-1)
+            if int(sigma_by_condition.shape[0]) != k_theta:
+                raise ValueError("base_noise_sigmas must contain one value per theta row.")
+            if not np.all(np.isfinite(sigma_by_condition)) or np.any(sigma_by_condition <= 0.0):
+                raise ValueError("base_noise_sigmas must be finite and positive.")
 
-    def _log_prob_batches(x_eval: torch.Tensor, theta_row: np.ndarray) -> torch.Tensor:
+    def _sample_base_for_condition(condition_idx: int) -> torch.Tensor:
+        if isinstance(base, NoisyGeometricBase) and sigma_by_condition is not None:
+            u = base.sample_u(int(mc_skl_samples), device=device, dtype=dtype)
+            x0 = base.points_from_u(u)
+            return x0 + float(sigma_by_condition[int(condition_idx)]) * torch.randn_like(x0)
+        return base.sample(int(mc_skl_samples), device=device, dtype=dtype)
+
+    def _log_prob_batches(x_eval: torch.Tensor, theta_row: np.ndarray, condition_idx: int) -> torch.Tensor:
         outs: list[torch.Tensor] = []
         theta_np = np.asarray(theta_row, dtype=np.float64).reshape(1, -1)
+        base_sigma = None
+        if isinstance(base, NoisyGeometricBase) and sigma_by_condition is not None:
+            base_sigma = float(sigma_by_condition[int(condition_idx)])
         for start in range(0, int(x_eval.shape[0]), bs):
             xb = x_eval[start : start + bs]
             theta_b = torch.from_numpy(theta_np.astype(np.float32)).to(device=device, dtype=dtype).expand(int(xb.shape[0]), -1)
@@ -1737,12 +1779,13 @@ def estimate_pushed_base_symmetric_kl(
                     ode_steps=int(ode_steps),
                     ode_method=str(ode_method),
                     enable_grad=False,
+                    base_sigma=base_sigma,
                 )
             )
         return torch.cat(outs, dim=0)
 
     for i in range(k_theta):
-        x0 = base.sample(int(mc_skl_samples), device=device, dtype=dtype)
+        x0 = _sample_base_for_condition(i)
         xi = push_initial_points(
             model=model,
             x0=x0,
@@ -1751,11 +1794,11 @@ def estimate_pushed_base_symmetric_kl(
             ode_steps=int(ode_steps),
             ode_method=str(ode_method),
         )
-        logp_i = _log_prob_batches(xi, theta[i : i + 1])
+        logp_i = _log_prob_batches(xi, theta[i : i + 1], i)
         for j in range(k_theta):
             if i == j:
                 continue
-            logp_j = _log_prob_batches(xi, theta[j : j + 1])
+            logp_j = _log_prob_batches(xi, theta[j : j + 1], j)
             directed[i, j] = float(torch.mean(logp_i - logp_j).detach().cpu())
 
     skl = np.maximum(directed + directed.T, 0.0)
@@ -1782,6 +1825,7 @@ def estimate_pushed_base_symmetric_kl(
             "density_mc_samples": int(density_mc_samples),
             "ode_steps": int(ode_steps),
             "ode_method": str(ode_method),
+            "base_noise_sigmas": None if sigma_by_condition is None else sigma_by_condition.astype(np.float64, copy=True),
         }
     )
     return FlowSKLResult(

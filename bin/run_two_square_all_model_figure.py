@@ -38,28 +38,22 @@ class ModelCase:
 
 MODEL_CASES: tuple[ModelCase, ...] = (
     ModelCase(
+        label="Square + Lie sim.",
+        output_name="two-square__base-square__lie-similarity-2d__nf_best",
+        base_geometry="square",
+        velocity_family="lie-similarity-2d",
+    ),
+    ModelCase(
         label="Square + uncon.",
         output_name="two-square__base-square__unconstrained__nf_best",
         base_geometry="square",
         velocity_family="unconstrained",
     ),
     ModelCase(
-        label="Normal + uncon.",
-        output_name="two-square__base-standard-normal__unconstrained__nf_best",
-        base_geometry="standard-normal",
-        velocity_family="unconstrained",
-    ),
-    ModelCase(
-        label="Normal + centered",
+        label="Normal + affine",
         output_name="two-square__base-standard-normal__centered-affine__nf_best",
         base_geometry="standard-normal",
         velocity_family="centered-affine",
-    ),
-    ModelCase(
-        label="Square + Lie sim.",
-        output_name="two-square__base-square__lie-similarity-2d__nf_best",
-        base_geometry="square",
-        velocity_family="lie-similarity-2d",
     ),
 )
 
@@ -83,7 +77,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--nf-batch-size", type=int, default=0, help="0 reuses --batch-size.")
     p.add_argument("--nf-lr", type=float, default=1e-4)
     p.add_argument("--nf-density-points", type=int, default=512)
-    p.add_argument("--ode-steps", type=int, default=64)
+    p.add_argument("--ode-steps", type=int, default=32)
     p.add_argument("--ode-method", type=str, default="midpoint")
     p.add_argument("--plot-n-per-condition", type=int, default=600)
     p.add_argument("--generated-samples-per-condition", type=int, default=600)
@@ -179,6 +173,8 @@ def _plot_figure(args: argparse.Namespace) -> None:
     cmd = [
         sys.executable,
         "bin/visualize_two_square_target_dataset.py",
+        "--layout",
+        "overlap",
         "--device",
         str(args.device),
         "--seed",

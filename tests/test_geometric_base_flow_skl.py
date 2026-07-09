@@ -29,6 +29,7 @@ from fisher.geometric_base_flow_skl import (
     SquarePerimeterBase,
     StandardNormalBase,
     build_geometric_base_velocity_model,
+    estimate_pushed_base_symmetric_kl,
     estimate_smoothed_curve_symmetric_kl,
     finetune_geometric_base_cnf_likelihood,
     geometric_base_cnf_log_prob,
@@ -682,19 +683,24 @@ def test_geometric_base_cnf_likelihood_finetune_records_metadata() -> None:
         lr=1e-3,
         density_points=4,
         ode_steps=2,
+        initial_base_noise_sigmas=np.asarray([0.25], dtype=np.float64),
+        epoch_offset=10,
         checkpoint_selection="best",
         log_every=999,
     )
 
     assert meta["enabled"] is True
     assert meta["epochs"] == 1
+    assert meta["epoch_offset"] == 10
+    assert meta["total_epochs"] == 11
     assert meta["density_points"] == 4
     assert meta["base_noise_sigma"] == pytest.approx(0.5)
     assert meta["base_noise_sigma_init"] == pytest.approx(0.5)
+    np.testing.assert_allclose(meta["initial_base_noise_sigmas"], np.asarray([0.25]))
     assert meta["learn_base_noise"] is True
     assert meta["sigma_min"] == pytest.approx(1e-4)
     assert meta["checkpoint_selection"] == "best"
-    assert meta["selected_epoch"] == 1
+    assert meta["selected_epoch"] == 11
     assert np.asarray(meta["selected_base_noise_sigmas"]).shape == (1,)
     assert np.asarray(meta["best_base_noise_sigmas"]).shape == (1,)
     assert float(np.asarray(meta["selected_base_noise_sigmas"])[0]) > 0.0
@@ -773,6 +779,47 @@ def test_smoothed_curve_skl_identical_conditions_is_zero(monkeypatch: pytest.Mon
     assert result.canonical_metric_name == gb.SMOOTHED_LINE_CURVE_METRIC
 
 
+def test_pushed_base_skl_identical_noisy_geometric_conditions_is_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gb, "_make_flow_ode_solver", lambda model: IdentitySolver(model))
+    torch.manual_seed(0)
+    model = ConstantTranslationAffineVelocity((0.0, 0.0))
+    clean = LineSegmentBase(anchor=(0.0, 0.0), direction=(1.0, 0.0), u_low=-1.0, u_high=1.0)
+    base = NoisyGeometricBase(clean, sigma=0.2)
+
+    result = estimate_pushed_base_symmetric_kl(
+        model=model,
+        base=base,
+        theta_all=np.asarray([[0.0], [0.0]], dtype=np.float64),
+        device=torch.device("cpu"),
+        base_noise_sigmas=np.asarray([0.2, 0.2], dtype=np.float64),
+        mc_skl_samples=8,
+        density_mc_samples=8,
+        ode_steps=2,
+    )
+
+    np.testing.assert_allclose(result.symmetric_kl_matrix, np.zeros((2, 2)), atol=1e-7)
+    assert result.canonical_metric_name == gb.PUSHED_BASE_DISTRIBUTION_METRIC
+    np.testing.assert_allclose(result.train_metadata["base_noise_sigmas"], np.asarray([0.2, 0.2]))
+
+
+def test_pushed_base_skl_validates_per_condition_base_sigmas() -> None:
+    model = ConstantTranslationAffineVelocity((0.0, 0.0))
+    clean = LineSegmentBase(anchor=(0.0, 0.0), direction=(1.0, 0.0), u_low=-1.0, u_high=1.0)
+    base = NoisyGeometricBase(clean, sigma=0.2)
+
+    with pytest.raises(ValueError, match="one value per theta row"):
+        estimate_pushed_base_symmetric_kl(
+            model=model,
+            base=base,
+            theta_all=np.asarray([[0.0], [1.0]], dtype=np.float64),
+            device=torch.device("cpu"),
+            base_noise_sigmas=np.asarray([0.2], dtype=np.float64),
+            mc_skl_samples=2,
+            density_mc_samples=2,
+            ode_steps=1,
+        )
+
+
 def test_geometric_base_flow_skl_cli_defaults() -> None:
     mod = _load_cli_module()
     args = mod.build_parser().parse_args([])
@@ -806,13 +853,17 @@ def test_unified_geometric_base_fit_check_defaults() -> None:
     assert args.nf_density_points == 512
     assert args.nf_checkpoint_selection == "last"
     assert args.nf_learn_base_noise is True
+    assert args.nf_epoch_offset == 0
     assert mod.build_parser().parse_args(["--no-nf-learn-base-noise"]).nf_learn_base_noise is False
     assert args.nf_sigma_min == pytest.approx(1e-4)
+    assert args.init_model_checkpoint is None
+    assert args.skip_fm_training is False
     assert args.max_test_plot_per_condition == 600
     assert args.generated_samples_per_condition == 600
     assert args.smooth_sigma == pytest.approx(0.12)
     assert paths["png"].name == "geometric_base_fit_check.png"
     assert paths["summary"].name == "geometric_base_fit_check_summary.json"
+    assert "estimate_smoothed_curve_symmetric_kl" not in Path(mod.__file__).read_text(encoding="utf-8")
 
 
 def test_geometric_base_training_exposes_no_matched_source_path() -> None:

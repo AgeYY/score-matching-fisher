@@ -24,6 +24,7 @@ from fisher.geometric_base_flow_skl import (
     SquarePerimeterBase,
     StandardNormalBase,
     build_geometric_base_velocity_model,
+    estimate_pushed_base_symmetric_kl,
     push_base_curve,
     push_initial_points,
 )
@@ -41,9 +42,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--center-y", type=float, default=0.0)
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--points-per-edge", type=int, default=160)
-    p.add_argument("--point-size", type=float, default=8.0)
-    p.add_argument("--alpha", type=float, default=0.6)
+    p.add_argument("--point-size", type=float, default=30.0)
+    p.add_argument("--alpha", type=float, default=0.5)
     p.add_argument("--legend-font-size", type=float, default=14.0)
+    p.add_argument("--panel-label-font-size", type=float, default=18.0)
+    p.add_argument("--layout", choices=("overlap", "condition-rows"), default="overlap")
     p.add_argument("--contour-grid-size", type=int, default=140)
     p.add_argument("--contour-levels", type=int, default=6)
     p.add_argument("--contour-low-quantile", type=float, default=0.78)
@@ -56,6 +59,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--generated-samples-per-condition", type=int, default=600)
     p.add_argument("--contour-target-samples-per-condition", type=int, default=6000)
     p.add_argument("--contour-generated-samples-per-condition", type=int, default=6000)
+    p.add_argument("--target-skl-samples", type=int, default=4096)
+    p.add_argument("--target-skl-density-samples", type=int, default=4096)
     p.add_argument("--base-samples-per-condition", type=int, default=250)
     p.add_argument("--ode-steps", type=int, default=None)
     p.add_argument("--ode-method", type=str, default=None)
@@ -78,26 +83,38 @@ def _axis_limits(arrays: list[np.ndarray]) -> tuple[tuple[float, float], tuple[f
     maxs = np.max(xy, axis=0)
     center = 0.5 * (mins + maxs)
     radius = max(0.5 * float(np.max(maxs - mins)), 1e-6)
-    pad = 0.08 * radius
+    pad = 0.035 * radius
     return (
         (float(center[0] - radius - pad), float(center[0] + radius + pad)),
         (float(center[1] - radius - pad), float(center[1] + radius + pad)),
     )
 
 
-def _set_equal_axes(ax: Any, arrays: list[np.ndarray]) -> None:
-    xlim, ylim = _axis_limits(arrays)
+def _set_equal_axes(
+    ax: Any,
+    arrays: list[np.ndarray],
+    *,
+    axis_limits: tuple[tuple[float, float], tuple[float, float]] | None = None,
+) -> None:
+    xlim, ylim = _axis_limits(arrays) if axis_limits is None else axis_limits
     ax.set_xlim(*xlim)
     ax.set_ylim(*ylim)
     ax.set_aspect("equal", adjustable="box")
 
 
-def _style_panel(ax: Any, arrays: list[np.ndarray], *, legend_font_size: float, show_legend: bool = True) -> None:
+def _style_panel(
+    ax: Any,
+    arrays: list[np.ndarray],
+    *,
+    legend_font_size: float,
+    show_legend: bool = True,
+    axis_limits: tuple[tuple[float, float], tuple[float, float]] | None = None,
+) -> None:
     if show_legend:
         ax.legend(frameon=False, loc="lower right", fontsize=float(legend_font_size), markerscale=2.0)
     ax.grid(False)
     ax.set_axis_off()
-    _set_equal_axes(ax, arrays)
+    _set_equal_axes(ax, arrays, axis_limits=axis_limits)
 
 
 def _panel_label(ax: Any, text: str, *, font_size: float) -> None:
@@ -111,6 +128,137 @@ def _panel_label(ax: Any, text: str, *, font_size: float) -> None:
         fontsize=float(font_size),
         color="#222222",
     )
+
+
+def _format_skl(value: Any) -> str:
+    try:
+        val = float(value)
+    except (TypeError, ValueError):
+        return "SKL = n/a"
+    if not math.isfinite(val):
+        return "SKL = n/a"
+    if abs(val) < 0.01 and val != 0.0:
+        return f"SKL = {val:.2e}"
+    return f"SKL = {val:.3f}"
+
+
+def _square_boundary_torch(
+    u: torch.Tensor,
+    *,
+    theta: float,
+    side_length: float,
+    center: tuple[float, float],
+) -> torch.Tensor:
+    if u.ndim == 1:
+        u = u.unsqueeze(-1)
+    s = torch.remainder(u, 4.0)
+    side = float(side_length)
+    h = 0.5 * side
+    out = torch.empty(int(u.shape[0]), 2, device=u.device, dtype=u.dtype)
+    m0 = s[:, 0] < 1.0
+    m1 = (s[:, 0] >= 1.0) & (s[:, 0] < 2.0)
+    m2 = (s[:, 0] >= 2.0) & (s[:, 0] < 3.0)
+    m3 = s[:, 0] >= 3.0
+    out[m0, 0] = -h + side * s[m0, 0]
+    out[m0, 1] = -h
+    out[m1, 0] = h
+    out[m1, 1] = -h + side * (s[m1, 0] - 1.0)
+    out[m2, 0] = h - side * (s[m2, 0] - 2.0)
+    out[m2, 1] = h
+    out[m3, 0] = -h
+    out[m3, 1] = h - side * (s[m3, 0] - 3.0)
+
+    c = math.cos(float(theta))
+    st = math.sin(float(theta))
+    rot = torch.tensor([[c, -st], [st, c]], device=u.device, dtype=u.dtype)
+    center_t = torch.tensor(center, device=u.device, dtype=u.dtype).reshape(1, 2)
+    return out @ rot.T + center_t
+
+
+def _log_noisy_square_density(
+    x: torch.Tensor,
+    *,
+    theta: float,
+    side_length: float,
+    sigma: float,
+    center: tuple[float, float],
+    u_density: torch.Tensor,
+    chunk_size: int = 512,
+) -> torch.Tensor:
+    sig = float(sigma)
+    if sig <= 0.0:
+        return torch.full((int(x.shape[0]),), float("nan"), device=x.device, dtype=x.dtype)
+    means = _square_boundary_torch(u_density, theta=theta, side_length=side_length, center=center)
+    log_norm = -0.5 * int(x.shape[1]) * math.log(2.0 * math.pi * sig * sig)
+    out_parts: list[torch.Tensor] = []
+    for start in range(0, int(x.shape[0]), int(chunk_size)):
+        x_chunk = x[start : start + int(chunk_size)]
+        d2 = ((x_chunk[:, None, :] - means[None, :, :]) ** 2).sum(dim=-1)
+        out_parts.append(float(log_norm) + torch.logsumexp(-0.5 * d2 / (sig * sig), dim=1) - math.log(int(means.shape[0])))
+    return torch.cat(out_parts, dim=0)
+
+
+def _estimate_target_skl(
+    *,
+    theta_values: np.ndarray,
+    side_length: float,
+    sigma: float,
+    center: tuple[float, float],
+    n_samples: int,
+    density_samples: int,
+    seed: int,
+    device_text: str,
+) -> float:
+    if int(n_samples) < 1 or int(density_samples) < 1:
+        return float("nan")
+    if float(sigma) <= 0.0:
+        return float("nan")
+    dev = require_device(str(device_text))
+    dtype = torch.float32
+    gen = torch.Generator(device=dev)
+    gen.manual_seed(int(seed))
+    x_parts: list[torch.Tensor] = []
+    u_density_parts: list[torch.Tensor] = []
+    for idx, theta in enumerate(theta_values):
+        u_x = 4.0 * torch.rand(int(n_samples), 1, device=dev, dtype=dtype, generator=gen)
+        clean = _square_boundary_torch(u_x, theta=float(theta), side_length=float(side_length), center=center)
+        x_parts.append(clean + float(sigma) * torch.randn(int(n_samples), 2, device=dev, dtype=dtype, generator=gen))
+        u_density_parts.append(4.0 * torch.rand(int(density_samples), 1, device=dev, dtype=dtype, generator=gen))
+
+    log_11 = _log_noisy_square_density(
+        x_parts[0],
+        theta=float(theta_values[0]),
+        side_length=float(side_length),
+        sigma=float(sigma),
+        center=center,
+        u_density=u_density_parts[0],
+    )
+    log_12 = _log_noisy_square_density(
+        x_parts[0],
+        theta=float(theta_values[1]),
+        side_length=float(side_length),
+        sigma=float(sigma),
+        center=center,
+        u_density=u_density_parts[1],
+    )
+    log_22 = _log_noisy_square_density(
+        x_parts[1],
+        theta=float(theta_values[1]),
+        side_length=float(side_length),
+        sigma=float(sigma),
+        center=center,
+        u_density=u_density_parts[1],
+    )
+    log_21 = _log_noisy_square_density(
+        x_parts[1],
+        theta=float(theta_values[0]),
+        side_length=float(side_length),
+        sigma=float(sigma),
+        center=center,
+        u_density=u_density_parts[0],
+    )
+    skl = torch.mean(log_11 - log_12) + torch.mean(log_22 - log_21)
+    return float(torch.clamp(skl, min=0.0).detach().cpu().item())
 
 
 def _draw_density_contours(
@@ -213,13 +361,30 @@ def _generated_from_model(
     model.eval()
 
     base, resolved_base_geometry = _make_base_from_summary(summary)
-    ode_steps = int(ode_steps_override if ode_steps_override is not None else params.get("ode_steps", 64))
+    ode_steps = int(ode_steps_override if ode_steps_override is not None else params.get("ode_steps", 32))
     ode_method = str(ode_method_override if ode_method_override is not None else params.get("ode_method", "midpoint"))
     curve_points_per_edge = int(params.get("curve_points_per_edge", 100))
     curve_u = None
     if hasattr(base, "u_low") and hasattr(base, "u_high"):
         curve_u = torch.linspace(base.u_low, base.u_high, 4 * curve_points_per_edge + 1, dtype=torch.float32).reshape(-1, 1)
-    selected_sigmas = np.asarray(nf_meta.get("selected_base_noise_sigmas", []), dtype=np.float64).reshape(-1)
+    checkpoint_sigmas = checkpoint.get("base_noise_sigmas")
+    if checkpoint_sigmas is not None:
+        selected_sigmas = np.asarray(checkpoint_sigmas, dtype=np.float64).reshape(-1)
+    else:
+        selected_sigmas = np.asarray(nf_meta.get("selected_base_noise_sigmas", []), dtype=np.float64).reshape(-1)
+    skl_sigmas = selected_sigmas if isinstance(base, NoisyGeometricBase) and int(selected_sigmas.size) == int(condition_eval.shape[0]) else None
+    corrected_skl = estimate_pushed_base_symmetric_kl(
+        model=model,
+        base=base,
+        theta_all=condition_eval,
+        device=dev,
+        base_noise_sigmas=skl_sigmas,
+        mc_skl_samples=int(params.get("mc_skl_samples", 1024)),
+        density_mc_samples=int(params.get("density_mc_samples", 512)),
+        ode_steps=ode_steps,
+        ode_method=ode_method,
+        batch_size=int(params.get("batch_size", 256)),
+    )
 
     generated: list[np.ndarray] = []
     contour_generated: list[np.ndarray] = []
@@ -282,6 +447,11 @@ def _generated_from_model(
         contour_generated.append(pushed_contour.detach().cpu().numpy().astype(np.float64))
     summary = dict(summary)
     summary["resolved_base_geometry"] = resolved_base_geometry
+    summary["summary_skl_value"] = summary.get("skl_value")
+    summary["skl_value"] = float(corrected_skl.symmetric_kl_matrix[0, 1]) if int(condition_eval.shape[0]) > 1 else 0.0
+    summary["canonical_metric_name"] = corrected_skl.canonical_metric_name
+    summary["symmetric_kl_matrix"] = corrected_skl.symmetric_kl_matrix
+    summary["skl_metric_source"] = "recomputed_general_cnf"
     return generated, contour_generated, fitted_boundaries, base_samples, base_mean, summary
 
 
@@ -297,6 +467,10 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("--contour-target-samples-per-condition must be >= 5.")
     if int(args.contour_generated_samples_per_condition) < 5:
         raise ValueError("--contour-generated-samples-per-condition must be >= 5.")
+    if int(args.target_skl_samples) < 1:
+        raise ValueError("--target-skl-samples must be >= 1.")
+    if int(args.target_skl_density_samples) < 1:
+        raise ValueError("--target-skl-density-samples must be >= 1.")
     if int(args.base_samples_per_condition) < 1:
         raise ValueError("--base-samples-per-condition must be >= 1.")
     if int(args.contour_grid_size) < 30:
@@ -333,6 +507,20 @@ def main(argv: list[str] | None = None) -> int:
         samples.append(batch.x1.astype(np.float64, copy=False))
         contour_samples.append(contour_batch.x1.astype(np.float64, copy=False))
         boundaries.append(ds.boundary(points_per_edge=int(args.points_per_edge)).astype(np.float64, copy=False))
+    target_skl_value = _estimate_target_skl(
+        theta_values=theta_values,
+        side_length=float(args.side_length),
+        sigma=float(args.target_sigma),
+        center=center,
+        n_samples=int(args.target_skl_samples),
+        density_samples=int(args.target_skl_density_samples),
+        seed=int(args.seed) + 991,
+        device_text=str(args.device),
+    )
+    target_skl_text = _format_skl(target_skl_value)
+    torch.manual_seed(int(args.seed) + 12345)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(args.seed) + 12345)
 
     import matplotlib
 
@@ -349,6 +537,211 @@ def main(argv: list[str] | None = None) -> int:
     if model_labels and len(model_labels) != len(model_summaries):
         raise ValueError("--model-label must be omitted or provided once per model.")
     panel_count = 1 + len(model_summaries)
+    layout = str(args.layout).strip().lower()
+    if layout == "overlap":
+        fig, axes_arr = plt.subplots(1, panel_count, figsize=(5.2 * panel_count, 5.4), squeeze=False)
+        axes = list(axes_arr[0])
+        target_arrays: list[np.ndarray] = [*samples, *boundaries]
+        shared_axis_limits = _axis_limits(target_arrays)
+        model_summaries_out: list[dict[str, Any]] = []
+        generated_shapes: list[list[list[int]]] | None = None
+        base_sample_shapes: list[list[list[int]]] | None = None
+        if has_model:
+            generated_shapes = []
+            base_sample_shapes = []
+            generated_panels: list[tuple[str, str, list[np.ndarray], list[np.ndarray], list[np.ndarray], np.ndarray]] = []
+            for model_idx, (summary_arg, checkpoint_arg) in enumerate(zip(model_summaries, model_checkpoints, strict=True)):
+                generated, _contour_generated, fitted_boundaries, base_samples, base_mean, model_summary = _generated_from_model(
+                    summary_path=Path(summary_arg).expanduser().resolve(),
+                    checkpoint_path=Path(checkpoint_arg).expanduser().resolve(),
+                    n_per_condition=int(args.generated_samples_per_condition),
+                    contour_n_per_condition=max(5, int(args.generated_samples_per_condition)),
+                    base_samples_per_condition=int(args.base_samples_per_condition),
+                    device_text=str(args.device),
+                    ode_steps_override=args.ode_steps,
+                    ode_method_override=args.ode_method,
+                )
+                panel_name = str(model_labels[model_idx]) if model_labels else (
+                    f"{model_summary.get('base_geometry', 'base')} + {model_summary.get('velocity_family', 'velocity')}"
+                )
+                generated_shapes.append([list(arr.shape) for arr in generated])
+                base_sample_shapes.append([list(arr.shape) for arr in base_samples])
+                model_summaries_out.append(
+                    {
+                        "label": panel_name,
+                        "summary": str(Path(summary_arg).expanduser().resolve()),
+                        "checkpoint": str(Path(checkpoint_arg).expanduser().resolve()),
+                        "base_geometry": model_summary.get("base_geometry"),
+                        "velocity_family": model_summary.get("velocity_family"),
+                        "skl_value": model_summary.get("skl_value"),
+                        "summary_skl_value": model_summary.get("summary_skl_value"),
+                        "canonical_metric_name": model_summary.get("canonical_metric_name"),
+                        "skl_metric_source": model_summary.get("skl_metric_source"),
+                        "resolved_base_geometry": model_summary.get("resolved_base_geometry"),
+                    }
+                )
+                generated_panels.append((panel_name, _format_skl(model_summary.get("skl_value")), generated, fitted_boundaries, base_samples, base_mean))
+
+            ax_target = axes[0]
+            for idx in range(2):
+                color = colors[idx % len(colors)]
+                ax_target.scatter(
+                    samples[idx][:, 0],
+                    samples[idx][:, 1],
+                    s=float(args.point_size),
+                    marker="x",
+                    alpha=1.0,
+                    color=color,
+                    linewidths=1.15,
+                    label=f"Dataset {idx + 1}",
+                )
+                ax_target.plot(
+                    boundaries[idx][:, 0],
+                    boundaries[idx][:, 1],
+                    color=color,
+                    linewidth=3.2,
+                    alpha=0.95,
+                    label=f"Mean {idx + 1}",
+                )
+            _panel_label(ax_target, f"Target\n{target_skl_text}", font_size=float(args.panel_label_font_size))
+            _style_panel(
+                ax_target,
+                target_arrays,
+                legend_font_size=float(args.legend_font_size),
+                show_legend=False,
+                axis_limits=shared_axis_limits,
+            )
+            legend_handles = [
+                plt.Line2D([0], [0], marker="x", linestyle="None", color=colors[0], alpha=1.0, label="Dataset 1"),
+                plt.Line2D([0], [0], marker="x", linestyle="None", color=colors[1], alpha=1.0, label="Dataset 2"),
+                plt.Line2D([0], [0], marker="o", linestyle="None", color=colors[0], alpha=float(args.alpha), label="Generated 1"),
+                plt.Line2D([0], [0], marker="o", linestyle="None", color=colors[1], alpha=float(args.alpha), label="Generated 2"),
+                plt.Line2D([0], [0], color=colors[0], linewidth=3.2, label="Mean 1"),
+                plt.Line2D([0], [0], color=colors[1], linewidth=3.2, label="Mean 2"),
+                plt.Line2D([0], [0], color="#111111", linewidth=3.0, linestyle="--", label="Base mean"),
+            ]
+            ax_target.legend(
+                handles=legend_handles,
+                frameon=False,
+                loc="center",
+                bbox_to_anchor=(0.56, 0.43),
+                fontsize=max(9.0, 0.78 * float(args.legend_font_size)),
+                markerscale=1.55,
+                ncol=2,
+                columnspacing=1.1,
+                handlelength=1.8,
+                handletextpad=0.5,
+            )
+
+            for model_idx, (panel_name, skl_text, generated, fitted_boundaries, base_samples, base_mean) in enumerate(generated_panels):
+                ax_gen = axes[1 + model_idx]
+                panel_arrays = [*generated]
+                if int(base_mean.size) > 0:
+                    panel_arrays.append(base_mean)
+                    ax_gen.plot(
+                        base_mean[:, 0],
+                        base_mean[:, 1],
+                        color="#111111",
+                        linewidth=3.0,
+                        linestyle="--",
+                        label="Base mean",
+                    )
+                for idx in range(2):
+                    color = colors[idx % len(colors)]
+                    ax_gen.scatter(
+                        generated[idx][:, 0],
+                        generated[idx][:, 1],
+                        s=float(args.point_size),
+                        alpha=float(args.alpha),
+                        color=color,
+                        linewidths=0,
+                        label=f"Generated {idx + 1}",
+                    )
+                    if int(fitted_boundaries[idx].size) > 0:
+                        ax_gen.plot(
+                            fitted_boundaries[idx][:, 0],
+                            fitted_boundaries[idx][:, 1],
+                            color=color,
+                            linewidth=3.2,
+                            alpha=0.95,
+                            label="_nolegend_",
+                        )
+                        panel_arrays.append(fitted_boundaries[idx])
+                _panel_label(ax_gen, f"{panel_name}\n{skl_text}", font_size=float(args.panel_label_font_size))
+                _style_panel(
+                    ax_gen,
+                    panel_arrays,
+                    legend_font_size=float(args.legend_font_size),
+                    show_legend=False,
+                    axis_limits=shared_axis_limits,
+                )
+        else:
+            ax_target = axes[0]
+            for idx in range(2):
+                color = colors[idx % len(colors)]
+                ax_target.scatter(
+                    samples[idx][:, 0],
+                    samples[idx][:, 1],
+                    s=float(args.point_size),
+                    marker="x",
+                    alpha=1.0,
+                    color=color,
+                    linewidths=1.15,
+                    label=f"Dataset {idx + 1}",
+                )
+                ax_target.plot(
+                    boundaries[idx][:, 0],
+                    boundaries[idx][:, 1],
+                    color=color,
+                    linewidth=3.2,
+                    alpha=0.95,
+                    label=f"Mean {idx + 1}",
+                )
+            _panel_label(ax_target, f"Target\n{target_skl_text}", font_size=float(args.panel_label_font_size))
+            _style_panel(ax_target, target_arrays, legend_font_size=float(args.legend_font_size), axis_limits=shared_axis_limits)
+        fig.subplots_adjust(left=0.0, right=1.0, bottom=0.0, top=1.0, wspace=0.03)
+
+        out_dir = Path(args.output_dir).expanduser().resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        prefix = str(args.prefix).strip() or "two_square_target_dataset"
+        png_path = out_dir / f"{prefix}.png"
+        svg_path = out_dir / f"{prefix}.svg"
+        summary_path = out_dir / f"{prefix}_summary.json"
+        fig.savefig(png_path, dpi=180)
+        fig.savefig(svg_path)
+        plt.close(fig)
+
+        summary = {
+            "script": "bin/visualize_two_square_target_dataset.py",
+            "theta_values": theta_values.tolist(),
+            "n_per_condition": n_per_condition,
+            "side_length": float(args.side_length),
+            "target_sigma": float(args.target_sigma),
+            "target_skl_value": target_skl_value,
+            "target_skl_samples": int(args.target_skl_samples),
+            "target_skl_density_samples": int(args.target_skl_density_samples),
+            "center": [float(args.center_x), float(args.center_y)],
+            "seed": int(args.seed),
+            "points_per_edge": int(args.points_per_edge),
+            "layout": "overlap",
+            "shared_axis_limits": [[float(v) for v in shared_axis_limits[0]], [float(v) for v in shared_axis_limits[1]]],
+            "sample_shapes": [list(arr.shape) for arr in samples],
+            "model_panels": model_summaries_out,
+            "generated_sample_shapes": generated_shapes,
+            "base_sample_shapes": base_sample_shapes,
+            "png": str(png_path),
+            "svg": str(svg_path),
+            "summary": str(summary_path),
+        }
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, sort_keys=True)
+            f.write("\n")
+
+        print(f"png: {png_path}", flush=True)
+        print(f"svg: {svg_path}", flush=True)
+        print(f"summary_json: {summary_path}", flush=True)
+        return 0
+
     fig, axes_arr = plt.subplots(2, panel_count, figsize=(4.8 * panel_count, 8.2), squeeze=False)
     all_arrays: list[np.ndarray] = [*samples, *boundaries]
     model_summaries_out: list[dict[str, Any]] = []
@@ -389,6 +782,9 @@ def main(argv: list[str] | None = None) -> int:
                     "base_geometry": model_summary.get("base_geometry"),
                     "velocity_family": model_summary.get("velocity_family"),
                     "skl_value": model_summary.get("skl_value"),
+                    "summary_skl_value": model_summary.get("summary_skl_value"),
+                    "canonical_metric_name": model_summary.get("canonical_metric_name"),
+                    "skl_metric_source": model_summary.get("skl_metric_source"),
                     "resolved_base_geometry": model_summary.get("resolved_base_geometry"),
                 }
             )
@@ -419,7 +815,7 @@ def main(argv: list[str] | None = None) -> int:
             ax_target.plot([], [], color=color, linewidth=1.35, label="density contours")
             contour_metadata.append({"panel": "Target", "condition": int(row_idx + 1), **target_contours})
             if row_idx == 0:
-                _panel_label(ax_target, "Target", font_size=float(args.legend_font_size))
+                _panel_label(ax_target, f"Target\n{target_skl_text}", font_size=float(args.legend_font_size))
             _style_panel(ax_target, shared_arrays, legend_font_size=float(args.legend_font_size))
 
             for model_idx, (panel_name, generated, contour_generated, fitted_boundaries, base_samples, base_mean) in enumerate(generated_panels):
@@ -495,7 +891,7 @@ def main(argv: list[str] | None = None) -> int:
             ax_target.plot([], [], color=color, linewidth=1.35, label="density contours")
             contour_metadata.append({"panel": "Target", "condition": int(row_idx + 1), **target_contours})
             if row_idx == 0:
-                _panel_label(ax_target, "Target", font_size=float(args.legend_font_size))
+                _panel_label(ax_target, f"Target\n{target_skl_text}", font_size=float(args.legend_font_size))
             _style_panel(ax_target, shared_arrays, legend_font_size=float(args.legend_font_size))
     fig.subplots_adjust(left=0.0, right=1.0, bottom=0.0, top=1.0, wspace=0.03, hspace=0.03)
 
@@ -515,6 +911,9 @@ def main(argv: list[str] | None = None) -> int:
         "n_per_condition": n_per_condition,
         "side_length": float(args.side_length),
         "target_sigma": float(args.target_sigma),
+        "target_skl_value": target_skl_value,
+        "target_skl_samples": int(args.target_skl_samples),
+        "target_skl_density_samples": int(args.target_skl_density_samples),
         "center": [float(args.center_x), float(args.center_y)],
         "seed": int(args.seed),
         "points_per_edge": int(args.points_per_edge),

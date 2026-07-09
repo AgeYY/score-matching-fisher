@@ -28,7 +28,6 @@ from fisher.geometric_base_flow_skl import (
     StandardNormalBase,
     build_geometric_base_velocity_model,
     estimate_pushed_base_symmetric_kl,
-    estimate_smoothed_curve_symmetric_kl,
     finetune_geometric_base_cnf_likelihood,
     push_base_curve,
     push_initial_points,
@@ -119,6 +118,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--device", type=str, default=DEFAULT_DEVICE)
     p.add_argument("--output-dir", type=Path, default=None)
     p.add_argument("--seed", type=int, default=7)
+    p.add_argument("--init-model-checkpoint", type=Path, default=None)
+    p.add_argument("--skip-fm-training", action="store_true")
 
     p.add_argument("--theta-values", type=str, default="")
     p.add_argument("--condition-values", type=str, default="0.0,1.0")
@@ -150,7 +151,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--smooth-sigma", type=float, default=0.12)
     p.add_argument("--mc-skl-samples", type=int, default=1024)
     p.add_argument("--density-mc-samples", type=int, default=512)
-    p.add_argument("--ode-steps", type=int, default=64)
+    p.add_argument("--ode-steps", type=int, default=32)
     p.add_argument("--ode-method", type=str, default="midpoint")
     p.add_argument("--curve-points", type=int, default=300)
     p.add_argument("--curve-points-per-edge", type=int, default=100)
@@ -177,6 +178,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--nf-density-points", type=int, default=512)
     p.add_argument("--nf-checkpoint-selection", choices=("last", "best"), default="last")
     p.add_argument("--nf-learn-base-noise", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--nf-epoch-offset", type=int, default=0)
     p.add_argument("--nf-sigma-min", type=float, default=1e-4)
     return p
 
@@ -892,28 +894,58 @@ def main(argv: list[str] | None = None) -> int:
         depth=int(args.depth),
         path_schedule=str(args.path_schedule),
     ).to(dev)
-    train_meta = train_geometric_base_affine_flow(
-        model=model,
-        base=base,
-        theta_train=theta_train,
-        x_train=x_train,
-        theta_val=theta_val,
-        x_val=x_val,
-        device=dev,
-        path_schedule=str(args.path_schedule),
-        epochs=int(args.epochs),
-        batch_size=int(args.batch_size),
-        lr=float(args.lr),
-        weight_decay=float(args.weight_decay),
-        t_eps=float(args.t_eps),
-        patience=int(args.early_patience),
-        min_delta=float(args.early_min_delta),
-        ema_alpha=float(args.early_ema_alpha),
-        max_grad_norm=float(args.max_grad_norm),
-        log_every=max(1, int(args.log_every)),
-        return_checkpoint_states=True,
-    )
-    fm_checkpoint_states = train_meta.pop("_checkpoint_states", None)
+    init_checkpoint = None
+    init_nf_sigmas = None
+    inferred_nf_epoch_offset = int(args.nf_epoch_offset)
+    if args.init_model_checkpoint is not None:
+        init_path = Path(args.init_model_checkpoint).expanduser().resolve()
+        init_checkpoint = torch.load(init_path, map_location="cpu", weights_only=False)
+        model.load_state_dict(init_checkpoint["model_state_dict"])
+        if init_checkpoint.get("base_noise_sigmas") is not None:
+            init_nf_sigmas = np.asarray(init_checkpoint["base_noise_sigmas"], dtype=np.float64).reshape(-1)
+        else:
+            init_nf_meta = init_checkpoint.get("nf_likelihood_finetune_metadata") or {}
+            for key in ("selected_base_noise_sigmas", "last_base_noise_sigmas", "best_base_noise_sigmas"):
+                if key in init_nf_meta:
+                    init_nf_sigmas = np.asarray(init_nf_meta[key], dtype=np.float64).reshape(-1)
+                    break
+        if inferred_nf_epoch_offset == 0:
+            if init_checkpoint.get("checkpoint_epoch") is not None:
+                inferred_nf_epoch_offset = int(init_checkpoint["checkpoint_epoch"])
+            else:
+                init_nf_meta = init_checkpoint.get("nf_likelihood_finetune_metadata") or {}
+                if init_nf_meta.get("selected_epoch") is not None:
+                    inferred_nf_epoch_offset = int(init_nf_meta["selected_epoch"])
+    if bool(args.skip_fm_training):
+        if init_checkpoint is None:
+            raise ValueError("--skip-fm-training requires --init-model-checkpoint.")
+        train_meta = dict(init_checkpoint.get("train_metadata") or {})
+        if not train_meta:
+            raise ValueError("Initial checkpoint does not contain train_metadata.")
+        fm_checkpoint_states = None
+    else:
+        train_meta = train_geometric_base_affine_flow(
+            model=model,
+            base=base,
+            theta_train=theta_train,
+            x_train=x_train,
+            theta_val=theta_val,
+            x_val=x_val,
+            device=dev,
+            path_schedule=str(args.path_schedule),
+            epochs=int(args.epochs),
+            batch_size=int(args.batch_size),
+            lr=float(args.lr),
+            weight_decay=float(args.weight_decay),
+            t_eps=float(args.t_eps),
+            patience=int(args.early_patience),
+            min_delta=float(args.early_min_delta),
+            ema_alpha=float(args.early_ema_alpha),
+            max_grad_norm=float(args.max_grad_norm),
+            log_every=max(1, int(args.log_every)),
+            return_checkpoint_states=True,
+        )
+        fm_checkpoint_states = train_meta.pop("_checkpoint_states", None)
     nf_likelihood_meta = None
     nf_checkpoint_states = None
     if bool(args.nf_likelihood_finetune):
@@ -936,40 +968,31 @@ def main(argv: list[str] | None = None) -> int:
             ode_method=str(args.ode_method),
             checkpoint_selection=str(args.nf_checkpoint_selection),
             learn_base_noise=bool(args.nf_learn_base_noise),
+            initial_base_noise_sigmas=init_nf_sigmas,
             sigma_min=float(args.nf_sigma_min),
+            epoch_offset=int(inferred_nf_epoch_offset),
             log_every=max(1, int(args.log_every)),
             return_checkpoint_states=True,
         )
         nf_checkpoint_states = nf_likelihood_meta.pop("_checkpoint_states", None)
 
     has_base_geometry_coordinate = hasattr(base, "sample_u") and hasattr(base, "points_from_u")
-    if has_base_geometry_coordinate:
-        result = estimate_smoothed_curve_symmetric_kl(
-            model=model,
-            base=base,  # type: ignore[arg-type]
-            theta_all=condition_eval,
-            device=dev,
-            smooth_sigma=float(args.smooth_sigma),
-            mc_skl_samples=int(args.mc_skl_samples),
-            density_mc_samples=int(args.density_mc_samples),
-            ode_steps=int(args.ode_steps),
-            ode_method=str(args.ode_method),
-            batch_size=int(args.batch_size),
-            train_metadata=train_meta,
-        )
-    else:
-        result = estimate_pushed_base_symmetric_kl(
-            model=model,
-            base=base,  # type: ignore[arg-type]
-            theta_all=condition_eval,
-            device=dev,
-            mc_skl_samples=int(args.mc_skl_samples),
-            density_mc_samples=int(args.density_mc_samples),
-            ode_steps=int(args.ode_steps),
-            ode_method=str(args.ode_method),
-            batch_size=int(args.batch_size),
-            train_metadata=train_meta,
-        )
+    selected_base_sigmas = None
+    if nf_likelihood_meta is not None and "selected_base_noise_sigmas" in nf_likelihood_meta:
+        selected_base_sigmas = np.asarray(nf_likelihood_meta["selected_base_noise_sigmas"], dtype=np.float64).reshape(-1)
+    result = estimate_pushed_base_symmetric_kl(
+        model=model,
+        base=base,
+        theta_all=condition_eval,
+        device=dev,
+        base_noise_sigmas=selected_base_sigmas,
+        mc_skl_samples=int(args.mc_skl_samples),
+        density_mc_samples=int(args.density_mc_samples),
+        ode_steps=int(args.ode_steps),
+        ode_method=str(args.ode_method),
+        batch_size=int(args.batch_size),
+        train_metadata=train_meta,
+    )
 
     curve_u = None
     if has_base_geometry_coordinate:
@@ -983,9 +1006,6 @@ def main(argv: list[str] | None = None) -> int:
     base_samples = base_samples_t.detach().cpu().numpy().astype(np.float64)
     fitted_curves: list[np.ndarray] = []
     generated_samples: list[np.ndarray] = []
-    selected_base_sigmas = None
-    if nf_likelihood_meta is not None and "selected_base_noise_sigmas" in nf_likelihood_meta:
-        selected_base_sigmas = np.asarray(nf_likelihood_meta["selected_base_noise_sigmas"], dtype=np.float64).reshape(-1)
     for condition_idx, theta_row in enumerate(condition_eval):
         if has_base_geometry_coordinate and curve_u is not None:
             curve, _ = push_base_curve(
@@ -1058,6 +1078,8 @@ def main(argv: list[str] | None = None) -> int:
         "base_geometry": str(args.base_geometry),
         "base_name": str(getattr(base, "name", type(base).__name__)),
         "base_has_geometry_coordinate": bool(has_base_geometry_coordinate),
+        "init_model_checkpoint": None if args.init_model_checkpoint is None else str(Path(args.init_model_checkpoint).expanduser().resolve()),
+        "skip_fm_training": bool(args.skip_fm_training),
         "path_schedule": str(args.path_schedule),
         "t_eps": float(args.t_eps),
         "early_patience": int(args.early_patience),
@@ -1088,6 +1110,7 @@ def main(argv: list[str] | None = None) -> int:
         "nf_density_points": int(args.nf_density_points),
         "nf_checkpoint_selection": str(args.nf_checkpoint_selection),
         "nf_learn_base_noise": bool(args.nf_learn_base_noise),
+        "nf_epoch_offset": int(inferred_nf_epoch_offset),
         "nf_sigma_min": float(args.nf_sigma_min),
     }
     summary = {
