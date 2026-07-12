@@ -33,12 +33,14 @@ def _write_case_npz(path: Path, *, offset: float = 0.0, metrics: tuple[str, ...]
     pairs = np.asarray([[0, 1], [0, 2], [1, 2]], dtype=np.int64)
     classical = np.zeros((len(metrics), 3, 3), dtype=np.float64)
     flow = np.zeros((len(metrics), 3, 3), dtype=np.float64)
+    flow_finetuned = np.zeros((len(metrics), 3, 3), dtype=np.float64)
     gt = np.zeros((len(metrics), 3, 3), dtype=np.float64)
     for metric_idx in range(len(metrics)):
         for i, j in pairs:
             truth = offset + 10.0 + metric_idx
             classical[metric_idx, i, j] = classical[metric_idx, j, i] = truth + 1.0
             flow[metric_idx, i, j] = flow[metric_idx, j, i] = truth - 2.0
+            flow_finetuned[metric_idx, i, j] = flow_finetuned[metric_idx, j, i] = truth - 1.0
             gt[metric_idx, i, j] = gt[metric_idx, j, i] = truth
     np.savez_compressed(
         path,
@@ -47,6 +49,7 @@ def _write_case_npz(path: Path, *, offset: float = 0.0, metrics: tuple[str, ...]
         pair_indices=pairs,
         classical_matrices=classical,
         flow_matching_matrices=flow,
+        flow_matching_nll_finetuned_matrices=flow_finetuned,
         ground_truth_matrices=gt,
     )
     return path
@@ -111,6 +114,17 @@ def test_parser_defaults_and_cpu_auto(monkeypatch: pytest.MonkeyPatch) -> None:
     assert args.gpu_ids == [0]
     assert args.jobs_per_gpu == 1
     assert args.device == "cuda:0"
+    assert args.flow_likelihood_finetune_epochs == 500
+    assert args.seed == 19
+    assert args.n_list == [100, 1000, 2000, 3000]
+    assert args.n_repeats == 10
+    assert args.dataset_cov_theta_amp_scale == pytest.approx(1.0)
+    assert args.batch_size == 3000
+    assert args.flow_likelihood_finetune_batch_size == 3000
+    assert args.flow_likelihood_finetune_lr == pytest.approx(3e-5)
+    assert args.flow_likelihood_finetune_ode_steps == 32
+    assert args.flow_likelihood_finetune_patience == 150
+    assert args.flow_likelihood_finetune_checkpoint_selection == "best"
     assert args.cpu_threads_per_job == 16
     assert args.parallel_log_dir == args.output_dir / "parallel_logs"
 
@@ -134,6 +148,31 @@ def test_case_planning_paths_and_repeat_seeds(monkeypatch: pytest.MonkeyPatch, t
     ]
     assert tasks[1].result_path == tmp_path / "case_100_native" / "repeat_01" / mod.sweep.RESULTS_NAME
     assert tasks[1].key == (100, -1, 1)
+
+
+def test_case_planning_supports_isolated_dataset_root(tmp_path: Path) -> None:
+    mod = _load_cli_module()
+    root = tmp_path / "seed7_cases"
+    args = mod.build_parser().parse_args(
+        [
+            "--n-list",
+            "100,1000",
+            "--n-repeats",
+            "2",
+            "--pr-dim",
+            "none",
+            "--case-output-name",
+            "comparison",
+            "--case-dataset-root",
+            str(root),
+        ]
+    )
+
+    tasks = mod.plan_cases(args)
+
+    assert tasks[0].dataset_dir == root / "n100_native" / "repeat_00"
+    assert tasks[0].output_dir == tasks[0].dataset_dir / "comparison"
+    assert tasks[-1].dataset_dir == root / "n1000_native" / "repeat_01"
 
 
 def test_worker_command_and_env_forwarding(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -199,6 +238,16 @@ def test_cache_hits_and_force_behavior(monkeypatch: pytest.MonkeyPatch, tmp_path
     to_run, cache_hits = mod.select_tasks_to_run([force_task], args=force_args, metrics=ALL_METRICS)
     assert to_run == [force_task]
     assert cache_hits[force_task.key] is False
+
+    force_dataset_args = mod.build_parser().parse_args(
+        ["--n-list", "100", "--n-repeats", "1", "--force-dataset"]
+    )
+    force_dataset_task = mod.plan_cases(force_dataset_args)[0]
+    to_run, cache_hits = mod.select_tasks_to_run(
+        [force_dataset_task], args=force_dataset_args, metrics=ALL_METRICS
+    )
+    assert to_run == [force_dataset_task]
+    assert cache_hits[force_dataset_task.key] is False
 
 
 def test_visualization_only_preflight_fails_for_missing_repeat(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -268,6 +317,7 @@ def test_finalization_with_fake_child_runner(monkeypatch: pytest.MonkeyPatch, tm
     assert outputs["flow_loss_figure_svg"].is_file()
     with np.load(outputs["results_npz"], allow_pickle=False) as data:
         assert data["n_repeat_classical_matrices"].shape == (2, 2, 1, 3, 3)
+        assert data["n_repeat_flow_matching_nll_finetuned_matrices"].shape == (2, 2, 1, 3, 3)
     with outputs["errors_csv"].open(newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
     assert {row["repeat_idx"] for row in rows} == {"0", "1"}

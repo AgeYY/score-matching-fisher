@@ -23,6 +23,7 @@ from fisher.flow_matching_skl import (
     centered_radius_normalize,
     estimate_model_symmetric_kl,
     estimate_scalar_fisher_from_skl,
+    finetune_flow_skl_cnf_likelihood,
     flow_endpoint_log_prob,
     flow_skl_result_to_npz_dict,
     sample_flow_endpoint,
@@ -268,21 +269,23 @@ def test_build_flow_skl_model_uses_mlp_heads_and_film_nonlinear_subnets() -> Non
             low_rank_dim=1,
             path_schedule="linear",
         )
-        assert getattr(model, "network_architecture") == "film"
         if family in (
             "translation",
             "translation_fixed_norm",
             "translation_centered_fixed_norm",
         ):
+            assert getattr(model, "network_architecture") == "mlp"
             assert isinstance(model.mean_net, nn.Sequential)
             assert _first_linear_in_features(model.mean_net) == 2
         elif family == "nonlinear":
+            assert getattr(model, "network_architecture") == "film"
             assert type(model).__name__ == "ConditionalNonlinearXFlowFiLM"
             assert isinstance(model.net, fms._ConditionedFiLMNet)  # type: ignore[attr-defined]
             assert model.net.trunk_dim == 3
             assert model.net.theta_dim == 2
             assert isinstance(model.net.theta_embedding, nn.Linear)
         else:
+            assert getattr(model, "network_architecture") == "mlp"
             assert isinstance(model.b_net, nn.Sequential)
             assert _first_linear_in_features(model.b_net) == 2
             assert isinstance(model.a_net, nn.Sequential)
@@ -296,6 +299,109 @@ def test_build_flow_skl_model_uses_mlp_heads_and_film_nonlinear_subnets() -> Non
                 assert model.h_net.theta_dim == 2
                 assert isinstance(model.h_net.theta_embedding, nn.Linear)
                 assert all(isinstance(block.norm, nn.LayerNorm) for block in model.h_net.blocks)
+
+
+@pytest.mark.parametrize("family", ("translation", "shared_affine"))
+def test_constrained_models_support_residual_parameter_network(family: str) -> None:
+    model = build_flow_skl_model(
+        velocity_family=family,
+        theta_dim=2,
+        x_dim=3,
+        hidden_dim=8,
+        depth=3,
+        network_architecture="residual_mlp",
+        path_schedule="linear",
+    ).double()
+    assert model.network_architecture == "residual_mlp"
+    parameter_net = model.mean_net if family == "translation" else model.b_net
+    assert isinstance(parameter_net, fms._ResidualMLP)  # type: ignore[attr-defined]
+    assert len(parameter_net.blocks) == 2
+    theta = torch.eye(2, dtype=torch.float64)
+    x = torch.randn(2, 3, dtype=torch.float64)
+    t = torch.tensor([[0.25], [0.75]], dtype=torch.float64)
+    assert model(x, theta, t).shape == (2, 3)
+
+
+def test_train_flow_skl_supports_cosine_lr_and_last_checkpoint() -> None:
+    model = build_flow_skl_model(
+        velocity_family="translation",
+        theta_dim=2,
+        x_dim=2,
+        hidden_dim=4,
+        depth=1,
+        path_schedule="linear",
+    )
+    theta = np.eye(2, dtype=np.float64)[[0, 1, 0, 1]]
+    x = np.array([[0.0, 0.0], [1.0, -1.0], [0.2, 0.1], [1.2, -0.8]], dtype=np.float64)
+    out = train_flow_skl_model(
+        model=model,
+        theta_train=theta,
+        x_train=x,
+        theta_val=theta,
+        x_val=x,
+        device=torch.device("cpu"),
+        velocity_family="translation",
+        path_schedule="linear",
+        epochs=4,
+        batch_size=4,
+        lr=1e-3,
+        lr_schedule="cosine",
+        min_lr=1e-6,
+        patience=0,
+        checkpoint_selection="last",
+        fixed_validation=True,
+        log_every=999,
+    )
+    assert out["stopped_early"] is False
+    assert out["stopped_epoch"] == 4
+    assert out["selected_epoch"] == 4
+    assert out["checkpoint_selection"] == "last"
+    assert out["fixed_validation"] is True
+    assert out["lr_schedule"] == "cosine"
+    assert out["min_lr"] == pytest.approx(1e-6)
+    assert out["learning_rates"].shape == (4,)
+    assert out["learning_rates"][0] == pytest.approx(1e-3)
+    assert np.all(np.diff(out["learning_rates"]) < 0.0)
+
+
+def test_validation_sampling_does_not_change_last_model_training_rng() -> None:
+    theta = np.eye(2, dtype=np.float64)[[0, 1, 0, 1]]
+    x = np.array([[0.0, 0.0], [1.0, -1.0], [0.2, 0.1], [1.2, -0.8]], dtype=np.float64)
+    states: list[dict[str, torch.Tensor]] = []
+    for fixed_validation in (True, False):
+        torch.manual_seed(123)
+        model = build_flow_skl_model(
+            velocity_family="translation",
+            theta_dim=2,
+            x_dim=2,
+            hidden_dim=4,
+            depth=1,
+            path_schedule="linear",
+        )
+        metadata = train_flow_skl_model(
+            model=model,
+            theta_train=theta,
+            x_train=x,
+            theta_val=theta,
+            x_val=x,
+            device=torch.device("cpu"),
+            velocity_family="translation",
+            path_schedule="linear",
+            epochs=4,
+            batch_size=4,
+            lr=1e-3,
+            patience=0,
+            checkpoint_selection="last",
+            fixed_validation=fixed_validation,
+            validation_seed=999,
+            retain_best_state=True,
+            log_every=999,
+        )
+        assert "best_state_dict" in metadata
+        states.append({name: value.detach().clone() for name, value in model.state_dict().items()})
+    assert states[0].keys() == states[1].keys()
+    for name in states[0]:
+        torch.testing.assert_close(states[0][name], states[1][name], rtol=0.0, atol=0.0)
 
 
 def _patch_table_b(model: nn.Module, table: torch.Tensor) -> None:
@@ -557,7 +663,7 @@ def test_translation_training_uses_flow_matching_forward_loss() -> None:
     )
 
     assert out["n_total_steps"] == 2
-    assert out["network_architecture"] == "film"
+    assert out["network_architecture"] == "mlp"
     assert calls
     assert all(c["t_ndim"] == 1 for c in calls)
 
@@ -581,6 +687,46 @@ def test_translation_log_prob_uses_package_likelihood_against_shifted_normal() -
     x0 = x - mean.reshape(1, -1)
     expected = -0.5 * (torch.sum(x0**2, dim=1) + 2.0 * np.log(2.0 * np.pi))
     torch.testing.assert_close(got, expected, rtol=1e-12, atol=1e-12)
+
+
+def test_cnf_likelihood_finetune_updates_model_and_records_validation_nll() -> None:
+    torch.manual_seed(17)
+    model = build_flow_skl_model(
+        velocity_family="translation",
+        theta_dim=2,
+        x_dim=1,
+        hidden_dim=8,
+        depth=1,
+        path_schedule="linear",
+        divergence_estimator="exact",
+    )
+    theta = np.eye(2, dtype=np.float64)[[0, 0, 1, 1]]
+    x = np.asarray([[-1.2], [-0.8], [0.8], [1.2]], dtype=np.float64)
+    before = {key: value.detach().clone() for key, value in model.state_dict().items()}
+
+    meta = finetune_flow_skl_cnf_likelihood(
+        model=model,
+        theta_train=theta,
+        x_train=x,
+        theta_val=theta,
+        x_val=x,
+        device=torch.device("cpu"),
+        epochs=2,
+        batch_size=4,
+        lr=1e-2,
+        ode_steps=1,
+        ode_method="midpoint",
+        patience=0,
+        checkpoint_selection="best",
+        log_every=99,
+    )
+
+    assert np.asarray(meta["train_nll_losses"]).shape == (2,)
+    assert np.asarray(meta["val_nll_losses"]).shape == (2,)
+    assert np.all(np.isfinite(meta["train_nll_losses"]))
+    assert np.all(np.isfinite(meta["val_nll_losses"]))
+    assert meta["selected_epoch"] == meta["best_epoch"]
+    assert any(not torch.equal(before[key], value) for key, value in model.state_dict().items())
 
 
 def test_model_jeffreys_matches_translation_model_skl_with_deterministic_samples(

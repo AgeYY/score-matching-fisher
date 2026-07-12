@@ -87,6 +87,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Directory for per-case stdout/stderr logs. Defaults to <output-dir>/parallel_logs.",
     )
+    p.add_argument(
+        "--case-dataset-root",
+        type=Path,
+        default=None,
+        help="Optional isolated root for generated per-N/repeat datasets; defaults to the standard data layout.",
+    )
     original_parse_args = p.parse_args
 
     def parse_args(args=None, namespace=None):
@@ -99,6 +105,8 @@ def build_parser() -> argparse.ArgumentParser:
             parsed.parallel_log_dir = Path(parsed.output_dir).expanduser() / "parallel_logs"
         else:
             parsed.parallel_log_dir = Path(parsed.parallel_log_dir).expanduser()
+        if parsed.case_dataset_root is not None:
+            parsed.case_dataset_root = Path(parsed.case_dataset_root).expanduser()
         return parsed
 
     p.parse_args = parse_args  # type: ignore[method-assign]
@@ -136,14 +144,23 @@ class RunningCase:
 def plan_cases(args: argparse.Namespace) -> list[CaseTask]:
     tasks: list[CaseTask] = []
     for n_total, pr_dim, repeat_idx in sweep._unique_cases(args):
-        output_dir = sweep.case_output_dir(
-            n_total=int(n_total),
-            pr_dim=pr_dim,
-            case_output_name=str(args.case_output_name),
-            native_x_dim=int(args.native_x_dim),
-            repeat_idx=int(repeat_idx),
-            n_repeats=sweep._n_repeats(args),
-        )
+        if args.case_dataset_root is None:
+            output_dir = sweep.case_output_dir(
+                n_total=int(n_total),
+                pr_dim=pr_dim,
+                case_output_name=str(args.case_output_name),
+                native_x_dim=int(args.native_x_dim),
+                repeat_idx=int(repeat_idx),
+                n_repeats=sweep._n_repeats(args),
+            )
+        else:
+            case_root = Path(args.case_dataset_root) / f"n{int(n_total)}_{sweep._pr_dim_label(pr_dim)}"
+            dataset_dir = (
+                case_root / f"repeat_{int(repeat_idx):02d}"
+                if sweep._n_repeats(args) > 1
+                else case_root
+            )
+            output_dir = dataset_dir / str(args.case_output_name)
         tasks.append(
             CaseTask(
                 n_total=int(n_total),
@@ -158,18 +175,37 @@ def plan_cases(args: argparse.Namespace) -> list[CaseTask]:
     return tasks
 
 
-def _cache_is_usable(path: Path, metrics: tuple[str, ...]) -> bool:
+def _cache_is_usable(
+    path: Path,
+    metrics: tuple[str, ...],
+    *,
+    require_nll_finetuned: bool = False,
+) -> bool:
     if not Path(path).is_file():
         return False
-    sweep._filter_case_metrics(sweep._load_case_cache(Path(path)), metrics, path=Path(path))
+    sweep._filter_case_metrics(
+        sweep._load_case_cache(Path(path)),
+        metrics,
+        path=Path(path),
+        require_nll_finetuned=bool(require_nll_finetuned),
+    )
     return True
 
 
-def preflight_visualization_only(tasks: list[CaseTask], metrics: tuple[str, ...]) -> None:
+def preflight_visualization_only(
+    tasks: list[CaseTask],
+    metrics: tuple[str, ...],
+    *,
+    require_nll_finetuned: bool = False,
+) -> None:
     missing: list[str] = []
     for task in tasks:
         try:
-            if not _cache_is_usable(task.result_path, metrics):
+            if not _cache_is_usable(
+                task.result_path,
+                metrics,
+                require_nll_finetuned=bool(require_nll_finetuned),
+            ):
                 missing.append(f"{task.label}: {task.result_path}")
         except (FileNotFoundError, KeyError, ValueError) as exc:
             missing.append(f"{task.label}: {task.result_path} ({exc})")
@@ -187,16 +223,20 @@ def select_tasks_to_run(
     to_run: list[CaseTask] = []
     cache_hits: dict[tuple[int, int, int], bool] = {}
     for task in tasks:
-        if not bool(args.force_comparison):
+        if not bool(args.force_comparison) and not bool(args.force_dataset):
             try:
-                if _cache_is_usable(task.result_path, metrics):
+                if _cache_is_usable(
+                    task.result_path,
+                    metrics,
+                    require_nll_finetuned=int(args.flow_likelihood_finetune_epochs) > 0,
+                ):
                     print(f"[parallel-sweep] cache hit {task.label}: {task.result_path}", flush=True)
                     cache_hits[task.key] = True
                     continue
             except ValueError:
                 if bool(args.visualization_only):
                     raise
-                print(f"[parallel-sweep] cache missing requested metrics; rerunning {task.label}", flush=True)
+                print(f"[parallel-sweep] cache missing requested estimator data; rerunning {task.label}", flush=True)
         if bool(args.visualization_only):
             raise FileNotFoundError(f"--visualization-only requires cached results: {task.result_path}")
         cache_hits[task.key] = False
@@ -371,7 +411,11 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
     metrics = sweep.resolve_metric_names(args)
     tasks = plan_cases(args)
     if bool(args.visualization_only):
-        preflight_visualization_only(tasks, metrics)
+        preflight_visualization_only(
+            tasks,
+            metrics,
+            require_nll_finetuned=int(args.flow_likelihood_finetune_epochs) > 0,
+        )
 
     ground_truth = sweep.compute_baseline_ground_truth_rdms(args, metrics)
     gt_svg_path, gt_png_path = sweep.plot_ground_truth_rdms(
@@ -392,6 +436,7 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
             sweep._load_case_cache(task.result_path),
             metrics,
             path=task.result_path,
+            require_nll_finetuned=int(args.flow_likelihood_finetune_epochs) > 0,
         )
 
     worker_count = len(args.gpu_ids) * int(args.jobs_per_gpu)
@@ -411,6 +456,9 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
             "worker_count": int(worker_count),
             "cpu_threads_per_job": int(args.cpu_threads_per_job),
             "parallel_log_dir": str(Path(args.parallel_log_dir)),
+            "case_dataset_root": (
+                None if args.case_dataset_root is None else str(Path(args.case_dataset_root))
+            ),
         },
         summary_extra_payload={
             "parallel_case_logs": {

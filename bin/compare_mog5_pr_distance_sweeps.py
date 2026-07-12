@@ -123,14 +123,19 @@ def build_parser() -> argparse.ArgumentParser:
     single = _load_single_case_module()
     p = single.build_parser()
     p.description = __doc__
-    p.set_defaults(n_total=100_000, pr_dim=None, output_dir=default_native_output_dir(native_x_dim=3))
+    p.set_defaults(
+        n_total=100_000,
+        pr_dim=None,
+        output_dir=default_native_output_dir(native_x_dim=3),
+        flow_likelihood_finetune_epochs=500,
+    )
     for action in p._actions:
         if action.dest == "output_dir":
             action.help = "Aggregate sweep output directory."
     p.add_argument(
         "--n-list",
         type=_parse_int_list,
-        default=[50, 500, 1000, 1500, 2000, 3000],
+        default=[100, 1000, 2000, 3000],
         help="Comma-separated sample-size sweep values.",
     )
     p.add_argument(
@@ -312,6 +317,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError(f"--pr-dim must be >= native x_dim={native_x_dim}; got {args.pr_dim}.")
     if _n_repeats(args) < 1:
         raise ValueError(f"--n-repeats must be >= 1; got {getattr(args, 'n_repeats', None)}.")
+    if bool(args.force_dataset) and bool(args.visualization_only):
+        raise ValueError("--force-dataset cannot be combined with --visualization-only.")
 
 
 def compute_baseline_ground_truth_rdms(args: argparse.Namespace, metrics: tuple[str, ...]) -> dict[str, Any]:
@@ -329,6 +336,9 @@ def compute_baseline_ground_truth_rdms(args: argparse.Namespace, metrics: tuple[
             n_repeats=1,
         ),
     )
+    if getattr(args, "dataset_dir", None) is not None:
+        case_args.dataset_dir = Path(args.dataset_dir).expanduser()
+        case_args.output_dir = case_args.dataset_dir / str(args.case_output_name)
     dev = single.require_device(str(case_args.device))
     dataset_dir = single.resolve_dataset_dir(case_args)
     native_npz, projected_npz = single.ensure_dataset(case_args, dataset_dir)
@@ -417,7 +427,7 @@ def _load_case_cache(path: Path) -> dict[str, Any]:
     if not Path(path).is_file():
         raise FileNotFoundError(f"Missing cached comparison results: {path}")
     with np.load(path, allow_pickle=False) as data:
-        return {
+        out = {
             "metric_names": tuple(str(v) for v in data["metric_names"].tolist()),
             "condition_labels": tuple(str(v) for v in data["condition_labels"].tolist()),
             "pair_indices": np.asarray(data["pair_indices"], dtype=np.int64),
@@ -425,6 +435,11 @@ def _load_case_cache(path: Path) -> dict[str, Any]:
             "flow_matching_matrices": np.asarray(data["flow_matching_matrices"], dtype=np.float64),
             "ground_truth_matrices": np.asarray(data["ground_truth_matrices"], dtype=np.float64),
         }
+        if "flow_matching_nll_finetuned_matrices" in data.files:
+            out["flow_matching_nll_finetuned_matrices"] = np.asarray(
+                data["flow_matching_nll_finetuned_matrices"], dtype=np.float64
+            )
+        return out
 
 
 def _load_flow_loss_cache(path: Path) -> dict[str, Any]:
@@ -449,14 +464,23 @@ def _load_flow_loss_cache(path: Path) -> dict[str, Any]:
         return out
 
 
-def _filter_case_metrics(data: dict[str, Any], metrics: tuple[str, ...], *, path: Path | None = None) -> dict[str, Any]:
+def _filter_case_metrics(
+    data: dict[str, Any],
+    metrics: tuple[str, ...],
+    *,
+    path: Path | None = None,
+    require_nll_finetuned: bool = False,
+) -> dict[str, Any]:
     available = tuple(str(v) for v in data["metric_names"])
     missing = [metric for metric in metrics if metric not in available]
     if missing:
         where = "" if path is None else f" in {path}"
         raise ValueError(f"Cached comparison results{where} are missing requested metric(s): {', '.join(missing)}")
     indices = [available.index(metric) for metric in metrics]
-    return {
+    if bool(require_nll_finetuned) and "flow_matching_nll_finetuned_matrices" not in data:
+        where = "" if path is None else f" in {path}"
+        raise ValueError(f"Cached comparison results{where} are missing the NLL-fine-tuned flow estimator.")
+    out = {
         "metric_names": tuple(metrics),
         "condition_labels": tuple(data["condition_labels"]),
         "pair_indices": np.asarray(data["pair_indices"], dtype=np.int64),
@@ -464,6 +488,11 @@ def _filter_case_metrics(data: dict[str, Any], metrics: tuple[str, ...], *, path
         "flow_matching_matrices": np.asarray(data["flow_matching_matrices"], dtype=np.float64)[indices],
         "ground_truth_matrices": np.asarray(data["ground_truth_matrices"], dtype=np.float64)[indices],
     }
+    if "flow_matching_nll_finetuned_matrices" in data:
+        out["flow_matching_nll_finetuned_matrices"] = np.asarray(
+            data["flow_matching_nll_finetuned_matrices"], dtype=np.float64
+        )[indices]
+    return out
 
 
 def ensure_case_results(
@@ -483,10 +512,15 @@ def ensure_case_results(
         n_repeats=_n_repeats(args),
     )
     result_path = output_dir / RESULTS_NAME
-    if result_path.is_file() and not bool(args.force_comparison):
+    if result_path.is_file() and not bool(args.force_comparison) and not bool(args.force_dataset):
         requested_metrics = resolve_metric_names(args)
         try:
-            _filter_case_metrics(_load_case_cache(result_path), requested_metrics, path=result_path)
+            _filter_case_metrics(
+                _load_case_cache(result_path),
+                requested_metrics,
+                path=result_path,
+                require_nll_finetuned=int(args.flow_likelihood_finetune_epochs) > 0,
+            )
             print(
                 f"[sweep] cache hit n_total={n_total} repeat={int(repeat_idx)} "
                 f"pr_dim={_pr_dim_label(pr_dim)}: {result_path}",
@@ -593,12 +627,15 @@ def aggregate_sweeps(
     metric_names = tuple(first["metric_names"])
     condition_labels = tuple(first["condition_labels"])
     pair_indices = np.asarray(first["pair_indices"], dtype=np.int64)
+    has_nll_finetuned = "flow_matching_nll_finetuned_matrices" in first
 
     for case, data in case_data.items():
         if tuple(data["metric_names"]) != metric_names:
             raise ValueError(f"Metric names differ for case {case}.")
         if tuple(data["condition_labels"]) != condition_labels:
             raise ValueError(f"Condition labels differ for case {case}.")
+        if ("flow_matching_nll_finetuned_matrices" in data) != has_nll_finetuned:
+            raise ValueError(f"NLL-fine-tuned estimator availability differs for case {case}.")
         np.testing.assert_array_equal(np.asarray(data["pair_indices"], dtype=np.int64), pair_indices)
 
     repeat_indices = np.arange(_n_repeats(args), dtype=np.int64)
@@ -624,6 +661,9 @@ def aggregate_sweeps(
 
     n_repeat_classical = stack_repeat("classical_matrices")
     n_repeat_flow = stack_repeat("flow_matching_matrices")
+    n_repeat_flow_finetuned = (
+        stack_repeat("flow_matching_nll_finetuned_matrices") if has_nll_finetuned else None
+    )
     n_repeat_ground_truth = stack_repeat("ground_truth_matrices")
 
     aggregate = {
@@ -647,6 +687,11 @@ def aggregate_sweeps(
         "n_sweep_flow_matching_matrices": np.mean(n_repeat_flow, axis=1),
         "n_sweep_ground_truth_matrices": np.mean(n_repeat_ground_truth, axis=1),
     }
+    if n_repeat_flow_finetuned is not None:
+        aggregate["n_repeat_flow_matching_nll_finetuned_matrices"] = n_repeat_flow_finetuned
+        aggregate["n_sweep_flow_matching_nll_finetuned_matrices"] = np.mean(
+            n_repeat_flow_finetuned, axis=1
+        )
 
     rows: list[dict[str, Any]] = []
     for n_total in args.n_list:
@@ -656,10 +701,15 @@ def aggregate_sweeps(
                 gt = np.asarray(data["ground_truth_matrices"][metric_idx], dtype=np.float64)
                 for i, j in pair_indices:
                     ci, cj = int(i), int(j)
-                    for estimator, matrix_key in (
+                    estimators = [
                         ("classical", "classical_matrices"),
                         ("flow_matching", "flow_matching_matrices"),
-                    ):
+                    ]
+                    if has_nll_finetuned:
+                        estimators.append(
+                            ("flow_matching_nll_finetuned", "flow_matching_nll_finetuned_matrices")
+                        )
+                    for estimator, matrix_key in estimators:
                         est = float(np.asarray(data[matrix_key][metric_idx], dtype=np.float64)[ci, cj])
                         truth = float(gt[ci, cj])
                         abs_error = abs(est - truth)
@@ -688,27 +738,33 @@ def aggregate_sweeps(
 
 def write_aggregate_npz(path: Path, aggregate: dict[str, Any]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        path,
-        metric_names=np.asarray(aggregate["metric_names"]),
-        condition_labels=np.asarray(aggregate["condition_labels"]),
-        pair_indices=np.asarray(aggregate["pair_indices"], dtype=np.int64),
-        n_list=np.asarray(aggregate["n_list"], dtype=np.int64),
-        pr_dim=np.asarray([int(aggregate["pr_dim_storage"])], dtype=np.int64),
-        pr_projected=np.asarray([bool(aggregate["pr_projected"])]),
-        pr_dim_label=np.asarray([str(aggregate["pr_dim_label"])]),
-        native_x_dim=np.asarray([int(aggregate["native_x_dim"])], dtype=np.int64),
-        n_total=np.asarray([int(aggregate["n_total"])], dtype=np.int64),
-        n_repeats=np.asarray([int(aggregate["n_repeats"])], dtype=np.int64),
-        repeat_indices=np.asarray(aggregate["repeat_indices"], dtype=np.int64),
-        repeat_seeds=np.asarray(aggregate["repeat_seeds"], dtype=np.int64),
-        n_sweep_classical_matrices=np.asarray(aggregate["n_sweep_classical_matrices"], dtype=np.float64),
-        n_sweep_flow_matching_matrices=np.asarray(aggregate["n_sweep_flow_matching_matrices"], dtype=np.float64),
-        n_sweep_ground_truth_matrices=np.asarray(aggregate["n_sweep_ground_truth_matrices"], dtype=np.float64),
-        n_repeat_classical_matrices=np.asarray(aggregate["n_repeat_classical_matrices"], dtype=np.float64),
-        n_repeat_flow_matching_matrices=np.asarray(aggregate["n_repeat_flow_matching_matrices"], dtype=np.float64),
-        n_repeat_ground_truth_matrices=np.asarray(aggregate["n_repeat_ground_truth_matrices"], dtype=np.float64),
-    )
+    fields = {
+        "metric_names": np.asarray(aggregate["metric_names"]),
+        "condition_labels": np.asarray(aggregate["condition_labels"]),
+        "pair_indices": np.asarray(aggregate["pair_indices"], dtype=np.int64),
+        "n_list": np.asarray(aggregate["n_list"], dtype=np.int64),
+        "pr_dim": np.asarray([int(aggregate["pr_dim_storage"])], dtype=np.int64),
+        "pr_projected": np.asarray([bool(aggregate["pr_projected"])]),
+        "pr_dim_label": np.asarray([str(aggregate["pr_dim_label"])]),
+        "native_x_dim": np.asarray([int(aggregate["native_x_dim"])], dtype=np.int64),
+        "n_total": np.asarray([int(aggregate["n_total"])], dtype=np.int64),
+        "n_repeats": np.asarray([int(aggregate["n_repeats"])], dtype=np.int64),
+        "repeat_indices": np.asarray(aggregate["repeat_indices"], dtype=np.int64),
+        "repeat_seeds": np.asarray(aggregate["repeat_seeds"], dtype=np.int64),
+        "n_sweep_classical_matrices": np.asarray(aggregate["n_sweep_classical_matrices"], dtype=np.float64),
+        "n_sweep_flow_matching_matrices": np.asarray(aggregate["n_sweep_flow_matching_matrices"], dtype=np.float64),
+        "n_sweep_ground_truth_matrices": np.asarray(aggregate["n_sweep_ground_truth_matrices"], dtype=np.float64),
+        "n_repeat_classical_matrices": np.asarray(aggregate["n_repeat_classical_matrices"], dtype=np.float64),
+        "n_repeat_flow_matching_matrices": np.asarray(aggregate["n_repeat_flow_matching_matrices"], dtype=np.float64),
+        "n_repeat_ground_truth_matrices": np.asarray(aggregate["n_repeat_ground_truth_matrices"], dtype=np.float64),
+    }
+    for key in (
+        "n_sweep_flow_matching_nll_finetuned_matrices",
+        "n_repeat_flow_matching_nll_finetuned_matrices",
+    ):
+        if key in aggregate:
+            fields[key] = np.asarray(aggregate[key], dtype=np.float64)
+    np.savez_compressed(path, **fields)
     return path
 
 
@@ -766,10 +822,18 @@ def plot_sweep_error(
     estimator_styles = {
         "classical": {"color": "C1", "linestyle": "-", "label": "classical"},
         "flow_matching": {"color": "C0", "linestyle": "-", "label": "flow matching"},
+        "flow_matching_nll_finetuned": {
+            "color": "C2",
+            "linestyle": "--",
+            "label": "flow matching + NLL",
+        },
     }
+    flow_estimators = ["flow_matching"]
+    if "n_repeat_flow_matching_nll_finetuned_matrices" in aggregate or "n_sweep_flow_matching_nll_finetuned_matrices" in aggregate:
+        flow_estimators.append("flow_matching_nll_finetuned")
     row_specs = (
-        ("Classical + flow", ("classical", "flow_matching")),
-        ("Flow only", ("flow_matching",)),
+        ("All methods", ("classical", *flow_estimators)),
+        ("Flow methods", tuple(flow_estimators)),
     )
     xvals = np.asarray(aggregate["n_list"], dtype=np.int64)
     gt = np.asarray(aggregate.get("n_repeat_ground_truth_matrices", aggregate["n_sweep_ground_truth_matrices"]), dtype=np.float64)
@@ -783,6 +847,14 @@ def plot_sweep_error(
             dtype=np.float64,
         ),
     }
+    if "flow_matching_nll_finetuned" in flow_estimators:
+        matrices_by_estimator["flow_matching_nll_finetuned"] = np.asarray(
+            aggregate.get(
+                "n_repeat_flow_matching_nll_finetuned_matrices",
+                aggregate["n_sweep_flow_matching_nll_finetuned_matrices"],
+            ),
+            dtype=np.float64,
+        )
     error_label = "Mean relative absolute error" if relative else "Mean absolute error"
     sparse_x_ticks = _sparse_sweep_x_ticks(xvals)
 
@@ -860,9 +932,10 @@ def plot_sweep_error(
         handles_by_label.values(),
         handles_by_label.keys(),
         loc="lower center",
+        bbox_to_anchor=(0.5, -0.045),
         ncol=max(1, len(handles_by_label)),
         frameon=False,
-        fontsize=8,
+        fontsize=10,
     )
     title_kind = "relative absolute error" if relative else "absolute error"
     fig.suptitle(f"MoG5 PR distance comparison {title_kind} ({aggregate['pr_dim_label']})", fontsize=13)
@@ -870,11 +943,12 @@ def plot_sweep_error(
     metadata = {
         "Description": (
             f"layout=2x{len(ordered_metric_names)};metrics={','.join(ordered_metric_names)};"
-            "rows=classical+flow,flow_only;lines=repeat_means;errorbars=mean_sd"
+            f"rows=all_methods,flow_methods;estimators={','.join(('classical', *flow_estimators))};"
+            "lines=repeat_means;errorbars=mean_sd"
         )
     }
-    fig.savefig(svg_path, metadata=metadata)
-    fig.savefig(png_path, dpi=200)
+    fig.savefig(svg_path, metadata=metadata, bbox_inches="tight")
+    fig.savefig(png_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
     return svg_path, png_path
 
@@ -1096,6 +1170,12 @@ def write_summary(
         "n_total": int(args.n_total),
         "n_repeats": _n_repeats(args),
         "seed": int(args.seed),
+        "dataset_train_frac": float(args.dataset_train_frac),
+        "dataset_obs_noise_scale": float(args.dataset_obs_noise_scale),
+        "dataset_cov_theta_amp_scale": float(args.dataset_cov_theta_amp_scale),
+        "dataset_mog_mean_min_dist": (
+            None if args.dataset_mog_mean_min_dist is None else float(args.dataset_mog_mean_min_dist)
+        ),
         "repeat_seeds": [_repeat_seed(args, r) for r in range(_n_repeats(args))],
         "device": str(args.device),
         "case_output_name": str(args.case_output_name),
@@ -1107,6 +1187,14 @@ def write_summary(
         "abs_error_yscale": str(args.yscale),
         "rel_error_yscale": "linear",
         "loss_yscale": str(args.loss_yscale),
+        "flow_likelihood_finetune_epochs": int(args.flow_likelihood_finetune_epochs),
+        "flow_likelihood_finetune_batch_size": int(args.flow_likelihood_finetune_batch_size),
+        "flow_likelihood_finetune_lr": float(args.flow_likelihood_finetune_lr),
+        "flow_likelihood_finetune_ode_steps": int(args.flow_likelihood_finetune_ode_steps),
+        "flow_likelihood_finetune_ode_method": str(args.flow_likelihood_finetune_ode_method),
+        "flow_likelihood_finetune_checkpoint_selection": str(
+            args.flow_likelihood_finetune_checkpoint_selection
+        ),
     }
     if extra_config:
         config.update(extra_config)
@@ -1146,18 +1234,10 @@ def finalize_sweep_outputs(
     flow_loss_data: dict[tuple[int, int, int, str], dict[str, Any]] = {}
     flow_loss_warnings: list[str] = []
     for n_total, pr_dim, repeat_idx in _unique_cases(args):
+        key = _repeat_case_key(int(n_total), pr_dim, int(repeat_idx))
         for metric in metrics:
-            loss_path = case_flow_loss_npz(
-                n_total=int(n_total),
-                pr_dim=pr_dim,
-                case_output_name=str(args.case_output_name),
-                metric=str(metric),
-                native_x_dim=int(args.native_x_dim),
-                repeat_idx=int(repeat_idx),
-                n_repeats=_n_repeats(args),
-            )
+            loss_path = Path(case_paths[key]).parent / "flow" / f"{metric}_flow_matching_skl_results.npz"
             try:
-                key = _repeat_case_key(int(n_total), pr_dim, int(repeat_idx))
                 flow_loss_data[(key[0], key[1], key[2], str(metric))] = _load_flow_loss_cache(loss_path)
             except (FileNotFoundError, KeyError, ValueError) as exc:
                 flow_loss_warnings.append(str(exc))
@@ -1280,7 +1360,12 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
         case = _repeat_case_key(int(n_total), pr_dim, int(repeat_idx))
         case_paths[case] = Path(path)
         cache_hits[case] = bool(cache_hit)
-        case_data[case] = _filter_case_metrics(_load_case_cache(Path(path)), metrics, path=Path(path))
+        case_data[case] = _filter_case_metrics(
+            _load_case_cache(Path(path)),
+            metrics,
+            path=Path(path),
+            require_nll_finetuned=int(args.flow_likelihood_finetune_epochs) > 0,
+        )
 
     return finalize_sweep_outputs(
         args=args,

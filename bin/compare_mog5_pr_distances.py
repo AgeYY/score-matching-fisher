@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import math
 import sys
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,7 @@ from fisher.distance_comparison import (
     classical_metric_matrices,
     condition_labels,
     flow_metric_matrices,
+    flow_metric_variants,
     labels_from_theta,
     native_mog_ground_truth_matrices,
     pr_autoencoder_ground_truth_matrices,
@@ -87,7 +89,31 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="MoG5 PR embedded dimension. Use 'none' or 'null' for native mode.",
     )
-    p.add_argument("--seed", type=int, default=7, help="Dataset, flow, and estimation seed.")
+    p.add_argument("--seed", type=int, default=19, help="Dataset, flow, and estimation seed.")
+    p.add_argument(
+        "--dataset-train-frac",
+        type=float,
+        default=0.8,
+        help="Fraction of generated rows assigned to flow training; the remainder is validation.",
+    )
+    p.add_argument(
+        "--dataset-obs-noise-scale",
+        type=float,
+        default=1.0,
+        help="Scale factor for the random-MoG baseline observation noise.",
+    )
+    p.add_argument(
+        "--dataset-cov-theta-amp-scale",
+        type=float,
+        default=1.0,
+        help="Scale factor for the random-MoG mean-dependent variance term.",
+    )
+    p.add_argument(
+        "--dataset-mog-mean-min-dist",
+        type=float,
+        default=None,
+        help="Minimum pairwise component-mean distance; omitted uses 0.5*sqrt(native_x_dim).",
+    )
     p.add_argument("--device", type=str, default=DEFAULT_DEVICE, help="Execution device for PR GT encoding and flows.")
     p.add_argument(
         "--native-template-npz",
@@ -137,11 +163,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--early-patience", type=int, default=1_000)
     p.add_argument("--early-min-delta", type=float, default=1e-4)
     p.add_argument("--early-ema-alpha", type=float, default=0.05)
-    p.add_argument("--batch-size", type=int, default=2048)
+    p.add_argument("--batch-size", type=int, default=3000)
     p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--lr-schedule", choices=("constant", "cosine"), default="constant")
+    p.add_argument("--min-lr", type=float, default=0.0)
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--hidden-dim", type=int, default=256)
     p.add_argument("--depth", type=int, default=5)
+    p.add_argument("--network-architecture", choices=("mlp", "residual_mlp"), default="mlp")
+    p.add_argument("--fm-checkpoint-selection", choices=("best", "last"), default="best")
+    p.add_argument(
+        "--fixed-validation",
+        action="store_true",
+        help="Reuse one fixed set of validation base samples and interpolation times across FM epochs.",
+    )
     p.add_argument("--low-rank-dim", type=int, default=4)
     p.add_argument("--radius", type=float, default=1.0, help="Fixed norm radius for cosine/correlation flow rows.")
     p.add_argument("--path-schedule", choices=("cosine", "linear", "straight"), default="cosine")
@@ -167,6 +202,30 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=1e-8,
         help="Minimum std threshold for --flow-normalize-x; smaller stds are treated as constant dimensions.",
+    )
+    p.add_argument(
+        "--flow-likelihood-finetune-epochs",
+        type=int,
+        default=500,
+        help="CNF endpoint-NLL fine-tuning epochs; 0 disables the fine-tuned estimator.",
+    )
+    p.add_argument(
+        "--flow-likelihood-finetune-batch-size",
+        type=int,
+        default=3000,
+        help="NLL fine-tuning batch size; 0 reuses --batch-size.",
+    )
+    p.add_argument("--flow-likelihood-finetune-lr", type=float, default=3e-5)
+    p.add_argument("--flow-likelihood-finetune-weight-decay", type=float, default=0.0)
+    p.add_argument("--flow-likelihood-finetune-ode-steps", type=int, default=32)
+    p.add_argument("--flow-likelihood-finetune-ode-method", type=str, default="midpoint")
+    p.add_argument("--flow-likelihood-finetune-patience", type=int, default=150)
+    p.add_argument("--flow-likelihood-finetune-min-delta", type=float, default=1e-4)
+    p.add_argument("--flow-likelihood-finetune-ema-alpha", type=float, default=0.05)
+    p.add_argument(
+        "--flow-likelihood-finetune-checkpoint-selection",
+        choices=("best", "last"),
+        default="best",
     )
     return p
 
@@ -196,6 +255,30 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError(f"--native-x-dim must be >= 2; got {args.native_x_dim}.")
     if args.pr_dim is not None and int(args.pr_dim) < native_x_dim:
         raise ValueError(f"--pr-dim must be >= native x_dim={native_x_dim}; got {args.pr_dim}.")
+    if not (0.0 < float(args.dataset_train_frac) < 1.0):
+        raise ValueError("--dataset-train-frac must be in (0, 1) for train/validation selection.")
+    for name in ("dataset_obs_noise_scale", "dataset_cov_theta_amp_scale"):
+        value = float(getattr(args, name))
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(f"--{name.replace('_', '-')} must be finite and positive.")
+    if args.dataset_mog_mean_min_dist is not None:
+        value = float(args.dataset_mog_mean_min_dist)
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError("--dataset-mog-mean-min-dist must be finite and non-negative.")
+    if int(args.flow_likelihood_finetune_epochs) < 0:
+        raise ValueError("--flow-likelihood-finetune-epochs must be >= 0.")
+    if int(args.flow_likelihood_finetune_batch_size) < 0:
+        raise ValueError("--flow-likelihood-finetune-batch-size must be >= 0.")
+    if float(args.flow_likelihood_finetune_lr) <= 0.0:
+        raise ValueError("--flow-likelihood-finetune-lr must be > 0.")
+    if int(args.flow_likelihood_finetune_ode_steps) < 1:
+        raise ValueError("--flow-likelihood-finetune-ode-steps must be >= 1.")
+    if int(args.flow_likelihood_finetune_patience) < 0:
+        raise ValueError("--flow-likelihood-finetune-patience must be >= 0.")
+    if float(args.flow_likelihood_finetune_min_delta) < 0.0:
+        raise ValueError("--flow-likelihood-finetune-min-delta must be >= 0.")
+    if not (0.0 < float(args.flow_likelihood_finetune_ema_alpha) <= 1.0):
+        raise ValueError("--flow-likelihood-finetune-ema-alpha must be in (0, 1].")
 
 
 def _dataset_wrapper_args(args: argparse.Namespace, dataset_dir: Path) -> argparse.Namespace:
@@ -209,6 +292,12 @@ def _dataset_wrapper_args(args: argparse.Namespace, dataset_dir: Path) -> argpar
         "none" if args.pr_dim is None else str(int(args.pr_dim)),
         "--seed",
         str(int(args.seed)),
+        "--train-frac",
+        str(float(args.dataset_train_frac)),
+        "--obs-noise-scale",
+        str(float(args.dataset_obs_noise_scale)),
+        "--cov-theta-amp-scale",
+        str(float(args.dataset_cov_theta_amp_scale)),
         "--device",
         str(args.device),
         "--output-dir",
@@ -216,6 +305,8 @@ def _dataset_wrapper_args(args: argparse.Namespace, dataset_dir: Path) -> argpar
         "--pr-cache-dir",
         str(Path(args.pr_cache_dir)),
     ]
+    if args.dataset_mog_mean_min_dist is not None:
+        argv.extend(["--mog-mean-min-dist", str(float(args.dataset_mog_mean_min_dist))])
     if args.native_template_npz is not None:
         argv.extend(["--native-template-npz", str(Path(args.native_template_npz))])
     if bool(args.force_dataset):
@@ -240,9 +331,12 @@ def _flow_config_from_args(args: argparse.Namespace) -> FlowComparisonConfig:
         early_ema_alpha=float(args.early_ema_alpha),
         batch_size=int(args.batch_size),
         lr=float(args.lr),
+        lr_schedule=str(args.lr_schedule),
+        min_lr=float(args.min_lr),
         weight_decay=float(args.weight_decay),
         hidden_dim=int(args.hidden_dim),
         depth=int(args.depth),
+        network_architecture=str(args.network_architecture),
         low_rank_dim=int(args.low_rank_dim),
         radius=float(args.radius),
         path_schedule=str(args.path_schedule),
@@ -257,8 +351,20 @@ def _flow_config_from_args(args: argparse.Namespace) -> FlowComparisonConfig:
         solve_jitter=float(args.solve_jitter),
         max_grad_norm=float(args.max_grad_norm),
         log_every=int(args.log_every),
+        checkpoint_selection=str(args.fm_checkpoint_selection),
+        fixed_validation=bool(args.fixed_validation),
         normalize_x=bool(args.flow_normalize_x),
         normalize_x_eps=float(args.flow_normalize_x_eps),
+        likelihood_finetune_epochs=int(args.flow_likelihood_finetune_epochs),
+        likelihood_finetune_batch_size=int(args.flow_likelihood_finetune_batch_size),
+        likelihood_finetune_lr=float(args.flow_likelihood_finetune_lr),
+        likelihood_finetune_weight_decay=float(args.flow_likelihood_finetune_weight_decay),
+        likelihood_finetune_ode_steps=int(args.flow_likelihood_finetune_ode_steps),
+        likelihood_finetune_ode_method=str(args.flow_likelihood_finetune_ode_method),
+        likelihood_finetune_patience=int(args.flow_likelihood_finetune_patience),
+        likelihood_finetune_min_delta=float(args.flow_likelihood_finetune_min_delta),
+        likelihood_finetune_ema_alpha=float(args.flow_likelihood_finetune_ema_alpha),
+        likelihood_finetune_checkpoint_selection=str(args.flow_likelihood_finetune_checkpoint_selection),
     )
 
 
@@ -360,22 +466,45 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
 
     print("[distance-comparison] training flow-matching metrics", flush=True)
     flow_config = _flow_config_from_args(args)
-    flow, flow_paths = flow_metric_matrices(
-        bundle=work_bundle,
-        device=dev,
-        output_dir=output_dir / "flow",
-        config=flow_config,
-        seed=int(args.seed),
-        metrics=metrics,
-    )
+    if int(flow_config.likelihood_finetune_epochs) > 0:
+        print(
+            "[distance-comparison] enabling CNF NLL fine-tuned flow estimator "
+            f"for {int(flow_config.likelihood_finetune_epochs)} epochs",
+            flush=True,
+        )
+        flow_variants = flow_metric_variants(
+            bundle=work_bundle,
+            device=dev,
+            output_dir=output_dir / "flow",
+            config=flow_config,
+            seed=int(args.seed),
+            metrics=metrics,
+        )
+        flow = flow_variants.flow_matching
+        flow_finetuned = flow_variants.flow_matching_nll_finetuned
+        flow_paths = flow_variants.flow_npz_paths
+        flow_finetuned_paths = flow_variants.flow_nll_finetuned_npz_paths
+    else:
+        flow, flow_paths = flow_metric_matrices(
+            bundle=work_bundle,
+            device=dev,
+            output_dir=output_dir / "flow",
+            config=flow_config,
+            seed=int(args.seed),
+            metrics=metrics,
+        )
+        flow_finetuned = None
+        flow_finetuned_paths = None
 
     result = assemble_comparison_result(
         metrics=metrics,
         condition_names=names,
         classical=classical,
         flow_matching=flow,
+        flow_matching_nll_finetuned=flow_finetuned,
         ground_truth=ground_truth,
         flow_npz_paths=flow_paths,
+        flow_nll_finetuned_npz_paths=flow_finetuned_paths,
         flow_velocity_families={metric: velocity_family_for_metric(metric, flow_config) for metric in metrics},
     )
 

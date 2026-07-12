@@ -16,6 +16,7 @@ Existing native and projected NPZs are reused by default after metadata validati
 from __future__ import annotations
 
 import argparse
+import math
 import subprocess
 import sys
 from pathlib import Path
@@ -113,6 +114,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=7, help="Dataset and PR-autoencoder seed.")
     p.add_argument("--train-frac", type=float, default=0.8, help="Fraction of rows assigned to train_idx.")
     p.add_argument(
+        "--obs-noise-scale",
+        type=float,
+        default=1.0,
+        help="Scale factor for the random-MoG baseline observation noise.",
+    )
+    p.add_argument(
+        "--cov-theta-amp-scale",
+        type=float,
+        default=1.0,
+        help="Scale factor for the mean-dependent diagonal variance term.",
+    )
+    p.add_argument(
+        "--mog-mean-min-dist",
+        type=float,
+        default=None,
+        help="Minimum pairwise component-mean distance; omitted uses 0.5*sqrt(native_x_dim).",
+    )
+    p.add_argument(
         "--native-template-npz",
         type=Path,
         default=None,
@@ -172,6 +191,14 @@ def validate_args(args: argparse.Namespace) -> None:
     tf = float(args.train_frac)
     if not (0.0 < tf <= 1.0):
         raise ValueError(f"--train-frac must be in (0, 1]; got {args.train_frac}.")
+    for name in ("obs_noise_scale", "cov_theta_amp_scale"):
+        value = float(getattr(args, name))
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(f"--{name.replace('_', '-')} must be finite and positive; got {value}.")
+    if args.mog_mean_min_dist is not None:
+        value = float(args.mog_mean_min_dist)
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(f"--mog-mean-min-dist must be finite and non-negative; got {value}.")
     if args.native_template_npz is not None:
         template = validate_native_npz(
             Path(args.native_template_npz),
@@ -261,7 +288,7 @@ def validate_projected_npz(
 
 
 def build_native_command(args: argparse.Namespace, native_npz: Path) -> list[str]:
-    return [
+    command = [
         sys.executable,
         str(_REPO_ROOT / "bin" / "make_dataset.py"),
         "--dataset-family",
@@ -274,11 +301,50 @@ def build_native_command(args: argparse.Namespace, native_npz: Path) -> list[str
         str(int(args.n_total)),
         "--train-frac",
         str(float(args.train_frac)),
+        "--obs-noise-scale",
+        str(float(args.obs_noise_scale)),
+        "--cov-theta-amp-scale",
+        str(float(args.cov_theta_amp_scale)),
         "--seed",
         str(int(args.seed)),
         "--output-npz",
         str(native_npz),
     ]
+    if args.mog_mean_min_dist is not None:
+        command.extend(["--mog-mean-min-dist", str(float(args.mog_mean_min_dist))])
+    return command
+
+
+def validate_native_generation_config(
+    bundle: SharedDatasetBundle,
+    args: argparse.Namespace,
+    *,
+    path: Path,
+) -> None:
+    """Reject a cached native dataset generated under incompatible public controls."""
+
+    if args.native_template_npz is not None:
+        return
+    meta = dict(bundle.meta)
+    expected = {
+        "seed": float(args.seed),
+        "train_frac": float(args.train_frac),
+        "obs_noise_scale": float(args.obs_noise_scale),
+        "cov_theta_amp_scale": float(args.cov_theta_amp_scale),
+        "mog_mean_min_dist": (
+            0.5 * math.sqrt(float(args.native_x_dim))
+            if args.mog_mean_min_dist is None
+            else float(args.mog_mean_min_dist)
+        ),
+    }
+    mismatches: list[str] = []
+    for key, wanted in expected.items():
+        found = meta.get(key)
+        if found is None or not math.isclose(float(found), wanted, rel_tol=1e-10, abs_tol=1e-12):
+            mismatches.append(f"{key}: cached={found!r}, requested={wanted!r}")
+    if mismatches:
+        details = "; ".join(mismatches)
+        raise ValueError(f"{path} has incompatible generation metadata ({details}); rerun with --force.")
 
 
 def build_project_command(args: argparse.Namespace, native_npz: Path, projected_npz: Path) -> list[str]:
@@ -426,7 +492,13 @@ def run(args: argparse.Namespace, *, runner: Runner = _run_command) -> tuple[Pat
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if native_npz.is_file() and not bool(args.force):
-        validate_native_npz(native_npz, n_total=int(args.n_total), native_x_dim=int(args.native_x_dim))
+        native_bundle = validate_native_npz(
+            native_npz,
+            n_total=int(args.n_total),
+            native_x_dim=int(args.native_x_dim),
+        )
+        if native_bundle is not None:
+            validate_native_generation_config(native_bundle, args, path=native_npz)
         print(f"[mog5-pr] Reusing native NPZ: {native_npz}", flush=True)
     else:
         if args.native_template_npz is None:
@@ -435,7 +507,13 @@ def run(args: argparse.Namespace, *, runner: Runner = _run_command) -> tuple[Pat
                 _remove_native_viz(output_dir)
         else:
             write_native_from_template(args, native_npz)
-        validate_native_npz(native_npz, n_total=int(args.n_total), native_x_dim=int(args.native_x_dim))
+        native_bundle = validate_native_npz(
+            native_npz,
+            n_total=int(args.n_total),
+            native_x_dim=int(args.native_x_dim),
+        )
+        if native_bundle is not None:
+            validate_native_generation_config(native_bundle, args, path=native_npz)
 
     print(f"[mog5-pr] Native NPZ: {native_npz}", flush=True)
     if projected_npz is None:

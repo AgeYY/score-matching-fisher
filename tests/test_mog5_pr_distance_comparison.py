@@ -254,6 +254,50 @@ def test_flow_metric_mapping_and_mahalanobis_shared_assembly(monkeypatch, tmp_pa
     assert "mahalanobis_sq:0-1" not in paths
 
 
+def test_flow_metric_variants_saves_nll_finetuned_estimator(monkeypatch, tmp_path: Path) -> None:
+    bundle = _toy_bundle()
+
+    def fake_train_and_estimate_flow_variants(**kwargs):
+        del kwargs
+        base = np.asarray([[0.0, 4.0, 4.0], [4.0, 0.0, 4.0], [4.0, 4.0, 0.0]], dtype=np.float64)
+        fine = np.asarray([[0.0, 2.0, 2.0], [2.0, 0.0, 2.0], [2.0, 2.0, 0.0]], dtype=np.float64)
+        return (
+            FlowSKLResult(base, base.copy(), "model_jeffreys_symmetric_kl"),
+            FlowSKLResult(
+                fine,
+                fine.copy(),
+                "model_jeffreys_symmetric_kl",
+                train_metadata={
+                    "likelihood_finetune_metadata": {
+                        "train_nll_losses": np.asarray([3.0, 2.0]),
+                        "val_nll_losses": np.asarray([3.2, 2.2]),
+                        "val_monitor_nll_losses": np.asarray([3.2, 2.7]),
+                        "best_val_nll": 2.7,
+                        "best_epoch": 2,
+                        "selected_val_nll": 2.7,
+                        "selected_epoch": 2,
+                    }
+                },
+            ),
+        )
+
+    monkeypatch.setattr(dc, "train_and_estimate_flow_variants", fake_train_and_estimate_flow_variants)
+    variants = dc.flow_metric_variants(
+        bundle=bundle,
+        device=torch.device("cpu"),
+        output_dir=tmp_path,
+        config=dc.FlowComparisonConfig(epochs=1, likelihood_finetune_epochs=2),
+        metrics=(dc.METRIC_SYMMETRIC_KL,),
+    )
+
+    np.testing.assert_allclose(variants.flow_matching[dc.METRIC_SYMMETRIC_KL][0, 1], 4.0)
+    np.testing.assert_allclose(variants.flow_matching_nll_finetuned[dc.METRIC_SYMMETRIC_KL][0, 1], 2.0)
+    fine_path = variants.flow_nll_finetuned_npz_paths[dc.METRIC_SYMMETRIC_KL]
+    with np.load(fine_path, allow_pickle=False) as data:
+        assert str(data["estimator"][0]) == "flow_matching_nll_finetuned"
+        np.testing.assert_allclose(data["nll_train_losses"], [3.0, 2.0])
+
+
 def test_correlation_flow_routes_to_centered_fixed_norm(monkeypatch, tmp_path: Path) -> None:
     bundle = _toy_bundle()
     calls: list[dict[str, object]] = []
@@ -430,8 +474,15 @@ def test_flow_comparison_config_normalize_x_defaults_are_opt_in() -> None:
 
 
 def test_flow_comparison_config_default_t_eps_is_small_endpoint_clamp() -> None:
-    assert dc.FlowComparisonConfig().t_eps == 0.0005
-    assert dc.FlowComparisonConfig().early_ema_alpha == 0.05
+    config = dc.FlowComparisonConfig()
+    assert config.t_eps == 0.0005
+    assert config.early_ema_alpha == 0.05
+    assert config.likelihood_finetune_epochs == 500
+    assert config.likelihood_finetune_batch_size == 2048
+    assert config.likelihood_finetune_lr == pytest.approx(3e-5)
+    assert config.likelihood_finetune_ode_steps == 32
+    assert config.likelihood_finetune_patience == 150
+    assert config.likelihood_finetune_checkpoint_selection == "best"
 
 
 def test_save_flow_result_npz_persists_monitor_losses_and_ema_alpha(tmp_path: Path) -> None:
@@ -532,8 +583,9 @@ def test_assemble_rows_with_mocked_flow_results() -> None:
     labels = ("category_0", "category_1", "category_2")
     classical = {m: np.ones((3, 3), dtype=np.float64) for m in dc.METRIC_NAMES}
     flow = {m: 2.0 * np.ones((3, 3), dtype=np.float64) for m in dc.METRIC_NAMES}
+    flow_finetuned = {m: 2.5 * np.ones((3, 3), dtype=np.float64) for m in dc.METRIC_NAMES}
     gt = {m: 3.0 * np.ones((3, 3), dtype=np.float64) for m in dc.METRIC_NAMES}
-    for mats in (classical, flow, gt):
+    for mats in (classical, flow, flow_finetuned, gt):
         for mat in mats.values():
             np.fill_diagonal(mat, 0.0)
 
@@ -542,6 +594,7 @@ def test_assemble_rows_with_mocked_flow_results() -> None:
         condition_names=labels,
         classical=classical,
         flow_matching=flow,
+        flow_matching_nll_finetuned=flow_finetuned,
         ground_truth=gt,
     )
 
@@ -553,9 +606,11 @@ def test_assemble_rows_with_mocked_flow_results() -> None:
     assert first["condition_j"] == "category_1"
     assert first["classical"] == 1.0
     assert first["flow_matching"] == 2.0
+    assert first["flow_matching_nll_finetuned"] == 2.5
     assert first["ground_truth"] == 3.0
     assert first["abs_error_classical"] == 2.0
     assert first["abs_error_flow"] == 1.0
+    assert first["abs_error_flow_nll_finetuned"] == 0.5
 
 
 def test_cli_default_path_resolution_without_running_training() -> None:
@@ -566,8 +621,19 @@ def test_cli_default_path_resolution_without_running_training() -> None:
     assert args.n_total == 1_000
     assert args.native_x_dim == 3
     assert args.pr_dim is None
-    assert args.seed == 7
+    assert args.seed == 19
     assert args.device == "cuda:0"
+    assert args.dataset_train_frac == pytest.approx(0.8)
+    assert args.dataset_obs_noise_scale == pytest.approx(1.0)
+    assert args.dataset_cov_theta_amp_scale == pytest.approx(1.0)
+    assert args.dataset_mog_mean_min_dist is None
+    assert args.flow_likelihood_finetune_epochs == 500
+    assert args.batch_size == 3000
+    assert args.flow_likelihood_finetune_batch_size == 3000
+    assert args.flow_likelihood_finetune_lr == pytest.approx(3e-5)
+    assert args.flow_likelihood_finetune_ode_steps == 32
+    assert args.flow_likelihood_finetune_patience == 150
+    assert args.flow_likelihood_finetune_checkpoint_selection == "best"
     assert args.metric == "all"
     assert mod.resolve_metric_names(args) == dc.METRIC_NAMES
     assert args.gt_samples_per_class == 100_000
@@ -713,7 +779,18 @@ def test_cli_run_passes_selected_metric_only(monkeypatch, tmp_path: Path) -> Non
     monkeypatch.setattr(mod, "write_summary_json", fake_write_summary_json)
 
     args = mod.build_parser().parse_args(
-        ["--native-x-dim", "2", "--pr-dim", "5", "--metric", metric, "--output-dir", str(tmp_path / "out")]
+        [
+            "--native-x-dim",
+            "2",
+            "--pr-dim",
+            "5",
+            "--metric",
+            metric,
+            "--flow-likelihood-finetune-epochs",
+            "0",
+            "--output-dir",
+            str(tmp_path / "out"),
+        ]
     )
     paths = mod.run(args)
 
@@ -796,7 +873,18 @@ def test_cli_native_mode_uses_native_bundle_and_ground_truth(monkeypatch, tmp_pa
     monkeypatch.setattr(mod, "write_summary_json", fake_write_summary_json)
 
     args = mod.build_parser().parse_args(
-        ["--native-x-dim", "2", "--pr-dim", "none", "--metric", metric, "--output-dir", str(tmp_path / "out")]
+        [
+            "--native-x-dim",
+            "2",
+            "--pr-dim",
+            "none",
+            "--metric",
+            metric,
+            "--flow-likelihood-finetune-epochs",
+            "0",
+            "--output-dir",
+            str(tmp_path / "out"),
+        ]
     )
     mod.run(args)
 
@@ -822,7 +910,7 @@ def test_mahalanobis_cli_defaults_match_full_cli_without_running_training() -> N
 
     assert args.n_total == full_args.n_total == 1_000
     assert args.pr_dim == full_args.pr_dim is None
-    assert args.seed == full_args.seed == 7
+    assert args.seed == full_args.seed == 19
     assert args.device == full_args.device == "cuda:0"
     assert args.gt_samples_per_class == full_args.gt_samples_per_class == 100_000
     assert args.mc_jeffreys_sample == full_args.mc_jeffreys_sample == 4096

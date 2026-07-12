@@ -39,6 +39,9 @@ def test_parser_defaults_and_output_path_naming() -> None:
 
     assert args.seed == 7
     assert args.train_frac == 0.8
+    assert args.obs_noise_scale == pytest.approx(1.0)
+    assert args.cov_theta_amp_scale == pytest.approx(1.0)
+    assert args.mog_mean_min_dist is None
     assert args.device == "cuda:0"
     assert args.force is False
     assert args.use_cache is False
@@ -148,6 +151,8 @@ def test_command_construction_for_native_and_pr(monkeypatch: pytest.MonkeyPatch,
     assert _flag_value(native, "--x-dim") == "3"
     assert _flag_value(native, "--n-total") == "456"
     assert _flag_value(native, "--train-frac") == "0.8"
+    assert _flag_value(native, "--obs-noise-scale") == "1.0"
+    assert _flag_value(native, "--cov-theta-amp-scale") == "1.0"
     assert _flag_value(native, "--seed") == "7"
 
     assert _flag_value(projected, "--h-dim") == "9"

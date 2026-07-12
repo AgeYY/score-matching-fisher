@@ -21,6 +21,7 @@ from fisher.flow_matching_skl import (
     FlowSKLResult,
     build_flow_skl_model,
     estimate_model_symmetric_kl,
+    finetune_flow_skl_cnf_likelihood,
     flow_skl_result_to_npz_dict,
     train_flow_skl_model,
 )
@@ -55,10 +56,12 @@ CSV_COLUMNS = (
     "condition_j",
     "classical",
     "flow_matching",
+    "flow_matching_nll_finetuned",
     "ground_truth",
     "flow_velocity_family",
     "abs_error_classical",
     "abs_error_flow",
+    "abs_error_flow_nll_finetuned",
 )
 
 
@@ -72,9 +75,12 @@ class FlowComparisonConfig:
     early_ema_alpha: float = 0.05
     batch_size: int = 512
     lr: float = 1e-3
+    lr_schedule: str = "constant"
+    min_lr: float = 0.0
     weight_decay: float = 0.0
     hidden_dim: int = 256
     depth: int = 5
+    network_architecture: str = "mlp"
     low_rank_dim: int = 4
     path_schedule: str = "cosine"
     t_eps: float = 0.0005
@@ -88,9 +94,21 @@ class FlowComparisonConfig:
     solve_jitter: float = 1e-6
     max_grad_norm: float = 10.0
     log_every: int = 50
+    checkpoint_selection: str = "best"
+    fixed_validation: bool = False
     radius: float = 1.0
     normalize_x: bool = False
     normalize_x_eps: float = 1e-8
+    likelihood_finetune_epochs: int = 500
+    likelihood_finetune_batch_size: int = 2048
+    likelihood_finetune_lr: float = 3e-5
+    likelihood_finetune_weight_decay: float = 0.0
+    likelihood_finetune_ode_steps: int = 32
+    likelihood_finetune_ode_method: str = "midpoint"
+    likelihood_finetune_patience: int = 150
+    likelihood_finetune_min_delta: float = 1e-4
+    likelihood_finetune_ema_alpha: float = 0.05
+    likelihood_finetune_checkpoint_selection: str = "best"
 
 
 @dataclass(frozen=True)
@@ -102,8 +120,18 @@ class DistanceComparisonResult:
     flow_matrices: dict[str, np.ndarray]
     ground_truth_matrices: dict[str, np.ndarray]
     rows: list[dict[str, Any]]
+    flow_nll_finetuned_matrices: dict[str, np.ndarray] = field(default_factory=dict)
     flow_npz_paths: dict[str, Path] = field(default_factory=dict)
+    flow_nll_finetuned_npz_paths: dict[str, Path] = field(default_factory=dict)
     flow_velocity_families: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class FlowMetricVariantsResult:
+    flow_matching: dict[str, np.ndarray]
+    flow_matching_nll_finetuned: dict[str, np.ndarray]
+    flow_npz_paths: dict[str, Path]
+    flow_nll_finetuned_npz_paths: dict[str, Path]
 
 
 def labels_from_theta(theta: np.ndarray, *, num_categories: int | None = None) -> np.ndarray:
@@ -519,6 +547,10 @@ def _flow_npz_name(metric: str, pair: tuple[int, int] | None = None) -> str:
     return f"{metric}_pair_{int(pair[0])}_{int(pair[1])}_flow_matching_skl_results.npz"
 
 
+def _flow_nll_finetuned_npz_name(metric: str) -> str:
+    return f"{metric}_flow_matching_nll_finetuned_skl_results.npz"
+
+
 def _fit_shared_x_normalizer(x_train: np.ndarray, *, eps: float) -> tuple[np.ndarray, np.ndarray]:
     """Fit one train-only affine x normalizer shared across all classes."""
 
@@ -560,24 +592,27 @@ def velocity_family_for_metric(metric: str, config: FlowComparisonConfig) -> str
     return FLOW_VELOCITY_FAMILY_BY_METRIC[str(metric)]
 
 
-def train_and_estimate_flow(
+def _seed_flow_rng(seed: int, device: torch.device) -> None:
+    torch.manual_seed(int(seed))
+    np.random.seed(int(seed))
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(int(seed))
+
+
+def _build_and_train_flow_model(
     *,
     theta_train: np.ndarray,
     x_train: np.ndarray,
     theta_val: np.ndarray,
     x_val: np.ndarray,
-    theta_eval: np.ndarray,
     velocity_family: str,
     device: torch.device,
     seed: int,
     config: FlowComparisonConfig,
-) -> FlowSKLResult:
-    """Train one flow model and return its endpoint metric matrix."""
+) -> tuple[torch.nn.Module, dict[str, Any]]:
+    """Build and flow-match one conditional model."""
 
-    torch.manual_seed(int(seed))
-    np.random.seed(int(seed))
-    if device.type == "cuda":
-        torch.cuda.manual_seed_all(int(seed))
+    _seed_flow_rng(int(seed), device)
 
     theta_dim = int(theta_train.shape[1] if np.asarray(theta_train).ndim == 2 else 1)
     x_dim = int(x_train.shape[1] if np.asarray(x_train).ndim == 2 else 1)
@@ -588,6 +623,7 @@ def train_and_estimate_flow(
         radius=float(config.radius),
         hidden_dim=int(config.hidden_dim),
         depth=int(config.depth),
+        network_architecture=str(config.network_architecture),
         low_rank_dim=int(config.low_rank_dim),
         quadrature_steps=int(config.quadrature_steps),
         path_schedule=str(config.path_schedule),
@@ -607,6 +643,8 @@ def train_and_estimate_flow(
         epochs=int(config.epochs),
         batch_size=int(config.batch_size),
         lr=float(config.lr),
+        lr_schedule=str(config.lr_schedule),
+        min_lr=float(config.min_lr),
         weight_decay=float(config.weight_decay),
         t_eps=float(config.t_eps),
         patience=int(config.early_patience),
@@ -614,7 +652,24 @@ def train_and_estimate_flow(
         ema_alpha=float(config.early_ema_alpha),
         max_grad_norm=float(config.max_grad_norm),
         log_every=max(1, int(config.log_every)),
+        checkpoint_selection=str(config.checkpoint_selection),
+        fixed_validation=bool(config.fixed_validation),
+        validation_seed=int(seed) + 500_000 if bool(config.fixed_validation) else None,
     )
+    return model, train_meta
+
+
+def _estimate_trained_flow(
+    *,
+    model: torch.nn.Module,
+    theta_eval: np.ndarray,
+    velocity_family: str,
+    device: torch.device,
+    seed: int,
+    config: FlowComparisonConfig,
+    train_metadata: dict[str, Any],
+) -> FlowSKLResult:
+    _seed_flow_rng(int(seed), device)
     return estimate_model_symmetric_kl(
         model=model,
         theta_all=theta_eval,
@@ -628,8 +683,124 @@ def train_and_estimate_flow(
         solve_jitter=float(config.solve_jitter),
         quadrature_steps=int(config.quadrature_steps),
         fisher_kind="none",
+        train_metadata=train_metadata,
+    )
+
+
+def train_and_estimate_flow(
+    *,
+    theta_train: np.ndarray,
+    x_train: np.ndarray,
+    theta_val: np.ndarray,
+    x_val: np.ndarray,
+    theta_eval: np.ndarray,
+    velocity_family: str,
+    device: torch.device,
+    seed: int,
+    config: FlowComparisonConfig,
+) -> FlowSKLResult:
+    """Train one flow model and return its endpoint metric matrix."""
+
+    model, train_meta = _build_and_train_flow_model(
+        theta_train=theta_train,
+        x_train=x_train,
+        theta_val=theta_val,
+        x_val=x_val,
+        velocity_family=velocity_family,
+        device=device,
+        seed=int(seed),
+        config=config,
+    )
+    return _estimate_trained_flow(
+        model=model,
+        theta_eval=theta_eval,
+        velocity_family=velocity_family,
+        device=device,
+        seed=int(seed) + 100_000,
+        config=config,
         train_metadata=train_meta,
     )
+
+
+def train_and_estimate_flow_variants(
+    *,
+    theta_train: np.ndarray,
+    x_train: np.ndarray,
+    theta_val: np.ndarray,
+    x_val: np.ndarray,
+    theta_eval: np.ndarray,
+    velocity_family: str,
+    device: torch.device,
+    seed: int,
+    config: FlowComparisonConfig,
+) -> tuple[FlowSKLResult, FlowSKLResult | None]:
+    """Estimate a flow-matched model before and after optional CNF NLL fine-tuning."""
+
+    model, train_meta = _build_and_train_flow_model(
+        theta_train=theta_train,
+        x_train=x_train,
+        theta_val=theta_val,
+        x_val=x_val,
+        velocity_family=velocity_family,
+        device=device,
+        seed=int(seed),
+        config=config,
+    )
+    estimate_seed = int(seed) + 100_000
+    flow_result = _estimate_trained_flow(
+        model=model,
+        theta_eval=theta_eval,
+        velocity_family=velocity_family,
+        device=device,
+        seed=estimate_seed,
+        config=config,
+        train_metadata=train_meta,
+    )
+
+    if int(config.likelihood_finetune_epochs) <= 0:
+        return flow_result, None
+
+    fine_batch_size = (
+        int(config.batch_size)
+        if int(config.likelihood_finetune_batch_size) <= 0
+        else int(config.likelihood_finetune_batch_size)
+    )
+    _seed_flow_rng(int(seed) + 200_000, device)
+    fine_meta = finetune_flow_skl_cnf_likelihood(
+        model=model,
+        theta_train=theta_train,
+        x_train=x_train,
+        theta_val=theta_val,
+        x_val=x_val,
+        device=device,
+        epochs=int(config.likelihood_finetune_epochs),
+        batch_size=fine_batch_size,
+        lr=float(config.likelihood_finetune_lr),
+        weight_decay=float(config.likelihood_finetune_weight_decay),
+        ode_steps=int(config.likelihood_finetune_ode_steps),
+        ode_method=str(config.likelihood_finetune_ode_method),
+        patience=int(config.likelihood_finetune_patience),
+        min_delta=float(config.likelihood_finetune_min_delta),
+        ema_alpha=float(config.likelihood_finetune_ema_alpha),
+        max_grad_norm=float(config.max_grad_norm),
+        checkpoint_selection=str(config.likelihood_finetune_checkpoint_selection),
+        log_every=max(1, int(config.log_every)),
+    )
+    fine_train_meta = {
+        **dict(train_meta),
+        "likelihood_finetuned": True,
+        "likelihood_finetune_metadata": fine_meta,
+    }
+    fine_result = _estimate_trained_flow(
+        model=model,
+        theta_eval=theta_eval,
+        velocity_family=velocity_family,
+        device=device,
+        seed=estimate_seed,
+        config=config,
+        train_metadata=fine_train_meta,
+    )
+    return flow_result, fine_result
 
 
 def save_flow_result_npz(
@@ -641,6 +812,7 @@ def save_flow_result_npz(
     velocity_family: str,
     pair: tuple[int, int] | None = None,
     flow_metric_matrix: np.ndarray | None = None,
+    estimator: str = "flow_matching",
 ) -> Path:
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -649,6 +821,7 @@ def save_flow_result_npz(
         {
             "metric": np.asarray([str(metric)]),
             "velocity_family": np.asarray([str(velocity_family)]),
+            "estimator": np.asarray([str(estimator)]),
             "theta_eval": np.asarray(theta_eval, dtype=np.float64),
         }
     )
@@ -657,23 +830,54 @@ def save_flow_result_npz(
     if pair is not None:
         fields["condition_pair"] = np.asarray(pair, dtype=np.int64)
     meta = dict(result.train_metadata)
-    for key in ("train_losses", "val_losses", "val_monitor_losses"):
+    for key in ("train_losses", "val_losses", "val_monitor_losses", "learning_rates"):
         if key in meta:
             fields[key] = np.asarray(meta[key], dtype=np.float64)
-    for key in ("best_val_loss", "best_epoch", "stopped_epoch", "stopped_early", "early_ema_alpha"):
+    for key in (
+        "best_val_loss",
+        "best_epoch",
+        "selected_epoch",
+        "stopped_epoch",
+        "stopped_early",
+        "early_ema_alpha",
+        "min_lr",
+        "fixed_validation",
+    ):
         if key in meta:
             fields[key] = np.asarray([meta[key]])
+    for key in ("lr_schedule", "checkpoint_selection"):
+        if key in meta:
+            fields[key] = np.asarray([str(meta[key])])
     for key in ("flow_normalize_x", "flow_normalize_x_eps"):
         if key in meta:
             fields[key] = np.asarray([meta[key]])
     for key in ("flow_normalize_x_mean", "flow_normalize_x_std"):
         if key in meta:
             fields[key] = np.asarray(meta[key], dtype=np.float64)
+    fine_meta = meta.get("likelihood_finetune_metadata")
+    if isinstance(fine_meta, dict):
+        for source, target in (
+            ("train_nll_losses", "nll_train_losses"),
+            ("val_nll_losses", "nll_val_losses"),
+            ("val_monitor_nll_losses", "nll_val_monitor_losses"),
+        ):
+            if source in fine_meta:
+                fields[target] = np.asarray(fine_meta[source], dtype=np.float64)
+        for key in (
+            "best_val_nll",
+            "best_epoch",
+            "selected_val_nll",
+            "selected_epoch",
+            "stopped_epoch",
+            "stopped_early",
+        ):
+            if key in fine_meta:
+                fields[f"nll_{key}"] = np.asarray([fine_meta[key]])
     np.savez_compressed(out, **fields)
     return out
 
 
-def flow_metric_matrices(
+def _flow_metric_variants_impl(
     *,
     bundle: SharedDatasetBundle,
     device: torch.device,
@@ -681,8 +885,9 @@ def flow_metric_matrices(
     config: FlowComparisonConfig,
     seed: int = 7,
     metrics: Iterable[str] = METRIC_NAMES,
-) -> tuple[dict[str, np.ndarray], dict[str, Path]]:
-    """Train flow models and assemble per-metric matrices."""
+    include_likelihood_finetuned: bool,
+) -> FlowMetricVariantsResult:
+    """Train flow models and assemble ordinary and NLL-fine-tuned matrices."""
 
     meta = dict(bundle.meta)
     k = int(meta.get("num_categories", np.asarray(bundle.theta_all).shape[1]))
@@ -711,23 +916,39 @@ def flow_metric_matrices(
         x_val_flow = x_val_all
     flow_dir = Path(output_dir)
     matrices: dict[str, np.ndarray] = {}
+    fine_matrices: dict[str, np.ndarray] = {}
     paths: dict[str, Path] = {}
+    fine_paths: dict[str, Path] = {}
     theta_eval = _theta_eval_from_num_categories(k)
 
     for metric in tuple(str(m) for m in metrics):
         family = velocity_family_for_metric(metric, config)
         print(f"[distance-comparison] flow metric={metric} velocity_family={family}", flush=True)
-        result = train_and_estimate_flow(
-            theta_train=theta_train_all,
-            x_train=x_train_flow,
-            theta_val=theta_val_all,
-            x_val=x_val_flow,
-            theta_eval=theta_eval,
-            velocity_family=family,
-            device=device,
-            seed=int(seed),
-            config=config,
-        )
+        if bool(include_likelihood_finetuned):
+            result, fine_result = train_and_estimate_flow_variants(
+                theta_train=theta_train_all,
+                x_train=x_train_flow,
+                theta_val=theta_val_all,
+                x_val=x_val_flow,
+                theta_eval=theta_eval,
+                velocity_family=family,
+                device=device,
+                seed=int(seed),
+                config=config,
+            )
+        else:
+            result = train_and_estimate_flow(
+                theta_train=theta_train_all,
+                x_train=x_train_flow,
+                theta_val=theta_val_all,
+                x_val=x_val_flow,
+                theta_eval=theta_eval,
+                velocity_family=family,
+                device=device,
+                seed=int(seed),
+                config=config,
+            )
+            fine_result = None
         result.train_metadata = {**dict(result.train_metadata), **normalize_meta}
         matrices[metric] = flow_skl_to_metric_readout(
             metric,
@@ -741,9 +962,77 @@ def flow_metric_matrices(
             theta_eval=theta_eval,
             velocity_family=family,
             flow_metric_matrix=matrices[metric],
+            estimator="flow_matching",
         )
         paths[metric] = path
-    return matrices, paths
+        if fine_result is not None:
+            fine_result.train_metadata = {**dict(fine_result.train_metadata), **normalize_meta}
+            fine_matrices[metric] = flow_skl_to_metric_readout(
+                metric,
+                fine_result.symmetric_kl_matrix,
+                radius=float(config.radius),
+            )
+            fine_path = save_flow_result_npz(
+                flow_dir / _flow_nll_finetuned_npz_name(metric),
+                result=fine_result,
+                metric=metric,
+                theta_eval=theta_eval,
+                velocity_family=family,
+                flow_metric_matrix=fine_matrices[metric],
+                estimator="flow_matching_nll_finetuned",
+            )
+            fine_paths[metric] = fine_path
+    return FlowMetricVariantsResult(
+        flow_matching=matrices,
+        flow_matching_nll_finetuned=fine_matrices,
+        flow_npz_paths=paths,
+        flow_nll_finetuned_npz_paths=fine_paths,
+    )
+
+
+def flow_metric_matrices(
+    *,
+    bundle: SharedDatasetBundle,
+    device: torch.device,
+    output_dir: str | Path,
+    config: FlowComparisonConfig,
+    seed: int = 7,
+    metrics: Iterable[str] = METRIC_NAMES,
+) -> tuple[dict[str, np.ndarray], dict[str, Path]]:
+    """Train ordinary flow-matching models and assemble per-metric matrices."""
+
+    result = _flow_metric_variants_impl(
+        bundle=bundle,
+        device=device,
+        output_dir=output_dir,
+        config=config,
+        seed=int(seed),
+        metrics=metrics,
+        include_likelihood_finetuned=False,
+    )
+    return result.flow_matching, result.flow_npz_paths
+
+
+def flow_metric_variants(
+    *,
+    bundle: SharedDatasetBundle,
+    device: torch.device,
+    output_dir: str | Path,
+    config: FlowComparisonConfig,
+    seed: int = 7,
+    metrics: Iterable[str] = METRIC_NAMES,
+) -> FlowMetricVariantsResult:
+    """Train flow models and optionally add NLL-fine-tuned comparison matrices."""
+
+    return _flow_metric_variants_impl(
+        bundle=bundle,
+        device=device,
+        output_dir=output_dir,
+        config=config,
+        seed=int(seed),
+        metrics=metrics,
+        include_likelihood_finetuned=True,
+    )
 
 
 def pair_rows(
@@ -753,6 +1042,7 @@ def pair_rows(
     classical: dict[str, np.ndarray],
     flow_matching: dict[str, np.ndarray],
     ground_truth: dict[str, np.ndarray],
+    flow_matching_nll_finetuned: dict[str, np.ndarray] | None = None,
     flow_velocity_families: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     label_tuple = tuple(str(v) for v in labels)
@@ -762,11 +1052,17 @@ def pair_rows(
     for metric in tuple(str(m) for m in metrics):
         cmat = np.asarray(classical[metric], dtype=np.float64)
         fmat = np.asarray(flow_matching[metric], dtype=np.float64)
+        fine_mat = (
+            None
+            if flow_matching_nll_finetuned is None or metric not in flow_matching_nll_finetuned
+            else np.asarray(flow_matching_nll_finetuned[metric], dtype=np.float64)
+        )
         gmat = np.asarray(ground_truth[metric], dtype=np.float64)
         for i, j in pairs:
             i_int, j_int = int(i), int(j)
             cval = float(cmat[i_int, j_int])
             fval = float(fmat[i_int, j_int])
+            fine_val = float("nan") if fine_mat is None else float(fine_mat[i_int, j_int])
             gval = float(gmat[i_int, j_int])
             rows.append(
                 {
@@ -775,10 +1071,12 @@ def pair_rows(
                     "condition_j": label_tuple[j_int],
                     "classical": cval,
                     "flow_matching": fval,
+                    "flow_matching_nll_finetuned": fine_val,
                     "ground_truth": gval,
                     "flow_velocity_family": family_by_metric[metric],
                     "abs_error_classical": abs(cval - gval),
                     "abs_error_flow": abs(fval - gval),
+                    "abs_error_flow_nll_finetuned": abs(fine_val - gval),
                 }
             )
     return rows
@@ -791,7 +1089,9 @@ def assemble_comparison_result(
     classical: dict[str, np.ndarray],
     flow_matching: dict[str, np.ndarray],
     ground_truth: dict[str, np.ndarray],
+    flow_matching_nll_finetuned: dict[str, np.ndarray] | None = None,
     flow_npz_paths: dict[str, Path] | None = None,
+    flow_nll_finetuned_npz_paths: dict[str, Path] | None = None,
     flow_velocity_families: dict[str, str] | None = None,
 ) -> DistanceComparisonResult:
     metric_tuple = tuple(str(m) for m in metrics)
@@ -806,6 +1106,7 @@ def assemble_comparison_result(
         labels=label_tuple,
         classical=classical,
         flow_matching=flow_matching,
+        flow_matching_nll_finetuned=flow_matching_nll_finetuned,
         ground_truth=ground_truth,
         flow_velocity_families=family_by_metric,
     )
@@ -817,7 +1118,15 @@ def assemble_comparison_result(
         flow_matrices={m: np.asarray(flow_matching[m], dtype=np.float64) for m in metric_tuple},
         ground_truth_matrices={m: np.asarray(ground_truth[m], dtype=np.float64) for m in metric_tuple},
         rows=rows,
+        flow_nll_finetuned_matrices=(
+            {}
+            if flow_matching_nll_finetuned is None
+            else {m: np.asarray(flow_matching_nll_finetuned[m], dtype=np.float64) for m in metric_tuple}
+        ),
         flow_npz_paths={} if flow_npz_paths is None else dict(flow_npz_paths),
+        flow_nll_finetuned_npz_paths=(
+            {} if flow_nll_finetuned_npz_paths is None else dict(flow_nll_finetuned_npz_paths)
+        ),
         flow_velocity_families={m: family_by_metric[m] for m in metric_tuple},
     )
 
@@ -840,17 +1149,21 @@ def write_results_npz(path: str | Path, result: DistanceComparisonResult) -> Pat
     stack_classical = np.stack([result.classical_matrices[m] for m in result.metrics], axis=0)
     stack_flow = np.stack([result.flow_matrices[m] for m in result.metrics], axis=0)
     stack_gt = np.stack([result.ground_truth_matrices[m] for m in result.metrics], axis=0)
-    np.savez_compressed(
-        out,
-        metric_names=metric_names,
-        condition_labels=np.asarray(result.condition_labels),
-        pair_indices=result.pair_indices.astype(np.int64, copy=False),
-        classical_matrices=stack_classical,
-        flow_matching_matrices=stack_flow,
-        ground_truth_matrices=stack_gt,
-        abs_error_classical=np.abs(stack_classical - stack_gt),
-        abs_error_flow=np.abs(stack_flow - stack_gt),
-    )
+    fields: dict[str, Any] = {
+        "metric_names": metric_names,
+        "condition_labels": np.asarray(result.condition_labels),
+        "pair_indices": result.pair_indices.astype(np.int64, copy=False),
+        "classical_matrices": stack_classical,
+        "flow_matching_matrices": stack_flow,
+        "ground_truth_matrices": stack_gt,
+        "abs_error_classical": np.abs(stack_classical - stack_gt),
+        "abs_error_flow": np.abs(stack_flow - stack_gt),
+    }
+    if result.flow_nll_finetuned_matrices:
+        stack_fine = np.stack([result.flow_nll_finetuned_matrices[m] for m in result.metrics], axis=0)
+        fields["flow_matching_nll_finetuned_matrices"] = stack_fine
+        fields["abs_error_flow_nll_finetuned"] = np.abs(stack_fine - stack_gt)
+    np.savez_compressed(out, **fields)
     return out
 
 
@@ -882,23 +1195,40 @@ def write_summary_json(
     for metric in result.metrics:
         c = np.asarray(result.classical_matrices[metric], dtype=np.float64)
         f = np.asarray(result.flow_matrices[metric], dtype=np.float64)
+        fine = (
+            None
+            if metric not in result.flow_nll_finetuned_matrices
+            else np.asarray(result.flow_nll_finetuned_matrices[metric], dtype=np.float64)
+        )
         g = np.asarray(result.ground_truth_matrices[metric], dtype=np.float64)
         pairs = result.pair_indices
         c_err = np.asarray([abs(float(c[i, j]) - float(g[i, j])) for i, j in pairs], dtype=np.float64)
         f_err = np.asarray([abs(float(f[i, j]) - float(g[i, j])) for i, j in pairs], dtype=np.float64)
-        metric_summary[metric] = {
+        metric_payload = {
             "flow_velocity_family": result.flow_velocity_families.get(metric, FLOW_VELOCITY_FAMILY_BY_METRIC[metric]),
             "mean_abs_error_classical": float(np.mean(c_err)),
             "mean_abs_error_flow": float(np.mean(f_err)),
             "max_abs_error_classical": float(np.max(c_err)),
             "max_abs_error_flow": float(np.max(f_err)),
         }
+        if fine is not None:
+            fine_err = np.asarray([abs(float(fine[i, j]) - float(g[i, j])) for i, j in pairs], dtype=np.float64)
+            metric_payload.update(
+                {
+                    "mean_abs_error_flow_nll_finetuned": float(np.mean(fine_err)),
+                    "max_abs_error_flow_nll_finetuned": float(np.max(fine_err)),
+                }
+            )
+        metric_summary[metric] = metric_payload
     summary = {
         "metrics": list(result.metrics),
         "condition_labels": list(result.condition_labels),
         "num_pairs": int(result.pair_indices.shape[0]),
         "metric_summary": metric_summary,
         "flow_npz_paths": {k: str(v) for k, v in result.flow_npz_paths.items()},
+        "flow_nll_finetuned_npz_paths": {
+            k: str(v) for k, v in result.flow_nll_finetuned_npz_paths.items()
+        },
     }
     if extra is not None:
         summary.update(extra)

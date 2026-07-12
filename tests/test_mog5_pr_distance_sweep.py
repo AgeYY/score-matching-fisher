@@ -36,15 +36,18 @@ def _write_case_npz(path: Path, *, offset: float = 0.0, metrics: tuple[str, ...]
     pairs = np.asarray([[0, 1], [0, 2], [1, 2]], dtype=np.int64)
     classical = np.zeros((len(metrics), 3, 3), dtype=np.float64)
     flow = np.zeros((len(metrics), 3, 3), dtype=np.float64)
+    flow_finetuned = np.zeros((len(metrics), 3, 3), dtype=np.float64)
     gt = np.zeros((len(metrics), 3, 3), dtype=np.float64)
     for metric_idx in range(len(metrics)):
         for i, j in pairs:
             gt_val = offset + 10.0 + metric_idx
             classical_val = gt_val + float(i + 1)
             flow_val = gt_val - float(j + 2)
+            flow_finetuned_val = gt_val - 1.0
             gt[metric_idx, i, j] = gt[metric_idx, j, i] = gt_val
             classical[metric_idx, i, j] = classical[metric_idx, j, i] = classical_val
             flow[metric_idx, i, j] = flow[metric_idx, j, i] = flow_val
+            flow_finetuned[metric_idx, i, j] = flow_finetuned[metric_idx, j, i] = flow_finetuned_val
     np.savez_compressed(
         path,
         metric_names=metric_names,
@@ -52,6 +55,7 @@ def _write_case_npz(path: Path, *, offset: float = 0.0, metrics: tuple[str, ...]
         pair_indices=pairs,
         classical_matrices=classical,
         flow_matching_matrices=flow,
+        flow_matching_nll_finetuned_matrices=flow_finetuned,
         ground_truth_matrices=gt,
     )
     return path
@@ -154,6 +158,7 @@ def _write_zero_gt_case_npz(path: Path) -> Path:
     pairs = np.asarray([[0, 1]], dtype=np.int64)
     classical = np.asarray([[[0.0, 2.0], [2.0, 0.0]]], dtype=np.float64)
     flow = np.asarray([[[0.0, -3.0], [-3.0, 0.0]]], dtype=np.float64)
+    flow_finetuned = np.asarray([[[0.0, -1.0], [-1.0, 0.0]]], dtype=np.float64)
     gt = np.zeros((1, 2, 2), dtype=np.float64)
     np.savez_compressed(
         path,
@@ -162,6 +167,7 @@ def _write_zero_gt_case_npz(path: Path) -> Path:
         pair_indices=pairs,
         classical_matrices=classical,
         flow_matching_matrices=flow,
+        flow_matching_nll_finetuned_matrices=flow_finetuned,
         ground_truth_matrices=gt,
     )
     return path
@@ -204,7 +210,7 @@ def test_parser_defaults() -> None:
     repo_root = Path(__file__).resolve().parent.parent
     args = mod.build_parser().parse_args([])
 
-    assert args.n_list == [50, 500, 1000, 1500, 2000, 3000]
+    assert args.n_list == [100, 1000, 2000, 3000]
     assert args.native_x_dim == 3
     assert args.pr_dim is None
     assert not hasattr(args, "pr_dim_list")
@@ -216,6 +222,10 @@ def test_parser_defaults() -> None:
     assert args.yscale == "linear"
     assert args.loss_yscale == "linear"
     assert args.n_repeats == 10
+    assert args.seed == 19
+    assert args.dataset_cov_theta_amp_scale == pytest.approx(1.0)
+    assert args.batch_size == 3000
+    assert args.flow_likelihood_finetune_batch_size == 3000
     assert args.lr == pytest.approx(1e-3)
     assert args.output_dir == repo_root / "data" / "mog5_native_xdim3_distance_sweeps"
 
@@ -253,12 +263,20 @@ def test_aggregate_mean_pairwise_abs_errors(tmp_path: Path) -> None:
     n_rows = [r for r in rows if r["axis"] == "n_total" and r["metric"] == "squared_euclidean"]
     classical_errors = [r["abs_error"] for r in n_rows if r["estimator"] == "classical"]
     flow_errors = [r["abs_error"] for r in n_rows if r["estimator"] == "flow_matching"]
+    flow_finetuned_errors = [
+        r["abs_error"] for r in n_rows if r["estimator"] == "flow_matching_nll_finetuned"
+    ]
     classical_rel_errors = [r["rel_error"] for r in n_rows if r["estimator"] == "classical"]
     flow_rel_errors = [r["rel_error"] for r in n_rows if r["estimator"] == "flow_matching"]
+    flow_finetuned_rel_errors = [
+        r["rel_error"] for r in n_rows if r["estimator"] == "flow_matching_nll_finetuned"
+    ]
     assert np.mean(classical_errors) == pytest.approx((1.0 + 1.0 + 2.0) / 3.0)
     assert np.mean(flow_errors) == pytest.approx((3.0 + 4.0 + 4.0) / 3.0)
+    assert np.mean(flow_finetuned_errors) == pytest.approx(1.0)
     assert np.mean(classical_rel_errors) == pytest.approx(((1.0 / 10.0) + (1.0 / 10.0) + (2.0 / 10.0)) / 3.0)
     assert np.mean(flow_rel_errors) == pytest.approx(((3.0 / 10.0) + (4.0 / 10.0) + (4.0 / 10.0)) / 3.0)
+    assert np.mean(flow_finetuned_rel_errors) == pytest.approx(1.0 / 10.0)
 
 
 def test_repeat_case_paths_and_single_case_args(tmp_path: Path) -> None:
@@ -346,6 +364,7 @@ def test_repeat_aggregate_arrays_and_csv_rows(tmp_path: Path) -> None:
     out = mod.write_aggregate_npz(tmp_path / "sweep.npz", aggregate)
 
     assert aggregate["n_repeat_classical_matrices"].shape == (2, 2, 5, 3, 3)
+    assert aggregate["n_repeat_flow_matching_nll_finetuned_matrices"].shape == (2, 2, 5, 3, 3)
     np.testing.assert_allclose(
         aggregate["n_sweep_classical_matrices"],
         np.mean(aggregate["n_repeat_classical_matrices"], axis=1),
@@ -363,6 +382,7 @@ def test_repeat_aggregate_arrays_and_csv_rows(tmp_path: Path) -> None:
     assert {row["repeat_seed"] for row in rows} == {31, 32}
     with np.load(out, allow_pickle=False) as npz:
         assert npz["n_repeat_classical_matrices"].shape == (2, 2, 5, 3, 3)
+        assert npz["n_repeat_flow_matching_nll_finetuned_matrices"].shape == (2, 2, 5, 3, 3)
         np.testing.assert_array_equal(npz["repeat_seeds"], [31, 32])
 
 
@@ -378,8 +398,10 @@ def test_relative_error_uses_denominator_floor_for_zero_ground_truth(tmp_path: P
     n_rows = [r for r in rows if r["axis"] == "n_total"]
     classical = next(r for r in n_rows if r["estimator"] == "classical")
     flow = next(r for r in n_rows if r["estimator"] == "flow_matching")
+    flow_finetuned = next(r for r in n_rows if r["estimator"] == "flow_matching_nll_finetuned")
     assert classical["rel_error"] == pytest.approx(2.0 / mod.REL_ERROR_DENOM_FLOOR)
     assert flow["rel_error"] == pytest.approx(3.0 / mod.REL_ERROR_DENOM_FLOOR)
+    assert flow_finetuned["rel_error"] == pytest.approx(1.0 / mod.REL_ERROR_DENOM_FLOOR)
 
 
 def test_mean_pair_error_curve_returns_raw_curve_values(tmp_path: Path) -> None:
@@ -435,7 +457,8 @@ def test_plot_sweep_error_writes_errorbar_style_panels(monkeypatch, tmp_path: Pa
     rel_text = rel_svg.read_text(encoding="utf-8")
     expected_description = (
         "layout=2x5;metrics=correlation,cosine,squared_euclidean,mahalanobis_sq,symmetric_kl;"
-        "rows=classical+flow,flow_only"
+        "rows=all_methods,flow_methods;"
+        "estimators=classical,flow_matching,flow_matching_nll_finetuned"
     )
     assert expected_description in abs_text
     assert expected_description in rel_text

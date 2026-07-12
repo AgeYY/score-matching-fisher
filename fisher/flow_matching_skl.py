@@ -53,6 +53,8 @@ LOW_RANK_AFFINE_FAMILIES = {
 
 MC_ENDPOINT_FAMILIES = LOW_RANK_AFFINE_FAMILIES | {"nonlinear"}
 
+PARAMETER_NETWORK_ARCHITECTURES = ("mlp", "residual_mlp")
+
 
 @dataclass
 class FlowSKLResult:
@@ -255,6 +257,77 @@ def _make_mlp(
     return nn.Sequential(*layers)
 
 
+class _ResidualMLP(nn.Module):
+    """Width-preserving residual MLP with ``depth`` hidden linear layers."""
+
+    def __init__(
+        self,
+        *,
+        in_dim: int,
+        out_dim: int,
+        hidden_dim: int,
+        depth: int,
+        final_gain: float = 0.01,
+    ) -> None:
+        super().__init__()
+        if int(depth) < 1:
+            raise ValueError("depth must be >= 1.")
+        gain = float(nn.init.calculate_gain("relu"))
+        self.input = nn.Linear(int(in_dim), int(hidden_dim))
+        nn.init.xavier_uniform_(self.input.weight, gain=gain)
+        nn.init.zeros_(self.input.bias)
+        self.blocks = nn.ModuleList(nn.Linear(int(hidden_dim), int(hidden_dim)) for _ in range(int(depth) - 1))
+        for layer in self.blocks:
+            nn.init.xavier_uniform_(layer.weight, gain=1.0)
+            nn.init.zeros_(layer.bias)
+        self.output = nn.Linear(int(hidden_dim), int(out_dim))
+        nn.init.xavier_uniform_(self.output.weight, gain=float(final_gain))
+        nn.init.zeros_(self.output.bias)
+        self.residual_scale = 1.0 / math.sqrt(max(1, int(depth) - 1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = torch.nn.functional.silu(self.input(x))
+        for layer in self.blocks:
+            h = h + self.residual_scale * torch.nn.functional.silu(layer(h))
+        return self.output(h)
+
+
+def _normalize_parameter_network_architecture(architecture: str) -> str:
+    key = str(architecture).strip().lower().replace("-", "_")
+    if key not in PARAMETER_NETWORK_ARCHITECTURES:
+        raise ValueError(
+            f"network_architecture must be one of {PARAMETER_NETWORK_ARCHITECTURES}; got {architecture!r}."
+        )
+    return key
+
+
+def _make_parameter_net(
+    *,
+    architecture: str,
+    in_dim: int,
+    out_dim: int,
+    hidden_dim: int,
+    depth: int,
+    final_gain: float = 0.01,
+) -> nn.Module:
+    key = _normalize_parameter_network_architecture(architecture)
+    if key == "mlp":
+        return _make_mlp(
+            in_dim=int(in_dim),
+            out_dim=int(out_dim),
+            hidden_dim=int(hidden_dim),
+            depth=int(depth),
+            final_gain=float(final_gain),
+        )
+    return _ResidualMLP(
+        in_dim=int(in_dim),
+        out_dim=int(out_dim),
+        hidden_dim=int(hidden_dim),
+        depth=int(depth),
+        final_gain=float(final_gain),
+    )
+
+
 def _resolve_path_schedule(
     path_schedule: str | GaussianAffinePathSchedule,
 ) -> tuple[GaussianAffinePathSchedule, str]:
@@ -403,6 +476,80 @@ def _standard_normal_log_prob(x: torch.Tensor) -> torch.Tensor:
     return -0.5 * (torch.sum(flat * flat, dim=1) + float(flat.shape[1]) * math.log(2.0 * math.pi))
 
 
+def _velocity_and_exact_divergence(
+    model: nn.Module,
+    x: torch.Tensor,
+    theta: torch.Tensor,
+    t: torch.Tensor,
+    *,
+    create_graph: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Evaluate velocity and an exact differentiable Jacobian trace."""
+
+    with torch.enable_grad():
+        x_req = x.requires_grad_(True) if x.requires_grad else x.detach().requires_grad_(True)
+        theta_b = _expand_theta_to_batch(theta, batch=int(x_req.shape[0]))
+        t_col = _as_col_t(t, batch=int(x_req.shape[0]))
+        velocity = model(x_req, theta_b, t_col)
+        divergence = torch.zeros(int(x_req.shape[0]), dtype=x_req.dtype, device=x_req.device)
+        for dim in range(int(x_req.reshape(int(x_req.shape[0]), -1).shape[1])):
+            component = velocity.reshape(int(velocity.shape[0]), -1)[:, dim]
+            if not component.requires_grad:
+                continue
+            gradient = torch.autograd.grad(
+                component.sum(),
+                x_req,
+                create_graph=bool(create_graph),
+                retain_graph=True,
+                allow_unused=True,
+            )[0]
+            if gradient is not None:
+                divergence = divergence + gradient.reshape(int(gradient.shape[0]), -1)[:, dim]
+        return velocity, divergence
+
+
+def _differentiable_endpoint_log_prob(
+    model: nn.Module,
+    x: torch.Tensor,
+    theta: torch.Tensor,
+    *,
+    ode_steps: int,
+    ode_method: str,
+) -> torch.Tensor:
+    """Differentiate a fixed-step reverse CNF solve through model parameters."""
+
+    method = str(ode_method).strip().lower()
+    if method not in {"euler", "midpoint"}:
+        raise ValueError("Differentiable CNF likelihood supports only euler and midpoint ODE methods.")
+    theta_b = _expand_theta_to_batch(theta, batch=int(x.shape[0]))
+    dt = -1.0 / float(ode_steps)
+    z = x
+    log_det = torch.zeros(int(x.shape[0]), dtype=x.dtype, device=x.device)
+    for step in range(int(ode_steps)):
+        t0 = torch.full((int(x.shape[0]), 1), 1.0 + float(step) * dt, dtype=x.dtype, device=x.device)
+        if method == "euler":
+            velocity, divergence = _velocity_and_exact_divergence(
+                model, z, theta_b, t0, create_graph=True
+            )
+            z = z + dt * velocity
+            log_det = log_det + dt * divergence
+        else:
+            velocity0, _ = _velocity_and_exact_divergence(model, z, theta_b, t0, create_graph=True)
+            z_mid = z + 0.5 * dt * velocity0
+            t_mid = torch.full(
+                (int(x.shape[0]), 1),
+                1.0 + (float(step) + 0.5) * dt,
+                dtype=x.dtype,
+                device=x.device,
+            )
+            velocity_mid, divergence_mid = _velocity_and_exact_divergence(
+                model, z_mid, theta_b, t_mid, create_graph=True
+            )
+            z = z + dt * velocity_mid
+            log_det = log_det + dt * divergence_mid
+    return _standard_normal_log_prob(z) + log_det
+
+
 def flow_endpoint_log_prob(
     model: nn.Module,
     x_norm: torch.Tensor,
@@ -412,6 +559,7 @@ def flow_endpoint_log_prob(
     quadrature_steps: int | None = None,
     ode_steps: int = 32,
     ode_method: str = "midpoint",
+    enable_grad: bool = False,
 ) -> torch.Tensor:
     """Compute endpoint log probability with ``flow_matching`` ODE likelihood."""
 
@@ -423,9 +571,17 @@ def flow_endpoint_log_prob(
         raise ValueError("ode_steps must be >= 1.")
     if not str(ode_method).strip():
         raise ValueError("ode_method must be non-empty.")
-    x_eval = x_norm.detach()
+    x_eval = x_norm if bool(enable_grad) else x_norm.detach()
     theta = theta.to(device=x_eval.device, dtype=x_eval.dtype)
     theta_b = _expand_theta_to_batch(theta, batch=int(x_eval.shape[0]))
+    if bool(enable_grad):
+        return _differentiable_endpoint_log_prob(
+            model,
+            x_eval,
+            theta_b,
+            ode_steps=steps,
+            ode_method=str(ode_method),
+        )
     de, probes = _resolve_divergence_controls(
         divergence_estimator=str(getattr(model, "divergence_estimator", "exact")),
         hutchinson_probes=int(getattr(model, "hutchinson_probes", 1)),
@@ -443,7 +599,7 @@ def flow_endpoint_log_prob(
             method=str(ode_method),
             time_grid=time_grid,
             exact_divergence=exact,
-            enable_grad=False,
+            enable_grad=bool(enable_grad),
             theta_cond=theta_b,
         )
         logps.append(logp)
@@ -480,6 +636,7 @@ class TranslationFlowSKLModel(nn.Module):
         radius: float = 1.0,
         hidden_dim: int = 128,
         depth: int = 3,
+        network_architecture: str = "mlp",
         path_schedule: str | GaussianAffinePathSchedule = "cosine",
         divergence_estimator: str = "exact",
         hutchinson_probes: int = 1,
@@ -500,8 +657,9 @@ class TranslationFlowSKLModel(nn.Module):
             hutchinson_probes=int(hutchinson_probes),
         )
         self.set_path_schedule(path_schedule)
-        self.network_architecture = "film"
-        self.mean_net = _make_mlp(
+        self.network_architecture = _normalize_parameter_network_architecture(network_architecture)
+        self.mean_net = _make_parameter_net(
+            architecture=self.network_architecture,
             in_dim=self.theta_dim,
             out_dim=self.x_dim,
             hidden_dim=int(hidden_dim),
@@ -623,6 +781,7 @@ class _CenteredAffineFlowSKLBase(nn.Module):
         x_dim: int,
         hidden_dim: int = 128,
         depth: int = 3,
+        network_architecture: str = "mlp",
         quadrature_steps: int = 64,
         path_schedule: str | GaussianAffinePathSchedule = "cosine",
         divergence_estimator: str = "exact",
@@ -644,13 +803,14 @@ class _CenteredAffineFlowSKLBase(nn.Module):
         self.hidden_dim = int(hidden_dim)
         self.depth = int(depth)
         self.quadrature_steps = int(quadrature_steps)
-        self.network_architecture = "film"
+        self.network_architecture = _normalize_parameter_network_architecture(network_architecture)
         _set_divergence_controls(
             self,
             divergence_estimator=divergence_estimator,
             hutchinson_probes=int(hutchinson_probes),
         )
-        self.b_net = _make_mlp(
+        self.b_net = _make_parameter_net(
+            architecture=self.network_architecture,
             in_dim=self.theta_dim,
             out_dim=self.x_dim,
             hidden_dim=self.hidden_dim,
@@ -690,6 +850,7 @@ class CenteredSharedAffineFlowSKLModel(_CenteredAffineFlowSKLBase):
         x_dim: int,
         hidden_dim: int = 128,
         depth: int = 3,
+        network_architecture: str = "mlp",
         quadrature_steps: int = 64,
         path_schedule: str | GaussianAffinePathSchedule = "cosine",
         divergence_estimator: str = "exact",
@@ -701,6 +862,7 @@ class CenteredSharedAffineFlowSKLModel(_CenteredAffineFlowSKLBase):
             x_dim=x_dim,
             hidden_dim=hidden_dim,
             depth=depth,
+            network_architecture=network_architecture,
             quadrature_steps=quadrature_steps,
             path_schedule=path_schedule,
             divergence_estimator=divergence_estimator,
@@ -712,7 +874,8 @@ class CenteredSharedAffineFlowSKLModel(_CenteredAffineFlowSKLBase):
         if float(a_diag_jitter) < 0.0:
             raise ValueError("a_diag_jitter must be nonnegative.")
         self.a_diag_jitter = float(a_diag_jitter)
-        self.a_net = _make_mlp(
+        self.a_net = _make_parameter_net(
+            architecture=self.network_architecture,
             in_dim=1,
             out_dim=self.x_dim * self.x_dim,
             hidden_dim=self.hidden_dim,
@@ -770,6 +933,7 @@ class CenteredSharedAffineScalarFlowSKLModel(CenteredSharedAffineFlowSKLModel):
         x_dim: int,
         hidden_dim: int = 128,
         depth: int = 3,
+        network_architecture: str = "mlp",
         quadrature_steps: int = 64,
         path_schedule: str | GaussianAffinePathSchedule = "cosine",
         divergence_estimator: str = "exact",
@@ -781,6 +945,7 @@ class CenteredSharedAffineScalarFlowSKLModel(CenteredSharedAffineFlowSKLModel):
             x_dim=x_dim,
             hidden_dim=hidden_dim,
             depth=depth,
+            network_architecture=network_architecture,
             quadrature_steps=quadrature_steps,
             path_schedule=path_schedule,
             divergence_estimator=divergence_estimator,
@@ -788,7 +953,8 @@ class CenteredSharedAffineScalarFlowSKLModel(CenteredSharedAffineFlowSKLModel):
             a_diag_jitter=float(a_diag_jitter),
         )
         self.velocity_family = "shared_affine_scalar"
-        self.a_net = _make_mlp(
+        self.a_net = _make_parameter_net(
+            architecture=self.network_architecture,
             in_dim=1,
             out_dim=1,
             hidden_dim=self.hidden_dim,
@@ -811,6 +977,7 @@ class CenteredSharedAffineDiagFlowSKLModel(CenteredSharedAffineFlowSKLModel):
         x_dim: int,
         hidden_dim: int = 128,
         depth: int = 3,
+        network_architecture: str = "mlp",
         quadrature_steps: int = 64,
         path_schedule: str | GaussianAffinePathSchedule = "cosine",
         divergence_estimator: str = "exact",
@@ -822,6 +989,7 @@ class CenteredSharedAffineDiagFlowSKLModel(CenteredSharedAffineFlowSKLModel):
             x_dim=x_dim,
             hidden_dim=hidden_dim,
             depth=depth,
+            network_architecture=network_architecture,
             quadrature_steps=quadrature_steps,
             path_schedule=path_schedule,
             divergence_estimator=divergence_estimator,
@@ -829,7 +997,8 @@ class CenteredSharedAffineDiagFlowSKLModel(CenteredSharedAffineFlowSKLModel):
             a_diag_jitter=float(a_diag_jitter),
         )
         self.velocity_family = "shared_affine_diag"
-        self.a_net = _make_mlp(
+        self.a_net = _make_parameter_net(
+            architecture=self.network_architecture,
             in_dim=1,
             out_dim=self.x_dim,
             hidden_dim=self.hidden_dim,
@@ -1213,6 +1382,7 @@ def build_flow_skl_model(
     radius: float = 1.0,
     hidden_dim: int = 128,
     depth: int = 3,
+    network_architecture: str = "mlp",
     low_rank_dim: int = 4,
     quadrature_steps: int = 64,
     path_schedule: str | GaussianAffinePathSchedule = "cosine",
@@ -1237,6 +1407,7 @@ def build_flow_skl_model(
             path_schedule=path_schedule,
             divergence_estimator=str(divergence_estimator),
             hutchinson_probes=int(hutchinson_probes),
+            network_architecture=network_architecture,
             **common,
         )
     shared_affine_classes = {
@@ -1251,6 +1422,7 @@ def build_flow_skl_model(
             divergence_estimator=str(divergence_estimator),
             hutchinson_probes=int(hutchinson_probes),
             a_diag_jitter=float(shared_affine_a_diag_jitter),
+            network_architecture=network_architecture,
             **common,
         )
     condition_affine_classes = {
@@ -1309,6 +1481,9 @@ def train_flow_skl_model(
     epochs: int = 1000,
     batch_size: int = 512,
     lr: float = 1e-4,
+    lr_schedule: str = "constant",
+    min_lr: float = 0.0,
+    lr_schedule_epochs: int | None = None,
     weight_decay: float = 0.0,
     t_eps: float = 0.0005,
     patience: int = 0,
@@ -1316,6 +1491,10 @@ def train_flow_skl_model(
     ema_alpha: float = 0.05,
     max_grad_norm: float = 10.0,
     log_every: int = 50,
+    checkpoint_selection: str = "best",
+    fixed_validation: bool = False,
+    validation_seed: int | None = None,
+    retain_best_state: bool = False,
 ) -> dict[str, Any]:
     """Train a flow-SKL model and return training metadata."""
 
@@ -1326,6 +1505,17 @@ def train_flow_skl_model(
         raise ValueError("batch_size must be >= 1.")
     if float(lr) <= 0.0:
         raise ValueError("lr must be > 0.")
+    schedule_key = str(lr_schedule).strip().lower()
+    if schedule_key not in ("constant", "cosine"):
+        raise ValueError("lr_schedule must be 'constant' or 'cosine'.")
+    if not math.isfinite(float(min_lr)) or float(min_lr) < 0.0 or float(min_lr) > float(lr):
+        raise ValueError("min_lr must be finite and in [0, lr].")
+    schedule_epochs = int(epochs) if lr_schedule_epochs is None else int(lr_schedule_epochs)
+    if schedule_epochs < int(epochs):
+        raise ValueError("lr_schedule_epochs must be >= epochs.")
+    checkpoint_key = str(checkpoint_selection).strip().lower()
+    if checkpoint_key not in ("best", "last"):
+        raise ValueError("checkpoint_selection must be 'best' or 'last'.")
     te = float(t_eps)
     if not (0.0 < te < 0.5):
         raise ValueError("t_eps must be in (0, 0.5).")
@@ -1349,7 +1539,16 @@ def train_flow_skl_model(
     train_ds = TensorDataset(torch.from_numpy(th_tr.astype(np.float32)), torch.from_numpy(x_tr.astype(np.float32)))
     val_ds = TensorDataset(torch.from_numpy(th_va.astype(np.float32)), torch.from_numpy(x_va.astype(np.float32)))
     train_loader = DataLoader(train_ds, batch_size=int(batch_size), shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=int(batch_size), shuffle=False)
+    val_loader_generator = None
+    if validation_seed is not None:
+        val_loader_generator = torch.Generator()
+        val_loader_generator.manual_seed(int(validation_seed) + 1)
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=int(batch_size),
+        shuffle=False,
+        generator=val_loader_generator,
+    )
 
     model.to(device)
     _, schedule_name = _resolve_path_schedule(path_schedule)
@@ -1358,6 +1557,13 @@ def train_flow_skl_model(
     if hasattr(model, "set_path_schedule"):
         model.set_path_schedule(path_schedule)  # type: ignore[attr-defined]
     opt = torch.optim.AdamW(_adamw_parameters(model), lr=float(lr), weight_decay=float(weight_decay))
+    scheduler = None
+    if schedule_key == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt,
+            T_max=schedule_epochs,
+            eta_min=float(min_lr),
+        )
 
     train_losses: list[float] = []
     val_losses: list[float] = []
@@ -1371,8 +1577,28 @@ def train_flow_skl_model(
     stopped_epoch = int(epochs)
     n_clipped_steps = 0
     n_total_steps = 0
+    learning_rates: list[float] = []
+
+    val_generator = None
+    if validation_seed is not None:
+        val_generator = torch.Generator(device=device)
+        val_generator.manual_seed(int(validation_seed))
+    fixed_val_batches: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] | None = None
+    if bool(fixed_validation):
+        fixed_val_batches = []
+        with torch.no_grad():
+            for tb, x1b in val_loader:
+                tb = tb.to(device)
+                x1b = x1b.to(device)
+                bs = int(x1b.shape[0])
+                t_raw = torch.rand(bs, device=device, dtype=x1b.dtype, generator=val_generator)
+                t = te + (1.0 - 2.0 * te) * t_raw
+                x0b = torch.randn(x1b.shape, device=device, dtype=x1b.dtype, generator=val_generator)
+                sample = path.sample(x_0=x0b, x_1=x1b, t=t)
+                fixed_val_batches.append((tb, sample.x_t, sample.t, sample.dx_t))
 
     for epoch in range(1, int(epochs) + 1):
+        learning_rates.append(float(opt.param_groups[0]["lr"]))
         model.train()
         ep_losses: list[float] = []
         for tb, x1b in train_loader:
@@ -1400,21 +1626,25 @@ def train_flow_skl_model(
         model.eval()
         val_ep: list[float] = []
         with torch.no_grad():
-            for tb, x1b in val_loader:
-                tb = tb.to(device)
-                x1b = x1b.to(device)
-                bs = int(x1b.shape[0])
-                t_raw = torch.rand(bs, device=device, dtype=x1b.dtype)
-                t = te + (1.0 - 2.0 * te) * t_raw
-                x0b = torch.randn_like(x1b)
-                path_sample = path.sample(x_0=x0b, x_1=x1b, t=t)
-                val_ep.append(
-                    float(
-                        torch.mean((model(path_sample.x_t, tb, path_sample.t) - path_sample.dx_t) ** 2)
-                        .detach()
-                        .cpu()
+            if fixed_val_batches is not None:
+                for tb, x_t, t, dx_t in fixed_val_batches:
+                    val_ep.append(float(torch.mean((model(x_t, tb, t) - dx_t) ** 2).detach().cpu()))
+            else:
+                for tb, x1b in val_loader:
+                    tb = tb.to(device)
+                    x1b = x1b.to(device)
+                    bs = int(x1b.shape[0])
+                    t_raw = torch.rand(bs, device=device, dtype=x1b.dtype, generator=val_generator)
+                    t = te + (1.0 - 2.0 * te) * t_raw
+                    x0b = torch.randn(x1b.shape, device=device, dtype=x1b.dtype, generator=val_generator)
+                    path_sample = path.sample(x_0=x0b, x_1=x1b, t=t)
+                    val_ep.append(
+                        float(
+                            torch.mean((model(path_sample.x_t, tb, path_sample.t) - path_sample.dx_t) ** 2)
+                            .detach()
+                            .cpu()
+                        )
                     )
-                )
         val_loss = float(np.mean(val_ep))
         val_losses.append(val_loss)
         val_ema = scalar_val_ema_update(val_ema, val_loss, alpha)
@@ -1428,6 +1658,9 @@ def train_flow_skl_model(
             patience_counter = 0
         else:
             patience_counter += 1
+
+        if scheduler is not None:
+            scheduler.step()
 
         if epoch == 1 or epoch % max(1, int(log_every)) == 0 or epoch == int(epochs):
             print(
@@ -1446,10 +1679,10 @@ def train_flow_skl_model(
             )
             break
 
-    if best_state is not None:
+    if checkpoint_key == "best" and best_state is not None:
         model.load_state_dict(best_state)
 
-    return {
+    metadata: dict[str, Any] = {
         "velocity_family": fam,
         "network_architecture": str(getattr(model, "network_architecture", "film")),
         "train_losses": np.asarray(train_losses, dtype=np.float64),
@@ -1462,6 +1695,204 @@ def train_flow_skl_model(
         "n_clipped_steps": int(n_clipped_steps),
         "n_total_steps": int(n_total_steps),
         "path_schedule": schedule_name,
+        "early_ema_alpha": float(alpha),
+        "learning_rates": np.asarray(learning_rates, dtype=np.float64),
+        "lr_schedule": schedule_key,
+        "min_lr": float(min_lr),
+        "lr_schedule_epochs": int(schedule_epochs),
+        "checkpoint_selection": checkpoint_key,
+        "selected_epoch": int(best_epoch if checkpoint_key == "best" else stopped_epoch),
+        "fixed_validation": bool(fixed_validation),
+        "validation_seed": None if validation_seed is None else int(validation_seed),
+    }
+    if bool(retain_best_state) and best_state is not None:
+        metadata["best_state_dict"] = best_state
+    return metadata
+
+
+def finetune_flow_skl_cnf_likelihood(
+    *,
+    model: nn.Module,
+    theta_train: np.ndarray,
+    x_train: np.ndarray,
+    theta_val: np.ndarray | None,
+    x_val: np.ndarray | None,
+    device: torch.device,
+    epochs: int = 100,
+    batch_size: int = 512,
+    lr: float = 1e-4,
+    weight_decay: float = 0.0,
+    ode_steps: int = 32,
+    ode_method: str = "midpoint",
+    patience: int = 0,
+    min_delta: float = 1e-4,
+    ema_alpha: float = 0.05,
+    max_grad_norm: float = 10.0,
+    checkpoint_selection: str = "best",
+    log_every: int = 50,
+) -> dict[str, Any]:
+    """Fine-tune a conditional CNF by maximizing endpoint log likelihood."""
+
+    if int(epochs) < 1:
+        raise ValueError("epochs must be >= 1.")
+    if int(batch_size) < 1:
+        raise ValueError("batch_size must be >= 1.")
+    if float(lr) <= 0.0:
+        raise ValueError("lr must be > 0.")
+    if int(ode_steps) < 1:
+        raise ValueError("ode_steps must be >= 1.")
+    if not str(ode_method).strip():
+        raise ValueError("ode_method must be non-empty.")
+    if int(patience) < 0:
+        raise ValueError("patience must be >= 0.")
+    if float(min_delta) < 0.0:
+        raise ValueError("min_delta must be >= 0.")
+    alpha = float(ema_alpha)
+    if not (0.0 < alpha <= 1.0):
+        raise ValueError("ema_alpha must be in (0, 1].")
+    selection = str(checkpoint_selection).strip().lower()
+    if selection not in {"best", "last"}:
+        raise ValueError("checkpoint_selection must be 'best' or 'last'.")
+
+    th_tr = _as_2d_float64(theta_train, name="theta_train")
+    x_tr = _as_2d_float64(x_train, name="x_train")
+    if theta_val is None or x_val is None:
+        th_va = th_tr
+        x_va = x_tr
+    else:
+        th_va = _as_2d_float64(theta_val, name="theta_val")
+        x_va = _as_2d_float64(x_val, name="x_val")
+    if th_tr.shape[0] < 1 or x_tr.shape[0] < 1 or th_va.shape[0] < 1 or x_va.shape[0] < 1:
+        raise ValueError("train and validation splits must be non-empty.")
+    if th_tr.shape[0] != x_tr.shape[0] or th_va.shape[0] != x_va.shape[0]:
+        raise ValueError("theta and x split lengths must match.")
+
+    train_ds = TensorDataset(torch.from_numpy(th_tr.astype(np.float32)), torch.from_numpy(x_tr.astype(np.float32)))
+    val_ds = TensorDataset(torch.from_numpy(th_va.astype(np.float32)), torch.from_numpy(x_va.astype(np.float32)))
+    train_loader = DataLoader(train_ds, batch_size=int(batch_size), shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=int(batch_size), shuffle=False)
+
+    model.to(device)
+    parameters = _adamw_parameters(model)
+    if not parameters:
+        raise ValueError("model has no trainable parameters.")
+    opt = torch.optim.AdamW(parameters, lr=float(lr), weight_decay=float(weight_decay))
+
+    train_losses: list[float] = []
+    val_losses: list[float] = []
+    val_monitor_losses: list[float] = []
+    val_ema: float | None = None
+    best_val = float("inf")
+    best_epoch = 0
+    best_state: dict[str, torch.Tensor] | None = None
+    patience_counter = 0
+    stopped_early = False
+    stopped_epoch = int(epochs)
+    n_clipped_steps = 0
+    n_total_steps = 0
+
+    def batch_nll(tb: torch.Tensor, xb: torch.Tensor, *, enable_grad: bool) -> torch.Tensor:
+        log_prob = flow_endpoint_log_prob(
+            model,
+            xb,
+            tb,
+            ode_steps=int(ode_steps),
+            ode_method=str(ode_method),
+            enable_grad=bool(enable_grad),
+        )
+        return -torch.mean(log_prob)
+
+    for epoch in range(1, int(epochs) + 1):
+        model.train()
+        epoch_losses: list[float] = []
+        for tb, xb in train_loader:
+            tb = tb.to(device)
+            xb = xb.to(device)
+            loss = batch_nll(tb, xb, enable_grad=True)
+            if not bool(torch.isfinite(loss).item()):
+                raise FloatingPointError(f"Non-finite CNF NLL at epoch {epoch}.")
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            n_total_steps += 1
+            if float(max_grad_norm) > 0.0:
+                grad_norm = torch.nn.utils.clip_grad_norm_(parameters, float(max_grad_norm))
+                if float(grad_norm) > float(max_grad_norm):
+                    n_clipped_steps += 1
+            opt.step()
+            epoch_losses.append(float(loss.detach().cpu()))
+        train_loss = float(np.mean(epoch_losses))
+        train_losses.append(train_loss)
+
+        model.eval()
+        val_epoch: list[float] = []
+        for tb, xb in val_loader:
+            tb = tb.to(device)
+            xb = xb.to(device)
+            val_loss_tensor = batch_nll(tb, xb, enable_grad=False)
+            if not bool(torch.isfinite(val_loss_tensor).item()):
+                raise FloatingPointError(f"Non-finite validation CNF NLL at epoch {epoch}.")
+            val_epoch.append(float(val_loss_tensor.detach().cpu()))
+        val_loss = float(np.mean(val_epoch))
+        val_losses.append(val_loss)
+        val_ema = scalar_val_ema_update(val_ema, val_loss, alpha)
+        val_monitor = float(val_ema)
+        val_monitor_losses.append(val_monitor)
+
+        if val_monitor < best_val - float(min_delta):
+            best_val = val_monitor
+            best_epoch = int(epoch)
+            best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+            patience_counter = 0
+        else:
+            patience_counter += 1
+
+        if epoch == 1 or epoch % max(1, int(log_every)) == 0 or epoch == int(epochs):
+            print(
+                f"[flow-skl-cnf {epoch:4d}/{int(epochs)}] train_nll={train_loss:.6f} "
+                f"val_nll={val_loss:.6f} val_smooth={val_monitor:.6f} "
+                f"best_smooth={best_val:.6f} best_epoch={best_epoch}",
+                flush=True,
+            )
+        if int(patience) > 0 and patience_counter >= int(patience):
+            stopped_early = True
+            stopped_epoch = int(epoch)
+            print(
+                f"[flow-skl-cnf early-stop] epoch={epoch} best_epoch={best_epoch} "
+                f"best_smooth={best_val:.6f} patience={int(patience)}",
+                flush=True,
+            )
+            break
+
+    if selection == "best":
+        if best_state is None:
+            raise RuntimeError("Likelihood fine-tuning did not produce a finite validation checkpoint.")
+        model.load_state_dict(best_state)
+        selected_epoch = int(best_epoch)
+        selected_val = float(best_val)
+    else:
+        selected_epoch = int(stopped_epoch)
+        selected_val = float(val_monitor_losses[-1])
+    model.eval()
+
+    return {
+        "train_nll_losses": np.asarray(train_losses, dtype=np.float64),
+        "val_nll_losses": np.asarray(val_losses, dtype=np.float64),
+        "val_monitor_nll_losses": np.asarray(val_monitor_losses, dtype=np.float64),
+        "best_val_nll": float(best_val),
+        "best_epoch": int(best_epoch),
+        "selected_val_nll": float(selected_val),
+        "selected_epoch": int(selected_epoch),
+        "checkpoint_selection": selection,
+        "stopped_epoch": int(stopped_epoch),
+        "stopped_early": bool(stopped_early),
+        "n_clipped_steps": int(n_clipped_steps),
+        "n_total_steps": int(n_total_steps),
+        "epochs_requested": int(epochs),
+        "batch_size": int(batch_size),
+        "learning_rate": float(lr),
+        "weight_decay": float(weight_decay),
+        "ode_steps": int(ode_steps),
+        "ode_method": str(ode_method),
         "early_ema_alpha": float(alpha),
     }
 
