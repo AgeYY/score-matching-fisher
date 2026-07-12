@@ -1802,6 +1802,22 @@ def finetune_flow_skl_cnf_likelihood(
         )
         return -torch.mean(log_prob)
 
+    # The untouched FM checkpoint is a valid fine-tuning candidate. Evaluating
+    # it here ensures that a harmful first likelihood update can be rejected.
+    model.eval()
+    initial_val_epoch: list[float] = []
+    for tb, xb in val_loader:
+        tb = tb.to(device)
+        xb = xb.to(device)
+        initial_val_tensor = batch_nll(tb, xb, enable_grad=False)
+        if not bool(torch.isfinite(initial_val_tensor).item()):
+            raise FloatingPointError("Non-finite validation CNF NLL before fine-tuning.")
+        initial_val_epoch.append(float(initial_val_tensor.detach().cpu()))
+    initial_val_nll = float(np.mean(initial_val_epoch))
+    val_ema = initial_val_nll
+    best_val = initial_val_nll
+    best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+
     for epoch in range(1, int(epochs) + 1):
         model.train()
         epoch_losses: list[float] = []
@@ -1879,6 +1895,7 @@ def finetune_flow_skl_cnf_likelihood(
         "val_nll_losses": np.asarray(val_losses, dtype=np.float64),
         "val_monitor_nll_losses": np.asarray(val_monitor_losses, dtype=np.float64),
         "best_val_nll": float(best_val),
+        "initial_val_nll": float(initial_val_nll),
         "best_epoch": int(best_epoch),
         "selected_val_nll": float(selected_val),
         "selected_epoch": int(selected_epoch),

@@ -729,6 +729,42 @@ def test_cnf_likelihood_finetune_updates_model_and_records_validation_nll() -> N
     assert any(not torch.equal(before[key], value) for key, value in model.state_dict().items())
 
 
+def test_cnf_likelihood_finetune_can_select_untouched_epoch_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ScalarModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.location = nn.Parameter(torch.zeros(()))
+
+    def fake_log_prob(model, x, theta, **kwargs):
+        del theta, kwargs
+        return -torch.square(x[:, 0] - model.location)
+
+    monkeypatch.setattr("fisher.flow_matching_skl.flow_endpoint_log_prob", fake_log_prob)
+    model = ScalarModel()
+    meta = finetune_flow_skl_cnf_likelihood(
+        model=model,
+        theta_train=np.ones((4, 1), dtype=np.float64),
+        x_train=np.ones((4, 1), dtype=np.float64),
+        theta_val=np.ones((4, 1), dtype=np.float64),
+        x_val=-np.ones((4, 1), dtype=np.float64),
+        device=torch.device("cpu"),
+        epochs=2,
+        batch_size=4,
+        lr=1e-1,
+        ode_steps=1,
+        patience=1,
+        checkpoint_selection="best",
+        log_every=99,
+    )
+
+    assert meta["initial_val_nll"] == pytest.approx(1.0)
+    assert meta["selected_epoch"] == 0
+    assert meta["best_epoch"] == 0
+    assert model.location.item() == pytest.approx(0.0)
+
+
 def test_model_jeffreys_matches_translation_model_skl_with_deterministic_samples(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
