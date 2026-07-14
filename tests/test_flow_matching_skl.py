@@ -291,6 +291,8 @@ def test_build_flow_skl_model_uses_mlp_heads_and_film_nonlinear_subnets() -> Non
             assert isinstance(model.a_net, nn.Sequential)
             if family.startswith("condition_affine"):
                 assert _first_linear_in_features(model.a_net) == 3
+            elif family == "covariate_affine":
+                assert _first_linear_in_features(model.a_net) == 2
             else:
                 assert _first_linear_in_features(model.a_net) == 1
             if "low_rank" in family:

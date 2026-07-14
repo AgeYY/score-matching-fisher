@@ -33,6 +33,7 @@ VELOCITY_FAMILIES = (
     "condition_affine",
     "condition_affine_scalar",
     "condition_affine_diag",
+    "covariate_affine",
     "shared_affine_low_rank",
     "shared_affine_low_rank_scalar",
     "shared_affine_low_rank_diag",
@@ -1081,6 +1082,102 @@ class CenteredConditionAffineFlowSKLModel(_CenteredAffineFlowSKLBase):
         )
 
 
+class CenteredCovariateAffineFlowSKLModel(_CenteredAffineFlowSKLBase):
+    """Centered affine velocity whose ``A`` depends on selected condition coordinates.
+
+    The endpoint mean ``b(theta)`` sees the complete condition, whereas the
+    affine matrix sees only ``theta[:, affine_condition_indices]`` and flow
+    time.  This is useful when some condition coordinates index groups whose
+    covariance must be shared exactly, while other coordinates are continuous
+    covariates along which the covariance may vary.
+    """
+
+    def __init__(
+        self,
+        *,
+        theta_dim: int,
+        x_dim: int,
+        affine_condition_indices: tuple[int, ...],
+        hidden_dim: int = 128,
+        depth: int = 3,
+        network_architecture: str = "mlp",
+        quadrature_steps: int = 64,
+        path_schedule: str | GaussianAffinePathSchedule = "cosine",
+        divergence_estimator: str = "exact",
+        hutchinson_probes: int = 1,
+    ) -> None:
+        super().__init__(
+            theta_dim=theta_dim,
+            x_dim=x_dim,
+            hidden_dim=hidden_dim,
+            depth=depth,
+            network_architecture=network_architecture,
+            quadrature_steps=quadrature_steps,
+            path_schedule=path_schedule,
+            divergence_estimator=divergence_estimator,
+            hutchinson_probes=int(hutchinson_probes),
+        )
+        indices = tuple(int(index) for index in affine_condition_indices)
+        if not indices:
+            raise ValueError("affine_condition_indices must be non-empty.")
+        if len(set(indices)) != len(indices):
+            raise ValueError("affine_condition_indices must not contain duplicates.")
+        if any(index < 0 or index >= self.theta_dim for index in indices):
+            raise ValueError(
+                f"affine_condition_indices must lie in [0, {self.theta_dim - 1}]; got {indices}."
+            )
+        self.velocity_family = "covariate_affine"
+        self.affine_condition_indices = indices
+        self.a_net = _make_parameter_net(
+            architecture=self.network_architecture,
+            in_dim=1 + len(indices),
+            out_dim=self.x_dim * self.x_dim,
+            hidden_dim=self.hidden_dim,
+            depth=self.depth,
+            final_gain=0.01,
+        )
+
+    def A(self, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(0)
+        if theta.ndim != 2 or int(theta.shape[1]) != self.theta_dim:
+            raise ValueError(f"theta must have shape [B, {self.theta_dim}].")
+        t = _as_col_t(t, batch=int(theta.shape[0]))
+        context = theta[:, self.affine_condition_indices]
+        raw = self.a_net(torch.cat([t, context], dim=1)).reshape(
+            int(theta.shape[0]), self.x_dim, self.x_dim
+        )
+        return 0.5 * (raw + raw.transpose(-1, -2))
+
+    def forward(self, x: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        theta = _expand_theta_to_batch(theta, batch=int(x.shape[0]))
+        t = _as_col_t(t, batch=int(x.shape[0]))
+        b = self.b(theta)
+        beta, beta_dot = self._beta_beta_dot(t, batch=int(x.shape[0]))
+        centered = x - beta * b
+        return beta_dot * b + _apply_matrix(self.A(theta, t), centered)
+
+    def log_prob_normalized(
+        self,
+        x_norm: torch.Tensor,
+        theta: torch.Tensor,
+        *,
+        solve_jitter: float = 1e-6,
+        quadrature_steps: int | None = None,
+        ode_steps: int = 32,
+        ode_method: str = "midpoint",
+    ) -> torch.Tensor:
+        return flow_endpoint_log_prob(
+            self,
+            x_norm,
+            theta,
+            solve_jitter=float(solve_jitter),
+            quadrature_steps=quadrature_steps,
+            ode_steps=int(ode_steps),
+            ode_method=str(ode_method),
+        )
+
+
 class CenteredConditionAffineScalarFlowSKLModel(CenteredConditionAffineFlowSKLModel):
     """Centered condition-specific affine velocity with ``A(theta,t) = a(theta,t) I``."""
 
@@ -1390,6 +1487,7 @@ def build_flow_skl_model(
     hutchinson_probes: int = 1,
     shared_affine_a_diag_jitter: float = 1e-3,
     low_rank_basis: np.ndarray | torch.Tensor | None = None,
+    affine_condition_indices: tuple[int, ...] | None = None,
 ) -> nn.Module:
     """Build a velocity-family model for flow-matching SKL estimation."""
 
@@ -1436,6 +1534,21 @@ def build_flow_skl_model(
             path_schedule=path_schedule,
             divergence_estimator=str(divergence_estimator),
             hutchinson_probes=int(hutchinson_probes),
+            **common,
+        )
+    if fam == "covariate_affine":
+        indices = (
+            (int(theta_dim) - 1,)
+            if affine_condition_indices is None
+            else affine_condition_indices
+        )
+        return CenteredCovariateAffineFlowSKLModel(
+            affine_condition_indices=tuple(int(index) for index in indices),
+            quadrature_steps=int(quadrature_steps),
+            path_schedule=path_schedule,
+            divergence_estimator=str(divergence_estimator),
+            hutchinson_probes=int(hutchinson_probes),
+            network_architecture=network_architecture,
             **common,
         )
     low_rank_affine_classes = {
