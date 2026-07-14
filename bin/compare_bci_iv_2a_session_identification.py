@@ -72,7 +72,7 @@ def parse_args() -> argparse.Namespace:
         help="Optional prior rdm_cache directory from which matching cache files are copied.",
     )
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--repeats", type=int, default=20)
+    parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument(
         "--recordings",
         nargs="+",
@@ -190,6 +190,10 @@ def save_outputs(
         for n_index, n_label in enumerate(N_LABELS):
             for repeat in range(repeats):
                 for subject in range(n_recordings):
+                    if not np.all(
+                        np.isfinite(scores[method_index, n_index, repeat, subject])
+                    ):
+                        continue
                     for candidate in range(n_recordings):
                         rows.append(
                             {
@@ -222,6 +226,7 @@ def save_outputs(
         "methods": list(METHODS),
         "n_labels": list(N_LABELS),
         "repeats": int(repeats),
+        "all_data_repeats": 1,
         "seed": int(seed),
         "chance_top1": 1.0 / float(n_recordings),
         "primary_interval_seconds_cue_relative": list(PRIMARY_INTERVAL),
@@ -235,21 +240,38 @@ def save_outputs(
         for n_index, n_label in enumerate(N_LABELS):
             rank_values = ranks[method_index, n_index]
             pre_rank_values = pre_ranks[method_index, n_index]
-            per_subject_top1 = np.mean(rank_values == 1, axis=0)
+            valid_repeats = np.all(np.isfinite(rank_values), axis=1)
+            valid_pre_repeats = np.all(np.isfinite(pre_rank_values), axis=1)
+            top1_by_repeat = np.mean(rank_values[valid_repeats] == 1, axis=1)
+            pre_top1_by_repeat = np.mean(
+                pre_rank_values[valid_pre_repeats] == 1, axis=1
+            )
+            per_subject_top1 = np.mean(
+                rank_values[valid_repeats] == 1, axis=0
+            )
+            top1_repeat_sd = (
+                float(np.std(top1_by_repeat, ddof=1))
+                if top1_by_repeat.size > 1
+                else None
+            )
             margins = []
             for repeat in range(repeats):
                 for subject in range(n_recordings):
                     candidate_scores = scores[method_index, n_index, repeat, subject]
+                    if not np.all(np.isfinite(candidate_scores)):
+                        continue
                     margins.append(
                         float(candidate_scores[subject] - np.max(np.delete(candidate_scores, subject)))
                     )
             summary["metrics"][method][n_label] = {
-                "top1_accuracy": float(np.mean(rank_values == 1)),
-                "top1_subject_sem": float(
-                    np.std(per_subject_top1, ddof=1) / np.sqrt(n_recordings)
+                "top1_accuracy": float(np.mean(top1_by_repeat)),
+                "top1_repeat_sd": top1_repeat_sd,
+                "top1_accuracy_by_repeat": top1_by_repeat.tolist(),
+                "n_identification_repeats": int(top1_by_repeat.size),
+                "mean_reciprocal_rank": float(
+                    np.mean(1.0 / rank_values[valid_repeats])
                 ),
-                "mean_reciprocal_rank": float(np.mean(1.0 / rank_values)),
-                "pre_cue_top1_accuracy": float(np.mean(pre_rank_values == 1)),
+                "pre_cue_top1_accuracy": float(np.mean(pre_top1_by_repeat)),
                 "mean_true_minus_best_competitor_margin": float(np.mean(margins)),
                 "top1_accuracy_by_recording": per_subject_top1.tolist(),
                 "effective_n_per_class": effective_n[n_index].astype(int).tolist(),
@@ -257,8 +279,22 @@ def save_outputs(
     for method_index, method in enumerate(METHODS[1:], start=1):
         summary["paired_method_comparison"][method] = {}
         for n_index, n_label in enumerate(N_LABELS):
-            classical_by_subject = np.mean(ranks[0, n_index] == 1, axis=0)
-            flow_by_subject = np.mean(ranks[method_index, n_index] == 1, axis=0)
+            classical_by_subject = np.nanmean(
+                np.where(
+                    np.isfinite(ranks[0, n_index]),
+                    ranks[0, n_index] == 1,
+                    np.nan,
+                ),
+                axis=0,
+            )
+            flow_by_subject = np.nanmean(
+                np.where(
+                    np.isfinite(ranks[method_index, n_index]),
+                    ranks[method_index, n_index] == 1,
+                    np.nan,
+                ),
+                axis=0,
+            )
             differences = flow_by_subject - classical_by_subject
             observed = float(np.mean(differences))
             null = []
@@ -274,7 +310,7 @@ def save_outputs(
             summary["paired_method_comparison"][method][n_label] = {
                 "flow_minus_classical_top1": observed,
                 "exact_two_sided_subject_sign_flip_p": exact_p,
-                "unit": "recording-level top1 accuracy averaged over subsampling repeats",
+                "unit": "paired recording-level top1 accuracy",
             }
     (output_dir / "summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -300,15 +336,25 @@ def plot_outputs(output_dir: Path, summary: dict, scores: np.ndarray) -> None:
     colors = ("#4C78A8", "#E45756", "#54A24B")
     for method, color in zip(METHODS, colors[: len(METHODS)], strict=True):
         values = [summary["metrics"][method][label]["top1_accuracy"] for label in N_LABELS]
-        errors = [summary["metrics"][method][label]["top1_subject_sem"] for label in N_LABELS]
-        ax.errorbar(
+        errors = [
+            summary["metrics"][method][label]["top1_repeat_sd"]
+            for label in N_LABELS[:-1]
+        ]
+        ax.plot(
             x,
             values,
-            yerr=errors,
             marker="o",
             linewidth=1.8,
-            capsize=3,
             label=METHOD_LABELS[method],
+            color=color,
+        )
+        ax.errorbar(
+            x[:-1],
+            values[:-1],
+            yerr=errors,
+            fmt="none",
+            linewidth=1.5,
+            capsize=3,
             color=color,
         )
     ax.axhline(
@@ -320,7 +366,7 @@ def plot_outputs(output_dir: Path, summary: dict, scores: np.ndarray) -> None:
     )
     ax.set_xticks(x, N_LABELS)
     ax.set_xlabel("Query trials per class")
-    ax.set_ylabel("Top-1 recording accuracy")
+    ax.set_ylabel("Top-1 accuracy")
     ax.set_ylim(0.0, 1.02)
     ax.tick_params(width=1.8)
     for spine in ax.spines.values():
@@ -339,7 +385,7 @@ def plot_outputs(output_dir: Path, summary: dict, scores: np.ndarray) -> None:
     )
     axes = np.atleast_1d(axes)
     for method_index, (method, ax) in enumerate(zip(METHODS, axes, strict=True)):
-        matrix = np.mean(scores[method_index, -1], axis=0)
+        matrix = np.nanmean(scores[method_index, -1], axis=0)
         image = ax.imshow(matrix, vmin=-1.0, vmax=1.0, cmap="coolwarm")
         ax.set_title(METHOD_LABELS[method])
         ax.set_xlabel("Reference recording")
@@ -465,7 +511,8 @@ def main() -> None:
         requested = [4, 8, 12, 18, 24, max_balanced]
         effective_n[:, subject] = np.asarray(requested, dtype=np.int64)
         for n_index, n_per_class in enumerate(requested):
-            for repeat in range(args.repeats):
+            n_repeats = 1 if N_LABELS[n_index] == "all" else args.repeats
+            for repeat in range(n_repeats):
                 subset_seed = args.seed + subject * 100_000 + n_index * 1_000 + repeat
                 selected = subsample_balanced_trials(y_query, n_per_class, subset_seed)
                 x_sub, y_sub = x_query[selected], y_query[selected]
@@ -508,7 +555,7 @@ def main() -> None:
                         )
             print(
                 f"[query] {dataset.session_key} n={N_LABELS[n_index]} "
-                f"effective={n_per_class} repeats={args.repeats} complete",
+                f"effective={n_per_class} repeats={n_repeats} complete",
                 flush=True,
             )
     summary = save_outputs(
