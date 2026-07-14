@@ -82,7 +82,7 @@ def plot_mog5_native_scatter_covariance(
         plot_idx = np.arange(n, dtype=np.int64)
 
     colors = [plt.get_cmap("tab10")(i) for i in range(5)]
-    fig, ax = plt.subplots(figsize=(6.6, 9.0), constrained_layout=True)
+    fig, ax = plt.subplots(figsize=(4.0, 3.5), constrained_layout=True)
     for cls in range(5):
         mask = labels[plot_idx] == cls
         if np.any(mask):
@@ -90,8 +90,8 @@ def plot_mog5_native_scatter_covariance(
             ax.scatter(
                 pts[:, 0],
                 pts[:, 1],
-                s=24,
-                alpha=0.62,
+                s=12,
+                alpha=0.55,
                 color=colors[cls],
                 edgecolors="none",
                 label=f"category {cls}",
@@ -108,8 +108,8 @@ def plot_mog5_native_scatter_covariance(
                 angle=0.0,
                 facecolor=colors[cls],
                 edgecolor=colors[cls],
-                linewidth=1.35,
-                alpha=0.5,
+                linewidth=2.0,
+                alpha=0.38,
                 zorder=2,
             )
         )
@@ -117,24 +117,30 @@ def plot_mog5_native_scatter_covariance(
             [float(mu[0])],
             [float(mu[1])],
             marker="X",
-            s=92,
+            s=88,
             color=colors[cls],
             edgecolors="black",
-            linewidths=0.75,
+            linewidths=1.0,
             zorder=4,
         )
 
-    ax.set_title("MoG5 native dataset")
+    ax.set_title("MoG5 native dataset", fontsize=16)
     ax.set_aspect("equal", adjustable="datalim")
     ax.set_axis_off()
-    ax.legend(loc="best", frameon=False, fontsize=8)
+    ax.legend(
+        loc="best",
+        frameon=False,
+        fontsize=11,
+        handletextpad=0.4,
+        labelspacing=0.3,
+    )
 
     svg_path = Path(svg_path)
     png_path = Path(png_path)
     svg_path.parent.mkdir(parents=True, exist_ok=True)
     png_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(svg_path)
-    fig.savefig(png_path, dpi=220)
+    fig.savefig(png_path, dpi=300)
     plt.close(fig)
     return svg_path, png_path
 

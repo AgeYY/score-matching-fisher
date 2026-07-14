@@ -120,6 +120,11 @@ def test_parser_defaults_and_cpu_auto(monkeypatch: pytest.MonkeyPatch) -> None:
     assert args.n_repeats == 10
     assert args.dataset_cov_theta_amp_scale == pytest.approx(1.0)
     assert args.batch_size == 3000
+    assert args.lr == pytest.approx(1e-4)
+    assert args.hidden_dim == 128
+    assert args.depth == 3
+    assert args.fixed_validation is True
+    assert args.fixed_validation_paths == 10
     assert args.flow_likelihood_finetune_batch_size == 3000
     assert args.flow_likelihood_finetune_lr == pytest.approx(3e-5)
     assert args.flow_likelihood_finetune_ode_steps == 32

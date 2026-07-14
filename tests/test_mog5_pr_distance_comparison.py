@@ -458,6 +458,9 @@ def test_train_and_estimate_flow_uses_model_jeffreys_readout(monkeypatch) -> Non
     assert "corr_soft_eps" not in build_calls[0]
     assert train_calls
     assert train_calls[0]["ema_alpha"] == pytest.approx(0.2)
+    assert train_calls[0]["best_checkpoint_metric"] == "flow_matching"
+    assert train_calls[0]["likelihood_validation_every"] == 100
+    assert train_calls[0]["fixed_validation_paths"] == 10
     assert estimate_calls
     call = estimate_calls[0]
     assert "theta_data" not in call
@@ -477,6 +480,12 @@ def test_flow_comparison_config_default_t_eps_is_small_endpoint_clamp() -> None:
     config = dc.FlowComparisonConfig()
     assert config.t_eps == 0.0005
     assert config.early_ema_alpha == 0.05
+    assert config.batch_size == 3000
+    assert config.lr == pytest.approx(1e-4)
+    assert config.hidden_dim == 128
+    assert config.depth == 3
+    assert config.fixed_validation is True
+    assert config.fixed_validation_paths == 10
     assert config.likelihood_finetune_epochs == 500
     assert config.likelihood_finetune_batch_size == 2048
     assert config.likelihood_finetune_lr == pytest.approx(3e-5)
@@ -629,6 +638,11 @@ def test_cli_default_path_resolution_without_running_training() -> None:
     assert args.dataset_mog_mean_min_dist is None
     assert args.flow_likelihood_finetune_epochs == 500
     assert args.batch_size == 3000
+    assert args.lr == pytest.approx(1e-4)
+    assert args.hidden_dim == 128
+    assert args.depth == 3
+    assert args.fixed_validation is True
+    assert args.fixed_validation_paths == 10
     assert args.flow_likelihood_finetune_batch_size == 3000
     assert args.flow_likelihood_finetune_lr == pytest.approx(3e-5)
     assert args.flow_likelihood_finetune_ode_steps == 32
@@ -648,6 +662,7 @@ def test_cli_default_path_resolution_without_running_training() -> None:
     assert mod._flow_config_from_args(args).radius == 1.0
     assert mod._flow_config_from_args(args).t_eps == 0.0005
     assert mod._flow_config_from_args(args).early_ema_alpha == 0.05
+    assert mod._flow_config_from_args(args).fixed_validation_paths == 10
     assert mod._flow_config_from_args(args).normalize_x is False
     assert mod._flow_config_from_args(args).normalize_x_eps == pytest.approx(1e-8)
     assert mod.resolve_dataset_dir(args) == repo_root / "data" / "mog_5native_xdim3_n1000"
@@ -676,6 +691,74 @@ def test_cli_early_ema_alpha_override_propagates_to_flow_config() -> None:
     args = mod.build_parser().parse_args(["--early-ema-alpha", "0.2"])
     assert args.early_ema_alpha == pytest.approx(0.2)
     assert mod._flow_config_from_args(args).early_ema_alpha == pytest.approx(0.2)
+
+
+def test_cli_short_lr_schedule_horizon_propagates_to_flow_config() -> None:
+    mod = _load_cli_module()
+    args = mod.build_parser().parse_args(
+        ["--lr-schedule", "cosine", "--min-lr", "1e-6", "--lr-schedule-epochs", "5000"]
+    )
+
+    mod.validate_args(args)
+    config = mod._flow_config_from_args(args)
+
+    assert config.lr_schedule == "cosine"
+    assert config.min_lr == pytest.approx(1e-6)
+    assert config.lr_schedule_epochs == 5000
+
+
+def test_cli_rejects_nonpositive_lr_schedule_horizon() -> None:
+    mod = _load_cli_module()
+    args = mod.build_parser().parse_args(["--lr-schedule-epochs", "0"])
+
+    with pytest.raises(ValueError, match="lr-schedule-epochs"):
+        mod.validate_args(args)
+
+
+def test_cli_accepts_comma_separated_metric_subset() -> None:
+    mod = _load_cli_module()
+    args = mod.build_parser().parse_args(["--metric", "correlation,cosine,correlation"])
+
+    mod.validate_args(args)
+
+    assert mod.resolve_metric_names(args) == ("correlation", "cosine")
+
+
+def test_cli_rejects_unknown_metric_in_subset() -> None:
+    mod = _load_cli_module()
+    args = mod.build_parser().parse_args(["--metric", "cosine,unknown"])
+
+    with pytest.raises(ValueError, match="Unknown --metric"):
+        mod.validate_args(args)
+
+
+def test_cli_fixed_validation_paths_override_propagates_to_flow_config() -> None:
+    mod = _load_cli_module()
+    args = mod.build_parser().parse_args(["--fixed-validation", "--fixed-validation-paths", "12"])
+
+    mod.validate_args(args)
+    config = mod._flow_config_from_args(args)
+
+    assert config.fixed_validation is True
+    assert config.fixed_validation_paths == 12
+
+
+def test_cli_can_disable_fixed_validation_default() -> None:
+    mod = _load_cli_module()
+    args = mod.build_parser().parse_args(["--no-fixed-validation"])
+
+    mod.validate_args(args)
+
+    assert args.fixed_validation is False
+    assert mod._flow_config_from_args(args).fixed_validation is False
+
+
+def test_cli_rejects_nonpositive_fixed_validation_paths() -> None:
+    mod = _load_cli_module()
+    args = mod.build_parser().parse_args(["--fixed-validation-paths", "0"])
+
+    with pytest.raises(ValueError, match="fixed-validation-paths"):
+        mod.validate_args(args)
 
 
 def test_cli_flow_normalize_x_override_propagates_to_flow_config() -> None:

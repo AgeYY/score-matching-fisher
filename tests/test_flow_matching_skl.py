@@ -141,6 +141,8 @@ def test_flow_skl_default_t_eps_is_small_endpoint_clamp() -> None:
     sig = inspect.signature(train_flow_skl_model)
     assert sig.parameters["t_eps"].default == pytest.approx(0.0005)
     assert sig.parameters["ema_alpha"].default == pytest.approx(0.05)
+    assert sig.parameters["best_checkpoint_metric"].default == "flow_matching"
+    assert sig.parameters["fixed_validation_paths"].default == 1
 
     mod = _load_run_flow_matching_skl_module()
     args = mod.build_parser().parse_args([])
@@ -154,6 +156,34 @@ def test_centered_fixed_radius_normalize_behavior_is_unchanged() -> None:
     centered = raw - raw.mean(dim=1, keepdim=True)
     expected = 2.0 * centered / torch.linalg.norm(centered, dim=1, keepdim=True)
     torch.testing.assert_close(got, expected)
+
+
+def test_fixed_validation_paths_are_stratified_per_observation() -> None:
+    theta = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+    x1 = torch.tensor([[2.0, 3.0], [4.0, 5.0]])
+    loader = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(theta, x1),
+        batch_size=2,
+        shuffle=False,
+    )
+    path, _ = fms._make_flow_matching_affine_path("linear")  # type: ignore[attr-defined]
+    generator = torch.Generator().manual_seed(123)
+    batches = fms._make_fixed_validation_batches(  # type: ignore[attr-defined]
+        val_loader=loader,
+        path=path,
+        device=torch.device("cpu"),
+        t_eps=0.001,
+        paths_per_observation=4,
+        generator=generator,
+    )
+
+    theta_paths, _, times, _ = batches[0]
+    assert theta_paths.shape == (8, 2)
+    torch.testing.assert_close(theta_paths[:4], theta[0].expand(4, -1))
+    torch.testing.assert_close(theta_paths[4:], theta[1].expand(4, -1))
+    raw_times = (times.reshape(2, 4) - 0.001) / (1.0 - 0.002)
+    strata = torch.floor(raw_times * 4).to(torch.int64)
+    torch.testing.assert_close(strata, torch.arange(4).expand(2, -1))
 
 
 def test_train_flow_skl_early_stopping_uses_ema_monitor(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -224,6 +254,59 @@ def test_train_flow_skl_rejects_invalid_ema_alpha() -> None:
             velocity_family="translation",
             ema_alpha=0.0,
         )
+
+
+def test_train_flow_skl_can_select_best_checkpoint_by_validation_nll(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    nll_values = [3.0, 1.0, 2.0]
+    calls: list[int] = []
+
+    def fake_flow_endpoint_log_prob(model, x_norm, theta, **kwargs):
+        del model, theta
+        assert kwargs["ode_steps"] == 7
+        assert kwargs["ode_method"] == "midpoint"
+        value = nll_values[len(calls)]
+        calls.append(len(calls))
+        return torch.full((x_norm.shape[0],), -value, device=x_norm.device)
+
+    monkeypatch.setattr(fms, "flow_endpoint_log_prob", fake_flow_endpoint_log_prob)
+    model = build_flow_skl_model(
+        velocity_family="translation",
+        theta_dim=2,
+        x_dim=2,
+        hidden_dim=4,
+        depth=1,
+        path_schedule="linear",
+    )
+    theta = np.eye(2, dtype=np.float64)[[0, 1, 0, 1]]
+    x = np.array([[0.0, 0.0], [1.0, -1.0], [0.2, 0.1], [1.2, -0.8]], dtype=np.float64)
+
+    out = train_flow_skl_model(
+        model=model,
+        theta_train=theta,
+        x_train=x,
+        theta_val=theta,
+        x_val=x,
+        device=torch.device("cpu"),
+        velocity_family="translation",
+        path_schedule="linear",
+        epochs=3,
+        batch_size=4,
+        patience=0,
+        min_delta=0.0,
+        log_every=999,
+        best_checkpoint_metric="validation_nll",
+        likelihood_validation_every=1,
+        likelihood_validation_ode_steps=7,
+    )
+
+    np.testing.assert_array_equal(out["likelihood_validation_epochs"], [1, 2, 3])
+    np.testing.assert_allclose(out["likelihood_validation_nlls"], nll_values)
+    assert out["best_checkpoint_metric"] == "validation_nll"
+    assert out["best_val_loss"] == pytest.approx(1.0)
+    assert out["best_epoch"] == 2
+    assert out["selected_epoch"] == 2
 
 
 def test_conditioned_film_net_preserves_shape_dtype_and_uses_linear_theta_embedding() -> None:
@@ -362,6 +445,67 @@ def test_train_flow_skl_supports_cosine_lr_and_last_checkpoint() -> None:
     assert out["learning_rates"].shape == (4,)
     assert out["learning_rates"][0] == pytest.approx(1e-3)
     assert np.all(np.diff(out["learning_rates"]) < 0.0)
+
+
+def test_cosine_lr_reaches_minimum_on_short_horizon_and_stays_there() -> None:
+    model = build_flow_skl_model(
+        velocity_family="translation",
+        theta_dim=2,
+        x_dim=2,
+        hidden_dim=4,
+        depth=1,
+        path_schedule="linear",
+    )
+    theta = np.eye(2, dtype=np.float64)[[0, 1, 0, 1]]
+    x = np.array([[0.0, 0.0], [1.0, -1.0], [0.2, 0.1], [1.2, -0.8]], dtype=np.float64)
+    out = train_flow_skl_model(
+        model=model,
+        theta_train=theta,
+        x_train=x,
+        theta_val=theta,
+        x_val=x,
+        device=torch.device("cpu"),
+        velocity_family="translation",
+        path_schedule="linear",
+        epochs=4,
+        batch_size=4,
+        lr=1e-3,
+        lr_schedule="cosine",
+        min_lr=1e-6,
+        lr_schedule_epochs=2,
+        patience=0,
+        checkpoint_selection="last",
+        fixed_validation=True,
+        log_every=999,
+    )
+
+    assert out["lr_schedule_epochs"] == 2
+    np.testing.assert_allclose(out["learning_rates"], [1e-3, 5.005e-4, 1e-6, 1e-6])
+
+
+def test_train_flow_skl_rejects_nonpositive_lr_schedule_horizon() -> None:
+    model = build_flow_skl_model(
+        velocity_family="translation",
+        theta_dim=2,
+        x_dim=2,
+        hidden_dim=4,
+        depth=1,
+        path_schedule="linear",
+    )
+    theta = np.eye(2, dtype=np.float64)[[0, 1]]
+    x = np.array([[0.0, 0.0], [1.0, -1.0]], dtype=np.float64)
+
+    with pytest.raises(ValueError, match="lr_schedule_epochs"):
+        train_flow_skl_model(
+            model=model,
+            theta_train=theta,
+            x_train=x,
+            theta_val=theta,
+            x_val=x,
+            device=torch.device("cpu"),
+            epochs=1,
+            lr_schedule_epochs=0,
+        )
 
 
 def test_validation_sampling_does_not_change_last_model_training_rng() -> None:

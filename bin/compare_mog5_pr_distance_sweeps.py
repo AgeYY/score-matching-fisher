@@ -820,21 +820,29 @@ def plot_sweep_error(
     ordered_metric_indices = [metric_names.index(metric) for metric in ordered_metric_names]
     pair_indices = np.asarray(aggregate["pair_indices"], dtype=np.int64)
     estimator_styles = {
-        "classical": {"color": "C1", "linestyle": "-", "label": "classical"},
-        "flow_matching": {"color": "C0", "linestyle": "-", "label": "flow matching"},
+        "classical": {
+            "color": "C0",
+            "linestyle": "-",
+            "marker": "o",
+            "label": "Classical",
+        },
+        "flow_matching": {
+            "color": "C1",
+            "linestyle": "-",
+            "marker": "s",
+            "label": "Flow matching",
+        },
         "flow_matching_nll_finetuned": {
             "color": "C2",
             "linestyle": "--",
-            "label": "flow matching + NLL",
+            "marker": "^",
+            "label": "Flow matching + NLL",
         },
     }
     flow_estimators = ["flow_matching"]
     if "n_repeat_flow_matching_nll_finetuned_matrices" in aggregate or "n_sweep_flow_matching_nll_finetuned_matrices" in aggregate:
         flow_estimators.append("flow_matching_nll_finetuned")
-    row_specs = (
-        ("All methods", ("classical", *flow_estimators)),
-        ("Flow methods", tuple(flow_estimators)),
-    )
+    estimators = ("classical", *flow_estimators)
     xvals = np.asarray(aggregate["n_list"], dtype=np.int64)
     gt = np.asarray(aggregate.get("n_repeat_ground_truth_matrices", aggregate["n_sweep_ground_truth_matrices"]), dtype=np.float64)
     matrices_by_estimator = {
@@ -858,97 +866,100 @@ def plot_sweep_error(
     error_label = "Mean relative absolute error" if relative else "Mean absolute error"
     sparse_x_ticks = _sparse_sweep_x_ticks(xvals)
 
-    fig_width = max(7.0, 3.6 * len(ordered_metric_names))
-    fig, axes = plt.subplots(2, len(ordered_metric_names), figsize=(fig_width, 8.0), squeeze=False, constrained_layout=True)
+    n_panels = len(ordered_metric_names)
+    fig, axes_obj = plt.subplots(
+        1,
+        n_panels,
+        figsize=(3.0 * n_panels, 3.5),
+        squeeze=False,
+    )
+    axes = axes_obj[0]
     handles_by_label: dict[str, Any] = {}
     for panel_idx, (metric_idx, metric) in enumerate(zip(ordered_metric_indices, ordered_metric_names, strict=True)):
-        axes[0, panel_idx].set_title(GROUND_TRUTH_RDM_METRIC_TITLES.get(str(metric), str(metric)))
-        for row_idx, (row_label, estimators) in enumerate(row_specs):
-            ax = axes[row_idx, panel_idx]
-            for estimator in estimators:
-                matrices = matrices_by_estimator[estimator]
-                yvals = _mean_pair_error_curve(
-                    matrices,
-                    gt,
-                    pair_indices,
-                    metric_idx=metric_idx,
-                    relative=bool(relative),
-                )
-                style = estimator_styles[estimator]
-                y_arr = np.asarray(yvals, dtype=np.float64)
-                if y_arr.ndim == 1:
-                    y_repeat = y_arr[:, None]
-                else:
-                    y_repeat = y_arr
-                y_mean = np.mean(y_repeat, axis=1)
-                y_sd = (
-                    np.std(y_repeat, axis=1, ddof=1)
-                    if int(y_repeat.shape[1]) > 1
-                    else np.zeros_like(y_mean, dtype=np.float64)
-                )
-                errorbar = ax.errorbar(
-                    xvals,
-                    y_mean,
-                    yerr=y_sd,
-                    color=style["color"],
-                    fmt=style["linestyle"],
-                    linewidth=1.8,
-                    elinewidth=1.2,
-                    capsize=3.0,
-                    label=f"{style['label']} mean",
-                    zorder=3,
-                )
-                handles_by_label[errorbar.get_label()] = errorbar
-            ax.set_xlabel("N data points")
-            if panel_idx == 0:
-                ax.set_ylabel(error_label)
+        ax = axes[panel_idx]
+        ax.set_title(GROUND_TRUTH_RDM_METRIC_TITLES.get(str(metric), str(metric)), fontsize=16)
+        for estimator in estimators:
+            matrices = matrices_by_estimator[estimator]
+            yvals = _mean_pair_error_curve(
+                matrices,
+                gt,
+                pair_indices,
+                metric_idx=metric_idx,
+                relative=bool(relative),
+            )
+            style = estimator_styles[estimator]
+            y_arr = np.asarray(yvals, dtype=np.float64)
+            if y_arr.ndim == 1:
+                y_repeat = y_arr[:, None]
             else:
-                ax.set_ylabel("")
-            if panel_idx == 0:
-                ax.text(
-                    -0.36,
-                    0.5,
-                    row_label,
-                    transform=ax.transAxes,
-                    rotation=90,
-                    va="center",
-                    ha="center",
-                    fontsize=10,
-                    fontweight="semibold",
-                )
-            ax.set_xticks(sparse_x_ticks)
-            if str(yscale) == "log":
-                ax.set_yscale("log")
-                ymin = min(
-                    (
-                        line.get_ydata()[line.get_ydata() > 0].min()
-                        for line in ax.lines
-                        if np.any(line.get_ydata() > 0)
-                    ),
-                    default=1e-12,
-                )
-                ax.set_ylim(bottom=max(float(ymin) * 0.5, 1e-12))
-    fig.legend(
+                y_repeat = y_arr
+            y_mean = np.mean(y_repeat, axis=1)
+            y_sd = (
+                np.std(y_repeat, axis=1, ddof=1)
+                if int(y_repeat.shape[1]) > 1
+                else np.zeros_like(y_mean, dtype=np.float64)
+            )
+            errorbar = ax.errorbar(
+                xvals,
+                y_mean,
+                yerr=y_sd,
+                color=style["color"],
+                linestyle=style["linestyle"],
+                marker=style["marker"],
+                markersize=6.5,
+                markeredgewidth=1.2,
+                linewidth=2.2,
+                elinewidth=1.5,
+                capsize=3.5,
+                capthick=1.5,
+                label=style["label"],
+                zorder=3,
+            )
+            handles_by_label[errorbar.get_label()] = errorbar
+        ax.set_xticks(sparse_x_ticks)
+        ax.set_axisbelow(True)
+        ax.grid(axis="x", visible=False)
+        ax.grid(axis="y", color="#D0D0D0", linewidth=0.8, alpha=0.65)
+        ax.tick_params(axis="both", labelsize=16, width=1.8, length=5)
+        for spine in ax.spines.values():
+            spine.set_linewidth(1.8)
+        if panel_idx == 0:
+            ax.set_ylabel(error_label, fontsize=16)
+        if str(yscale) == "log":
+            ax.set_yscale("log")
+            ymin = min(
+                (
+                    line.get_ydata()[line.get_ydata() > 0].min()
+                    for line in ax.lines
+                    if np.any(line.get_ydata() > 0)
+                ),
+                default=1e-12,
+            )
+            ax.set_ylim(bottom=max(float(ymin) * 0.5, 1e-12))
+    fig.supxlabel("Total samples", fontsize=16, y=0.04)
+    axes[0].legend(
         handles_by_label.values(),
         handles_by_label.keys(),
-        loc="lower center",
-        bbox_to_anchor=(0.5, -0.045),
-        ncol=max(1, len(handles_by_label)),
+        loc="upper right",
+        ncol=1,
         frameon=False,
-        fontsize=10,
+        fontsize=12,
+        handlelength=1.6,
+        handletextpad=0.5,
+        labelspacing=0.35,
+        borderaxespad=0.25,
     )
-    title_kind = "relative absolute error" if relative else "absolute error"
-    fig.suptitle(f"MoG5 PR distance comparison {title_kind} ({aggregate['pr_dim_label']})", fontsize=13)
+    fig.subplots_adjust(left=0.065, right=0.99, bottom=0.22, top=0.88, wspace=0.32)
     svg_path.parent.mkdir(parents=True, exist_ok=True)
     metadata = {
         "Description": (
-            f"layout=2x{len(ordered_metric_names)};metrics={','.join(ordered_metric_names)};"
-            f"rows=all_methods,flow_methods;estimators={','.join(('classical', *flow_estimators))};"
+            f"layout=1x{len(ordered_metric_names)};metrics={','.join(ordered_metric_names)};"
+            f"estimators={','.join(estimators)};"
             "lines=repeat_means;errorbars=mean_sd"
         )
     }
     fig.savefig(svg_path, metadata=metadata, bbox_inches="tight")
-    fig.savefig(png_path, dpi=200, bbox_inches="tight")
+    fig.savefig(png_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     return svg_path, png_path
 
@@ -977,10 +988,23 @@ def plot_ground_truth_rdms(
     ordered_metric_names += tuple(metric for metric in metric_names if metric not in ordered_metric_names)
     ordered_indices = [metric_names.index(metric) for metric in ordered_metric_names]
     ordered_matrices = matrices[ordered_indices]
+    display_condition_labels = tuple(f"C{idx}" for idx in range(len(condition_labels)))
 
-    fig_width = max(4.8, 3.8 * len(ordered_metric_names))
-    fig, axes_obj = plt.subplots(1, len(ordered_metric_names), figsize=(fig_width, 4.6), squeeze=False, constrained_layout=True)
-    axes = axes_obj[0]
+    n_panels = len(ordered_metric_names)
+    fig = plt.figure(figsize=(2.5 * n_panels, 3.1))
+    grid = fig.add_gridspec(
+        2,
+        n_panels,
+        height_ratios=(1.0, 0.075),
+        left=0.06,
+        right=0.995,
+        bottom=0.12,
+        top=0.88,
+        wspace=0.22,
+        hspace=0.32,
+    )
+    axes = [fig.add_subplot(grid[0, panel_idx]) for panel_idx in range(n_panels)]
+    colorbar_axes = [fig.add_subplot(grid[1, panel_idx]) for panel_idx in range(n_panels)]
     images = []
     ticks = np.arange(len(condition_labels), dtype=np.int64)
     for panel_idx, (ax, metric, matrix) in enumerate(zip(axes, ordered_metric_names, ordered_matrices, strict=True)):
@@ -995,26 +1019,35 @@ def plot_ground_truth_rdms(
             vmax = vmin + 1.0
         image = ax.imshow(arr, cmap="viridis", vmin=vmin, vmax=vmax, aspect="equal")
         images.append(image)
-        ax.set_title(GROUND_TRUTH_RDM_METRIC_TITLES.get(str(metric), str(metric)))
+        ax.set_title(GROUND_TRUTH_RDM_METRIC_TITLES.get(str(metric), str(metric)), fontsize=13)
         ax.set_xticks(ticks)
         ax.set_yticks(ticks)
-        ax.set_xticklabels(condition_labels, rotation=45, ha="right", fontsize=8)
-        ax.set_xlabel("condition")
+        ax.set_xticklabels(display_condition_labels, fontsize=13)
         if panel_idx == 0:
-            ax.set_yticklabels(condition_labels, fontsize=8)
-            ax.set_ylabel("condition")
+            ax.set_yticklabels(display_condition_labels, fontsize=13)
         else:
             ax.set_yticklabels([])
-            ax.set_ylabel("")
-        fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+        ax.tick_params(width=1.5, length=3)
+        for spine in ax.spines.values():
+            spine.set_linewidth(1.5)
+        colorbar = fig.colorbar(
+            image,
+            cax=colorbar_axes[panel_idx],
+            orientation="horizontal",
+            ticks=np.linspace(vmin, vmax, 3),
+            format="%.2g",
+        )
+        colorbar.ax.tick_params(labelsize=13, width=1.5, length=3)
+        colorbar.outline.set_linewidth(1.5)
 
-    fig.suptitle(
-        f"MoG5 ground-truth RDMs ({ground_truth['pr_dim_label']}, n_total={int(ground_truth['n_total'])})",
-        fontsize=13,
-    )
     svg_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(svg_path, metadata={"Description": "metrics=" + ",".join(ordered_metric_names)})
-    fig.savefig(png_path, dpi=200)
+    fig.savefig(
+        svg_path,
+        metadata={"Description": "metrics=" + ",".join(ordered_metric_names)},
+        bbox_inches="tight",
+        pad_inches=0.05,
+    )
+    fig.savefig(png_path, dpi=300, bbox_inches="tight", pad_inches=0.05)
     plt.close(fig)
     return svg_path, png_path
 

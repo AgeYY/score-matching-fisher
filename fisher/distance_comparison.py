@@ -73,13 +73,14 @@ class FlowComparisonConfig:
     early_patience: int = 1_000
     early_min_delta: float = 1e-4
     early_ema_alpha: float = 0.05
-    batch_size: int = 512
-    lr: float = 1e-3
+    batch_size: int = 3000
+    lr: float = 1e-4
     lr_schedule: str = "constant"
     min_lr: float = 0.0
+    lr_schedule_epochs: int | None = None
     weight_decay: float = 0.0
-    hidden_dim: int = 256
-    depth: int = 5
+    hidden_dim: int = 128
+    depth: int = 3
     network_architecture: str = "mlp"
     low_rank_dim: int = 4
     path_schedule: str = "cosine"
@@ -95,7 +96,12 @@ class FlowComparisonConfig:
     max_grad_norm: float = 10.0
     log_every: int = 50
     checkpoint_selection: str = "best"
-    fixed_validation: bool = False
+    best_checkpoint_metric: str = "flow_matching"
+    likelihood_validation_every: int = 100
+    likelihood_validation_ode_steps: int = 32
+    likelihood_validation_ode_method: str = "midpoint"
+    fixed_validation: bool = True
+    fixed_validation_paths: int = 10
     radius: float = 1.0
     normalize_x: bool = False
     normalize_x_eps: float = 1e-8
@@ -645,6 +651,7 @@ def _build_and_train_flow_model(
         lr=float(config.lr),
         lr_schedule=str(config.lr_schedule),
         min_lr=float(config.min_lr),
+        lr_schedule_epochs=None if config.lr_schedule_epochs is None else int(config.lr_schedule_epochs),
         weight_decay=float(config.weight_decay),
         t_eps=float(config.t_eps),
         patience=int(config.early_patience),
@@ -653,7 +660,12 @@ def _build_and_train_flow_model(
         max_grad_norm=float(config.max_grad_norm),
         log_every=max(1, int(config.log_every)),
         checkpoint_selection=str(config.checkpoint_selection),
+        best_checkpoint_metric=str(config.best_checkpoint_metric),
+        likelihood_validation_every=int(config.likelihood_validation_every),
+        likelihood_validation_ode_steps=int(config.likelihood_validation_ode_steps),
+        likelihood_validation_ode_method=str(config.likelihood_validation_ode_method),
         fixed_validation=bool(config.fixed_validation),
+        fixed_validation_paths=int(config.fixed_validation_paths),
         validation_seed=int(seed) + 500_000 if bool(config.fixed_validation) else None,
     )
     return model, train_meta
@@ -841,6 +853,7 @@ def save_flow_result_npz(
         "stopped_early",
         "early_ema_alpha",
         "min_lr",
+        "lr_schedule_epochs",
         "fixed_validation",
     ):
         if key in meta:

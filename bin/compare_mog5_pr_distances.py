@@ -148,9 +148,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--metric",
-        choices=("all", *METRIC_NAMES),
         default="all",
-        help="Distance metric to compute, or all metrics.",
+        help="Distance metric, comma-separated metric subset, or 'all'.",
     )
 
     p.add_argument("--gt-samples-per-class", type=int, default=100_000)
@@ -164,18 +163,39 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--early-min-delta", type=float, default=1e-4)
     p.add_argument("--early-ema-alpha", type=float, default=0.05)
     p.add_argument("--batch-size", type=int, default=3000)
-    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--lr-schedule", choices=("constant", "cosine"), default="constant")
     p.add_argument("--min-lr", type=float, default=0.0)
+    p.add_argument(
+        "--lr-schedule-epochs",
+        type=int,
+        default=None,
+        help="Cosine decay horizon; defaults to --epochs and stays at --min-lr afterward.",
+    )
     p.add_argument("--weight-decay", type=float, default=0.0)
-    p.add_argument("--hidden-dim", type=int, default=256)
-    p.add_argument("--depth", type=int, default=5)
+    p.add_argument("--hidden-dim", type=int, default=128)
+    p.add_argument("--depth", type=int, default=3)
     p.add_argument("--network-architecture", choices=("mlp", "residual_mlp"), default="mlp")
     p.add_argument("--fm-checkpoint-selection", choices=("best", "last"), default="best")
-    p.add_argument(
+    validation_group = p.add_mutually_exclusive_group()
+    validation_group.add_argument(
         "--fixed-validation",
+        dest="fixed_validation",
         action="store_true",
         help="Reuse one fixed set of validation base samples and interpolation times across FM epochs.",
+    )
+    validation_group.add_argument(
+        "--no-fixed-validation",
+        dest="fixed_validation",
+        action="store_false",
+        help="Resample validation flow paths at every epoch.",
+    )
+    p.set_defaults(fixed_validation=True)
+    p.add_argument(
+        "--fixed-validation-paths",
+        type=int,
+        default=10,
+        help="Number of fixed stratified flow paths per validation observation.",
     )
     p.add_argument("--low-rank-dim", type=int, default=4)
     p.add_argument("--radius", type=float, default=1.0, help="Fixed norm radius for cosine/correlation flow rows.")
@@ -231,10 +251,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def resolve_metric_names(args: argparse.Namespace) -> tuple[str, ...]:
-    metric = str(getattr(args, "metric", "all"))
-    if metric == "all":
+    selection = str(getattr(args, "metric", "all")).strip()
+    if selection == "all":
         return tuple(METRIC_NAMES)
-    return (metric,)
+    metrics = tuple(dict.fromkeys(part.strip() for part in selection.split(",") if part.strip()))
+    invalid = tuple(metric for metric in metrics if metric not in METRIC_NAMES)
+    if not metrics or invalid:
+        valid = ", ".join(METRIC_NAMES)
+        invalid_text = selection if not metrics else ", ".join(invalid)
+        raise ValueError(f"Unknown --metric value(s): {invalid_text}. Expected 'all' or a subset of: {valid}.")
+    return metrics
 
 
 def resolve_dataset_dir(args: argparse.Namespace) -> Path:
@@ -250,6 +276,7 @@ def resolve_output_dir(args: argparse.Namespace) -> Path:
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    resolve_metric_names(args)
     native_x_dim = int(args.native_x_dim)
     if native_x_dim < 2:
         raise ValueError(f"--native-x-dim must be >= 2; got {args.native_x_dim}.")
@@ -265,6 +292,10 @@ def validate_args(args: argparse.Namespace) -> None:
         value = float(args.dataset_mog_mean_min_dist)
         if not math.isfinite(value) or value < 0.0:
             raise ValueError("--dataset-mog-mean-min-dist must be finite and non-negative.")
+    if int(args.fixed_validation_paths) < 1:
+        raise ValueError("--fixed-validation-paths must be >= 1.")
+    if args.lr_schedule_epochs is not None and int(args.lr_schedule_epochs) < 1:
+        raise ValueError("--lr-schedule-epochs must be >= 1.")
     if int(args.flow_likelihood_finetune_epochs) < 0:
         raise ValueError("--flow-likelihood-finetune-epochs must be >= 0.")
     if int(args.flow_likelihood_finetune_batch_size) < 0:
@@ -333,6 +364,7 @@ def _flow_config_from_args(args: argparse.Namespace) -> FlowComparisonConfig:
         lr=float(args.lr),
         lr_schedule=str(args.lr_schedule),
         min_lr=float(args.min_lr),
+        lr_schedule_epochs=None if args.lr_schedule_epochs is None else int(args.lr_schedule_epochs),
         weight_decay=float(args.weight_decay),
         hidden_dim=int(args.hidden_dim),
         depth=int(args.depth),
@@ -353,6 +385,7 @@ def _flow_config_from_args(args: argparse.Namespace) -> FlowComparisonConfig:
         log_every=int(args.log_every),
         checkpoint_selection=str(args.fm_checkpoint_selection),
         fixed_validation=bool(args.fixed_validation),
+        fixed_validation_paths=int(args.fixed_validation_paths),
         normalize_x=bool(args.flow_normalize_x),
         normalize_x_eps=float(args.flow_normalize_x_eps),
         likelihood_finetune_epochs=int(args.flow_likelihood_finetune_epochs),

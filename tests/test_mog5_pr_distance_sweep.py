@@ -226,7 +226,11 @@ def test_parser_defaults() -> None:
     assert args.dataset_cov_theta_amp_scale == pytest.approx(1.0)
     assert args.batch_size == 3000
     assert args.flow_likelihood_finetune_batch_size == 3000
-    assert args.lr == pytest.approx(1e-3)
+    assert args.lr == pytest.approx(1e-4)
+    assert args.hidden_dim == 128
+    assert args.depth == 3
+    assert args.fixed_validation is True
+    assert args.fixed_validation_paths == 10
     assert args.output_dir == repo_root / "data" / "mog5_native_xdim3_distance_sweeps"
 
     native2_args = mod.build_parser().parse_args(["--native-x-dim", "2", "--pr-dim", "none"])
@@ -456,8 +460,7 @@ def test_plot_sweep_error_writes_errorbar_style_panels(monkeypatch, tmp_path: Pa
     abs_text = abs_svg.read_text(encoding="utf-8")
     rel_text = rel_svg.read_text(encoding="utf-8")
     expected_description = (
-        "layout=2x5;metrics=correlation,cosine,squared_euclidean,mahalanobis_sq,symmetric_kl;"
-        "rows=all_methods,flow_methods;"
+        "layout=1x5;metrics=correlation,cosine,squared_euclidean,mahalanobis_sq,symmetric_kl;"
         "estimators=classical,flow_matching,flow_matching_nll_finetuned"
     )
     assert expected_description in abs_text
@@ -466,7 +469,7 @@ def test_plot_sweep_error_writes_errorbar_style_panels(monkeypatch, tmp_path: Pa
         assert title in abs_text
     assert "errorbars=mean_sd" in abs_text
     assert "points=repeats" not in abs_text
-    assert "N data points" in abs_text
+    assert "Total samples" in abs_text
     assert "Mean absolute error" in abs_text
     assert "Mean relative absolute error" in rel_text
 

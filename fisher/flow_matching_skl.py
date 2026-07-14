@@ -1468,6 +1468,48 @@ def _adamw_parameters(model: nn.Module) -> list[nn.Parameter]:
     return [p for p in model.parameters() if p.requires_grad]
 
 
+def _make_fixed_validation_batches(
+    *,
+    val_loader: DataLoader,
+    path: Any,
+    device: torch.device,
+    t_eps: float,
+    paths_per_observation: int,
+    generator: torch.Generator | None,
+) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Create fixed FM validation paths with one time draw in each stratum."""
+
+    count = int(paths_per_observation)
+    if count < 1:
+        raise ValueError("paths_per_observation must be >= 1.")
+    batches: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    with torch.no_grad():
+        for theta, x1 in val_loader:
+            theta = theta.to(device)
+            x1 = x1.to(device)
+            batch = int(x1.shape[0])
+            strata = torch.arange(count, device=device, dtype=x1.dtype).view(1, count)
+            jitter = torch.rand(
+                (batch, count),
+                device=device,
+                dtype=x1.dtype,
+                generator=generator,
+            )
+            t_raw = (strata + jitter) / float(count)
+            t = float(t_eps) + (1.0 - 2.0 * float(t_eps)) * t_raw.reshape(-1)
+            x1_paths = x1[:, None, :].expand(-1, count, -1).reshape(-1, x1.shape[1])
+            theta_paths = theta[:, None, :].expand(-1, count, -1).reshape(-1, theta.shape[1])
+            x0 = torch.randn(
+                x1_paths.shape,
+                device=device,
+                dtype=x1.dtype,
+                generator=generator,
+            )
+            sample = path.sample(x_0=x0, x_1=x1_paths, t=t)
+            batches.append((theta_paths, sample.x_t, sample.t, sample.dx_t))
+    return batches
+
+
 def train_flow_skl_model(
     *,
     model: nn.Module,
@@ -1492,7 +1534,12 @@ def train_flow_skl_model(
     max_grad_norm: float = 10.0,
     log_every: int = 50,
     checkpoint_selection: str = "best",
+    best_checkpoint_metric: str = "flow_matching",
+    likelihood_validation_every: int = 100,
+    likelihood_validation_ode_steps: int = 32,
+    likelihood_validation_ode_method: str = "midpoint",
     fixed_validation: bool = False,
+    fixed_validation_paths: int = 1,
     validation_seed: int | None = None,
     retain_best_state: bool = False,
 ) -> dict[str, Any]:
@@ -1511,11 +1558,20 @@ def train_flow_skl_model(
     if not math.isfinite(float(min_lr)) or float(min_lr) < 0.0 or float(min_lr) > float(lr):
         raise ValueError("min_lr must be finite and in [0, lr].")
     schedule_epochs = int(epochs) if lr_schedule_epochs is None else int(lr_schedule_epochs)
-    if schedule_epochs < int(epochs):
-        raise ValueError("lr_schedule_epochs must be >= epochs.")
+    if schedule_epochs < 1:
+        raise ValueError("lr_schedule_epochs must be >= 1.")
     checkpoint_key = str(checkpoint_selection).strip().lower()
     if checkpoint_key not in ("best", "last"):
         raise ValueError("checkpoint_selection must be 'best' or 'last'.")
+    best_metric_key = str(best_checkpoint_metric).strip().lower()
+    if best_metric_key not in ("flow_matching", "validation_nll"):
+        raise ValueError("best_checkpoint_metric must be 'flow_matching' or 'validation_nll'.")
+    if int(likelihood_validation_every) < 1:
+        raise ValueError("likelihood_validation_every must be >= 1.")
+    if int(likelihood_validation_ode_steps) < 1:
+        raise ValueError("likelihood_validation_ode_steps must be >= 1.")
+    if int(fixed_validation_paths) < 1:
+        raise ValueError("fixed_validation_paths must be >= 1.")
     te = float(t_eps)
     if not (0.0 < te < 0.5):
         raise ValueError("t_eps must be in (0, 0.5).")
@@ -1568,6 +1624,8 @@ def train_flow_skl_model(
     train_losses: list[float] = []
     val_losses: list[float] = []
     val_monitor_losses: list[float] = []
+    likelihood_validation_epochs: list[int] = []
+    likelihood_validation_nlls: list[float] = []
     val_ema: float | None = None
     best_val = float("inf")
     best_epoch = 0
@@ -1585,17 +1643,14 @@ def train_flow_skl_model(
         val_generator.manual_seed(int(validation_seed))
     fixed_val_batches: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] | None = None
     if bool(fixed_validation):
-        fixed_val_batches = []
-        with torch.no_grad():
-            for tb, x1b in val_loader:
-                tb = tb.to(device)
-                x1b = x1b.to(device)
-                bs = int(x1b.shape[0])
-                t_raw = torch.rand(bs, device=device, dtype=x1b.dtype, generator=val_generator)
-                t = te + (1.0 - 2.0 * te) * t_raw
-                x0b = torch.randn(x1b.shape, device=device, dtype=x1b.dtype, generator=val_generator)
-                sample = path.sample(x_0=x0b, x_1=x1b, t=t)
-                fixed_val_batches.append((tb, sample.x_t, sample.t, sample.dx_t))
+        fixed_val_batches = _make_fixed_validation_batches(
+            val_loader=val_loader,
+            path=path,
+            device=device,
+            t_eps=te,
+            paths_per_observation=int(fixed_validation_paths),
+            generator=val_generator,
+        )
 
     for epoch in range(1, int(epochs) + 1):
         learning_rates.append(float(opt.param_groups[0]["lr"]))
@@ -1651,22 +1706,50 @@ def train_flow_skl_model(
         val_smooth = float(val_ema)
         val_monitor_losses.append(val_smooth)
 
-        if val_smooth < best_val - float(min_delta):
-            best_val = val_smooth
-            best_epoch = int(epoch)
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            patience_counter = 0
-        else:
-            patience_counter += 1
+        checkpoint_metric_value: float | None = None
+        if best_metric_key == "flow_matching":
+            checkpoint_metric_value = val_smooth
+        elif (
+            epoch == 1
+            or epoch % int(likelihood_validation_every) == 0
+            or epoch == int(epochs)
+        ):
+            nll_sum = 0.0
+            nll_count = 0
+            for tb, x1b in val_loader:
+                tb = tb.to(device)
+                x1b = x1b.to(device)
+                log_prob = flow_endpoint_log_prob(
+                    model,
+                    x1b,
+                    tb,
+                    ode_steps=int(likelihood_validation_ode_steps),
+                    ode_method=str(likelihood_validation_ode_method),
+                    enable_grad=False,
+                )
+                nll_sum += float((-log_prob).sum().detach().cpu())
+                nll_count += int(x1b.shape[0])
+            checkpoint_metric_value = nll_sum / float(nll_count)
+            likelihood_validation_epochs.append(int(epoch))
+            likelihood_validation_nlls.append(float(checkpoint_metric_value))
 
-        if scheduler is not None:
+        if checkpoint_metric_value is not None:
+            if checkpoint_metric_value < best_val - float(min_delta):
+                best_val = float(checkpoint_metric_value)
+                best_epoch = int(epoch)
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                patience_counter = 0
+            else:
+                patience_counter += 1
+
+        if scheduler is not None and epoch <= schedule_epochs:
             scheduler.step()
 
         if epoch == 1 or epoch % max(1, int(log_every)) == 0 or epoch == int(epochs):
             print(
                 f"[flow-skl {fam} {epoch:4d}/{int(epochs)}] train={train_loss:.6f} "
                 f"val={val_loss:.6f} val_smooth={val_smooth:.6f} "
-                f"best_smooth={best_val:.6f} best_epoch={best_epoch}",
+                f"best_{best_metric_key}={best_val:.6f} best_epoch={best_epoch}",
                 flush=True,
             )
         if int(patience) > 0 and patience_counter >= int(patience):
@@ -1674,7 +1757,7 @@ def train_flow_skl_model(
             stopped_epoch = int(epoch)
             print(
                 f"[flow-skl {fam} early-stop] epoch={epoch} best_epoch={best_epoch} "
-                f"best_smooth={best_val:.6f} patience={int(patience)}",
+                f"best_{best_metric_key}={best_val:.6f} patience={int(patience)}",
                 flush=True,
             )
             break
@@ -1688,6 +1771,8 @@ def train_flow_skl_model(
         "train_losses": np.asarray(train_losses, dtype=np.float64),
         "val_losses": np.asarray(val_losses, dtype=np.float64),
         "val_monitor_losses": np.asarray(val_monitor_losses, dtype=np.float64),
+        "likelihood_validation_epochs": np.asarray(likelihood_validation_epochs, dtype=np.int64),
+        "likelihood_validation_nlls": np.asarray(likelihood_validation_nlls, dtype=np.float64),
         "best_val_loss": float(best_val),
         "best_epoch": int(best_epoch),
         "stopped_epoch": int(stopped_epoch),
@@ -1701,8 +1786,13 @@ def train_flow_skl_model(
         "min_lr": float(min_lr),
         "lr_schedule_epochs": int(schedule_epochs),
         "checkpoint_selection": checkpoint_key,
+        "best_checkpoint_metric": best_metric_key,
+        "likelihood_validation_every": int(likelihood_validation_every),
+        "likelihood_validation_ode_steps": int(likelihood_validation_ode_steps),
+        "likelihood_validation_ode_method": str(likelihood_validation_ode_method),
         "selected_epoch": int(best_epoch if checkpoint_key == "best" else stopped_epoch),
         "fixed_validation": bool(fixed_validation),
+        "fixed_validation_paths": int(fixed_validation_paths),
         "validation_seed": None if validation_seed is None else int(validation_seed),
     }
     if bool(retain_best_state) and best_state is not None:
