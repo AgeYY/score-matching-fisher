@@ -3,21 +3,23 @@
 ## Runtime Environment (Mandatory)
 
 - Always run Python/code commands inside the `mamba` environment `geo_diffusion`.
-- Default execution device is CUDA device 0 (`--device cuda:0`) for training/evaluation scripts.
+- Training/evaluation scripts may use either CUDA device 0 or 1. Before starting a run, inspect both GPUs and select the one with more available memory and lower utilization; do not assume a fixed default GPU.
+- Pass the selected device explicitly as `--device cuda:<GPU_ID>` and use the same device for the entire run.
 
 ## Standard Command Pattern
 
 Use this pattern for all project runs:
 
 ```bash
-mamba run -n geo_diffusion python <script>.py ... --device cuda:0
+nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu --format=csv,noheader
+mamba run -n geo_diffusion python <script>.py ... --device cuda:<GPU_ID>
 ```
 
 For the unified CLI:
 
 ```bash
-mamba run -n geo_diffusion python run_fisher.py score ... --device cuda:0
-mamba run -n geo_diffusion python run_fisher.py decoder ... --device cuda:0
+mamba run -n geo_diffusion python run_fisher.py score ... --device cuda:<GPU_ID>
+mamba run -n geo_diffusion python run_fisher.py decoder ... --device cuda:<GPU_ID>
 ```
 
 ## Data layout
@@ -68,7 +70,7 @@ When polling until a long-running process finishes, **do not** use a loop like:
 **Preferred:** capture the PID when starting, then `wait` or poll the PID only:
 
 ```bash
-mamba run -n geo_diffusion python bin/some_script.py ... --device cuda:0 &
+mamba run -n geo_diffusion python bin/some_script.py ... --device cuda:<GPU_ID> &
 pid=$!
 wait "${pid}"
 # or: while kill -0 "${pid}" 2>/dev/null; do sleep 30; done

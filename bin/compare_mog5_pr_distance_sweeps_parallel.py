@@ -180,6 +180,9 @@ def _cache_is_usable(
     metrics: tuple[str, ...],
     *,
     require_nll_finetuned: bool = False,
+    require_tre: bool = False,
+    require_ctsm_v: bool = False,
+    require_ctsm_v_binary: bool = False,
 ) -> bool:
     if not Path(path).is_file():
         return False
@@ -188,6 +191,9 @@ def _cache_is_usable(
         metrics,
         path=Path(path),
         require_nll_finetuned=bool(require_nll_finetuned),
+        require_tre=bool(require_tre),
+        require_ctsm_v=bool(require_ctsm_v),
+        require_ctsm_v_binary=bool(require_ctsm_v_binary),
     )
     return True
 
@@ -197,6 +203,9 @@ def preflight_visualization_only(
     metrics: tuple[str, ...],
     *,
     require_nll_finetuned: bool = False,
+    require_tre: bool = False,
+    require_ctsm_v: bool = False,
+    require_ctsm_v_binary: bool = False,
 ) -> None:
     missing: list[str] = []
     for task in tasks:
@@ -205,6 +214,9 @@ def preflight_visualization_only(
                 task.result_path,
                 metrics,
                 require_nll_finetuned=bool(require_nll_finetuned),
+                require_tre=bool(require_tre),
+                require_ctsm_v=bool(require_ctsm_v),
+                require_ctsm_v_binary=bool(require_ctsm_v_binary),
             ):
                 missing.append(f"{task.label}: {task.result_path}")
         except (FileNotFoundError, KeyError, ValueError) as exc:
@@ -229,6 +241,9 @@ def select_tasks_to_run(
                     task.result_path,
                     metrics,
                     require_nll_finetuned=int(args.flow_likelihood_finetune_epochs) > 0,
+                    require_tre=bool(args.include_tre),
+                    require_ctsm_v=bool(args.include_ctsm_v),
+                    require_ctsm_v_binary=bool(args.include_ctsm_v_binary),
                 ):
                     print(f"[parallel-sweep] cache hit {task.label}: {task.result_path}", flush=True)
                     cache_hits[task.key] = True
@@ -415,6 +430,9 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
             tasks,
             metrics,
             require_nll_finetuned=int(args.flow_likelihood_finetune_epochs) > 0,
+            require_tre=bool(args.include_tre),
+            require_ctsm_v=bool(args.include_ctsm_v),
+            require_ctsm_v_binary=bool(args.include_ctsm_v_binary),
         )
 
     ground_truth = sweep.compute_baseline_ground_truth_rdms(args, metrics)
@@ -437,6 +455,9 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
             metrics,
             path=task.result_path,
             require_nll_finetuned=int(args.flow_likelihood_finetune_epochs) > 0,
+            require_tre=bool(args.include_tre),
+            require_ctsm_v=bool(args.include_ctsm_v),
+            require_ctsm_v_binary=bool(args.include_ctsm_v_binary),
         )
 
     worker_count = len(args.gpu_ids) * int(args.jobs_per_gpu)

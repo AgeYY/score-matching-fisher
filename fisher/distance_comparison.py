@@ -11,6 +11,7 @@ from typing import Any, Iterable
 
 import numpy as np
 import torch
+from sklearn.covariance import LedoitWolf
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import StratifiedKFold
 from sklearn.pipeline import make_pipeline
@@ -20,6 +21,7 @@ from fisher.autoencoder_embedding import PRAutoencoderConfig, train_or_load_pr_a
 from fisher.flow_matching_skl import (
     FlowSKLResult,
     build_flow_skl_model,
+    estimate_affine_endpoint_gaussians,
     estimate_model_symmetric_kl,
     finetune_flow_skl_cnf_likelihood,
     flow_skl_result_to_npz_dict,
@@ -32,6 +34,7 @@ METRIC_SQUARED_EUCLIDEAN = "squared_euclidean"
 METRIC_COSINE = "cosine"
 METRIC_CORRELATION = "correlation"
 METRIC_MAHALANOBIS_SQ = "mahalanobis_sq"
+METRIC_FID = "fid"
 METRIC_SYMMETRIC_KL = "symmetric_kl"
 
 METRIC_NAMES = (
@@ -39,6 +42,7 @@ METRIC_NAMES = (
     METRIC_COSINE,
     METRIC_CORRELATION,
     METRIC_MAHALANOBIS_SQ,
+    METRIC_FID,
     METRIC_SYMMETRIC_KL,
 )
 
@@ -47,6 +51,7 @@ FLOW_VELOCITY_FAMILY_BY_METRIC = {
     METRIC_COSINE: "translation_fixed_norm",
     METRIC_CORRELATION: "translation_centered_fixed_norm",
     METRIC_MAHALANOBIS_SQ: "shared_affine",
+    METRIC_FID: "condition_affine",
     METRIC_SYMMETRIC_KL: "nonlinear",
 }
 
@@ -57,11 +62,17 @@ CSV_COLUMNS = (
     "classical",
     "flow_matching",
     "flow_matching_nll_finetuned",
+    "tre",
+    "ctsm_v",
+    "ctsm_v_binary",
     "ground_truth",
     "flow_velocity_family",
     "abs_error_classical",
     "abs_error_flow",
     "abs_error_flow_nll_finetuned",
+    "abs_error_tre",
+    "abs_error_ctsm_v",
+    "abs_error_ctsm_v_binary",
 )
 
 
@@ -127,8 +138,17 @@ class DistanceComparisonResult:
     ground_truth_matrices: dict[str, np.ndarray]
     rows: list[dict[str, Any]]
     flow_nll_finetuned_matrices: dict[str, np.ndarray] = field(default_factory=dict)
+    tre_matrices: dict[str, np.ndarray] = field(default_factory=dict)
+    ctsm_v_matrices: dict[str, np.ndarray] = field(default_factory=dict)
+    ctsm_v_binary_matrices: dict[str, np.ndarray] = field(default_factory=dict)
     flow_npz_paths: dict[str, Path] = field(default_factory=dict)
     flow_nll_finetuned_npz_paths: dict[str, Path] = field(default_factory=dict)
+    tre_npz_paths: dict[str, Path] = field(default_factory=dict)
+    tre_checkpoint_paths: dict[str, Path] = field(default_factory=dict)
+    ctsm_v_npz_paths: dict[str, Path] = field(default_factory=dict)
+    ctsm_v_checkpoint_paths: dict[str, Path] = field(default_factory=dict)
+    ctsm_v_binary_npz_paths: dict[str, Path] = field(default_factory=dict)
+    ctsm_v_binary_checkpoint_paths: dict[str, Path] = field(default_factory=dict)
     flow_velocity_families: dict[str, str] = field(default_factory=dict)
 
 
@@ -267,6 +287,95 @@ def mahalanobis_sq_matrix(
     return out
 
 
+def mahalanobis_sq_matrix_ledoit_wolf(
+    x: np.ndarray,
+    labels: np.ndarray,
+    *,
+    num_categories: int,
+    ridge: float = 1e-6,
+) -> np.ndarray:
+    """Squared Mahalanobis distances using pooled Ledoit-Wolf covariance."""
+
+    x_arr = np.asarray(x, dtype=np.float64)
+    lab = np.asarray(labels, dtype=np.int64).reshape(-1)
+    means = class_means(x_arr, lab, num_categories=int(num_categories))
+    residuals = x_arr - means[lab]
+    cov = np.asarray(
+        LedoitWolf(assume_centered=True).fit(residuals).covariance_,
+        dtype=np.float64,
+    )
+    cov = cov + float(ridge) * np.eye(int(x_arr.shape[1]), dtype=np.float64)
+    out = np.zeros((int(num_categories), int(num_categories)), dtype=np.float64)
+    for i, j in pair_indices(num_categories):
+        delta = means[int(i)] - means[int(j)]
+        val = float(delta @ np.linalg.solve(cov, delta))
+        out[int(i), int(j)] = out[int(j), int(i)] = max(0.0, val)
+    return out
+
+
+def class_covariances(
+    x: np.ndarray,
+    labels: np.ndarray,
+    *,
+    num_categories: int,
+) -> np.ndarray:
+    """Unbiased sample covariance for each category."""
+
+    x_arr = np.asarray(x, dtype=np.float64)
+    lab = np.asarray(labels, dtype=np.int64).reshape(-1)
+    if x_arr.ndim != 2 or int(x_arr.shape[0]) != int(lab.shape[0]):
+        raise ValueError("x must be [N, D] and labels must have N entries.")
+    covariances = np.empty(
+        (int(num_categories), int(x_arr.shape[1]), int(x_arr.shape[1])),
+        dtype=np.float64,
+    )
+    for category in range(int(num_categories)):
+        category_x = x_arr[lab == category]
+        if int(category_x.shape[0]) < 2:
+            raise ValueError(f"Category {category} needs at least two observations for FID covariance.")
+        cov = np.atleast_2d(np.cov(category_x, rowvar=False, ddof=1)).astype(np.float64)
+        covariances[category] = 0.5 * (cov + cov.T)
+    return covariances
+
+
+def _symmetric_psd_sqrt(matrix: np.ndarray) -> np.ndarray:
+    sym = 0.5 * (np.asarray(matrix, dtype=np.float64) + np.asarray(matrix, dtype=np.float64).T)
+    eigenvalues, eigenvectors = np.linalg.eigh(sym)
+    clipped = np.clip(eigenvalues, 0.0, None)
+    return (eigenvectors * np.sqrt(clipped)[None, :]) @ eigenvectors.T
+
+
+def gaussian_fid_matrix(means: np.ndarray, covariances: np.ndarray) -> np.ndarray:
+    """Pairwise Gaussian Fréchet distances (FID) from means and covariances."""
+
+    mu = np.asarray(means, dtype=np.float64)
+    cov = np.asarray(covariances, dtype=np.float64)
+    if mu.ndim != 2 or cov.shape != (int(mu.shape[0]), int(mu.shape[1]), int(mu.shape[1])):
+        raise ValueError("means must be [K, D] and covariances must be [K, D, D].")
+    out = np.zeros((int(mu.shape[0]), int(mu.shape[0])), dtype=np.float64)
+    covariance_roots = [_symmetric_psd_sqrt(cov[index]) for index in range(int(mu.shape[0]))]
+    for i, j in pair_indices(int(mu.shape[0])):
+        delta = mu[int(i)] - mu[int(j)]
+        middle = covariance_roots[int(i)] @ cov[int(j)] @ covariance_roots[int(i)]
+        covariance_term = np.trace(cov[int(i)] + cov[int(j)] - 2.0 * _symmetric_psd_sqrt(middle))
+        value = float(delta @ delta + covariance_term)
+        out[int(i), int(j)] = out[int(j), int(i)] = max(0.0, value)
+    return out
+
+
+def fid_matrix(
+    x: np.ndarray,
+    labels: np.ndarray,
+    *,
+    num_categories: int,
+) -> np.ndarray:
+    """Classical finite-sample FID between category-wise Gaussian fits."""
+
+    means = class_means(x, labels, num_categories=int(num_categories))
+    covariances = class_covariances(x, labels, num_categories=int(num_categories))
+    return gaussian_fid_matrix(means, covariances)
+
+
 def logistic_density_ratio_skl_matrix(
     x: np.ndarray,
     labels: np.ndarray,
@@ -347,6 +456,8 @@ def classical_metric_matrices(
                 num_categories=int(num_categories),
                 ridge=float(mahalanobis_ridge),
             )
+        elif metric == METRIC_FID:
+            out[metric] = fid_matrix(x, labels, num_categories=int(num_categories))
         elif metric == METRIC_SYMMETRIC_KL:
             out[metric] = logistic_density_ratio_skl_matrix(
                 x,
@@ -382,6 +493,22 @@ def analytic_diagonal_gaussian_skl_matrix(
             kl_ji = 0.5 * np.sum(np.log(var[i] / var[j]) + (var[j] + diff2) / var[i] - 1.0)
             out[i, j] = out[j, i] = float(kl_ij + kl_ji)
     return out
+
+
+def analytic_diagonal_gaussian_fid_matrix(
+    means: np.ndarray,
+    variances: np.ndarray,
+) -> np.ndarray:
+    """Analytic FID matrix for diagonal Gaussian components."""
+
+    mu = np.asarray(means, dtype=np.float64)
+    var = np.asarray(variances, dtype=np.float64)
+    if mu.ndim != 2 or var.shape != mu.shape:
+        raise ValueError("means and variances must have matching shape [K, D].")
+    if np.any(var < 0.0):
+        raise ValueError("variances must be nonnegative.")
+    covariances = np.asarray([np.diag(row) for row in var], dtype=np.float64)
+    return gaussian_fid_matrix(mu, covariances)
 
 
 def _pr_config_from_projected_meta(meta: dict[str, Any]) -> PRAutoencoderConfig:
@@ -510,7 +637,9 @@ def native_mog_ground_truth_matrices(
     """Monte Carlo native-coordinate MoG ground truth plus analytic native SKL."""
 
     metric_tuple = tuple(str(m) for m in metrics)
-    sampled_metrics = tuple(m for m in metric_tuple if m != METRIC_SYMMETRIC_KL)
+    sampled_metrics = tuple(
+        m for m in metric_tuple if m not in (METRIC_SYMMETRIC_KL, METRIC_FID)
+    )
     means = np.asarray(native_meta.get("mog_component_means"), dtype=np.float64)
     variances = np.asarray(native_meta.get("mog_component_variances"), dtype=np.float64)
     if means.ndim != 2 or variances.shape != means.shape:
@@ -540,6 +669,8 @@ def native_mog_ground_truth_matrices(
         )
     if METRIC_SYMMETRIC_KL in metric_tuple:
         out[METRIC_SYMMETRIC_KL] = analytic_diagonal_gaussian_skl_matrix(means, variances)
+    if METRIC_FID in metric_tuple:
+        out[METRIC_FID] = analytic_diagonal_gaussian_fid_matrix(means, variances)
     return {metric: out[metric] for metric in metric_tuple}
 
 
@@ -591,6 +722,33 @@ def flow_skl_to_metric_readout(metric: str, symmetric_kl_matrix: np.ndarray, *, 
         out = out / (2.0 * r * r)
     np.fill_diagonal(out, 0.0)
     return out
+
+
+def flow_result_to_metric_readout(
+    metric: str,
+    result: FlowSKLResult,
+    *,
+    radius: float,
+    normalize_meta: dict[str, Any],
+) -> np.ndarray:
+    """Read a requested metric from a trained flow result."""
+
+    if str(metric) != METRIC_FID:
+        return flow_skl_to_metric_readout(
+            metric,
+            result.symmetric_kl_matrix,
+            radius=float(radius),
+        )
+    if result.endpoint_gaussian_means is None or result.endpoint_gaussian_covariances is None:
+        raise ValueError("FID requires endpoint Gaussian moments from a condition-affine flow.")
+    means = np.asarray(result.endpoint_gaussian_means, dtype=np.float64)
+    covariances = np.asarray(result.endpoint_gaussian_covariances, dtype=np.float64)
+    if bool(normalize_meta.get("flow_normalize_x", False)):
+        x_mean = np.asarray(normalize_meta["flow_normalize_x_mean"], dtype=np.float64)
+        x_std = np.asarray(normalize_meta["flow_normalize_x_std"], dtype=np.float64)
+        means = x_mean[None, :] + means * x_std[None, :]
+        covariances = covariances * x_std[None, :, None] * x_std[None, None, :]
+    return gaussian_fid_matrix(means, covariances)
 
 
 def velocity_family_for_metric(metric: str, config: FlowComparisonConfig) -> str:
@@ -682,7 +840,7 @@ def _estimate_trained_flow(
     train_metadata: dict[str, Any],
 ) -> FlowSKLResult:
     _seed_flow_rng(int(seed), device)
-    return estimate_model_symmetric_kl(
+    result = estimate_model_symmetric_kl(
         model=model,
         theta_all=theta_eval,
         device=device,
@@ -697,6 +855,16 @@ def _estimate_trained_flow(
         fisher_kind="none",
         train_metadata=train_metadata,
     )
+    if str(velocity_family).startswith("condition_affine"):
+        means, covariances = estimate_affine_endpoint_gaussians(
+            model=model,
+            theta_all=theta_eval,
+            device=device,
+            ode_steps=int(config.ode_steps),
+        )
+        result.endpoint_gaussian_means = means
+        result.endpoint_gaussian_covariances = covariances
+    return result
 
 
 def train_and_estimate_flow(
@@ -963,10 +1131,11 @@ def _flow_metric_variants_impl(
             )
             fine_result = None
         result.train_metadata = {**dict(result.train_metadata), **normalize_meta}
-        matrices[metric] = flow_skl_to_metric_readout(
+        matrices[metric] = flow_result_to_metric_readout(
             metric,
-            result.symmetric_kl_matrix,
+            result,
             radius=float(config.radius),
+            normalize_meta=normalize_meta,
         )
         path = save_flow_result_npz(
             flow_dir / _flow_npz_name(metric),
@@ -980,10 +1149,11 @@ def _flow_metric_variants_impl(
         paths[metric] = path
         if fine_result is not None:
             fine_result.train_metadata = {**dict(fine_result.train_metadata), **normalize_meta}
-            fine_matrices[metric] = flow_skl_to_metric_readout(
+            fine_matrices[metric] = flow_result_to_metric_readout(
                 metric,
-                fine_result.symmetric_kl_matrix,
+                fine_result,
                 radius=float(config.radius),
+                normalize_meta=normalize_meta,
             )
             fine_path = save_flow_result_npz(
                 flow_dir / _flow_nll_finetuned_npz_name(metric),
@@ -1056,6 +1226,9 @@ def pair_rows(
     flow_matching: dict[str, np.ndarray],
     ground_truth: dict[str, np.ndarray],
     flow_matching_nll_finetuned: dict[str, np.ndarray] | None = None,
+    tre: dict[str, np.ndarray] | None = None,
+    ctsm_v: dict[str, np.ndarray] | None = None,
+    ctsm_v_binary: dict[str, np.ndarray] | None = None,
     flow_velocity_families: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     label_tuple = tuple(str(v) for v in labels)
@@ -1070,12 +1243,24 @@ def pair_rows(
             if flow_matching_nll_finetuned is None or metric not in flow_matching_nll_finetuned
             else np.asarray(flow_matching_nll_finetuned[metric], dtype=np.float64)
         )
+        tre_mat = None if tre is None or metric not in tre else np.asarray(tre[metric], dtype=np.float64)
+        ctsm_mat = None if ctsm_v is None or metric not in ctsm_v else np.asarray(ctsm_v[metric], dtype=np.float64)
+        ctsm_binary_mat = (
+            None
+            if ctsm_v_binary is None or metric not in ctsm_v_binary
+            else np.asarray(ctsm_v_binary[metric], dtype=np.float64)
+        )
         gmat = np.asarray(ground_truth[metric], dtype=np.float64)
         for i, j in pairs:
             i_int, j_int = int(i), int(j)
             cval = float(cmat[i_int, j_int])
             fval = float(fmat[i_int, j_int])
             fine_val = float("nan") if fine_mat is None else float(fine_mat[i_int, j_int])
+            tre_val = float("nan") if tre_mat is None else float(tre_mat[i_int, j_int])
+            ctsm_val = float("nan") if ctsm_mat is None else float(ctsm_mat[i_int, j_int])
+            ctsm_binary_val = (
+                float("nan") if ctsm_binary_mat is None else float(ctsm_binary_mat[i_int, j_int])
+            )
             gval = float(gmat[i_int, j_int])
             rows.append(
                 {
@@ -1085,11 +1270,17 @@ def pair_rows(
                     "classical": cval,
                     "flow_matching": fval,
                     "flow_matching_nll_finetuned": fine_val,
+                    "tre": tre_val,
+                    "ctsm_v": ctsm_val,
+                    "ctsm_v_binary": ctsm_binary_val,
                     "ground_truth": gval,
                     "flow_velocity_family": family_by_metric[metric],
                     "abs_error_classical": abs(cval - gval),
                     "abs_error_flow": abs(fval - gval),
                     "abs_error_flow_nll_finetuned": abs(fine_val - gval),
+                    "abs_error_tre": abs(tre_val - gval),
+                    "abs_error_ctsm_v": abs(ctsm_val - gval),
+                    "abs_error_ctsm_v_binary": abs(ctsm_binary_val - gval),
                 }
             )
     return rows
@@ -1103,8 +1294,17 @@ def assemble_comparison_result(
     flow_matching: dict[str, np.ndarray],
     ground_truth: dict[str, np.ndarray],
     flow_matching_nll_finetuned: dict[str, np.ndarray] | None = None,
+    tre: dict[str, np.ndarray] | None = None,
+    ctsm_v: dict[str, np.ndarray] | None = None,
+    ctsm_v_binary: dict[str, np.ndarray] | None = None,
     flow_npz_paths: dict[str, Path] | None = None,
     flow_nll_finetuned_npz_paths: dict[str, Path] | None = None,
+    tre_npz_paths: dict[str, Path] | None = None,
+    tre_checkpoint_paths: dict[str, Path] | None = None,
+    ctsm_v_npz_paths: dict[str, Path] | None = None,
+    ctsm_v_checkpoint_paths: dict[str, Path] | None = None,
+    ctsm_v_binary_npz_paths: dict[str, Path] | None = None,
+    ctsm_v_binary_checkpoint_paths: dict[str, Path] | None = None,
     flow_velocity_families: dict[str, str] | None = None,
 ) -> DistanceComparisonResult:
     metric_tuple = tuple(str(m) for m in metrics)
@@ -1120,6 +1320,9 @@ def assemble_comparison_result(
         classical=classical,
         flow_matching=flow_matching,
         flow_matching_nll_finetuned=flow_matching_nll_finetuned,
+        tre=tre,
+        ctsm_v=ctsm_v,
+        ctsm_v_binary=ctsm_v_binary,
         ground_truth=ground_truth,
         flow_velocity_families=family_by_metric,
     )
@@ -1136,9 +1339,42 @@ def assemble_comparison_result(
             if flow_matching_nll_finetuned is None
             else {m: np.asarray(flow_matching_nll_finetuned[m], dtype=np.float64) for m in metric_tuple}
         ),
+        tre_matrices=(
+            {}
+            if tre is None
+            else {m: np.asarray(tre[m], dtype=np.float64) for m in metric_tuple if m in tre}
+        ),
+        ctsm_v_matrices=(
+            {}
+            if ctsm_v is None
+            else {m: np.asarray(ctsm_v[m], dtype=np.float64) for m in metric_tuple if m in ctsm_v}
+        ),
+        ctsm_v_binary_matrices=(
+            {}
+            if ctsm_v_binary is None
+            else {
+                m: np.asarray(ctsm_v_binary[m], dtype=np.float64)
+                for m in metric_tuple
+                if m in ctsm_v_binary
+            }
+        ),
         flow_npz_paths={} if flow_npz_paths is None else dict(flow_npz_paths),
         flow_nll_finetuned_npz_paths=(
             {} if flow_nll_finetuned_npz_paths is None else dict(flow_nll_finetuned_npz_paths)
+        ),
+        tre_npz_paths={} if tre_npz_paths is None else dict(tre_npz_paths),
+        tre_checkpoint_paths={} if tre_checkpoint_paths is None else dict(tre_checkpoint_paths),
+        ctsm_v_npz_paths={} if ctsm_v_npz_paths is None else dict(ctsm_v_npz_paths),
+        ctsm_v_checkpoint_paths=(
+            {} if ctsm_v_checkpoint_paths is None else dict(ctsm_v_checkpoint_paths)
+        ),
+        ctsm_v_binary_npz_paths=(
+            {} if ctsm_v_binary_npz_paths is None else dict(ctsm_v_binary_npz_paths)
+        ),
+        ctsm_v_binary_checkpoint_paths=(
+            {}
+            if ctsm_v_binary_checkpoint_paths is None
+            else dict(ctsm_v_binary_checkpoint_paths)
         ),
         flow_velocity_families={m: family_by_metric[m] for m in metric_tuple},
     )
@@ -1176,6 +1412,30 @@ def write_results_npz(path: str | Path, result: DistanceComparisonResult) -> Pat
         stack_fine = np.stack([result.flow_nll_finetuned_matrices[m] for m in result.metrics], axis=0)
         fields["flow_matching_nll_finetuned_matrices"] = stack_fine
         fields["abs_error_flow_nll_finetuned"] = np.abs(stack_fine - stack_gt)
+    if result.tre_matrices:
+        empty = np.full_like(stack_gt[0], np.nan, dtype=np.float64)
+        stack_tre = np.stack(
+            [result.tre_matrices.get(metric, empty) for metric in result.metrics],
+            axis=0,
+        )
+        fields["tre_matrices"] = stack_tre
+        fields["abs_error_tre"] = np.abs(stack_tre - stack_gt)
+    if result.ctsm_v_matrices:
+        empty = np.full_like(stack_gt[0], np.nan, dtype=np.float64)
+        stack_ctsm = np.stack(
+            [result.ctsm_v_matrices.get(metric, empty) for metric in result.metrics],
+            axis=0,
+        )
+        fields["ctsm_v_matrices"] = stack_ctsm
+        fields["abs_error_ctsm_v"] = np.abs(stack_ctsm - stack_gt)
+    if result.ctsm_v_binary_matrices:
+        empty = np.full_like(stack_gt[0], np.nan, dtype=np.float64)
+        stack_ctsm_binary = np.stack(
+            [result.ctsm_v_binary_matrices.get(metric, empty) for metric in result.metrics],
+            axis=0,
+        )
+        fields["ctsm_v_binary_matrices"] = stack_ctsm_binary
+        fields["abs_error_ctsm_v_binary"] = np.abs(stack_ctsm_binary - stack_gt)
     np.savez_compressed(out, **fields)
     return out
 
@@ -1213,6 +1473,21 @@ def write_summary_json(
             if metric not in result.flow_nll_finetuned_matrices
             else np.asarray(result.flow_nll_finetuned_matrices[metric], dtype=np.float64)
         )
+        tre = (
+            None
+            if metric not in result.tre_matrices
+            else np.asarray(result.tre_matrices[metric], dtype=np.float64)
+        )
+        ctsm = (
+            None
+            if metric not in result.ctsm_v_matrices
+            else np.asarray(result.ctsm_v_matrices[metric], dtype=np.float64)
+        )
+        ctsm_binary = (
+            None
+            if metric not in result.ctsm_v_binary_matrices
+            else np.asarray(result.ctsm_v_binary_matrices[metric], dtype=np.float64)
+        )
         g = np.asarray(result.ground_truth_matrices[metric], dtype=np.float64)
         pairs = result.pair_indices
         c_err = np.asarray([abs(float(c[i, j]) - float(g[i, j])) for i, j in pairs], dtype=np.float64)
@@ -1232,6 +1507,33 @@ def write_summary_json(
                     "max_abs_error_flow_nll_finetuned": float(np.max(fine_err)),
                 }
             )
+        if tre is not None:
+            tre_err = np.asarray([abs(float(tre[i, j]) - float(g[i, j])) for i, j in pairs], dtype=np.float64)
+            metric_payload.update(
+                {
+                    "mean_abs_error_tre": float(np.mean(tre_err)),
+                    "max_abs_error_tre": float(np.max(tre_err)),
+                }
+            )
+        if ctsm is not None:
+            ctsm_err = np.asarray([abs(float(ctsm[i, j]) - float(g[i, j])) for i, j in pairs], dtype=np.float64)
+            metric_payload.update(
+                {
+                    "mean_abs_error_ctsm_v": float(np.mean(ctsm_err)),
+                    "max_abs_error_ctsm_v": float(np.max(ctsm_err)),
+                }
+            )
+        if ctsm_binary is not None:
+            ctsm_binary_err = np.asarray(
+                [abs(float(ctsm_binary[i, j]) - float(g[i, j])) for i, j in pairs],
+                dtype=np.float64,
+            )
+            metric_payload.update(
+                {
+                    "mean_abs_error_ctsm_v_binary": float(np.mean(ctsm_binary_err)),
+                    "max_abs_error_ctsm_v_binary": float(np.max(ctsm_binary_err)),
+                }
+            )
         metric_summary[metric] = metric_payload
     summary = {
         "metrics": list(result.metrics),
@@ -1241,6 +1543,14 @@ def write_summary_json(
         "flow_npz_paths": {k: str(v) for k, v in result.flow_npz_paths.items()},
         "flow_nll_finetuned_npz_paths": {
             k: str(v) for k, v in result.flow_nll_finetuned_npz_paths.items()
+        },
+        "tre_npz_paths": {k: str(v) for k, v in result.tre_npz_paths.items()},
+        "tre_checkpoint_paths": {k: str(v) for k, v in result.tre_checkpoint_paths.items()},
+        "ctsm_v_npz_paths": {k: str(v) for k, v in result.ctsm_v_npz_paths.items()},
+        "ctsm_v_checkpoint_paths": {k: str(v) for k, v in result.ctsm_v_checkpoint_paths.items()},
+        "ctsm_v_binary_npz_paths": {k: str(v) for k, v in result.ctsm_v_binary_npz_paths.items()},
+        "ctsm_v_binary_checkpoint_paths": {
+            k: str(v) for k, v in result.ctsm_v_binary_checkpoint_paths.items()
         },
     }
     if extra is not None:

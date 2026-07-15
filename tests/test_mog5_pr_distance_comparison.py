@@ -121,6 +121,13 @@ def test_metric_matrices_on_grouped_arrays() -> None:
         expected[int(i), int(j)] = expected[int(j), int(i)] = float(delta @ np.linalg.solve(cov, delta))
     np.testing.assert_allclose(mah, expected)
 
+    mah_lw = dc.mahalanobis_sq_matrix_ledoit_wolf(x2, labels2, num_categories=3, ridge=1e-6)
+    assert mah_lw.shape == (3, 3)
+    np.testing.assert_allclose(mah_lw, mah_lw.T)
+    np.testing.assert_allclose(np.diag(mah_lw), 0.0)
+    assert np.all(np.isfinite(mah_lw))
+    assert np.all(mah_lw >= 0.0)
+
 
 def test_analytic_diagonal_gaussian_skl_matches_manual_two_component_calculation() -> None:
     means = np.array([[0.0, 0.0], [1.0, 2.0]], dtype=np.float64)
@@ -132,6 +139,31 @@ def test_analytic_diagonal_gaussian_skl_matches_manual_two_component_calculation
     kl_10 = 0.5 * np.sum(np.log(variances[0] / variances[1]) + (variances[1] + diff2) / variances[0] - 1.0)
     expected = kl_01 + kl_10
     np.testing.assert_allclose(got, np.array([[0.0, expected], [expected, 0.0]]))
+
+
+def test_gaussian_fid_matches_closed_form_for_diagonal_covariances() -> None:
+    means = np.array([[0.0, 0.0], [1.0, 0.0]], dtype=np.float64)
+    covariances = np.array([np.diag([1.0, 4.0]), np.diag([9.0, 1.0])], dtype=np.float64)
+
+    got = dc.gaussian_fid_matrix(means, covariances)
+
+    np.testing.assert_allclose(got, np.array([[0.0, 6.0], [6.0, 0.0]]), atol=1e-12)
+
+
+def test_classical_fid_is_symmetric_and_finite() -> None:
+    x = np.array(
+        [[-1.0, 0.0], [1.0, 0.0], [0.0, -1.0], [2.0, 1.0], [4.0, 1.0], [3.0, 2.0]],
+        dtype=np.float64,
+    )
+    labels = np.array([0, 0, 0, 1, 1, 1], dtype=np.int64)
+
+    got = dc.fid_matrix(x, labels, num_categories=2)
+
+    assert got.shape == (2, 2)
+    np.testing.assert_allclose(got, got.T)
+    np.testing.assert_allclose(np.diag(got), 0.0)
+    assert np.all(np.isfinite(got))
+    assert got[0, 1] > 0.0
 
 
 def test_ground_truth_symmetric_kl_only_skips_pr_encoding(monkeypatch, tmp_path: Path) -> None:
@@ -174,6 +206,30 @@ def test_flow_skl_to_metric_readout_scales_fixed_norm_rows() -> None:
         dc.flow_skl_to_metric_readout(dc.METRIC_SQUARED_EUCLIDEAN, skl, radius=2.0),
         [[0.0, 16.0], [16.0, 0.0]],
     )
+
+
+def test_flow_fid_readout_restores_shared_x_normalization() -> None:
+    zeros = np.zeros((2, 2), dtype=np.float64)
+    result = FlowSKLResult(
+        symmetric_kl_matrix=zeros,
+        canonical_metric_matrix=zeros.copy(),
+        canonical_metric_name="model_jeffreys_symmetric_kl",
+        endpoint_gaussian_means=np.array([[0.0, 0.0], [1.0, 0.0]], dtype=np.float64),
+        endpoint_gaussian_covariances=np.array([np.eye(2), np.eye(2)], dtype=np.float64),
+    )
+
+    got = dc.flow_result_to_metric_readout(
+        dc.METRIC_FID,
+        result,
+        radius=1.0,
+        normalize_meta={
+            "flow_normalize_x": True,
+            "flow_normalize_x_mean": np.array([10.0, -3.0]),
+            "flow_normalize_x_std": np.array([2.0, 5.0]),
+        },
+    )
+
+    np.testing.assert_allclose(got, [[0.0, 4.0], [4.0, 0.0]], atol=1e-12)
 
 
 def test_flow_metric_mapping_and_mahalanobis_shared_assembly(monkeypatch, tmp_path: Path) -> None:

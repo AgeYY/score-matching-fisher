@@ -7,6 +7,7 @@ import argparse
 import importlib.util
 import math
 import sys
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,14 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from global_setting import DEFAULT_DEVICE
+from fisher.ctsm_distance import (
+    CTSMVBinaryJeffreysConfig,
+    CTSMVJeffreysConfig,
+    save_pairwise_binary_ctsm_v_jeffreys_result,
+    save_ctsm_v_jeffreys_result,
+    train_and_estimate_pairwise_binary_ctsm_v_jeffreys,
+    train_and_estimate_ctsm_v_jeffreys,
+)
 from fisher.distance_comparison import (
     METRIC_NAMES,
     FlowComparisonConfig,
@@ -36,6 +45,13 @@ from fisher.distance_comparison import (
 )
 from fisher.shared_dataset_io import load_shared_dataset_npz
 from fisher.shared_fisher_est import require_device
+from fisher.tre_distance import (
+    TRE_ARCHITECTURES,
+    TRE_WAYMARK_SCHEDULES,
+    TREDensityRatioConfig,
+    save_pairwise_tre_jeffreys_result,
+    train_and_estimate_pairwise_tre_jeffreys,
+)
 
 
 def _load_make_mog5_module() -> Any:
@@ -247,6 +263,73 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("best", "last"),
         default="best",
     )
+    p.add_argument(
+        "--include-tre",
+        action="store_true",
+        help="Fit one Torch TRE model per condition pair and add its Jeffreys-divergence estimate.",
+    )
+    p.add_argument(
+        "--tre-augment-existing",
+        action="store_true",
+        help="Reuse estimators in the output NPZ and train only the requested TRE estimator.",
+    )
+    p.add_argument("--tre-num-bridges", type=int, default=8)
+    p.add_argument("--tre-waymark-schedule", choices=TRE_WAYMARK_SCHEDULES, default="angle")
+    p.add_argument("--tre-architecture", choices=TRE_ARCHITECTURES, default="mlp")
+    p.add_argument("--tre-hidden-dim", type=int, default=128)
+    p.add_argument("--tre-depth", type=int, default=3)
+    p.add_argument("--tre-epochs", type=int, default=1_000)
+    p.add_argument("--tre-batch-size", type=int, default=512)
+    p.add_argument("--tre-lr", type=float, default=1e-3)
+    p.add_argument("--tre-weight-decay", type=float, default=0.0)
+    p.add_argument("--tre-early-patience", type=int, default=100)
+    p.add_argument("--tre-early-min-delta", type=float, default=1e-5)
+    p.add_argument("--tre-max-grad-norm", type=float, default=10.0)
+    p.add_argument("--tre-validation-pairs", type=int, default=2_048)
+    p.add_argument("--tre-eval-batch-size", type=int, default=4_096)
+    tre_normalization = p.add_mutually_exclusive_group()
+    tre_normalization.add_argument("--tre-standardize", dest="tre_standardize", action="store_true")
+    tre_normalization.add_argument("--no-tre-standardize", dest="tre_standardize", action="store_false")
+    p.set_defaults(tre_standardize=True)
+    p.add_argument(
+        "--include-ctsm-v",
+        action="store_true",
+        help="Train pair-conditioned CTSM-v and add its Jeffreys-divergence estimate.",
+    )
+    p.add_argument(
+        "--ctsm-v-augment-existing",
+        action="store_true",
+        help="Reuse estimators in the output NPZ and train only requested CTSM-v variants.",
+    )
+    p.add_argument(
+        "--include-ctsm-v-binary",
+        action="store_true",
+        help="Fit one unconditioned CTSM-v model per condition pair and estimate Jeffreys divergence.",
+    )
+    p.add_argument("--ctsm-v-binary-epochs", type=int, default=50_000)
+    p.add_argument("--ctsm-v-epochs", type=int, default=8_000)
+    p.add_argument("--ctsm-v-batch-size", type=int, default=512)
+    p.add_argument("--ctsm-v-lr", type=float, default=2e-3)
+    p.add_argument("--ctsm-v-weight-decay", type=float, default=0.0)
+    p.add_argument("--ctsm-v-hidden-dim", type=int, default=256)
+    p.add_argument("--ctsm-v-architecture", choices=("mlp", "film"), default="film")
+    p.add_argument("--ctsm-v-film-depth", type=int, default=3)
+    p.add_argument("--ctsm-v-gated-film", action="store_true")
+    p.add_argument("--ctsm-v-raw-time", action="store_true")
+    p.add_argument("--ctsm-v-m-scale", type=float, default=1.0)
+    p.add_argument("--ctsm-v-delta-scale", type=float, default=0.5)
+    p.add_argument("--ctsm-v-two-sb-var", type=float, default=2.0)
+    p.add_argument("--ctsm-v-path-schedule", choices=("linear", "cosine"), default="linear")
+    p.add_argument("--ctsm-v-path-eps", type=float, default=1e-12)
+    p.add_argument("--ctsm-v-factor", type=float, default=1.0)
+    p.add_argument("--ctsm-v-t-eps", type=float, default=1e-4)
+    p.add_argument("--ctsm-v-integration-steps", type=int, default=300)
+    p.add_argument("--ctsm-v-eval-batch-size", type=int, default=4096)
+    p.add_argument("--ctsm-v-early-patience", type=int, default=1_000)
+    p.add_argument("--ctsm-v-early-min-delta", type=float, default=1e-4)
+    p.add_argument("--ctsm-v-early-ema-alpha", type=float, default=0.05)
+    p.add_argument("--ctsm-v-validation-batches", type=int, default=8)
+    p.add_argument("--ctsm-v-normalize-x", action="store_true")
     return p
 
 
@@ -276,7 +359,7 @@ def resolve_output_dir(args: argparse.Namespace) -> Path:
 
 
 def validate_args(args: argparse.Namespace) -> None:
-    resolve_metric_names(args)
+    metrics = resolve_metric_names(args)
     native_x_dim = int(args.native_x_dim)
     if native_x_dim < 2:
         raise ValueError(f"--native-x-dim must be >= 2; got {args.native_x_dim}.")
@@ -310,6 +393,56 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--flow-likelihood-finetune-min-delta must be >= 0.")
     if not (0.0 < float(args.flow_likelihood_finetune_ema_alpha) <= 1.0):
         raise ValueError("--flow-likelihood-finetune-ema-alpha must be in (0, 1].")
+    includes_ctsm = bool(args.include_ctsm_v) or bool(args.include_ctsm_v_binary)
+    if includes_ctsm and "symmetric_kl" not in metrics:
+        raise ValueError("CTSM-v estimators require --metric to include symmetric_kl.")
+    if bool(args.ctsm_v_augment_existing) and not includes_ctsm:
+        raise ValueError("--ctsm-v-augment-existing requires a CTSM-v estimator.")
+    if bool(args.tre_augment_existing) and not bool(args.include_tre):
+        raise ValueError("--tre-augment-existing requires --include-tre.")
+    if bool(args.include_tre) and "symmetric_kl" not in metrics:
+        raise ValueError("TRE requires --metric to include symmetric_kl.")
+    TREDensityRatioConfig(
+        num_bridges=int(args.tre_num_bridges),
+        waymark_schedule=str(args.tre_waymark_schedule),
+        architecture=str(args.tre_architecture),
+        hidden_dim=int(args.tre_hidden_dim),
+        depth=int(args.tre_depth),
+        epochs=int(args.tre_epochs),
+        batch_size=int(args.tre_batch_size),
+        lr=float(args.tre_lr),
+        weight_decay=float(args.tre_weight_decay),
+        early_patience=int(args.tre_early_patience),
+        early_min_delta=float(args.tre_early_min_delta),
+        max_grad_norm=float(args.tre_max_grad_norm),
+        validation_pairs=int(args.tre_validation_pairs),
+        standardize=bool(args.tre_standardize),
+        log_every=int(args.log_every),
+    ).validate()
+    if int(args.tre_eval_batch_size) < 1:
+        raise ValueError("--tre-eval-batch-size must be >= 1.")
+    if int(args.ctsm_v_epochs) < 1:
+        raise ValueError("--ctsm-v-epochs must be >= 1.")
+    if int(args.ctsm_v_binary_epochs) < 1:
+        raise ValueError("--ctsm-v-binary-epochs must be >= 1.")
+    if int(args.ctsm_v_batch_size) < 2:
+        raise ValueError("--ctsm-v-batch-size must be >= 2.")
+    if float(args.ctsm_v_lr) <= 0.0:
+        raise ValueError("--ctsm-v-lr must be > 0.")
+    if int(args.ctsm_v_hidden_dim) < 1 or int(args.ctsm_v_film_depth) < 1:
+        raise ValueError("CTSM-v hidden dimension and FiLM depth must be >= 1.")
+    if float(args.ctsm_v_two_sb_var) <= 0.0:
+        raise ValueError("--ctsm-v-two-sb-var must be > 0.")
+    if not (0.0 <= float(args.ctsm_v_t_eps) < 0.5):
+        raise ValueError("--ctsm-v-t-eps must be in [0, 0.5).")
+    if int(args.ctsm_v_integration_steps) < 2:
+        raise ValueError("--ctsm-v-integration-steps must be >= 2.")
+    if int(args.ctsm_v_eval_batch_size) < 1:
+        raise ValueError("--ctsm-v-eval-batch-size must be >= 1.")
+    if int(args.ctsm_v_early_patience) < 0 or int(args.ctsm_v_validation_batches) < 1:
+        raise ValueError("CTSM-v patience must be non-negative and validation batches must be >= 1.")
+    if not (0.0 < float(args.ctsm_v_early_ema_alpha) <= 1.0):
+        raise ValueError("--ctsm-v-early-ema-alpha must be in (0, 1].")
 
 
 def _dataset_wrapper_args(args: argparse.Namespace, dataset_dir: Path) -> argparse.Namespace:
@@ -401,6 +534,130 @@ def _flow_config_from_args(args: argparse.Namespace) -> FlowComparisonConfig:
     )
 
 
+def _ctsm_v_config_from_args(args: argparse.Namespace) -> CTSMVJeffreysConfig:
+    return CTSMVJeffreysConfig(
+        epochs=int(args.ctsm_v_epochs),
+        batch_size=int(args.ctsm_v_batch_size),
+        lr=float(args.ctsm_v_lr),
+        weight_decay=float(args.ctsm_v_weight_decay),
+        hidden_dim=int(args.ctsm_v_hidden_dim),
+        architecture=str(args.ctsm_v_architecture),
+        film_depth=int(args.ctsm_v_film_depth),
+        gated_film=bool(args.ctsm_v_gated_film),
+        raw_time=bool(args.ctsm_v_raw_time),
+        m_scale=float(args.ctsm_v_m_scale),
+        delta_scale=float(args.ctsm_v_delta_scale),
+        two_sb_var=float(args.ctsm_v_two_sb_var),
+        path_schedule=str(args.ctsm_v_path_schedule),
+        path_eps=float(args.ctsm_v_path_eps),
+        factor=float(args.ctsm_v_factor),
+        t_eps=float(args.ctsm_v_t_eps),
+        integration_steps=int(args.ctsm_v_integration_steps),
+        eval_batch_size=int(args.ctsm_v_eval_batch_size),
+        early_patience=int(args.ctsm_v_early_patience),
+        early_min_delta=float(args.ctsm_v_early_min_delta),
+        early_ema_alpha=float(args.ctsm_v_early_ema_alpha),
+        validation_batches_per_epoch=int(args.ctsm_v_validation_batches),
+        normalize_x=bool(args.ctsm_v_normalize_x),
+        log_every=int(args.log_every),
+    )
+
+
+def _tre_config_from_args(args: argparse.Namespace) -> TREDensityRatioConfig:
+    return TREDensityRatioConfig(
+        num_bridges=int(args.tre_num_bridges),
+        waymark_schedule=str(args.tre_waymark_schedule),
+        architecture=str(args.tre_architecture),
+        hidden_dim=int(args.tre_hidden_dim),
+        depth=int(args.tre_depth),
+        epochs=int(args.tre_epochs),
+        batch_size=int(args.tre_batch_size),
+        lr=float(args.tre_lr),
+        weight_decay=float(args.tre_weight_decay),
+        early_patience=int(args.tre_early_patience),
+        early_min_delta=float(args.tre_early_min_delta),
+        max_grad_norm=float(args.tre_max_grad_norm),
+        validation_pairs=int(args.tre_validation_pairs),
+        standardize=bool(args.tre_standardize),
+        log_every=int(args.log_every),
+    )
+
+
+def _ctsm_v_binary_config_from_args(args: argparse.Namespace) -> CTSMVBinaryJeffreysConfig:
+    return CTSMVBinaryJeffreysConfig(
+        epochs=int(args.ctsm_v_binary_epochs),
+        batch_size=int(args.ctsm_v_batch_size),
+        lr=float(args.ctsm_v_lr),
+        weight_decay=float(args.ctsm_v_weight_decay),
+        hidden_dim=int(args.ctsm_v_hidden_dim),
+        two_sb_var=float(args.ctsm_v_two_sb_var),
+        path_schedule=str(args.ctsm_v_path_schedule),
+        path_eps=float(args.ctsm_v_path_eps),
+        factor=float(args.ctsm_v_factor),
+        t_eps=float(args.ctsm_v_t_eps),
+        integration_steps=int(args.ctsm_v_integration_steps),
+        eval_batch_size=int(args.ctsm_v_eval_batch_size),
+        early_patience=int(args.ctsm_v_early_patience),
+        early_min_delta=float(args.ctsm_v_early_min_delta),
+        early_ema_alpha=float(args.ctsm_v_early_ema_alpha),
+        validation_batches_per_epoch=int(args.ctsm_v_validation_batches),
+        normalize_x=bool(args.ctsm_v_normalize_x),
+        log_every=int(args.log_every),
+    )
+
+
+def _load_existing_estimators(
+    path: Path,
+    *,
+    metrics: tuple[str, ...],
+    require_nll_finetuned: bool,
+) -> tuple[
+    dict[str, np.ndarray],
+    dict[str, np.ndarray],
+    dict[str, np.ndarray] | None,
+    dict[str, np.ndarray],
+    dict[str, np.ndarray] | None,
+    dict[str, np.ndarray] | None,
+    dict[str, np.ndarray] | None,
+]:
+    if not path.is_file():
+        raise FileNotFoundError(f"Estimator augmentation requires an existing result NPZ: {path}")
+    with np.load(path, allow_pickle=False) as data:
+        required = (
+            "metric_names",
+            "classical_matrices",
+            "flow_matching_matrices",
+            "ground_truth_matrices",
+        )
+        missing_fields = [field for field in required if field not in data.files]
+        if missing_fields:
+            raise KeyError(f"Existing comparison NPZ {path} is missing: {', '.join(missing_fields)}")
+        available = tuple(str(value) for value in data["metric_names"].tolist())
+        missing_metrics = [metric for metric in metrics if metric not in available]
+        if missing_metrics:
+            raise ValueError(f"Existing comparison NPZ {path} is missing metrics: {', '.join(missing_metrics)}")
+        indices = [available.index(metric) for metric in metrics]
+
+        def unpack(field: str) -> dict[str, np.ndarray]:
+            stack = np.asarray(data[field], dtype=np.float64)[indices]
+            return {metric: stack[index] for index, metric in enumerate(metrics)}
+
+        classical = unpack("classical_matrices")
+        flow = unpack("flow_matching_matrices")
+        ground_truth = unpack("ground_truth_matrices")
+        fine = None
+        if "flow_matching_nll_finetuned_matrices" in data.files:
+            fine = unpack("flow_matching_nll_finetuned_matrices")
+        elif bool(require_nll_finetuned):
+            raise ValueError(f"Existing comparison NPZ {path} has no FM+NLL matrices.")
+        tre = unpack("tre_matrices") if "tre_matrices" in data.files else None
+        ctsm_v = unpack("ctsm_v_matrices") if "ctsm_v_matrices" in data.files else None
+        ctsm_v_binary = (
+            unpack("ctsm_v_binary_matrices") if "ctsm_v_binary_matrices" in data.files else None
+        )
+    return classical, flow, fine, ground_truth, tre, ctsm_v, ctsm_v_binary
+
+
 def _validate_bundle(
     bundle,
     *,
@@ -461,73 +718,185 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
     k = int(work_bundle.meta.get("num_categories", 5))
     labels = labels_from_theta(work_bundle.theta_all, num_categories=k)
     names = condition_labels(k)
-
-    print("[distance-comparison] computing classical finite-sample metrics", flush=True)
-    classical = classical_metric_matrices(
-        work_bundle.x_all,
-        labels,
-        num_categories=k,
-        metrics=metrics,
-        mahalanobis_ridge=float(args.mahalanobis_ridge),
-        skl_folds=int(args.skl_folds),
-        skl_seed=int(args.seed),
-        skl_logistic_c=float(args.skl_logistic_c),
-    )
-
-    if pr_projected:
-        print("[distance-comparison] computing projected-coordinate Monte Carlo ground truth", flush=True)
-        ground_truth = pr_autoencoder_ground_truth_matrices(
-            native_meta=dict(native_bundle.meta),
-            projected_meta=dict(work_bundle.meta),
-            device=dev,
-            cache_dir=Path(args.pr_cache_dir),
-            samples_per_class=int(args.gt_samples_per_class),
-            seed=int(args.seed) + 12345,
-            batch_size=int(args.gt_batch_size),
-            mahalanobis_ridge=float(args.mahalanobis_ridge),
-            metrics=metrics,
-        )
-    else:
-        print("[distance-comparison] computing native-coordinate Monte Carlo ground truth", flush=True)
-        ground_truth = native_mog_ground_truth_matrices(
-            native_meta=dict(native_bundle.meta),
-            samples_per_class=int(args.gt_samples_per_class),
-            seed=int(args.seed) + 12345,
-            mahalanobis_ridge=float(args.mahalanobis_ridge),
-            metrics=metrics,
-        )
-
-    print("[distance-comparison] training flow-matching metrics", flush=True)
     flow_config = _flow_config_from_args(args)
-    if int(flow_config.likelihood_finetune_epochs) > 0:
-        print(
-            "[distance-comparison] enabling CNF NLL fine-tuned flow estimator "
-            f"for {int(flow_config.likelihood_finetune_epochs)} epochs",
-            flush=True,
-        )
-        flow_variants = flow_metric_variants(
-            bundle=work_bundle,
-            device=dev,
-            output_dir=output_dir / "flow",
-            config=flow_config,
-            seed=int(args.seed),
+    existing_results_path = output_dir / "mog5_pr_distance_comparison_results.npz"
+    existing_tre = None
+    existing_ctsm_v = None
+    existing_ctsm_v_binary = None
+    augment_existing = bool(args.ctsm_v_augment_existing) or bool(args.tre_augment_existing)
+    if augment_existing:
+        print(f"[distance-comparison] reusing existing estimators from {existing_results_path}", flush=True)
+        (
+            classical,
+            flow,
+            flow_finetuned,
+            ground_truth,
+            existing_tre,
+            existing_ctsm_v,
+            existing_ctsm_v_binary,
+        ) = _load_existing_estimators(
+            existing_results_path,
             metrics=metrics,
+            require_nll_finetuned=int(flow_config.likelihood_finetune_epochs) > 0,
         )
-        flow = flow_variants.flow_matching
-        flow_finetuned = flow_variants.flow_matching_nll_finetuned
-        flow_paths = flow_variants.flow_npz_paths
-        flow_finetuned_paths = flow_variants.flow_nll_finetuned_npz_paths
-    else:
-        flow, flow_paths = flow_metric_matrices(
-            bundle=work_bundle,
-            device=dev,
-            output_dir=output_dir / "flow",
-            config=flow_config,
-            seed=int(args.seed),
-            metrics=metrics,
-        )
-        flow_finetuned = None
+        flow_paths = None
         flow_finetuned_paths = None
+    else:
+        print("[distance-comparison] computing classical finite-sample metrics", flush=True)
+        classical = classical_metric_matrices(
+            work_bundle.x_all,
+            labels,
+            num_categories=k,
+            metrics=metrics,
+            mahalanobis_ridge=float(args.mahalanobis_ridge),
+            skl_folds=int(args.skl_folds),
+            skl_seed=int(args.seed),
+            skl_logistic_c=float(args.skl_logistic_c),
+        )
+
+        if pr_projected:
+            print("[distance-comparison] computing projected-coordinate Monte Carlo ground truth", flush=True)
+            ground_truth = pr_autoencoder_ground_truth_matrices(
+                native_meta=dict(native_bundle.meta),
+                projected_meta=dict(work_bundle.meta),
+                device=dev,
+                cache_dir=Path(args.pr_cache_dir),
+                samples_per_class=int(args.gt_samples_per_class),
+                seed=int(args.seed) + 12345,
+                batch_size=int(args.gt_batch_size),
+                mahalanobis_ridge=float(args.mahalanobis_ridge),
+                metrics=metrics,
+            )
+        else:
+            print("[distance-comparison] computing native-coordinate Monte Carlo ground truth", flush=True)
+            ground_truth = native_mog_ground_truth_matrices(
+                native_meta=dict(native_bundle.meta),
+                samples_per_class=int(args.gt_samples_per_class),
+                seed=int(args.seed) + 12345,
+                mahalanobis_ridge=float(args.mahalanobis_ridge),
+                metrics=metrics,
+            )
+
+        print("[distance-comparison] training flow-matching metrics", flush=True)
+        if int(flow_config.likelihood_finetune_epochs) > 0:
+            print(
+                "[distance-comparison] enabling CNF NLL fine-tuned flow estimator "
+                f"for {int(flow_config.likelihood_finetune_epochs)} epochs",
+                flush=True,
+            )
+            flow_variants = flow_metric_variants(
+                bundle=work_bundle,
+                device=dev,
+                output_dir=output_dir / "flow",
+                config=flow_config,
+                seed=int(args.seed),
+                metrics=metrics,
+            )
+            flow = flow_variants.flow_matching
+            flow_finetuned = flow_variants.flow_matching_nll_finetuned
+            flow_paths = flow_variants.flow_npz_paths
+            flow_finetuned_paths = flow_variants.flow_nll_finetuned_npz_paths
+        else:
+            flow, flow_paths = flow_metric_matrices(
+                bundle=work_bundle,
+                device=dev,
+                output_dir=output_dir / "flow",
+                config=flow_config,
+                seed=int(args.seed),
+                metrics=metrics,
+            )
+            flow_finetuned = None
+            flow_finetuned_paths = None
+
+    tre = existing_tre
+    tre_paths = None
+    tre_checkpoint_paths = None
+    tre_config = _tre_config_from_args(args)
+    if bool(args.include_tre):
+        print("[distance-comparison] training pairwise Torch TRE models", flush=True)
+        labels_train = labels_from_theta(work_bundle.theta_train, num_categories=k)
+        labels_validation = labels_from_theta(work_bundle.theta_validation, num_categories=k)
+        tre_states, tre_result = train_and_estimate_pairwise_tre_jeffreys(
+            x_train=work_bundle.x_train,
+            labels_train=labels_train,
+            x_validation=work_bundle.x_validation,
+            labels_validation=labels_validation,
+            x_eval=work_bundle.x_all,
+            labels_eval=labels,
+            num_categories=k,
+            device=dev,
+            seed=int(args.seed),
+            config=tre_config,
+            eval_batch_size=int(args.tre_eval_batch_size),
+        )
+        tre_npz, tre_checkpoint = save_pairwise_tre_jeffreys_result(
+            output_dir / "tre" / "symmetric_kl_tre_results.npz",
+            output_dir / "tre" / "symmetric_kl_tre_models.pt",
+            pair_state_dicts=tre_states,
+            result=tre_result,
+        )
+        tre = {"symmetric_kl": tre_result.symmetric_kl_matrix}
+        tre_paths = {"symmetric_kl": tre_npz}
+        tre_checkpoint_paths = {"symmetric_kl": tre_checkpoint}
+
+    ctsm_v = existing_ctsm_v
+    ctsm_v_paths = None
+    ctsm_v_checkpoint_paths = None
+    ctsm_v_config = _ctsm_v_config_from_args(args)
+    if bool(args.include_ctsm_v):
+        print("[distance-comparison] training pair-conditioned CTSM-v", flush=True)
+        ctsm_model, ctsm_result = train_and_estimate_ctsm_v_jeffreys(
+            theta_train=work_bundle.theta_train,
+            x_train=work_bundle.x_train,
+            theta_val=work_bundle.theta_validation,
+            x_val=work_bundle.x_validation,
+            theta_eval=work_bundle.theta_all,
+            x_eval=work_bundle.x_all,
+            labels_eval=labels,
+            num_categories=k,
+            device=dev,
+            seed=int(args.seed),
+            config=ctsm_v_config,
+        )
+        ctsm_npz, ctsm_checkpoint = save_ctsm_v_jeffreys_result(
+            output_dir / "ctsm_v" / "symmetric_kl_ctsm_v_results.npz",
+            output_dir / "ctsm_v" / "symmetric_kl_ctsm_v_model.pt",
+            model=ctsm_model,
+            result=ctsm_result,
+        )
+        ctsm_v = {"symmetric_kl": ctsm_result.symmetric_kl_matrix}
+        ctsm_v_paths = {"symmetric_kl": ctsm_npz}
+        ctsm_v_checkpoint_paths = {"symmetric_kl": ctsm_checkpoint}
+
+    ctsm_v_binary = existing_ctsm_v_binary
+    ctsm_v_binary_paths = None
+    ctsm_v_binary_checkpoint_paths = None
+    ctsm_v_binary_config = _ctsm_v_binary_config_from_args(args)
+    if bool(args.include_ctsm_v_binary):
+        print("[distance-comparison] training pairwise CTSM-v-binary models", flush=True)
+        labels_train = labels_from_theta(work_bundle.theta_train, num_categories=k)
+        labels_val = labels_from_theta(work_bundle.theta_validation, num_categories=k)
+        pair_states, ctsm_binary_result = train_and_estimate_pairwise_binary_ctsm_v_jeffreys(
+            x_train=work_bundle.x_train,
+            labels_train=labels_train,
+            x_val=work_bundle.x_validation,
+            labels_val=labels_val,
+            x_eval=work_bundle.x_all,
+            labels_eval=labels,
+            num_categories=k,
+            device=dev,
+            seed=int(args.seed),
+            config=ctsm_v_binary_config,
+        )
+        ctsm_binary_npz, ctsm_binary_checkpoint = save_pairwise_binary_ctsm_v_jeffreys_result(
+            output_dir / "ctsm_v_binary" / "symmetric_kl_ctsm_v_binary_results.npz",
+            output_dir / "ctsm_v_binary" / "symmetric_kl_ctsm_v_binary_models.pt",
+            pair_state_dicts=pair_states,
+            result=ctsm_binary_result,
+        )
+        ctsm_v_binary = {"symmetric_kl": ctsm_binary_result.symmetric_kl_matrix}
+        ctsm_v_binary_paths = {"symmetric_kl": ctsm_binary_npz}
+        ctsm_v_binary_checkpoint_paths = {"symmetric_kl": ctsm_binary_checkpoint}
 
     result = assemble_comparison_result(
         metrics=metrics,
@@ -535,9 +904,18 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
         classical=classical,
         flow_matching=flow,
         flow_matching_nll_finetuned=flow_finetuned,
+        tre=tre,
+        ctsm_v=ctsm_v,
+        ctsm_v_binary=ctsm_v_binary,
         ground_truth=ground_truth,
         flow_npz_paths=flow_paths,
         flow_nll_finetuned_npz_paths=flow_finetuned_paths,
+        tre_npz_paths=tre_paths,
+        tre_checkpoint_paths=tre_checkpoint_paths,
+        ctsm_v_npz_paths=ctsm_v_paths,
+        ctsm_v_checkpoint_paths=ctsm_v_checkpoint_paths,
+        ctsm_v_binary_npz_paths=ctsm_v_binary_paths,
+        ctsm_v_binary_checkpoint_paths=ctsm_v_binary_checkpoint_paths,
         flow_velocity_families={metric: velocity_family_for_metric(metric, flow_config) for metric in metrics},
     )
 
@@ -570,6 +948,15 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
             "skl_logistic_c": float(args.skl_logistic_c),
             "pr_cache_dir": str(Path(args.pr_cache_dir)),
             "flow_defaults": vars(flow_config),
+            "include_tre": bool(args.include_tre),
+            "tre_defaults": asdict(tre_config),
+            "tre_eval_batch_size": int(args.tre_eval_batch_size),
+            "tre_augment_existing": bool(args.tre_augment_existing),
+            "include_ctsm_v": bool(args.include_ctsm_v),
+            "ctsm_v_defaults": asdict(ctsm_v_config),
+            "include_ctsm_v_binary": bool(args.include_ctsm_v_binary),
+            "ctsm_v_binary_defaults": asdict(ctsm_v_binary_config),
+            "ctsm_v_augment_existing": bool(args.ctsm_v_augment_existing),
         },
     )
     print(f"results_npz: {results_npz}", flush=True)

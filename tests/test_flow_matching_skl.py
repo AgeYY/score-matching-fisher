@@ -1317,6 +1317,35 @@ def test_condition_affine_families_report_model_jeffreys_without_endpoint_diagno
         assert result.canonical_metric_name == "model_jeffreys_symmetric_kl"
 
 
+def test_affine_endpoint_gaussians_integrate_mean_and_covariance() -> None:
+    class ConstantAffineModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.x_dim = 2
+            self.anchor = nn.Parameter(torch.zeros(()))
+            self.register_buffer("means", torch.tensor([[0.0, 0.0], [1.0, -2.0]]))
+
+        def endpoint_mean(self, theta: torch.Tensor) -> torch.Tensor:
+            return theta @ self.means
+
+        def A(self, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+            del t
+            diagonal = torch.tensor([np.log(2.0), np.log(0.5)], dtype=theta.dtype, device=theta.device)
+            return torch.diag(diagonal).unsqueeze(0).expand(int(theta.shape[0]), -1, -1)
+
+    means, covariances = fms.estimate_affine_endpoint_gaussians(
+        model=ConstantAffineModel(),
+        theta_all=np.eye(2, dtype=np.float64),
+        device=torch.device("cpu"),
+        ode_steps=8,
+    )
+
+    np.testing.assert_allclose(means, [[0.0, 0.0], [1.0, -2.0]], atol=1e-6)
+    expected_covariance = np.diag([4.0, 0.25])
+    np.testing.assert_allclose(covariances[0], expected_covariance, atol=1e-5)
+    np.testing.assert_allclose(covariances[1], expected_covariance, atol=1e-5)
+
+
 def test_restricted_low_rank_affine_endpoint_uses_model_jeffreys_without_endpoint_diagnostics() -> None:
     theta = np.eye(2, dtype=np.float64)
     for family in ("shared_affine_low_rank_scalar", "shared_affine_low_rank_diag"):

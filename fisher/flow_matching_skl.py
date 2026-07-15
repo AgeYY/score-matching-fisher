@@ -66,6 +66,8 @@ class FlowSKLResult:
     fisher_theta_midpoints: np.ndarray | None = None
     fisher_full: np.ndarray | None = None
     fisher_linear: np.ndarray | None = None
+    endpoint_gaussian_means: np.ndarray | None = None
+    endpoint_gaussian_covariances: np.ndarray | None = None
     train_metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -2336,6 +2338,54 @@ def estimate_affine_mixed_covariance_fisher(
     )
 
 
+@torch.no_grad()
+def estimate_affine_endpoint_gaussians(
+    *,
+    model: nn.Module,
+    theta_all: np.ndarray,
+    device: torch.device,
+    ode_steps: int = 64,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return endpoint means and covariances for an affine Gaussian flow."""
+
+    theta = _as_2d_float64(theta_all, name="theta_all")
+    if not hasattr(model, "endpoint_mean") or not hasattr(model, "A"):
+        raise ValueError("Affine endpoint moments require model.endpoint_mean() and model.A().")
+    steps = int(ode_steps)
+    if steps < 1:
+        raise ValueError("ode_steps must be >= 1.")
+
+    model.to(device)
+    model.eval()
+    dtype = _model_floating_dtype(model)
+    x_dim = int(getattr(model, "x_dim"))
+    means = np.empty((int(theta.shape[0]), x_dim), dtype=np.float64)
+    covariances = np.empty((int(theta.shape[0]), x_dim, x_dim), dtype=np.float64)
+    dt = 1.0 / float(steps)
+
+    for condition_idx in range(int(theta.shape[0])):
+        th = torch.from_numpy(theta[condition_idx : condition_idx + 1].astype(np.float32)).to(
+            device=device,
+            dtype=dtype,
+        )
+        means[condition_idx] = (
+            model.endpoint_mean(th).detach().cpu().numpy().reshape(-1).astype(np.float64)
+        )
+        covariance = torch.eye(x_dim, dtype=dtype, device=device).unsqueeze(0)
+        for step in range(steps):
+            t_value = (float(step) + 0.5) * dt
+            tt = torch.full((1, 1), t_value, dtype=dtype, device=device)
+            try:
+                a = model.A(th, tt)
+            except TypeError:
+                a = model.A(tt)
+            transition = torch.matrix_exp(float(dt) * a)
+            covariance = transition @ covariance @ transition.transpose(-1, -2)
+        cov_np = covariance.detach().cpu().numpy().reshape(x_dim, x_dim).astype(np.float64)
+        covariances[condition_idx] = 0.5 * (cov_np + cov_np.T)
+    return means, covariances
+
+
 def estimate_model_symmetric_kl(
     *,
     model: nn.Module,
@@ -2454,4 +2504,8 @@ def flow_skl_result_to_npz_dict(result: FlowSKLResult) -> dict[str, Any]:
         out["fisher_full"] = result.fisher_full
     if result.fisher_linear is not None:
         out["fisher_linear"] = result.fisher_linear
+    if result.endpoint_gaussian_means is not None:
+        out["endpoint_gaussian_means"] = result.endpoint_gaussian_means
+    if result.endpoint_gaussian_covariances is not None:
+        out["endpoint_gaussian_covariances"] = result.endpoint_gaussian_covariances
     return out

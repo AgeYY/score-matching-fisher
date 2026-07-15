@@ -130,6 +130,8 @@ def test_parser_defaults_and_cpu_auto(monkeypatch: pytest.MonkeyPatch) -> None:
     assert args.flow_likelihood_finetune_ode_steps == 32
     assert args.flow_likelihood_finetune_patience == 150
     assert args.flow_likelihood_finetune_checkpoint_selection == "best"
+    assert args.tre_num_bridges == 8
+    assert args.tre_architecture == "mlp"
     assert args.cpu_threads_per_job == 16
     assert args.parallel_log_dir == args.output_dir / "parallel_logs"
 
@@ -195,6 +197,8 @@ def test_worker_command_and_env_forwarding(monkeypatch: pytest.MonkeyPatch, tmp_
             "7",
             "--batch-size",
             "32",
+            "--include-tre",
+            "--tre-augment-existing",
             "--native-template-npz",
             str(tmp_path / "ignored.npz"),
             "--output-dir",
@@ -220,6 +224,8 @@ def test_worker_command_and_env_forwarding(monkeypatch: pytest.MonkeyPatch, tmp_
     assert "--metric symmetric_kl" in joined
     assert "--epochs 7" in joined
     assert "--batch-size 32" in joined
+    assert "--include-tre" in command
+    assert "--tre-augment-existing" in command
     assert env["CUDA_VISIBLE_DEVICES"] == "3"
     assert env["PYTHONUNBUFFERED"] == "1"
     for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):

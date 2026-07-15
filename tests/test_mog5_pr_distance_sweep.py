@@ -16,6 +16,7 @@ ALL_METRICS = (
     "cosine",
     "correlation",
     "mahalanobis_sq",
+    "fid",
     "symmetric_kl",
 )
 
@@ -29,7 +30,15 @@ def _load_cli_module():
     return mod
 
 
-def _write_case_npz(path: Path, *, offset: float = 0.0, metrics: tuple[str, ...] = ALL_METRICS) -> Path:
+def _write_case_npz(
+    path: Path,
+    *,
+    offset: float = 0.0,
+    metrics: tuple[str, ...] = ALL_METRICS,
+    include_tre: bool = False,
+    include_ctsm_v: bool = False,
+    include_ctsm_v_binary: bool = False,
+) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     metric_names = np.asarray(metrics)
     labels = np.asarray(["category_0", "category_1", "category_2"])
@@ -38,6 +47,9 @@ def _write_case_npz(path: Path, *, offset: float = 0.0, metrics: tuple[str, ...]
     flow = np.zeros((len(metrics), 3, 3), dtype=np.float64)
     flow_finetuned = np.zeros((len(metrics), 3, 3), dtype=np.float64)
     gt = np.zeros((len(metrics), 3, 3), dtype=np.float64)
+    tre = np.full((len(metrics), 3, 3), np.nan, dtype=np.float64)
+    ctsm_v = np.full((len(metrics), 3, 3), np.nan, dtype=np.float64)
+    ctsm_v_binary = np.full((len(metrics), 3, 3), np.nan, dtype=np.float64)
     for metric_idx in range(len(metrics)):
         for i, j in pairs:
             gt_val = offset + 10.0 + metric_idx
@@ -48,8 +60,11 @@ def _write_case_npz(path: Path, *, offset: float = 0.0, metrics: tuple[str, ...]
             classical[metric_idx, i, j] = classical[metric_idx, j, i] = classical_val
             flow[metric_idx, i, j] = flow[metric_idx, j, i] = flow_val
             flow_finetuned[metric_idx, i, j] = flow_finetuned[metric_idx, j, i] = flow_finetuned_val
-    np.savez_compressed(
-        path,
+            if metrics[metric_idx] == "symmetric_kl":
+                tre[metric_idx, i, j] = tre[metric_idx, j, i] = gt_val + 0.75
+                ctsm_v[metric_idx, i, j] = ctsm_v[metric_idx, j, i] = gt_val + 0.5
+                ctsm_v_binary[metric_idx, i, j] = ctsm_v_binary[metric_idx, j, i] = gt_val + 0.25
+    fields = dict(
         metric_names=metric_names,
         condition_labels=labels,
         pair_indices=pairs,
@@ -58,6 +73,13 @@ def _write_case_npz(path: Path, *, offset: float = 0.0, metrics: tuple[str, ...]
         flow_matching_nll_finetuned_matrices=flow_finetuned,
         ground_truth_matrices=gt,
     )
+    if include_tre:
+        fields["tre_matrices"] = tre
+    if include_ctsm_v:
+        fields["ctsm_v_matrices"] = ctsm_v
+    if include_ctsm_v_binary:
+        fields["ctsm_v_binary_matrices"] = ctsm_v_binary
+    np.savez_compressed(path, **fields)
     return path
 
 
@@ -227,6 +249,10 @@ def test_parser_defaults() -> None:
     assert args.batch_size == 3000
     assert args.flow_likelihood_finetune_batch_size == 3000
     assert args.lr == pytest.approx(1e-4)
+    assert args.ctsm_v_t_eps == pytest.approx(1e-4)
+    assert args.tre_num_bridges == 8
+    assert args.tre_architecture == "mlp"
+    assert args.tre_epochs == 1000
     assert args.hidden_dim == 128
     assert args.depth == 3
     assert args.fixed_validation is True
@@ -260,7 +286,7 @@ def test_aggregate_mean_pairwise_abs_errors(tmp_path: Path) -> None:
 
     aggregate, rows = mod.aggregate_sweeps(args=args, case_data=data)
 
-    assert aggregate["n_sweep_classical_matrices"].shape == (1, 5, 3, 3)
+    assert aggregate["n_sweep_classical_matrices"].shape == (1, len(ALL_METRICS), 3, 3)
     assert "pr_dim_list" not in aggregate
     assert "pr_dim_sweep_classical_matrices" not in aggregate
     assert {r["axis"] for r in rows} == {"n_total"}
@@ -281,6 +307,107 @@ def test_aggregate_mean_pairwise_abs_errors(tmp_path: Path) -> None:
     assert np.mean(classical_rel_errors) == pytest.approx(((1.0 / 10.0) + (1.0 / 10.0) + (2.0 / 10.0)) / 3.0)
     assert np.mean(flow_rel_errors) == pytest.approx(((3.0 / 10.0) + (4.0 / 10.0) + (4.0 / 10.0)) / 3.0)
     assert np.mean(flow_finetuned_rel_errors) == pytest.approx(1.0 / 10.0)
+
+
+def test_ctsm_v_is_aggregated_only_for_symmetric_kl(tmp_path: Path) -> None:
+    mod = _load_cli_module()
+    args = mod.build_parser().parse_args(
+        [
+            "--n-list",
+            "100,200",
+            "--n-repeats",
+            "1",
+            "--include-ctsm-v",
+            "--include-ctsm-v-binary",
+        ]
+    )
+    case_data = {
+        (100, -1): mod._filter_case_metrics(
+            mod._load_case_cache(
+                _write_case_npz(
+                    tmp_path / "case_100.npz",
+                    include_ctsm_v=True,
+                    include_ctsm_v_binary=True,
+                )
+            ),
+            ALL_METRICS,
+            require_ctsm_v=True,
+            require_ctsm_v_binary=True,
+        ),
+        (200, -1): mod._filter_case_metrics(
+            mod._load_case_cache(
+                _write_case_npz(
+                    tmp_path / "case_200.npz",
+                    offset=2.0,
+                    include_ctsm_v=True,
+                    include_ctsm_v_binary=True,
+                )
+            ),
+            ALL_METRICS,
+            require_ctsm_v=True,
+            require_ctsm_v_binary=True,
+        ),
+    }
+
+    aggregate, rows = mod.aggregate_sweeps(args=args, case_data=case_data)
+    assert aggregate["n_repeat_ctsm_v_matrices"].shape == (2, 1, len(ALL_METRICS), 3, 3)
+    ctsm_rows = [row for row in rows if row["estimator"] == "ctsm_v"]
+    assert ctsm_rows
+    assert {row["metric"] for row in ctsm_rows} == {"symmetric_kl"}
+    ctsm_binary_rows = [row for row in rows if row["estimator"] == "ctsm_v_binary"]
+    assert ctsm_binary_rows
+    assert {row["metric"] for row in ctsm_binary_rows} == {"symmetric_kl"}
+
+    svg, png = mod.plot_sweep_error(
+        aggregate,
+        svg_path=tmp_path / "ctsm.svg",
+        png_path=tmp_path / "ctsm.png",
+        yscale="linear",
+        relative=False,
+    )
+    assert svg.is_file() and png.is_file()
+    assert (
+        "estimators=classical,flow_matching,flow_matching_nll_finetuned,ctsm_v,ctsm_v_binary"
+        in svg.read_text(encoding="utf-8")
+    )
+
+
+def test_tre_is_aggregated_and_plotted_only_for_symmetric_kl(tmp_path: Path) -> None:
+    mod = _load_cli_module()
+    args = mod.build_parser().parse_args(
+        ["--n-list", "100,200", "--n-repeats", "1", "--include-tre"]
+    )
+    case_data = {
+        (n_total, -1): mod._filter_case_metrics(
+            mod._load_case_cache(
+                _write_case_npz(
+                    tmp_path / f"case_{n_total}.npz",
+                    offset=float(index),
+                    include_tre=True,
+                )
+            ),
+            ALL_METRICS,
+            require_tre=True,
+        )
+        for index, n_total in enumerate((100, 200))
+    }
+
+    aggregate, rows = mod.aggregate_sweeps(args=args, case_data=case_data)
+    assert aggregate["n_repeat_tre_matrices"].shape == (2, 1, len(ALL_METRICS), 3, 3)
+    tre_rows = [row for row in rows if row["estimator"] == "tre"]
+    assert tre_rows
+    assert {row["metric"] for row in tre_rows} == {"symmetric_kl"}
+    svg, png = mod.plot_sweep_error(
+        aggregate,
+        svg_path=tmp_path / "tre.svg",
+        png_path=tmp_path / "tre.png",
+        yscale="linear",
+        relative=True,
+    )
+    assert svg.is_file() and png.is_file()
+    assert "estimators=classical,flow_matching,flow_matching_nll_finetuned,tre" in svg.read_text(
+        encoding="utf-8"
+    )
 
 
 def test_repeat_case_paths_and_single_case_args(tmp_path: Path) -> None:
@@ -367,8 +494,14 @@ def test_repeat_aggregate_arrays_and_csv_rows(tmp_path: Path) -> None:
     aggregate, rows = mod.aggregate_sweeps(args=args, case_data=case_data)
     out = mod.write_aggregate_npz(tmp_path / "sweep.npz", aggregate)
 
-    assert aggregate["n_repeat_classical_matrices"].shape == (2, 2, 5, 3, 3)
-    assert aggregate["n_repeat_flow_matching_nll_finetuned_matrices"].shape == (2, 2, 5, 3, 3)
+    assert aggregate["n_repeat_classical_matrices"].shape == (2, 2, len(ALL_METRICS), 3, 3)
+    assert aggregate["n_repeat_flow_matching_nll_finetuned_matrices"].shape == (
+        2,
+        2,
+        len(ALL_METRICS),
+        3,
+        3,
+    )
     np.testing.assert_allclose(
         aggregate["n_sweep_classical_matrices"],
         np.mean(aggregate["n_repeat_classical_matrices"], axis=1),
@@ -385,8 +518,14 @@ def test_repeat_aggregate_arrays_and_csv_rows(tmp_path: Path) -> None:
     assert {row["repeat_idx"] for row in rows} == {0, 1}
     assert {row["repeat_seed"] for row in rows} == {31, 32}
     with np.load(out, allow_pickle=False) as npz:
-        assert npz["n_repeat_classical_matrices"].shape == (2, 2, 5, 3, 3)
-        assert npz["n_repeat_flow_matching_nll_finetuned_matrices"].shape == (2, 2, 5, 3, 3)
+        assert npz["n_repeat_classical_matrices"].shape == (2, 2, len(ALL_METRICS), 3, 3)
+        assert npz["n_repeat_flow_matching_nll_finetuned_matrices"].shape == (
+            2,
+            2,
+            len(ALL_METRICS),
+            3,
+            3,
+        )
         np.testing.assert_array_equal(npz["repeat_seeds"], [31, 32])
 
 
@@ -670,7 +809,7 @@ def test_visualization_only_writes_outputs_from_fake_caches(monkeypatch, tmp_pat
     assert outputs["dataset_figure_png"].is_file()
     assert outputs["summary_json"].is_file()
     with np.load(outputs["results_npz"], allow_pickle=False) as data:
-        assert data["n_sweep_classical_matrices"].shape == (1, 5, 3, 3)
+        assert data["n_sweep_classical_matrices"].shape == (1, len(ALL_METRICS), 3, 3)
         assert "pr_dim_list" not in data.files
         assert "pr_dim_sweep_classical_matrices" not in data.files
     with outputs["errors_csv"].open(newline="", encoding="utf-8") as f:

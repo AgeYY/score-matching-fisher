@@ -44,6 +44,7 @@ GROUND_TRUTH_RDM_METRIC_ORDER = (
     "cosine",
     "squared_euclidean",
     "mahalanobis_sq",
+    "fid",
     "symmetric_kl",
 )
 GROUND_TRUTH_RDM_METRIC_TITLES = {
@@ -51,6 +52,7 @@ GROUND_TRUTH_RDM_METRIC_TITLES = {
     "cosine": "Cosine",
     "squared_euclidean": "Squared Euclidean",
     "mahalanobis_sq": "Squared Mahalanobis",
+    "fid": "FID",
     "symmetric_kl": "Jeffreys divergence",
 }
 SWEEP_X_TICK_VALUES = (50, 1000, 2000, 3000)
@@ -310,6 +312,9 @@ def resolve_metric_names(args: argparse.Namespace) -> tuple[str, ...]:
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    single = _load_single_case_module()
+    if hasattr(single, "validate_args"):
+        single.validate_args(args)
     native_x_dim = int(args.native_x_dim)
     if native_x_dim < 2:
         raise ValueError(f"--native-x-dim must be >= 2; got {args.native_x_dim}.")
@@ -439,6 +444,14 @@ def _load_case_cache(path: Path) -> dict[str, Any]:
             out["flow_matching_nll_finetuned_matrices"] = np.asarray(
                 data["flow_matching_nll_finetuned_matrices"], dtype=np.float64
             )
+        if "tre_matrices" in data.files:
+            out["tre_matrices"] = np.asarray(data["tre_matrices"], dtype=np.float64)
+        if "ctsm_v_matrices" in data.files:
+            out["ctsm_v_matrices"] = np.asarray(data["ctsm_v_matrices"], dtype=np.float64)
+        if "ctsm_v_binary_matrices" in data.files:
+            out["ctsm_v_binary_matrices"] = np.asarray(
+                data["ctsm_v_binary_matrices"], dtype=np.float64
+            )
         return out
 
 
@@ -470,6 +483,9 @@ def _filter_case_metrics(
     *,
     path: Path | None = None,
     require_nll_finetuned: bool = False,
+    require_tre: bool = False,
+    require_ctsm_v: bool = False,
+    require_ctsm_v_binary: bool = False,
 ) -> dict[str, Any]:
     available = tuple(str(v) for v in data["metric_names"])
     missing = [metric for metric in metrics if metric not in available]
@@ -480,6 +496,15 @@ def _filter_case_metrics(
     if bool(require_nll_finetuned) and "flow_matching_nll_finetuned_matrices" not in data:
         where = "" if path is None else f" in {path}"
         raise ValueError(f"Cached comparison results{where} are missing the NLL-fine-tuned flow estimator.")
+    if bool(require_tre) and "tre_matrices" not in data:
+        where = "" if path is None else f" in {path}"
+        raise ValueError(f"Cached comparison results{where} are missing the TRE estimator.")
+    if bool(require_ctsm_v) and "ctsm_v_matrices" not in data:
+        where = "" if path is None else f" in {path}"
+        raise ValueError(f"Cached comparison results{where} are missing the CTSM-v estimator.")
+    if bool(require_ctsm_v_binary) and "ctsm_v_binary_matrices" not in data:
+        where = "" if path is None else f" in {path}"
+        raise ValueError(f"Cached comparison results{where} are missing the CTSM-v-binary estimator.")
     out = {
         "metric_names": tuple(metrics),
         "condition_labels": tuple(data["condition_labels"]),
@@ -491,6 +516,14 @@ def _filter_case_metrics(
     if "flow_matching_nll_finetuned_matrices" in data:
         out["flow_matching_nll_finetuned_matrices"] = np.asarray(
             data["flow_matching_nll_finetuned_matrices"], dtype=np.float64
+        )[indices]
+    if "tre_matrices" in data:
+        out["tre_matrices"] = np.asarray(data["tre_matrices"], dtype=np.float64)[indices]
+    if "ctsm_v_matrices" in data:
+        out["ctsm_v_matrices"] = np.asarray(data["ctsm_v_matrices"], dtype=np.float64)[indices]
+    if "ctsm_v_binary_matrices" in data:
+        out["ctsm_v_binary_matrices"] = np.asarray(
+            data["ctsm_v_binary_matrices"], dtype=np.float64
         )[indices]
     return out
 
@@ -520,6 +553,9 @@ def ensure_case_results(
                 requested_metrics,
                 path=result_path,
                 require_nll_finetuned=int(args.flow_likelihood_finetune_epochs) > 0,
+                require_tre=bool(args.include_tre),
+                require_ctsm_v=bool(args.include_ctsm_v),
+                require_ctsm_v_binary=bool(args.include_ctsm_v_binary),
             )
             print(
                 f"[sweep] cache hit n_total={n_total} repeat={int(repeat_idx)} "
@@ -628,6 +664,9 @@ def aggregate_sweeps(
     condition_labels = tuple(first["condition_labels"])
     pair_indices = np.asarray(first["pair_indices"], dtype=np.int64)
     has_nll_finetuned = "flow_matching_nll_finetuned_matrices" in first
+    has_tre = "tre_matrices" in first
+    has_ctsm_v = "ctsm_v_matrices" in first
+    has_ctsm_v_binary = "ctsm_v_binary_matrices" in first
 
     for case, data in case_data.items():
         if tuple(data["metric_names"]) != metric_names:
@@ -636,6 +675,12 @@ def aggregate_sweeps(
             raise ValueError(f"Condition labels differ for case {case}.")
         if ("flow_matching_nll_finetuned_matrices" in data) != has_nll_finetuned:
             raise ValueError(f"NLL-fine-tuned estimator availability differs for case {case}.")
+        if ("tre_matrices" in data) != has_tre:
+            raise ValueError(f"TRE estimator availability differs for case {case}.")
+        if ("ctsm_v_matrices" in data) != has_ctsm_v:
+            raise ValueError(f"CTSM-v estimator availability differs for case {case}.")
+        if ("ctsm_v_binary_matrices" in data) != has_ctsm_v_binary:
+            raise ValueError(f"CTSM-v-binary estimator availability differs for case {case}.")
         np.testing.assert_array_equal(np.asarray(data["pair_indices"], dtype=np.int64), pair_indices)
 
     repeat_indices = np.arange(_n_repeats(args), dtype=np.int64)
@@ -663,6 +708,11 @@ def aggregate_sweeps(
     n_repeat_flow = stack_repeat("flow_matching_matrices")
     n_repeat_flow_finetuned = (
         stack_repeat("flow_matching_nll_finetuned_matrices") if has_nll_finetuned else None
+    )
+    n_repeat_tre = stack_repeat("tre_matrices") if has_tre else None
+    n_repeat_ctsm_v = stack_repeat("ctsm_v_matrices") if has_ctsm_v else None
+    n_repeat_ctsm_v_binary = (
+        stack_repeat("ctsm_v_binary_matrices") if has_ctsm_v_binary else None
     )
     n_repeat_ground_truth = stack_repeat("ground_truth_matrices")
 
@@ -692,6 +742,17 @@ def aggregate_sweeps(
         aggregate["n_sweep_flow_matching_nll_finetuned_matrices"] = np.mean(
             n_repeat_flow_finetuned, axis=1
         )
+    if n_repeat_tre is not None:
+        aggregate["n_repeat_tre_matrices"] = n_repeat_tre
+        aggregate["n_sweep_tre_matrices"] = np.mean(n_repeat_tre, axis=1)
+    if n_repeat_ctsm_v is not None:
+        aggregate["n_repeat_ctsm_v_matrices"] = n_repeat_ctsm_v
+        aggregate["n_sweep_ctsm_v_matrices"] = np.mean(n_repeat_ctsm_v, axis=1)
+    if n_repeat_ctsm_v_binary is not None:
+        aggregate["n_repeat_ctsm_v_binary_matrices"] = n_repeat_ctsm_v_binary
+        aggregate["n_sweep_ctsm_v_binary_matrices"] = np.mean(
+            n_repeat_ctsm_v_binary, axis=1
+        )
 
     rows: list[dict[str, Any]] = []
     for n_total in args.n_list:
@@ -709,6 +770,32 @@ def aggregate_sweeps(
                         estimators.append(
                             ("flow_matching_nll_finetuned", "flow_matching_nll_finetuned_matrices")
                         )
+                    if has_tre:
+                        tre_metric = np.asarray(data["tre_matrices"][metric_idx], dtype=np.float64)
+                        tre_pair_values = np.asarray(
+                            [tre_metric[int(a), int(b)] for a, b in pair_indices],
+                            dtype=np.float64,
+                        )
+                        if np.all(np.isfinite(tre_pair_values)):
+                            estimators.append(("tre", "tre_matrices"))
+                    if has_ctsm_v:
+                        ctsm_metric = np.asarray(data["ctsm_v_matrices"][metric_idx], dtype=np.float64)
+                        ctsm_pair_values = np.asarray(
+                            [ctsm_metric[int(a), int(b)] for a, b in pair_indices],
+                            dtype=np.float64,
+                        )
+                        if np.all(np.isfinite(ctsm_pair_values)):
+                            estimators.append(("ctsm_v", "ctsm_v_matrices"))
+                    if has_ctsm_v_binary:
+                        ctsm_binary_metric = np.asarray(
+                            data["ctsm_v_binary_matrices"][metric_idx], dtype=np.float64
+                        )
+                        ctsm_binary_pair_values = np.asarray(
+                            [ctsm_binary_metric[int(a), int(b)] for a, b in pair_indices],
+                            dtype=np.float64,
+                        )
+                        if np.all(np.isfinite(ctsm_binary_pair_values)):
+                            estimators.append(("ctsm_v_binary", "ctsm_v_binary_matrices"))
                     for estimator, matrix_key in estimators:
                         est = float(np.asarray(data[matrix_key][metric_idx], dtype=np.float64)[ci, cj])
                         truth = float(gt[ci, cj])
@@ -761,6 +848,12 @@ def write_aggregate_npz(path: Path, aggregate: dict[str, Any]) -> Path:
     for key in (
         "n_sweep_flow_matching_nll_finetuned_matrices",
         "n_repeat_flow_matching_nll_finetuned_matrices",
+        "n_sweep_tre_matrices",
+        "n_repeat_tre_matrices",
+        "n_sweep_ctsm_v_matrices",
+        "n_repeat_ctsm_v_matrices",
+        "n_sweep_ctsm_v_binary_matrices",
+        "n_repeat_ctsm_v_binary_matrices",
     ):
         if key in aggregate:
             fields[key] = np.asarray(aggregate[key], dtype=np.float64)
@@ -838,11 +931,35 @@ def plot_sweep_error(
             "marker": "^",
             "label": "Flow matching + NLL",
         },
+        "tre": {
+            "color": "C3",
+            "linestyle": "-.",
+            "marker": "D",
+            "label": "TRE",
+        },
+        "ctsm_v": {
+            "color": "C4",
+            "linestyle": ":",
+            "marker": "P",
+            "label": "CTSM-v",
+        },
+        "ctsm_v_binary": {
+            "color": "C5",
+            "linestyle": "--",
+            "marker": "X",
+            "label": "Pairwise CTSM-v-binary",
+        },
     }
     flow_estimators = ["flow_matching"]
     if "n_repeat_flow_matching_nll_finetuned_matrices" in aggregate or "n_sweep_flow_matching_nll_finetuned_matrices" in aggregate:
         flow_estimators.append("flow_matching_nll_finetuned")
-    estimators = ("classical", *flow_estimators)
+    estimators = ["classical", *flow_estimators]
+    if "n_repeat_tre_matrices" in aggregate or "n_sweep_tre_matrices" in aggregate:
+        estimators.append("tre")
+    if "n_repeat_ctsm_v_matrices" in aggregate or "n_sweep_ctsm_v_matrices" in aggregate:
+        estimators.append("ctsm_v")
+    if "n_repeat_ctsm_v_binary_matrices" in aggregate or "n_sweep_ctsm_v_binary_matrices" in aggregate:
+        estimators.append("ctsm_v_binary")
     xvals = np.asarray(aggregate["n_list"], dtype=np.int64)
     gt = np.asarray(aggregate.get("n_repeat_ground_truth_matrices", aggregate["n_sweep_ground_truth_matrices"]), dtype=np.float64)
     matrices_by_estimator = {
@@ -863,6 +980,24 @@ def plot_sweep_error(
             ),
             dtype=np.float64,
         )
+    if "tre" in estimators:
+        matrices_by_estimator["tre"] = np.asarray(
+            aggregate.get("n_repeat_tre_matrices", aggregate["n_sweep_tre_matrices"]),
+            dtype=np.float64,
+        )
+    if "ctsm_v" in estimators:
+        matrices_by_estimator["ctsm_v"] = np.asarray(
+            aggregate.get("n_repeat_ctsm_v_matrices", aggregate["n_sweep_ctsm_v_matrices"]),
+            dtype=np.float64,
+        )
+    if "ctsm_v_binary" in estimators:
+        matrices_by_estimator["ctsm_v_binary"] = np.asarray(
+            aggregate.get(
+                "n_repeat_ctsm_v_binary_matrices",
+                aggregate["n_sweep_ctsm_v_binary_matrices"],
+            ),
+            dtype=np.float64,
+        )
     error_label = "Mean relative absolute error" if relative else "Mean absolute error"
     sparse_x_ticks = _sparse_sweep_x_ticks(xvals)
 
@@ -880,6 +1015,8 @@ def plot_sweep_error(
         ax.set_title(GROUND_TRUTH_RDM_METRIC_TITLES.get(str(metric), str(metric)), fontsize=16)
         for estimator in estimators:
             matrices = matrices_by_estimator[estimator]
+            if not np.any(np.isfinite(matrices[..., metric_idx, :, :])):
+                continue
             yvals = _mean_pair_error_curve(
                 matrices,
                 gt,
@@ -1228,6 +1365,27 @@ def write_summary(
         "flow_likelihood_finetune_checkpoint_selection": str(
             args.flow_likelihood_finetune_checkpoint_selection
         ),
+        "include_ctsm_v": bool(args.include_ctsm_v),
+        "include_ctsm_v_binary": bool(args.include_ctsm_v_binary),
+        "ctsm_v_binary_epochs": int(args.ctsm_v_binary_epochs),
+        "ctsm_v_epochs": int(args.ctsm_v_epochs),
+        "ctsm_v_batch_size": int(args.ctsm_v_batch_size),
+        "ctsm_v_lr": float(args.ctsm_v_lr),
+        "ctsm_v_architecture": str(args.ctsm_v_architecture),
+        "ctsm_v_hidden_dim": int(args.ctsm_v_hidden_dim),
+        "ctsm_v_film_depth": int(args.ctsm_v_film_depth),
+        "ctsm_v_path_schedule": str(args.ctsm_v_path_schedule),
+        "ctsm_v_integration_steps": int(args.ctsm_v_integration_steps),
+        "include_tre": bool(args.include_tre),
+        "tre_num_bridges": int(args.tre_num_bridges),
+        "tre_waymark_schedule": str(args.tre_waymark_schedule),
+        "tre_architecture": str(args.tre_architecture),
+        "tre_hidden_dim": int(args.tre_hidden_dim),
+        "tre_depth": int(args.tre_depth),
+        "tre_epochs": int(args.tre_epochs),
+        "tre_batch_size": int(args.tre_batch_size),
+        "tre_lr": float(args.tre_lr),
+        "tre_early_patience": int(args.tre_early_patience),
     }
     if extra_config:
         config.update(extra_config)
@@ -1398,6 +1556,9 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
             metrics,
             path=Path(path),
             require_nll_finetuned=int(args.flow_likelihood_finetune_epochs) > 0,
+            require_tre=bool(args.include_tre),
+            require_ctsm_v=bool(args.include_ctsm_v),
+            require_ctsm_v_binary=bool(args.include_ctsm_v_binary),
         )
 
     return finalize_sweep_outputs(
