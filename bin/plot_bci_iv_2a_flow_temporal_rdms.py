@@ -20,6 +20,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from global_setting import (  # noqa: E402
+    DEFAULT_EARLY_STOPPING_PATIENCE,
+    DEFAULT_TRAINING_MAX_EPOCHS,
+)
 from fisher.bci_iv_2a_dataset import (  # noqa: E402
     CLASS_NAMES,
     EEG_CHANNEL_COUNT,
@@ -60,8 +64,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tmin", type=float, default=-2.0)
     parser.add_argument("--tmax", type=float, default=4.0)
     parser.add_argument("--seed", type=int, default=7)
-    parser.add_argument("--epochs", type=int, default=5_000)
-    parser.add_argument("--patience", type=int, default=500)
+    parser.add_argument("--epochs", type=int, default=DEFAULT_TRAINING_MAX_EPOCHS)
+    parser.add_argument("--patience", type=int, default=DEFAULT_EARLY_STOPPING_PATIENCE)
     parser.add_argument("--batch-size", type=int, default=4_096)
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--depth", type=int, default=2)

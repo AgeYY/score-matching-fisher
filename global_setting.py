@@ -34,6 +34,15 @@ STRINGER_EXAMPLE_SESSION_FILE = os.environ.get(
 # Override at runtime: export SCORE_MATCHING_FISHER_DEFAULT_DEVICE=cuda:1
 DEFAULT_DEVICE = os.environ.get("SCORE_MATCHING_FISHER_DEFAULT_DEVICE", "cuda:0")
 
+# Project-wide defaults for training loops. Individual experiments may override
+# these explicitly on the CLI when their protocol requires a different budget.
+DEFAULT_TRAINING_MAX_EPOCHS = int(
+    os.environ.get("SCORE_MATCHING_FISHER_TRAINING_MAX_EPOCHS", "20000")
+)
+DEFAULT_EARLY_STOPPING_PATIENCE = int(
+    os.environ.get("SCORE_MATCHING_FISHER_EARLY_STOPPING_PATIENCE", "1000")
+)
+
 
 def _default_cuda_device_id(device_name: str) -> int:
     text = str(device_name).strip().lower()

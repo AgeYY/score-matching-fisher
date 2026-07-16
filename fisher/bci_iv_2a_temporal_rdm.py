@@ -10,6 +10,7 @@ import numpy as np
 import torch
 from sklearn.covariance import LedoitWolf
 
+from global_setting import DEFAULT_EARLY_STOPPING_PATIENCE, DEFAULT_TRAINING_MAX_EPOCHS
 from fisher.distance_comparison import (
     correlation_distance_matrix,
     cosine_distance_matrix,
@@ -37,11 +38,11 @@ class FlowTemporalRDMConfig:
 
     hidden_dim: int = 64
     depth: int = 2
-    epochs: int = 5_000
+    epochs: int = DEFAULT_TRAINING_MAX_EPOCHS
     batch_size: int = 4_096
     learning_rate: float = 1e-3
     weight_decay: float = 1e-5
-    patience: int = 500
+    patience: int = DEFAULT_EARLY_STOPPING_PATIENCE
     validation_fraction: float = 0.25
     covariance_steps: int = 48
     covariance_ridge: float = 1e-5
@@ -268,8 +269,15 @@ def fit_native_time_affine_flow_rdms(
     device: torch.device,
     seed: int,
     config: FlowTemporalRDMConfig,
+    evaluation_time_points: np.ndarray | None = None,
 ) -> tuple[FlowTemporalRDMResult, torch.nn.Module]:
-    """Fit one continuous physical-time affine flow and return dense native-time RDMs."""
+    """Fit one continuous physical-time affine flow and evaluate temporal RDMs.
+
+    Training always uses every supplied native-time observation.  By default,
+    endpoint moments and RDMs are also evaluated at every native time.  Passing
+    ``evaluation_time_points`` evaluates the fitted continuous model on a
+    smaller common grid without temporally binning the training data.
+    """
 
     values = _validate_temporal_samples(samples)
     times = np.asarray(time_points, dtype=np.float64).reshape(-1)
@@ -277,6 +285,17 @@ def fit_native_time_affine_flow_rdms(
         raise ValueError("time_points must have one entry per native sample.")
     if np.any(np.diff(times) <= 0.0):
         raise ValueError("time_points must be strictly increasing.")
+    if evaluation_time_points is None:
+        evaluation_times = times
+    else:
+        evaluation_times = np.asarray(evaluation_time_points, dtype=np.float64).reshape(-1)
+        if evaluation_times.size < 2:
+            raise ValueError("evaluation_time_points must contain at least two times.")
+        if np.any(np.diff(evaluation_times) <= 0.0):
+            raise ValueError("evaluation_time_points must be strictly increasing.")
+        tolerance = 10.0 * np.finfo(np.float64).eps * max(1.0, float(np.max(np.abs(times))))
+        if evaluation_times[0] < times[0] - tolerance or evaluation_times[-1] > times[-1] + tolerance:
+            raise ValueError("evaluation_time_points must lie inside the training time range.")
     if not 0.0 < float(config.validation_fraction) < 1.0:
         raise ValueError("validation_fraction must lie in (0, 1).")
 
@@ -300,6 +319,7 @@ def fit_native_time_affine_flow_rdms(
 
     condition_scale = max(float(np.max(np.abs(times))), np.finfo(np.float64).eps)
     time_conditions = (times / condition_scale).reshape(-1, 1)
+    evaluation_conditions = (evaluation_times / condition_scale).reshape(-1, 1)
 
     def flatten_trials(trial_indices: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         theta = np.tile(time_conditions, (int(trial_indices.size), 1))
@@ -343,7 +363,7 @@ def fit_native_time_affine_flow_rdms(
     )
     normalized_means, normalized_covariances = time_conditioned_affine_endpoint_moments(
         model,
-        time_conditions,
+        evaluation_conditions,
         device=device,
         covariance_steps=int(config.covariance_steps),
         covariance_ridge=float(config.covariance_ridge),

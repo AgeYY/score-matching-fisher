@@ -6,6 +6,11 @@
 - Training/evaluation scripts may use either CUDA device 0 or 1. Before starting a run, inspect both GPUs and select the one with more available memory and lower utilization; do not assume a fixed default GPU.
 - Pass the selected device explicitly as `--device cuda:<GPU_ID>` and use the same device for the entire run.
 
+## Training Defaults (Mandatory)
+
+- Unless the user explicitly specifies different values in their prompt, always use the project-wide defaults from `global_setting.py`: maximum training epochs `20_000` and early-stopping patience `1_000`.
+- Explicit user-provided epoch or patience values override these defaults for that run only.
+
 ## Standard Command Pattern
 
 Use this pattern for all project runs:

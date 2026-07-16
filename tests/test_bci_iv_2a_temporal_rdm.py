@@ -4,11 +4,13 @@ import numpy as np
 import torch
 
 from fisher.bci_iv_2a_temporal_rdm import (
+    FlowTemporalRDMConfig,
     classical_temporal_rdms,
     fit_temporal_gaussians,
     gaussian_fid_matrix_batched,
     time_conditioned_affine_endpoint_moments,
 )
+from global_setting import DEFAULT_EARLY_STOPPING_PATIENCE, DEFAULT_TRAINING_MAX_EPOCHS
 from fisher.distance_comparison import gaussian_fid_matrix
 
 
@@ -26,6 +28,14 @@ def test_temporal_rdms_have_expected_shape_and_geometry() -> None:
         np.testing.assert_allclose(matrix, matrix.T, atol=1e-12)
         np.testing.assert_allclose(np.diag(matrix), 0.0, atol=1e-12)
         assert np.all(matrix >= 0.0)
+
+
+def test_flow_temporal_rdm_uses_project_training_defaults() -> None:
+    config = FlowTemporalRDMConfig()
+    assert DEFAULT_TRAINING_MAX_EPOCHS == 20_000
+    assert DEFAULT_EARLY_STOPPING_PATIENCE == 1_000
+    assert config.epochs == DEFAULT_TRAINING_MAX_EPOCHS
+    assert config.patience == DEFAULT_EARLY_STOPPING_PATIENCE
 
 
 def test_euclidean_temporal_rdm_uses_timewise_trial_means() -> None:
@@ -99,3 +109,23 @@ def test_time_conditioned_affine_moments_keep_identity_for_zero_matrix() -> None
     )
     np.testing.assert_allclose(means, [[-1.0, 1.0], [0.0, 0.0], [1.0, -1.0]])
     np.testing.assert_allclose(covariances, np.broadcast_to(np.eye(2), (3, 2, 2)))
+
+
+def test_flow_evaluation_times_must_lie_inside_training_range() -> None:
+    from fisher.bci_iv_2a_temporal_rdm import FlowTemporalRDMConfig, fit_native_time_affine_flow_rdms
+
+    samples = np.zeros((3, 4, 2), dtype=np.float64)
+    times = np.arange(4, dtype=np.float64)
+    try:
+        fit_native_time_affine_flow_rdms(
+            samples,
+            times,
+            evaluation_time_points=np.array([-1.0, 1.0]),
+            device=torch.device("cpu"),
+            seed=1,
+            config=FlowTemporalRDMConfig(epochs=1),
+        )
+    except ValueError as error:
+        assert "inside the training time range" in str(error)
+    else:
+        raise AssertionError("Expected out-of-range evaluation times to be rejected.")
