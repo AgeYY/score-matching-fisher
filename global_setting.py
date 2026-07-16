@@ -50,6 +50,12 @@ def _default_cuda_device_id(device_name: str) -> int:
 DEFAULT_CUDA_DEVICE_ID = _default_cuda_device_id(DEFAULT_DEVICE)
 DEFAULT_CUDA_DEVICE_IDS = [DEFAULT_CUDA_DEVICE_ID]
 
+# Project-wide defaults for primary model training. Training entry points may
+# still expose explicit CLI overrides, while smoke tests and specialized
+# fine-tuning stages can intentionally use smaller budgets.
+TRAINING_MAX_EPOCHS = 20_000
+EARLY_STOPPING_PATIENCE = 1_000
+
 # Local Hugging Face builder cache location for the EcoSet validation Arrow table.
 # Override at runtime:
 # export SCORE_MATCHING_FISHER_ECOSET_VALIDATION_DIR=/path/to/ecoset-validation.arrow

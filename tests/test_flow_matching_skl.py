@@ -141,6 +141,7 @@ def test_flow_skl_default_t_eps_is_small_endpoint_clamp() -> None:
     sig = inspect.signature(train_flow_skl_model)
     assert sig.parameters["t_eps"].default == pytest.approx(0.0005)
     assert sig.parameters["ema_alpha"].default == pytest.approx(0.05)
+    assert sig.parameters["device_resident_data"].default is False
 
     mod = _load_run_flow_matching_skl_module()
     args = mod.build_parser().parse_args([])
@@ -201,6 +202,48 @@ def test_train_flow_skl_early_stopping_uses_ema_monitor(monkeypatch: pytest.Monk
     assert out["early_ema_alpha"] == pytest.approx(0.25)
     assert len(out["val_losses"]) == 4
     assert [call[2] for call in ema_calls] == [pytest.approx(0.25)] * 4
+
+
+def test_train_flow_skl_device_resident_data_bypasses_dataloader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_dataloader(*args, **kwargs):
+        raise AssertionError("DataLoader should not be constructed for device-resident data.")
+
+    monkeypatch.setattr(fms, "DataLoader", fail_dataloader)
+    model = build_flow_skl_model(
+        velocity_family="translation",
+        theta_dim=2,
+        x_dim=2,
+        hidden_dim=4,
+        depth=1,
+        path_schedule="linear",
+    )
+    theta = np.eye(2, dtype=np.float64)[[0, 1, 0, 1]]
+    x = np.array(
+        [[0.0, 0.0], [1.0, -1.0], [0.2, 0.1], [1.2, -0.8]],
+        dtype=np.float64,
+    )
+    out = train_flow_skl_model(
+        model=model,
+        theta_train=theta,
+        x_train=x,
+        theta_val=theta,
+        x_val=x,
+        device=torch.device("cpu"),
+        velocity_family="translation",
+        path_schedule="linear",
+        epochs=2,
+        batch_size=2,
+        patience=0,
+        fixed_validation=True,
+        validation_seed=123,
+        device_resident_data=True,
+        log_every=999,
+    )
+    assert out["device_resident_data"] is True
+    assert out["stopped_epoch"] == 2
+    assert out["n_total_steps"] == 4
 
 
 def test_train_flow_skl_rejects_invalid_ema_alpha() -> None:

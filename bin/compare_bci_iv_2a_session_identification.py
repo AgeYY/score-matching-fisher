@@ -19,10 +19,12 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from global_setting import EARLY_STOPPING_PATIENCE, TRAINING_MAX_EPOCHS  # noqa: E402
 from fisher.bci_iv_2a_dataset import load_features_npz  # noqa: E402
 from fisher.bci_iv_2a_session_identification import (  # noqa: E402
     FlowRDMConfig,
     QUERY_RUNS,
+    RDM_MATCHING_INTERVAL,
     REFERENCE_RUNS,
     classical_mahalanobis_rdms,
     load_rdm_cache,
@@ -53,7 +55,7 @@ METHOD_SEED_OFFSETS = {
     "time_varying_shared_affine_flow": 20_000_000,
 }
 N_LABELS = ("4", "8", "12", "18", "24", "all")
-PRIMARY_INTERVAL = (2.0, 3.5)
+PRIMARY_INTERVAL = RDM_MATCHING_INTERVAL
 PRE_CUE_INTERVAL = (-1.5, -0.5)
 
 
@@ -74,10 +76,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument(
+        "--n-values",
+        nargs="+",
+        default=list(N_LABELS),
+        help="Balanced query trials per class; list integer values followed by all.",
+    )
+    parser.add_argument(
+        "--standardization",
+        choices=("per_half", "none"),
+        default="per_half",
+        help="Feature standardization fitted independently within each RDM fit.",
+    )
+    parser.add_argument(
         "--recordings",
         nargs="+",
         default=None,
         help="Recording stems to include, for example A01T A02T A03T.",
+    )
+    parser.add_argument(
+        "--query-recordings",
+        nargs="+",
+        default=None,
+        help=(
+            "Optional cache-worker mode: fit only these query recordings, then exit "
+            "before scoring. All --recordings remain reference candidates."
+        ),
+    )
+    parser.add_argument(
+        "--reference-recordings",
+        nargs="+",
+        default=None,
+        help=(
+            "Optional cache-worker mode: fit only these reference recordings, then exit "
+            "before fitting queries or scoring."
+        ),
     )
     parser.add_argument(
         "--methods",
@@ -86,12 +118,12 @@ def parse_args() -> argparse.Namespace:
         default=list(METHODS),
     )
     parser.add_argument("--seed", type=int, default=20260713)
-    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--epochs", type=int, default=TRAINING_MAX_EPOCHS)
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--depth", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
-    parser.add_argument("--patience", type=int, default=15)
+    parser.add_argument("--patience", type=int, default=EARLY_STOPPING_PATIENCE)
     return parser.parse_args()
 
 
@@ -115,8 +147,19 @@ def fit_or_load(
         rdms, _ = load_rdm_cache(cache_path)
         return rdms
     if method == "classical_mahalanobis":
-        rdms = classical_mahalanobis_rdms(x, labels)
-        metadata = {**context, "method": method, "seed": int(seed)}
+        rdms = classical_mahalanobis_rdms(
+            x,
+            labels,
+            standardize_features=config.standardize_features,
+        )
+        metadata = {
+            **context,
+            "method": method,
+            "seed": int(seed),
+            "feature_standardization": (
+                "per_fit_mean_and_scale" if config.standardize_features else "none"
+            ),
+        }
     elif method == "shared_affine_flow":
         rdms, fit_metadata = shared_affine_flow_rdms(
             x,
@@ -153,6 +196,7 @@ def save_outputs(
     config: FlowRDMConfig,
     seed: int,
     recording_keys: list[str],
+    input_features: dict,
 ) -> dict:
     n_recordings = len(recording_keys)
     if n_recordings < 2:
@@ -232,6 +276,7 @@ def save_outputs(
         "primary_interval_seconds_cue_relative": list(PRIMARY_INTERVAL),
         "pre_cue_interval_seconds_cue_relative": list(PRE_CUE_INTERVAL),
         "flow_config": asdict(config),
+        "input_features": input_features,
         "metrics": {},
         "paired_method_comparison": {},
     }
@@ -337,7 +382,11 @@ def plot_outputs(output_dir: Path, summary: dict, scores: np.ndarray) -> None:
     for method, color in zip(METHODS, colors[: len(METHODS)], strict=True):
         values = [summary["metrics"][method][label]["top1_accuracy"] for label in N_LABELS]
         errors = [
-            summary["metrics"][method][label]["top1_repeat_sd"]
+            (
+                np.nan
+                if summary["metrics"][method][label]["top1_repeat_sd"] is None
+                else summary["metrics"][method][label]["top1_repeat_sd"]
+            )
             for label in N_LABELS[:-1]
         ]
         ax.plot(
@@ -404,7 +453,7 @@ def plot_outputs(output_dir: Path, summary: dict, scores: np.ndarray) -> None:
 
 
 def main() -> None:
-    global METHODS
+    global METHODS, N_LABELS
     args = parse_args()
     if args.repeats < 1:
         raise ValueError("--repeats must be >= 1")
@@ -416,6 +465,15 @@ def main() -> None:
     if not selected_methods or selected_methods[0] != "classical_mahalanobis":
         raise ValueError("--methods must list classical_mahalanobis first.")
     METHODS = selected_methods
+    n_labels = tuple(str(value).lower() for value in args.n_values)
+    if len(set(n_labels)) != len(n_labels):
+        raise ValueError("--n-values must not contain duplicates.")
+    if not n_labels or n_labels[-1] != "all" or "all" in n_labels[:-1]:
+        raise ValueError("--n-values must end with exactly one 'all'.")
+    for value in n_labels[:-1]:
+        if not value.isdigit() or int(value) < 1:
+            raise ValueError("Finite --n-values entries must be positive integers.")
+    N_LABELS = n_labels
     device = torch.device(args.device)
     if device.type != "cuda" or not torch.cuda.is_available():
         raise RuntimeError("This experiment requires CUDA; no CPU fallback is permitted.")
@@ -431,6 +489,7 @@ def main() -> None:
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
         patience=args.patience,
+        standardize_features=args.standardization == "per_half",
     )
     if args.recordings is None:
         feature_paths = sorted(args.feature_dir.glob("A??T.npz"))
@@ -453,18 +512,61 @@ def main() -> None:
     times = datasets[0].time_centers
     if any(not np.array_equal(dataset.time_centers, times) for dataset in datasets[1:]):
         raise ValueError("Feature files do not share the same time grid.")
+    if any(dataset.feature_names != datasets[0].feature_names for dataset in datasets[1:]):
+        raise ValueError("Feature files do not share the same feature names.")
+    feature_kinds = {str(dataset.metadata.get("feature_kind", "unknown")) for dataset in datasets}
+    feature_units = {str(dataset.metadata.get("feature_units", "unspecified")) for dataset in datasets}
+    if len(feature_kinds) != 1 or len(feature_units) != 1:
+        raise ValueError("Feature files do not share one feature kind and unit.")
+    input_features = {
+        "feature_kind": next(iter(feature_kinds)),
+        "feature_units": next(iter(feature_units)),
+        "n_features": int(datasets[0].features.shape[-1]),
+        "n_time_points": int(times.size),
+        "time_centers_seconds_cue_relative": times.tolist(),
+        "feature_standardization_during_rdm_fit": args.standardization,
+        "source_preprocessing": datasets[0].metadata.get("preprocessing"),
+        "unavoidable_acquisition_processing": datasets[0].metadata.get(
+            "unavoidable_acquisition_processing"
+        ),
+    }
+    if args.query_recordings is None:
+        query_recording_set = set(recording_keys)
+    else:
+        if len(set(args.query_recordings)) != len(args.query_recordings):
+            raise ValueError("--query-recordings must not contain duplicates.")
+        unknown = sorted(set(args.query_recordings) - set(recording_keys))
+        if unknown:
+            raise ValueError(f"Unknown --query-recordings entries: {unknown}")
+        query_recording_set = set(args.query_recordings)
+    if args.reference_recordings is None:
+        reference_recording_set = set(recording_keys)
+    else:
+        if len(set(args.reference_recordings)) != len(args.reference_recordings):
+            raise ValueError("--reference-recordings must not contain duplicates.")
+        unknown = sorted(set(args.reference_recordings) - set(recording_keys))
+        if unknown:
+            raise ValueError(f"Unknown --reference-recordings entries: {unknown}")
+        reference_recording_set = set(args.reference_recordings)
 
     print(f"[experiment] device={device} GPU={torch.cuda.get_device_name(device)}", flush=True)
     print(f"[experiment] output={args.output_dir.resolve()}", flush=True)
     print(f"[experiment] recordings={recording_keys} methods={list(METHODS)}", flush=True)
     print(
-        f"[experiment] epochs={config.epochs} patience={config.patience} "
+        f"[experiment] feature_kind={input_features['feature_kind']} "
+        f"units={input_features['feature_units']} standardization={args.standardization}",
+        flush=True,
+    )
+    print(
+        f"[experiment] n_values={list(N_LABELS)} epochs={config.epochs} patience={config.patience} "
         "checkpoint=best",
         flush=True,
     )
     reference_vectors: dict[tuple[str, str], np.ndarray] = {}
     pre_reference_vectors: dict[tuple[str, str], np.ndarray] = {}
     for subject, dataset in enumerate(datasets):
+        if dataset.session_key not in reference_recording_set:
+            continue
         x_ref, y_ref, _ = select_half(dataset, REFERENCE_RUNS)
         for method in METHODS:
             cache_path = cache_dir / f"reference_{dataset.session_key}_{method}.npz"
@@ -498,6 +600,13 @@ def main() -> None:
             )
         print(f"[reference] {dataset.session_key} complete", flush=True)
 
+    if args.reference_recordings is not None:
+        print(
+            f"[cache-worker] references complete: {sorted(reference_recording_set)}",
+            flush=True,
+        )
+        return
+
     scores = np.full(
         (len(METHODS), len(N_LABELS), args.repeats, n_recordings, n_recordings),
         np.nan,
@@ -506,9 +615,15 @@ def main() -> None:
     pre_scores = np.full_like(scores, np.nan)
     effective_n = np.zeros((len(N_LABELS), n_recordings), dtype=np.int64)
     for subject, dataset in enumerate(datasets):
+        if dataset.session_key not in query_recording_set:
+            continue
         x_query, y_query, _ = select_half(dataset, QUERY_RUNS)
         max_balanced = int(np.min(per_class_counts(y_query)))
-        requested = [4, 8, 12, 18, 24, max_balanced]
+        requested = [int(value) for value in N_LABELS[:-1]] + [max_balanced]
+        if any(value > max_balanced for value in requested[:-1]):
+            raise ValueError(
+                f"{dataset.session_key}: requested n exceeds the available balanced count {max_balanced}."
+            )
         effective_n[:, subject] = np.asarray(requested, dtype=np.int64)
         for n_index, n_per_class in enumerate(requested):
             n_repeats = 1 if N_LABELS[n_index] == "all" else args.repeats
@@ -558,6 +673,12 @@ def main() -> None:
                 f"effective={n_per_class} repeats={n_repeats} complete",
                 flush=True,
             )
+    if args.query_recordings is not None:
+        print(
+            f"[cache-worker] query recordings complete: {sorted(query_recording_set)}",
+            flush=True,
+        )
+        return
     summary = save_outputs(
         args.output_dir,
         scores=scores,
@@ -567,6 +688,7 @@ def main() -> None:
         config=config,
         seed=args.seed,
         recording_keys=recording_keys,
+        input_features=input_features,
     )
     plot_outputs(args.output_dir, summary, scores)
     print(f"[experiment] Saved: {args.output_dir / 'summary.json'}", flush=True)

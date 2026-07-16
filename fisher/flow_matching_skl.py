@@ -1608,6 +1608,7 @@ def train_flow_skl_model(
     fixed_validation: bool = False,
     validation_seed: int | None = None,
     retain_best_state: bool = False,
+    device_resident_data: bool = False,
 ) -> dict[str, Any]:
     """Train a flow-SKL model and return training metadata."""
 
@@ -1649,21 +1650,56 @@ def train_flow_skl_model(
     if th_tr.shape[0] != x_tr.shape[0] or th_va.shape[0] != x_va.shape[0]:
         raise ValueError("theta and x split lengths must match.")
 
-    train_ds = TensorDataset(torch.from_numpy(th_tr.astype(np.float32)), torch.from_numpy(x_tr.astype(np.float32)))
-    val_ds = TensorDataset(torch.from_numpy(th_va.astype(np.float32)), torch.from_numpy(x_va.astype(np.float32)))
-    train_loader = DataLoader(train_ds, batch_size=int(batch_size), shuffle=True)
-    val_loader_generator = None
-    if validation_seed is not None:
-        val_loader_generator = torch.Generator()
-        val_loader_generator.manual_seed(int(validation_seed) + 1)
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=int(batch_size),
-        shuffle=False,
-        generator=val_loader_generator,
-    )
-
     model.to(device)
+    th_tr_tensor = torch.from_numpy(th_tr.astype(np.float32))
+    x_tr_tensor = torch.from_numpy(x_tr.astype(np.float32))
+    th_va_tensor = torch.from_numpy(th_va.astype(np.float32))
+    x_va_tensor = torch.from_numpy(x_va.astype(np.float32))
+    train_loader: DataLoader | None = None
+    val_loader: DataLoader | None = None
+    if bool(device_resident_data):
+        th_tr_tensor = th_tr_tensor.to(device)
+        x_tr_tensor = x_tr_tensor.to(device)
+        th_va_tensor = th_va_tensor.to(device)
+        x_va_tensor = x_va_tensor.to(device)
+    else:
+        train_ds = TensorDataset(th_tr_tensor, x_tr_tensor)
+        val_ds = TensorDataset(th_va_tensor, x_va_tensor)
+        train_loader = DataLoader(train_ds, batch_size=int(batch_size), shuffle=True)
+        val_loader_generator = None
+        if validation_seed is not None:
+            val_loader_generator = torch.Generator()
+            val_loader_generator.manual_seed(int(validation_seed) + 1)
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=int(batch_size),
+            shuffle=False,
+            generator=val_loader_generator,
+        )
+
+    def training_batches():
+        if bool(device_resident_data):
+            permutation = torch.randperm(th_tr_tensor.shape[0], device=device)
+            for start in range(0, th_tr_tensor.shape[0], int(batch_size)):
+                selected = permutation[start : start + int(batch_size)]
+                yield th_tr_tensor[selected], x_tr_tensor[selected]
+            return
+        if train_loader is None:
+            raise RuntimeError("CPU training loader was not initialized.")
+        for theta_batch, x_batch in train_loader:
+            yield theta_batch.to(device), x_batch.to(device)
+
+    def validation_batches():
+        if bool(device_resident_data):
+            for start in range(0, th_va_tensor.shape[0], int(batch_size)):
+                stop = min(th_va_tensor.shape[0], start + int(batch_size))
+                yield th_va_tensor[start:stop], x_va_tensor[start:stop]
+            return
+        if val_loader is None:
+            raise RuntimeError("CPU validation loader was not initialized.")
+        for theta_batch, x_batch in val_loader:
+            yield theta_batch.to(device), x_batch.to(device)
+
     _, schedule_name = _resolve_path_schedule(path_schedule)
     path, path_name = _make_flow_matching_affine_path(path_schedule)
     schedule_name = path_name
@@ -1700,9 +1736,7 @@ def train_flow_skl_model(
     if bool(fixed_validation):
         fixed_val_batches = []
         with torch.no_grad():
-            for tb, x1b in val_loader:
-                tb = tb.to(device)
-                x1b = x1b.to(device)
+            for tb, x1b in validation_batches():
                 bs = int(x1b.shape[0])
                 t_raw = torch.rand(bs, device=device, dtype=x1b.dtype, generator=val_generator)
                 t = te + (1.0 - 2.0 * te) * t_raw
@@ -1714,9 +1748,7 @@ def train_flow_skl_model(
         learning_rates.append(float(opt.param_groups[0]["lr"]))
         model.train()
         ep_losses: list[float] = []
-        for tb, x1b in train_loader:
-            tb = tb.to(device)
-            x1b = x1b.to(device)
+        for tb, x1b in training_batches():
             bs = int(x1b.shape[0])
             t_raw = torch.rand(bs, device=device, dtype=x1b.dtype)
             t = te + (1.0 - 2.0 * te) * t_raw
@@ -1743,9 +1775,7 @@ def train_flow_skl_model(
                 for tb, x_t, t, dx_t in fixed_val_batches:
                     val_ep.append(float(torch.mean((model(x_t, tb, t) - dx_t) ** 2).detach().cpu()))
             else:
-                for tb, x1b in val_loader:
-                    tb = tb.to(device)
-                    x1b = x1b.to(device)
+                for tb, x1b in validation_batches():
                     bs = int(x1b.shape[0])
                     t_raw = torch.rand(bs, device=device, dtype=x1b.dtype, generator=val_generator)
                     t = te + (1.0 - 2.0 * te) * t_raw
@@ -1817,6 +1847,7 @@ def train_flow_skl_model(
         "selected_epoch": int(best_epoch if checkpoint_key == "best" else stopped_epoch),
         "fixed_validation": bool(fixed_validation),
         "validation_seed": None if validation_seed is None else int(validation_seed),
+        "device_resident_data": bool(device_resident_data),
     }
     if bool(retain_best_state) and best_state is not None:
         metadata["best_state_dict"] = best_state

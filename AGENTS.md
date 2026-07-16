@@ -3,21 +3,66 @@
 ## Runtime Environment (Mandatory)
 
 - Always run Python/code commands inside the `mamba` environment `geo_diffusion`.
-- Default execution device is CUDA device 0 (`--device cuda:0`) for training/evaluation scripts.
+- Before every new GPU training/evaluation run, compare free memory on CUDA
+  devices 0 and 1 and use whichever device has more free memory. Break an exact
+  tie in favor of CUDA device 0.
+- Keep the selected device fixed for the complete run or multi-stage pipeline;
+  do not switch devices between stages of the same run.
+- If neither CUDA device 0 nor CUDA device 1 is available, stop and report that
+  constraint instead of silently switching to CPU.
+
+## Training Budget (Mandatory)
+
+- Unless the user explicitly requests different values in the current prompt,
+  always use the project-wide training defaults from `global_setting.py`:
+  `TRAINING_MAX_EPOCHS = 20_000` and
+  `EARLY_STOPPING_PATIENCE = 1_000`.
+- Training scripts and configuration objects must use these global constants as
+  their defaults instead of introducing smaller local epoch or patience
+  defaults. Explicit command-line overrides requested by the user still take
+  precedence.
+
+Select the device immediately before starting a GPU run:
+
+```bash
+GPU_INDEX="$(
+  nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits |
+    awk -F',' '
+      {
+        gsub(/[[:space:]]/, "", $1)
+        gsub(/[[:space:]]/, "", $2)
+      }
+      $1 == "0" || $1 == "1" {
+        if (!found || ($2 + 0) > best_free) {
+          best_index = $1
+          best_free = $2 + 0
+          found = 1
+        }
+      }
+      END { if (found) print best_index }
+    '
+)"
+if [[ -z "${GPU_INDEX}" ]]; then
+  echo "Neither CUDA device 0 nor CUDA device 1 is available." >&2
+  exit 1
+fi
+DEVICE="cuda:${GPU_INDEX}"
+echo "Selected ${DEVICE}"
+```
 
 ## Standard Command Pattern
 
 Use this pattern for all project runs:
 
 ```bash
-mamba run -n geo_diffusion python <script>.py ... --device cuda:0
+mamba run -n geo_diffusion python <script>.py ... --device "${DEVICE}"
 ```
 
 For the unified CLI:
 
 ```bash
-mamba run -n geo_diffusion python run_fisher.py score ... --device cuda:0
-mamba run -n geo_diffusion python run_fisher.py decoder ... --device cuda:0
+mamba run -n geo_diffusion python run_fisher.py score ... --device "${DEVICE}"
+mamba run -n geo_diffusion python run_fisher.py decoder ... --device "${DEVICE}"
 ```
 
 ## Data layout
@@ -55,7 +100,8 @@ mamba run -n geo_diffusion python bin/setup_repo_symlinks.py
 
 ## Notes
 
-- If CUDA is unavailable on the current machine, stop and report that constraint instead of silently switching to CPU.
+- Free GPU memory at selection time is the availability criterion. Record the
+  selected device in the run log when possible.
 
 ## Background jobs (agents)
 
@@ -68,7 +114,7 @@ When polling until a long-running process finishes, **do not** use a loop like:
 **Preferred:** capture the PID when starting, then `wait` or poll the PID only:
 
 ```bash
-mamba run -n geo_diffusion python bin/some_script.py ... --device cuda:0 &
+mamba run -n geo_diffusion python bin/some_script.py ... --device "${DEVICE}" &
 pid=$!
 wait "${pid}"
 # or: while kill -0 "${pid}" 2>/dev/null; do sleep 30; done

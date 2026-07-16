@@ -144,27 +144,62 @@ def _make_plot(histories: list[FitHistory], output_dir: Path) -> tuple[Path, Pat
     _plot_group(axes[0, 1], all_queries, title="All-data query fits (9)")
 
     finite_ax = axes[1, 0]
-    for history in finite_queries:
-        epochs = np.arange(1, history.stop_epoch + 1)
-        finite_ax.plot(epochs, history.validation_ema, color="0.55", alpha=0.12, linewidth=0.7)
     hardest_epochs = np.arange(1, hardest.stop_epoch + 1)
-    finite_ax.plot(
-        hardest_epochs,
-        hardest.validation_ema,
-        color="#b2182b",
-        linewidth=1.8,
-        label=f"{hardest.recording}, n={hardest.n_label}, repeat {hardest.repeat}",
-    )
-    finite_ax.scatter(
-        hardest.best_epoch,
-        hardest.validation_ema[hardest.best_epoch - 1],
-        color="#b2182b",
-        s=30,
-        zorder=3,
-    )
-    finite_ax.set_title(f"Finite-query fits ({len(finite_queries)})")
-    finite_ax.set_xlabel("Epoch")
-    finite_ax.set_ylabel("Validation EMA loss")
+    if finite_queries:
+        for history in finite_queries:
+            epochs = np.arange(1, history.stop_epoch + 1)
+            finite_ax.plot(
+                epochs,
+                history.validation_ema,
+                color="0.55",
+                alpha=0.12,
+                linewidth=0.7,
+            )
+        finite_hardest = max(finite_queries, key=lambda history: history.best_epoch)
+        epochs = np.arange(1, finite_hardest.stop_epoch + 1)
+        finite_ax.plot(
+            epochs,
+            finite_hardest.validation_ema,
+            color="#b2182b",
+            linewidth=1.8,
+            label=(
+                f"{finite_hardest.recording}, n={finite_hardest.n_label}, "
+                f"repeat {finite_hardest.repeat}"
+            ),
+        )
+        finite_ax.scatter(
+            finite_hardest.best_epoch,
+            finite_hardest.validation_ema[finite_hardest.best_epoch - 1],
+            color="#b2182b",
+            s=30,
+            zorder=3,
+        )
+        finite_ax.set_title(f"Finite-query fits ({len(finite_queries)})")
+        finite_ax.set_xlabel("Epoch")
+        finite_ax.set_ylabel("Validation EMA loss")
+    else:
+        recording_order = sorted({history.recording for history in histories})
+        reference_by_recording = {history.recording: history for history in references}
+        query_by_recording = {history.recording: history for history in all_queries}
+        x = np.arange(len(recording_order))
+        finite_ax.plot(
+            x,
+            [reference_by_recording[key].best_epoch for key in recording_order],
+            marker="o",
+            linewidth=1.3,
+            label="Reference",
+        )
+        finite_ax.plot(
+            x,
+            [query_by_recording[key].best_epoch for key in recording_order],
+            marker="s",
+            linewidth=1.3,
+            label="All-data query",
+        )
+        finite_ax.set_xticks(x, [key.removeprefix("A").removesuffix("T") for key in recording_order])
+        finite_ax.set_title("Selected epochs by recording")
+        finite_ax.set_xlabel("Recording")
+        finite_ax.set_ylabel("Best epoch")
     finite_ax.legend(frameon=False, fontsize=9, loc="best")
     _style_axis(finite_ax)
 
@@ -212,7 +247,11 @@ def _write_summary(histories: list[FitHistory], output_dir: Path) -> Path:
         ],
         dtype=np.float64,
     )
-    categories = ("reference", "4", "8", "12", "18", "24", "all")
+    finite_categories = sorted(
+        {history.n_label for history in histories if history.n_label not in {"reference", "all"}},
+        key=int,
+    )
+    categories = ("reference", *finite_categories, "all")
     category_summaries: dict[str, Any] = {}
     for category in categories:
         selected = [history for history in histories if history.n_label == category]

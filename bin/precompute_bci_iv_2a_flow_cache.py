@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from global_setting import EARLY_STOPPING_PATIENCE, TRAINING_MAX_EPOCHS  # noqa: E402
 from fisher.bci_iv_2a_dataset import load_features_npz  # noqa: E402
 from fisher.bci_iv_2a_session_identification import (  # noqa: E402
     FlowRDMConfig,
@@ -37,8 +38,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--subject-index", type=int, required=True)
     parser.add_argument("--repeats", type=int, default=20)
     parser.add_argument("--seed", type=int, default=20260713)
-    parser.add_argument("--epochs", type=int, default=20_000)
-    parser.add_argument("--patience", type=int, default=1_000)
+    parser.add_argument("--epochs", type=int, default=TRAINING_MAX_EPOCHS)
+    parser.add_argument("--patience", type=int, default=EARLY_STOPPING_PATIENCE)
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--depth", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=1024)
