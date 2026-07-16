@@ -18,7 +18,11 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from global_setting import DEFAULT_DEVICE
+from global_setting import (
+    DEFAULT_DEVICE,
+    TRAINING_EARLY_STOPPING_PATIENCE,
+    TRAINING_MAX_EPOCHS,
+)
 from fisher.ctsm_distance import (
     CTSMVBinaryJeffreysConfig,
     CTSMVJeffreysConfig,
@@ -174,8 +178,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--skl-folds", type=int, default=5)
     p.add_argument("--skl-logistic-c", type=float, default=1.0)
 
-    p.add_argument("--epochs", type=int, default=20_000)
-    p.add_argument("--early-patience", type=int, default=1_000)
+    p.add_argument("--epochs", type=int, default=TRAINING_MAX_EPOCHS)
+    p.add_argument(
+        "--early-patience", type=int, default=TRAINING_EARLY_STOPPING_PATIENCE
+    )
     p.add_argument("--early-min-delta", type=float, default=1e-4)
     p.add_argument("--early-ema-alpha", type=float, default=0.05)
     p.add_argument("--batch-size", type=int, default=3000)
@@ -242,7 +248,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--flow-likelihood-finetune-epochs",
         type=int,
-        default=500,
+        default=TRAINING_MAX_EPOCHS,
         help="CNF endpoint-NLL fine-tuning epochs; 0 disables the fine-tuned estimator.",
     )
     p.add_argument(
@@ -255,13 +261,31 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--flow-likelihood-finetune-weight-decay", type=float, default=0.0)
     p.add_argument("--flow-likelihood-finetune-ode-steps", type=int, default=32)
     p.add_argument("--flow-likelihood-finetune-ode-method", type=str, default="midpoint")
-    p.add_argument("--flow-likelihood-finetune-patience", type=int, default=150)
+    p.add_argument(
+        "--flow-likelihood-finetune-patience",
+        type=int,
+        default=TRAINING_EARLY_STOPPING_PATIENCE,
+    )
     p.add_argument("--flow-likelihood-finetune-min-delta", type=float, default=1e-4)
     p.add_argument("--flow-likelihood-finetune-ema-alpha", type=float, default=0.05)
     p.add_argument(
         "--flow-likelihood-finetune-checkpoint-selection",
         choices=("best", "last"),
         default="best",
+    )
+    p.add_argument(
+        "--flow-likelihood-finetune-divergence-estimator",
+        choices=("exact", "hutchinson"),
+        default="exact",
+    )
+    p.add_argument("--flow-likelihood-finetune-hutchinson-probes", type=int, default=1)
+    p.add_argument(
+        "--flow-likelihood-augment-existing",
+        action="store_true",
+        help=(
+            "Reuse classical, ground-truth, and optional TRE/CTSM-v estimators in the output NPZ; "
+            "retrain only flow matching and add its CNF NLL-fine-tuned variant."
+        ),
     )
     p.add_argument(
         "--include-tre",
@@ -278,11 +302,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tre-architecture", choices=TRE_ARCHITECTURES, default="mlp")
     p.add_argument("--tre-hidden-dim", type=int, default=128)
     p.add_argument("--tre-depth", type=int, default=3)
-    p.add_argument("--tre-epochs", type=int, default=1_000)
+    p.add_argument("--tre-epochs", type=int, default=TRAINING_MAX_EPOCHS)
     p.add_argument("--tre-batch-size", type=int, default=512)
     p.add_argument("--tre-lr", type=float, default=1e-3)
     p.add_argument("--tre-weight-decay", type=float, default=0.0)
-    p.add_argument("--tre-early-patience", type=int, default=100)
+    p.add_argument(
+        "--tre-early-patience", type=int, default=TRAINING_EARLY_STOPPING_PATIENCE
+    )
     p.add_argument("--tre-early-min-delta", type=float, default=1e-5)
     p.add_argument("--tre-max-grad-norm", type=float, default=10.0)
     p.add_argument("--tre-validation-pairs", type=int, default=2_048)
@@ -306,8 +332,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Fit one unconditioned CTSM-v model per condition pair and estimate Jeffreys divergence.",
     )
-    p.add_argument("--ctsm-v-binary-epochs", type=int, default=50_000)
-    p.add_argument("--ctsm-v-epochs", type=int, default=8_000)
+    p.add_argument("--ctsm-v-binary-epochs", type=int, default=TRAINING_MAX_EPOCHS)
+    p.add_argument("--ctsm-v-epochs", type=int, default=TRAINING_MAX_EPOCHS)
     p.add_argument("--ctsm-v-batch-size", type=int, default=512)
     p.add_argument("--ctsm-v-lr", type=float, default=2e-3)
     p.add_argument("--ctsm-v-weight-decay", type=float, default=0.0)
@@ -325,7 +351,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ctsm-v-t-eps", type=float, default=1e-4)
     p.add_argument("--ctsm-v-integration-steps", type=int, default=300)
     p.add_argument("--ctsm-v-eval-batch-size", type=int, default=4096)
-    p.add_argument("--ctsm-v-early-patience", type=int, default=1_000)
+    p.add_argument(
+        "--ctsm-v-early-patience",
+        type=int,
+        default=TRAINING_EARLY_STOPPING_PATIENCE,
+    )
     p.add_argument("--ctsm-v-early-min-delta", type=float, default=1e-4)
     p.add_argument("--ctsm-v-early-ema-alpha", type=float, default=0.05)
     p.add_argument("--ctsm-v-validation-batches", type=int, default=8)
@@ -393,6 +423,18 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--flow-likelihood-finetune-min-delta must be >= 0.")
     if not (0.0 < float(args.flow_likelihood_finetune_ema_alpha) <= 1.0):
         raise ValueError("--flow-likelihood-finetune-ema-alpha must be in (0, 1].")
+    if int(args.flow_likelihood_finetune_hutchinson_probes) < 1:
+        raise ValueError("--flow-likelihood-finetune-hutchinson-probes must be >= 1.")
+    if bool(args.flow_likelihood_augment_existing) and int(args.flow_likelihood_finetune_epochs) <= 0:
+        raise ValueError(
+            "--flow-likelihood-augment-existing requires --flow-likelihood-finetune-epochs > 0."
+        )
+    if bool(args.flow_likelihood_augment_existing) and (
+        bool(args.tre_augment_existing) or bool(args.ctsm_v_augment_existing)
+    ):
+        raise ValueError(
+            "--flow-likelihood-augment-existing cannot be combined with another augmentation mode."
+        )
     includes_ctsm = bool(args.include_ctsm_v) or bool(args.include_ctsm_v_binary)
     if includes_ctsm and "symmetric_kl" not in metrics:
         raise ValueError("CTSM-v estimators require --metric to include symmetric_kl.")
@@ -531,6 +573,12 @@ def _flow_config_from_args(args: argparse.Namespace) -> FlowComparisonConfig:
         likelihood_finetune_min_delta=float(args.flow_likelihood_finetune_min_delta),
         likelihood_finetune_ema_alpha=float(args.flow_likelihood_finetune_ema_alpha),
         likelihood_finetune_checkpoint_selection=str(args.flow_likelihood_finetune_checkpoint_selection),
+        likelihood_finetune_divergence_estimator=str(
+            args.flow_likelihood_finetune_divergence_estimator
+        ),
+        likelihood_finetune_hutchinson_probes=int(
+            args.flow_likelihood_finetune_hutchinson_probes
+        ),
     )
 
 
@@ -723,7 +771,12 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
     existing_tre = None
     existing_ctsm_v = None
     existing_ctsm_v_binary = None
-    augment_existing = bool(args.ctsm_v_augment_existing) or bool(args.tre_augment_existing)
+    flow_likelihood_augment_existing = bool(args.flow_likelihood_augment_existing)
+    augment_existing = (
+        bool(args.ctsm_v_augment_existing)
+        or bool(args.tre_augment_existing)
+        or flow_likelihood_augment_existing
+    )
     if augment_existing:
         print(f"[distance-comparison] reusing existing estimators from {existing_results_path}", flush=True)
         (
@@ -737,10 +790,31 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
         ) = _load_existing_estimators(
             existing_results_path,
             metrics=metrics,
-            require_nll_finetuned=int(flow_config.likelihood_finetune_epochs) > 0,
+            require_nll_finetuned=(
+                int(flow_config.likelihood_finetune_epochs) > 0
+                and not flow_likelihood_augment_existing
+            ),
         )
         flow_paths = None
         flow_finetuned_paths = None
+        if flow_likelihood_augment_existing:
+            print(
+                "[distance-comparison] retraining flow matching and adding CNF NLL fine-tuning "
+                f"for {int(flow_config.likelihood_finetune_epochs)} epochs",
+                flush=True,
+            )
+            flow_variants = flow_metric_variants(
+                bundle=work_bundle,
+                device=dev,
+                output_dir=output_dir / "flow",
+                config=flow_config,
+                seed=int(args.seed),
+                metrics=metrics,
+            )
+            flow = flow_variants.flow_matching
+            flow_finetuned = flow_variants.flow_matching_nll_finetuned
+            flow_paths = flow_variants.flow_npz_paths
+            flow_finetuned_paths = flow_variants.flow_nll_finetuned_npz_paths
     else:
         print("[distance-comparison] computing classical finite-sample metrics", flush=True)
         classical = classical_metric_matrices(
@@ -812,7 +886,7 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
     tre_paths = None
     tre_checkpoint_paths = None
     tre_config = _tre_config_from_args(args)
-    if bool(args.include_tre):
+    if bool(args.include_tre) and not flow_likelihood_augment_existing:
         print("[distance-comparison] training pairwise Torch TRE models", flush=True)
         labels_train = labels_from_theta(work_bundle.theta_train, num_categories=k)
         labels_validation = labels_from_theta(work_bundle.theta_validation, num_categories=k)
@@ -948,6 +1022,7 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
             "skl_logistic_c": float(args.skl_logistic_c),
             "pr_cache_dir": str(Path(args.pr_cache_dir)),
             "flow_defaults": vars(flow_config),
+            "flow_likelihood_augment_existing": flow_likelihood_augment_existing,
             "include_tre": bool(args.include_tre),
             "tre_defaults": asdict(tre_config),
             "tre_eval_batch_size": int(args.tre_eval_batch_size),

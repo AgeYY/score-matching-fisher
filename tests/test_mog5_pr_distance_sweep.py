@@ -252,7 +252,10 @@ def test_parser_defaults() -> None:
     assert args.ctsm_v_t_eps == pytest.approx(1e-4)
     assert args.tre_num_bridges == 8
     assert args.tre_architecture == "mlp"
-    assert args.tre_epochs == 1000
+    assert args.tre_epochs == 20_000
+    assert args.tre_early_patience == 1_000
+    assert args.flow_likelihood_finetune_epochs == 20_000
+    assert args.flow_likelihood_finetune_patience == 1_000
     assert args.hidden_dim == 128
     assert args.depth == 3
     assert args.fixed_validation is True

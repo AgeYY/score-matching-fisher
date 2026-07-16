@@ -20,6 +20,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from global_setting import TRAINING_EARLY_STOPPING_PATIENCE, TRAINING_MAX_EPOCHS
+
 
 TRE_WAYMARK_SCHEDULES = ("angle", "linear_alpha")
 TRE_ARCHITECTURES = ("linear", "mlp")
@@ -34,11 +36,11 @@ class TREDensityRatioConfig:
     architecture: str = "mlp"
     hidden_dim: int = 128
     depth: int = 3
-    epochs: int = 1_000
+    epochs: int = TRAINING_MAX_EPOCHS
     batch_size: int = 512
     lr: float = 1e-3
     weight_decay: float = 0.0
-    early_patience: int = 100
+    early_patience: int = TRAINING_EARLY_STOPPING_PATIENCE
     early_min_delta: float = 1e-5
     max_grad_norm: float = 10.0
     validation_pairs: int = 2_048

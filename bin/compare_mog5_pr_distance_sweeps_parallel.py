@@ -3,6 +3,7 @@
 
 import argparse
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -183,6 +184,9 @@ def _cache_is_usable(
     require_tre: bool = False,
     require_ctsm_v: bool = False,
     require_ctsm_v_binary: bool = False,
+    expected_native_x_dim: int | None = None,
+    expected_n_total: int | None = None,
+    expected_seed: int | None = None,
 ) -> bool:
     if not Path(path).is_file():
         return False
@@ -195,6 +199,27 @@ def _cache_is_usable(
         require_ctsm_v=bool(require_ctsm_v),
         require_ctsm_v_binary=bool(require_ctsm_v_binary),
     )
+    summary_path = Path(path).with_name("mog5_pr_distance_comparison_summary.json")
+    if summary_path.is_file() and any(
+        value is not None for value in (expected_native_x_dim, expected_n_total, expected_seed)
+    ):
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        expected = {
+            "native_x_dim": expected_native_x_dim,
+            "n_total": expected_n_total,
+            "seed": expected_seed,
+        }
+        mismatches = {
+            key: (summary.get(key), value)
+            for key, value in expected.items()
+            if value is not None and summary.get(key) != int(value)
+        }
+        if mismatches:
+            details = ", ".join(
+                f"{key}: cached={cached!r}, requested={requested!r}"
+                for key, (cached, requested) in mismatches.items()
+            )
+            raise ValueError(f"Cached comparison metadata mismatch ({details}).")
     return True
 
 
@@ -244,6 +269,9 @@ def select_tasks_to_run(
                     require_tre=bool(args.include_tre),
                     require_ctsm_v=bool(args.include_ctsm_v),
                     require_ctsm_v_binary=bool(args.include_ctsm_v_binary),
+                    expected_native_x_dim=int(args.native_x_dim),
+                    expected_n_total=int(task.n_total),
+                    expected_seed=int(task.seed),
                 ):
                     print(f"[parallel-sweep] cache hit {task.label}: {task.result_path}", flush=True)
                     cache_hits[task.key] = True
@@ -251,7 +279,7 @@ def select_tasks_to_run(
             except ValueError:
                 if bool(args.visualization_only):
                     raise
-                print(f"[parallel-sweep] cache missing requested estimator data; rerunning {task.label}", flush=True)
+                print(f"[parallel-sweep] incompatible cache; rerunning {task.label}", flush=True)
         if bool(args.visualization_only):
             raise FileNotFoundError(f"--visualization-only requires cached results: {task.result_path}")
         cache_hits[task.key] = False

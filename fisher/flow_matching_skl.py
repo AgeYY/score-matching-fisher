@@ -510,6 +510,44 @@ def _velocity_and_exact_divergence(
         return velocity, divergence
 
 
+def _velocity_and_hutchinson_divergence(
+    model: nn.Module,
+    x: torch.Tensor,
+    theta: torch.Tensor,
+    t: torch.Tensor,
+    *,
+    probes: torch.Tensor,
+    create_graph: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Evaluate velocity and a differentiable Hutchinson trace estimate."""
+
+    with torch.enable_grad():
+        x_req = x.requires_grad_(True) if x.requires_grad else x.detach().requires_grad_(True)
+        theta_b = _expand_theta_to_batch(theta, batch=int(x_req.shape[0]))
+        t_col = _as_col_t(t, batch=int(x_req.shape[0]))
+        velocity = model(x_req, theta_b, t_col)
+        flat_velocity = velocity.reshape(int(velocity.shape[0]), -1)
+        flat_probes = probes.reshape(int(probes.shape[0]), int(probes.shape[1]), -1)
+        estimates: list[torch.Tensor] = []
+        for probe in flat_probes:
+            gradient = torch.autograd.grad(
+                torch.sum(flat_velocity * probe),
+                x_req,
+                create_graph=bool(create_graph),
+                retain_graph=True,
+                allow_unused=True,
+            )[0]
+            if gradient is None:
+                estimates.append(
+                    torch.zeros(int(x_req.shape[0]), dtype=x_req.dtype, device=x_req.device)
+                )
+            else:
+                estimates.append(
+                    torch.sum(gradient.reshape(int(gradient.shape[0]), -1) * probe, dim=1)
+                )
+        return velocity, torch.stack(estimates, dim=0).mean(dim=0)
+
+
 def _differentiable_endpoint_log_prob(
     model: nn.Module,
     x: torch.Tensor,
@@ -517,6 +555,8 @@ def _differentiable_endpoint_log_prob(
     *,
     ode_steps: int,
     ode_method: str,
+    divergence_estimator: str,
+    hutchinson_probes: int,
 ) -> torch.Tensor:
     """Differentiate a fixed-step reverse CNF solve through model parameters."""
 
@@ -524,19 +564,38 @@ def _differentiable_endpoint_log_prob(
     if method not in {"euler", "midpoint"}:
         raise ValueError("Differentiable CNF likelihood supports only euler and midpoint ODE methods.")
     theta_b = _expand_theta_to_batch(theta, batch=int(x.shape[0]))
+    de, n_probes = _resolve_divergence_controls(
+        divergence_estimator=divergence_estimator,
+        hutchinson_probes=hutchinson_probes,
+    )
+    probes = None
+    if de == "hutchinson":
+        probes = torch.empty(
+            (n_probes,) + tuple(x.shape), dtype=x.dtype, device=x.device
+        ).bernoulli_(0.5)
+        probes = probes.mul_(2.0).sub_(1.0)
     dt = -1.0 / float(ode_steps)
     z = x
     log_det = torch.zeros(int(x.shape[0]), dtype=x.dtype, device=x.device)
     for step in range(int(ode_steps)):
         t0 = torch.full((int(x.shape[0]), 1), 1.0 + float(step) * dt, dtype=x.dtype, device=x.device)
         if method == "euler":
-            velocity, divergence = _velocity_and_exact_divergence(
-                model, z, theta_b, t0, create_graph=True
-            )
+            if probes is None:
+                velocity, divergence = _velocity_and_exact_divergence(
+                    model, z, theta_b, t0, create_graph=True
+                )
+            else:
+                velocity, divergence = _velocity_and_hutchinson_divergence(
+                    model, z, theta_b, t0, probes=probes, create_graph=True
+                )
             z = z + dt * velocity
             log_det = log_det + dt * divergence
         else:
-            velocity0, _ = _velocity_and_exact_divergence(model, z, theta_b, t0, create_graph=True)
+            velocity0 = model(
+                z,
+                _expand_theta_to_batch(theta_b, batch=int(z.shape[0])),
+                _as_col_t(t0, batch=int(z.shape[0])),
+            )
             z_mid = z + 0.5 * dt * velocity0
             t_mid = torch.full(
                 (int(x.shape[0]), 1),
@@ -544,9 +603,14 @@ def _differentiable_endpoint_log_prob(
                 dtype=x.dtype,
                 device=x.device,
             )
-            velocity_mid, divergence_mid = _velocity_and_exact_divergence(
-                model, z_mid, theta_b, t_mid, create_graph=True
-            )
+            if probes is None:
+                velocity_mid, divergence_mid = _velocity_and_exact_divergence(
+                    model, z_mid, theta_b, t_mid, create_graph=True
+                )
+            else:
+                velocity_mid, divergence_mid = _velocity_and_hutchinson_divergence(
+                    model, z_mid, theta_b, t_mid, probes=probes, create_graph=True
+                )
             z = z + dt * velocity_mid
             log_det = log_det + dt * divergence_mid
     return _standard_normal_log_prob(z) + log_det
@@ -562,6 +626,8 @@ def flow_endpoint_log_prob(
     ode_steps: int = 32,
     ode_method: str = "midpoint",
     enable_grad: bool = False,
+    divergence_estimator: str | None = None,
+    hutchinson_probes: int | None = None,
 ) -> torch.Tensor:
     """Compute endpoint log probability with ``flow_matching`` ODE likelihood."""
 
@@ -576,6 +642,18 @@ def flow_endpoint_log_prob(
     x_eval = x_norm if bool(enable_grad) else x_norm.detach()
     theta = theta.to(device=x_eval.device, dtype=x_eval.dtype)
     theta_b = _expand_theta_to_batch(theta, batch=int(x_eval.shape[0]))
+    de, probes = _resolve_divergence_controls(
+        divergence_estimator=(
+            str(getattr(model, "divergence_estimator", "exact"))
+            if divergence_estimator is None
+            else str(divergence_estimator)
+        ),
+        hutchinson_probes=(
+            int(getattr(model, "hutchinson_probes", 1))
+            if hutchinson_probes is None
+            else int(hutchinson_probes)
+        ),
+    )
     if bool(enable_grad):
         return _differentiable_endpoint_log_prob(
             model,
@@ -583,11 +661,9 @@ def flow_endpoint_log_prob(
             theta_b,
             ode_steps=steps,
             ode_method=str(ode_method),
+            divergence_estimator=de,
+            hutchinson_probes=probes,
         )
-    de, probes = _resolve_divergence_controls(
-        divergence_estimator=str(getattr(model, "divergence_estimator", "exact")),
-        hutchinson_probes=int(getattr(model, "hutchinson_probes", 1)),
-    )
     exact = de == "exact"
     repeats = 1 if exact else probes
     time_grid = torch.linspace(1.0, 0.0, steps + 1, dtype=x_eval.dtype, device=x_eval.device)
@@ -1821,6 +1897,8 @@ def finetune_flow_skl_cnf_likelihood(
     ema_alpha: float = 0.05,
     max_grad_norm: float = 10.0,
     checkpoint_selection: str = "best",
+    divergence_estimator: str = "exact",
+    hutchinson_probes: int = 1,
     log_every: int = 50,
 ) -> dict[str, Any]:
     """Fine-tune a conditional CNF by maximizing endpoint log likelihood."""
@@ -1835,6 +1913,10 @@ def finetune_flow_skl_cnf_likelihood(
         raise ValueError("ode_steps must be >= 1.")
     if not str(ode_method).strip():
         raise ValueError("ode_method must be non-empty.")
+    likelihood_de, likelihood_probes = _resolve_divergence_controls(
+        divergence_estimator=divergence_estimator,
+        hutchinson_probes=hutchinson_probes,
+    )
     if int(patience) < 0:
         raise ValueError("patience must be >= 0.")
     if float(min_delta) < 0.0:
@@ -1891,6 +1973,8 @@ def finetune_flow_skl_cnf_likelihood(
             ode_steps=int(ode_steps),
             ode_method=str(ode_method),
             enable_grad=bool(enable_grad),
+            divergence_estimator=likelihood_de,
+            hutchinson_probes=likelihood_probes,
         )
         return -torch.mean(log_prob)
 
@@ -2002,6 +2086,8 @@ def finetune_flow_skl_cnf_likelihood(
         "weight_decay": float(weight_decay),
         "ode_steps": int(ode_steps),
         "ode_method": str(ode_method),
+        "divergence_estimator": likelihood_de,
+        "hutchinson_probes": int(likelihood_probes),
         "early_ema_alpha": float(alpha),
     }
 

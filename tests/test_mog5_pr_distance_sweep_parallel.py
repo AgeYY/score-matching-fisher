@@ -114,7 +114,7 @@ def test_parser_defaults_and_cpu_auto(monkeypatch: pytest.MonkeyPatch) -> None:
     assert args.gpu_ids == [0]
     assert args.jobs_per_gpu == 1
     assert args.device == "cuda:0"
-    assert args.flow_likelihood_finetune_epochs == 500
+    assert args.flow_likelihood_finetune_epochs == 20_000
     assert args.seed == 19
     assert args.n_list == [100, 1000, 2000, 3000]
     assert args.n_repeats == 10
@@ -128,7 +128,7 @@ def test_parser_defaults_and_cpu_auto(monkeypatch: pytest.MonkeyPatch) -> None:
     assert args.flow_likelihood_finetune_batch_size == 3000
     assert args.flow_likelihood_finetune_lr == pytest.approx(3e-5)
     assert args.flow_likelihood_finetune_ode_steps == 32
-    assert args.flow_likelihood_finetune_patience == 150
+    assert args.flow_likelihood_finetune_patience == 1_000
     assert args.flow_likelihood_finetune_checkpoint_selection == "best"
     assert args.tre_num_bridges == 8
     assert args.tre_architecture == "mlp"
@@ -259,6 +259,27 @@ def test_cache_hits_and_force_behavior(monkeypatch: pytest.MonkeyPatch, tmp_path
     )
     assert to_run == [force_dataset_task]
     assert cache_hits[force_dataset_task.key] is False
+
+
+def test_cache_metadata_mismatch_forces_dimension_rerun(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    mod = _load_cli_module()
+    _patch_case_output_dir(monkeypatch, mod, tmp_path)
+    args = mod.build_parser().parse_args(
+        ["--n-list", "100", "--n-repeats", "1", "--native-x-dim", "10", "--seed", "7"]
+    )
+    task = mod.plan_cases(args)[0]
+    _write_case_npz(task.result_path)
+    task.result_path.with_name("mog5_pr_distance_comparison_summary.json").write_text(
+        json.dumps({"native_x_dim": 3, "n_total": 100, "seed": 7}) + "\n",
+        encoding="utf-8",
+    )
+
+    to_run, cache_hits = mod.select_tasks_to_run([task], args=args, metrics=ALL_METRICS)
+
+    assert to_run == [task]
+    assert cache_hits[task.key] is False
 
 
 def test_visualization_only_preflight_fails_for_missing_repeat(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

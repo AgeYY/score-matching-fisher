@@ -11,6 +11,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from global_setting import TRAINING_EARLY_STOPPING_PATIENCE, TRAINING_MAX_EPOCHS
 from fisher.ctsm_models import (
     ToyBinaryTimeScoreNet,
     ToyPairConditionedTimeScoreNet,
@@ -26,7 +27,7 @@ from fisher.shared_fisher_est import (
 
 @dataclass(frozen=True)
 class CTSMVJeffreysConfig:
-    epochs: int = 8_000
+    epochs: int = TRAINING_MAX_EPOCHS
     batch_size: int = 512
     lr: float = 2e-3
     weight_decay: float = 0.0
@@ -44,7 +45,7 @@ class CTSMVJeffreysConfig:
     t_eps: float = 1e-4
     integration_steps: int = 300
     eval_batch_size: int = 4096
-    early_patience: int = 1_000
+    early_patience: int = TRAINING_EARLY_STOPPING_PATIENCE
     early_min_delta: float = 1e-4
     early_ema_alpha: float = 0.05
     validation_batches_per_epoch: int = 8
@@ -65,7 +66,7 @@ class CTSMVJeffreysResult:
 
 @dataclass(frozen=True)
 class CTSMVBinaryJeffreysConfig:
-    epochs: int = 50_000
+    epochs: int = TRAINING_MAX_EPOCHS
     batch_size: int = 512
     lr: float = 2e-3
     weight_decay: float = 0.0
@@ -77,7 +78,7 @@ class CTSMVBinaryJeffreysConfig:
     t_eps: float = 1e-4
     integration_steps: int = 300
     eval_batch_size: int = 4096
-    early_patience: int = 1_000
+    early_patience: int = TRAINING_EARLY_STOPPING_PATIENCE
     early_min_delta: float = 1e-4
     early_ema_alpha: float = 0.05
     validation_batches_per_epoch: int = 8

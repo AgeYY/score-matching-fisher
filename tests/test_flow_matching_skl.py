@@ -873,6 +873,38 @@ def test_cnf_likelihood_finetune_updates_model_and_records_validation_nll() -> N
     assert any(not torch.equal(before[key], value) for key, value in model.state_dict().items())
 
 
+def test_differentiable_hutchinson_log_prob_has_finite_parameter_gradients() -> None:
+    torch.manual_seed(23)
+    model = build_flow_skl_model(
+        velocity_family="nonlinear",
+        theta_dim=2,
+        x_dim=3,
+        hidden_dim=8,
+        depth=1,
+        path_schedule="linear",
+        divergence_estimator="exact",
+    )
+    x = torch.randn(4, 3)
+    theta = torch.eye(2)[[0, 0, 1, 1]]
+
+    log_prob = flow_endpoint_log_prob(
+        model,
+        x,
+        theta,
+        ode_steps=2,
+        ode_method="midpoint",
+        enable_grad=True,
+        divergence_estimator="hutchinson",
+        hutchinson_probes=1,
+    )
+    (-log_prob.mean()).backward()
+
+    assert torch.all(torch.isfinite(log_prob))
+    gradients = [parameter.grad for parameter in model.parameters() if parameter.grad is not None]
+    assert gradients
+    assert all(torch.all(torch.isfinite(gradient)) for gradient in gradients)
+
+
 def test_cnf_likelihood_finetune_can_select_untouched_epoch_zero(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
