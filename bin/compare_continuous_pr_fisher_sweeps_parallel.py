@@ -64,6 +64,8 @@ METHOD_LABELS = {
     "classical_full": "classical full",
     "flow_linear": "flow linear",
     "flow_full": "flow full",
+    "gkr_linear": "GKR linear",
+    "gkr_full": "GKR full",
 }
 
 METHOD_COLORS = {
@@ -73,6 +75,8 @@ METHOD_COLORS = {
     "flow_full": "C0",
     "classical_linear": "C1",
     "classical_full": "C1",
+    "gkr_linear": "C2",
+    "gkr_full": "C2",
 }
 
 METHOD_LINESTYLES = {
@@ -82,6 +86,8 @@ METHOD_LINESTYLES = {
     "classical_full": "-",
     "flow_linear": "-",
     "flow_full": "-",
+    "gkr_linear": "-",
+    "gkr_full": "-",
 }
 
 METHOD_MARKERS = {
@@ -91,6 +97,8 @@ METHOD_MARKERS = {
     "classical_full": "s",
     "flow_linear": "o",
     "flow_full": "o",
+    "gkr_linear": "^",
+    "gkr_full": "^",
 }
 
 GP_SMOOTHED_ESTIMATOR_METHODS = (
@@ -98,6 +106,8 @@ GP_SMOOTHED_ESTIMATOR_METHODS = (
     "classical_full",
     "flow_linear",
     "classical_linear",
+    "gkr_linear",
+    "gkr_full",
 )
 SMOOTHED_ESTIMATOR_METHODS = GP_SMOOTHED_ESTIMATOR_METHODS
 
@@ -496,12 +506,12 @@ def _method_label(name: str) -> str:
     return METHOD_LABELS.get(str(name), str(name).replace("_", " "))
 
 
-def _fisher_family_methods(family: str) -> tuple[str, str, str]:
+def _fisher_family_methods(family: str) -> tuple[str, ...]:
     fam = str(family)
     if fam == "full":
-        return ("ground_truth_native_full", "flow_full", "classical_full")
+        return ("ground_truth_native_full", "flow_full", "classical_full", "gkr_full")
     if fam == "linear":
-        return ("ground_truth_native_linear", "flow_linear", "classical_linear")
+        return ("ground_truth_native_linear", "flow_linear", "classical_linear", "gkr_linear")
     raise ValueError(f"Unknown Fisher family: {family!r}.")
 
 
@@ -755,8 +765,8 @@ def _plot_composite_fisher_curves(
 
 
 def _plot_composite_error_vs_n(ax: Any, rows: list[dict[str, Any]], *, family: str, yscale: str) -> None:
-    _, flow_method, classical_method = _fisher_family_methods(str(family))
-    for method in (flow_method, classical_method):
+    methods = _fisher_family_methods(str(family))[1:]
+    for method in methods:
         ns, means, sds = _errorbar_series(rows, method=method, pr_dim="none")
         if len(ns) == 0:
             continue

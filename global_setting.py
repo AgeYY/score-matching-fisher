@@ -15,6 +15,15 @@ DATAROOT = os.environ.get(
 # Default datasets and run outputs live directly under DATAROOT (same tree as the repo `data/` symlink).
 DATA_DIR = DATAROOT
 
+# Project-wide training budget. Training CLIs and shared FM/NLL trainers use
+# these values unless an experiment explicitly overrides them.
+DEFAULT_TRAINING_MAX_EPOCHS = int(
+    os.environ.get("SCORE_MATCHING_FISHER_MAX_EPOCHS", "20000")
+)
+DEFAULT_EARLY_STOPPING_PATIENCE = int(
+    os.environ.get("SCORE_MATCHING_FISHER_EARLY_STOPPING_PATIENCE", "1000")
+)
+
 # Local Stringer et al. 2019 mouse visual cortex dataset.
 # Override at runtime:
 # export SCORE_MATCHING_FISHER_STRINGER_DATA_DIR=/path/to/stringer-et-al-2019

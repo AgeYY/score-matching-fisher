@@ -17,6 +17,10 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
+from global_setting import (
+    DEFAULT_EARLY_STOPPING_PATIENCE,
+    DEFAULT_TRAINING_MAX_EPOCHS,
+)
 from fisher.autoencoder_embedding import PRAutoencoderConfig, train_or_load_pr_autoencoder
 from fisher.flow_matching_skl import (
     FlowSKLResult,
@@ -80,8 +84,8 @@ CSV_COLUMNS = (
 class FlowComparisonConfig:
     """Training/evaluation defaults for flow-matching comparison runs."""
 
-    epochs: int = 20_000
-    early_patience: int = 1_000
+    epochs: int = DEFAULT_TRAINING_MAX_EPOCHS
+    early_patience: int = DEFAULT_EARLY_STOPPING_PATIENCE
     early_min_delta: float = 1e-4
     early_ema_alpha: float = 0.05
     batch_size: int = 3000
@@ -116,13 +120,13 @@ class FlowComparisonConfig:
     radius: float = 1.0
     normalize_x: bool = False
     normalize_x_eps: float = 1e-8
-    likelihood_finetune_epochs: int = 500
+    likelihood_finetune_epochs: int = DEFAULT_TRAINING_MAX_EPOCHS
     likelihood_finetune_batch_size: int = 2048
     likelihood_finetune_lr: float = 3e-5
     likelihood_finetune_weight_decay: float = 0.0
     likelihood_finetune_ode_steps: int = 32
     likelihood_finetune_ode_method: str = "midpoint"
-    likelihood_finetune_patience: int = 150
+    likelihood_finetune_patience: int = DEFAULT_EARLY_STOPPING_PATIENCE
     likelihood_finetune_min_delta: float = 1e-4
     likelihood_finetune_ema_alpha: float = 0.05
     likelihood_finetune_checkpoint_selection: str = "best"

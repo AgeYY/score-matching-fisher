@@ -16,7 +16,12 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from global_setting import DATA_DIR, DEFAULT_DEVICE
+from global_setting import (
+    DATA_DIR,
+    DEFAULT_DEVICE,
+    DEFAULT_EARLY_STOPPING_PATIENCE,
+    DEFAULT_TRAINING_MAX_EPOCHS,
+)
 
 from fisher.geometric_base_flow_skl import (
     ConditionTimeAffineVelocity,
@@ -55,14 +60,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ode-steps", type=int, default=64)
     p.add_argument("--ode-method", type=str, default="midpoint")
 
-    p.add_argument("--epochs", type=int, default=1000)
+    p.add_argument("--epochs", type=int, default=DEFAULT_TRAINING_MAX_EPOCHS)
     p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--hidden-dim", type=int, default=128)
     p.add_argument("--depth", type=int, default=3)
     p.add_argument("--t-eps", type=float, default=0.0005)
-    p.add_argument("--early-patience", type=int, default=0)
+    p.add_argument(
+        "--early-patience", type=int, default=DEFAULT_EARLY_STOPPING_PATIENCE
+    )
     p.add_argument("--early-min-delta", type=float, default=1e-4)
     p.add_argument("--early-ema-alpha", type=float, default=0.05)
     p.add_argument("--max-grad-norm", type=float, default=10.0)

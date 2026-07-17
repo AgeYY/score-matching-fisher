@@ -18,7 +18,11 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from global_setting import DEFAULT_DEVICE
+from global_setting import (
+    DEFAULT_DEVICE,
+    DEFAULT_EARLY_STOPPING_PATIENCE,
+    DEFAULT_TRAINING_MAX_EPOCHS,
+)
 from fisher.ctsm_distance import (
     CTSMVBinaryJeffreysConfig,
     CTSMVJeffreysConfig,
@@ -174,8 +178,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--skl-folds", type=int, default=5)
     p.add_argument("--skl-logistic-c", type=float, default=1.0)
 
-    p.add_argument("--epochs", type=int, default=20_000)
-    p.add_argument("--early-patience", type=int, default=1_000)
+    p.add_argument("--epochs", type=int, default=DEFAULT_TRAINING_MAX_EPOCHS)
+    p.add_argument(
+        "--early-patience", type=int, default=DEFAULT_EARLY_STOPPING_PATIENCE
+    )
     p.add_argument("--early-min-delta", type=float, default=1e-4)
     p.add_argument("--early-ema-alpha", type=float, default=0.05)
     p.add_argument("--batch-size", type=int, default=3000)
@@ -242,7 +248,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--flow-likelihood-finetune-epochs",
         type=int,
-        default=500,
+        default=DEFAULT_TRAINING_MAX_EPOCHS,
         help="CNF endpoint-NLL fine-tuning epochs; 0 disables the fine-tuned estimator.",
     )
     p.add_argument(
@@ -255,7 +261,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--flow-likelihood-finetune-weight-decay", type=float, default=0.0)
     p.add_argument("--flow-likelihood-finetune-ode-steps", type=int, default=32)
     p.add_argument("--flow-likelihood-finetune-ode-method", type=str, default="midpoint")
-    p.add_argument("--flow-likelihood-finetune-patience", type=int, default=150)
+    p.add_argument(
+        "--flow-likelihood-finetune-patience",
+        type=int,
+        default=DEFAULT_EARLY_STOPPING_PATIENCE,
+    )
     p.add_argument("--flow-likelihood-finetune-min-delta", type=float, default=1e-4)
     p.add_argument("--flow-likelihood-finetune-ema-alpha", type=float, default=0.05)
     p.add_argument(

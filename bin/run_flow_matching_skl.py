@@ -16,7 +16,12 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from global_setting import DATA_DIR, DEFAULT_DEVICE
+from global_setting import (
+    DATA_DIR,
+    DEFAULT_DEVICE,
+    DEFAULT_EARLY_STOPPING_PATIENCE,
+    DEFAULT_TRAINING_MAX_EPOCHS,
+)
 
 from fisher.data import ToyCategoricalRandomMoGDataset
 from fisher.flow_matching_skl import (
@@ -53,7 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--num-categories", type=int, default=2)
     p.add_argument("--mog-mean-min-dist", type=float, default=None)
 
-    p.add_argument("--epochs", type=int, default=1000)
+    p.add_argument("--epochs", type=int, default=DEFAULT_TRAINING_MAX_EPOCHS)
     p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=0.0)
@@ -65,7 +70,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--hutchinson-probes", type=int, default=1)
     p.add_argument("--shared-affine-a-diag-jitter", type=float, default=1e-3)
     p.add_argument("--t-eps", type=float, default=0.0005)
-    p.add_argument("--early-patience", type=int, default=0)
+    p.add_argument(
+        "--early-patience", type=int, default=DEFAULT_EARLY_STOPPING_PATIENCE
+    )
     p.add_argument("--early-min-delta", type=float, default=1e-4)
     p.add_argument("--early-ema-alpha", type=float, default=0.05)
     p.add_argument("--max-grad-norm", type=float, default=10.0)

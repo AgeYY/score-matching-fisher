@@ -542,11 +542,11 @@ def test_flow_comparison_config_default_t_eps_is_small_endpoint_clamp() -> None:
     assert config.depth == 3
     assert config.fixed_validation is True
     assert config.fixed_validation_paths == 10
-    assert config.likelihood_finetune_epochs == 500
+    assert config.likelihood_finetune_epochs == 20_000
     assert config.likelihood_finetune_batch_size == 2048
     assert config.likelihood_finetune_lr == pytest.approx(3e-5)
     assert config.likelihood_finetune_ode_steps == 32
-    assert config.likelihood_finetune_patience == 150
+    assert config.likelihood_finetune_patience == 1_000
     assert config.likelihood_finetune_checkpoint_selection == "best"
 
 
@@ -692,7 +692,7 @@ def test_cli_default_path_resolution_without_running_training() -> None:
     assert args.dataset_obs_noise_scale == pytest.approx(1.0)
     assert args.dataset_cov_theta_amp_scale == pytest.approx(1.0)
     assert args.dataset_mog_mean_min_dist is None
-    assert args.flow_likelihood_finetune_epochs == 500
+    assert args.flow_likelihood_finetune_epochs == 20_000
     assert args.batch_size == 3000
     assert args.lr == pytest.approx(1e-4)
     assert args.hidden_dim == 128
@@ -702,7 +702,7 @@ def test_cli_default_path_resolution_without_running_training() -> None:
     assert args.flow_likelihood_finetune_batch_size == 3000
     assert args.flow_likelihood_finetune_lr == pytest.approx(3e-5)
     assert args.flow_likelihood_finetune_ode_steps == 32
-    assert args.flow_likelihood_finetune_patience == 150
+    assert args.flow_likelihood_finetune_patience == 1_000
     assert args.flow_likelihood_finetune_checkpoint_selection == "best"
     assert args.metric == "all"
     assert mod.resolve_metric_names(args) == dc.METRIC_NAMES

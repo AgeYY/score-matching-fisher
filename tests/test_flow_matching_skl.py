@@ -18,6 +18,7 @@ if str(_REPO_ROOT) not in sys.path:
 from fisher import flow_matching_skl as fms
 from fisher.flow_matching_skl import (
     FlowSKLResult,
+    GaussianRBFEmbedding,
     VELOCITY_FAMILIES,
     build_flow_skl_model,
     centered_radius_normalize,
@@ -339,6 +340,62 @@ def _first_linear_in_features(module: nn.Sequential) -> int:
     first = module[0]
     assert isinstance(first, nn.Linear)
     return int(first.in_features)
+
+
+def test_gaussian_rbf_embedding_defaults_to_center_spacing_and_is_differentiable() -> None:
+    embedding = GaussianRBFEmbedding(num_centers=8, lower=-6.0, upper=6.0).double()
+    expected_spacing = 12.0 / 7.0
+    assert embedding.spacing == pytest.approx(expected_spacing)
+    assert float(embedding.bandwidth.item()) == pytest.approx(expected_spacing)
+
+    theta_centers = torch.tensor([[-6.0], [6.0]], dtype=torch.float64)
+    features_at_centers = embedding(theta_centers)
+    assert features_at_centers.shape == (2, 8)
+    assert float(features_at_centers[0, 0]) == pytest.approx(1.0)
+    assert float(features_at_centers[1, -1]) == pytest.approx(1.0)
+
+    theta = torch.tensor([[0.2]], dtype=torch.float64, requires_grad=True)
+    features = embedding(theta)
+    gradient = torch.autograd.grad(features[0, 3], theta)[0]
+    assert torch.isfinite(gradient).all()
+    assert float(torch.abs(gradient).item()) > 0.0
+
+
+def test_condition_affine_model_supports_gaussian_rbf_theta_embedding() -> None:
+    model = build_flow_skl_model(
+        velocity_family="condition_affine",
+        theta_dim=1,
+        x_dim=2,
+        hidden_dim=8,
+        depth=2,
+        theta_embedding="gaussian_rbf",
+        theta_rbf_num_centers=8,
+        theta_rbf_lower=-6.0,
+        theta_rbf_upper=6.0,
+        path_schedule="linear",
+    ).double()
+    assert isinstance(model.theta_embedding, GaussianRBFEmbedding)
+    assert model.theta_embedding_type == "gaussian_rbf"
+    assert _first_linear_in_features(model.b_net) == 8
+    assert _first_linear_in_features(model.a_net) == 9
+
+    theta = torch.tensor([[-0.4], [0.7]], dtype=torch.float64, requires_grad=True)
+    x = torch.randn(2, 2, dtype=torch.float64)
+    t = torch.tensor([[0.25], [0.75]], dtype=torch.float64)
+    velocity = model(x, theta, t)
+    theta_gradient = torch.autograd.grad(velocity.square().sum(), theta)[0]
+    assert velocity.shape == (2, 2)
+    assert torch.isfinite(theta_gradient).all()
+
+
+def test_gaussian_rbf_theta_embedding_rejects_vector_conditions() -> None:
+    with pytest.raises(ValueError, match="theta_dim == 1"):
+        build_flow_skl_model(
+            velocity_family="condition_affine",
+            theta_dim=2,
+            x_dim=2,
+            theta_embedding="gaussian_rbf",
+        )
 
 
 def test_build_flow_skl_model_uses_mlp_heads_and_film_nonlinear_subnets() -> None:

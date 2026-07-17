@@ -114,7 +114,7 @@ def test_parser_defaults_and_cpu_auto(monkeypatch: pytest.MonkeyPatch) -> None:
     assert args.gpu_ids == [0]
     assert args.jobs_per_gpu == 1
     assert args.device == "cuda:0"
-    assert args.flow_likelihood_finetune_epochs == 500
+    assert args.flow_likelihood_finetune_epochs == 20_000
     assert args.seed == 19
     assert args.n_list == [100, 1000, 2000, 3000]
     assert args.n_repeats == 10
@@ -128,7 +128,7 @@ def test_parser_defaults_and_cpu_auto(monkeypatch: pytest.MonkeyPatch) -> None:
     assert args.flow_likelihood_finetune_batch_size == 3000
     assert args.flow_likelihood_finetune_lr == pytest.approx(3e-5)
     assert args.flow_likelihood_finetune_ode_steps == 32
-    assert args.flow_likelihood_finetune_patience == 150
+    assert args.flow_likelihood_finetune_patience == 1_000
     assert args.flow_likelihood_finetune_checkpoint_selection == "best"
     assert args.tre_num_bridges == 8
     assert args.tre_architecture == "mlp"

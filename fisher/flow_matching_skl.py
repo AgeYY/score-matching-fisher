@@ -18,6 +18,10 @@ from torch import nn
 from torch.nn.utils import parametrizations
 from torch.utils.data import DataLoader, TensorDataset
 
+from global_setting import (
+    DEFAULT_EARLY_STOPPING_PATIENCE,
+    DEFAULT_TRAINING_MAX_EPOCHS,
+)
 from fisher.gaussian_x_flow import GaussianAffinePathSchedule, path_schedule_from_name
 from fisher.linear_x_flow import resolve_lxf_low_rank_dim
 from fisher.model_weight_ema import scalar_val_ema_update
@@ -54,6 +58,7 @@ LOW_RANK_AFFINE_FAMILIES = {
 MC_ENDPOINT_FAMILIES = LOW_RANK_AFFINE_FAMILIES | {"nonlinear"}
 
 PARAMETER_NETWORK_ARCHITECTURES = ("mlp", "residual_mlp")
+THETA_EMBEDDING_TYPES = ("identity", "gaussian_rbf")
 
 
 @dataclass
@@ -150,6 +155,86 @@ class _SinusoidalTimeEmbedding(nn.Module):
         if self.dim % 2:
             emb = torch.cat([emb, torch.zeros(int(t.shape[0]), 1, dtype=t.dtype, device=t.device)], dim=1)
         return emb
+
+
+class GaussianRBFEmbedding(nn.Module):
+    """Fixed Gaussian RBF features for a scalar condition.
+
+    The default bandwidth is the spacing between adjacent centers. Centers and
+    bandwidth are buffers, so the embedding follows the model device/dtype
+    while remaining differentiable with respect to the input condition.
+    """
+
+    def __init__(
+        self,
+        *,
+        num_centers: int = 8,
+        lower: float = -6.0,
+        upper: float = 6.0,
+        bandwidth: float | None = None,
+    ) -> None:
+        super().__init__()
+        if int(num_centers) < 2:
+            raise ValueError("num_centers must be >= 2.")
+        if not math.isfinite(float(lower)) or not math.isfinite(float(upper)):
+            raise ValueError("lower and upper must be finite.")
+        if not float(lower) < float(upper):
+            raise ValueError("lower must be smaller than upper.")
+        spacing = (float(upper) - float(lower)) / float(int(num_centers) - 1)
+        resolved_bandwidth = spacing if bandwidth is None else float(bandwidth)
+        if not math.isfinite(resolved_bandwidth) or resolved_bandwidth <= 0.0:
+            raise ValueError("bandwidth must be finite and positive.")
+
+        self.num_centers = int(num_centers)
+        self.lower = float(lower)
+        self.upper = float(upper)
+        self.spacing = float(spacing)
+        self.output_dim = self.num_centers
+        self.register_buffer(
+            "centers",
+            torch.linspace(self.lower, self.upper, self.num_centers, dtype=torch.float32),
+        )
+        self.register_buffer("bandwidth", torch.tensor(resolved_bandwidth, dtype=torch.float32))
+
+    def forward(self, theta: torch.Tensor) -> torch.Tensor:
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        if theta.ndim != 2 or int(theta.shape[1]) != 1:
+            raise ValueError("GaussianRBFEmbedding expects scalar theta with shape [B] or [B, 1].")
+        centers = self.centers.to(dtype=theta.dtype)
+        bandwidth = self.bandwidth.to(dtype=theta.dtype)
+        scaled_distance = (theta - centers.reshape(1, -1)) / bandwidth
+        return torch.exp(-0.5 * scaled_distance.square())
+
+
+def _normalize_theta_embedding_type(theta_embedding: str) -> str:
+    name = str(theta_embedding).strip().lower().replace("-", "_")
+    if name not in THETA_EMBEDDING_TYPES:
+        raise ValueError(f"theta_embedding must be one of {THETA_EMBEDDING_TYPES}; got {theta_embedding!r}.")
+    return name
+
+
+def _make_theta_embedding(
+    *,
+    theta_embedding: str,
+    theta_dim: int,
+    rbf_num_centers: int,
+    rbf_lower: float,
+    rbf_upper: float,
+    rbf_bandwidth: float | None,
+) -> tuple[nn.Module, int]:
+    name = _normalize_theta_embedding_type(theta_embedding)
+    if name == "identity":
+        return nn.Identity(), int(theta_dim)
+    if int(theta_dim) != 1:
+        raise ValueError("gaussian_rbf theta embedding currently requires theta_dim == 1.")
+    embedding = GaussianRBFEmbedding(
+        num_centers=int(rbf_num_centers),
+        lower=float(rbf_lower),
+        upper=float(rbf_upper),
+        bandwidth=rbf_bandwidth,
+    )
+    return embedding, embedding.output_dim
 
 
 class _ConditionedFiLMNet(nn.Module):
@@ -788,6 +873,11 @@ class _CenteredAffineFlowSKLBase(nn.Module):
         path_schedule: str | GaussianAffinePathSchedule = "cosine",
         divergence_estimator: str = "exact",
         hutchinson_probes: int = 1,
+        theta_embedding: str = "identity",
+        theta_rbf_num_centers: int = 8,
+        theta_rbf_lower: float = -6.0,
+        theta_rbf_upper: float = 6.0,
+        theta_rbf_bandwidth: float | None = None,
     ) -> None:
         super().__init__()
         if int(theta_dim) < 1:
@@ -806,6 +896,15 @@ class _CenteredAffineFlowSKLBase(nn.Module):
         self.depth = int(depth)
         self.quadrature_steps = int(quadrature_steps)
         self.network_architecture = _normalize_parameter_network_architecture(network_architecture)
+        self.theta_embedding_type = _normalize_theta_embedding_type(theta_embedding)
+        self.theta_embedding, self.theta_embedding_dim = _make_theta_embedding(
+            theta_embedding=self.theta_embedding_type,
+            theta_dim=self.theta_dim,
+            rbf_num_centers=int(theta_rbf_num_centers),
+            rbf_lower=float(theta_rbf_lower),
+            rbf_upper=float(theta_rbf_upper),
+            rbf_bandwidth=theta_rbf_bandwidth,
+        )
         _set_divergence_controls(
             self,
             divergence_estimator=divergence_estimator,
@@ -813,7 +912,7 @@ class _CenteredAffineFlowSKLBase(nn.Module):
         )
         self.b_net = _make_parameter_net(
             architecture=self.network_architecture,
-            in_dim=self.theta_dim,
+            in_dim=self.theta_embedding_dim,
             out_dim=self.x_dim,
             hidden_dim=self.hidden_dim,
             depth=self.depth,
@@ -834,7 +933,7 @@ class _CenteredAffineFlowSKLBase(nn.Module):
     def b(self, theta: torch.Tensor) -> torch.Tensor:
         if theta.ndim == 1:
             theta = theta.unsqueeze(-1)
-        return self.b_net(theta)
+        return self.b_net(self.theta_embedding(theta))
 
     def endpoint_mean(self, theta: torch.Tensor) -> torch.Tensor:
         return self.b(theta)
@@ -1027,6 +1126,11 @@ class CenteredConditionAffineFlowSKLModel(_CenteredAffineFlowSKLBase):
         path_schedule: str | GaussianAffinePathSchedule = "cosine",
         divergence_estimator: str = "exact",
         hutchinson_probes: int = 1,
+        theta_embedding: str = "identity",
+        theta_rbf_num_centers: int = 8,
+        theta_rbf_lower: float = -6.0,
+        theta_rbf_upper: float = 6.0,
+        theta_rbf_bandwidth: float | None = None,
     ) -> None:
         super().__init__(
             theta_dim=theta_dim,
@@ -1037,10 +1141,15 @@ class CenteredConditionAffineFlowSKLModel(_CenteredAffineFlowSKLBase):
             path_schedule=path_schedule,
             divergence_estimator=divergence_estimator,
             hutchinson_probes=int(hutchinson_probes),
+            theta_embedding=theta_embedding,
+            theta_rbf_num_centers=int(theta_rbf_num_centers),
+            theta_rbf_lower=float(theta_rbf_lower),
+            theta_rbf_upper=float(theta_rbf_upper),
+            theta_rbf_bandwidth=theta_rbf_bandwidth,
         )
         self.velocity_family = "condition_affine"
         self.a_net = _make_mlp(
-            in_dim=1 + self.theta_dim,
+            in_dim=1 + self.theta_embedding_dim,
             out_dim=self.x_dim * self.x_dim,
             hidden_dim=self.hidden_dim,
             depth=self.depth,
@@ -1051,7 +1160,10 @@ class CenteredConditionAffineFlowSKLModel(_CenteredAffineFlowSKLBase):
         if theta.ndim == 1:
             theta = theta.unsqueeze(-1)
         t = _as_col_t(t, batch=int(theta.shape[0]))
-        raw = self.a_net(torch.cat([t, theta], dim=1)).reshape(int(theta.shape[0]), self.x_dim, self.x_dim)
+        theta_features = self.theta_embedding(theta)
+        raw = self.a_net(torch.cat([t, theta_features], dim=1)).reshape(
+            int(theta.shape[0]), self.x_dim, self.x_dim
+        )
         return 0.5 * (raw + raw.transpose(-1, -2))
 
     def forward(self, x: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
@@ -1097,6 +1209,11 @@ class CenteredConditionAffineScalarFlowSKLModel(CenteredConditionAffineFlowSKLMo
         path_schedule: str | GaussianAffinePathSchedule = "cosine",
         divergence_estimator: str = "exact",
         hutchinson_probes: int = 1,
+        theta_embedding: str = "identity",
+        theta_rbf_num_centers: int = 8,
+        theta_rbf_lower: float = -6.0,
+        theta_rbf_upper: float = 6.0,
+        theta_rbf_bandwidth: float | None = None,
     ) -> None:
         super().__init__(
             theta_dim=theta_dim,
@@ -1107,10 +1224,15 @@ class CenteredConditionAffineScalarFlowSKLModel(CenteredConditionAffineFlowSKLMo
             path_schedule=path_schedule,
             divergence_estimator=divergence_estimator,
             hutchinson_probes=int(hutchinson_probes),
+            theta_embedding=theta_embedding,
+            theta_rbf_num_centers=int(theta_rbf_num_centers),
+            theta_rbf_lower=float(theta_rbf_lower),
+            theta_rbf_upper=float(theta_rbf_upper),
+            theta_rbf_bandwidth=theta_rbf_bandwidth,
         )
         self.velocity_family = "condition_affine_scalar"
         self.a_net = _make_mlp(
-            in_dim=1 + self.theta_dim,
+            in_dim=1 + self.theta_embedding_dim,
             out_dim=1,
             hidden_dim=self.hidden_dim,
             depth=self.depth,
@@ -1121,7 +1243,8 @@ class CenteredConditionAffineScalarFlowSKLModel(CenteredConditionAffineFlowSKLMo
         if theta.ndim == 1:
             theta = theta.unsqueeze(-1)
         t = _as_col_t(t, batch=int(theta.shape[0]))
-        return _scalar_batch_to_matrix(self.a_net(torch.cat([t, theta], dim=1)), x_dim=self.x_dim)
+        theta_features = self.theta_embedding(theta)
+        return _scalar_batch_to_matrix(self.a_net(torch.cat([t, theta_features], dim=1)), x_dim=self.x_dim)
 
 
 class CenteredConditionAffineDiagFlowSKLModel(CenteredConditionAffineFlowSKLModel):
@@ -1138,6 +1261,11 @@ class CenteredConditionAffineDiagFlowSKLModel(CenteredConditionAffineFlowSKLMode
         path_schedule: str | GaussianAffinePathSchedule = "cosine",
         divergence_estimator: str = "exact",
         hutchinson_probes: int = 1,
+        theta_embedding: str = "identity",
+        theta_rbf_num_centers: int = 8,
+        theta_rbf_lower: float = -6.0,
+        theta_rbf_upper: float = 6.0,
+        theta_rbf_bandwidth: float | None = None,
     ) -> None:
         super().__init__(
             theta_dim=theta_dim,
@@ -1148,10 +1276,15 @@ class CenteredConditionAffineDiagFlowSKLModel(CenteredConditionAffineFlowSKLMode
             path_schedule=path_schedule,
             divergence_estimator=divergence_estimator,
             hutchinson_probes=int(hutchinson_probes),
+            theta_embedding=theta_embedding,
+            theta_rbf_num_centers=int(theta_rbf_num_centers),
+            theta_rbf_lower=float(theta_rbf_lower),
+            theta_rbf_upper=float(theta_rbf_upper),
+            theta_rbf_bandwidth=theta_rbf_bandwidth,
         )
         self.velocity_family = "condition_affine_diag"
         self.a_net = _make_mlp(
-            in_dim=1 + self.theta_dim,
+            in_dim=1 + self.theta_embedding_dim,
             out_dim=self.x_dim,
             hidden_dim=self.hidden_dim,
             depth=self.depth,
@@ -1162,7 +1295,8 @@ class CenteredConditionAffineDiagFlowSKLModel(CenteredConditionAffineFlowSKLMode
         if theta.ndim == 1:
             theta = theta.unsqueeze(-1)
         t = _as_col_t(t, batch=int(theta.shape[0]))
-        return _diag_batch_to_matrix(self.a_net(torch.cat([t, theta], dim=1)), x_dim=self.x_dim)
+        theta_features = self.theta_embedding(theta)
+        return _diag_batch_to_matrix(self.a_net(torch.cat([t, theta_features], dim=1)), x_dim=self.x_dim)
 
 
 class CenteredSharedAffineLowRankFlowSKLModel(CenteredSharedAffineFlowSKLModel):
@@ -1392,6 +1526,11 @@ def build_flow_skl_model(
     hutchinson_probes: int = 1,
     shared_affine_a_diag_jitter: float = 1e-3,
     low_rank_basis: np.ndarray | torch.Tensor | None = None,
+    theta_embedding: str = "identity",
+    theta_rbf_num_centers: int = 8,
+    theta_rbf_lower: float = -6.0,
+    theta_rbf_upper: float = 6.0,
+    theta_rbf_bandwidth: float | None = None,
 ) -> nn.Module:
     """Build a velocity-family model for flow-matching SKL estimation."""
 
@@ -1438,6 +1577,11 @@ def build_flow_skl_model(
             path_schedule=path_schedule,
             divergence_estimator=str(divergence_estimator),
             hutchinson_probes=int(hutchinson_probes),
+            theta_embedding=str(theta_embedding),
+            theta_rbf_num_centers=int(theta_rbf_num_centers),
+            theta_rbf_lower=float(theta_rbf_lower),
+            theta_rbf_upper=float(theta_rbf_upper),
+            theta_rbf_bandwidth=theta_rbf_bandwidth,
             **common,
         )
     low_rank_affine_classes = {
@@ -1522,7 +1666,7 @@ def train_flow_skl_model(
     device: torch.device,
     velocity_family: str | None = None,
     path_schedule: str | GaussianAffinePathSchedule = "cosine",
-    epochs: int = 1000,
+    epochs: int = DEFAULT_TRAINING_MAX_EPOCHS,
     batch_size: int = 512,
     lr: float = 1e-4,
     lr_schedule: str = "constant",
@@ -1530,7 +1674,7 @@ def train_flow_skl_model(
     lr_schedule_epochs: int | None = None,
     weight_decay: float = 0.0,
     t_eps: float = 0.0005,
-    patience: int = 0,
+    patience: int = DEFAULT_EARLY_STOPPING_PATIENCE,
     min_delta: float = 1e-4,
     ema_alpha: float = 0.05,
     max_grad_norm: float = 10.0,
@@ -1614,7 +1758,8 @@ def train_flow_skl_model(
     schedule_name = path_name
     if hasattr(model, "set_path_schedule"):
         model.set_path_schedule(path_schedule)  # type: ignore[attr-defined]
-    opt = torch.optim.AdamW(_adamw_parameters(model), lr=float(lr), weight_decay=float(weight_decay))
+    parameters = _adamw_parameters(model)
+    opt = torch.optim.AdamW(parameters, lr=float(lr), weight_decay=float(weight_decay))
     scheduler = None
     if schedule_key == "cosine":
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -1671,7 +1816,7 @@ def train_flow_skl_model(
             loss.backward()
             n_total_steps += 1
             if float(max_grad_norm) > 0.0:
-                grad_norm = torch.nn.utils.clip_grad_norm_(_adamw_parameters(model), float(max_grad_norm))
+                grad_norm = torch.nn.utils.clip_grad_norm_(parameters, float(max_grad_norm))
                 if float(grad_norm) > float(max_grad_norm):
                     n_clipped_steps += 1
             opt.step()
@@ -1810,13 +1955,13 @@ def finetune_flow_skl_cnf_likelihood(
     theta_val: np.ndarray | None,
     x_val: np.ndarray | None,
     device: torch.device,
-    epochs: int = 100,
+    epochs: int = DEFAULT_TRAINING_MAX_EPOCHS,
     batch_size: int = 512,
     lr: float = 1e-4,
     weight_decay: float = 0.0,
     ode_steps: int = 32,
     ode_method: str = "midpoint",
-    patience: int = 0,
+    patience: int = DEFAULT_EARLY_STOPPING_PATIENCE,
     min_delta: float = 1e-4,
     ema_alpha: float = 0.05,
     max_grad_norm: float = 10.0,

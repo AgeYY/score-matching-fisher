@@ -22,6 +22,13 @@ mamba run -n geo_diffusion python run_fisher.py score ... --device cuda:<GPU_ID>
 mamba run -n geo_diffusion python run_fisher.py decoder ... --device cuda:<GPU_ID>
 ```
 
+## Training Defaults (Mandatory)
+
+- Use `DEFAULT_TRAINING_MAX_EPOCHS` and `DEFAULT_EARLY_STOPPING_PATIENCE` from `global_setting.py` for training runs.
+- Their defaults are 20,000 maximum epochs and 1,000 epochs of early-stopping patience.
+- Always use these global values unless the user's prompt explicitly requests different values.
+- Explicit prompt values take precedence over the global defaults for that run only.
+
 ## Data layout
 
 - Default datasets and run outputs use `DATA_DIR = DATAROOT` from `global_setting.py` (override `DATAROOT` via `SCORE_MATCHING_FISHER_DATAROOT`). The repo `data/` path is a symlink to `DATAROOT` when present.

@@ -26,7 +26,7 @@ def test_parser_defaults_match_selected_diagnostic() -> None:
     assert args.device == "cuda:0"
     assert args.batch_size == 3000
     assert args.nll_batch_size == 3000
-    assert args.nll_epochs == 500
+    assert args.nll_epochs == 20_000
 
 
 def test_relative_pair_error_averages_upper_triangle_ratios() -> None:

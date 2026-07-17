@@ -31,7 +31,11 @@ from fisher.continuous_fisher_comparison import (
     write_results_npz,
     write_summary_json,
 )
-from global_setting import DEFAULT_DEVICE
+from global_setting import (
+    DEFAULT_DEVICE,
+    DEFAULT_EARLY_STOPPING_PATIENCE,
+    DEFAULT_TRAINING_MAX_EPOCHS,
+)
 from fisher.shared_dataset_io import load_shared_dataset_npz
 from fisher.shared_fisher_est import require_device
 
@@ -79,8 +83,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--skl-folds", type=int, default=5)
     p.add_argument("--skl-logistic-c", type=float, default=1.0)
 
-    p.add_argument("--epochs", type=int, default=20_000)
-    p.add_argument("--early-patience", type=int, default=1_000)
+    p.add_argument("--epochs", type=int, default=DEFAULT_TRAINING_MAX_EPOCHS)
+    p.add_argument(
+        "--early-patience", type=int, default=DEFAULT_EARLY_STOPPING_PATIENCE
+    )
     p.add_argument("--early-min-delta", type=float, default=1e-4)
     p.add_argument("--early-ema-alpha", type=float, default=0.05)
     p.add_argument("--batch-size", type=int, default=2048)
@@ -88,6 +94,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--hidden-dim", type=int, default=256)
     p.add_argument("--depth", type=int, default=5)
+    p.add_argument(
+        "--theta-embedding",
+        choices=("identity", "gaussian-rbf"),
+        default="gaussian-rbf",
+        help="Condition embedding used by the scalar condition-affine velocity.",
+    )
+    p.add_argument("--theta-rbf-num-centers", type=int, default=8)
+    p.add_argument(
+        "--theta-rbf-bandwidth",
+        type=float,
+        default=None,
+        help="Gaussian RBF bandwidth h; by default use adjacent-center spacing.",
+    )
     p.add_argument("--path-schedule", choices=("cosine", "linear", "straight"), default="cosine")
     p.add_argument("--t-eps", type=float, default=0.0005)
     p.add_argument("--quadrature-steps", type=int, default=64)
@@ -101,6 +120,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-grad-norm", type=float, default=10.0)
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--affine-ridge", type=float, default=1e-6)
+    p.add_argument("--nll-epochs", type=int, default=0)
+    p.add_argument("--nll-batch-size", type=int, default=2048)
+    p.add_argument("--nll-lr", type=float, default=1e-3)
+    p.add_argument("--nll-weight-decay", type=float, default=0.0)
+    p.add_argument("--nll-ode-steps", type=int, default=32)
+    p.add_argument("--nll-ode-method", type=str, default="midpoint")
+    p.add_argument(
+        "--nll-patience", type=int, default=100
+    )
+    p.add_argument("--nll-min-delta", type=float, default=1e-4)
+    p.add_argument("--nll-ema-alpha", type=float, default=0.05)
+    p.add_argument(
+        "--nll-checkpoint-selection", choices=("best", "last"), default="best"
+    )
     return p
 
 
@@ -115,6 +148,9 @@ def _flow_config_from_args(args: argparse.Namespace) -> ContinuousFlowConfig:
         weight_decay=float(args.weight_decay),
         hidden_dim=int(args.hidden_dim),
         depth=int(args.depth),
+        theta_embedding=str(args.theta_embedding).replace("-", "_"),
+        theta_rbf_num_centers=int(args.theta_rbf_num_centers),
+        theta_rbf_bandwidth=args.theta_rbf_bandwidth,
         path_schedule=str(args.path_schedule),
         t_eps=float(args.t_eps),
         quadrature_steps=int(args.quadrature_steps),
@@ -128,6 +164,16 @@ def _flow_config_from_args(args: argparse.Namespace) -> ContinuousFlowConfig:
         max_grad_norm=float(args.max_grad_norm),
         log_every=int(args.log_every),
         affine_ridge=float(args.affine_ridge),
+        likelihood_finetune_epochs=int(args.nll_epochs),
+        likelihood_finetune_batch_size=int(args.nll_batch_size),
+        likelihood_finetune_lr=float(args.nll_lr),
+        likelihood_finetune_weight_decay=float(args.nll_weight_decay),
+        likelihood_finetune_ode_steps=int(args.nll_ode_steps),
+        likelihood_finetune_ode_method=str(args.nll_ode_method),
+        likelihood_finetune_patience=int(args.nll_patience),
+        likelihood_finetune_min_delta=float(args.nll_min_delta),
+        likelihood_finetune_ema_alpha=float(args.nll_ema_alpha),
+        likelihood_finetune_checkpoint_selection=str(args.nll_checkpoint_selection),
     )
 
 
@@ -150,6 +196,14 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--pr-dim must be >= --native-x-dim.")
     if not (0.0 < float(args.train_frac) < 1.0):
         raise ValueError("--train-frac must be in (0, 1).")
+    if int(args.nll_epochs) < 0:
+        raise ValueError("--nll-epochs must be >= 0.")
+    if int(args.theta_rbf_num_centers) < 2:
+        raise ValueError("--theta-rbf-num-centers must be >= 2.")
+    if args.theta_rbf_bandwidth is not None and (
+        not np.isfinite(float(args.theta_rbf_bandwidth)) or float(args.theta_rbf_bandwidth) <= 0.0
+    ):
+        raise ValueError("--theta-rbf-bandwidth must be finite and positive.")
 
 
 def resolve_dataset_dir(args: argparse.Namespace) -> Path:

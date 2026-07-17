@@ -19,6 +19,10 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from global_setting import (
+    DEFAULT_EARLY_STOPPING_PATIENCE,
+    DEFAULT_TRAINING_MAX_EPOCHS,
+)
 from fisher.distance_comparison import (
     FLOW_VELOCITY_FAMILY_BY_METRIC,
     METRIC_CORRELATION,
@@ -90,18 +94,22 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=_REPO_ROOT / "data" / "mog5_translation_optimum_diagnostic",
     )
-    parser.add_argument("--epochs", type=int, default=20_000)
-    parser.add_argument("--early-patience", type=int, default=1_000)
+    parser.add_argument("--epochs", type=int, default=DEFAULT_TRAINING_MAX_EPOCHS)
+    parser.add_argument(
+        "--early-patience", type=int, default=DEFAULT_EARLY_STOPPING_PATIENCE
+    )
     parser.add_argument("--batch-size", type=int, default=3_000)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--depth", type=int, default=5)
     parser.add_argument("--path-schedule", choices=("cosine", "linear", "straight"), default="cosine")
-    parser.add_argument("--nll-epochs", type=int, default=500)
+    parser.add_argument("--nll-epochs", type=int, default=DEFAULT_TRAINING_MAX_EPOCHS)
     parser.add_argument("--nll-batch-size", type=int, default=3_000)
     parser.add_argument("--nll-lr", type=float, default=3e-5)
     parser.add_argument("--nll-ode-steps", type=int, default=32)
-    parser.add_argument("--nll-patience", type=int, default=150)
+    parser.add_argument(
+        "--nll-patience", type=int, default=DEFAULT_EARLY_STOPPING_PATIENCE
+    )
     return parser
 
 

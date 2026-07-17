@@ -114,6 +114,9 @@ def test_parallel_parser_pr_dims_defaults_and_command(tmp_path: Path, monkeypatc
     assert default_args.skip_dataset_viz is False
     assert default_args.composite_smoothing == "kernel"
     assert default_args.kernel_smooth_bandwidth_grid == pytest.approx(2.0)
+    assert default_args.theta_embedding == "gaussian-rbf"
+    assert default_args.theta_rbf_num_centers == 8
+    assert default_args.theta_rbf_bandwidth is None
     skip_viz_args = mod.build_parser().parse_args(["--skip-dataset-viz"])
     assert skip_viz_args.skip_dataset_viz is True
     assert args.cpu_threads_per_job == 3
@@ -131,6 +134,8 @@ def test_parallel_parser_pr_dims_defaults_and_command(tmp_path: Path, monkeypatc
     assert "--pr-dim 30" in joined
     assert "--epochs 7" in joined
     assert "--batch-size 32" in joined
+    assert "--theta-embedding gaussian-rbf" in joined
+    assert "--theta-rbf-num-centers 8" in joined
     env = mod.build_case_env({"PATH": "/bin"}, gpu_id=3, cpu_threads_per_job=4)
     assert env["CUDA_VISIBLE_DEVICES"] == "3"
     assert env["PYTHONUNBUFFERED"] == "1"
@@ -192,6 +197,15 @@ def test_errorbar_series_uses_sample_sd_not_sem() -> None:
     np.testing.assert_array_equal(ns, [100])
     np.testing.assert_allclose(means, [3.0])
     np.testing.assert_allclose(sds, [2.0])
+
+
+def test_linear_fisher_family_includes_gkr_only() -> None:
+    mod = _load_parallel_module()
+
+    assert "gkr_linear" in mod._fisher_family_methods("linear")
+    assert "gkr_linear" not in mod._fisher_family_methods("full")
+    assert "gkr_full" in mod._fisher_family_methods("full")
+    assert "gkr_full" not in mod._fisher_family_methods("linear")
 
 
 def test_plot_sweep_errors_writes_errorbar_style_metadata(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

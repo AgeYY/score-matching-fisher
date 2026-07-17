@@ -21,6 +21,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from global_setting import DEFAULT_TRAINING_MAX_EPOCHS
 from fisher.distance_comparison import METRIC_NAMES
 from fisher.dataset_visualization import plot_mog5_native_scatter_covariance
 
@@ -129,7 +130,7 @@ def build_parser() -> argparse.ArgumentParser:
         n_total=100_000,
         pr_dim=None,
         output_dir=default_native_output_dir(native_x_dim=3),
-        flow_likelihood_finetune_epochs=500,
+        flow_likelihood_finetune_epochs=DEFAULT_TRAINING_MAX_EPOCHS,
     )
     for action in p._actions:
         if action.dest == "output_dir":

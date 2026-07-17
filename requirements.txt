@@ -18,6 +18,7 @@ scikit-learn
 pillow
 typing-extensions
 pytest
+gpytorch
 torchdiffeq
 flow-matching
 zuko

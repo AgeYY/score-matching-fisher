@@ -23,12 +23,17 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
+from global_setting import (
+    DEFAULT_EARLY_STOPPING_PATIENCE,
+    DEFAULT_TRAINING_MAX_EPOCHS,
+)
 from fisher.distance_comparison import encode_with_pr_autoencoder, save_flow_result_npz
 from fisher.flow_matching_skl import (
     FlowSKLResult,
     build_flow_skl_model,
     estimate_adjacent_model_jeffreys_fisher,
     estimate_affine_mixed_symmetric_kl_fisher,
+    finetune_flow_skl_cnf_likelihood,
     train_flow_skl_model,
 )
 from fisher.shared_dataset_io import SharedDatasetBundle, load_shared_dataset_npz
@@ -44,6 +49,8 @@ CURVES_PNG_NAME = "continuous_pr_fisher_curves.png"
 
 METHOD_FLOW_LINEAR = "flow_linear"
 METHOD_FLOW_FULL = "flow_full"
+METHOD_FLOW_LINEAR_NLL = "flow_linear_nll"
+METHOD_FLOW_FULL_NLL = "flow_full_nll"
 METHOD_CLASSICAL_LINEAR = "classical_linear"
 METHOD_CLASSICAL_FULL = "classical_full"
 METHOD_GT_NATIVE_FULL = "ground_truth_native_full"
@@ -64,8 +71,8 @@ CSV_COLUMNS = (
 
 @dataclass(frozen=True)
 class ContinuousFlowConfig:
-    epochs: int = 20_000
-    early_patience: int = 1_000
+    epochs: int = DEFAULT_TRAINING_MAX_EPOCHS
+    early_patience: int = DEFAULT_EARLY_STOPPING_PATIENCE
     early_min_delta: float = 1e-4
     early_ema_alpha: float = 0.05
     batch_size: int = 2048
@@ -73,6 +80,9 @@ class ContinuousFlowConfig:
     weight_decay: float = 0.0
     hidden_dim: int = 256
     depth: int = 5
+    theta_embedding: str = "gaussian_rbf"
+    theta_rbf_num_centers: int = 8
+    theta_rbf_bandwidth: float | None = None
     path_schedule: str = "cosine"
     t_eps: float = 0.0005
     quadrature_steps: int = 64
@@ -86,6 +96,16 @@ class ContinuousFlowConfig:
     max_grad_norm: float = 10.0
     log_every: int = 50
     affine_ridge: float = 1e-6
+    likelihood_finetune_epochs: int = 0
+    likelihood_finetune_batch_size: int = 2048
+    likelihood_finetune_lr: float = 1e-3
+    likelihood_finetune_weight_decay: float = 0.0
+    likelihood_finetune_ode_steps: int = 32
+    likelihood_finetune_ode_method: str = "midpoint"
+    likelihood_finetune_patience: int = 100
+    likelihood_finetune_min_delta: float = 1e-4
+    likelihood_finetune_ema_alpha: float = 0.05
+    likelihood_finetune_checkpoint_selection: str = "best"
 
 
 @dataclass(frozen=True)
@@ -453,6 +473,15 @@ def train_flow_fisher_curves(
 
     for method, family in ((METHOD_FLOW_LINEAR, "condition_affine"), (METHOD_FLOW_FULL, "nonlinear")):
         print(f"[continuous-fisher] training {method} velocity_family={family}", flush=True)
+        theta_embedding_kwargs: dict[str, Any] = {}
+        if family == "condition_affine":
+            theta_embedding_kwargs = {
+                "theta_embedding": str(config.theta_embedding),
+                "theta_rbf_num_centers": int(config.theta_rbf_num_centers),
+                "theta_rbf_lower": float(bundle.meta["theta_low"]),
+                "theta_rbf_upper": float(bundle.meta["theta_high"]),
+                "theta_rbf_bandwidth": config.theta_rbf_bandwidth,
+            }
         model = build_flow_skl_model(
             velocity_family=family,
             theta_dim=theta_dim,
@@ -464,6 +493,7 @@ def train_flow_fisher_curves(
             divergence_estimator=str(config.divergence_estimator),
             hutchinson_probes=int(config.hutchinson_probes),
             shared_affine_a_diag_jitter=float(config.shared_affine_a_diag_jitter),
+            **theta_embedding_kwargs,
         ).to(device)
         meta = train_flow_skl_model(
             model=model,
@@ -484,6 +514,10 @@ def train_flow_fisher_curves(
             ema_alpha=float(config.early_ema_alpha),
             max_grad_norm=float(config.max_grad_norm),
             log_every=max(1, int(config.log_every)),
+        )
+        torch.save(
+            {key: value.detach().cpu() for key, value in model.state_dict().items()},
+            output_dir / f"{method}_selected_model.pt",
         )
         if method == METHOD_FLOW_LINEAR:
             fd = estimate_affine_mixed_symmetric_kl_fisher(
@@ -530,6 +564,110 @@ def train_flow_fisher_curves(
             theta_eval=theta_grid,
             velocity_family=family,
         )
+
+        if int(config.likelihood_finetune_epochs) <= 0:
+            continue
+        torch_rng_state = torch.get_rng_state()
+        cuda_rng_states = torch.cuda.get_rng_state_all() if device.type == "cuda" else None
+        numpy_rng_state = np.random.get_state()
+        nll_method = (
+            METHOD_FLOW_LINEAR_NLL if method == METHOD_FLOW_LINEAR else METHOD_FLOW_FULL_NLL
+        )
+        print(f"[continuous-fisher] fine-tuning {method} with CNF NLL", flush=True)
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        fine_meta = finetune_flow_skl_cnf_likelihood(
+            model=model,
+            theta_train=np.asarray(bundle.theta_train, dtype=np.float64).reshape(-1, 1),
+            x_train=np.asarray(bundle.x_train, dtype=np.float64),
+            theta_val=np.asarray(bundle.theta_validation, dtype=np.float64).reshape(-1, 1),
+            x_val=np.asarray(bundle.x_validation, dtype=np.float64),
+            device=device,
+            epochs=int(config.likelihood_finetune_epochs),
+            batch_size=min(
+                int(config.likelihood_finetune_batch_size),
+                int(np.asarray(bundle.x_train).shape[0]),
+            ),
+            lr=float(config.likelihood_finetune_lr),
+            weight_decay=float(config.likelihood_finetune_weight_decay),
+            ode_steps=int(config.likelihood_finetune_ode_steps),
+            ode_method=str(config.likelihood_finetune_ode_method),
+            patience=int(config.likelihood_finetune_patience),
+            min_delta=float(config.likelihood_finetune_min_delta),
+            ema_alpha=float(config.likelihood_finetune_ema_alpha),
+            max_grad_norm=float(config.max_grad_norm),
+            checkpoint_selection=str(config.likelihood_finetune_checkpoint_selection),
+            log_every=max(1, int(config.log_every)),
+        )
+        fine_train_meta = {
+            **dict(meta),
+            "likelihood_finetuned": True,
+            "likelihood_finetune_metadata": fine_meta,
+        }
+        if method == METHOD_FLOW_LINEAR:
+            fine_fd = estimate_affine_mixed_symmetric_kl_fisher(
+                model=model,
+                theta_all=theta_grid,
+                device=device,
+                ridge=float(config.affine_ridge),
+                ode_steps=int(config.ode_steps),
+            )
+            curves[nll_method] = fine_fd["fisher"]
+            fine_result = FlowSKLResult(
+                symmetric_kl_matrix=np.asarray(
+                    fine_fd["symmetric_kl_matrix"], dtype=np.float64
+                ),
+                canonical_metric_matrix=np.asarray(
+                    fine_fd["canonical_metric_matrix"], dtype=np.float64
+                ),
+                canonical_metric_name=str(fine_fd["canonical_metric_name"]),
+                fisher_theta_midpoints=fine_fd["theta_midpoints"],
+                fisher_linear=fine_fd["fisher"],
+                train_metadata=fine_train_meta,
+            )
+        else:
+            fine_fd = estimate_adjacent_model_jeffreys_fisher(
+                model=model,
+                theta_all=theta_grid,
+                device=device,
+                mc_jeffreys_sample=int(config.mc_jeffreys_sample),
+                ode_steps=int(config.ode_steps),
+                ode_method=str(config.ode_method),
+                batch_size=int(config.batch_size),
+                solve_jitter=float(config.solve_jitter),
+                quadrature_steps=int(config.quadrature_steps),
+            )
+            curves[nll_method] = fine_fd["fisher"]
+            fine_result = FlowSKLResult(
+                symmetric_kl_matrix=np.zeros(
+                    (int(theta_grid.shape[0]), int(theta_grid.shape[0])),
+                    dtype=np.float64,
+                ),
+                canonical_metric_matrix=np.zeros(
+                    (int(theta_grid.shape[0]), int(theta_grid.shape[0])),
+                    dtype=np.float64,
+                ),
+                canonical_metric_name="adjacent_model_jeffreys_sum",
+                fisher_theta_midpoints=fine_fd["theta_midpoints"],
+                fisher_full=fine_fd["fisher"],
+                train_metadata=fine_train_meta,
+            )
+        paths[nll_method] = save_flow_result_npz(
+            output_dir / f"{nll_method}_flow_matching_skl_results.npz",
+            result=fine_result,
+            metric=nll_method,
+            theta_eval=theta_grid,
+            velocity_family=family,
+            estimator="flow_matching_nll_finetuned",
+        )
+        torch.save(
+            {key: value.detach().cpu() for key, value in model.state_dict().items()},
+            output_dir / f"{nll_method}_selected_model.pt",
+        )
+        np.random.set_state(numpy_rng_state)
+        torch.set_rng_state(torch_rng_state)
+        if cuda_rng_states is not None:
+            torch.cuda.set_rng_state_all(cuda_rng_states)
     return curves, paths
 
 
@@ -708,6 +846,8 @@ def run_continuous_comparison(
         METHOD_FLOW_LINEAR: linear_ref,
         METHOD_CLASSICAL_FULL: METHOD_GT_NATIVE_FULL,
         METHOD_FLOW_FULL: METHOD_GT_NATIVE_FULL,
+        METHOD_FLOW_LINEAR_NLL: linear_ref,
+        METHOD_FLOW_FULL_NLL: METHOD_GT_NATIVE_FULL,
     }
     rows, errors = assemble_rows(theta_grid=grid, curves=curves, references=references, reference_by_method=ref_by_method)
     return ContinuousFisherResult(
