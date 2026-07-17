@@ -1403,6 +1403,55 @@ def test_affine_endpoint_gaussians_integrate_mean_and_covariance() -> None:
     np.testing.assert_allclose(covariances[1], expected_covariance, atol=1e-5)
 
 
+def test_affine_gaussian_jeffreys_fisher_includes_covariance_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    means = np.asarray([[0.0], [2.0]], dtype=np.float64)
+    covariances = np.asarray([[[1.0]], [[4.0]]], dtype=np.float64)
+
+    def fake_endpoint_gaussians(**kwargs):
+        del kwargs
+        return means, covariances
+
+    monkeypatch.setattr(fms, "estimate_affine_endpoint_gaussians", fake_endpoint_gaussians)
+    result = fms.estimate_affine_gaussian_jeffreys_fisher(
+        model=nn.Identity(),
+        theta_all=np.asarray([[0.0], [1.0]], dtype=np.float64),
+        device=torch.device("cpu"),
+        ridge=0.0,
+    )
+
+    np.testing.assert_allclose(result["adjacent_linear_jeffreys"], [2.5])
+    np.testing.assert_allclose(result["adjacent_covariance_jeffreys"], [1.125])
+    np.testing.assert_allclose(result["adjacent_jeffreys"], [3.625])
+    np.testing.assert_allclose(result["fisher"], [3.625])
+
+
+def test_affine_gaussian_jeffreys_fisher_converges_to_full_gaussian_fisher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mean_slope = 2.0
+    log_std_slope = 0.3
+
+    def fake_endpoint_gaussians(**kwargs):
+        theta = np.asarray(kwargs["theta_all"], dtype=np.float64).reshape(-1)
+        means = (mean_slope * theta).reshape(-1, 1)
+        variances = np.exp(2.0 * log_std_slope * theta)
+        return means, variances.reshape(-1, 1, 1)
+
+    monkeypatch.setattr(fms, "estimate_affine_endpoint_gaussians", fake_endpoint_gaussians)
+    step = 1e-4
+    result = fms.estimate_affine_gaussian_jeffreys_fisher(
+        model=nn.Identity(),
+        theta_all=np.asarray([[-0.5 * step], [0.5 * step]], dtype=np.float64),
+        device=torch.device("cpu"),
+        ridge=0.0,
+    )
+
+    expected = mean_slope**2 + 2.0 * log_std_slope**2
+    np.testing.assert_allclose(result["fisher"], [expected], rtol=1e-7, atol=1e-7)
+
+
 def test_restricted_low_rank_affine_endpoint_uses_model_jeffreys_without_endpoint_diagnostics() -> None:
     theta = np.eye(2, dtype=np.float64)
     for family in ("shared_affine_low_rank_scalar", "shared_affine_low_rank_diag"):

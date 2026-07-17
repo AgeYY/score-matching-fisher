@@ -2490,6 +2490,7 @@ def estimate_affine_endpoint_gaussians(
     theta_all: np.ndarray,
     device: torch.device,
     ode_steps: int = 64,
+    batch_size: int = 128,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return endpoint means and covariances for an affine Gaussian flow."""
 
@@ -2499,6 +2500,9 @@ def estimate_affine_endpoint_gaussians(
     steps = int(ode_steps)
     if steps < 1:
         raise ValueError("ode_steps must be >= 1.")
+    bs = int(batch_size)
+    if bs < 1:
+        raise ValueError("batch_size must be >= 1.")
 
     model.to(device)
     model.eval()
@@ -2508,27 +2512,100 @@ def estimate_affine_endpoint_gaussians(
     covariances = np.empty((int(theta.shape[0]), x_dim, x_dim), dtype=np.float64)
     dt = 1.0 / float(steps)
 
-    for condition_idx in range(int(theta.shape[0])):
-        th = torch.from_numpy(theta[condition_idx : condition_idx + 1].astype(np.float32)).to(
-            device=device,
-            dtype=dtype,
-        )
-        means[condition_idx] = (
-            model.endpoint_mean(th).detach().cpu().numpy().reshape(-1).astype(np.float64)
-        )
-        covariance = torch.eye(x_dim, dtype=dtype, device=device).unsqueeze(0)
+    for start in range(0, int(theta.shape[0]), bs):
+        stop = min(start + bs, int(theta.shape[0]))
+        th = torch.from_numpy(theta[start:stop].astype(np.float32)).to(device=device, dtype=dtype)
+        means[start:stop] = model.endpoint_mean(th).detach().cpu().numpy().astype(np.float64)
+        covariance = torch.eye(x_dim, dtype=dtype, device=device).expand(stop - start, -1, -1).clone()
         for step in range(steps):
             t_value = (float(step) + 0.5) * dt
-            tt = torch.full((1, 1), t_value, dtype=dtype, device=device)
+            tt = torch.full((stop - start, 1), t_value, dtype=dtype, device=device)
             try:
                 a = model.A(th, tt)
             except TypeError:
                 a = model.A(tt)
             transition = torch.matrix_exp(float(dt) * a)
             covariance = transition @ covariance @ transition.transpose(-1, -2)
-        cov_np = covariance.detach().cpu().numpy().reshape(x_dim, x_dim).astype(np.float64)
-        covariances[condition_idx] = 0.5 * (cov_np + cov_np.T)
+        cov_np = covariance.detach().cpu().numpy().astype(np.float64)
+        covariances[start:stop] = 0.5 * (cov_np + np.swapaxes(cov_np, -1, -2))
     return means, covariances
+
+
+@torch.no_grad()
+def estimate_affine_gaussian_jeffreys_fisher(
+    *,
+    model: nn.Module,
+    theta_all: np.ndarray,
+    device: torch.device,
+    ridge: float = 1e-6,
+    ode_steps: int = 64,
+    batch_size: int = 128,
+) -> dict[str, np.ndarray]:
+    """Estimate full scalar Fisher from adjacent affine-Gaussian endpoints."""
+
+    theta = _as_2d_float64(theta_all, name="theta_all")
+    if int(theta.shape[1]) != 1:
+        raise ValueError("Scalar Fisher requires theta_all with one column.")
+    if int(theta.shape[0]) < 2:
+        raise ValueError("At least two theta points are required.")
+    rr = float(ridge)
+    if rr < 0.0 or not math.isfinite(rr):
+        raise ValueError("ridge must be finite and nonnegative.")
+
+    order = np.argsort(theta[:, 0], kind="mergesort")
+    theta_s = theta[order]
+    dtheta = np.diff(theta_s[:, 0])
+    if np.any(dtheta <= 0.0):
+        raise ValueError("theta_all must contain strictly increasing unique scalar values after sorting.")
+
+    means, covariances = estimate_affine_endpoint_gaussians(
+        model=model,
+        theta_all=theta_s,
+        device=device,
+        ode_steps=int(ode_steps),
+        batch_size=int(batch_size),
+    )
+    x_dim = int(means.shape[1])
+    eye = np.eye(x_dim, dtype=np.float64)
+    covariances = covariances + rr * eye[None, :, :]
+    n_pairs = int(theta_s.shape[0]) - 1
+    linear_jeffreys = np.empty(n_pairs, dtype=np.float64)
+    covariance_jeffreys = np.empty(n_pairs, dtype=np.float64)
+
+    for index in range(n_pairs):
+        cov_l = covariances[index]
+        cov_r = covariances[index + 1]
+        delta = means[index + 1] - means[index]
+        precision_delta_l = np.linalg.solve(cov_l, delta)
+        precision_delta_r = np.linalg.solve(cov_r, delta)
+        linear_jeffreys[index] = 0.5 * float(
+            delta @ (precision_delta_l + precision_delta_r)
+        )
+        trace_term = float(
+            np.trace(np.linalg.solve(cov_r, cov_l))
+            + np.trace(np.linalg.solve(cov_l, cov_r))
+            - 2.0 * float(x_dim)
+        )
+        covariance_jeffreys[index] = max(0.0, 0.5 * trace_term)
+
+    adjacent_jeffreys = np.maximum(linear_jeffreys + covariance_jeffreys, 0.0)
+    scale = dtheta**2
+    return {
+        "theta_midpoints": (
+            0.5 * (theta_s[:-1, 0] + theta_s[1:, 0])
+        ).reshape(-1, 1).astype(np.float64),
+        "theta_left": theta_s[:-1].astype(np.float64),
+        "theta_right": theta_s[1:].astype(np.float64),
+        "dtheta": dtheta.astype(np.float64),
+        "endpoint_means": means,
+        "endpoint_covariances": covariances,
+        "adjacent_linear_jeffreys": linear_jeffreys,
+        "adjacent_covariance_jeffreys": covariance_jeffreys,
+        "adjacent_jeffreys": adjacent_jeffreys,
+        "linear_fisher": (linear_jeffreys / scale).astype(np.float64),
+        "covariance_fisher": (covariance_jeffreys / scale).astype(np.float64),
+        "fisher": (adjacent_jeffreys / scale).astype(np.float64),
+    }
 
 
 def estimate_model_symmetric_kl(

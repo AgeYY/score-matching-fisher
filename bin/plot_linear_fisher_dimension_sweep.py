@@ -113,45 +113,96 @@ def _plot(cases: list[dict[str, object]], output_dir: Path) -> tuple[Path, Path]
     plt.rcParams.update(
         {
             "font.size": 16,
-            "axes.labelsize": 16,
-            "xtick.labelsize": 14,
-            "ytick.labelsize": 14,
+            "axes.labelsize": 18,
+            "xtick.labelsize": 16,
+            "ytick.labelsize": 16,
             "legend.fontsize": 12,
             "axes.grid": False,
             "savefig.bbox": "tight",
         }
     )
-    fig, axis = plt.subplots(figsize=(4.8, 3.5))
+    fig, axis = plt.subplots(figsize=(4.0, 3.5))
     dimensions = np.asarray([int(case["x_dim"]) for case in cases], dtype=np.int64)
-    for key, label, color, marker in (
-        ("flow_mae", "Flow matching", "C0", "o"),
-        ("classical_mae", "Classical + LW", "C1", "s"),
-        ("gkr_mae", "GKR", "C2", "^"),
-    ):
+
+    def add_errorbar(
+        target_axis: plt.Axes,
+        key: str,
+        label: str,
+        color: str,
+        marker: str,
+        *,
+        markersize: float = 6.0,
+        linewidth: float = 2.2,
+        capsize: float = 3.0,
+    ) -> None:
         values = np.asarray([case[key] for case in cases], dtype=np.float64)
         means = np.mean(values, axis=1)
         errors = np.std(values, axis=1, ddof=1)
-        axis.errorbar(
+        target_axis.errorbar(
             dimensions,
             means,
             yerr=errors,
             color=color,
             marker=marker,
-            markersize=6,
-            linewidth=2.2,
-            capsize=3,
+            markersize=markersize,
+            linewidth=linewidth,
+            capsize=capsize,
             label=label,
         )
-    axis.set_yscale("log")
+
+    add_errorbar(axis, "flow_mae", "Flow matching", "C0", "o")
+    add_errorbar(axis, "gkr_mae", "GKR", "C2", "^")
+    axis.set_axisbelow(True)
+    axis.grid(axis="y", color="0.82", linewidth=0.8)
+    axis.spines["top"].set_visible(False)
+    axis.spines["right"].set_visible(False)
+    axis.spines["left"].set_linewidth(2.2)
+    axis.spines["bottom"].set_linewidth(2.2)
+    axis.tick_params(width=1.8, labelsize=16)
+    axis.set_ylim(0.0, 1.55)
+    axis.set_yticks((0.0, 0.5, 1.0, 1.5))
     axis.set_xticks(dimensions)
     axis.set_xticklabels([str(value) for value in dimensions])
+    tick_labels = axis.get_xticklabels()
+    tick_labels[dimensions.tolist().index(3)].set_horizontalalignment("right")
+    tick_labels[dimensions.tolist().index(10)].set_horizontalalignment("left")
     axis.set_xlabel("Response dimension")
     axis.set_ylabel("Mean absolute error")
-    axis.legend(frameon=False, loc="upper left", fontsize=10)
-    for spine in axis.spines.values():
-        spine.set_linewidth(1.8)
-    axis.tick_params(width=1.8)
-    fig.tight_layout()
+
+    inset_axis = axis.inset_axes((0.15, 0.39, 0.27, 0.301))
+    for key, label, color, marker in (
+        ("flow_mae", "Flow matching", "C0", "o"),
+        ("gkr_mae", "GKR", "C2", "^"),
+        ("classical_mae", "Classical + LW", "C1", "s"),
+    ):
+        add_errorbar(
+            inset_axis,
+            key,
+            label,
+            color,
+            marker,
+            markersize=4.0,
+            linewidth=1.8,
+            capsize=2.5,
+        )
+    inset_axis.set_xlim(axis.get_xlim())
+    inset_axis.set_ylim(0.0, 125.0)
+    inset_axis.set_yticks((0.0, 50.0, 100.0))
+    inset_axis.set_xticks((10, 50, 90))
+    inset_axis.grid(False)
+    for spine in inset_axis.spines.values():
+        spine.set_visible(True)
+        spine.set_linewidth(1.5)
+    inset_axis.tick_params(width=1.5, length=3.0, labelsize=14)
+    inset_axis.set_title("Classical + LW", color="C1", fontsize=10, pad=2)
+    axis.legend(
+        frameon=False,
+        loc="upper left",
+        fontsize=13,
+        ncol=1,
+        handletextpad=0.6,
+    )
+    fig.subplots_adjust(left=0.20, right=0.98, bottom=0.18, top=0.98)
 
     output_stem = output_dir / "linear_fisher_error_vs_dimension_n3000"
     png = output_stem.with_suffix(".png")
