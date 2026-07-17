@@ -329,6 +329,75 @@ def gaussian_fid_rdms_from_moments(
     return rdms
 
 
+def gaussian_jeffreys_rdms_from_moments(
+    means: np.ndarray,
+    covariances: np.ndarray,
+    *,
+    ridge: float = 1e-8,
+) -> np.ndarray:
+    """Compute time-resolved Gaussian Jeffreys-divergence RDMs.
+
+    The returned entry is the Jeffreys sum
+    ``KL(N_i || N_j) + KL(N_j || N_i)``.  A small eigenvalue floor is
+    applied independently to every class-and-time covariance before the
+    analytic full-covariance Gaussian expression is evaluated.
+    """
+
+    mean_values = np.asarray(means, dtype=np.float64)
+    covariance_values = np.asarray(covariances, dtype=np.float64)
+    if mean_values.ndim != 3 or mean_values.shape[1] != N_CLASSES:
+        raise ValueError("means must have shape [time, class, feature].")
+    expected = (
+        mean_values.shape[0],
+        N_CLASSES,
+        mean_values.shape[2],
+        mean_values.shape[2],
+    )
+    if covariance_values.shape != expected:
+        raise ValueError(f"covariances must have shape {expected}; got {covariance_values.shape}.")
+    ridge_value = float(ridge)
+    if not math.isfinite(ridge_value) or ridge_value <= 0.0:
+        raise ValueError("ridge must be finite and positive.")
+
+    n_times, _, n_features = mean_values.shape
+    stabilized = np.empty_like(covariance_values)
+    precisions = np.empty_like(covariance_values)
+    for time_index in range(n_times):
+        for label in range(N_CLASSES):
+            covariance = 0.5 * (
+                covariance_values[time_index, label]
+                + covariance_values[time_index, label].T
+            )
+            eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+            eigenvalues = np.maximum(eigenvalues, ridge_value)
+            stabilized[time_index, label] = (
+                eigenvectors * eigenvalues[None, :]
+            ) @ eigenvectors.T
+            precisions[time_index, label] = (
+                eigenvectors * (1.0 / eigenvalues)[None, :]
+            ) @ eigenvectors.T
+
+    rdms = np.zeros((n_times, N_CLASSES, N_CLASSES), dtype=np.float64)
+    for time_index in range(n_times):
+        for left in range(N_CLASSES):
+            for right in range(left + 1, N_CLASSES):
+                delta = mean_values[time_index, left] - mean_values[time_index, right]
+                value = 0.5 * (
+                    float(np.trace(precisions[time_index, right] @ stabilized[time_index, left]))
+                    + float(np.trace(precisions[time_index, left] @ stabilized[time_index, right]))
+                    - 2.0 * float(n_features)
+                    + float(
+                        delta
+                        @ (precisions[time_index, left] + precisions[time_index, right])
+                        @ delta
+                    )
+                )
+                distance = max(0.0, value)
+                rdms[time_index, left, right] = distance
+                rdms[time_index, right, left] = distance
+    return rdms
+
+
 def classical_fid_rdms(
     x: np.ndarray,
     labels: np.ndarray,
@@ -963,6 +1032,73 @@ def load_condition_affine_flow_checkpoint(
     model.load_state_dict(payload["model_state_dict"])
     model.eval()
     return model, payload
+
+
+def condition_affine_flow_fid_rdms_from_checkpoint(
+    checkpoint_path: str | Path,
+    *,
+    device: torch.device,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Recompute condition-affine FID RDMs from one saved best checkpoint."""
+
+    means, covariances, payload = condition_affine_flow_gaussian_components_from_checkpoint(
+        checkpoint_path,
+        device=device,
+    )
+    return gaussian_fid_rdms_from_moments(means, covariances), payload
+
+
+def condition_affine_flow_gaussian_components_from_checkpoint(
+    checkpoint_path: str | Path,
+    *,
+    device: torch.device,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    """Recover endpoint means and covariances from a saved best checkpoint."""
+
+    model, payload = load_condition_affine_flow_checkpoint(
+        checkpoint_path,
+        device=device,
+    )
+    times_value = payload.get("time_centers")
+    if not isinstance(times_value, torch.Tensor):
+        raise ValueError(f"Checkpoint {checkpoint_path} does not contain time_centers.")
+    times = times_value.detach().cpu().numpy().astype(np.float64)
+    config = dict(payload.get("flow_rdm_config", {}))
+    covariance_ode_steps = int(config.get("covariance_ode_steps", 0))
+    covariance_ridge = float(config.get("covariance_ridge", 0.0))
+    if covariance_ode_steps < 1 or covariance_ridge <= 0.0:
+        raise ValueError(f"Checkpoint {checkpoint_path} has invalid covariance settings.")
+
+    grid_labels = np.repeat(np.arange(N_CLASSES, dtype=np.int64), times.size)
+    grid_times = np.tile(times, N_CLASSES)
+    conditions = condition_design(grid_labels, grid_times)
+    dtype = next(model.parameters()).dtype
+    condition_tensor = torch.from_numpy(conditions.astype(np.float32)).to(
+        device=device,
+        dtype=dtype,
+    )
+    with torch.no_grad():
+        means_flat = model.endpoint_mean(condition_tensor).detach().cpu().numpy()
+    covariance_flat = _time_conditioned_endpoint_covariances(
+        model,
+        conditions,
+        device=device,
+        steps=covariance_ode_steps,
+        ridge=covariance_ridge,
+    )
+    x_dim = int(means_flat.shape[1])
+    means = means_flat.astype(np.float64).reshape(
+        N_CLASSES,
+        times.size,
+        x_dim,
+    ).transpose(1, 0, 2)
+    covariances = covariance_flat.reshape(
+        N_CLASSES,
+        times.size,
+        x_dim,
+        x_dim,
+    ).transpose(1, 0, 2, 3)
+    return means, covariances, payload
 
 
 def shared_affine_flow_rdms(

@@ -17,11 +17,13 @@ from fisher.bci_iv_2a_session_identification import (
     classical_squared_euclidean_rdms,
     classical_mahalanobis_rdms,
     condition_affine_flow_fid_rdms,
+    condition_affine_flow_fid_rdms_from_checkpoint,
     condition_design,
     empirical_condition_gaussian_components,
     empirical_condition_means,
     empirical_gaussian_components,
     gaussian_fid_rdms_from_moments,
+    gaussian_jeffreys_rdms_from_moments,
     load_condition_affine_flow_checkpoint,
     load_translation_flow_checkpoint,
     pearson_similarity,
@@ -170,6 +172,18 @@ def test_gaussian_fid_rdms_match_diagonal_closed_form() -> None:
     np.testing.assert_allclose(np.diagonal(rdms, axis1=1, axis2=2), 0.0)
 
 
+def test_gaussian_jeffreys_rdms_match_one_dimensional_closed_form() -> None:
+    means = np.zeros((1, 4, 1), dtype=np.float64)
+    means[0, 1, 0] = 2.0
+    covariances = np.ones((1, 4, 1, 1), dtype=np.float64)
+    covariances[0, 1, 0, 0] = 4.0
+    rdms = gaussian_jeffreys_rdms_from_moments(means, covariances)
+    expected = 0.5 * (1.0 / 4.0 + 4.0 - 2.0 + 4.0 * (1.0 + 1.0 / 4.0))
+    np.testing.assert_allclose(rdms[0, 0, 1], expected, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(rdms, rdms.transpose(0, 2, 1))
+    np.testing.assert_allclose(np.diagonal(rdms, axis1=1, axis2=2), 0.0)
+
+
 def test_classical_fid_uses_class_specific_covariances() -> None:
     rng = np.random.default_rng(43)
     labels = np.repeat(np.arange(4), 12)
@@ -278,12 +292,19 @@ def test_condition_affine_flow_fid_saves_best_checkpoint(tmp_path) -> None:
         checkpoint,
         device=torch.device("cpu"),
     )
+    checkpoint_rdms, checkpoint_payload = condition_affine_flow_fid_rdms_from_checkpoint(
+        checkpoint,
+        device=torch.device("cpu"),
+    )
     assert model.training is False
     assert rdms.shape == (2, 4, 4)
+    assert checkpoint_rdms.shape == rdms.shape
+    np.testing.assert_allclose(checkpoint_rdms, checkpoint_rdms.transpose(0, 2, 1))
     assert components["flow_endpoint_covariances"].shape == (2, 4, 2, 2)
     np.testing.assert_allclose(rdms, rdms.transpose(0, 2, 1))
     assert metadata["covariance_sharing"] == "none_across_class_or_eeg_time"
     assert payload["training"]["selected_epoch"] == metadata["selected_epoch"]
+    assert checkpoint_payload["training"] == payload["training"]
     assert payload["context"]["role"] == "reference"
 
 
