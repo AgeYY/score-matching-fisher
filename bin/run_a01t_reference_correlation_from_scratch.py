@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train and plot one recording's reference-split correlation RDMs from scratch."""
+"""Train and plot one recording's reference correlation or Mahalanobis RDMs."""
 
 from __future__ import annotations
 
@@ -26,24 +26,37 @@ from fisher.bci_iv_2a_dataset import load_features_npz  # noqa: E402
 from fisher.bci_iv_2a_session_identification import (  # noqa: E402
     FlowRDMConfig,
     _stratified_validation_trials,
+    _time_conditioned_endpoint_covariances,
     condition_design,
     empirical_condition_means,
+    empirical_gaussian_components,
     per_class_counts,
+    rdms_from_means_and_precisions,
 )
 from fisher.flow_matching_skl import build_flow_skl_model, train_flow_skl_model  # noqa: E402
 
 
 ROLE = "reference"
-VELOCITY_FAMILY = "translation_centered_fixed_norm"
+VELOCITY_FAMILIES = {
+    "correlation": "translation_centered_fixed_norm",
+    "mahalanobis": "covariate_affine",
+}
 VISIBLE_CUE_INTERVAL = (0.0, 1.25)
+DEFAULT_TIME_RBF_NUM_CENTERS = 8
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--recording",
-        default="A01T",
-        help="BCI IV-2a training recording, for example A01T or A03T.",
+        default="A03T",
+        help="BCI IV-2a training recording (default: A03T).",
+    )
+    parser.add_argument(
+        "--metric",
+        choices=tuple(VELOCITY_FAMILIES),
+        default="correlation",
+        help="RDM metric to estimate (default: correlation).",
     )
     parser.add_argument(
         "--feature-file",
@@ -77,12 +90,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--depth", type=int, default=2)
     parser.add_argument(
+        "--eeg-time-embedding",
+        choices=("identity", "gaussian-rbf"),
+        default="gaussian-rbf",
+        help="Embedding of EEG time u for the Mahalanobis affine model.",
+    )
+    parser.add_argument(
+        "--time-rbf-num-centers",
+        type=int,
+        default=DEFAULT_TIME_RBF_NUM_CENTERS,
+        help=f"Number of Gaussian RBF centers for EEG time (default: {DEFAULT_TIME_RBF_NUM_CENTERS}).",
+    )
+    parser.add_argument(
+        "--time-rbf-bandwidth",
+        type=float,
+        default=None,
+        help="Gaussian RBF bandwidth in scaled EEG-time units; default is center spacing.",
+    )
+    parser.add_argument(
         "--trial-fraction",
         type=float,
-        default=1.0,
+        default=0.5,
         help=(
             "Fraction of reference trials retained independently within each class; "
-            "sampling is without replacement and uses --seed."
+            "sampling is without replacement and uses --seed (default: 0.5)."
         ),
     )
     return parser.parse_args()
@@ -162,9 +193,15 @@ def _flow_config(args: argparse.Namespace) -> FlowRDMConfig:
     )
 
 
-def _model_kwargs(config: FlowRDMConfig, channels: int) -> dict[str, Any]:
-    return {
-        "velocity_family": VELOCITY_FAMILY,
+def _model_kwargs(
+    metric: str,
+    config: FlowRDMConfig,
+    channels: int,
+    times: np.ndarray,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "velocity_family": VELOCITY_FAMILIES[metric],
         "theta_dim": 5,
         "x_dim": channels,
         "radius": 1.0,
@@ -174,14 +211,43 @@ def _model_kwargs(config: FlowRDMConfig, channels: int) -> dict[str, Any]:
         "path_schedule": "cosine",
         "divergence_estimator": "exact",
     }
+    if metric == "mahalanobis":
+        # theta[:, 4] is physical EEG time, so A is shared across classes but
+        # is allowed to vary with EEG time.
+        kwargs["affine_condition_indices"] = (4,)
+        if args.eeg_time_embedding == "gaussian-rbf":
+            if int(args.time_rbf_num_centers) < 2:
+                raise ValueError("--time-rbf-num-centers must be >= 2.")
+            time_scale = max(float(np.max(np.abs(times))), np.finfo(np.float64).eps)
+            lower = float(np.min(times) / time_scale)
+            upper = float(np.max(times) / time_scale)
+            spacing = (upper - lower) / float(int(args.time_rbf_num_centers) - 1)
+            bandwidth = (
+                spacing
+                if args.time_rbf_bandwidth is None
+                else float(args.time_rbf_bandwidth)
+            )
+            kwargs.update(
+                {
+                    "theta_embedding": "gaussian_rbf",
+                    "theta_rbf_indices": (4,),
+                    "theta_rbf_num_centers": int(args.time_rbf_num_centers),
+                    "theta_rbf_lower": lower,
+                    "theta_rbf_upper": upper,
+                    "theta_rbf_bandwidth": bandwidth,
+                }
+            )
+    return kwargs
 
 
 @torch.no_grad()
-def _flow_correlation_rdms(
+def _flow_rdms(
     model: torch.nn.Module,
+    metric: str,
     times: np.ndarray,
+    config: FlowRDMConfig,
     device: torch.device,
-) -> np.ndarray:
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
     labels = np.repeat(np.arange(4, dtype=np.int64), times.size)
     grid_times = np.tile(times, 4)
     theta = torch.from_numpy(
@@ -196,26 +262,51 @@ def _flow_correlation_rdms(
         .reshape(4, times.size, -1)
         .transpose(1, 0, 2)
     )
-    return correlation_rdms_from_means(means)
+    components = {"flow_means": means}
+    if metric == "correlation":
+        return correlation_rdms_from_means(means), components
+    if metric != "mahalanobis":
+        raise ValueError(f"Unsupported metric: {metric!r}.")
+    time_conditions = condition_design(np.zeros(times.size, dtype=np.int64), times)
+    covariances = _time_conditioned_endpoint_covariances(
+        model,
+        time_conditions,
+        device=device,
+        steps=int(config.covariance_ode_steps),
+        ridge=float(config.covariance_ridge),
+    )
+    distance_covariances = covariances + float(config.covariance_ridge) * np.eye(
+        covariances.shape[-1], dtype=np.float64
+    )[None, :, :]
+    precisions = np.linalg.inv(distance_covariances)
+    components.update(
+        {
+            "flow_endpoint_covariances": covariances,
+            "flow_distance_covariances": distance_covariances,
+            "flow_precisions": precisions,
+        }
+    )
+    return rdms_from_means_and_precisions(means, precisions), components
 
 
 def _save_and_reload_best(
     path: Path,
     *,
+    metric: str,
     model_kwargs: dict[str, Any],
     train_meta: dict[str, Any],
     config: FlowRDMConfig,
     times: np.ndarray,
     context: dict[str, Any],
     device: torch.device,
-) -> tuple[np.ndarray, dict[str, Any]]:
+) -> tuple[np.ndarray, dict[str, Any], dict[str, np.ndarray]]:
     best_state = train_meta.get("best_state_dict")
     if best_state is None:
         raise RuntimeError("Training did not retain its best validation state.")
     payload = {
         "format_version": 1,
         "checkpoint_role": "best_validation_model_used_for_rdm_evaluation",
-        "velocity_family": VELOCITY_FAMILY,
+        "velocity_family": VELOCITY_FAMILIES[metric],
         "model_kwargs": model_kwargs,
         "model_state_dict": {
             key: value.detach().cpu().clone() for key, value in best_state.items()
@@ -236,12 +327,14 @@ def _save_and_reload_best(
     model = build_flow_skl_model(**reloaded["model_kwargs"]).to(device)
     model.load_state_dict(reloaded["model_state_dict"])
     model.eval()
-    return _flow_correlation_rdms(model, times, device), reloaded
+    rdms, components = _flow_rdms(model, metric, times, config, device)
+    return rdms, reloaded, components
 
 
 def _plot(
     output_dir: Path,
     recording: str,
+    metric: str,
     times: np.ndarray,
     classical_curve: np.ndarray,
     flow_curve: np.ndarray,
@@ -254,6 +347,10 @@ def _plot(
             "ytick.labelsize": 16,
             "legend.fontsize": 14,
             "axes.grid": False,
+            "axes.facecolor": "white",
+            "figure.facecolor": "white",
+            "savefig.facecolor": "white",
+            "savefig.transparent": False,
             "savefig.bbox": "tight",
         }
     )
@@ -265,7 +362,11 @@ def _plot(
     axis.set_xlim(float(times[0]), float(times[-1]))
     axis.set_ylim(0.0, 1.04 * float(max(np.max(classical_curve), np.max(flow_curve))))
     axis.set_xlabel("Time from cue onset (s)")
-    axis.set_ylabel("Mean correlation distance")
+    axis.set_ylabel(
+        "Mean correlation distance"
+        if metric == "correlation"
+        else "Mean Mahalanobis² distance"
+    )
     axis.legend(
         frameon=False,
         loc="lower center",
@@ -279,14 +380,16 @@ def _plot(
     axis.tick_params(width=1.8)
     prefix = recording.lower()
     figure.savefig(
-        output_dir / f"{prefix}_reference_correlation_distance_vs_time.png", dpi=300
+        output_dir / f"{prefix}_reference_{metric}_distance_vs_time.png", dpi=300
     )
-    figure.savefig(output_dir / f"{prefix}_reference_correlation_distance_vs_time.svg")
+    figure.savefig(output_dir / f"{prefix}_reference_{metric}_distance_vs_time.svg")
     plt.close(figure)
 
 
 def main() -> None:
     args = parse_args()
+    metric = str(args.metric)
+    velocity_family = VELOCITY_FAMILIES[metric]
     recording = str(args.recording).strip().upper()
     if len(recording) != 4 or recording[0] != "A" or recording[-1] != "T":
         raise ValueError("--recording must look like A01T through A09T.")
@@ -307,7 +410,7 @@ def main() -> None:
         args.output_dir = (
             ROOT
             / "data/bci_iv_2a"
-            / f"{recording.lower()}_reference_correlation_from_scratch"
+            / f"{recording.lower()}_reference_{metric}_from_scratch"
         )
     if args.device != "cuda:0":
         raise ValueError("This project requires --device cuda:0.")
@@ -339,9 +442,26 @@ def main() -> None:
     times = np.asarray(dataset.time_centers, dtype=np.float64)
 
     classical_started = time.perf_counter()
-    classical_rdms = correlation_rdms_from_means(
-        empirical_condition_means(values, labels, standardize_features=False)
-    )
+    if metric == "correlation":
+        classical_means = empirical_condition_means(
+            values, labels, standardize_features=False
+        )
+        classical_rdms = correlation_rdms_from_means(classical_means)
+        classical_components = {"classical_means": classical_means}
+    else:
+        classical_means, classical_covariances, classical_precisions = (
+            empirical_gaussian_components(
+                values, labels, standardize_features=False
+            )
+        )
+        classical_rdms = rdms_from_means_and_precisions(
+            classical_means, classical_precisions
+        )
+        classical_components = {
+            "classical_means": classical_means,
+            "classical_covariances": classical_covariances,
+            "classical_precisions": classical_precisions,
+        }
     classical_seconds = time.perf_counter() - classical_started
 
     config = _flow_config(args)
@@ -357,7 +477,7 @@ def main() -> None:
 
     theta_train, x_train = flatten(train_trials)
     theta_validation, x_validation = flatten(validation_trials)
-    model_kwargs = _model_kwargs(config, values.shape[-1])
+    model_kwargs = _model_kwargs(metric, config, values.shape[-1], times, args)
     model = build_flow_skl_model(**model_kwargs).to(device)
     torch.cuda.synchronize(device)
     flow_started = time.perf_counter()
@@ -368,7 +488,7 @@ def main() -> None:
         theta_val=theta_validation,
         x_val=x_validation,
         device=device,
-        velocity_family=VELOCITY_FAMILY,
+        velocity_family=velocity_family,
         path_schedule="cosine",
         epochs=config.epochs,
         batch_size=config.batch_size,
@@ -388,7 +508,7 @@ def main() -> None:
     context = {
         "recording": recording,
         "role": ROLE,
-        "metric": "correlation",
+        "metric": metric,
         "split_seed": split_seed,
         "trial_fraction": float(args.trial_fraction),
         "parent_trial_indices": parent_reference_indices.tolist(),
@@ -396,9 +516,10 @@ def main() -> None:
         "per_class_counts": per_class_counts(labels).tolist(),
     }
     prefix = recording.lower()
-    checkpoint_path = args.output_dir / f"{prefix}_reference_correlation_flow_best.pt"
-    flow_rdms, checkpoint = _save_and_reload_best(
+    checkpoint_path = args.output_dir / f"{prefix}_reference_{metric}_flow_best.pt"
+    flow_rdms, checkpoint, flow_components = _save_and_reload_best(
         checkpoint_path,
+        metric=metric,
         model_kwargs=model_kwargs,
         train_meta=train_meta,
         config=config,
@@ -412,7 +533,7 @@ def main() -> None:
     classical_curve = mean_off_diagonal_distance(classical_rdms)
     flow_curve = mean_off_diagonal_distance(flow_rdms)
     np.savez_compressed(
-        args.output_dir / f"{prefix}_reference_correlation_rdms.npz",
+        args.output_dir / f"{prefix}_reference_{metric}_rdms.npz",
         classical_rdms=classical_rdms,
         flow_rdms=flow_rdms,
         classical_mean_distance=classical_curve,
@@ -426,12 +547,34 @@ def main() -> None:
         monitored_validation_losses=np.asarray(
             train_meta["val_monitor_losses"], dtype=np.float64
         ),
+        **classical_components,
+        **flow_components,
     )
-    _plot(args.output_dir, recording, times, classical_curve, flow_curve)
+    _plot(args.output_dir, recording, metric, times, classical_curve, flow_curve)
     total_seconds = time.perf_counter() - total_started
     summary = {
-        "experiment": f"{recording} reference correlation RDM from scratch",
+        "experiment": f"{recording} reference {metric} RDM from scratch",
         "recording": recording,
+        "metric": metric,
+        "velocity_family": velocity_family,
+        "covariance_sharing": (
+            "not_applicable"
+            if metric == "correlation"
+            else "shared_across_classes_and_varying_with_eeg_time"
+        ),
+        "eeg_time_embedding": (
+            args.eeg_time_embedding if metric == "mahalanobis" else "not_applicable"
+        ),
+        "time_rbf_num_centers": (
+            int(args.time_rbf_num_centers)
+            if metric == "mahalanobis" and args.eeg_time_embedding == "gaussian-rbf"
+            else None
+        ),
+        "time_rbf_bandwidth": (
+            model_kwargs.get("theta_rbf_bandwidth")
+            if metric == "mahalanobis" and args.eeg_time_embedding == "gaussian-rbf"
+            else None
+        ),
         "cache_usage": "none; classical and flow RDMs recomputed on every invocation",
         "device": args.device,
         "gpu": torch.cuda.get_device_name(0),
@@ -453,7 +596,7 @@ def main() -> None:
         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     print(json.dumps(summary, indent=2, sort_keys=True), flush=True)
-    print(f"[{recording} correlation] output={args.output_dir.resolve()}", flush=True)
+    print(f"[{recording} {metric}] output={args.output_dir.resolve()}", flush=True)
 
 
 if __name__ == "__main__":

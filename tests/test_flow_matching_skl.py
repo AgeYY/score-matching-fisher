@@ -301,6 +301,78 @@ def _first_linear_in_features(module: nn.Sequential) -> int:
     return int(first.in_features)
 
 
+def test_gaussian_rbf_embedding_uses_center_spacing_and_is_differentiable() -> None:
+    embedding = fms.GaussianRBFEmbedding(
+        num_centers=8,
+        lower=-3.0 / 7.0,
+        upper=1.0,
+    ).double()
+    expected_spacing = (1.0 + 3.0 / 7.0) / 7.0
+    assert embedding.spacing == pytest.approx(expected_spacing)
+    assert float(embedding.bandwidth.item()) == pytest.approx(expected_spacing)
+    at_bounds = embedding(
+        torch.tensor([[-3.0 / 7.0], [1.0]], dtype=torch.float64)
+    )
+    assert at_bounds.shape == (2, 8)
+    assert float(at_bounds[0, 0]) == pytest.approx(1.0)
+    assert float(at_bounds[1, -1]) == pytest.approx(1.0)
+    value = torch.tensor([[0.2]], dtype=torch.float64, requires_grad=True)
+    gradient = torch.autograd.grad(embedding(value)[0, 3], value)[0]
+    assert torch.isfinite(gradient).all()
+    assert float(torch.abs(gradient).item()) > 0.0
+
+
+def test_covariate_affine_rbf_embeds_only_eeg_time_and_preserves_class_sharing() -> None:
+    model = build_flow_skl_model(
+        velocity_family="covariate_affine",
+        theta_dim=5,
+        x_dim=3,
+        affine_condition_indices=(4,),
+        theta_embedding="gaussian_rbf",
+        theta_rbf_indices=(4,),
+        theta_rbf_num_centers=8,
+        theta_rbf_lower=-3.0 / 7.0,
+        theta_rbf_upper=1.0,
+        hidden_dim=8,
+        depth=2,
+        path_schedule="linear",
+    ).double()
+    assert model.theta_embedding_type == "gaussian_rbf"
+    assert model.theta_rbf_indices == (4,)
+    assert model.theta_embedding_dim == 12
+    assert model.affine_context_embedding_dim == 8
+    assert _first_linear_in_features(model.b_net) == 12
+    assert _first_linear_in_features(model.a_net) == 9
+
+    theta = torch.tensor(
+        [[1.0, 0.0, 0.0, 0.0, 0.2], [0.0, 1.0, 0.0, 0.0, 0.2]],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    theta_features = model.theta_embedding(theta)
+    torch.testing.assert_close(theta_features[:, :4], theta[:, :4])
+    t = torch.full((2, 1), 0.4, dtype=torch.float64)
+    a = model.A(theta, t)
+    torch.testing.assert_close(a[0], a[1], rtol=1e-12, atol=1e-12)
+    velocity = model(torch.randn(2, 3, dtype=torch.float64), theta, t)
+    gradient = torch.autograd.grad(velocity.square().sum(), theta)[0]
+    assert velocity.shape == (2, 3)
+    assert torch.isfinite(gradient).all()
+    assert float(torch.linalg.norm(gradient[:, 4]).item()) > 0.0
+
+
+def test_covariate_affine_rbf_rejects_invalid_time_coordinate() -> None:
+    with pytest.raises(ValueError, match="RBF coordinate"):
+        build_flow_skl_model(
+            velocity_family="covariate_affine",
+            theta_dim=5,
+            x_dim=2,
+            affine_condition_indices=(4,),
+            theta_embedding="gaussian_rbf",
+            theta_rbf_indices=(5,),
+        )
+
+
 def test_build_flow_skl_model_uses_mlp_heads_and_film_nonlinear_subnets() -> None:
     for family in VELOCITY_FAMILIES:
         model = build_flow_skl_model(
