@@ -428,6 +428,139 @@ def _plot_grid(
     return png, svg
 
 
+def _plot_all_metrics_with_accuracy(
+    *,
+    metric_rdms: list[dict[str, Any]],
+    histories: dict[tuple[str, str], dict[str, Any]],
+    recordings: list[str],
+    times: np.ndarray,
+    summary: dict[str, Any],
+    output_stem: Path,
+) -> tuple[Path, Path]:
+    """Combine all temporal-RDM fits and full-window top-1 accuracy."""
+    _set_plot_style()
+    fig = plt.figure(figsize=(24.0, 27.0), layout="constrained")
+    outer = fig.add_gridspec(4, 2, height_ratios=(1.0, 1.0, 0.36, 0.36))
+    step = float(np.median(np.diff(times)))
+    extent = (
+        float(times[0] - step / 2.0),
+        float(times[-1] + step / 2.0),
+        float(times[0] - step / 2.0),
+        float(times[-1] + step / 2.0),
+    )
+
+    for block_index, spec in enumerate(metric_rdms):
+        block = fig.add_subfigure(outer[block_index // 2, block_index % 2])
+        axes = block.subplots(
+            len(ROW_SPECS),
+            len(recordings),
+            sharex=True,
+            sharey=True,
+            squeeze=False,
+        )
+        image = None
+        for row, (method, split, row_label) in enumerate(ROW_SPECS):
+            for col, recording in enumerate(recordings):
+                ax = axes[row, col]
+                image = ax.imshow(
+                    spec["rdms"][(method, split, recording)],
+                    origin="lower",
+                    extent=extent,
+                    interpolation="nearest",
+                    aspect="equal",
+                    cmap=spec["cmap"],
+                    norm=spec["norm"],
+                    rasterized=True,
+                )
+                for boundary in BOUNDARIES_SECONDS:
+                    ax.axvline(boundary, color="white", linestyle="--", linewidth=0.8, alpha=0.95)
+                    ax.axhline(boundary, color="white", linestyle="--", linewidth=0.8, alpha=0.95)
+                if row == 0:
+                    ax.set_title(recording, fontsize=11, pad=2)
+                if col == 0:
+                    ax.set_ylabel(row_label, fontsize=9)
+                    ax.set_yticks((-2.0, 0.0, 1.25, 4.0), ("−2", "0", "1.25", "4"))
+                else:
+                    ax.set_yticklabels([])
+                if row == len(ROW_SPECS) - 1:
+                    ax.set_xticks((-2.0, 0.0, 1.25, 4.0), ("−2", "0", "1.25", "4"))
+                    ax.set_xlabel("Time (s)", fontsize=9)
+                else:
+                    ax.set_xticklabels([])
+                ax.tick_params(width=1.2, length=3, labelsize=8)
+                for spine in ax.spines.values():
+                    spine.set_linewidth(1.2)
+        if image is None:
+            raise RuntimeError(f"No panels plotted for {spec['title']}")
+        colorbar = block.colorbar(
+            image,
+            ax=axes,
+            shrink=0.72,
+            pad=0.01,
+            extend=spec.get("extend", "neither"),
+        )
+        colorbar.set_label(spec["colorbar_label"], fontsize=10)
+        colorbar.ax.tick_params(width=1.2, labelsize=8)
+        colorbar.outline.set_linewidth(1.2)
+        block.suptitle(spec["title"], fontsize=16)
+
+    loss_block = fig.add_subfigure(outer[2, :])
+    loss_axes = loss_block.subplots(1, len(recordings), sharex=True, sharey=True, squeeze=False)
+    all_losses = np.concatenate(
+        [np.concatenate((history["train"], history["validation"])) for history in histories.values()]
+    )
+    loss_limits = (float(np.min(all_losses) - 0.04), float(np.max(all_losses) + 0.04))
+    for col, recording in enumerate(recordings):
+        _plot_loss_axis(
+            loss_axes[0, col],
+            recording=recording,
+            histories=histories,
+            y_limits=loss_limits,
+            show_legend=col == 0,
+        )
+        if col == 0:
+            loss_axes[0, col].set_ylabel("Flow-matching loss")
+    loss_block.suptitle("Flow training histories", fontsize=18)
+
+    accuracy_block = fig.add_subfigure(outer[3, :])
+    ax = accuracy_block.subplots()
+    metric_keys = ("correlation", "cosine", "euclidean", "fid")
+    metric_labels = ("Correlation", "Cosine", "Euclidean", r"Gaussian $W_2$")
+    classical = np.asarray(
+        [summary["intervals"]["full"]["classical"][key]["top1_accuracy"] for key in metric_keys]
+    )
+    flow = np.asarray(
+        [summary["intervals"]["full"]["flow"][key]["top1_accuracy"] for key in metric_keys]
+    )
+    x = np.arange(len(metric_keys), dtype=np.float64)
+    width = 0.34
+    classical_bars = ax.bar(x - width / 2.0, classical, width, label="Classical", color="#4c78a8")
+    flow_bars = ax.bar(x + width / 2.0, flow, width, label="Flow", color="#e45756")
+    chance = float(summary["chance_top1"])
+    ax.axhline(chance, color="black", linestyle="--", linewidth=1.8, label="Chance")
+    ax.bar_label(classical_bars, labels=[f"{100 * value:.0f}%" for value in classical], padding=3)
+    ax.bar_label(flow_bars, labels=[f"{100 * value:.0f}%" for value in flow], padding=3)
+    ax.set_xticks(x, metric_labels)
+    ax.set_ylim(0.0, 1.0)
+    ax.set_yticks(np.linspace(0.0, 1.0, 6), [f"{value:.0%}" for value in np.linspace(0.0, 1.0, 6)])
+    ax.set_ylabel("Top-1 accuracy")
+    ax.set_title("Five-way session identification — full temporal window")
+    ax.legend(frameon=False, ncols=3, loc="upper right")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_linewidth(1.8)
+    ax.spines["bottom"].set_linewidth(1.8)
+    ax.tick_params(width=1.8)
+
+    fig.suptitle("Temporal RDM fits and session-identification accuracy", fontsize=22)
+    png = output_stem.with_suffix(".png")
+    svg = output_stem.with_suffix(".svg")
+    fig.savefig(png, dpi=300)
+    fig.savefig(svg)
+    plt.close(fig)
+    return png, svg
+
+
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     input_dir = args.input_dir.resolve()
@@ -443,6 +576,20 @@ def main(argv: list[str] | None = None) -> None:
             histories=histories,
             recordings=recordings,
             output_stem=output_dir / "all_sessions_flow_loss_vs_epoch",
+        )
+    )
+
+    correlation_rdms = _load_metric_rdms(input_dir, recordings, "correlation")
+    generated.extend(
+        _plot_grid(
+            rdms=correlation_rdms,
+            recordings=recordings,
+            times=times,
+            title="Correlation temporal RDMs — all fitted sessions",
+            colorbar_label="Correlation distance",
+            norm=Normalize(vmin=0.0, vmax=2.0),
+            cmap="viridis",
+            output_stem=output_dir / "all_sessions_fitted_correlation_temporal_rdms",
         )
     )
 
@@ -473,9 +620,68 @@ def main(argv: list[str] | None = None) -> None:
         )
     )
 
+    euclidean_rdms = _load_metric_rdms(input_dir, recordings, "euclidean")
+    euclidean_values = _strict_upper_values(euclidean_rdms)
+    euclidean_vmax = float(np.percentile(euclidean_values, 99.5))
+    generated.extend(
+        _plot_grid(
+            rdms=euclidean_rdms,
+            recordings=recordings,
+            times=times,
+            title="Euclidean temporal RDMs — shared absolute scale",
+            colorbar_label="Euclidean distance",
+            norm=PowerNorm(gamma=0.5, vmin=0.0, vmax=euclidean_vmax),
+            cmap="magma",
+            output_stem=output_dir / "all_sessions_fitted_euclidean_temporal_rdms_absolute",
+            colorbar_extend="max",
+        )
+    )
+
     w2_rdms = _load_metric_rdms(input_dir, recordings, "fid")
     w2_values = _strict_upper_values(w2_rdms)
     w2_vmax = float(np.percentile(w2_values, 99.5))
+    generated.extend(
+        _plot_all_metrics_with_accuracy(
+            metric_rdms=[
+                {
+                    "title": "Correlation",
+                    "rdms": correlation_rdms,
+                    "colorbar_label": "Correlation distance",
+                    "norm": Normalize(vmin=0.0, vmax=2.0),
+                    "cmap": "viridis",
+                },
+                {
+                    "title": "Cosine",
+                    "rdms": cosine_rdms,
+                    "colorbar_label": "Cosine distance",
+                    "norm": Normalize(vmin=0.0, vmax=2.0),
+                    "cmap": "viridis",
+                },
+                {
+                    "title": "Euclidean",
+                    "rdms": euclidean_rdms,
+                    "colorbar_label": "Euclidean distance",
+                    "norm": PowerNorm(gamma=0.5, vmin=0.0, vmax=euclidean_vmax),
+                    "cmap": "magma",
+                    "extend": "max",
+                },
+                {
+                    "title": r"Gaussian $W_2$ (pattern-normalized)",
+                    "rdms": _panel_normalized(w2_rdms),
+                    "colorbar_label": r"$W_2$ / panel 95th percentile",
+                    "norm": Normalize(vmin=0.0, vmax=1.5),
+                    "cmap": "magma",
+                    "extend": "max",
+                },
+            ],
+            histories=histories,
+            recordings=recordings,
+            times=times,
+            summary=summary,
+            output_stem=output_dir / "all_metrics_temporal_rdms_with_top1_accuracy",
+        )
+    )
+
     generated.extend(
         _plot_grid(
             rdms=w2_rdms,
