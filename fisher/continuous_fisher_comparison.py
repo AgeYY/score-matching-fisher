@@ -189,6 +189,7 @@ def make_native_dataset_npz(
     n_total: int,
     train_frac: float,
     seed: int,
+    cov_theta_amp_scale: float = 1.0,
     force: bool = False,
 ) -> Path:
     output_npz = Path(output_npz)
@@ -207,6 +208,8 @@ def make_native_dataset_npz(
             str(float(train_frac)),
             "--seed",
             str(int(seed)),
+            "--cov-theta-amp-scale",
+            str(float(cov_theta_amp_scale)),
             "--output-npz",
             str(output_npz),
         ]

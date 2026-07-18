@@ -388,6 +388,28 @@ def test_condition_affine_model_supports_gaussian_rbf_theta_embedding() -> None:
     assert torch.isfinite(theta_gradient).all()
 
 
+def test_nonlinear_model_supports_gaussian_rbf_theta_embedding() -> None:
+    model = fms.build_flow_skl_model(
+        velocity_family="nonlinear",
+        theta_dim=1,
+        x_dim=3,
+        hidden_dim=16,
+        depth=2,
+        theta_embedding="gaussian_rbf",
+        theta_rbf_num_centers=8,
+        theta_rbf_lower=-6.0,
+        theta_rbf_upper=6.0,
+    )
+    x = torch.randn(4, 3)
+    theta = torch.linspace(-1.0, 1.0, 4).reshape(-1, 1).requires_grad_(True)
+    t = torch.full((4, 1), 0.5)
+    output = model(x, theta, t)
+
+    assert output.shape == x.shape
+    assert model.theta_embedding_type == "gaussian_rbf"
+    torch.autograd.grad(output.sum(), theta)
+
+
 def test_gaussian_rbf_theta_embedding_rejects_vector_conditions() -> None:
     with pytest.raises(ValueError, match="theta_dim == 1"):
         build_flow_skl_model(

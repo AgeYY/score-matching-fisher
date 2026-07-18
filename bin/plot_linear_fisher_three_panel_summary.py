@@ -109,10 +109,11 @@ def _plot_dimension_inset(
         (gkr, "C2", "^"),
         (classical, "C1", "s"),
     ):
+        errors = np.std(values, axis=1, ddof=1) if values.shape[1] > 1 else None
         axis.errorbar(
             dimensions,
             np.mean(values, axis=1),
-            yerr=np.std(values, axis=1, ddof=1),
+            yerr=errors,
             color=color,
             marker=marker,
             markersize=3.5,
@@ -162,9 +163,14 @@ def main() -> None:
         sample_flow_mean = np.mean(sample_flow_mae, axis=1)
         sample_gkr_mean = np.mean(sample_gkr_mae, axis=1)
         sample_classical_mean = np.mean(sample_classical_mae, axis=1)
-        sample_flow_error = np.std(sample_flow_mae, axis=1, ddof=1)
-        sample_gkr_error = np.std(sample_gkr_mae, axis=1, ddof=1)
-        sample_classical_error = np.std(sample_classical_mae, axis=1, ddof=1)
+        if sample_flow_mae.shape[1] > 1:
+            sample_flow_error = np.std(sample_flow_mae, axis=1, ddof=1)
+            sample_gkr_error = np.std(sample_gkr_mae, axis=1, ddof=1)
+            sample_classical_error = np.std(sample_classical_mae, axis=1, ddof=1)
+        else:
+            sample_flow_error = None
+            sample_gkr_error = None
+            sample_classical_error = None
     else:
         raise ValueError("Sample-size MAE arrays must have one or two dimensions.")
     if theta.ndim == 3:
@@ -262,10 +268,11 @@ def main() -> None:
         (dimension_flow_mae, "C0", "o"),
         (dimension_gkr_mae, "C2", "^"),
     ):
+        errors = np.std(values, axis=1, ddof=1) if values.shape[1] > 1 else None
         dimension_axis.errorbar(
             dimensions,
             np.mean(values, axis=1),
-            yerr=np.std(values, axis=1, ddof=1),
+            yerr=errors,
             color=color,
             marker=marker,
             markersize=6,

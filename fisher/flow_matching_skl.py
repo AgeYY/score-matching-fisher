@@ -808,6 +808,11 @@ class ConditionalNonlinearXFlowFiLM(nn.Module):
         depth: int = 3,
         divergence_estimator: str = "hutchinson",
         hutchinson_probes: int = 1,
+        theta_embedding: str = "identity",
+        theta_rbf_num_centers: int = 8,
+        theta_rbf_lower: float = -6.0,
+        theta_rbf_upper: float = 6.0,
+        theta_rbf_bandwidth: float | None = None,
     ) -> None:
         super().__init__()
         self.velocity_family = "nonlinear"
@@ -819,9 +824,18 @@ class ConditionalNonlinearXFlowFiLM(nn.Module):
             hutchinson_probes=int(hutchinson_probes),
         )
         self.network_architecture = "film"
+        self.theta_embedding_type = _normalize_theta_embedding_type(theta_embedding)
+        self.theta_embedding, self.theta_embedding_dim = _make_theta_embedding(
+            theta_embedding=self.theta_embedding_type,
+            theta_dim=self.theta_dim,
+            rbf_num_centers=int(theta_rbf_num_centers),
+            rbf_lower=float(theta_rbf_lower),
+            rbf_upper=float(theta_rbf_upper),
+            rbf_bandwidth=theta_rbf_bandwidth,
+        )
         self.net = _make_film_net(
             trunk_dim=self.x_dim,
-            theta_dim=self.theta_dim,
+            theta_dim=self.theta_embedding_dim,
             out_dim=self.x_dim,
             hidden_dim=int(hidden_dim),
             depth=int(depth),
@@ -832,7 +846,7 @@ class ConditionalNonlinearXFlowFiLM(nn.Module):
         if theta.ndim == 1:
             theta = theta.unsqueeze(-1)
         t = _as_col_t(t, batch=int(x.shape[0]))
-        return self.net(x, theta, t)
+        return self.net(x, self.theta_embedding(theta), t)
 
     def log_prob_normalized(
         self,
@@ -1605,6 +1619,11 @@ def build_flow_skl_model(
         return ConditionalNonlinearXFlowFiLM(
             divergence_estimator=str(divergence_estimator),
             hutchinson_probes=int(hutchinson_probes),
+            theta_embedding=str(theta_embedding),
+            theta_rbf_num_centers=int(theta_rbf_num_centers),
+            theta_rbf_lower=float(theta_rbf_lower),
+            theta_rbf_upper=float(theta_rbf_upper),
+            theta_rbf_bandwidth=theta_rbf_bandwidth,
             **common,
         )
     raise AssertionError(f"Unhandled velocity family {fam!r}.")

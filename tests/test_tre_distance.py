@@ -10,6 +10,7 @@ from fisher.tre_distance import (
     build_tre_waymarks,
     estimate_tre_log_ratio,
     save_pairwise_tre_jeffreys_result,
+    train_and_estimate_binned_tre_fisher,
     train_and_estimate_pairwise_tre_jeffreys,
     train_tre_density_ratio,
     tre_jeffreys_from_log_ratios,
@@ -123,6 +124,49 @@ def test_pairwise_tre_trains_one_model_per_condition_pair(tmp_path) -> None:
     with np.load(npz_path, allow_pickle=False) as data:
         assert tuple(data["pair_keys"].tolist()) == ("0_1", "0_2", "1_2")
         assert "pair_0_1_train_losses" in data.files
+
+
+def test_binned_tre_converts_adjacent_jeffreys_to_fisher() -> None:
+    rng = np.random.default_rng(29)
+    theta_grid = np.array([[-1.0], [0.0], [1.0]])
+
+    def sample_split(n_per_bin: int) -> tuple[np.ndarray, np.ndarray]:
+        theta = np.repeat(theta_grid[:, 0], n_per_bin).reshape(-1, 1)
+        mean = theta[:, 0]
+        x = np.column_stack(
+            [mean + 0.4 * rng.normal(size=theta.shape[0]), 0.3 * rng.normal(size=theta.shape[0])]
+        )
+        return theta, x.astype(np.float32)
+
+    theta_train, x_train = sample_split(16)
+    theta_validation, x_validation = sample_split(8)
+    theta_eval, x_eval = sample_split(12)
+    states, result = train_and_estimate_binned_tre_fisher(
+        theta_train=theta_train,
+        x_train=x_train,
+        theta_validation=theta_validation,
+        x_validation=x_validation,
+        theta_eval=theta_eval,
+        x_eval=x_eval,
+        theta_grid=theta_grid,
+        device=torch.device("cpu"),
+        seed=31,
+        config=TREDensityRatioConfig(
+            num_bridges=2,
+            architecture="linear",
+            epochs=2,
+            batch_size=8,
+            lr=1e-2,
+            early_patience=0,
+            validation_pairs=8,
+            log_every=100,
+        ),
+    )
+
+    assert set(states) == {"0_1", "1_2"}
+    assert result.fisher.shape == (2,)
+    assert np.all(result.jeffreys >= 0.0)
+    np.testing.assert_allclose(result.fisher, result.jeffreys / np.diff(theta_grid[:, 0]) ** 2)
 
 
 def test_distance_comparison_serializes_tre_matrix(tmp_path) -> None:

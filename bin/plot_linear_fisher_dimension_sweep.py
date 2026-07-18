@@ -137,7 +137,7 @@ def _plot(cases: list[dict[str, object]], output_dir: Path) -> tuple[Path, Path]
     ) -> None:
         values = np.asarray([case[key] for case in cases], dtype=np.float64)
         means = np.mean(values, axis=1)
-        errors = np.std(values, axis=1, ddof=1)
+        errors = np.std(values, axis=1, ddof=1) if values.shape[1] > 1 else None
         target_axis.errorbar(
             dimensions,
             means,
@@ -221,8 +221,8 @@ def main() -> None:
         raise ValueError("--n-total must be >= 2.")
     if not dimensions or any(value < 1 for value in dimensions):
         raise ValueError("--x-dim-list values must be >= 1.")
-    if len(seeds) < 2:
-        raise ValueError("--seed-list must contain at least two distinct seeds.")
+    if not seeds:
+        raise ValueError("--seed-list must contain at least one seed.")
     if float(args.theta_spacing) <= 0.0:
         raise ValueError("--theta-spacing must be positive.")
     if int(args.min_endpoint_samples) < 2:
@@ -364,7 +364,10 @@ def main() -> None:
                 **{
                     f"{key}_{statistic}": float(function(np.asarray(case[key], dtype=np.float64)))
                     for key in ("flow_mae", "classical_mae", "gkr_mae")
-                    for statistic, function in (("mean", np.mean), ("std", lambda x: np.std(x, ddof=1)))
+                    for statistic, function in (
+                        ("mean", np.mean),
+                        ("std", lambda x: np.std(x, ddof=1) if x.size > 1 else 0.0),
+                    )
                 },
                 "repeats": [
                     {

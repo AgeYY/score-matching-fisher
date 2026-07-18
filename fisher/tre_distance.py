@@ -94,6 +94,18 @@ class PairwiseTREJeffreysResult:
     run_metadata: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class BinnedTREFisherResult:
+    """Adjacent-bin TRE Jeffreys estimates converted to scalar Fisher."""
+
+    fisher: np.ndarray
+    jeffreys: np.ndarray
+    raw_jeffreys: np.ndarray
+    pair_histories: dict[str, dict[str, Any]]
+    pair_metadata: dict[str, dict[str, Any]]
+    run_metadata: dict[str, Any]
+
+
 def tre_waymark_coefficients(
     num_bridges: int,
     *,
@@ -419,6 +431,174 @@ def tre_jeffreys_from_log_ratios(log_ratio_x0: np.ndarray, log_ratio_x1: np.ndar
     if not np.all(np.isfinite(ratio0)) or not np.all(np.isfinite(ratio1)):
         raise ValueError("Endpoint log-ratio arrays must be finite.")
     return float(np.mean(ratio0, dtype=np.float64) - np.mean(ratio1, dtype=np.float64))
+
+
+def _theta_endpoint_windows(
+    theta: np.ndarray,
+    x: np.ndarray,
+    theta_grid: np.ndarray,
+    *,
+    radius: float | None,
+    min_samples: int,
+) -> list[np.ndarray]:
+    theta_arr = np.asarray(theta, dtype=np.float64).reshape(-1)
+    x_arr = np.asarray(x, dtype=np.float32)
+    grid = np.asarray(theta_grid, dtype=np.float64).reshape(-1)
+    if x_arr.ndim != 2 or int(x_arr.shape[0]) != int(theta_arr.shape[0]):
+        raise ValueError("theta and x must have matching rows.")
+    if grid.size < 2 or np.any(np.diff(grid) <= 0.0):
+        raise ValueError("theta_grid must contain at least two increasing values.")
+    radius_value = 0.5 * float(np.min(np.diff(grid))) if radius is None else float(radius)
+    if radius_value <= 0.0:
+        raise ValueError("window radius must be positive.")
+    required = int(min_samples)
+    if required < 1:
+        raise ValueError("min_samples must be positive.")
+    required = min(required, int(theta_arr.size))
+    windows: list[np.ndarray] = []
+    for value in grid:
+        index = np.flatnonzero(np.abs(theta_arr - float(value)) <= radius_value)
+        if int(index.size) < required:
+            index = np.argsort(np.abs(theta_arr - float(value)), kind="mergesort")[:required]
+        windows.append(x_arr[index])
+    return windows
+
+
+def train_and_estimate_binned_tre_fisher(
+    *,
+    theta_train: np.ndarray,
+    x_train: np.ndarray,
+    theta_validation: np.ndarray,
+    x_validation: np.ndarray,
+    theta_eval: np.ndarray,
+    x_eval: np.ndarray,
+    theta_grid: np.ndarray,
+    device: torch.device,
+    seed: int = 7,
+    config: TREDensityRatioConfig | None = None,
+    window_radius: float | None = None,
+    min_train_samples: int = 2,
+    min_validation_samples: int = 2,
+    min_eval_samples: int = 2,
+    eval_batch_size: int = 4_096,
+) -> tuple[dict[str, dict[str, torch.Tensor]], BinnedTREFisherResult]:
+    """Fit independent TRE models between adjacent local theta windows."""
+
+    cfg = TREDensityRatioConfig() if config is None else config
+    cfg.validate()
+    grid = np.asarray(theta_grid, dtype=np.float64).reshape(-1)
+    train_windows = _theta_endpoint_windows(
+        theta_train,
+        x_train,
+        grid,
+        radius=window_radius,
+        min_samples=int(min_train_samples),
+    )
+    validation_windows = _theta_endpoint_windows(
+        theta_validation,
+        x_validation,
+        grid,
+        radius=window_radius,
+        min_samples=int(min_validation_samples),
+    )
+    eval_windows = _theta_endpoint_windows(
+        theta_eval,
+        x_eval,
+        grid,
+        radius=window_radius,
+        min_samples=int(min_eval_samples),
+    )
+    n_pairs = int(grid.size - 1)
+    raw_jeffreys = np.empty(n_pairs, dtype=np.float64)
+    jeffreys = np.empty(n_pairs, dtype=np.float64)
+    fisher = np.empty(n_pairs, dtype=np.float64)
+    state_dicts: dict[str, dict[str, torch.Tensor]] = {}
+    pair_histories: dict[str, dict[str, Any]] = {}
+    pair_metadata: dict[str, dict[str, Any]] = {}
+    started = time.perf_counter()
+    for pair_index in range(n_pairs):
+        pair_key = f"{pair_index}_{pair_index + 1}"
+        pair_seed = int(seed) + 10_007 * pair_index
+        print(
+            f"[binned-TRE] fitting pair={pair_key} seed={pair_seed} "
+            f"bridges={cfg.num_bridges}",
+            flush=True,
+        )
+        model, training = train_tre_density_ratio(
+            x0_train=train_windows[pair_index],
+            x1_train=train_windows[pair_index + 1],
+            x0_validation=validation_windows[pair_index],
+            x1_validation=validation_windows[pair_index + 1],
+            device=torch.device(device),
+            seed=pair_seed,
+            config=cfg,
+        )
+        log_ratio_left = estimate_tre_log_ratio(
+            model,
+            eval_windows[pair_index],
+            device=torch.device(device),
+            batch_size=int(eval_batch_size),
+        )
+        log_ratio_right = estimate_tre_log_ratio(
+            model,
+            eval_windows[pair_index + 1],
+            device=torch.device(device),
+            batch_size=int(eval_batch_size),
+        )
+        raw_value = tre_jeffreys_from_log_ratios(log_ratio_left, log_ratio_right)
+        clipped_value = max(0.0, raw_value)
+        spacing = float(grid[pair_index + 1] - grid[pair_index])
+        raw_jeffreys[pair_index] = raw_value
+        jeffreys[pair_index] = clipped_value
+        fisher[pair_index] = clipped_value / spacing**2
+        state_dicts[pair_key] = {
+            key: value.detach().cpu().clone() for key, value in model.state_dict().items()
+        }
+        pair_histories[pair_key] = {
+            "train_losses": training.train_losses,
+            "validation_losses": training.validation_losses,
+            "best_epoch": int(training.best_epoch),
+            "best_validation_loss": float(training.best_validation_loss),
+            "stopped_epoch": int(training.stopped_epoch),
+            "stopped_early": bool(training.stopped_early),
+            "training_seconds": float(training.training_seconds),
+        }
+        pair_metadata[pair_key] = {
+            "theta_left": float(grid[pair_index]),
+            "theta_right": float(grid[pair_index + 1]),
+            "spacing": spacing,
+            "pair_seed": pair_seed,
+            "n_train_left": int(train_windows[pair_index].shape[0]),
+            "n_train_right": int(train_windows[pair_index + 1].shape[0]),
+            "n_validation_left": int(validation_windows[pair_index].shape[0]),
+            "n_validation_right": int(validation_windows[pair_index + 1].shape[0]),
+            "n_eval_left": int(eval_windows[pair_index].shape[0]),
+            "n_eval_right": int(eval_windows[pair_index + 1].shape[0]),
+            "raw_jeffreys": raw_value,
+            "jeffreys": clipped_value,
+            "fisher": float(fisher[pair_index]),
+        }
+    result = BinnedTREFisherResult(
+        fisher=fisher,
+        jeffreys=jeffreys,
+        raw_jeffreys=raw_jeffreys,
+        pair_histories=pair_histories,
+        pair_metadata=pair_metadata,
+        run_metadata={
+            "seed": int(seed),
+            "num_pairs": n_pairs,
+            "theta_grid": grid.tolist(),
+            "window_radius": (
+                0.5 * float(np.min(np.diff(grid)))
+                if window_radius is None
+                else float(window_radius)
+            ),
+            "eval_batch_size": int(eval_batch_size),
+            "total_training_seconds": float(time.perf_counter() - started),
+            "config": asdict(cfg),
+        },
+    )
+    return state_dicts, result
 
 
 def train_and_estimate_pairwise_tre_jeffreys(

@@ -506,6 +506,191 @@ class ToyConditionalGaussianRandampSqrtdDataset(ToyConditionalGaussianRandampDat
 
 
 @dataclass
+class ToyConditionalGaussianRandampSqrtdTwoTrajectoryDataset(ToyConditionalGaussianRandampSqrtdDataset):
+    """Equal-weight mixture centered on one trajectory and a scaled copy.
+
+    With ``mu(theta)`` and component covariance ``Sigma(theta)`` inherited from
+    :class:`ToyConditionalGaussianRandampSqrtdDataset`, this model is
+
+    ``0.5 N(mu(theta), Sigma(theta)) + 0.5 N(s * mu(theta), Sigma(theta))``.
+
+    The default ``s=2`` gives the two trajectories requested by the full-Fisher
+    experiments.  Both components share the same continuously varying noise
+    covariance so the new behavior isolates conditional bimodality.
+    """
+
+    secondary_trajectory_scale: float = 2.0
+    secondary_trajectory_probability: float = 0.5
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        scale = float(self.secondary_trajectory_scale)
+        probability = float(self.secondary_trajectory_probability)
+        if not math.isfinite(scale) or scale <= 0.0:
+            raise ValueError("secondary_trajectory_scale must be finite and positive.")
+        if not (0.0 < probability < 1.0):
+            raise ValueError("secondary_trajectory_probability must be in (0, 1).")
+
+    def base_trajectory(self, theta: np.ndarray) -> np.ndarray:
+        """Return the unscaled component trajectory ``mu(theta)``."""
+        return super().tuning_curve(theta)
+
+    def base_trajectory_derivative(self, theta: np.ndarray) -> np.ndarray:
+        return super().tuning_curve_derivative(theta)
+
+    def component_means(self, theta: np.ndarray) -> np.ndarray:
+        """Return component means with shape ``(n, 2, x_dim)``."""
+        mu = self.base_trajectory(theta)
+        return np.stack([mu, float(self.secondary_trajectory_scale) * mu], axis=1)
+
+    def tuning_curve(self, theta: np.ndarray) -> np.ndarray:
+        """Return the mixture mean ``E[X | theta]``."""
+        p = float(self.secondary_trajectory_probability)
+        scale = float(self.secondary_trajectory_scale)
+        return ((1.0 - p) + p * scale) * self.base_trajectory(theta)
+
+    def tuning_curve_derivative(self, theta: np.ndarray) -> np.ndarray:
+        p = float(self.secondary_trajectory_probability)
+        scale = float(self.secondary_trajectory_scale)
+        return ((1.0 - p) + p * scale) * self.base_trajectory_derivative(theta)
+
+    def _component_variance_diag(self, theta: np.ndarray) -> np.ndarray:
+        return self._variance_diag_from_mu(self.base_trajectory(theta))
+
+    def _component_variance_diag_derivative(self, theta: np.ndarray) -> np.ndarray:
+        mu = self.base_trajectory(theta)
+        dmu = self.base_trajectory_derivative(theta)
+        alpha = self._sigma_activity_alpha.reshape(1, -1)
+        if self.randamp_sqrtd_obs_var_mu_law == RANDAMP_SQRTD_VAR_MU_LAW_ADDITIVE:
+            return alpha * np.sign(mu) * dmu
+        d = float(self.x_dim)
+        sb = self._sigma_base.reshape(1, -1)
+        return d * (sb**2) * alpha * np.sign(mu) * dmu
+
+    def component_covariance(self, theta: np.ndarray) -> np.ndarray:
+        """Return the within-component covariance ``Sigma(theta)``."""
+        variance = self._component_variance_diag(theta)
+        covariance = np.zeros((variance.shape[0], self.x_dim, self.x_dim), dtype=np.float64)
+        diagonal = np.arange(self.x_dim)
+        covariance[:, diagonal, diagonal] = variance
+        return covariance
+
+    def component_covariance_derivative(self, theta: np.ndarray) -> np.ndarray:
+        derivative = self._component_variance_diag_derivative(theta)
+        dcovariance = np.zeros((derivative.shape[0], self.x_dim, self.x_dim), dtype=np.float64)
+        diagonal = np.arange(self.x_dim)
+        dcovariance[:, diagonal, diagonal] = derivative
+        return dcovariance
+
+    def covariance(self, theta: np.ndarray) -> np.ndarray:
+        """Return the total conditional covariance of the Gaussian mixture."""
+        mu = self.base_trajectory(theta)
+        p = float(self.secondary_trajectory_probability)
+        delta_scale = float(self.secondary_trajectory_scale) - 1.0
+        between_scale = p * (1.0 - p) * delta_scale**2
+        between = between_scale * np.einsum("ni,nj->nij", mu, mu)
+        return self.component_covariance(theta) + between
+
+    def covariance_derivative(self, theta: np.ndarray) -> np.ndarray:
+        mu = self.base_trajectory(theta)
+        dmu = self.base_trajectory_derivative(theta)
+        p = float(self.secondary_trajectory_probability)
+        delta_scale = float(self.secondary_trajectory_scale) - 1.0
+        between_scale = p * (1.0 - p) * delta_scale**2
+        dbetween = between_scale * (
+            np.einsum("ni,nj->nij", dmu, mu) + np.einsum("ni,nj->nij", mu, dmu)
+        )
+        return self.component_covariance_derivative(theta) + dbetween
+
+    def covariance_scales(self, theta: np.ndarray) -> np.ndarray:
+        covariance = self.covariance(theta)
+        return np.sqrt(np.maximum(np.diagonal(covariance, axis1=1, axis2=2), 1e-12))
+
+    def covariance_scales_derivative(self, theta: np.ndarray) -> np.ndarray:
+        covariance = self.covariance(theta)
+        dcovariance = self.covariance_derivative(theta)
+        variance = np.diagonal(covariance, axis1=1, axis2=2)
+        dvariance = np.diagonal(dcovariance, axis1=1, axis2=2)
+        return dvariance / (2.0 * np.sqrt(np.maximum(variance, 1e-12)))
+
+    def sample_x_with_component(self, theta: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Sample responses and return their component labels (0 or 1)."""
+        theta = _theta_col(theta)
+        component = (
+            self.rng.random(theta.shape[0]) < float(self.secondary_trajectory_probability)
+        ).astype(np.int64)
+        means = self.component_means(theta)
+        selected_means = means[np.arange(theta.shape[0]), component]
+        eps = self.rng.standard_normal(size=selected_means.shape)
+        chol = np.linalg.cholesky(self.component_covariance(theta))
+        x = selected_means + np.einsum("nij,nj->ni", chol, eps)
+        return x.astype(np.float64), component
+
+    def sample_x(self, theta: np.ndarray) -> np.ndarray:
+        x, _ = self.sample_x_with_component(theta)
+        return x
+
+    def log_p_x_given_theta(self, x: np.ndarray, theta: np.ndarray) -> np.ndarray:
+        """Evaluate the exact two-component Gaussian-mixture log density."""
+        x = np.asarray(x, dtype=np.float64).reshape(-1, self.x_dim)
+        theta = _theta_col(theta)
+        if theta.shape[0] != x.shape[0]:
+            raise ValueError(f"x and theta must have the same number of rows; got {x.shape[0]} and {theta.shape[0]}.")
+        means = self.component_means(theta)
+        variance = self._component_variance_diag(theta)
+        logdet = np.sum(np.log(variance), axis=1)
+        normalizer = float(self.x_dim) * np.log(2.0 * np.pi) + logdet
+
+        def component_log_density(mean: np.ndarray) -> np.ndarray:
+            quadratic = np.sum(((x - mean) ** 2) / variance, axis=1)
+            return -0.5 * (normalizer + quadratic)
+
+        p = float(self.secondary_trajectory_probability)
+        log_first = np.log1p(-p) + component_log_density(means[:, 0])
+        log_second = np.log(p) + component_log_density(means[:, 1])
+        return np.logaddexp(log_first, log_second)
+
+    def theta_score(self, x: np.ndarray, theta: np.ndarray) -> np.ndarray:
+        """Evaluate the exact scalar condition score ``d/dtheta log p(x|theta)``."""
+        x = np.asarray(x, dtype=np.float64).reshape(-1, self.x_dim)
+        theta = _theta_col(theta)
+        if theta.shape[0] != x.shape[0]:
+            raise ValueError(
+                f"x and theta must have the same number of rows; got {x.shape[0]} and {theta.shape[0]}."
+            )
+        mu = self.base_trajectory(theta)
+        dmu = self.base_trajectory_derivative(theta)
+        variance = self._component_variance_diag(theta)
+        dvariance = self._component_variance_diag_derivative(theta)
+        scales = np.asarray([1.0, float(self.secondary_trajectory_scale)], dtype=np.float64)
+        component_means = scales.reshape(1, 2, 1) * mu[:, None, :]
+        component_dmeans = scales.reshape(1, 2, 1) * dmu[:, None, :]
+        residual = x[:, None, :] - component_means
+        component_scores = np.sum(
+            residual * component_dmeans / variance[:, None, :]
+            + 0.5
+            * dvariance[:, None, :]
+            * (
+                np.square(residual) / np.square(variance[:, None, :])
+                - 1.0 / variance[:, None, :]
+            ),
+            axis=2,
+        )
+        logdet = np.sum(np.log(variance), axis=1)
+        normalizer = float(self.x_dim) * np.log(2.0 * np.pi) + logdet
+        component_log_density = -0.5 * (
+            normalizer[:, None]
+            + np.sum(np.square(residual) / variance[:, None, :], axis=2)
+        )
+        p = float(self.secondary_trajectory_probability)
+        log_weights = np.log(np.asarray([1.0 - p, p], dtype=np.float64)).reshape(1, 2)
+        joint_log_density = component_log_density + log_weights
+        mixture_log_density = np.logaddexp(joint_log_density[:, 0], joint_log_density[:, 1])
+        responsibilities = np.exp(joint_log_density - mixture_log_density[:, None])
+        return np.sum(responsibilities * component_scores, axis=1)
+
+
+@dataclass
 class ToyConditionalGaussianRandamp2DSqrtdDataset(ToyConditionalGaussianRandampSqrtdDataset):
     """Random-amplitude 2D Gaussian bump means with sqrt-d additive diagonal variance."""
 
