@@ -406,7 +406,7 @@ def test_build_flow_skl_model_uses_mlp_heads_and_film_nonlinear_subnets() -> Non
             assert isinstance(model.a_net, nn.Sequential)
             if family.startswith("condition_affine"):
                 assert _first_linear_in_features(model.a_net) == 3
-            elif family == "covariate_affine":
+            elif family.startswith("covariate_affine"):
                 assert _first_linear_in_features(model.a_net) == 2
             else:
                 assert _first_linear_in_features(model.a_net) == 1
@@ -558,6 +558,7 @@ def test_build_flow_skl_model_constructs_restricted_velocity_families() -> None:
         "shared_affine_diag": "CenteredSharedAffineDiagFlowSKLModel",
         "condition_affine_scalar": "CenteredConditionAffineScalarFlowSKLModel",
         "condition_affine_diag": "CenteredConditionAffineDiagFlowSKLModel",
+        "covariate_affine_diag": "CenteredCovariateAffineDiagFlowSKLModel",
         "shared_affine_low_rank_scalar": "CenteredSharedAffineLowRankScalarFlowSKLModel",
         "shared_affine_low_rank_diag": "CenteredSharedAffineLowRankDiagFlowSKLModel",
     }

@@ -340,6 +340,30 @@ def test_covariate_affine_matrix_is_class_shared_at_fixed_eeg_time() -> None:
     np.testing.assert_allclose(matrices, matrices.transpose(0, 2, 1))
 
 
+def test_covariate_affine_diag_is_diagonal_and_class_shared() -> None:
+    model = build_flow_skl_model(
+        velocity_family="covariate_affine_diag",
+        theta_dim=5,
+        x_dim=3,
+        hidden_dim=8,
+        depth=1,
+        affine_condition_indices=(4,),
+        divergence_estimator="exact",
+    )
+    theta = torch.tensor(
+        [
+            [1.0, 0.0, 0.0, 0.0, 0.25],
+            [0.0, 0.0, 0.0, 1.0, 0.25],
+        ]
+    )
+    matrices = model.A(theta, torch.full((2, 1), 0.4)).detach().numpy()
+    np.testing.assert_allclose(matrices[0], matrices[1], atol=0.0, rtol=0.0)
+    off_diagonal = matrices.copy()
+    diagonal = np.arange(3)
+    off_diagonal[:, diagonal, diagonal] = 0.0
+    np.testing.assert_allclose(off_diagonal, 0.0, atol=0.0, rtol=0.0)
+
+
 def test_time_conditioned_covariance_integrator_returns_one_spd_matrix_per_time() -> None:
     model = build_flow_skl_model(
         velocity_family="covariate_affine",

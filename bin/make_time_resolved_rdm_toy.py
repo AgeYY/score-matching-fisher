@@ -41,17 +41,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=ROOT / "data/time_resolved_rdm_toy_xdim40_n100_per_class",
+        default=ROOT
+        / "data/time_resolved_rdm_toy_controlled_rotation_xdim40_n100_per_class",
     )
     parser.add_argument("--x-dim", type=int, default=40)
     parser.add_argument("--n-trials-per-class", type=int, default=100)
     parser.add_argument("--n-time-points", type=int, default=301)
     parser.add_argument("--time-low", type=float, default=-6.0)
     parser.add_argument("--time-high", type=float, default=6.0)
+    parser.add_argument(
+        "--trajectory-mode",
+        choices=("scaled", "controlled_rotation"),
+        default="controlled_rotation",
+    )
     parser.add_argument("--secondary-scale", type=float, default=2.0)
     parser.add_argument("--covariance-alpha", type=float, default=0.65)
     parser.add_argument("--n-covariance-ellipses", type=int, default=16)
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument(
+        "--sample-seed",
+        type=int,
+        default=None,
+        help="Noise/sample seed; omitted preserves the historical seed+1 behavior.",
+    )
+    parser.add_argument(
+        "--skip-plot",
+        action="store_true",
+        help="Write the dataset archive and metadata without trajectory figures.",
+    )
+    parser.add_argument(
+        "--correlation-only",
+        action="store_true",
+        help="Omit covariance and non-correlation ground truths from the archive.",
+    )
     return parser.parse_args()
 
 
@@ -171,6 +193,16 @@ def _plot_dataset(
     axis.set_title("Two labeled time trajectories")
     axis.set_axis_off()
     axis.set_aspect("equal", adjustable="box")
+    if dataset.trajectory_mode == "controlled_rotation":
+        class_labels = (
+            r"Class 1",
+            r"Class 2 (rotated)",
+        )
+    else:
+        class_labels = (
+            r"Class 1",
+            r"Class 2 (scaled)",
+        )
     legend_handles = [
         Line2D(
             [0],
@@ -178,7 +210,7 @@ def _plot_dataset(
             color="0.15",
             linewidth=2.8,
             linestyle="solid",
-            label=r"Class 1: $\mu(t)$",
+            label=class_labels[0],
         ),
         Line2D(
             [0],
@@ -186,10 +218,16 @@ def _plot_dataset(
             color="0.15",
             linewidth=2.8,
             linestyle="dashed",
-            label=rf"Class 2: ${float(dataset.secondary_trajectory_scale):g}\mu(t)$",
+            label=class_labels[1],
         ),
     ]
-    axis.legend(handles=legend_handles, frameon=False, loc="best")
+    axis.legend(
+        handles=legend_handles,
+        frameon=False,
+        loc="lower left",
+        fontsize=11,
+        handlelength=2.2,
+    )
     colorbar = figure.colorbar(
         ScalarMappable(norm=norm, cmap=cmap),
         ax=axis,
@@ -215,36 +253,56 @@ def main() -> None:
         n_time_points=int(args.n_time_points),
         time_low=float(args.time_low),
         time_high=float(args.time_high),
+        trajectory_mode=str(args.trajectory_mode),
         secondary_trajectory_scale=float(args.secondary_scale),
         covariance_alpha=float(args.covariance_alpha),
         seed=int(args.seed),
     )
-    responses, labels = dataset.sample_trials(int(args.n_trials_per_class))
-    metadata = dataset.metadata(n_trials_per_class=int(args.n_trials_per_class))
+    responses, labels = dataset.sample_trials(
+        int(args.n_trials_per_class), sample_seed=args.sample_seed
+    )
+    metadata = dataset.metadata(
+        n_trials_per_class=int(args.n_trials_per_class),
+        sample_seed=args.sample_seed,
+    )
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    archive_payload: dict[str, np.ndarray] = {
+        "time": dataset.time,
+        "responses": responses,
+        "labels": labels,
+        "class_names": np.asarray(metadata["class_names"]),
+        "class_scales": dataset.class_scales,
+        "true_class_means": dataset.class_means,
+        "true_correlation_distance": dataset.true_correlation_distance(),
+        "true_cosine_distance": dataset.true_cosine_distance(),
+        "true_euclidean_distance": dataset.true_euclidean_distance(),
+        "true_fid_distance": dataset.true_fid_distance(),
+        "target_correlation_distance": dataset.target_correlation_distance,
+        "metadata_json": np.asarray(json.dumps(metadata, sort_keys=True)),
+    }
+    if not bool(args.correlation_only):
+        archive_payload.update(
+            {
+                "true_shared_covariances": dataset.shared_covariances,
+                "true_squared_euclidean": dataset.true_squared_euclidean_distance(),
+                "true_squared_mahalanobis": dataset.true_squared_mahalanobis_distance(),
+                "tuning_amplitudes": dataset.base_dataset._randamp_amp,
+                "tuning_centers": dataset.base_dataset._tuning_centers_theta,
+            }
+        )
     np.savez_compressed(
         args.output_dir / "two_class_time_resolved_rdm_toy.npz",
-        time=dataset.time,
-        responses=responses,
-        labels=labels,
-        class_names=np.asarray(metadata["class_names"]),
-        class_scales=dataset.class_scales,
-        true_class_means=dataset.class_means,
-        true_shared_covariances=dataset.shared_covariances,
-        true_squared_euclidean=dataset.true_squared_euclidean_distance(),
-        true_squared_mahalanobis=dataset.true_squared_mahalanobis_distance(),
-        tuning_amplitudes=dataset.base_dataset._randamp_amp,
-        tuning_centers=dataset.base_dataset._tuning_centers_theta,
-        metadata_json=np.asarray(json.dumps(metadata, sort_keys=True)),
+        **archive_payload,
     )
     (args.output_dir / "summary.json").write_text(
         json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
-    _plot_dataset(
-        dataset,
-        args.output_dir,
-        n_covariance_ellipses=int(args.n_covariance_ellipses),
-    )
+    if not bool(args.skip_plot):
+        _plot_dataset(
+            dataset,
+            args.output_dir,
+            n_covariance_ellipses=int(args.n_covariance_ellipses),
+        )
     print(json.dumps(metadata, indent=2, sort_keys=True), flush=True)
     print(f"[dataset] output={args.output_dir.resolve()}", flush=True)
 

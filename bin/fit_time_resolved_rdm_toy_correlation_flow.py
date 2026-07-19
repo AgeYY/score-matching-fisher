@@ -38,7 +38,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    dataset_dir = ROOT / "data/time_resolved_rdm_toy_xdim40_n100_per_class"
+    dataset_dir = (
+        ROOT
+        / "data/time_resolved_rdm_toy_controlled_rotation_xdim40_n100_per_class"
+    )
     parser.add_argument(
         "--dataset-npz",
         type=Path,
@@ -71,6 +74,11 @@ def parse_args() -> argparse.Namespace:
         default="hutchinson",
     )
     parser.add_argument("--hutchinson-probes", type=int, default=4)
+    parser.add_argument(
+        "--skip-plots",
+        action="store_true",
+        help="Save numerical results and checkpoint without per-case figures.",
+    )
     return parser.parse_args()
 
 
@@ -86,8 +94,13 @@ def _stratified_trial_split(
 ) -> tuple[np.ndarray, np.ndarray]:
     class_labels = np.asarray(labels, dtype=np.int64).reshape(-1)
     fraction = float(validation_fraction)
-    if not 0.0 < fraction < 1.0:
-        raise ValueError("validation_fraction must lie in (0, 1).")
+    if not 0.0 <= fraction < 1.0:
+        raise ValueError("validation_fraction must lie in [0, 1).")
+    if fraction == 0.0:
+        return (
+            np.arange(class_labels.size, dtype=np.int64),
+            np.empty(0, dtype=np.int64),
+        )
     rng = np.random.default_rng(int(seed))
     train_parts: list[np.ndarray] = []
     validation_parts: list[np.ndarray] = []
@@ -274,22 +287,34 @@ def _plot_distances(
     plt.close(figure)
 
 
-def _plot_losses(output_dir: Path, train_metadata: dict[str, Any]) -> None:
+def _plot_losses(
+    output_dir: Path,
+    train_metadata: dict[str, Any],
+    *,
+    validation_mode: str,
+) -> None:
     train = np.asarray(train_metadata["train_losses"], dtype=np.float64)
     validation = np.asarray(train_metadata["val_losses"], dtype=np.float64)
     monitored = np.asarray(train_metadata["val_monitor_losses"], dtype=np.float64)
     epochs = np.arange(1, train.size + 1)
     figure, axis = plt.subplots(figsize=(4.0, 3.5), layout="constrained")
     axis.plot(epochs, train, color="#4477AA", linewidth=1.0, alpha=0.6, label="Training")
+    held_out = validation_mode == "held-out trials"
     axis.plot(
         epochs,
         validation,
         color="#CC6677",
         linewidth=1.0,
         alpha=0.6,
-        label="Validation",
+        label="Validation" if held_out else "Selection loss",
     )
-    axis.plot(epochs, monitored, color="#228833", linewidth=1.8, label="EMA validation")
+    axis.plot(
+        epochs,
+        monitored,
+        color="#228833",
+        linewidth=1.8,
+        label="EMA validation" if held_out else "EMA selection",
+    )
     axis.axvline(
         int(train_metadata["best_epoch"]),
         color="0.15",
@@ -326,10 +351,18 @@ def main() -> None:
         labels = np.asarray(archive["labels"], dtype=np.int64)
         native_time = np.asarray(archive["time"], dtype=np.float64)
         true_class_means = np.asarray(archive["true_class_means"], dtype=np.float64)
+        dataset_ground_truth = (
+            np.asarray(archive["true_correlation_distance"], dtype=np.float64)
+            if "true_correlation_distance" in archive.files
+            else None
+        )
     with np.load(args.classical_npz, allow_pickle=False) as archive:
         classical_bin_centers = np.asarray(archive["bin_centers"], dtype=np.float64)
         classical_distance = np.asarray(
             archive["estimated_correlation_distance"], dtype=np.float64
+        )
+        classical_binned_ground_truth = np.asarray(
+            archive["true_correlation_distance"], dtype=np.float64
         )
     train_indices, validation_indices = _stratified_trial_split(
         labels, float(args.validation_fraction), int(args.seed)
@@ -338,9 +371,18 @@ def main() -> None:
     theta_train, x_train = _flatten_trials(
         responses, labels, native_time, train_indices, time_scale
     )
-    theta_validation, x_validation = _flatten_trials(
-        responses, labels, native_time, validation_indices, time_scale
-    )
+    if validation_indices.size:
+        theta_validation, x_validation = _flatten_trials(
+            responses, labels, native_time, validation_indices, time_scale
+        )
+        validation_mode = "held-out trials"
+    else:
+        theta_validation = theta_train
+        x_validation = x_train
+        validation_mode = (
+            "training endpoints with independent fixed flow-path noise; "
+            "not held-out data"
+        )
     model_kwargs: dict[str, Any] = {
         "velocity_family": VELOCITY_FAMILY,
         "theta_dim": 3,
@@ -401,7 +443,7 @@ def main() -> None:
     torch.cuda.synchronize(device)
     elapsed_seconds = time.perf_counter() - started
 
-    ground_truth = np.empty(native_time.size, dtype=np.float64)
+    ground_truth_from_means = np.empty(native_time.size, dtype=np.float64)
     for time_index in range(native_time.size):
         first = true_class_means[0, time_index]
         second = true_class_means[1, time_index]
@@ -410,14 +452,31 @@ def main() -> None:
         correlation = np.dot(first, second) / (
             np.linalg.norm(first) * np.linalg.norm(second)
         )
-        ground_truth[time_index] = 1.0 - np.clip(correlation, -1.0, 1.0)
+        ground_truth_from_means[time_index] = 1.0 - np.clip(
+            correlation, -1.0, 1.0
+        )
+    if dataset_ground_truth is None:
+        ground_truth = ground_truth_from_means
+    else:
+        np.testing.assert_allclose(
+            dataset_ground_truth,
+            ground_truth_from_means,
+            atol=2e-12,
+            rtol=0.0,
+        )
+        ground_truth = dataset_ground_truth
     flow_at_classical_bins = np.interp(
         classical_bin_centers, native_time, flow_distance
     )
-    classical_mean_absolute_error = float(np.mean(np.abs(classical_distance)))
+    ground_truth_at_classical_bins = np.interp(
+        classical_bin_centers, native_time, ground_truth
+    )
+    classical_mean_absolute_error = float(
+        np.mean(np.abs(classical_distance - ground_truth_at_classical_bins))
+    )
     flow_mean_absolute_error = float(np.mean(np.abs(flow_distance - ground_truth)))
     flow_bin_matched_mean_absolute_error = float(
-        np.mean(np.abs(flow_at_classical_bins))
+        np.mean(np.abs(flow_at_classical_bins - ground_truth_at_classical_bins))
     )
 
     np.savez_compressed(
@@ -428,6 +487,8 @@ def main() -> None:
         classical_bin_centers=classical_bin_centers,
         classical_correlation_distance=classical_distance,
         flow_at_classical_bin_centers=flow_at_classical_bins,
+        ground_truth_at_classical_bin_centers=ground_truth_at_classical_bins,
+        classical_binned_ground_truth=classical_binned_ground_truth,
         true_correlation_distance=ground_truth,
         train_trial_indices=train_indices,
         validation_trial_indices=validation_indices,
@@ -437,15 +498,20 @@ def main() -> None:
             train_metadata["val_monitor_losses"], dtype=np.float64
         ),
     )
-    _plot_distances(
-        args.output_dir,
-        native_time=native_time,
-        flow_distance=flow_distance,
-        classical_bin_centers=classical_bin_centers,
-        classical_distance=classical_distance,
-        ground_truth=ground_truth,
-    )
-    _plot_losses(args.output_dir, train_metadata)
+    if not bool(args.skip_plots):
+        _plot_distances(
+            args.output_dir,
+            native_time=native_time,
+            flow_distance=flow_distance,
+            classical_bin_centers=classical_bin_centers,
+            classical_distance=classical_distance,
+            ground_truth=ground_truth,
+        )
+        _plot_losses(
+            args.output_dir,
+            train_metadata,
+            validation_mode=validation_mode,
+        )
     summary = {
         "dataset_npz": str(args.dataset_npz.resolve()),
         "classical_npz": str(args.classical_npz.resolve()),
@@ -457,6 +523,7 @@ def main() -> None:
         "hutchinson_probes": int(args.hutchinson_probes),
         "train_trials": int(train_indices.size),
         "validation_trials": int(validation_indices.size),
+        "validation_mode": validation_mode,
         "train_samples": int(theta_train.shape[0]),
         "validation_samples": int(theta_validation.shape[0]),
         "best_epoch": int(train_metadata["best_epoch"]),
@@ -473,6 +540,7 @@ def main() -> None:
         "bin_matched_error_ratio_classical_over_flow": float(
             classical_mean_absolute_error / flow_bin_matched_mean_absolute_error
         ),
+        "ground_truth_distance_min": float(np.min(ground_truth)),
         "ground_truth_distance_max": float(np.max(ground_truth)),
         "seed": int(args.seed),
         "device": args.device,

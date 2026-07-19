@@ -31,7 +31,10 @@ from fisher.dataset_visualization import (  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
-    dataset_dir = ROOT / "data/time_resolved_rdm_toy_xdim40_n100_per_class"
+    dataset_dir = (
+        ROOT
+        / "data/time_resolved_rdm_toy_controlled_rotation_xdim40_n100_per_class"
+    )
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
@@ -127,7 +130,7 @@ def main() -> None:
         shared_covariances = np.asarray(
             archive["true_shared_covariances"], dtype=np.float64
         )
-        class_scales = np.asarray(archive["class_scales"], dtype=np.float64)
+        class_names = [str(value) for value in np.asarray(archive["class_names"])]
     with np.load(args.results_npz, allow_pickle=False) as archive:
         native_time = np.asarray(archive["native_time"], dtype=np.float64)
         flow_distance = np.asarray(
@@ -202,7 +205,7 @@ def main() -> None:
                 [0],
                 color="0.15",
                 linewidth=2.6,
-                label=rf"Class 1: ${class_scales[0]:g}\mu(t)$",
+                label=class_names[0],
             ),
             Line2D(
                 [0],
@@ -210,7 +213,7 @@ def main() -> None:
                 color="0.15",
                 linewidth=2.6,
                 linestyle="dashed",
-                label=rf"Class 2: ${class_scales[1]:g}\mu(t)$",
+                label=class_names[1],
             ),
         ],
         frameon=False,
@@ -260,12 +263,16 @@ def main() -> None:
     distance_axis.set_xlabel("Time")
     distance_axis.set_ylabel("Correlation distance")
     distance_axis.set_xlim(float(native_time[0]), float(native_time[-1]))
-    upper = max(float(np.max(classical_distance)), float(np.max(flow_distance)))
+    upper = max(
+        float(np.max(classical_distance)),
+        float(np.max(flow_distance)),
+        float(np.max(ground_truth)),
+    )
     distance_axis.set_ylim(-0.08 * upper, 1.08 * upper)
     distance_axis.spines["top"].set_visible(False)
     distance_axis.spines["right"].set_visible(False)
     distance_axis.tick_params(width=1.2, length=4)
-    distance_axis.legend(frameon=False, loc="upper right")
+    distance_axis.legend(frameon=False, loc="upper left")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     stem = "time_resolved_rdm_toy_trajectory_and_correlation_estimation"

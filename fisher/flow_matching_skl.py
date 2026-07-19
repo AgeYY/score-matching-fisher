@@ -34,6 +34,7 @@ VELOCITY_FAMILIES = (
     "condition_affine_scalar",
     "condition_affine_diag",
     "covariate_affine",
+    "covariate_affine_diag",
     "shared_affine_low_rank",
     "shared_affine_low_rank_scalar",
     "shared_affine_low_rank_diag",
@@ -1369,6 +1370,71 @@ class CenteredCovariateAffineFlowSKLModel(_CenteredAffineFlowSKLBase):
         )
 
 
+class CenteredCovariateAffineDiagFlowSKLModel(
+    CenteredCovariateAffineFlowSKLModel
+):
+    """Covariate-conditioned affine flow with diagonal, group-shared ``A``."""
+
+    def __init__(
+        self,
+        *,
+        theta_dim: int,
+        x_dim: int,
+        affine_condition_indices: tuple[int, ...],
+        hidden_dim: int = 128,
+        depth: int = 3,
+        network_architecture: str = "mlp",
+        quadrature_steps: int = 64,
+        path_schedule: str | GaussianAffinePathSchedule = "cosine",
+        divergence_estimator: str = "exact",
+        hutchinson_probes: int = 1,
+        theta_embedding: str = "identity",
+        theta_rbf_indices: tuple[int, ...] | None = None,
+        theta_rbf_num_centers: int = 8,
+        theta_rbf_lower: float = -6.0,
+        theta_rbf_upper: float = 6.0,
+        theta_rbf_bandwidth: float | None = None,
+    ) -> None:
+        super().__init__(
+            theta_dim=theta_dim,
+            x_dim=x_dim,
+            affine_condition_indices=affine_condition_indices,
+            hidden_dim=hidden_dim,
+            depth=depth,
+            network_architecture=network_architecture,
+            quadrature_steps=quadrature_steps,
+            path_schedule=path_schedule,
+            divergence_estimator=divergence_estimator,
+            hutchinson_probes=hutchinson_probes,
+            theta_embedding=theta_embedding,
+            theta_rbf_indices=theta_rbf_indices,
+            theta_rbf_num_centers=theta_rbf_num_centers,
+            theta_rbf_lower=theta_rbf_lower,
+            theta_rbf_upper=theta_rbf_upper,
+            theta_rbf_bandwidth=theta_rbf_bandwidth,
+        )
+        self.velocity_family = "covariate_affine_diag"
+        self.a_net = _make_parameter_net(
+            architecture=self.network_architecture,
+            in_dim=1 + self.affine_context_embedding_dim,
+            out_dim=self.x_dim,
+            hidden_dim=self.hidden_dim,
+            depth=self.depth,
+            final_gain=0.01,
+        )
+
+    def A(self, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(0)
+        if theta.ndim != 2 or int(theta.shape[1]) != self.theta_dim:
+            raise ValueError(f"theta must have shape [B, {self.theta_dim}].")
+        t = _as_col_t(t, batch=int(theta.shape[0]))
+        context = theta[:, self.affine_condition_indices]
+        context_features = self.affine_context_embedding(context)
+        diagonal = self.a_net(torch.cat([t, context_features], dim=1))
+        return _diag_batch_to_matrix(diagonal, x_dim=self.x_dim)
+
+
 class CenteredConditionAffineScalarFlowSKLModel(CenteredConditionAffineFlowSKLModel):
     """Centered condition-specific affine velocity with ``A(theta,t) = a(theta,t) I``."""
 
@@ -1690,7 +1756,10 @@ def build_flow_skl_model(
 
     fam = _normalize_velocity_family(velocity_family)
     theta_embedding_name = _normalize_theta_embedding_type(theta_embedding)
-    if theta_embedding_name != "identity" and fam != "covariate_affine":
+    if theta_embedding_name != "identity" and fam not in {
+        "covariate_affine",
+        "covariate_affine_diag",
+    }:
         raise ValueError(
             "Non-identity theta embedding is currently supported only for "
             "the covariate_affine velocity family."
@@ -1739,13 +1808,17 @@ def build_flow_skl_model(
             hutchinson_probes=int(hutchinson_probes),
             **common,
         )
-    if fam == "covariate_affine":
+    covariate_affine_classes = {
+        "covariate_affine": CenteredCovariateAffineFlowSKLModel,
+        "covariate_affine_diag": CenteredCovariateAffineDiagFlowSKLModel,
+    }
+    if fam in covariate_affine_classes:
         indices = (
             (int(theta_dim) - 1,)
             if affine_condition_indices is None
             else affine_condition_indices
         )
-        return CenteredCovariateAffineFlowSKLModel(
+        return covariate_affine_classes[fam](
             affine_condition_indices=tuple(int(index) for index in indices),
             quadrature_steps=int(quadrature_steps),
             path_schedule=path_schedule,

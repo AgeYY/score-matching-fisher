@@ -33,17 +33,22 @@ def parse_args() -> argparse.Namespace:
         "--dataset-npz",
         type=Path,
         default=ROOT
-        / "data/time_resolved_rdm_toy_xdim40_n100_per_class"
+        / "data/time_resolved_rdm_toy_controlled_rotation_xdim40_n100_per_class"
         / "two_class_time_resolved_rdm_toy.npz",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
         default=ROOT
-        / "data/time_resolved_rdm_toy_xdim40_n100_per_class"
+        / "data/time_resolved_rdm_toy_controlled_rotation_xdim40_n100_per_class"
         / "classical_correlation_bin0p5",
     )
     parser.add_argument("--bin-width", type=float, default=0.5)
+    parser.add_argument(
+        "--skip-plot",
+        action="store_true",
+        help="Save numerical estimates without the per-case figure.",
+    )
     return parser.parse_args()
 
 
@@ -73,61 +78,62 @@ def main() -> None:
         dataset_npz=np.asarray(str(args.dataset_npz.resolve())),
     )
 
-    plt.rcParams.update(
-        {
-            "font.size": 16,
-            "axes.labelsize": 16,
-            "axes.titlesize": 14,
-            "xtick.labelsize": 16,
-            "ytick.labelsize": 16,
-            "legend.fontsize": 11,
-            "axes.grid": False,
-            "figure.facecolor": "white",
-            "savefig.facecolor": "white",
-            "savefig.bbox": "tight",
-        }
-    )
-    figure, axis = plt.subplots(figsize=(4.0, 3.5), layout="constrained")
-    axis.plot(
-        result["bin_centers"],
-        estimated,
-        color="#4477AA",
-        linewidth=2.0,
-        marker="o",
-        markersize=4.0,
-        label="Classical",
-    )
-    axis.plot(
-        result["bin_centers"],
-        ground_truth,
-        color="0.15",
-        linewidth=2.0,
-        linestyle="--",
-        label="Ground truth",
-    )
-    upper = max(float(np.max(estimated)), np.finfo(np.float64).eps)
-    axis.set_ylim(-0.08 * upper, 1.08 * upper)
-    axis.set_xlim(float(time[0]), float(time[-1]))
-    axis.set_xlabel("Time")
-    axis.set_ylabel("Correlation distance")
-    axis.legend(
-        frameon=False,
-        loc="lower center",
-        bbox_to_anchor=(0.5, 1.01),
-        ncol=2,
-        borderaxespad=0.0,
-        handlelength=2.2,
-    )
-    axis.grid(False)
-    axis.spines["top"].set_visible(False)
-    axis.spines["right"].set_visible(False)
-    axis.spines["left"].set_linewidth(1.8)
-    axis.spines["bottom"].set_linewidth(1.8)
-    axis.tick_params(width=1.8)
-    stem = "classical_correlation_distance_vs_time"
-    figure.savefig(args.output_dir / f"{stem}.png", dpi=300)
-    figure.savefig(args.output_dir / f"{stem}.svg")
-    plt.close(figure)
+    if not bool(args.skip_plot):
+        plt.rcParams.update(
+            {
+                "font.size": 16,
+                "axes.labelsize": 16,
+                "axes.titlesize": 14,
+                "xtick.labelsize": 16,
+                "ytick.labelsize": 16,
+                "legend.fontsize": 11,
+                "axes.grid": False,
+                "figure.facecolor": "white",
+                "savefig.facecolor": "white",
+                "savefig.bbox": "tight",
+            }
+        )
+        figure, axis = plt.subplots(figsize=(4.0, 3.5), layout="constrained")
+        axis.plot(
+            result["bin_centers"],
+            estimated,
+            color="#4477AA",
+            linewidth=2.0,
+            marker="o",
+            markersize=4.0,
+            label="Classical",
+        )
+        axis.plot(
+            result["bin_centers"],
+            ground_truth,
+            color="0.15",
+            linewidth=2.0,
+            linestyle="--",
+            label="Ground truth",
+        )
+        upper = max(float(np.max(estimated)), np.finfo(np.float64).eps)
+        axis.set_ylim(-0.08 * upper, 1.08 * upper)
+        axis.set_xlim(float(time[0]), float(time[-1]))
+        axis.set_xlabel("Time")
+        axis.set_ylabel("Correlation distance")
+        axis.legend(
+            frameon=False,
+            loc="lower center",
+            bbox_to_anchor=(0.5, 1.01),
+            ncol=2,
+            borderaxespad=0.0,
+            handlelength=2.2,
+        )
+        axis.grid(False)
+        axis.spines["top"].set_visible(False)
+        axis.spines["right"].set_visible(False)
+        axis.spines["left"].set_linewidth(1.8)
+        axis.spines["bottom"].set_linewidth(1.8)
+        axis.tick_params(width=1.8)
+        stem = "classical_correlation_distance_vs_time"
+        figure.savefig(args.output_dir / f"{stem}.png", dpi=300)
+        figure.savefig(args.output_dir / f"{stem}.svg")
+        plt.close(figure)
 
     summary = {
         "dataset_npz": str(args.dataset_npz.resolve()),
@@ -139,11 +145,12 @@ def main() -> None:
         "n_bins": int(result["bin_centers"].size),
         "estimated_distance_min": float(np.min(estimated)),
         "estimated_distance_max": float(np.max(estimated)),
+        "mean_absolute_error": float(np.mean(np.abs(estimated - ground_truth))),
         "ground_truth_distance_min": float(np.min(ground_truth)),
         "ground_truth_distance_max": float(np.max(ground_truth)),
         "ground_truth_interpretation": (
-            "Zero because class 2 is a positive scalar multiple of class 1, "
-            "and correlation distance is invariant to positive scaling."
+            "Correlation distance between the population class means after "
+            "averaging each mean over the native time samples in the bin."
         ),
     }
     (args.output_dir / "summary.json").write_text(
