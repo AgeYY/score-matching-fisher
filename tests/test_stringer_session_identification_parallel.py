@@ -7,6 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from global_setting import DEFAULT_DEVICE
+
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
@@ -38,7 +40,7 @@ def test_parallel_parser_defaults_jobs_per_gpu_five(monkeypatch: pytest.MonkeyPa
     assert args.gpu_ids == [0, 1]
     assert args.jobs_per_gpu == 5
     assert args.cpu_threads_per_job == 4
-    assert args.device == "cuda:1"
+    assert args.device == DEFAULT_DEVICE
     assert args.output_dir == tmp_path / "out"
     assert args.parallel_log_dir == tmp_path / "out" / "parallel_logs"
 

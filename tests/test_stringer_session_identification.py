@@ -20,7 +20,10 @@ from fisher.stringer_session_identification import (
     DISTANCE_RMSE,
     DIRECTION_A_TO_B,
     FLOW_ORIENTATION_ENCODING_PERIODIC_SINCOS,
+    FLOW_ORIENTATION_ENCODING_PERIODIC_RBF,
     FLOW_ORIENTATION_ENCODING_SCALAR,
+    STRINGER_FLOW_FIXED_VALIDATION_PATHS,
+    STRINGER_FLOW_PERIODIC_RBF_NUM_CENTERS,
     HALF_A,
     HALF_B,
     DISTANCES,
@@ -54,6 +57,11 @@ from fisher.stringer_session_identification import (
     write_subsample_results_npz,
     write_summary_json,
     zscore_log_fisher_curve,
+)
+from global_setting import (
+    DEFAULT_DEVICE,
+    DEFAULT_EARLY_STOPPING_PATIENCE,
+    DEFAULT_TRAINING_MAX_EPOCHS,
 )
 
 
@@ -95,6 +103,21 @@ def test_encode_flow_orientation_periodic_wraps_at_period() -> None:
     np.testing.assert_allclose(encoded[3], [-1.0, 0.0], atol=1e-12)
 
 
+def test_encode_flow_orientation_periodic_rbf_is_local_and_wraps_at_period() -> None:
+    period = float(np.pi)
+    spacing = period / STRINGER_FLOW_PERIODIC_RBF_NUM_CENTERS
+    theta = np.asarray([0.0, period, spacing, period / 2.0], dtype=np.float64)
+
+    encoded = encode_flow_orientation(theta, period=period, encoding=FLOW_ORIENTATION_ENCODING_PERIODIC_RBF)
+
+    assert encoded.shape == (4, STRINGER_FLOW_PERIODIC_RBF_NUM_CENTERS)
+    np.testing.assert_allclose(encoded[0], encoded[1], atol=1e-12)
+    assert int(np.argmax(encoded[0])) == 0
+    assert int(np.argmax(encoded[2])) == 1
+    assert int(np.argmax(encoded[3])) == STRINGER_FLOW_PERIODIC_RBF_NUM_CENTERS // 2
+    np.testing.assert_allclose(encoded.max(axis=1), 1.0, atol=1e-12)
+
+
 def test_encode_flow_orientation_scalar_keeps_original_theta_column() -> None:
     theta = np.asarray([0.0, 0.25, 0.5], dtype=np.float64)
 
@@ -125,9 +148,12 @@ def test_flow_orientation_encoding_changes_half_curve_cache_signature() -> None:
     )
 
     periodic = half_curve_signature(flow_orientation_encoding=FLOW_ORIENTATION_ENCODING_PERIODIC_SINCOS, **common)
+    periodic_rbf = half_curve_signature(flow_orientation_encoding=FLOW_ORIENTATION_ENCODING_PERIODIC_RBF, **common)
     scalar = half_curve_signature(flow_orientation_encoding=FLOW_ORIENTATION_ENCODING_SCALAR, **common)
 
-    assert periodic != scalar
+    assert len({periodic, periodic_rbf, scalar}) == 3
+    assert f'"flow_fixed_validation_paths":{STRINGER_FLOW_FIXED_VALIDATION_PATHS}' in periodic
+    assert f'"flow_periodic_rbf_num_centers":{STRINGER_FLOW_PERIODIC_RBF_NUM_CENTERS}' in periodic_rbf
 
 
 class _DummyAffineModel(torch.nn.Module):
@@ -631,6 +657,21 @@ def test_select_logcorr_flow_advantage_example_uses_n650_candidate() -> None:
     assert selected["flow_rank"] == 1
 
 
+def test_select_logcorr_flow_advantage_example_can_fall_back_without_advantage() -> None:
+    result = _logcorr_example_result()
+    flow = result.summary["subsample_runs"][0]["identification"][METHOD_FLOW_LINEAR]
+    flow[f"{DISTANCE_PRIMARY}_{DIRECTION_A_TO_B}"]["ranks"] = [2, 2]
+
+    selected = select_logcorr_flow_advantage_example(
+        result.summary,
+        n_subset=650,
+        require_advantage=False,
+    )
+
+    assert selected["session_index"] == 1
+    assert selected["classical_rank"] == selected["flow_rank"] == 2
+
+
 def test_plot_subsample_logcorr_example_writes_three_panel_figure(tmp_path: Path) -> None:
     result = _logcorr_example_result()
     curves_csv = _write_logcorr_example_curves(tmp_path / "curves.csv")
@@ -708,14 +749,14 @@ def test_cli_defaults_match_session_identification_plan() -> None:
     mod = _load_cli_module()
     args = mod.build_parser().parse_args([])
 
-    assert args.device == "cuda:1"
+    assert args.device == DEFAULT_DEVICE
     assert args.session_stimuli_type == "gratings_static"
     assert args.max_sessions is None
     assert args.theta_grid_size == 17
     assert args.pca_dim == 50
     assert args.flow_orientation_encoding == FLOW_ORIENTATION_ENCODING_PERIODIC_SINCOS
-    assert args.epochs == 50000
-    assert args.early_patience == 1000
+    assert args.epochs == DEFAULT_TRAINING_MAX_EPOCHS
+    assert args.early_patience == DEFAULT_EARLY_STOPPING_PATIENCE
     assert args.visualization_only is False
     assert args.subsample_a_convergence is False
     assert args.subsample_a_n_list == "200,650,1100,1550,2000"
@@ -728,3 +769,6 @@ def test_cli_defaults_match_session_identification_plan() -> None:
 
     scalar_args = mod.build_parser().parse_args(["--flow-orientation-encoding", FLOW_ORIENTATION_ENCODING_SCALAR])
     assert scalar_args.flow_orientation_encoding == FLOW_ORIENTATION_ENCODING_SCALAR
+
+    rbf_args = mod.build_parser().parse_args(["--flow-orientation-encoding", FLOW_ORIENTATION_ENCODING_PERIODIC_RBF])
+    assert rbf_args.flow_orientation_encoding == FLOW_ORIENTATION_ENCODING_PERIODIC_RBF

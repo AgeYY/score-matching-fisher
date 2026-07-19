@@ -44,6 +44,9 @@ from fisher.stringer_session_identification import (
     SUBSAMPLE_TOPK_ACCURACY_PNG_NAME,
     SUBSAMPLE_TOPK_ACCURACY_SVG_NAME,
     SUMMARY_JSON_NAME,
+    STRINGER_FLOW_FIXED_VALIDATION,
+    STRINGER_FLOW_FIXED_VALIDATION_PATHS,
+    STRINGER_FLOW_VALIDATION_SEED_OFFSET,
     IdentificationResult,
     SubsampleConvergenceResult,
     load_subsample_results_npz,
@@ -67,7 +70,12 @@ from fisher.stringer_session_identification import (
     write_subsample_summary_json,
     write_summary_json,
 )
-from global_setting import DATA_DIR, DEFAULT_DEVICE
+from global_setting import (
+    DATA_DIR,
+    DEFAULT_DEVICE,
+    DEFAULT_EARLY_STOPPING_PATIENCE,
+    DEFAULT_TRAINING_MAX_EPOCHS,
+)
 
 
 def _default_data_root() -> Path:
@@ -113,8 +121,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--subsample-a-sampling", choices=("stratified", "uniform"), default="stratified")
     p.add_argument("--subsample-a-without-replacement", action=argparse.BooleanOptionalAction, default=True)
 
-    p.add_argument("--epochs", type=int, default=50000)
-    p.add_argument("--early-patience", type=int, default=1000)
+    p.add_argument("--epochs", type=int, default=DEFAULT_TRAINING_MAX_EPOCHS)
+    p.add_argument("--early-patience", type=int, default=DEFAULT_EARLY_STOPPING_PATIENCE)
     p.add_argument("--early-min-delta", type=float, default=1e-4)
     p.add_argument("--early-ema-alpha", type=float, default=0.05)
     p.add_argument("--batch-size", type=int, default=1024)
@@ -368,6 +376,11 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
                 "subsample_logcorr_example_png": str(logcorr_example_png),
                 "flow_config": vars(flow_config_from_args(args)),
                 "flow_orientation_encoding": str(args.flow_orientation_encoding),
+                "flow_validation_protocol": {
+                    "fixed": STRINGER_FLOW_FIXED_VALIDATION,
+                    "paths": STRINGER_FLOW_FIXED_VALIDATION_PATHS,
+                    "seed_offset": STRINGER_FLOW_VALIDATION_SEED_OFFSET,
+                },
                 "classical_config": {
                     "linear_ridge": float(args.classical_linear_ridge),
                     "window_radius": args.classical_window_radius,
@@ -457,6 +470,11 @@ def run(args: argparse.Namespace) -> dict[str, Path]:
             "all_distance_summary_png": str(all_summary_png),
             "flow_config": vars(flow_config_from_args(args)),
             "flow_orientation_encoding": str(args.flow_orientation_encoding),
+            "flow_validation_protocol": {
+                "fixed": STRINGER_FLOW_FIXED_VALIDATION,
+                "paths": STRINGER_FLOW_FIXED_VALIDATION_PATHS,
+                "seed_offset": STRINGER_FLOW_VALIDATION_SEED_OFFSET,
+            },
             "classical_config": {
                 "linear_ridge": float(args.classical_linear_ridge),
                 "window_radius": args.classical_window_radius,

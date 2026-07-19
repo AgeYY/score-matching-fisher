@@ -58,7 +58,16 @@ HALF_B = "B"
 DIRECTION_A_TO_B = "A_to_B"
 FLOW_ORIENTATION_ENCODING_SCALAR = "scalar"
 FLOW_ORIENTATION_ENCODING_PERIODIC_SINCOS = "periodic-sincos"
-FLOW_ORIENTATION_ENCODINGS = (FLOW_ORIENTATION_ENCODING_PERIODIC_SINCOS, FLOW_ORIENTATION_ENCODING_SCALAR)
+FLOW_ORIENTATION_ENCODING_PERIODIC_RBF = "periodic-rbf"
+FLOW_ORIENTATION_ENCODINGS = (
+    FLOW_ORIENTATION_ENCODING_PERIODIC_SINCOS,
+    FLOW_ORIENTATION_ENCODING_PERIODIC_RBF,
+    FLOW_ORIENTATION_ENCODING_SCALAR,
+)
+STRINGER_FLOW_PERIODIC_RBF_NUM_CENTERS = 8
+STRINGER_FLOW_FIXED_VALIDATION = True
+STRINGER_FLOW_FIXED_VALIDATION_PATHS = 10
+STRINGER_FLOW_VALIDATION_SEED_OFFSET = 10_000
 ASUBSAMPLE_TASK_ENDPOINT_FULL_A = "endpoint_full_a"
 ASUBSAMPLE_TASK_REFERENCE_B = "reference_b"
 ASUBSAMPLE_TASK_SUBSET_A = "subset_a"
@@ -499,7 +508,14 @@ def encode_flow_orientation(theta: np.ndarray, *, period: float, encoding: str) 
     if pp <= 0.0 or not math.isfinite(pp):
         raise ValueError("period must be finite and positive for periodic orientation encoding.")
     phase = 2.0 * math.pi * np.mod(theta_col[:, 0], pp) / pp
-    return np.stack([np.cos(phase), np.sin(phase)], axis=1).astype(np.float64)
+    if enc == FLOW_ORIENTATION_ENCODING_PERIODIC_SINCOS:
+        return np.stack([np.cos(phase), np.sin(phase)], axis=1).astype(np.float64)
+
+    num_centers = STRINGER_FLOW_PERIODIC_RBF_NUM_CENTERS
+    centers = 2.0 * math.pi * np.arange(num_centers, dtype=np.float64) / num_centers
+    phase_bandwidth = 2.0 * math.pi / num_centers
+    phase_delta = phase[:, None] - centers[None, :]
+    return np.exp(-2.0 * np.sin(0.5 * phase_delta) ** 2 / phase_bandwidth**2).astype(np.float64)
 
 
 def estimate_affine_mixed_symmetric_kl_fisher_for_conditions(
@@ -675,6 +691,9 @@ def train_flow_linear_curve(
         ema_alpha=float(config.early_ema_alpha),
         max_grad_norm=float(config.max_grad_norm),
         log_every=max(1, int(config.log_every)),
+        fixed_validation=STRINGER_FLOW_FIXED_VALIDATION,
+        fixed_validation_paths=STRINGER_FLOW_FIXED_VALIDATION_PATHS,
+        validation_seed=int(seed) + STRINGER_FLOW_VALIDATION_SEED_OFFSET,
     )
     train_meta = dict(train_meta)
     train_meta.update(
@@ -768,26 +787,36 @@ def half_curve_signature(
     classical_window_radius: float | None,
     classical_min_endpoint_samples: int,
 ) -> str:
-    return config_signature(
-        {
-            "session_file": str(session_info.session_file),
-            "session_index": int(session_index),
-            "half_label": str(half_label),
-            "half_indices": np.asarray(half_indices, dtype=np.int64).tolist(),
-            "theta_grid": np.asarray(theta_grid, dtype=np.float64).reshape(-1).tolist(),
-            "period": float(period),
-            "pca_dim": int(pca_dim),
-            "pca_random_state": int(pca_random_state),
-            "pca_whiten": bool(pca_whiten),
-            "train_frac": float(train_frac),
-            "seed": int(seed),
-            "flow_config": json_ready(vars(flow_config)),
-            "flow_orientation_encoding": normalize_flow_orientation_encoding(flow_orientation_encoding),
-            "classical_ridge": float(classical_ridge),
-            "classical_window_radius": classical_window_radius,
-            "classical_min_endpoint_samples": int(classical_min_endpoint_samples),
-        }
-    )
+    encoding = normalize_flow_orientation_encoding(flow_orientation_encoding)
+    signature = {
+        "session_file": str(session_info.session_file),
+        "session_index": int(session_index),
+        "half_label": str(half_label),
+        "half_indices": np.asarray(half_indices, dtype=np.int64).tolist(),
+        "theta_grid": np.asarray(theta_grid, dtype=np.float64).reshape(-1).tolist(),
+        "period": float(period),
+        "pca_dim": int(pca_dim),
+        "pca_random_state": int(pca_random_state),
+        "pca_whiten": bool(pca_whiten),
+        "train_frac": float(train_frac),
+        "seed": int(seed),
+        "flow_config": json_ready(vars(flow_config)),
+        "flow_orientation_encoding": encoding,
+        "flow_fixed_validation": STRINGER_FLOW_FIXED_VALIDATION,
+        "flow_fixed_validation_paths": STRINGER_FLOW_FIXED_VALIDATION_PATHS,
+        "flow_validation_seed_offset": STRINGER_FLOW_VALIDATION_SEED_OFFSET,
+        "classical_ridge": float(classical_ridge),
+        "classical_window_radius": classical_window_radius,
+        "classical_min_endpoint_samples": int(classical_min_endpoint_samples),
+    }
+    if encoding == FLOW_ORIENTATION_ENCODING_PERIODIC_RBF:
+        signature.update(
+            {
+                "flow_periodic_rbf_num_centers": STRINGER_FLOW_PERIODIC_RBF_NUM_CENTERS,
+                "flow_periodic_rbf_bandwidth_rule": "one_center_spacing",
+            }
+        )
+    return config_signature(signature)
 
 
 def save_half_cache(path: Path, *, result: HalfCurveResult, signature: str) -> Path:
@@ -2352,9 +2381,11 @@ def select_logcorr_flow_advantage_example(
     summary: dict[str, Any],
     *,
     n_subset: int = 650,
+    require_advantage: bool = True,
 ) -> dict[str, Any]:
     session_keys = [str(v) for v in summary.get("session_keys", [])]
     candidates: list[dict[str, Any]] = []
+    fallback_candidates: list[dict[str, Any]] = []
     for run_summary in summary.get("subsample_runs", []):
         if int(run_summary.get("subset_n")) != int(n_subset):
             continue
@@ -2364,17 +2395,24 @@ def select_logcorr_flow_advantage_example(
         classical_ranks = [int(v) for v in classical["ranks"]]
         flow_ranks = [int(v) for v in flow["ranks"]]
         for session_index, (classical_rank, flow_rank) in enumerate(zip(classical_ranks, flow_ranks)):
+            candidate = {
+                "subset_n": int(n_subset),
+                "repeat": int(run_summary["repeat"]),
+                "session_index": int(session_index),
+                "session_key": session_keys[int(session_index)],
+                "classical_rank": int(classical_rank),
+                "flow_rank": int(flow_rank),
+            }
+            fallback_candidates.append(candidate)
             if int(flow_rank) == 1 and int(classical_rank) > 1:
-                candidates.append(
-                    {
-                        "subset_n": int(n_subset),
-                        "repeat": int(run_summary["repeat"]),
-                        "session_index": int(session_index),
-                        "session_key": session_keys[int(session_index)],
-                        "classical_rank": int(classical_rank),
-                        "flow_rank": int(flow_rank),
-                    }
-                )
+                candidates.append(candidate)
+    if not candidates and not require_advantage and fallback_candidates:
+        best_margin = max(int(row["classical_rank"]) - int(row["flow_rank"]) for row in fallback_candidates)
+        candidates = [
+            row
+            for row in fallback_candidates
+            if int(row["classical_rank"]) - int(row["flow_rank"]) == best_margin
+        ]
     if not candidates:
         raise ValueError(f"No flow-advantage log-correlation example found at A subset size {int(n_subset)}.")
     candidates = sorted(candidates, key=lambda row: (int(row["repeat"]), int(row["session_index"])))
@@ -2433,7 +2471,11 @@ def plot_subsample_logcorr_example(
     n_subset: int = 650,
 ) -> tuple[Path, Path]:
     curve_rows = _read_curve_rows_csv(curves_csv_path)
-    example = select_logcorr_flow_advantage_example(result.summary, n_subset=int(n_subset))
+    example = select_logcorr_flow_advantage_example(
+        result.summary,
+        n_subset=int(n_subset),
+        require_advantage=False,
+    )
     session_index = int(example["session_index"])
     repeat = int(example["repeat"])
     session_label = str(session_index)
