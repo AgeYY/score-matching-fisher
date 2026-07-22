@@ -912,6 +912,116 @@ def test_translation_log_prob_uses_package_likelihood_against_shifted_normal() -
     torch.testing.assert_close(got, expected, rtol=1e-12, atol=1e-12)
 
 
+def test_flow_training_fits_response_standardizer_on_train_split_only() -> None:
+    model = build_flow_skl_model(
+        velocity_family="translation",
+        theta_dim=1,
+        x_dim=2,
+        hidden_dim=4,
+        depth=1,
+        path_schedule="linear",
+    )
+    theta_train = np.zeros((4, 1), dtype=np.float64)
+    x_train = np.asarray([[8.0, -2.0], [12.0, -2.0], [8.0, 4.0], [12.0, 4.0]])
+    theta_val = np.zeros((2, 1), dtype=np.float64)
+    x_val = np.asarray([[1000.0, 2000.0], [3000.0, 4000.0]])
+
+    train_flow_skl_model(
+        model=model,
+        theta_train=theta_train,
+        x_train=x_train,
+        theta_val=theta_val,
+        x_val=x_val,
+        device=torch.device("cpu"),
+        path_schedule="linear",
+        epochs=1,
+        batch_size=4,
+        patience=0,
+        log_every=99,
+    )
+
+    standardizer = model._response_standardizer  # type: ignore[attr-defined]
+    np.testing.assert_allclose(standardizer.mean.cpu().numpy(), [10.0, 1.0])
+    np.testing.assert_allclose(standardizer.scale.cpu().numpy(), [2.0, 3.0])
+    transformed_train = standardizer.transform_numpy(x_train)
+    np.testing.assert_allclose(np.mean(transformed_train, axis=0), 0.0, atol=1e-12)
+    np.testing.assert_allclose(np.std(transformed_train, axis=0), 1.0, atol=1e-12)
+
+
+def test_flow_sampling_and_likelihood_are_transparent_in_observed_coordinates() -> None:
+    model = build_flow_skl_model(
+        velocity_family="translation",
+        theta_dim=1,
+        x_dim=2,
+        hidden_dim=4,
+        depth=1,
+        path_schedule="linear",
+        divergence_estimator="exact",
+    ).double()
+    model.mean_net = ConstantNet(torch.tensor([0.5, -1.0], dtype=torch.float64))
+    fms._fit_response_standardizer(  # type: ignore[attr-defined]
+        model,
+        np.asarray([[8.0, -6.0], [12.0, 4.0]], dtype=np.float64),
+    )
+    theta = np.zeros((1, 1), dtype=np.float64)
+
+    torch.manual_seed(123)
+    base = torch.randn(4, 2, dtype=torch.float64)
+    torch.manual_seed(123)
+    samples = sample_flow_endpoint(
+        model=model,
+        theta=theta,
+        n_samples=4,
+        device=torch.device("cpu"),
+        ode_steps=1,
+        ode_method="midpoint",
+    )
+    location = torch.tensor([10.0, -1.0], dtype=torch.float64)
+    scale = torch.tensor([2.0, 5.0], dtype=torch.float64)
+    expected_samples = location + scale * (base + torch.tensor([0.5, -1.0], dtype=torch.float64))
+    torch.testing.assert_close(samples, expected_samples, rtol=1e-6, atol=1e-6)
+
+    x_observed = torch.tensor([[14.0, 4.0]], dtype=torch.float64)
+    theta_tensor = torch.zeros((1, 1), dtype=torch.float64)
+    got = flow_endpoint_log_prob(model, x_observed, theta_tensor, ode_steps=1, ode_method="midpoint")
+    z = (x_observed - location) / scale - torch.tensor([[0.5, -1.0]], dtype=torch.float64)
+    expected = -0.5 * (torch.sum(z**2, dim=1) + 2.0 * np.log(2.0 * np.pi)) - torch.log(scale).sum()
+    torch.testing.assert_close(got, expected, rtol=1e-12, atol=1e-12)
+    torch.testing.assert_close(
+        model.endpoint_mean(theta_tensor),
+        location.reshape(1, -1) + scale.reshape(1, -1) * torch.tensor([[0.5, -1.0]], dtype=torch.float64),
+    )
+
+
+def test_response_standardizer_round_trips_in_state_dict_and_accepts_legacy_checkpoint() -> None:
+    kwargs = {
+        "velocity_family": "translation",
+        "theta_dim": 1,
+        "x_dim": 2,
+        "hidden_dim": 4,
+        "depth": 1,
+        "path_schedule": "linear",
+    }
+    model = build_flow_skl_model(**kwargs)
+    fms._fit_response_standardizer(  # type: ignore[attr-defined]
+        model,
+        np.asarray([[1.0, 10.0], [5.0, 14.0]], dtype=np.float64),
+    )
+    state = {key: value.detach().clone() for key, value in model.state_dict().items()}
+
+    restored = build_flow_skl_model(**kwargs)
+    restored.load_state_dict(state, strict=True)
+    np.testing.assert_allclose(restored._response_standardizer.mean.cpu().numpy(), [3.0, 12.0])  # type: ignore[attr-defined]
+    np.testing.assert_allclose(restored._response_standardizer.scale.cpu().numpy(), [2.0, 2.0])  # type: ignore[attr-defined]
+
+    legacy_state = {key: value for key, value in state.items() if not key.startswith("_response_standardizer.")}
+    legacy = build_flow_skl_model(**kwargs)
+    legacy.load_state_dict(legacy_state, strict=True)
+    np.testing.assert_allclose(legacy._response_standardizer.mean.cpu().numpy(), 0.0)  # type: ignore[attr-defined]
+    np.testing.assert_allclose(legacy._response_standardizer.scale.cpu().numpy(), 1.0)  # type: ignore[attr-defined]
+    assert bool(legacy._response_standardizer.fitted.item()) is True  # type: ignore[attr-defined]
+
+
 def test_cnf_likelihood_finetune_updates_model_and_records_validation_nll() -> None:
     torch.manual_seed(17)
     model = build_flow_skl_model(
@@ -1546,6 +1656,42 @@ class ScalarAffineIdentityCovModel(nn.Module):
         del theta
         batch = int(t.reshape(-1, 1).shape[0])
         return torch.zeros(batch, self.x_dim, self.x_dim, dtype=self.slope.dtype, device=self.slope.device)
+
+
+def test_affine_diagnostics_are_returned_in_observed_response_units() -> None:
+    model = ScalarAffineIdentityCovModel(np.asarray([1.0, 2.0], dtype=np.float64))
+    fms._fit_response_standardizer(  # type: ignore[attr-defined]
+        model,
+        np.asarray([[10.0, -5.0], [14.0, 1.0]], dtype=np.float64),
+    )
+    theta = np.asarray([0.0, 0.5, 1.0], dtype=np.float64).reshape(-1, 1)
+
+    means, covariances = fms.estimate_affine_endpoint_gaussians(
+        model=model,
+        theta_all=theta,
+        device=torch.device("cpu"),
+        ode_steps=1,
+    )
+    expected_means = np.asarray([12.0, -2.0])[None, :] + theta * np.asarray([2.0, 6.0])[None, :]
+    np.testing.assert_allclose(means, expected_means)
+    np.testing.assert_allclose(
+        covariances,
+        np.repeat(np.diag([4.0, 9.0])[None, :, :], theta.shape[0], axis=0),
+    )
+
+    mixed = fms.estimate_affine_mixed_symmetric_kl_fisher(
+        model=model,
+        theta_all=theta,
+        device=torch.device("cpu"),
+        ridge=0.0,
+        ode_steps=1,
+    )
+    np.testing.assert_allclose(mixed["delta_mu"], np.repeat([[1.0, 3.0]], 2, axis=0))
+    np.testing.assert_allclose(
+        mixed["mixed_covariance"],
+        np.repeat(np.diag([4.0, 9.0])[None, :, :], 2, axis=0),
+    )
+    np.testing.assert_allclose(mixed["fisher"], [5.0, 5.0])
 
 
 def test_affine_mixed_covariance_fisher_zero_a_closed_form() -> None:

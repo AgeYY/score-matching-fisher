@@ -22,6 +22,8 @@ from fisher.distance_comparison import save_flow_result_npz
 from fisher.flow_matching_skl import (
     DEFAULT_AFFINE_COVARIANCE_ODE_STEPS,
     FlowSKLResult,
+    _model_endpoint_mean_standardized,
+    _unstandardize_affine_deltas_covariances,
     build_flow_skl_model,
     train_flow_skl_model,
 )
@@ -578,8 +580,22 @@ def estimate_affine_mixed_symmetric_kl_fisher_for_conditions(
     for i in range(n_theta - 1):
         cond_l = torch.from_numpy(cond_s[i : i + 1].astype(np.float32)).to(device=device, dtype=dtype)
         cond_r = torch.from_numpy(cond_s[i + 1 : i + 2].astype(np.float32)).to(device=device, dtype=dtype)
-        mu_l = model.endpoint_mean(cond_l).detach().cpu().numpy().reshape(-1).astype(np.float64)
-        mu_r = model.endpoint_mean(cond_r).detach().cpu().numpy().reshape(-1).astype(np.float64)
+        mu_l = (
+            _model_endpoint_mean_standardized(model, cond_l)
+            .detach()
+            .cpu()
+            .numpy()
+            .reshape(-1)
+            .astype(np.float64)
+        )
+        mu_r = (
+            _model_endpoint_mean_standardized(model, cond_r)
+            .detach()
+            .cpu()
+            .numpy()
+            .reshape(-1)
+            .astype(np.float64)
+        )
         delta = mu_r - mu_l
         sigma_t = torch.eye(x_dim, dtype=dtype, device=device).reshape(1, x_dim, x_dim)
         dt = 1.0 / float(steps)
@@ -602,6 +618,9 @@ def estimate_affine_mixed_symmetric_kl_fisher_for_conditions(
         mid_covs[i] = sigma
         deltas[i] = delta
 
+    deltas_observed, mid_covs_observed = _unstandardize_affine_deltas_covariances(
+        model, deltas, mid_covs
+    )
     return {
         "theta_midpoints": (0.5 * (theta_s[:-1, 0] + theta_s[1:, 0])).reshape(-1, 1).astype(np.float64),
         "theta_left": theta_s[:-1].astype(np.float64),
@@ -609,8 +628,8 @@ def estimate_affine_mixed_symmetric_kl_fisher_for_conditions(
         "condition_left": cond_s[:-1].astype(np.float64),
         "condition_right": cond_s[1:].astype(np.float64),
         "dtheta": dtheta.astype(np.float64),
-        "delta_mu": deltas,
-        "mixed_covariance": mid_covs,
+        "delta_mu": deltas_observed,
+        "mixed_covariance": mid_covs_observed,
         "adjacent_symmetric_kl": adjacent_skl,
         "symmetric_kl_matrix": skl_matrix,
         "canonical_metric_matrix": skl_matrix.copy(),

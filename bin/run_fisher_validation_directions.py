@@ -11,7 +11,7 @@ from typing import Any
 
 import numpy as np
 import torch
-from sklearn.decomposition import PCA
+from sklearn.decomposition import PCA, TruncatedSVD
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -97,6 +97,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--session-index", type=int, default=0)
     parser.add_argument("--pca-dim", type=int, default=50)
     parser.add_argument(
+        "--pca-center",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Center Stringer responses before dimensionality reduction.",
+    )
+    parser.add_argument(
         "--pca-whiten",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -154,6 +160,7 @@ def _training_signature(args: argparse.Namespace, *, n_train: int, n_validation:
         "hidden_dim": int(args.hidden_dim),
         "depth": int(args.depth),
         "ode_steps": int(args.ode_steps),
+        "pca_center": bool(getattr(args, "pca_center", True)),
         "pca_whiten": bool(getattr(args, "pca_whiten", True)),
         "fit_gkr": not bool(args.skip_gkr or args.fm_only),
     }
@@ -272,6 +279,22 @@ def _fit_estimators(
         "seed": int(seed),
         "training_signature": signature,
         "flow_training": _jsonable_training(flow_training),
+        "flow_response_standardizer": {
+            "enabled": True,
+            "fit_pool": "flow_training_split_only",
+            "mean_norm": float(
+                torch.linalg.vector_norm(flow_model._response_standardizer.mean)  # type: ignore[attr-defined]
+                .detach()
+                .cpu()
+                .item()
+            ),
+            "scale_mean": float(
+                flow_model._response_standardizer.scale.mean()  # type: ignore[attr-defined]
+                .detach()
+                .cpu()
+                .item()
+            ),
+        },
     }
     metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     del flow_model
@@ -520,16 +543,32 @@ def _prepare_stringer(
             "validation" if args.direction == "train-test-allocation" else "test"
         ),
     )
-    pca = PCA(
-        n_components=args.pca_dim,
-        whiten=bool(args.pca_whiten),
-        svd_solver="randomized",
-        random_state=seed,
+    if not bool(args.pca_center) and bool(args.pca_whiten):
+        raise ValueError("Uncentered projection does not support whitening; pass --no-pca-whiten.")
+    if bool(args.pca_center):
+        projector: PCA | TruncatedSVD = PCA(
+            n_components=args.pca_dim,
+            whiten=bool(args.pca_whiten),
+            svd_solver="randomized",
+            random_state=seed,
+        )
+        projection_method = "pca_centered"
+    else:
+        projector = TruncatedSVD(
+            n_components=args.pca_dim,
+            algorithm="randomized",
+            random_state=seed,
+        )
+        projection_method = "truncated_svd_uncentered"
+    projector.fit(response_all[split.train])
+    x_train = projector.transform(response_all[split.train]).astype(np.float64)
+    x_validation = projector.transform(response_all[split.validation]).astype(np.float64)
+    x_test = projector.transform(response_all[split.test]).astype(np.float64)
+    projection_mean = (
+        np.asarray(projector.mean_, dtype=np.float64)
+        if isinstance(projector, PCA)
+        else np.zeros(response_all.shape[1], dtype=np.float64)
     )
-    pca.fit(response_all[split.train])
-    x_train = pca.transform(response_all[split.train]).astype(np.float64)
-    x_validation = pca.transform(response_all[split.validation]).astype(np.float64)
-    x_test = pca.transform(response_all[split.test]).astype(np.float64)
     case_dir.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         case_dir / "split_and_pca.npz",
@@ -537,10 +576,13 @@ def _prepare_stringer(
         validation_index=split.validation,
         test_index=split.test,
         stratum=split.stratum,
-        pca_components=pca.components_,
-        pca_mean=pca.mean_,
-        pca_explained_variance=pca.explained_variance_,
+        pca_components=projector.components_,
+        pca_mean=projection_mean,
+        pca_explained_variance=projector.explained_variance_,
+        pca_explained_variance_ratio=projector.explained_variance_ratio_,
+        pca_center=np.asarray(bool(args.pca_center)),
         pca_whiten=np.asarray(bool(args.pca_whiten)),
+        projection_method=np.asarray(projection_method),
     )
     return {
         "theta_train": theta_all[split.train],

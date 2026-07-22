@@ -99,6 +99,193 @@ def _as_torch_2d(a: np.ndarray, *, device: torch.device) -> torch.Tensor:
     return torch.from_numpy(arr.astype(np.float32, copy=False)).to(device)
 
 
+class _ResponseStandardizer(nn.Module):
+    """Train-fitted featurewise standardization carried privately by a flow model.
+
+    Each response feature is transformed independently as
+    ``(x - training_mean) / training_standard_deviation``. This does not rotate
+    features or whiten their full covariance matrix.
+    """
+
+    def __init__(self, x_dim: int, *, eps: float = 1e-8) -> None:
+        super().__init__()
+        if int(x_dim) < 1:
+            raise ValueError("x_dim must be >= 1.")
+        if not math.isfinite(float(eps)) or float(eps) <= 0.0:
+            raise ValueError("eps must be finite and positive.")
+        self.x_dim = int(x_dim)
+        self.eps = float(eps)
+        self.register_buffer("mean", torch.zeros(self.x_dim, dtype=torch.float32))
+        self.register_buffer("scale", torch.ones(self.x_dim, dtype=torch.float32))
+        self.register_buffer("fitted", torch.tensor(False, dtype=torch.bool))
+
+    def fit(self, x_train: np.ndarray) -> None:
+        x = _as_2d_float64(x_train, name="x_train")
+        if int(x.shape[0]) < 1:
+            raise ValueError("x_train must be non-empty.")
+        if int(x.shape[1]) != self.x_dim:
+            raise ValueError(f"x_train must have {self.x_dim} response features.")
+        if not np.all(np.isfinite(x)):
+            raise ValueError("x_train must contain only finite values.")
+        mean = np.mean(x, axis=0, dtype=np.float64)
+        scale = np.std(x, axis=0, dtype=np.float64)
+        scale = np.where(scale < self.eps, 1.0, scale)
+        with torch.no_grad():
+            self.mean.copy_(torch.as_tensor(mean, dtype=self.mean.dtype, device=self.mean.device))
+            self.scale.copy_(torch.as_tensor(scale, dtype=self.scale.dtype, device=self.scale.device))
+            self.fitted.fill_(True)
+
+    def transform_numpy(self, x: np.ndarray) -> np.ndarray:
+        arr = _as_2d_float64(x, name="x")
+        mean, scale = self.numpy_parameters()
+        return ((arr - mean) / scale).astype(np.float64, copy=False)
+
+    def transform_tensor(self, x: torch.Tensor) -> torch.Tensor:
+        if int(x.shape[-1]) != self.x_dim:
+            raise ValueError(f"x must have {self.x_dim} response features.")
+        mean = self.mean.to(device=x.device, dtype=x.dtype)
+        scale = self.scale.to(device=x.device, dtype=x.dtype)
+        return (x - mean) / scale
+
+    def inverse_tensor(self, x_standardized: torch.Tensor) -> torch.Tensor:
+        if int(x_standardized.shape[-1]) != self.x_dim:
+            raise ValueError(f"x must have {self.x_dim} response features.")
+        mean = self.mean.to(device=x_standardized.device, dtype=x_standardized.dtype)
+        scale = self.scale.to(device=x_standardized.device, dtype=x_standardized.dtype)
+        return x_standardized * scale + mean
+
+    def log_abs_det_inverse(self, *, like: torch.Tensor) -> torch.Tensor:
+        scale = self.scale.to(device=like.device, dtype=like.dtype)
+        return torch.log(scale).sum()
+
+    def numpy_parameters(self) -> tuple[np.ndarray, np.ndarray]:
+        return (
+            self.mean.detach().cpu().numpy().astype(np.float64, copy=True),
+            self.scale.detach().cpu().numpy().astype(np.float64, copy=True),
+        )
+
+    def _load_from_state_dict(
+        self,
+        state_dict: dict[str, torch.Tensor],
+        prefix: str,
+        local_metadata: dict[str, Any],
+        strict: bool,
+        missing_keys: list[str],
+        unexpected_keys: list[str],
+        error_msgs: list[str],
+    ) -> None:
+        # Checkpoints created before response standardization represent models
+        # trained in observed coordinates, so identity is the exact fallback.
+        legacy_checkpoint = not any(
+            prefix + name in state_dict for name in ("mean", "scale", "fitted")
+        )
+        state_dict.setdefault(prefix + "mean", self.mean.detach().clone())
+        state_dict.setdefault(prefix + "scale", self.scale.detach().clone())
+        state_dict.setdefault(
+            prefix + "fitted",
+            torch.tensor(legacy_checkpoint, dtype=self.fitted.dtype, device=self.fitted.device),
+        )
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
+
+def _response_standardizer(model: nn.Module, *, x_dim: int | None = None) -> _ResponseStandardizer | None:
+    standardizer = getattr(model, "_response_standardizer", None)
+    if standardizer is not None:
+        if not isinstance(standardizer, _ResponseStandardizer):
+            raise TypeError("model._response_standardizer has an incompatible type.")
+        return standardizer
+    if x_dim is None:
+        return None
+    standardizer = _ResponseStandardizer(int(x_dim))
+    model.add_module("_response_standardizer", standardizer)
+    return standardizer
+
+
+def _with_response_standardizer(model: nn.Module, *, x_dim: int) -> nn.Module:
+    _response_standardizer(model, x_dim=int(x_dim))
+    return model
+
+
+def _fit_response_standardizer(model: nn.Module, x_train: np.ndarray) -> _ResponseStandardizer:
+    x = _as_2d_float64(x_train, name="x_train")
+    standardizer = _response_standardizer(model, x_dim=int(x.shape[1]))
+    assert standardizer is not None
+    standardizer.fit(x)
+    return standardizer
+
+
+def _ensure_response_standardizer_fitted(model: nn.Module, x_train: np.ndarray) -> _ResponseStandardizer:
+    x = _as_2d_float64(x_train, name="x_train")
+    standardizer = _response_standardizer(model, x_dim=int(x.shape[1]))
+    assert standardizer is not None
+    if not bool(standardizer.fitted.detach().cpu().item()):
+        standardizer.fit(x)
+    return standardizer
+
+
+def _standardize_response_tensor(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    standardizer = _response_standardizer(model)
+    return x if standardizer is None else standardizer.transform_tensor(x)
+
+
+def _unstandardize_response_tensor(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    standardizer = _response_standardizer(model)
+    return x if standardizer is None else standardizer.inverse_tensor(x)
+
+
+def _model_endpoint_mean_standardized(model: nn.Module, theta: torch.Tensor) -> torch.Tensor:
+    endpoint = getattr(model, "_endpoint_mean_standardized", None)
+    if endpoint is not None:
+        return endpoint(theta)
+    return model.endpoint_mean(theta)  # type: ignore[attr-defined]
+
+
+def _response_standardizer_numpy_parameters(model: nn.Module) -> tuple[np.ndarray, np.ndarray]:
+    standardizer = _response_standardizer(model)
+    if standardizer is None:
+        x_dim = int(getattr(model, "x_dim"))
+        return np.zeros(x_dim, dtype=np.float64), np.ones(x_dim, dtype=np.float64)
+    return standardizer.numpy_parameters()
+
+
+def _unstandardize_affine_moments(
+    model: nn.Module,
+    means: np.ndarray,
+    covariances: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    mean, scale = _response_standardizer_numpy_parameters(model)
+    means_observed = mean[None, :] + np.asarray(means, dtype=np.float64) * scale[None, :]
+    covariances_observed = (
+        np.asarray(covariances, dtype=np.float64)
+        * scale[None, :, None]
+        * scale[None, None, :]
+    )
+    return means_observed, covariances_observed
+
+
+def _unstandardize_affine_deltas_covariances(
+    model: nn.Module,
+    deltas: np.ndarray,
+    covariances: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    _, scale = _response_standardizer_numpy_parameters(model)
+    deltas_observed = np.asarray(deltas, dtype=np.float64) * scale[None, :]
+    covariances_observed = (
+        np.asarray(covariances, dtype=np.float64)
+        * scale[None, :, None]
+        * scale[None, None, :]
+    )
+    return deltas_observed, covariances_observed
+
+
 def _as_col_t(t: torch.Tensor, *, batch: int | None = None) -> torch.Tensor:
     if t.ndim == 0:
         t = t.reshape(1, 1)
@@ -639,7 +826,7 @@ def _differentiable_endpoint_log_prob(
     return _standard_normal_log_prob(z) + log_det
 
 
-def flow_endpoint_log_prob(
+def _flow_endpoint_log_prob_standardized(
     model: nn.Module,
     x_norm: torch.Tensor,
     theta: torch.Tensor,
@@ -650,7 +837,7 @@ def flow_endpoint_log_prob(
     ode_method: str = "midpoint",
     enable_grad: bool = False,
 ) -> torch.Tensor:
-    """Compute endpoint log probability with ``flow_matching`` ODE likelihood."""
+    """Compute endpoint log probability in the model's standardized coordinates."""
 
     del solve_jitter, quadrature_steps
     if x_norm.ndim == 1:
@@ -695,6 +882,36 @@ def flow_endpoint_log_prob(
     if len(logps) == 1:
         return logps[0]
     return torch.stack(logps, dim=0).mean(dim=0)
+
+
+def flow_endpoint_log_prob(
+    model: nn.Module,
+    x_norm: torch.Tensor,
+    theta: torch.Tensor,
+    *,
+    solve_jitter: float = 1e-6,
+    quadrature_steps: int | None = None,
+    ode_steps: int = 32,
+    ode_method: str = "midpoint",
+    enable_grad: bool = False,
+) -> torch.Tensor:
+    """Compute endpoint log probability for responses in observed coordinates."""
+
+    x_standardized = _standardize_response_tensor(model, x_norm)
+    log_prob_standardized = _flow_endpoint_log_prob_standardized(
+        model,
+        x_standardized,
+        theta,
+        solve_jitter=float(solve_jitter),
+        quadrature_steps=quadrature_steps,
+        ode_steps=int(ode_steps),
+        ode_method=str(ode_method),
+        enable_grad=bool(enable_grad),
+    )
+    standardizer = _response_standardizer(model)
+    if standardizer is None:
+        return log_prob_standardized
+    return log_prob_standardized - standardizer.log_abs_det_inverse(like=x_standardized)
 
 
 def row_radius_normalize(x: torch.Tensor, radius: float, *, eps: float = 1e-12) -> torch.Tensor:
@@ -761,7 +978,7 @@ class TranslationFlowSKLModel(nn.Module):
         self.path_schedule = schedule
         self.path_schedule_name = name
 
-    def endpoint_mean(self, theta: torch.Tensor) -> torch.Tensor:
+    def _endpoint_mean_standardized(self, theta: torch.Tensor) -> torch.Tensor:
         if theta.ndim == 1:
             theta = theta.unsqueeze(-1)
         raw = self.mean_net(theta)
@@ -771,11 +988,14 @@ class TranslationFlowSKLModel(nn.Module):
             return centered_radius_normalize(raw, self.radius)
         return raw
 
+    def endpoint_mean(self, theta: torch.Tensor) -> torch.Tensor:
+        return _unstandardize_response_tensor(self, self._endpoint_mean_standardized(theta))
+
     def forward(self, x: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         del x
         t = _as_col_t(t, batch=int(theta.shape[0]))
         _, _, _, beta_dot = self.path_schedule.ab_ad_bd(t)
-        return beta_dot * self.endpoint_mean(theta)
+        return beta_dot * self._endpoint_mean_standardized(theta)
 
     def log_prob_normalized(
         self,
@@ -787,7 +1007,7 @@ class TranslationFlowSKLModel(nn.Module):
         ode_steps: int = 32,
         ode_method: str = "midpoint",
     ) -> torch.Tensor:
-        return flow_endpoint_log_prob(
+        return _flow_endpoint_log_prob_standardized(
             self,
             x_norm,
             theta,
@@ -860,7 +1080,7 @@ class ConditionalNonlinearXFlowFiLM(nn.Module):
         ode_steps: int = 32,
         ode_method: str = "midpoint",
     ) -> torch.Tensor:
-        return flow_endpoint_log_prob(
+        return _flow_endpoint_log_prob_standardized(
             self,
             x_norm,
             theta,
@@ -951,8 +1171,11 @@ class _CenteredAffineFlowSKLBase(nn.Module):
             theta = theta.unsqueeze(-1)
         return self.b_net(self.theta_embedding(theta))
 
-    def endpoint_mean(self, theta: torch.Tensor) -> torch.Tensor:
+    def _endpoint_mean_standardized(self, theta: torch.Tensor) -> torch.Tensor:
         return self.b(theta)
+
+    def endpoint_mean(self, theta: torch.Tensor) -> torch.Tensor:
+        return _unstandardize_response_tensor(self, self._endpoint_mean_standardized(theta))
 
     def regularization_loss(self) -> torch.Tensor | None:
         return None
@@ -1029,7 +1252,7 @@ class CenteredSharedAffineFlowSKLModel(_CenteredAffineFlowSKLBase):
         ode_steps: int = 32,
         ode_method: str = "midpoint",
     ) -> torch.Tensor:
-        return flow_endpoint_log_prob(
+        return _flow_endpoint_log_prob_standardized(
             self,
             x_norm,
             theta,
@@ -1200,7 +1423,7 @@ class CenteredConditionAffineFlowSKLModel(_CenteredAffineFlowSKLBase):
         ode_steps: int = 32,
         ode_method: str = "midpoint",
     ) -> torch.Tensor:
-        return flow_endpoint_log_prob(
+        return _flow_endpoint_log_prob_standardized(
             self,
             x_norm,
             theta,
@@ -1425,7 +1648,7 @@ class CenteredSharedAffineLowRankFlowSKLModel(CenteredSharedAffineFlowSKLModel):
         ode_steps: int = 32,
         ode_method: str = "midpoint",
     ) -> torch.Tensor:
-        return flow_endpoint_log_prob(
+        return _flow_endpoint_log_prob_standardized(
             self,
             x_norm,
             theta,
@@ -1558,14 +1781,17 @@ def build_flow_skl_model(
         "depth": int(depth),
     }
     if fam in TRANSLATION_FAMILIES:
-        return TranslationFlowSKLModel(
-            velocity_family=fam,
-            radius=float(radius),
-            path_schedule=path_schedule,
-            divergence_estimator=str(divergence_estimator),
-            hutchinson_probes=int(hutchinson_probes),
-            network_architecture=network_architecture,
-            **common,
+        return _with_response_standardizer(
+            TranslationFlowSKLModel(
+                velocity_family=fam,
+                radius=float(radius),
+                path_schedule=path_schedule,
+                divergence_estimator=str(divergence_estimator),
+                hutchinson_probes=int(hutchinson_probes),
+                network_architecture=network_architecture,
+                **common,
+            ),
+            x_dim=int(x_dim),
         )
     shared_affine_classes = {
         "shared_affine": CenteredSharedAffineFlowSKLModel,
@@ -1573,14 +1799,17 @@ def build_flow_skl_model(
         "shared_affine_diag": CenteredSharedAffineDiagFlowSKLModel,
     }
     if fam in shared_affine_classes:
-        return shared_affine_classes[fam](
-            quadrature_steps=int(quadrature_steps),
-            path_schedule=path_schedule,
-            divergence_estimator=str(divergence_estimator),
-            hutchinson_probes=int(hutchinson_probes),
-            a_diag_jitter=float(shared_affine_a_diag_jitter),
-            network_architecture=network_architecture,
-            **common,
+        return _with_response_standardizer(
+            shared_affine_classes[fam](
+                quadrature_steps=int(quadrature_steps),
+                path_schedule=path_schedule,
+                divergence_estimator=str(divergence_estimator),
+                hutchinson_probes=int(hutchinson_probes),
+                a_diag_jitter=float(shared_affine_a_diag_jitter),
+                network_architecture=network_architecture,
+                **common,
+            ),
+            x_dim=int(x_dim),
         )
     condition_affine_classes = {
         "condition_affine": CenteredConditionAffineFlowSKLModel,
@@ -1588,17 +1817,20 @@ def build_flow_skl_model(
         "condition_affine_diag": CenteredConditionAffineDiagFlowSKLModel,
     }
     if fam in condition_affine_classes:
-        return condition_affine_classes[fam](
-            quadrature_steps=int(quadrature_steps),
-            path_schedule=path_schedule,
-            divergence_estimator=str(divergence_estimator),
-            hutchinson_probes=int(hutchinson_probes),
-            theta_embedding=str(theta_embedding),
-            theta_rbf_num_centers=int(theta_rbf_num_centers),
-            theta_rbf_lower=float(theta_rbf_lower),
-            theta_rbf_upper=float(theta_rbf_upper),
-            theta_rbf_bandwidth=theta_rbf_bandwidth,
-            **common,
+        return _with_response_standardizer(
+            condition_affine_classes[fam](
+                quadrature_steps=int(quadrature_steps),
+                path_schedule=path_schedule,
+                divergence_estimator=str(divergence_estimator),
+                hutchinson_probes=int(hutchinson_probes),
+                theta_embedding=str(theta_embedding),
+                theta_rbf_num_centers=int(theta_rbf_num_centers),
+                theta_rbf_lower=float(theta_rbf_lower),
+                theta_rbf_upper=float(theta_rbf_upper),
+                theta_rbf_bandwidth=theta_rbf_bandwidth,
+                **common,
+            ),
+            x_dim=int(x_dim),
         )
     low_rank_affine_classes = {
         "shared_affine_low_rank": CenteredSharedAffineLowRankFlowSKLModel,
@@ -1607,26 +1839,32 @@ def build_flow_skl_model(
     }
     if fam in low_rank_affine_classes:
         rank = resolve_lxf_low_rank_dim(int(low_rank_dim), int(x_dim), log_prefix="[flow-skl] ")
-        return low_rank_affine_classes[fam](
-            correction_rank=rank,
-            quadrature_steps=int(quadrature_steps),
-            path_schedule=path_schedule,
-            divergence_estimator=str(divergence_estimator),
-            hutchinson_probes=int(hutchinson_probes),
-            a_diag_jitter=float(shared_affine_a_diag_jitter),
-            low_rank_basis=low_rank_basis,
-            **common,
+        return _with_response_standardizer(
+            low_rank_affine_classes[fam](
+                correction_rank=rank,
+                quadrature_steps=int(quadrature_steps),
+                path_schedule=path_schedule,
+                divergence_estimator=str(divergence_estimator),
+                hutchinson_probes=int(hutchinson_probes),
+                a_diag_jitter=float(shared_affine_a_diag_jitter),
+                low_rank_basis=low_rank_basis,
+                **common,
+            ),
+            x_dim=int(x_dim),
         )
     if fam == "nonlinear":
-        return ConditionalNonlinearXFlowFiLM(
-            divergence_estimator=str(divergence_estimator),
-            hutchinson_probes=int(hutchinson_probes),
-            theta_embedding=str(theta_embedding),
-            theta_rbf_num_centers=int(theta_rbf_num_centers),
-            theta_rbf_lower=float(theta_rbf_lower),
-            theta_rbf_upper=float(theta_rbf_upper),
-            theta_rbf_bandwidth=theta_rbf_bandwidth,
-            **common,
+        return _with_response_standardizer(
+            ConditionalNonlinearXFlowFiLM(
+                divergence_estimator=str(divergence_estimator),
+                hutchinson_probes=int(hutchinson_probes),
+                theta_embedding=str(theta_embedding),
+                theta_rbf_num_centers=int(theta_rbf_num_centers),
+                theta_rbf_lower=float(theta_rbf_lower),
+                theta_rbf_upper=float(theta_rbf_upper),
+                theta_rbf_bandwidth=theta_rbf_bandwidth,
+                **common,
+            ),
+            x_dim=int(x_dim),
         )
     raise AssertionError(f"Unhandled velocity family {fam!r}.")
 
@@ -1759,8 +1997,18 @@ def train_flow_skl_model(
     if th_tr.shape[0] != x_tr.shape[0] or th_va.shape[0] != x_va.shape[0]:
         raise ValueError("theta and x split lengths must match.")
 
+    x_tr_observed = x_tr
+    x_va_observed = x_va
+    response_standardizer = _fit_response_standardizer(model, x_tr_observed)
+    x_tr = response_standardizer.transform_numpy(x_tr_observed)
+    x_va = response_standardizer.transform_numpy(x_va_observed)
+
     train_ds = TensorDataset(torch.from_numpy(th_tr.astype(np.float32)), torch.from_numpy(x_tr.astype(np.float32)))
     val_ds = TensorDataset(torch.from_numpy(th_va.astype(np.float32)), torch.from_numpy(x_va.astype(np.float32)))
+    val_observed_ds = TensorDataset(
+        torch.from_numpy(th_va.astype(np.float32)),
+        torch.from_numpy(x_va_observed.astype(np.float32)),
+    )
     train_loader = DataLoader(train_ds, batch_size=int(batch_size), shuffle=True)
     val_loader_generator = None
     if validation_seed is not None:
@@ -1772,6 +2020,7 @@ def train_flow_skl_model(
         shuffle=False,
         generator=val_loader_generator,
     )
+    val_observed_loader = DataLoader(val_observed_ds, batch_size=int(batch_size), shuffle=False)
 
     model.to(device)
     _, schedule_name = _resolve_path_schedule(path_schedule)
@@ -1884,7 +2133,7 @@ def train_flow_skl_model(
         ):
             nll_sum = 0.0
             nll_count = 0
-            for tb, x1b in val_loader:
+            for tb, x1b in val_observed_loader:
                 tb = tb.to(device)
                 x1b = x1b.to(device)
                 log_prob = flow_endpoint_log_prob(
@@ -2025,6 +2274,7 @@ def finetune_flow_skl_cnf_likelihood(
     if th_tr.shape[0] != x_tr.shape[0] or th_va.shape[0] != x_va.shape[0]:
         raise ValueError("theta and x split lengths must match.")
 
+    _ensure_response_standardizer_fitted(model, x_tr)
     train_ds = TensorDataset(torch.from_numpy(th_tr.astype(np.float32)), torch.from_numpy(x_tr.astype(np.float32)))
     val_ds = TensorDataset(torch.from_numpy(th_va.astype(np.float32)), torch.from_numpy(x_va.astype(np.float32)))
     train_loader = DataLoader(train_ds, batch_size=int(batch_size), shuffle=True)
@@ -2193,12 +2443,12 @@ def sample_flow_endpoint(
     if not str(ode_method).strip():
         raise ValueError("ode_method must be non-empty.")
     x_dim = int(getattr(model, "x_dim"))
-    x = torch.randn(int(n_samples), x_dim, dtype=torch.float32, device=device)
+    x = torch.randn(int(n_samples), x_dim, dtype=_model_floating_dtype(model), device=device)
     theta_b = th.expand(int(n_samples), int(th.shape[1]))
     model.eval()
     time_grid = torch.linspace(0.0, 1.0, steps + 1, dtype=x.dtype, device=device)
     solver = _make_flow_ode_solver(model)
-    return solver.sample(
+    x_standardized = solver.sample(
         x_init=x,
         step_size=None,
         method=str(ode_method),
@@ -2207,6 +2457,7 @@ def sample_flow_endpoint(
         enable_grad=False,
         theta_cond=theta_b,
     )
+    return _unstandardize_response_tensor(model, x_standardized)
 
 
 def _log_prob_model(
@@ -2456,8 +2707,8 @@ def estimate_affine_mixed_symmetric_kl_fisher(
     for i in range(n_theta - 1):
         th_l = torch.from_numpy(theta_s[i : i + 1].astype(np.float32)).to(device=device, dtype=dtype)
         th_r = torch.from_numpy(theta_s[i + 1 : i + 2].astype(np.float32)).to(device=device, dtype=dtype)
-        mu_l = model.endpoint_mean(th_l).detach().cpu().numpy().reshape(-1).astype(np.float64)
-        mu_r = model.endpoint_mean(th_r).detach().cpu().numpy().reshape(-1).astype(np.float64)
+        mu_l = _model_endpoint_mean_standardized(model, th_l).detach().cpu().numpy().reshape(-1).astype(np.float64)
+        mu_r = _model_endpoint_mean_standardized(model, th_r).detach().cpu().numpy().reshape(-1).astype(np.float64)
         delta = mu_r - mu_l
         sigma_t = torch.eye(x_dim, dtype=dtype, device=device).reshape(1, x_dim, x_dim)
         dt = 1.0 / float(steps)
@@ -2480,13 +2731,16 @@ def estimate_affine_mixed_symmetric_kl_fisher(
         mid_covs[i] = sigma
         deltas[i] = delta
 
+    deltas_observed, mid_covs_observed = _unstandardize_affine_deltas_covariances(
+        model, deltas, mid_covs
+    )
     return {
         "theta_midpoints": (0.5 * (theta_s[:-1, 0] + theta_s[1:, 0])).reshape(-1, 1).astype(np.float64),
         "theta_left": theta_s[:-1].astype(np.float64),
         "theta_right": theta_s[1:].astype(np.float64),
         "dtheta": dtheta.astype(np.float64),
-        "delta_mu": deltas,
-        "mixed_covariance": mid_covs,
+        "delta_mu": deltas_observed,
+        "mixed_covariance": mid_covs_observed,
         "adjacent_symmetric_kl": adjacent_skl,
         "symmetric_kl_matrix": skl_matrix,
         "canonical_metric_matrix": skl_matrix.copy(),
@@ -2547,7 +2801,9 @@ def estimate_affine_endpoint_gaussians(
     for start in range(0, int(theta.shape[0]), bs):
         stop = min(start + bs, int(theta.shape[0]))
         th = torch.from_numpy(theta[start:stop].astype(np.float32)).to(device=device, dtype=dtype)
-        means[start:stop] = model.endpoint_mean(th).detach().cpu().numpy().astype(np.float64)
+        means[start:stop] = (
+            _model_endpoint_mean_standardized(model, th).detach().cpu().numpy().astype(np.float64)
+        )
         covariance = torch.eye(x_dim, dtype=dtype, device=device).expand(stop - start, -1, -1).clone()
         for step in range(steps):
             t_value = (float(step) + 0.5) * dt
@@ -2560,7 +2816,7 @@ def estimate_affine_endpoint_gaussians(
             covariance = transition @ covariance @ transition.transpose(-1, -2)
         cov_np = covariance.detach().cpu().numpy().astype(np.float64)
         covariances[start:stop] = 0.5 * (cov_np + np.swapaxes(cov_np, -1, -2))
-    return means, covariances
+    return _unstandardize_affine_moments(model, means, covariances)
 
 
 @torch.no_grad()
