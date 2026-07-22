@@ -20,6 +20,7 @@ from sklearn.decomposition import PCA
 from fisher.continuous_fisher_comparison import ContinuousFlowConfig, METHOD_CLASSICAL_LINEAR, METHOD_FLOW_LINEAR
 from fisher.distance_comparison import save_flow_result_npz
 from fisher.flow_matching_skl import (
+    DEFAULT_AFFINE_COVARIANCE_ODE_STEPS,
     FlowSKLResult,
     build_flow_skl_model,
     train_flow_skl_model,
@@ -525,7 +526,7 @@ def estimate_affine_mixed_symmetric_kl_fisher_for_conditions(
     condition_all: np.ndarray,
     device: torch.device,
     ridge: float = 1e-6,
-    ode_steps: int = 64,
+    ode_steps: int = DEFAULT_AFFINE_COVARIANCE_ODE_STEPS,
 ) -> dict[str, Any]:
     theta = np.asarray(theta_all, dtype=np.float64).reshape(-1, 1)
     cond = np.asarray(condition_all, dtype=np.float64)
@@ -580,16 +581,18 @@ def estimate_affine_mixed_symmetric_kl_fisher_for_conditions(
         mu_l = model.endpoint_mean(cond_l).detach().cpu().numpy().reshape(-1).astype(np.float64)
         mu_r = model.endpoint_mean(cond_r).detach().cpu().numpy().reshape(-1).astype(np.float64)
         delta = mu_r - mu_l
-        sigma = eye_np.copy()
+        sigma_t = torch.eye(x_dim, dtype=dtype, device=device).reshape(1, x_dim, x_dim)
         dt = 1.0 / float(steps)
         for step in range(steps):
             t_val = (float(step) + 0.5) * dt
             tt = torch.full((1, 1), t_val, dtype=dtype, device=device)
             a_l = _a_for(cond_l, tt)
             a_r = _a_for(cond_r, tt)
-            a_bar = (0.5 * (a_l + a_r)).detach().cpu().numpy().reshape(x_dim, x_dim).astype(np.float64)
-            sigma = sigma + dt * (a_bar @ sigma + sigma @ a_bar.T)
-            sigma = 0.5 * (sigma + sigma.T)
+            a_bar = 0.5 * (a_l + a_r)
+            transition = torch.matrix_exp(float(dt) * a_bar)
+            sigma_t = transition @ sigma_t @ transition.transpose(-1, -2)
+            sigma_t = 0.5 * (sigma_t + sigma_t.transpose(-1, -2))
+        sigma = sigma_t.detach().cpu().numpy().reshape(x_dim, x_dim).astype(np.float64)
         cov = sigma + rr * eye_np
         skl = max(0.0, float(delta @ np.linalg.solve(cov, delta)))
         adjacent_skl[i] = skl

@@ -1588,6 +1588,33 @@ def test_affine_mixed_covariance_fisher_zero_a_closed_form() -> None:
     np.testing.assert_allclose(compat["symmetric_kl_matrix"], got["symmetric_kl_matrix"], rtol=1e-12, atol=1e-12)
 
 
+def test_affine_mixed_covariance_uses_midpoint_matrix_exponential() -> None:
+    class ConstantExpansionModel(ScalarAffineIdentityCovModel):
+        def A(self, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+            del theta
+            batch = int(t.reshape(-1, 1).shape[0])
+            eye = torch.eye(self.x_dim, dtype=self.slope.dtype, device=self.slope.device)
+            return float(np.log(2.0)) * eye.expand(batch, -1, -1)
+
+    model = ConstantExpansionModel(np.asarray([2.0, -1.0], dtype=np.float64))
+    theta = np.asarray([0.0, 0.5, 1.0], dtype=np.float64).reshape(-1, 1)
+    got = fms.estimate_affine_mixed_symmetric_kl_fisher(
+        model=model,
+        theta_all=theta,
+        device=torch.device("cpu"),
+        ridge=0.0,
+        ode_steps=1,
+    )
+
+    np.testing.assert_allclose(
+        got["mixed_covariance"],
+        4.0 * np.repeat(np.eye(2)[None], 2, axis=0),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(got["fisher"], np.asarray([1.25, 1.25]), rtol=1e-6, atol=1e-6)
+
+
 def test_adjacent_model_jeffreys_fisher_uses_only_adjacent_pairs(monkeypatch: pytest.MonkeyPatch) -> None:
     class DummyModel(nn.Module):
         x_dim = 1

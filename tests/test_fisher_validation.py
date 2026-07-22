@@ -15,6 +15,7 @@ from fisher.fisher_validation import (
     finite_grid_probe_increment,
     gaussian_mixture_moments,
     probe_mean,
+    stratified_disjoint_subset_indices,
     stratified_train_validation_test_split,
 )
 
@@ -176,6 +177,43 @@ def test_stratified_split_keeps_validation_fixed_across_test_ratios() -> None:
     for smaller, larger in zip(splits[:-1], splits[1:], strict=True):
         assert set(smaller.test).issubset(set(larger.test))
         assert set(larger.train).issubset(set(smaller.train))
+
+
+def test_stratified_disjoint_subsets_are_exact_disjoint_and_balanced() -> None:
+    theta = (np.arange(160, dtype=np.float64) + 0.5) * np.pi / 160.0
+    subsets = stratified_disjoint_subset_indices(
+        theta,
+        32,
+        n_subsets=5,
+        n_strata=16,
+        seed=37,
+        period=np.pi,
+    )
+
+    assert [subset.size for subset in subsets] == [32] * 5
+    assert np.unique(np.concatenate(subsets)).size == 160
+    for subset in subsets:
+        assert np.unique(subset).size == subset.size
+        bins = np.floor(theta[subset] / np.pi * 16).astype(np.int64)
+        counts = np.bincount(bins, minlength=16)
+        assert int(np.max(counts) - np.min(counts)) <= 1
+
+
+def test_stratified_disjoint_subsets_reject_invalid_sizes() -> None:
+    theta = np.linspace(0.0, 1.0, 20)
+    for size, count in ((0, 1), (1, 0), (21, 1), (5, 5)):
+        try:
+            stratified_disjoint_subset_indices(
+                theta,
+                size,
+                n_subsets=count,
+                n_strata=2,
+                seed=0,
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"Expected invalid size/count {(size, count)} to fail.")
 
 
 def test_toy_oracle_direction_recovers_finite_pair_information() -> None:

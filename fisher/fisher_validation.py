@@ -45,6 +45,72 @@ class LinearThresholdEvaluation:
     orientation: np.ndarray
 
 
+def stratified_disjoint_subset_indices(
+    theta: np.ndarray,
+    subset_size: int,
+    *,
+    n_subsets: int,
+    n_strata: int,
+    seed: int,
+    period: float | None = None,
+) -> list[np.ndarray]:
+    """Return equal-size, disjoint, condition-stratified subsets.
+
+    A random ordering is generated within each stratum. Observations are then
+    interleaved according to their within-stratum quantile and divided into
+    consecutive blocks. This makes each block follow the full condition
+    histogram while ensuring sampling without replacement across blocks.
+    """
+
+    values = np.asarray(theta, dtype=np.float64).reshape(-1)
+    size = int(subset_size)
+    count = int(n_subsets)
+    if values.size < 1:
+        raise ValueError("theta must contain at least one observation.")
+    if size < 1:
+        raise ValueError("subset_size must be positive.")
+    if count < 1:
+        raise ValueError("n_subsets must be positive.")
+    if size * count > values.size:
+        raise ValueError("subset_size * n_subsets must not exceed len(theta).")
+    if int(n_strata) < 1:
+        raise ValueError("n_strata must be positive.")
+
+    if period is None:
+        lower = float(np.min(values))
+        upper = float(np.max(values))
+        if not upper > lower:
+            raise ValueError("theta must vary.")
+        scaled = (values - lower) / (upper - lower)
+    else:
+        if not float(period) > 0.0:
+            raise ValueError("period must be positive.")
+        scaled = np.mod(values, float(period)) / float(period)
+    stratum = np.minimum(
+        (scaled * int(n_strata)).astype(np.int64), int(n_strata) - 1
+    )
+
+    rng = np.random.default_rng(int(seed))
+    ordered_index: list[np.ndarray] = []
+    ordered_priority: list[np.ndarray] = []
+    for bin_index in range(int(n_strata)):
+        index = np.flatnonzero(stratum == bin_index)
+        if index.size == 0:
+            raise ValueError(f"Stratum {bin_index} has no observations.")
+        index = rng.permutation(index)
+        priority = (np.arange(index.size, dtype=np.float64) + 0.5) / index.size
+        priority += rng.uniform(-1e-12, 1e-12, size=index.size)
+        ordered_index.append(index)
+        ordered_priority.append(priority)
+    all_index = np.concatenate(ordered_index)
+    all_priority = np.concatenate(ordered_priority)
+    order = all_index[np.argsort(all_priority, kind="mergesort")]
+    return [
+        np.sort(order[subset_index * size : (subset_index + 1) * size]).astype(np.int64)
+        for subset_index in range(count)
+    ]
+
+
 def _validate_split_fractions(
     train_fraction: float,
     validation_fraction: float,

@@ -190,6 +190,29 @@ def test_condition_fisher_readout_uses_scalar_theta_spacing_with_2d_conditions()
     np.testing.assert_allclose(fd["fisher"], [16.0])
 
 
+def test_condition_fisher_readout_uses_midpoint_matrix_exponential() -> None:
+    class ExpandingAffineModel(_DummyAffineModel):
+        def A(self, condition: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+            del condition, t
+            return torch.full(
+                (1, 1, 1), float(np.log(2.0)), dtype=self.weight.dtype, device=self.weight.device
+            )
+
+    theta = np.asarray([0.0, 0.5], dtype=np.float64)
+    condition = np.asarray([[0.0, 1.0], [2.0, 0.0]], dtype=np.float64)
+    fd = estimate_affine_mixed_symmetric_kl_fisher_for_conditions(
+        model=ExpandingAffineModel(),
+        theta_all=theta,
+        condition_all=condition,
+        device=torch.device("cpu"),
+        ode_steps=1,
+        ridge=0.0,
+    )
+
+    np.testing.assert_allclose(fd["mixed_covariance"], [[[4.0]]], rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(fd["fisher"], [4.0], rtol=1e-6, atol=1e-6)
+
+
 def test_stratified_half_split_is_complete_disjoint_and_balanced() -> None:
     theta = np.linspace(0.0, np.pi, 101, endpoint=False, dtype=np.float64)
 
