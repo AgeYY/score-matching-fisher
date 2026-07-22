@@ -37,6 +37,7 @@ VELOCITY_FAMILIES = (
     "condition_affine",
     "condition_affine_scalar",
     "condition_affine_diag",
+    "condition_affine_low_rank",
     "shared_affine_low_rank",
     "shared_affine_low_rank_scalar",
     "shared_affine_low_rank_diag",
@@ -1313,6 +1314,133 @@ class CenteredConditionAffineDiagFlowSKLModel(CenteredConditionAffineFlowSKLMode
         return _diag_batch_to_matrix(self.a_net(torch.cat([t, theta_features], dim=1)), x_dim=self.x_dim)
 
 
+class CenteredConditionAffineLowRankFlowSKLModel(_CenteredAffineFlowSKLBase):
+    """Centered affine velocity with symmetric rank-r ``A(theta,t)``.
+
+    The drift matrix is represented in diagonal-core factorized form as
+    ``A = U diag(s) U.T``.  ``U`` and the signed spectrum ``s`` both depend on
+    condition and time.  The forward pass applies the factors directly so FM
+    training does not allocate a dense ``[batch, D, D]`` matrix.
+    """
+
+    def __init__(
+        self,
+        *,
+        theta_dim: int,
+        x_dim: int,
+        rank: int,
+        hidden_dim: int = 128,
+        depth: int = 3,
+        quadrature_steps: int = 64,
+        path_schedule: str | GaussianAffinePathSchedule = "cosine",
+        divergence_estimator: str = "exact",
+        hutchinson_probes: int = 1,
+        theta_embedding: str = "identity",
+        theta_rbf_num_centers: int = 8,
+        theta_rbf_lower: float = -6.0,
+        theta_rbf_upper: float = 6.0,
+        theta_rbf_bandwidth: float | None = None,
+    ) -> None:
+        if int(rank) < 1:
+            raise ValueError("rank must be >= 1.")
+        if int(rank) > int(x_dim):
+            raise ValueError("rank must be <= x_dim.")
+        super().__init__(
+            theta_dim=theta_dim,
+            x_dim=x_dim,
+            hidden_dim=hidden_dim,
+            depth=depth,
+            quadrature_steps=quadrature_steps,
+            path_schedule=path_schedule,
+            divergence_estimator=divergence_estimator,
+            hutchinson_probes=int(hutchinson_probes),
+            theta_embedding=theta_embedding,
+            theta_rbf_num_centers=int(theta_rbf_num_centers),
+            theta_rbf_lower=float(theta_rbf_lower),
+            theta_rbf_upper=float(theta_rbf_upper),
+            theta_rbf_bandwidth=theta_rbf_bandwidth,
+        )
+        self.velocity_family = "condition_affine_low_rank"
+        self.rank = int(rank)
+        cond_dim = 1 + self.theta_embedding_dim
+        self.u_net = _make_mlp(
+            in_dim=cond_dim,
+            out_dim=self.x_dim * self.rank,
+            hidden_dim=self.hidden_dim,
+            depth=self.depth,
+            final_gain=0.0,
+        )
+        self.s_net = _make_mlp(
+            in_dim=cond_dim,
+            out_dim=self.rank,
+            hidden_dim=self.hidden_dim,
+            depth=self.depth,
+            final_gain=0.01,
+        )
+
+        # A nonzero orthonormal initial basis avoids the zero-gradient fixed
+        # point of a product parameterization initialized with U=s=0.
+        initial_u, _ = torch.linalg.qr(torch.randn(self.x_dim, self.rank), mode="reduced")
+        u_output = self.u_net[-1]
+        if not isinstance(u_output, nn.Linear):
+            raise TypeError("u_net output layer must be linear.")
+        with torch.no_grad():
+            u_output.weight.zero_()
+            u_output.bias.copy_(initial_u.reshape(-1))
+
+    def low_rank_factors(
+        self,
+        theta: torch.Tensor,
+        t: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return unit-column factors ``U`` and signed coefficients ``s``."""
+
+        if theta.ndim == 1:
+            theta = theta.unsqueeze(-1)
+        t = _as_col_t(t, batch=int(theta.shape[0]))
+        theta_features = self.theta_embedding(theta)
+        condition = torch.cat([t, theta_features], dim=1)
+        u = self.u_net(condition).reshape(int(theta.shape[0]), self.x_dim, self.rank)
+        u = u / torch.linalg.vector_norm(u, dim=1, keepdim=True).clamp_min(1e-8)
+        s = self.s_net(condition)
+        return u, s
+
+    def A(self, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        u, s = self.low_rank_factors(theta, t)
+        return torch.bmm(u * s.unsqueeze(1), u.transpose(1, 2))
+
+    def forward(self, x: torch.Tensor, theta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        theta = _expand_theta_to_batch(theta, batch=int(x.shape[0]))
+        t = _as_col_t(t, batch=int(x.shape[0]))
+        b = self.b(theta)
+        beta, beta_dot = self._beta_beta_dot(t, batch=int(x.shape[0]))
+        centered = x - beta * b
+        u, s = self.low_rank_factors(theta, t)
+        reduced = torch.einsum("bd,bdr->br", centered, u)
+        a_centered = torch.einsum("br,bdr->bd", reduced * s, u)
+        return beta_dot * b + a_centered
+
+    def log_prob_normalized(
+        self,
+        x_norm: torch.Tensor,
+        theta: torch.Tensor,
+        *,
+        solve_jitter: float = 1e-6,
+        quadrature_steps: int | None = None,
+        ode_steps: int = 32,
+        ode_method: str = "midpoint",
+    ) -> torch.Tensor:
+        return flow_endpoint_log_prob(
+            self,
+            x_norm,
+            theta,
+            solve_jitter=float(solve_jitter),
+            quadrature_steps=quadrature_steps,
+            ode_steps=int(ode_steps),
+            ode_method=str(ode_method),
+        )
+
+
 class CenteredSharedAffineLowRankFlowSKLModel(CenteredSharedAffineFlowSKLModel):
     """Centered shared-affine velocity plus ``U h(theta,t,U^T centered_x)``."""
 
@@ -1587,6 +1715,21 @@ def build_flow_skl_model(
     }
     if fam in condition_affine_classes:
         return condition_affine_classes[fam](
+            quadrature_steps=int(quadrature_steps),
+            path_schedule=path_schedule,
+            divergence_estimator=str(divergence_estimator),
+            hutchinson_probes=int(hutchinson_probes),
+            theta_embedding=str(theta_embedding),
+            theta_rbf_num_centers=int(theta_rbf_num_centers),
+            theta_rbf_lower=float(theta_rbf_lower),
+            theta_rbf_upper=float(theta_rbf_upper),
+            theta_rbf_bandwidth=theta_rbf_bandwidth,
+            **common,
+        )
+    if fam == "condition_affine_low_rank":
+        rank = resolve_lxf_low_rank_dim(int(low_rank_dim), int(x_dim), log_prefix="[flow-skl] ")
+        return CenteredConditionAffineLowRankFlowSKLModel(
+            rank=rank,
             quadrature_steps=int(quadrature_steps),
             path_schedule=path_schedule,
             divergence_estimator=str(divergence_estimator),

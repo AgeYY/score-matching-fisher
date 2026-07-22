@@ -603,6 +603,8 @@ def fit_flow_direction_estimator(
     condition_grid: np.ndarray | None = None,
     theta_rbf_num_centers: int = 8,
     theta_rbf_bandwidth: float | None = None,
+    velocity_family: str = "condition_affine",
+    low_rank_dim: int = 82,
 ) -> tuple[Any, dict[str, Any], dict[str, Any], np.ndarray]:
     """Fit the established affine Flow estimator and return decoder directions."""
 
@@ -630,7 +632,7 @@ def fit_flow_direction_estimator(
     if device.type == "cuda":
         torch.cuda.manual_seed_all(int(seed))
     model = build_flow_skl_model(
-        velocity_family="condition_affine",
+        velocity_family=str(velocity_family),
         theta_dim=int(flow_train.shape[1]),
         x_dim=int(np.asarray(x_train).shape[1]),
         hidden_dim=int(hidden_dim),
@@ -643,6 +645,7 @@ def fit_flow_direction_estimator(
         theta_rbf_lower=float(np.min(grid)),
         theta_rbf_upper=float(np.max(grid)),
         theta_rbf_bandwidth=theta_rbf_bandwidth,
+        low_rank_dim=int(low_rank_dim),
     ).to(device)
     training = train_flow_skl_model(
         model=model,
@@ -651,7 +654,7 @@ def fit_flow_direction_estimator(
         theta_val=flow_validation,
         x_val=np.asarray(x_validation, dtype=np.float64),
         device=device,
-        velocity_family="condition_affine",
+        velocity_family=str(velocity_family),
         path_schedule="cosine",
         epochs=int(epochs),
         batch_size=int(batch_size),
@@ -688,6 +691,13 @@ def fit_flow_direction_estimator(
             ode_steps=int(ode_steps),
         )
     directions = decoder_directions(estimate["delta_mu"], estimate["mixed_covariance"])
+    training = dict(training)
+    training.update(
+        {
+            "velocity_family": str(velocity_family),
+            "low_rank_dim": int(low_rank_dim) if "low_rank" in str(velocity_family) else None,
+        }
+    )
     return model, training, estimate, directions
 
 

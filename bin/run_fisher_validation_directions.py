@@ -110,6 +110,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--depth", type=int, default=5)
     parser.add_argument("--ode-steps", type=int, default=64)
+    parser.add_argument(
+        "--flow-velocity-family",
+        choices=("condition_affine", "condition_affine_low_rank"),
+        default="condition_affine",
+    )
+    parser.add_argument("--flow-low-rank-dim", type=int, default=82)
     parser.add_argument("--ole-crossfit-folds", type=int, default=5)
     parser.add_argument("--ole-crossfit-seed", type=int, default=20_260_721)
     parser.add_argument("--ole-min-endpoint-samples", type=int, default=8)
@@ -154,6 +160,8 @@ def _training_signature(args: argparse.Namespace, *, n_train: int, n_validation:
         "hidden_dim": int(args.hidden_dim),
         "depth": int(args.depth),
         "ode_steps": int(args.ode_steps),
+        "flow_velocity_family": str(args.flow_velocity_family),
+        "flow_low_rank_dim": int(args.flow_low_rank_dim),
         "pca_whiten": bool(getattr(args, "pca_whiten", True)),
         "fit_gkr": not bool(args.skip_gkr or args.fm_only),
     }
@@ -231,6 +239,8 @@ def _fit_estimators(
         hidden_dim=args.hidden_dim,
         depth=args.depth,
         ode_steps=args.ode_steps,
+        velocity_family=args.flow_velocity_family,
+        low_rank_dim=args.flow_low_rank_dim,
     )
     arrays = {
         "theta_midpoints": np.asarray(flow_estimate["theta_midpoints"], dtype=np.float64).reshape(-1),

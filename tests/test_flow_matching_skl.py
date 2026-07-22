@@ -446,6 +446,14 @@ def test_build_flow_skl_model_uses_mlp_heads_and_film_nonlinear_subnets() -> Non
             assert model.net.trunk_dim == 3
             assert model.net.theta_dim == 2
             assert isinstance(model.net.theta_embedding, nn.Linear)
+        elif family == "condition_affine_low_rank":
+            assert getattr(model, "network_architecture") == "mlp"
+            assert isinstance(model.b_net, nn.Sequential)
+            assert isinstance(model.u_net, nn.Sequential)
+            assert isinstance(model.s_net, nn.Sequential)
+            assert _first_linear_in_features(model.b_net) == 2
+            assert _first_linear_in_features(model.u_net) == 3
+            assert _first_linear_in_features(model.s_net) == 3
         else:
             assert getattr(model, "network_architecture") == "mlp"
             assert isinstance(model.b_net, nn.Sequential)
@@ -787,6 +795,53 @@ def test_condition_affine_full_A_is_symmetric_for_arbitrary_theta_and_t() -> Non
     t = torch.tensor([[0.0], [0.37], [0.91]], dtype=torch.float64)
     a_t = model.A(theta, t)
     torch.testing.assert_close(a_t, a_t.transpose(-1, -2), rtol=1e-12, atol=1e-12)
+
+
+def test_condition_affine_low_rank_A_is_symmetric_and_rank_bounded() -> None:
+    torch.manual_seed(123)
+    model = build_flow_skl_model(
+        velocity_family="condition_affine_low_rank",
+        theta_dim=3,
+        x_dim=7,
+        hidden_dim=8,
+        depth=2,
+        low_rank_dim=2,
+        path_schedule="linear",
+    ).double()
+    theta = torch.tensor(
+        [[1.0, 0.0, 0.0], [0.25, 0.5, -0.75], [-1.0, 0.0, 1.0]],
+        dtype=torch.float64,
+    )
+    t = torch.tensor([[0.0], [0.37], [0.91]], dtype=torch.float64)
+    a_t = model.A(theta, t)
+
+    assert model.rank == 2
+    assert a_t.shape == (3, 7, 7)
+    torch.testing.assert_close(a_t, a_t.transpose(-1, -2), rtol=1e-12, atol=1e-12)
+    assert torch.all(torch.linalg.matrix_rank(a_t, atol=1e-10, rtol=1e-10) <= 2)
+
+
+def test_condition_affine_low_rank_forward_matches_dense_matrix_application() -> None:
+    torch.manual_seed(456)
+    model = build_flow_skl_model(
+        velocity_family="condition_affine_low_rank",
+        theta_dim=2,
+        x_dim=5,
+        hidden_dim=8,
+        depth=1,
+        low_rank_dim=3,
+        path_schedule="linear",
+    ).double()
+    x = torch.randn(4, 5, dtype=torch.float64)
+    theta = torch.randn(4, 2, dtype=torch.float64)
+    t = torch.tensor([[0.1], [0.3], [0.6], [0.9]], dtype=torch.float64)
+
+    b = model.b(theta)
+    beta, beta_dot = model._beta_beta_dot(t, batch=4)
+    centered = x - beta * b
+    expected = beta_dot * b + torch.einsum("bij,bj->bi", model.A(theta, t), centered)
+
+    torch.testing.assert_close(model(x, theta, t), expected, rtol=1e-11, atol=1e-11)
 
 
 def test_translation_families_report_model_jeffreys(
