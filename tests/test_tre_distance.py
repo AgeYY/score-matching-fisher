@@ -169,6 +169,55 @@ def test_binned_tre_converts_adjacent_jeffreys_to_fisher() -> None:
     np.testing.assert_allclose(result.fisher, result.jeffreys / np.diff(theta_grid[:, 0]) ** 2)
 
 
+def test_periodic_binned_tre_wraps_endpoint_windows(monkeypatch) -> None:
+    theta_grid = np.array([[0.0], [0.5 * np.pi], [np.pi]])
+    theta = np.array([0.01, 0.02, 0.49 * np.pi, 0.51 * np.pi, np.pi - 0.02, np.pi - 0.01])
+    x = np.arange(theta.size, dtype=np.float32).reshape(-1, 1)
+    seen_pairs: list[tuple[tuple[float, ...], tuple[float, ...]]] = []
+
+    class DummyModel:
+        def state_dict(self):
+            return {}
+
+    class DummyTraining:
+        train_losses = np.array([0.0])
+        validation_losses = np.array([0.0])
+        best_epoch = 1
+        best_validation_loss = 0.0
+        stopped_epoch = 1
+        stopped_early = False
+        training_seconds = 0.0
+
+    def fake_train(*, x0_train, x1_train, **kwargs):
+        del kwargs
+        seen_pairs.append(
+            (tuple(x0_train[:, 0].tolist()), tuple(x1_train[:, 0].tolist()))
+        )
+        return DummyModel(), DummyTraining()
+
+    monkeypatch.setattr("fisher.tre_distance.train_tre_density_ratio", fake_train)
+    monkeypatch.setattr(
+        "fisher.tre_distance.estimate_tre_log_ratio",
+        lambda model, values, **kwargs: np.zeros(values.shape[0]),
+    )
+    train_and_estimate_binned_tre_fisher(
+        theta_train=theta,
+        x_train=x,
+        theta_validation=theta,
+        x_validation=x,
+        theta_eval=theta,
+        x_eval=x,
+        theta_grid=theta_grid,
+        theta_period=np.pi,
+        window_radius=0.05,
+        device=torch.device("cpu"),
+        config=TREDensityRatioConfig(epochs=1, early_patience=0),
+    )
+
+    assert seen_pairs[0][0] == (0.0, 1.0, 4.0, 5.0)
+    assert seen_pairs[1][1] == (0.0, 1.0, 4.0, 5.0)
+
+
 def test_distance_comparison_serializes_tre_matrix(tmp_path) -> None:
     metric = dc.METRIC_SYMMETRIC_KL
     classical = {metric: np.array([[0.0, 1.0], [1.0, 0.0]])}

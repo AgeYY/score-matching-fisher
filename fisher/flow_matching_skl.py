@@ -2312,6 +2312,7 @@ def estimate_adjacent_model_jeffreys_fisher(
     *,
     model: nn.Module,
     theta_all: np.ndarray,
+    condition_all: np.ndarray | None = None,
     device: torch.device,
     mc_jeffreys_sample: int = 4096,
     ode_steps: int = 64,
@@ -2333,6 +2334,12 @@ def estimate_adjacent_model_jeffreys_fisher(
         raise ValueError("At least two theta points are required.")
     order = np.argsort(theta[:, 0], kind="mergesort")
     theta_s = theta[order]
+    condition = theta if condition_all is None else _as_2d_float64(
+        condition_all, name="condition_all"
+    )
+    if int(condition.shape[0]) != int(theta.shape[0]):
+        raise ValueError("condition_all and theta_all must have the same number of rows.")
+    condition_s = condition[order]
     dtheta = np.diff(theta_s[:, 0])
     if np.any(dtheta <= 0.0):
         raise ValueError("theta_all must contain strictly increasing unique scalar values after sorting.")
@@ -2347,7 +2354,7 @@ def estimate_adjacent_model_jeffreys_fisher(
         for a, b in ((i, i + 1), (i + 1, i)):
             xa = sample_flow_endpoint(
                 model=model,
-                theta=theta_s[a : a + 1],
+                theta=condition_s[a : a + 1],
                 n_samples=int(mc_jeffreys_sample),
                 device=device,
                 ode_steps=int(ode_steps),
@@ -2356,7 +2363,7 @@ def estimate_adjacent_model_jeffreys_fisher(
             logp_a = _log_prob_model(
                 model=model,
                 x=xa,
-                theta=theta_s[a : a + 1],
+                theta=condition_s[a : a + 1],
                 device=device,
                 ode_steps=int(ode_steps),
                 ode_method=str(ode_method),
@@ -2367,7 +2374,7 @@ def estimate_adjacent_model_jeffreys_fisher(
             logp_b = _log_prob_model(
                 model=model,
                 x=xa,
-                theta=theta_s[b : b + 1],
+                theta=condition_s[b : b + 1],
                 device=device,
                 ode_steps=int(ode_steps),
                 ode_method=str(ode_method),
@@ -2382,6 +2389,8 @@ def estimate_adjacent_model_jeffreys_fisher(
         "theta_midpoints": (0.5 * (theta_s[:-1, 0] + theta_s[1:, 0])).reshape(-1, 1).astype(np.float64),
         "theta_left": theta_s[:-1].astype(np.float64),
         "theta_right": theta_s[1:].astype(np.float64),
+        "condition_left": condition_s[:-1].astype(np.float64),
+        "condition_right": condition_s[1:].astype(np.float64),
         "dtheta": dtheta.astype(np.float64),
         "adjacent_jeffreys": jeffreys,
         "fisher": (jeffreys / (dtheta**2)).astype(np.float64),

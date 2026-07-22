@@ -1648,3 +1648,40 @@ def test_adjacent_model_jeffreys_fisher_uses_only_adjacent_pairs(monkeypatch: py
     np.testing.assert_allclose(got["fisher"], np.asarray([0.0, 0.0]))
     sample_thetas = [val for kind, val in calls if kind == "sample"]
     assert sample_thetas == [0.0, 2.0, 2.0, 5.0]
+
+
+def test_adjacent_model_jeffreys_accepts_separate_model_conditions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DummyModel(nn.Module):
+        x_dim = 1
+
+    sampled_conditions: list[tuple[float, float]] = []
+
+    def fake_sample_flow_endpoint(*, model, theta, n_samples, device, ode_steps, ode_method):
+        del model, n_samples, device, ode_steps, ode_method
+        condition = tuple(np.asarray(theta).reshape(-1).tolist())
+        sampled_conditions.append(condition)
+        return torch.zeros((2, 1), dtype=torch.float32)
+
+    def fake_log_prob_model(*, model, x, theta, device, ode_steps, batch_size, solve_jitter, quadrature_steps, ode_method):
+        del model, x, device, ode_steps, batch_size, solve_jitter, quadrature_steps, ode_method
+        return np.full(2, float(np.asarray(theta).reshape(-1)[0]), dtype=np.float64)
+
+    monkeypatch.setattr(fms, "sample_flow_endpoint", fake_sample_flow_endpoint)
+    monkeypatch.setattr(fms, "_log_prob_model", fake_log_prob_model)
+    theta = np.asarray([0.0, 0.5, 1.0], dtype=np.float64).reshape(-1, 1)
+    condition = np.asarray([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]])
+
+    got = fms.estimate_adjacent_model_jeffreys_fisher(
+        model=DummyModel(),
+        theta_all=theta,
+        condition_all=condition,
+        device=torch.device("cpu"),
+        mc_jeffreys_sample=2,
+    )
+
+    np.testing.assert_allclose(got["dtheta"], [0.5, 0.5])
+    np.testing.assert_allclose(got["condition_left"], condition[:-1])
+    np.testing.assert_allclose(got["condition_right"], condition[1:])
+    assert sampled_conditions == [(1.0, 0.0), (0.0, 1.0), (0.0, 1.0), (-1.0, 0.0)]

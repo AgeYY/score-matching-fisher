@@ -440,6 +440,7 @@ def _theta_endpoint_windows(
     *,
     radius: float | None,
     min_samples: int,
+    period: float | None = None,
 ) -> list[np.ndarray]:
     theta_arr = np.asarray(theta, dtype=np.float64).reshape(-1)
     x_arr = np.asarray(x, dtype=np.float32)
@@ -455,11 +456,17 @@ def _theta_endpoint_windows(
     if required < 1:
         raise ValueError("min_samples must be positive.")
     required = min(required, int(theta_arr.size))
+    if period is not None and float(period) <= 0.0:
+        raise ValueError("period must be positive when provided.")
     windows: list[np.ndarray] = []
     for value in grid:
-        index = np.flatnonzero(np.abs(theta_arr - float(value)) <= radius_value)
+        distance = np.abs(theta_arr - float(value))
+        if period is not None:
+            wrapped = np.mod(distance, float(period))
+            distance = np.minimum(wrapped, float(period) - wrapped)
+        index = np.flatnonzero(distance <= radius_value)
         if int(index.size) < required:
-            index = np.argsort(np.abs(theta_arr - float(value)), kind="mergesort")[:required]
+            index = np.argsort(distance, kind="mergesort")[:required]
         windows.append(x_arr[index])
     return windows
 
@@ -477,6 +484,7 @@ def train_and_estimate_binned_tre_fisher(
     seed: int = 7,
     config: TREDensityRatioConfig | None = None,
     window_radius: float | None = None,
+    theta_period: float | None = None,
     min_train_samples: int = 2,
     min_validation_samples: int = 2,
     min_eval_samples: int = 2,
@@ -493,6 +501,7 @@ def train_and_estimate_binned_tre_fisher(
         grid,
         radius=window_radius,
         min_samples=int(min_train_samples),
+        period=theta_period,
     )
     validation_windows = _theta_endpoint_windows(
         theta_validation,
@@ -500,6 +509,7 @@ def train_and_estimate_binned_tre_fisher(
         grid,
         radius=window_radius,
         min_samples=int(min_validation_samples),
+        period=theta_period,
     )
     eval_windows = _theta_endpoint_windows(
         theta_eval,
@@ -507,6 +517,7 @@ def train_and_estimate_binned_tre_fisher(
         grid,
         radius=window_radius,
         min_samples=int(min_eval_samples),
+        period=theta_period,
     )
     n_pairs = int(grid.size - 1)
     raw_jeffreys = np.empty(n_pairs, dtype=np.float64)
@@ -593,6 +604,7 @@ def train_and_estimate_binned_tre_fisher(
                 if window_radius is None
                 else float(window_radius)
             ),
+            "theta_period": None if theta_period is None else float(theta_period),
             "eval_batch_size": int(eval_batch_size),
             "total_training_seconds": float(time.perf_counter() - started),
             "config": asdict(cfg),
