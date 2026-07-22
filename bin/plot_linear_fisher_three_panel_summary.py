@@ -53,80 +53,6 @@ def _style_main_axis(axis: plt.Axes, *, grid: bool) -> None:
     axis.grid(axis="y", color="0.82", linewidth=0.8) if grid else axis.grid(False)
 
 
-def _style_inset(axis: plt.Axes) -> None:
-    axis.grid(False)
-    for spine in axis.spines.values():
-        spine.set_visible(True)
-        spine.set_linewidth(1.5)
-    axis.tick_params(width=1.5, length=3.0, labelsize=12)
-
-
-def _plot_sample_inset(
-    axis: plt.Axes,
-    *,
-    n_values: np.ndarray,
-    flow: np.ndarray,
-    gkr: np.ndarray,
-    classical: np.ndarray,
-    flow_error: np.ndarray | None = None,
-    gkr_error: np.ndarray | None = None,
-    classical_error: np.ndarray | None = None,
-) -> None:
-    for values, error, color, marker in (
-        (flow, flow_error, "C0", "o"),
-        (gkr, gkr_error, "C2", "^"),
-        (classical, classical_error, "C1", "s"),
-    ):
-        axis.errorbar(
-            n_values,
-            values,
-            yerr=error,
-            color=color,
-            marker=marker,
-            markersize=3.5,
-            linewidth=1.6,
-            capsize=2,
-        )
-    axis.set_xscale("log")
-    axis.set_ylim(bottom=0.0)
-    axis.set_xticks((500, 3_000, 10_000))
-    axis.set_xticklabels(("500", "3k", "10k"))
-    axis.set_yticks((0.0, 100.0, 200.0))
-    axis.set_title("Classical + LW", color="C1", fontsize=11, pad=3)
-    _style_inset(axis)
-
-
-def _plot_dimension_inset(
-    axis: plt.Axes,
-    *,
-    dimensions: np.ndarray,
-    flow: np.ndarray,
-    gkr: np.ndarray,
-    classical: np.ndarray,
-) -> None:
-    for values, color, marker in (
-        (flow, "C0", "o"),
-        (gkr, "C2", "^"),
-        (classical, "C1", "s"),
-    ):
-        errors = np.std(values, axis=1, ddof=1) if values.shape[1] > 1 else None
-        axis.errorbar(
-            dimensions,
-            np.mean(values, axis=1),
-            yerr=errors,
-            color=color,
-            marker=marker,
-            markersize=3.5,
-            linewidth=1.6,
-            capsize=2.0,
-        )
-    axis.set_ylim(bottom=0.0)
-    axis.set_xticks((3, 50, 110))
-    axis.set_yticks((0.0, 50.0, 100.0))
-    axis.set_title("Classical + LW", color="C1", fontsize=11, pad=3)
-    _style_inset(axis)
-
-
 def main() -> None:
     args = parse_args()
     sample_path = args.sample_results.expanduser().resolve()
@@ -140,16 +66,33 @@ def main() -> None:
     with np.load(sample_path, allow_pickle=False) as result:
         n_values = np.asarray(result["n_values"], dtype=np.int64)
         theta = np.asarray(result["theta"], dtype=np.float64)
+        sample_ole_theta = np.asarray(
+            result["ole_theta"] if "ole_theta" in result.files else result["theta"],
+            dtype=np.float64,
+        )
+        ole_theta_spacing = float(
+            np.asarray(
+                result["ole_theta_spacing"]
+                if "ole_theta_spacing" in result.files
+                else 0.2
+            )
+        )
         ground_truth = np.asarray(result["ground_truth"], dtype=np.float64)
         sample_flow = np.asarray(result["flow"], dtype=np.float64)
         sample_gkr = np.asarray(result["gkr"], dtype=np.float64)
-        sample_classical = np.asarray(
-            result["classical_ledoit_wolf"], dtype=np.float64
+        sample_ole = np.asarray(
+            result["ole"]
+            if "ole" in result.files
+            else result["classical_ledoit_wolf"],
+            dtype=np.float64,
         )
         sample_flow_mae = np.asarray(result["flow_mae"], dtype=np.float64)
         sample_gkr_mae = np.asarray(result["gkr_mae"], dtype=np.float64)
-        sample_classical_mae = np.asarray(
-            result["classical_ledoit_wolf_mae"], dtype=np.float64
+        sample_ole_mae = np.asarray(
+            result["ole_mae"]
+            if "ole_mae" in result.files
+            else result["classical_ledoit_wolf_mae"],
+            dtype=np.float64,
         )
     representative_matches = np.flatnonzero(n_values == int(args.representative_n))
     if representative_matches.size != 1:
@@ -158,34 +101,43 @@ def main() -> None:
     if sample_flow_mae.ndim == 1:
         sample_flow_mean, sample_flow_error = sample_flow_mae, None
         sample_gkr_mean, sample_gkr_error = sample_gkr_mae, None
-        sample_classical_mean, sample_classical_error = sample_classical_mae, None
+        sample_ole_mean, sample_ole_error = sample_ole_mae, None
     elif sample_flow_mae.ndim == 2:
         sample_flow_mean = np.mean(sample_flow_mae, axis=1)
         sample_gkr_mean = np.mean(sample_gkr_mae, axis=1)
-        sample_classical_mean = np.mean(sample_classical_mae, axis=1)
+        sample_ole_mean = np.mean(sample_ole_mae, axis=1)
         if sample_flow_mae.shape[1] > 1:
             sample_flow_error = np.std(sample_flow_mae, axis=1, ddof=1)
             sample_gkr_error = np.std(sample_gkr_mae, axis=1, ddof=1)
-            sample_classical_error = np.std(sample_classical_mae, axis=1, ddof=1)
+            sample_ole_error = np.std(sample_ole_mae, axis=1, ddof=1)
         else:
             sample_flow_error = None
             sample_gkr_error = None
-            sample_classical_error = None
+            sample_ole_error = None
     else:
         raise ValueError("Sample-size MAE arrays must have one or two dimensions.")
     if theta.ndim == 3:
         theta = theta[:, 0]
+        sample_ole_theta = sample_ole_theta[:, 0]
         ground_truth = ground_truth[:, 0]
         sample_flow = sample_flow[:, 0]
         sample_gkr = sample_gkr[:, 0]
+        sample_ole = sample_ole[:, 0]
 
     with np.load(dimension_path, allow_pickle=False) as result:
         dimensions = np.asarray(result["x_dims"], dtype=np.int64)
         dimension_flow_mae = np.asarray(result["flow_mae"], dtype=np.float64)
         dimension_gkr_mae = np.asarray(result["gkr_mae"], dtype=np.float64)
-        dimension_classical_mae = np.asarray(
-            result["classical_ledoit_wolf_mae"], dtype=np.float64
-        )
+        if "ole_crossfit_mae" in result.files:
+            dimension_ole_mae = np.asarray(
+                result["ole_crossfit_mae"], dtype=np.float64
+            )
+        elif "ole_mae" in result.files:
+            dimension_ole_mae = np.asarray(result["ole_mae"], dtype=np.float64)
+        else:
+            dimension_ole_mae = np.asarray(
+                result["classical_ledoit_wolf_mae"], dtype=np.float64
+            )
 
     plt.rcParams.update(
         {
@@ -224,15 +176,23 @@ def main() -> None:
         linewidth=2.2,
         label="GKR",
     )
+    curve_axis.plot(
+        sample_ole_theta[representative_index],
+        sample_ole[representative_index],
+        color="C1",
+        linewidth=2.2,
+        label="OLE (cross-fit)",
+    )
     curve_axis.set_xlabel(r"$\theta$")
     curve_axis.set_ylabel("Linear Fisher information")
     curve_axis.set_title(rf"$N={int(args.representative_n):,}$")
-    curve_axis.legend(frameon=False, loc="lower center", fontsize=13)
+    handles, labels = curve_axis.get_legend_handles_labels()
     _style_main_axis(curve_axis, grid=False)
 
     for values, error, color, marker in (
         (sample_flow_mean, sample_flow_error, "C0", "o"),
         (sample_gkr_mean, sample_gkr_error, "C2", "^"),
+        (sample_ole_mean, sample_ole_error, "C1", "s"),
     ):
         sample_axis.errorbar(
             n_values,
@@ -252,21 +212,19 @@ def main() -> None:
     sample_axis.set_ylabel("Mean absolute error")
     sample_axis.set_title("Error versus sample size")
     _style_main_axis(sample_axis, grid=True)
-    sample_inset = sample_axis.inset_axes((0.62, 0.54, 0.32, 0.37))
-    _plot_sample_inset(
-        sample_inset,
-        n_values=n_values,
-        flow=sample_flow_mean,
-        gkr=sample_gkr_mean,
-        classical=sample_classical_mean,
-        flow_error=sample_flow_error,
-        gkr_error=sample_gkr_error,
-        classical_error=sample_classical_error,
+    sample_axis.legend(
+        handles,
+        labels,
+        frameon=False,
+        loc="upper right",
+        fontsize=11,
+        ncol=1,
+        handletextpad=0.6,
     )
-
     for values, color, marker in (
         (dimension_flow_mae, "C0", "o"),
         (dimension_gkr_mae, "C2", "^"),
+        (dimension_ole_mae, "C1", "s"),
     ):
         errors = np.std(values, axis=1, ddof=1) if values.shape[1] > 1 else None
         dimension_axis.errorbar(
@@ -289,15 +247,6 @@ def main() -> None:
     dimension_axis.set_ylabel("Mean absolute error")
     dimension_axis.set_title("Error versus dimension")
     _style_main_axis(dimension_axis, grid=True)
-    dimension_inset = dimension_axis.inset_axes((0.10, 0.53, 0.32, 0.37))
-    _plot_dimension_inset(
-        dimension_inset,
-        dimensions=dimensions,
-        flow=dimension_flow_mae,
-        gkr=dimension_gkr_mae,
-        classical=dimension_classical_mae,
-    )
-
     output_dir.mkdir(parents=True, exist_ok=True)
     output_stem = output_dir / "linear_fisher_curves_sample_and_dimension_errors"
     figure_png = output_stem.with_suffix(".png")
@@ -310,6 +259,7 @@ def main() -> None:
         "sample_results": str(sample_path),
         "dimension_results": str(dimension_path),
         "representative_n": int(args.representative_n),
+        "ole_theta_spacing": ole_theta_spacing,
         "figure_png": str(figure_png),
         "figure_svg": str(figure_svg),
     }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare ground-truth error and session identification on Gaussian toy data."""
+"""Compare ground-truth error and split-half identification on toy data."""
 
 from __future__ import annotations
 
@@ -65,6 +65,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--device", required=True)
     parser.add_argument("--output-dir", type=Path, default=Path(DATA_DIR) / "toy_fisher_evaluation_criterion")
+    parser.add_argument(
+        "--dataset-family",
+        choices=("randamp_gaussian_sqrtd", "cosine_gmm"),
+        default="randamp_gaussian_sqrtd",
+    )
     parser.add_argument("--n-sessions", type=int, default=6)
     parser.add_argument("--n-per-half", type=int, default=1000)
     parser.add_argument("--x-dim", type=int, default=50)
@@ -93,6 +98,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--n-per-half must be at least 2.")
     if int(args.x_dim) < 1:
         raise ValueError("--x-dim must be positive.")
+    if str(args.dataset_family) == "cosine_gmm" and int(args.x_dim) < 2:
+        raise ValueError("--x-dim must be at least 2 for cosine_gmm.")
     if not 0.0 < float(args.train_frac) < 1.0:
         raise ValueError("--train-frac must be in (0, 1).")
     if not float(args.theta_low) < float(args.theta_high):
@@ -102,15 +109,65 @@ def validate_args(args: argparse.Namespace) -> None:
 
 
 def population_meta(args: argparse.Namespace, session_index: int) -> dict[str, Any]:
-    return {
-        "dataset_family": "randamp_gaussian_sqrtd",
-        "seed": int(args.seed) + 100_003 * int(session_index),
+    family = str(args.dataset_family)
+    population_seed = int(args.seed) + 100_003 * int(session_index)
+    recipe = family_recipe_dict(family)
+    if family == "cosine_gmm":
+        # cosine_gmm's seed controls sampling only. Draw fixed mixture
+        # parameters so each synthetic session represents a distinct population.
+        rng = np.random.default_rng(population_seed)
+        recipe.update(
+            {
+                "gmm_sep_scale": float(recipe["gmm_sep_scale"]) * float(rng.uniform(0.75, 1.25)),
+                "gmm_sep_phase": float(recipe["gmm_sep_phase"]) + float(rng.uniform(-np.pi, np.pi)),
+                "gmm_mix_logit_scale": float(recipe["gmm_mix_logit_scale"])
+                * float(rng.uniform(0.75, 1.25)),
+                "gmm_mix_bias": float(recipe["gmm_mix_bias"]) + float(rng.uniform(-0.35, 0.35)),
+                "gmm_mix_phase": float(recipe["gmm_mix_phase"]) + float(rng.uniform(-np.pi, np.pi)),
+            }
+        )
+    meta = {
+        "dataset_family": family,
+        "seed": population_seed,
         "theta_low": float(args.theta_low),
         "theta_high": float(args.theta_high),
         "x_dim": int(args.x_dim),
-        "randamp_sqrtd_obs_var_mu_law": RANDAMP_SQRTD_VAR_MU_LAW_ADDITIVE,
-        **family_recipe_dict("randamp_gaussian_sqrtd"),
+        **recipe,
     }
+    if family == "randamp_gaussian_sqrtd":
+        meta["randamp_sqrtd_obs_var_mu_law"] = RANDAMP_SQRTD_VAR_MU_LAW_ADDITIVE
+    return meta
+
+
+def population_linear_fisher_curve(theta: np.ndarray, dataset: Any) -> np.ndarray:
+    """Return exact marginal linear Fisher information for either toy family."""
+    if not (hasattr(dataset, "_mix_weight") and hasattr(dataset, "component_means")):
+        return native_linear_fisher_curve(theta, dataset)
+    values = np.asarray(theta, dtype=np.float64).reshape(-1, 1)
+    probability, probability_derivative = dataset._mix_weight(values)
+    mean1, mean2 = dataset.component_means(values)
+    covariance1, covariance2, _, _ = dataset.component_covariances(values)
+    base_derivative = dataset.tuning_curve_derivative(values)
+    _, separation_derivative = dataset._separation(values)
+    derivative1 = base_derivative + separation_derivative
+    derivative2 = base_derivative - separation_derivative
+    p = probability[:, None]
+    mean = p * mean1 + (1.0 - p) * mean2
+    mean_derivative = (
+        probability_derivative[:, None] * (mean1 - mean2)
+        + p * derivative1
+        + (1.0 - p) * derivative2
+    )
+    delta1 = mean1 - mean
+    delta2 = mean2 - mean
+    covariance = (
+        probability[:, None, None]
+        * (covariance1 + np.einsum("ni,nj->nij", delta1, delta1))
+        + (1.0 - probability)[:, None, None]
+        * (covariance2 + np.einsum("ni,nj->nij", delta2, delta2))
+    )
+    inverse = np.linalg.inv(covariance)
+    return np.einsum("bi,bij,bj->b", mean_derivative, inverse, mean_derivative).astype(np.float64)
 
 
 def _signature(args: argparse.Namespace, session_index: int, half_index: int) -> str:
@@ -274,6 +331,7 @@ def _plot(
     mae: dict[str, np.ndarray],
     summaries: dict[str, dict[str, dict[str, object]]],
     output_dir: Path,
+    artifact_stem: str,
 ) -> tuple[Path, Path]:
     plt.rcParams.update(
         {
@@ -376,8 +434,8 @@ def _plot(
         axis.spines["left"].set_linewidth(1.8)
         axis.spines["bottom"].set_linewidth(1.8)
         axis.tick_params(width=1.8)
-    png = output_dir / "toy_gaussian_fisher_dual_criterion.png"
-    svg = output_dir / "toy_gaussian_fisher_dual_criterion.svg"
+    png = output_dir / f"{artifact_stem}.png"
+    svg = output_dir / f"{artifact_stem}.svg"
     fig.savefig(png, dpi=300, bbox_inches="tight")
     fig.savefig(svg, bbox_inches="tight")
     plt.close(fig)
@@ -418,11 +476,13 @@ def main() -> None:
         for method in TOY_IDENTIFICATION_METHODS
     }
     selected_epochs = np.empty((int(args.n_sessions), 2), dtype=np.int64)
+    population_metadata: list[dict[str, Any]] = []
 
     for session_index in range(int(args.n_sessions)):
         meta = population_meta(args, session_index)
+        population_metadata.append(meta)
         population = build_dataset_from_meta(meta)
-        ground_truth[session_index] = native_linear_fisher_curve(theta_midpoints, population)
+        ground_truth[session_index] = population_linear_fisher_curve(theta_midpoints, population)
         halves = [population.sample_joint(int(args.n_per_half)) for _ in range(2)]
         for half_index, (theta_all, x_all) in enumerate(halves):
             print(
@@ -450,6 +510,11 @@ def main() -> None:
         for method, values in estimates.items()
     }
     matrices, summaries = evaluate_identification(estimates, theta_midpoints)
+    artifact_stem = (
+        "toy_gaussian_fisher_dual_criterion"
+        if str(args.dataset_family) == "randamp_gaussian_sqrtd"
+        else "toy_cosine_gmm_fisher_dual_criterion"
+    )
     figure_png, figure_svg = _plot(
         theta_midpoints=theta_midpoints,
         ground_truth=ground_truth,
@@ -457,9 +522,10 @@ def main() -> None:
         mae=mae,
         summaries=summaries,
         output_dir=output_dir,
+        artifact_stem=artifact_stem,
     )
 
-    results_path = output_dir / "toy_gaussian_fisher_dual_criterion_results.npz"
+    results_path = output_dir / f"{artifact_stem}_results.npz"
     np.savez_compressed(
         results_path,
         theta_grid=theta_grid,
@@ -481,12 +547,13 @@ def main() -> None:
             "Ground-truth Fisher error and split-half session identification may rank "
             "the same estimators differently."
         ),
-        "dataset_family": "randamp_gaussian_sqrtd",
+        "dataset_family": str(args.dataset_family),
         "x_dim": int(args.x_dim),
         "n_sessions": int(args.n_sessions),
         "n_per_half": int(args.n_per_half),
         "train_fraction_per_half": float(args.train_frac),
         "population_seeds": [int(population_meta(args, index)["seed"]) for index in range(int(args.n_sessions))],
+        "population_metadata": population_metadata,
         "flow": {
             "velocity_family": "condition_affine",
             "theta_embedding": "gaussian_rbf",
@@ -511,7 +578,7 @@ def main() -> None:
         "figure_svg": str(figure_svg),
         "results_npz": str(results_path),
     }
-    summary_path = output_dir / "toy_gaussian_fisher_dual_criterion_summary.json"
+    summary_path = output_dir / f"{artifact_stem}_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(summary["ground_truth_mae"], indent=2), flush=True)
     print(json.dumps(summary["identification"], indent=2), flush=True)

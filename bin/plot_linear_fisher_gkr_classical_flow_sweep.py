@@ -20,7 +20,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from fisher.optimal_linear_estimator import (
+    cross_fitted_ole_linear_fisher,
+    optimal_linear_estimator,
+)
+from fisher.continuous_fisher_comparison import native_linear_fisher_curve
 from fisher.shared_dataset_io import load_shared_dataset_npz
+from fisher.shared_fisher_est import build_dataset_from_meta
 
 
 DEFAULT_N_LIST = (500, 1_000, 3_000, 5_000, 10_000)
@@ -37,6 +43,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed-list", type=int, nargs="+", default=[7])
     parser.add_argument("--theta-spacing", type=float, default=0.2)
     parser.add_argument("--min-endpoint-samples", type=int, default=8)
+    parser.add_argument("--ole-crossfit-folds", type=int, default=5)
+    parser.add_argument("--ole-crossfit-seed", type=int, default=20260721)
+    parser.add_argument("--ole-theta-spacing", type=float, default=0.4)
     parser.add_argument("--case-root", type=Path, default=REPO_ROOT / "data")
     parser.add_argument(
         "--output-dir",
@@ -68,13 +77,25 @@ def _case_paths(
     return dataset_path, result_path
 
 
-def _classical_ledoit_wolf_linear_fisher(
+def _grid_with_spacing(reference_grid: np.ndarray, spacing: float) -> np.ndarray:
+    reference = np.asarray(reference_grid, dtype=np.float64).reshape(-1)
+    span = float(reference[-1] - reference[0])
+    n_intervals = int(round(span / float(spacing)))
+    if n_intervals < 1 or not np.isclose(
+        n_intervals * float(spacing), span, rtol=1e-10, atol=1e-10
+    ):
+        raise ValueError("OLE spacing must evenly divide the condition range.")
+    return np.linspace(reference[0], reference[-1], n_intervals + 1)
+
+
+def _local_plugin_ledoit_wolf_linear_fisher(
     *,
     theta_all: np.ndarray,
     x_all: np.ndarray,
     theta_grid: np.ndarray,
     min_endpoint_samples: int,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Estimate an OLE curve from local empirical means and covariances."""
     theta = np.asarray(theta_all, dtype=np.float64).reshape(-1)
     x = np.asarray(x_all, dtype=np.float64)
     grid = np.asarray(theta_grid, dtype=np.float64).reshape(-1)
@@ -96,16 +117,26 @@ def _classical_ledoit_wolf_linear_fisher(
 
     local_means = np.asarray(means, dtype=np.float64)
     local_covariances = np.asarray(covariances, dtype=np.float64)
-    fisher = np.empty(grid.shape[0] - 1, dtype=np.float64)
+    mean_derivatives = np.empty(
+        (grid.shape[0] - 1, x.shape[1]), dtype=np.float64
+    )
+    pooled_covariances = np.empty(
+        (grid.shape[0] - 1, x.shape[1], x.shape[1]), dtype=np.float64
+    )
     for index, delta in enumerate(np.diff(grid)):
-        mean_delta = local_means[index + 1] - local_means[index]
-        covariance = 0.5 * (
+        mean_derivatives[index] = (
+            local_means[index + 1] - local_means[index]
+        ) / float(delta)
+        pooled_covariances[index] = 0.5 * (
             local_covariances[index] + local_covariances[index + 1]
         )
-        fisher[index] = float(
-            mean_delta @ np.linalg.solve(covariance, mean_delta) / float(delta) ** 2
-        )
-    return fisher, np.asarray(counts, dtype=np.int64)
+    estimate = optimal_linear_estimator(mean_derivatives, pooled_covariances)
+    return (
+        estimate.linear_fisher,
+        estimate.weights,
+        estimate.variance,
+        np.asarray(counts, dtype=np.int64),
+    )
 
 
 def _mae(estimate: np.ndarray, truth: np.ndarray) -> float:
@@ -119,7 +150,17 @@ def _mae(estimate: np.ndarray, truth: np.ndarray) -> float:
     )
 
 
-def _plot(cases: list[dict[str, object]], representative_n: int, output_dir: Path) -> tuple[Path, Path]:
+def _sample_count_label(value: int) -> str:
+    if int(value) >= 1_000 and int(value) % 1_000 == 0:
+        return f"{int(value) // 1_000}k"
+    return str(int(value))
+
+
+def _plot(
+    cases: list[dict[str, object]],
+    representative_n: int,
+    output_dir: Path,
+) -> tuple[Path, Path]:
     representative = next(
         case for case in cases if int(case["n_total"]) == int(representative_n)
     )
@@ -140,6 +181,7 @@ def _plot(cases: list[dict[str, object]], representative_n: int, output_dir: Pat
 
     curve_axis = axes[0]
     theta = np.asarray(representative_repeat["theta"], dtype=np.float64)
+    ole_theta = np.asarray(representative_repeat["ole_theta"], dtype=np.float64)
     curve_axis.plot(
         theta,
         np.asarray(representative_repeat["ground_truth"]),
@@ -162,6 +204,13 @@ def _plot(cases: list[dict[str, object]], representative_n: int, output_dir: Pat
         linewidth=2.2,
         label="GKR",
     )
+    curve_axis.plot(
+        ole_theta,
+        np.asarray(representative_repeat["ole"]),
+        color="C1",
+        linewidth=2.2,
+        label="OLE (cross-fit)",
+    )
     curve_axis.set_xlabel(r"$\theta$")
     curve_axis.set_ylabel("Linear Fisher information")
     curve_axis.set_title(rf"$N={int(representative_n):,}$")
@@ -172,6 +221,7 @@ def _plot(cases: list[dict[str, object]], representative_n: int, output_dir: Pat
     for key, label, color, marker in (
         ("flow_mae", "Flow matching", "C0", "o"),
         ("gkr_mae", "GKR", "C2", "^"),
+        ("ole_mae", "OLE (cross-fit)", "C1", "s"),
     ):
         values = np.asarray([case[key] for case in cases], dtype=np.float64)
         error_axis.errorbar(
@@ -187,47 +237,13 @@ def _plot(cases: list[dict[str, object]], representative_n: int, output_dir: Pat
         )
     error_axis.set_xscale("log")
     error_axis.set_xticks(n_values)
-    error_axis.set_xticklabels(["500", "1k", "3k", "5k", "10k"])
+    error_axis.set_xticklabels([_sample_count_label(value) for value in n_values])
     error_axis.set_xlabel("Total samples")
     error_axis.set_ylabel("Mean absolute error")
     error_axis.set_title("Error versus sample size")
     error_axis.set_ylim(bottom=0.0)
     error_axis.set_axisbelow(True)
     error_axis.grid(axis="y", color="0.82", linewidth=0.8)
-
-    inset_axis = error_axis.inset_axes((0.62, 0.54, 0.32, 0.37))
-    for key, color, marker in (
-        ("flow_mae", "C0", "o"),
-        ("gkr_mae", "C2", "^"),
-        ("classical_mae", "C1", "s"),
-    ):
-        values = np.asarray([case[key] for case in cases], dtype=np.float64)
-        inset_axis.errorbar(
-            n_values,
-            np.mean(values, axis=1),
-            yerr=(np.std(values, axis=1, ddof=1) if values.shape[1] > 1 else None),
-            color=color,
-            marker=marker,
-            markersize=3.5,
-            linewidth=1.6,
-            capsize=2,
-        )
-    inset_axis.set_xscale("log")
-    inset_axis.set_ylim(bottom=0.0)
-    inset_axis.set_xticks((500, 3_000, 10_000))
-    inset_axis.set_xticklabels(("500", "3k", "10k"))
-    inset_axis.set_yticks((0.0, 100.0, 200.0))
-    inset_axis.grid(False)
-    for spine in inset_axis.spines.values():
-        spine.set_visible(True)
-        spine.set_linewidth(1.5)
-    inset_axis.tick_params(width=1.5, length=3.0, labelsize=12)
-    inset_axis.set_title(
-        "Classical + LW",
-        color="C1",
-        fontsize=11,
-        pad=3,
-    )
 
     for axis in axes:
         axis.spines["top"].set_visible(False)
@@ -261,6 +277,12 @@ def main() -> None:
         raise ValueError("--theta-spacing must be positive.")
     if int(args.min_endpoint_samples) < 2:
         raise ValueError("--min-endpoint-samples must be >= 2.")
+    if int(args.ole_crossfit_folds) < 2:
+        raise ValueError("--ole-crossfit-folds must be >= 2.")
+    if int(args.min_endpoint_samples) < int(args.ole_crossfit_folds):
+        raise ValueError("--min-endpoint-samples must be >= --ole-crossfit-folds.")
+    if float(args.ole_theta_spacing) <= 0.0:
+        raise ValueError("--ole-theta-spacing must be positive.")
 
     case_root = args.case_root.expanduser().resolve()
     output_dir = args.output_dir.expanduser().resolve()
@@ -289,28 +311,59 @@ def main() -> None:
                 truth = np.asarray(result["ground_truth_linear_fisher"], dtype=np.float64)
                 flow = np.asarray(result["flow_linear_fisher"], dtype=np.float64)
                 gkr = np.asarray(result["gkr_linear_fisher"], dtype=np.float64)
-            classical, endpoint_counts = _classical_ledoit_wolf_linear_fisher(
-                theta_all=bundle.theta_all,
-                x_all=bundle.x_all,
-                theta_grid=theta_grid,
+            ole_grid = _grid_with_spacing(theta_grid, float(args.ole_theta_spacing))
+            ole_theta = 0.5 * (ole_grid[:-1] + ole_grid[1:])
+            population = build_dataset_from_meta(bundle.meta)
+            ole_truth = native_linear_fisher_curve(ole_theta, population)
+            plugin, plugin_weights, plugin_variance, endpoint_counts = (
+                _local_plugin_ledoit_wolf_linear_fisher(
+                    theta_all=bundle.theta_all,
+                    x_all=bundle.x_all,
+                    theta_grid=ole_grid,
+                    min_endpoint_samples=int(args.min_endpoint_samples),
+                )
+            )
+            crossfit = cross_fitted_ole_linear_fisher(
+                bundle.theta_all,
+                bundle.x_all,
+                ole_grid,
+                n_splits=int(args.ole_crossfit_folds),
+                seed=int(args.ole_crossfit_seed) + int(seed),
                 min_endpoint_samples=int(args.min_endpoint_samples),
             )
-            if not (
-                truth.shape == flow.shape == gkr.shape == classical.shape == theta.shape
-            ):
+            ole = crossfit.linear_fisher
+            if not truth.shape == flow.shape == gkr.shape == theta.shape:
                 raise ValueError(f"Curve shape mismatch for N={n_total}, seed={seed}.")
+            if not ole.shape == ole_truth.shape == ole_theta.shape:
+                raise ValueError(f"OLE curve shape mismatch for N={n_total}, seed={seed}.")
             repeats.append(
                 {
                     "seed": seed,
                     "dataset_path": str(dataset_path),
                     "result_path": str(result_path),
                     "theta": theta,
+                    "ole_theta": ole_theta,
                     "ground_truth": truth,
+                    "ole_ground_truth": ole_truth,
                     "flow": flow,
-                    "classical": classical,
+                    "ole": ole,
+                    "ole_raw": crossfit.linear_fisher_raw,
+                    "ole_fold_weights": crossfit.fold_weights,
+                    "ole_fold_intercepts": crossfit.fold_intercepts,
+                    "ole_projected_mean_left": crossfit.projected_mean_left,
+                    "ole_projected_mean_right": crossfit.projected_mean_right,
+                    "ole_projected_variance_left": crossfit.projected_variance_left,
+                    "ole_projected_variance_right": crossfit.projected_variance_right,
+                    "ole_n_left": crossfit.n_left,
+                    "ole_n_right": crossfit.n_right,
+                    "plugin": plugin,
+                    "plugin_weights": plugin_weights,
+                    "plugin_variance": plugin_variance,
                     "gkr": gkr,
                     "flow_mae": _mae(flow, truth),
-                    "classical_mae": _mae(classical, truth),
+                    "ole_mae": _mae(ole, ole_truth),
+                    "ole_raw_mae": _mae(crossfit.linear_fisher_raw, ole_truth),
+                    "plugin_mae": _mae(plugin, ole_truth),
                     "gkr_mae": _mae(gkr, truth),
                     "endpoint_count_min": int(endpoint_counts.min()),
                     "endpoint_count_max": int(endpoint_counts.max()),
@@ -321,27 +374,88 @@ def main() -> None:
                 "n_total": n_total,
                 "repeats": repeats,
                 "flow_mae": [float(repeat["flow_mae"]) for repeat in repeats],
-                "classical_mae": [float(repeat["classical_mae"]) for repeat in repeats],
+                "ole_mae": [float(repeat["ole_mae"]) for repeat in repeats],
+                "ole_raw_mae": [float(repeat["ole_raw_mae"]) for repeat in repeats],
+                "plugin_mae": [float(repeat["plugin_mae"]) for repeat in repeats],
                 "gkr_mae": [float(repeat["gkr_mae"]) for repeat in repeats],
             }
         )
 
-    figure_png, figure_svg = _plot(cases, int(args.representative_n), output_dir)
+    figure_png, figure_svg = _plot(
+        cases,
+        int(args.representative_n),
+        output_dir,
+    )
     results_npz = output_dir / "linear_fisher_gkr_classical_flow_results.npz"
     np.savez_compressed(
         results_npz,
         n_values=np.asarray(n_list, dtype=np.int64),
         seeds=np.asarray(seeds, dtype=np.int64),
+        ole_theta_spacing=np.asarray(float(args.ole_theta_spacing), dtype=np.float64),
         theta=np.stack([np.stack([np.asarray(r["theta"]) for r in case["repeats"]]) for case in cases]),
+        ole_theta=np.stack(
+            [np.stack([np.asarray(r["ole_theta"]) for r in case["repeats"]]) for case in cases]
+        ),
         ground_truth=np.stack([np.stack([np.asarray(r["ground_truth"]) for r in case["repeats"]]) for case in cases]),
+        ole_ground_truth=np.stack(
+            [np.stack([np.asarray(r["ole_ground_truth"]) for r in case["repeats"]]) for case in cases]
+        ),
         flow=np.stack([np.stack([np.asarray(r["flow"]) for r in case["repeats"]]) for case in cases]),
+        ole=np.stack(
+            [np.stack([np.asarray(r["ole"]) for r in case["repeats"]]) for case in cases]
+        ),
+        ole_crossfit=np.stack(
+            [np.stack([np.asarray(r["ole"]) for r in case["repeats"]]) for case in cases]
+        ),
+        ole_crossfit_raw=np.stack(
+            [np.stack([np.asarray(r["ole_raw"]) for r in case["repeats"]]) for case in cases]
+        ),
+        ole_crossfit_fold_weights=np.stack(
+            [np.stack([np.asarray(r["ole_fold_weights"]) for r in case["repeats"]]) for case in cases]
+        ),
+        ole_crossfit_fold_intercepts=np.stack(
+            [np.stack([np.asarray(r["ole_fold_intercepts"]) for r in case["repeats"]]) for case in cases]
+        ),
+        ole_crossfit_projected_mean_left=np.stack(
+            [np.stack([np.asarray(r["ole_projected_mean_left"]) for r in case["repeats"]]) for case in cases]
+        ),
+        ole_crossfit_projected_mean_right=np.stack(
+            [np.stack([np.asarray(r["ole_projected_mean_right"]) for r in case["repeats"]]) for case in cases]
+        ),
+        ole_crossfit_projected_variance_left=np.stack(
+            [np.stack([np.asarray(r["ole_projected_variance_left"]) for r in case["repeats"]]) for case in cases]
+        ),
+        ole_crossfit_projected_variance_right=np.stack(
+            [np.stack([np.asarray(r["ole_projected_variance_right"]) for r in case["repeats"]]) for case in cases]
+        ),
+        ole_crossfit_n_left=np.stack(
+            [np.stack([np.asarray(r["ole_n_left"]) for r in case["repeats"]]) for case in cases]
+        ),
+        ole_crossfit_n_right=np.stack(
+            [np.stack([np.asarray(r["ole_n_right"]) for r in case["repeats"]]) for case in cases]
+        ),
+        ole_plugin=np.stack(
+            [np.stack([np.asarray(r["plugin"]) for r in case["repeats"]]) for case in cases]
+        ),
+        ole_plugin_weights=np.stack(
+            [np.stack([np.asarray(r["plugin_weights"]) for r in case["repeats"]]) for case in cases]
+        ),
+        ole_plugin_variance=np.stack(
+            [np.stack([np.asarray(r["plugin_variance"]) for r in case["repeats"]]) for case in cases]
+        ),
         classical_ledoit_wolf=np.stack(
-            [np.stack([np.asarray(r["classical"]) for r in case["repeats"]]) for case in cases]
+            [np.stack([np.asarray(r["plugin"]) for r in case["repeats"]]) for case in cases]
         ),
         gkr=np.stack([np.stack([np.asarray(r["gkr"]) for r in case["repeats"]]) for case in cases]),
         flow_mae=np.asarray([case["flow_mae"] for case in cases], dtype=np.float64),
+        ole_mae=np.asarray([case["ole_mae"] for case in cases], dtype=np.float64),
+        ole_crossfit_mae=np.asarray([case["ole_mae"] for case in cases], dtype=np.float64),
+        ole_crossfit_raw_mae=np.asarray(
+            [case["ole_raw_mae"] for case in cases], dtype=np.float64
+        ),
+        ole_plugin_mae=np.asarray([case["plugin_mae"] for case in cases], dtype=np.float64),
         classical_ledoit_wolf_mae=np.asarray(
-            [case["classical_mae"] for case in cases], dtype=np.float64
+            [case["plugin_mae"] for case in cases], dtype=np.float64
         ),
         gkr_mae=np.asarray([case["gkr_mae"] for case in cases], dtype=np.float64),
     )
@@ -356,7 +470,8 @@ def main() -> None:
             for repeat in case["repeats"]:
                 for key, method in (
                     ("flow_mae", "Flow matching"),
-                    ("classical_mae", "Classical + LW"),
+                    ("ole_mae", "OLE (cross-fitted held-out)"),
+                    ("plugin_mae", "Local plug-in + LW"),
                     ("gkr_mae", "GKR"),
                 ):
                     writer.writerow(
@@ -374,11 +489,16 @@ def main() -> None:
         "n_repeats": len(seeds),
         "seeds": seeds,
         "theta_spacing": float(args.theta_spacing),
+        "ole_theta_spacing": float(args.ole_theta_spacing),
         "representative_n": int(args.representative_n),
         "error_metric": "mean absolute error over theta midpoints",
-        "classical_estimator": {
-            "covariance": "Ledoit-Wolf shrinkage",
-            "mean_derivative": "adjacent local-window finite difference",
+        "ole_estimator": {
+            "definition": "cross-fitted locally unbiased linear decoder",
+            "fit": "training-fold endpoint means and Ledoit-Wolf covariances",
+            "evaluation": "bias-reduced achieved information from pooled held-out projections",
+            "n_splits": int(args.ole_crossfit_folds),
+            "crossfit_seed_base": int(args.ole_crossfit_seed),
+            "adaptive_endpoint_fallback": "nearest disjoint 2*min_endpoint_samples block",
             "uses_all_samples": True,
             "min_endpoint_samples": int(args.min_endpoint_samples),
         },
@@ -393,8 +513,14 @@ def main() -> None:
                 "n_total": int(case["n_total"]),
                 **{
                     f"{key}_{stat}": float(fn(np.asarray(case[key], dtype=np.float64)))
-                    for key in ("flow_mae", "classical_mae", "gkr_mae")
-                    for stat, fn in (("mean", np.mean), ("std", lambda x: np.std(x, ddof=1) if x.size > 1 else 0.0))
+                    for key in ("flow_mae", "ole_mae", "gkr_mae")
+                    for stat, fn in (
+                        ("mean", np.mean),
+                        (
+                            "std",
+                            lambda x: np.std(x, ddof=1) if x.size > 1 else 0.0,
+                        ),
+                    )
                 },
             }
             for case in cases
