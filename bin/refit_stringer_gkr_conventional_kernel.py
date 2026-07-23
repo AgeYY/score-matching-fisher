@@ -26,6 +26,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from fisher.gkr import GKRConfig, TorchGKR, TorchKernelCovariance
+from fisher.fisher_validation import gkr_checkpoint
 from fisher.shared_fisher_est import require_device
 from global_setting import DATA_DIR
 
@@ -50,6 +51,14 @@ def parse_args() -> argparse.Namespace:
         default=Path(DATA_DIR) / "stringer_gkr_conventional_kernel_gt1",
     )
     parser.add_argument("--covariance-epochs", type=int, default=300)
+    parser.add_argument("--mean-learning-rate", type=float, default=0.05)
+    parser.add_argument("--covariance-learning-rate", type=float, default=0.1)
+    parser.add_argument(
+        "--standardize-responses",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Standardize each response dimension while fitting the GKR mean.",
+    )
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--force", action="store_true")
     return parser.parse_args()
@@ -327,6 +336,10 @@ def main() -> int:
     args = parse_args()
     if int(args.covariance_epochs) < 1:
         raise ValueError("--covariance-epochs must be positive.")
+    if float(args.mean_learning_rate) <= 0.0:
+        raise ValueError("--mean-learning-rate must be positive.")
+    if float(args.covariance_learning_rate) <= 0.0:
+        raise ValueError("--covariance-learning-rate must be positive.")
     device = require_device(str(args.device))
     base_dir = args.base_result_dir.expanduser().resolve()
     output_dir = args.output_dir.expanduser().resolve()
@@ -365,6 +378,9 @@ def main() -> int:
                 "test_mean",
                 "test_covariance",
                 "covariance_epochs",
+                "mean_learning_rate",
+                "covariance_learning_rate",
+                "standardize_responses",
             }
             missing = required - set(saved.files)
             if missing:
@@ -376,6 +392,33 @@ def main() -> int:
                 raise ValueError(
                     f"Cached result uses {saved_epochs} covariance epochs, "
                     f"not {int(args.covariance_epochs)}; pass --force."
+                )
+            saved_mean_lr = float(saved["mean_learning_rate"])
+            saved_covariance_lr = float(saved["covariance_learning_rate"])
+            saved_standardize = bool(saved["standardize_responses"])
+            if not np.isclose(
+                saved_mean_lr, float(args.mean_learning_rate), rtol=0.0, atol=1e-15
+            ):
+                raise ValueError(
+                    f"Cached result uses mean learning rate {saved_mean_lr}, "
+                    f"not {float(args.mean_learning_rate)}; pass --force."
+                )
+            if not np.isclose(
+                saved_covariance_lr,
+                float(args.covariance_learning_rate),
+                rtol=0.0,
+                atol=1e-15,
+            ):
+                raise ValueError(
+                    "Cached result uses covariance learning rate "
+                    f"{saved_covariance_lr}, not "
+                    f"{float(args.covariance_learning_rate)}; pass --force."
+                )
+            if saved_standardize != bool(args.standardize_responses):
+                raise ValueError(
+                    "Cached result uses standardize_responses="
+                    f"{saved_standardize}, not "
+                    f"{bool(args.standardize_responses)}; pass --force."
                 )
             conventional_mean = np.asarray(saved["conventional_mean"])
             conventional_covariance = np.asarray(saved["conventional_covariance"])
@@ -389,16 +432,16 @@ def main() -> int:
     else:
         config = GKRConfig(
             mean_iterations=300,
-            mean_learning_rate=0.05,
+            mean_learning_rate=float(args.mean_learning_rate),
             n_inducing=200,
             covariance_epochs=int(args.covariance_epochs),
-            covariance_learning_rate=0.1,
+            covariance_learning_rate=float(args.covariance_learning_rate),
             covariance_batch_size=3000,
             validation_fraction=0.33,
             covariance_jitter=1e-6,
             likelihood_jitter=1e-5,
             prediction_batch_size=3000,
-            standardize_responses=True,
+            standardize_responses=bool(args.standardize_responses),
             log_every=25,
         )
         model = TorchGKR(
@@ -449,16 +492,13 @@ def main() -> int:
             covariance_losses=covariance_losses,
             learned_precision=np.asarray(learned_precision),
             covariance_epochs=np.asarray(int(args.covariance_epochs)),
+            mean_learning_rate=np.asarray(float(args.mean_learning_rate)),
+            covariance_learning_rate=np.asarray(
+                float(args.covariance_learning_rate)
+            ),
+            standardize_responses=np.asarray(bool(args.standardize_responses)),
         )
-        torch.save(
-            {
-                "mean_model": model.mean_model.state_dict(),
-                "mean_likelihood": model.mean_likelihood.state_dict(),
-                "covariance_model": model.covariance_model.state_dict(),
-                "config": vars(config),
-            },
-            checkpoint_path,
-        )
+        torch.save(gkr_checkpoint(model), checkpoint_path)
 
     effective_radius = math.asin(
         min(1.0, 1.0 / math.sqrt(max(learned_precision, 1e-12)))
@@ -491,6 +531,9 @@ def main() -> int:
                 "precision sin(pi * delta / period)"
             ),
             "covariance_epochs": int(args.covariance_epochs),
+            "mean_learning_rate": float(args.mean_learning_rate),
+            "covariance_learning_rate": float(args.covariance_learning_rate),
+            "standardize_responses": bool(args.standardize_responses),
         },
         "original_mean_test_log_likelihood": original_mean_likelihood,
         "conventional_mean_test_log_likelihood": conventional_mean_likelihood,
