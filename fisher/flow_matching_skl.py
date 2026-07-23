@@ -2460,6 +2460,44 @@ def sample_flow_endpoint(
     return _unstandardize_response_tensor(model, x_standardized)
 
 
+@torch.no_grad()
+def sample_flow_endpoint_conditions(
+    *,
+    model: nn.Module,
+    theta_all: np.ndarray,
+    device: torch.device,
+    ode_steps: int = 64,
+    ode_method: str = "midpoint",
+) -> torch.Tensor:
+    """Sample one endpoint for every supplied condition row."""
+
+    theta = _as_torch_2d(theta_all, device=device)
+    if int(theta.shape[0]) < 1:
+        raise ValueError("theta_all must contain at least one condition row.")
+    steps = int(ode_steps)
+    if steps < 1:
+        raise ValueError("ode_steps must be >= 1.")
+    if not str(ode_method).strip():
+        raise ValueError("ode_method must be non-empty.")
+    x_dim = int(getattr(model, "x_dim"))
+    dtype = _model_floating_dtype(model)
+    theta = theta.to(dtype=dtype)
+    x = torch.randn(int(theta.shape[0]), x_dim, dtype=dtype, device=device)
+    model.eval()
+    time_grid = torch.linspace(0.0, 1.0, steps + 1, dtype=dtype, device=device)
+    solver = _make_flow_ode_solver(model)
+    x_standardized = solver.sample(
+        x_init=x,
+        step_size=None,
+        method=str(ode_method),
+        time_grid=time_grid,
+        return_intermediates=False,
+        enable_grad=False,
+        theta_cond=theta,
+    )
+    return _unstandardize_response_tensor(model, x_standardized)
+
+
 def _log_prob_model(
     *,
     model: nn.Module,

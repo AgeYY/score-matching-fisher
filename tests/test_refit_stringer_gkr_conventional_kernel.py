@@ -69,7 +69,7 @@ def test_conventional_kernel_is_locally_quadratic_not_quartic() -> None:
     np.testing.assert_allclose(observed, expected, rtol=1e-12, atol=1e-12)
 
 
-def test_default_covariance_training_is_extended_to_300_epochs(
+def test_default_covariance_training_uses_log_lambda_configuration(
     monkeypatch,
 ) -> None:
     module = _load_script()
@@ -78,10 +78,15 @@ def test_default_covariance_training_is_extended_to_300_epochs(
         ["refit_stringer_gkr_conventional_kernel.py", "--device", "cuda:0"],
     )
     args = module.parse_args()
-    assert args.covariance_epochs == 300
+    assert args.covariance_epochs == 100
     assert args.standardize_responses is True
-    assert args.mean_learning_rate == 0.05
-    assert args.covariance_learning_rate == 0.1
+    assert args.mean_learning_rate == 0.01
+    assert args.covariance_learning_rate == 0.01
+    assert args.kernel_parameterization == "log-lambda"
+    assert args.neighbors_per_effective_dimension == 5.0
+    assert args.lambda_epsilon == 1e-8
+    assert args.initialization_grid_size == 256
+    assert args.initial_lambda is None
 
 
 def test_training_ablation_flags_are_explicit(monkeypatch) -> None:

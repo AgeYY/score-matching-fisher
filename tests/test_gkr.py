@@ -5,11 +5,73 @@ import torch
 
 from fisher.gkr import (
     GKRConfig,
+    PeriodicLogBandwidthKernelCovariance,
     TorchGKR,
     TorchKernelCovariance,
     estimate_gkr_linear_fisher,
     gaussian_residual_log_likelihood,
+    restore_gkr_checkpoint,
 )
+from fisher.fisher_validation import gkr_checkpoint
+
+
+def test_periodic_log_bandwidth_kernel_matches_equation_and_has_gradient() -> None:
+    estimator = PeriodicLogBandwidthKernelCovariance(
+        1,
+        1,
+        circular_period=np.pi,
+        initial_lambda=0.25,
+        jitter=0.0,
+        dtype=torch.float64,
+    )
+    estimator.set_data(
+        np.asarray([[1.0], [3.0]]),
+        np.asarray([[0.0], [0.5 * np.pi]]),
+    )
+    with torch.no_grad():
+        estimator.log_lambda.fill_(np.log(0.25))
+
+    covariance = estimator(np.asarray([[0.0]]))
+    expected_weight = np.exp(-1.0 / (0.25 + estimator.lambda_epsilon))
+    expected = (1.0 + expected_weight * 9.0) / (1.0 + expected_weight)
+    np.testing.assert_allclose(
+        float(covariance.item()), expected, rtol=1e-12, atol=1e-12
+    )
+
+    covariance.sum().backward()
+    assert estimator.log_lambda.grad is not None
+    assert torch.isfinite(estimator.log_lambda.grad)
+    assert float(estimator.log_lambda.grad.abs()) > 0.0
+
+
+def test_periodic_log_bandwidth_initialization_targets_residual_ess() -> None:
+    theta = np.linspace(0.0, np.pi, 200, endpoint=False)[:, None]
+    phase = 2.0 * theta[:, 0]
+    residuals = np.column_stack([np.sin(phase), np.cos(phase)])
+    estimator = PeriodicLogBandwidthKernelCovariance(
+        1,
+        2,
+        circular_period=np.pi,
+        neighbors_per_effective_dimension=5.0,
+        initialization_grid_size=128,
+        jitter=0.0,
+        dtype=torch.float64,
+    )
+
+    estimator.initialize_parameters(residuals, theta)
+
+    np.testing.assert_allclose(
+        estimator.residual_participation_ratio, 2.0, rtol=1e-12
+    )
+    np.testing.assert_allclose(
+        estimator.target_effective_sample_size, 10.0, rtol=1e-12
+    )
+    np.testing.assert_allclose(
+        estimator.initial_effective_sample_size,
+        estimator.target_effective_sample_size,
+        rtol=0.05,
+    )
+    assert 0.0 < estimator.initial_lambda < 0.01
 
 
 def test_variational_gkr_supports_mean_minibatches() -> None:
@@ -40,6 +102,57 @@ def test_variational_gkr_supports_mean_minibatches() -> None:
     assert np.isfinite(mean).all()
     assert np.isfinite(covariance).all()
     assert len(model.mean_loss_history) == 2
+
+
+def test_restore_log_lambda_gkr_checkpoint_preserves_predictions() -> None:
+    theta = np.linspace(0.0, np.pi, 18, endpoint=False)[:, None]
+    responses = np.column_stack(
+        [np.sin(2.0 * theta[:, 0]), np.cos(2.0 * theta[:, 0])]
+    )
+    config = GKRConfig(
+        mean_iterations=2,
+        n_inducing=5,
+        covariance_epochs=1,
+        covariance_batch_size=18,
+        prediction_batch_size=18,
+        log_every=0,
+    )
+    model = TorchGKR(
+        n_input=1,
+        n_output=2,
+        circular_period=np.pi,
+        config=config,
+        dtype=torch.float64,
+        device="cpu",
+        seed=3,
+    )
+    model.covariance_model = PeriodicLogBandwidthKernelCovariance(
+        1,
+        2,
+        circular_period=np.pi,
+        initial_lambda=0.2,
+        dtype=torch.float64,
+    )
+    model.fit(responses, theta)
+    query = np.asarray([[0.2], [1.1]])
+    expected_mean, expected_covariance = model.predict(query)
+    checkpoint = gkr_checkpoint(model)
+    checkpoint["covariance_kernel_metadata"] = {
+        "configuration": {
+            "neighbors_per_effective_dimension": 5.0,
+            "lambda_epsilon": 1e-8,
+            "initialization_grid_size": 256,
+        },
+        "initial_lambda": model.covariance_model.initial_lambda,
+    }
+
+    restored = restore_gkr_checkpoint(checkpoint)
+    actual_mean, actual_covariance = restored.predict(query)
+
+    np.testing.assert_allclose(actual_mean, expected_mean, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(
+        actual_covariance, expected_covariance, rtol=1e-12, atol=1e-12
+    )
 
 
 def test_gaussian_residual_log_likelihood_matches_manual_identity_case() -> None:

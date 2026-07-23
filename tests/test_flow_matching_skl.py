@@ -28,6 +28,7 @@ from fisher.flow_matching_skl import (
     flow_endpoint_log_prob,
     flow_skl_result_to_npz_dict,
     sample_flow_endpoint,
+    sample_flow_endpoint_conditions,
     train_flow_skl_model,
 )
 
@@ -1187,6 +1188,34 @@ def test_sample_flow_endpoint_uses_package_solver_for_constant_velocity() -> Non
         ode_method="midpoint",
     )
     torch.testing.assert_close(got, expected_x0 + mean.reshape(1, -1), rtol=1e-6, atol=1e-6)
+
+
+def test_sample_flow_endpoint_conditions_preserves_condition_rows() -> None:
+    model = build_flow_skl_model(
+        velocity_family="translation",
+        theta_dim=2,
+        x_dim=2,
+        hidden_dim=4,
+        depth=1,
+        path_schedule="linear",
+    )
+    model.mean_net = torch.nn.Linear(2, 2, bias=False)
+    with torch.no_grad():
+        model.mean_net.weight.copy_(torch.eye(2))
+    theta = np.asarray([[1.0, 0.0], [0.0, 2.0]], dtype=np.float64)
+    torch.manual_seed(123)
+    expected_x0 = torch.randn(2, 2, dtype=torch.float32)
+    torch.manual_seed(123)
+    got = sample_flow_endpoint_conditions(
+        model=model,
+        theta_all=theta,
+        device=torch.device("cpu"),
+        ode_steps=3,
+        ode_method="midpoint",
+    )
+    torch.testing.assert_close(
+        got, expected_x0 + torch.from_numpy(theta.astype(np.float32)), rtol=1e-6, atol=1e-6
+    )
 
 
 def test_shared_affine_forward_uses_centered_residual() -> None:

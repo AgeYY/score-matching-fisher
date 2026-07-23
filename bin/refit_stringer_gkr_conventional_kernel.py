@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Refit Stringer GKR with a conventional periodic covariance kernel."""
+"""Refit Stringer GKR with selectable periodic covariance parameterizations."""
 
 from __future__ import annotations
 
@@ -25,7 +25,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from fisher.gkr import GKRConfig, TorchGKR, TorchKernelCovariance
+from fisher.gkr import (
+    GKRConfig,
+    PeriodicLogBandwidthKernelCovariance,
+    TorchGKR,
+    TorchKernelCovariance,
+)
 from fisher.fisher_validation import gkr_checkpoint
 from fisher.shared_fisher_est import require_device
 from global_setting import DATA_DIR
@@ -48,11 +53,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path(DATA_DIR) / "stringer_gkr_conventional_kernel_gt1",
+        default=Path(DATA_DIR) / "stringer_gkr_periodic_log_lambda_gt1",
     )
-    parser.add_argument("--covariance-epochs", type=int, default=300)
-    parser.add_argument("--mean-learning-rate", type=float, default=0.05)
-    parser.add_argument("--covariance-learning-rate", type=float, default=0.1)
+    parser.add_argument("--covariance-epochs", type=int, default=100)
+    parser.add_argument("--mean-learning-rate", type=float, default=0.01)
+    parser.add_argument("--covariance-learning-rate", type=float, default=0.01)
+    parser.add_argument(
+        "--kernel-parameterization",
+        choices=("log-lambda", "precision"),
+        default="log-lambda",
+    )
+    parser.add_argument(
+        "--neighbors-per-effective-dimension",
+        type=float,
+        default=5.0,
+    )
+    parser.add_argument("--lambda-epsilon", type=float, default=1e-8)
+    parser.add_argument("--initialization-grid-size", type=int, default=256)
+    parser.add_argument(
+        "--initial-lambda",
+        type=float,
+        default=None,
+        help="Override residual-ESS bandwidth initialization.",
+    )
     parser.add_argument(
         "--standardize-responses",
         action=argparse.BooleanOptionalAction,
@@ -128,6 +151,42 @@ class ConventionalPeriodicKernelCovariance(TorchKernelCovariance):
             self.n_output, dtype=self.dtype, device=self.device
         )
         return covariance + self.jitter * eye.unsqueeze(0)
+
+
+def _median_periodic_effective_sample_size(
+    inputs: np.ndarray,
+    *,
+    bandwidth_lambda: float,
+    period: float,
+    grid_size: int,
+    epsilon: float,
+) -> float:
+    values = np.asarray(inputs, dtype=np.float64).reshape(-1)
+    query = np.arange(int(grid_size), dtype=np.float64) * (
+        float(period) / int(grid_size)
+    )
+    squared_distance = np.sin(
+        np.pi * (values[:, None] - query[None, :]) / float(period)
+    ) ** 2
+    log_weights = -squared_distance / (
+        float(bandwidth_lambda) + float(epsilon)
+    )
+    log_weights -= np.max(log_weights, axis=0, keepdims=True)
+    weights = np.exp(log_weights)
+    effective_size = np.square(weights.sum(axis=0)) / np.maximum(
+        np.square(weights).sum(axis=0), np.finfo(np.float64).tiny
+    )
+    return float(np.median(effective_size))
+
+
+def _residual_participation_ratio(residuals: np.ndarray) -> float:
+    values = np.asarray(residuals, dtype=np.float64)
+    centered = values - values.mean(axis=0, keepdims=True)
+    covariance = centered.T @ centered / max(values.shape[0] - 1, 1)
+    return float(
+        np.trace(covariance) ** 2
+        / max(np.square(covariance).sum(), np.finfo(np.float64).tiny)
+    )
 
 
 def _gaussian_log_likelihood(
@@ -237,6 +296,7 @@ def _plot(
     conventional_covariance: np.ndarray,
     original_likelihood: float,
     conventional_likelihood: float,
+    fitted_title: str,
     output_dir: Path,
 ) -> tuple[Path, Path]:
     plt.rcParams.update(
@@ -268,7 +328,7 @@ def _plot(
         selected_theta=selected_theta,
         means=conventional_mean,
         covariances=conventional_covariance,
-        title=f"Conventional periodic GKR\nmean LL = {conventional_likelihood:.1f}",
+        title=f"{fitted_title}\nmean LL = {conventional_likelihood:.1f}",
         norm=norm,
     )
     all_points = np.vstack(
@@ -340,6 +400,23 @@ def main() -> int:
         raise ValueError("--mean-learning-rate must be positive.")
     if float(args.covariance_learning_rate) <= 0.0:
         raise ValueError("--covariance-learning-rate must be positive.")
+    if float(args.neighbors_per_effective_dimension) <= 0.0:
+        raise ValueError(
+            "--neighbors-per-effective-dimension must be positive."
+        )
+    if float(args.lambda_epsilon) <= 0.0:
+        raise ValueError("--lambda-epsilon must be positive.")
+    if int(args.initialization_grid_size) < 2:
+        raise ValueError("--initialization-grid-size must be at least two.")
+    if args.initial_lambda is not None and float(args.initial_lambda) <= 0.0:
+        raise ValueError("--initial-lambda must be positive when provided.")
+    if (
+        args.kernel_parameterization == "precision"
+        and args.initial_lambda is not None
+    ):
+        raise ValueError(
+            "--initial-lambda is only available for log-lambda parameterization."
+        )
     device = require_device(str(args.device))
     base_dir = args.base_result_dir.expanduser().resolve()
     output_dir = args.output_dir.expanduser().resolve()
@@ -369,6 +446,26 @@ def main() -> int:
             saved["gkr_test_log_likelihood"], dtype=np.float64
         )
 
+    run_configuration = {
+        "kernel_parameterization": str(args.kernel_parameterization),
+        "covariance_epochs": int(args.covariance_epochs),
+        "mean_iterations": 300,
+        "mean_learning_rate": float(args.mean_learning_rate),
+        "covariance_learning_rate": float(args.covariance_learning_rate),
+        "standardize_responses": bool(args.standardize_responses),
+        "neighbors_per_effective_dimension": float(
+            args.neighbors_per_effective_dimension
+        ),
+        "lambda_epsilon": float(args.lambda_epsilon),
+        "initialization_grid_size": int(args.initialization_grid_size),
+        "requested_initial_lambda": (
+            None
+            if args.initial_lambda is None
+            else float(args.initial_lambda)
+        ),
+        "seed": int(args.seed),
+    }
+    configuration_json = json.dumps(run_configuration, sort_keys=True)
     result_path = output_dir / "conventional_gkr_results.npz"
     checkpoint_path = output_dir / "conventional_gkr_model.pt"
     started = time.perf_counter()
@@ -381,44 +478,26 @@ def main() -> int:
                 "mean_learning_rate",
                 "covariance_learning_rate",
                 "standardize_responses",
+                "configuration_json",
+                "initial_lambda",
+                "learned_lambda",
+                "initial_precision",
+                "learned_precision",
+                "residual_participation_ratio",
+                "target_effective_sample_size",
+                "initial_effective_sample_size",
+                "final_effective_sample_size",
             }
             missing = required - set(saved.files)
             if missing:
                 raise ValueError(
                     f"Cached result is missing {sorted(missing)}; pass --force."
                 )
-            saved_epochs = int(saved["covariance_epochs"])
-            if saved_epochs != int(args.covariance_epochs):
+            saved_configuration = str(saved["configuration_json"].item())
+            if saved_configuration != configuration_json:
                 raise ValueError(
-                    f"Cached result uses {saved_epochs} covariance epochs, "
-                    f"not {int(args.covariance_epochs)}; pass --force."
-                )
-            saved_mean_lr = float(saved["mean_learning_rate"])
-            saved_covariance_lr = float(saved["covariance_learning_rate"])
-            saved_standardize = bool(saved["standardize_responses"])
-            if not np.isclose(
-                saved_mean_lr, float(args.mean_learning_rate), rtol=0.0, atol=1e-15
-            ):
-                raise ValueError(
-                    f"Cached result uses mean learning rate {saved_mean_lr}, "
-                    f"not {float(args.mean_learning_rate)}; pass --force."
-                )
-            if not np.isclose(
-                saved_covariance_lr,
-                float(args.covariance_learning_rate),
-                rtol=0.0,
-                atol=1e-15,
-            ):
-                raise ValueError(
-                    "Cached result uses covariance learning rate "
-                    f"{saved_covariance_lr}, not "
-                    f"{float(args.covariance_learning_rate)}; pass --force."
-                )
-            if saved_standardize != bool(args.standardize_responses):
-                raise ValueError(
-                    "Cached result uses standardize_responses="
-                    f"{saved_standardize}, not "
-                    f"{bool(args.standardize_responses)}; pass --force."
+                    "Cached result uses a different run configuration; "
+                    "pass --force."
                 )
             conventional_mean = np.asarray(saved["conventional_mean"])
             conventional_covariance = np.asarray(saved["conventional_covariance"])
@@ -428,7 +507,22 @@ def main() -> int:
                 saved["conventional_test_log_likelihood"]
             )
             covariance_losses = np.asarray(saved["covariance_losses"])
+            initial_lambda = float(saved["initial_lambda"])
+            learned_lambda = float(saved["learned_lambda"])
+            initial_precision = float(saved["initial_precision"])
             learned_precision = float(saved["learned_precision"])
+            residual_participation_ratio = float(
+                saved["residual_participation_ratio"]
+            )
+            target_effective_sample_size = float(
+                saved["target_effective_sample_size"]
+            )
+            initial_effective_sample_size = float(
+                saved["initial_effective_sample_size"]
+            )
+            final_effective_sample_size = float(
+                saved["final_effective_sample_size"]
+            )
     else:
         config = GKRConfig(
             mean_iterations=300,
@@ -453,14 +547,30 @@ def main() -> int:
             device=device,
             seed=int(args.seed),
         )
-        model.covariance_model = ConventionalPeriodicKernelCovariance(
-            n_input=1,
-            n_output=x.shape[1],
-            circular_period=PERIOD,
-            jitter=config.covariance_jitter,
-            dtype=torch.float64,
-            device=device,
-        )
+        if args.kernel_parameterization == "log-lambda":
+            model.covariance_model = PeriodicLogBandwidthKernelCovariance(
+                n_input=1,
+                n_output=x.shape[1],
+                circular_period=PERIOD,
+                neighbors_per_effective_dimension=float(
+                    args.neighbors_per_effective_dimension
+                ),
+                lambda_epsilon=float(args.lambda_epsilon),
+                initialization_grid_size=int(args.initialization_grid_size),
+                initial_lambda=args.initial_lambda,
+                jitter=config.covariance_jitter,
+                dtype=torch.float64,
+                device=device,
+            )
+        else:
+            model.covariance_model = ConventionalPeriodicKernelCovariance(
+                n_input=1,
+                n_output=x.shape[1],
+                circular_period=PERIOD,
+                jitter=config.covariance_jitter,
+                dtype=torch.float64,
+                device=device,
+            )
         model.fit(x[fit], theta[fit, None])
         conventional_mean, conventional_covariance = model.predict(
             selected_theta[:, None]
@@ -475,8 +585,58 @@ def main() -> int:
         covariance_losses = np.asarray(
             model.covariance_loss_history, dtype=np.float64
         )
+        residuals = (
+            model.covariance_model.train_residuals.detach().cpu().numpy()
+        )
+        residual_participation_ratio = _residual_participation_ratio(
+            residuals
+        )
+        target_effective_sample_size = min(
+            max(
+                float(args.neighbors_per_effective_dimension)
+                * residual_participation_ratio,
+                float(x.shape[1] + 2),
+            ),
+            float(fit.size - 1),
+        )
         learned_precision = float(
             model.covariance_model.precision().detach().cpu().item()
+        )
+        if args.kernel_parameterization == "log-lambda":
+            if not isinstance(
+                model.covariance_model,
+                PeriodicLogBandwidthKernelCovariance,
+            ):
+                raise TypeError("Unexpected covariance model type.")
+            initial_lambda = float(model.covariance_model.initial_lambda)
+            learned_lambda = float(
+                model.covariance_model.bandwidth_lambda().detach().cpu()
+            )
+        else:
+            initial_lambda = 1.0
+            learned_lambda = 1.0 / max(learned_precision, 1e-12)
+        initial_precision = (
+            1.0
+            if args.kernel_parameterization == "precision"
+            else 1.0 / (initial_lambda + float(args.lambda_epsilon))
+        )
+        initial_effective_sample_size = (
+            _median_periodic_effective_sample_size(
+                theta[fit],
+                bandwidth_lambda=initial_lambda,
+                period=PERIOD,
+                grid_size=int(args.initialization_grid_size),
+                epsilon=float(args.lambda_epsilon),
+            )
+        )
+        final_effective_sample_size = (
+            _median_periodic_effective_sample_size(
+                theta[fit],
+                bandwidth_lambda=learned_lambda,
+                period=PERIOD,
+                grid_size=int(args.initialization_grid_size),
+                epsilon=float(args.lambda_epsilon),
+            )
         )
         np.savez_compressed(
             result_path,
@@ -490,7 +650,23 @@ def main() -> int:
             conventional_test_log_likelihood=conventional_test_likelihood,
             original_test_log_likelihood=original_test_likelihood,
             covariance_losses=covariance_losses,
+            configuration_json=np.asarray(configuration_json),
+            initial_lambda=np.asarray(initial_lambda),
+            learned_lambda=np.asarray(learned_lambda),
+            initial_precision=np.asarray(initial_precision),
             learned_precision=np.asarray(learned_precision),
+            residual_participation_ratio=np.asarray(
+                residual_participation_ratio
+            ),
+            target_effective_sample_size=np.asarray(
+                target_effective_sample_size
+            ),
+            initial_effective_sample_size=np.asarray(
+                initial_effective_sample_size
+            ),
+            final_effective_sample_size=np.asarray(
+                final_effective_sample_size
+            ),
             covariance_epochs=np.asarray(int(args.covariance_epochs)),
             mean_learning_rate=np.asarray(float(args.mean_learning_rate)),
             covariance_learning_rate=np.asarray(
@@ -498,13 +674,35 @@ def main() -> int:
             ),
             standardize_responses=np.asarray(bool(args.standardize_responses)),
         )
-        torch.save(gkr_checkpoint(model), checkpoint_path)
+        checkpoint = gkr_checkpoint(model)
+        checkpoint["covariance_kernel_metadata"] = {
+            "configuration": run_configuration,
+            "initial_lambda": initial_lambda,
+            "learned_lambda": learned_lambda,
+            "initial_precision": initial_precision,
+            "learned_precision": learned_precision,
+            "residual_participation_ratio": residual_participation_ratio,
+            "target_effective_sample_size": target_effective_sample_size,
+            "initial_effective_sample_size": initial_effective_sample_size,
+            "final_effective_sample_size": final_effective_sample_size,
+        }
+        torch.save(checkpoint, checkpoint_path)
 
-    effective_radius = math.asin(
-        min(1.0, 1.0 / math.sqrt(max(learned_precision, 1e-12)))
+    effective_radius = (PERIOD / math.pi) * math.asin(
+        math.sqrt(
+            min(
+                1.0,
+                max(learned_lambda + float(args.lambda_epsilon), 0.0),
+            )
+        )
     )
     original_mean_likelihood = float(np.mean(original_test_likelihood))
     conventional_mean_likelihood = float(np.mean(conventional_test_likelihood))
+    fitted_title = (
+        r"Periodic GKR ($\log\lambda$)"
+        if args.kernel_parameterization == "log-lambda"
+        else "Periodic GKR (precision)"
+    )
     png, svg = _plot(
         test_pc12=x[test, :2],
         theta_test=theta[test],
@@ -515,6 +713,7 @@ def main() -> int:
         conventional_covariance=conventional_covariance,
         original_likelihood=original_mean_likelihood,
         conventional_likelihood=conventional_mean_likelihood,
+        fitted_title=fitted_title,
         output_dir=output_dir / "figures",
     )
     summary = {
@@ -527,19 +726,30 @@ def main() -> int:
             "fit_fraction": float(fit.size / x.shape[0]),
             "test_fraction": float(test.size / x.shape[0]),
             "kernel": (
-                "exp(-d), d = sin(pi * delta / period)^T "
-                "precision sin(pi * delta / period)"
+                "exp(-sin(pi * delta / period)^2 / (lambda + epsilon))"
+                if args.kernel_parameterization == "log-lambda"
+                else "exp(-precision * sin(pi * delta / period)^2)"
             ),
-            "covariance_epochs": int(args.covariance_epochs),
-            "mean_learning_rate": float(args.mean_learning_rate),
-            "covariance_learning_rate": float(args.covariance_learning_rate),
-            "standardize_responses": bool(args.standardize_responses),
+            **run_configuration,
         },
         "original_mean_test_log_likelihood": original_mean_likelihood,
         "conventional_mean_test_log_likelihood": conventional_mean_likelihood,
         "likelihood_improvement": (
             conventional_mean_likelihood - original_mean_likelihood
         ),
+        "bandwidth_initialization": {
+            "residual_participation_ratio": residual_participation_ratio,
+            "neighbors_per_effective_dimension": float(
+                args.neighbors_per_effective_dimension
+            ),
+            "target_effective_sample_size": target_effective_sample_size,
+            "initial_effective_sample_size": initial_effective_sample_size,
+            "final_effective_sample_size": final_effective_sample_size,
+            "initial_lambda": initial_lambda,
+            "learned_lambda": learned_lambda,
+            "initial_precision": initial_precision,
+            "learned_precision": learned_precision,
+        },
         "learned_precision": learned_precision,
         "effective_exp_minus_one_radius_radians": effective_radius,
         "effective_exp_minus_one_radius_degrees": math.degrees(effective_radius),
