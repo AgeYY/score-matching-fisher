@@ -58,6 +58,12 @@ def parse_args() -> argparse.Namespace:
         / "stringer_gkr_conventional_kernel_lr001_cov300_all_sessions",
     )
     parser.add_argument(
+        "--lowest-lr-root",
+        type=Path,
+        default=Path(DATA_DIR)
+        / "stringer_gkr_conventional_kernel_lr0001_cov300_all_sessions",
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path(DATA_DIR) / "stringer_gkr_training_ablations",
@@ -270,7 +276,7 @@ def _plot(
         }
     )
     fig, axes = plt.subplots(1, 2, figsize=(7.5, 3.5), constrained_layout=True)
-    colors = ("C0", "C2", "C3")
+    colors = ("C0", "C2", "C3", "C4")
     _draw_paired_bars(
         axes[0],
         relative_likelihood,
@@ -316,6 +322,11 @@ def main() -> int:
             "LR 0.01",
             args.lower_lr_root.expanduser().resolve(),
         ),
+        Ablation(
+            "lowest_learning_rate",
+            "LR 0.001",
+            args.lowest_lr_root.expanduser().resolve(),
+        ),
     )
     output_dir = args.output_dir.expanduser().resolve()
     session_labels, bin_likelihood, likelihood, mahalanobis, sessions = _load(
@@ -352,6 +363,11 @@ def main() -> int:
                     "standardize_responses": True,
                     "mean_learning_rate": 0.01,
                     "covariance_learning_rate": 0.01,
+                },
+                "lowest_learning_rate": {
+                    "standardize_responses": True,
+                    "mean_learning_rate": 0.001,
+                    "covariance_learning_rate": 0.001,
                 },
             },
         },
@@ -395,6 +411,16 @@ def main() -> int:
                 ),
                 "sessions_improved": int(
                     np.count_nonzero(likelihood[:, 2] > likelihood[:, 0])
+                ),
+            },
+            "lowest_lr_minus_current_likelihood": {
+                "mean": float(np.mean(likelihood[:, 3] - likelihood[:, 0])),
+                "sem": float(
+                    np.std(likelihood[:, 3] - likelihood[:, 0], ddof=1)
+                    / np.sqrt(likelihood.shape[0])
+                ),
+                "sessions_improved": int(
+                    np.count_nonzero(likelihood[:, 3] > likelihood[:, 0])
                 ),
             },
         },
