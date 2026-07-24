@@ -838,7 +838,7 @@ def fit_cross_fitted_ole_direction_estimator(
 def gkr_checkpoint(model: Any) -> dict[str, Any]:
     """Return a portable state bundle for a fitted :class:`TorchGKR`."""
 
-    return {
+    checkpoint = {
         "mean_model": None if model.mean_model is None else model.mean_model.state_dict(),
         "mean_likelihood": (
             None if model.mean_likelihood is None else model.mean_likelihood.state_dict()
@@ -854,3 +854,8 @@ def gkr_checkpoint(model: Any) -> dict[str, Any]:
         "circular_period": model.circular_period,
         "seed": int(model.seed),
     }
+    if hasattr(model, "covariance_kernel_metadata"):
+        checkpoint["covariance_kernel_metadata"] = (
+            model.covariance_kernel_metadata()
+        )
+    return checkpoint

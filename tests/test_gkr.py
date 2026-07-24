@@ -5,6 +5,7 @@ import torch
 
 from fisher.gkr import (
     GKRConfig,
+    NonPeriodicLogBandwidthKernelCovariance,
     PeriodicLogBandwidthKernelCovariance,
     TorchGKR,
     TorchKernelCovariance,
@@ -13,6 +14,108 @@ from fisher.gkr import (
     restore_gkr_checkpoint,
 )
 from fisher.fisher_validation import gkr_checkpoint
+
+
+def test_nonperiodic_log_bandwidth_kernel_matches_rbf_equation() -> None:
+    estimator = NonPeriodicLogBandwidthKernelCovariance(
+        1,
+        1,
+        initial_lambda=0.25,
+        jitter=0.0,
+        dtype=torch.float64,
+    )
+    residuals = np.asarray([[1.0], [3.0]])
+    inputs = np.asarray([[0.0], [2.0]])
+    estimator.initialize_parameters(residuals, inputs)
+    estimator.set_data(residuals, inputs)
+
+    covariance = estimator(np.asarray([[0.0]]))
+    # Standardized inputs are -1 and +1, while the query is -1.
+    expected_weight = np.exp(-0.5 * 4.0 / (0.25 + estimator.lambda_epsilon))
+    expected = (1.0 + expected_weight * 9.0) / (1.0 + expected_weight)
+    np.testing.assert_allclose(
+        float(covariance.item()), expected, rtol=1e-12, atol=1e-12
+    )
+
+    covariance.sum().backward()
+    assert estimator.log_lambda.grad is not None
+    assert torch.isfinite(estimator.log_lambda.grad).all()
+    assert float(estimator.log_lambda.grad.abs().sum()) > 0.0
+
+
+def test_nonperiodic_log_bandwidth_initialization_targets_residual_ess() -> None:
+    inputs = np.linspace(-3.0, 5.0, 200)[:, None]
+    phase = np.linspace(0.0, 2.0 * np.pi, 200, endpoint=False)
+    residuals = np.column_stack([np.sin(phase), np.cos(phase)])
+    estimator = NonPeriodicLogBandwidthKernelCovariance(
+        1,
+        2,
+        neighbors_per_effective_dimension=5.0,
+        initialization_grid_size=128,
+        jitter=0.0,
+        dtype=torch.float64,
+    )
+
+    estimator.initialize_parameters(residuals, inputs)
+
+    np.testing.assert_allclose(
+        estimator.residual_participation_ratio, 2.0, rtol=1e-12
+    )
+    np.testing.assert_allclose(
+        estimator.target_effective_sample_size, 10.0, rtol=1e-12
+    )
+    np.testing.assert_allclose(
+        estimator.initial_effective_sample_size,
+        estimator.target_effective_sample_size,
+        rtol=0.05,
+    )
+    assert np.all(estimator.initial_lambda > 0.0)
+
+
+def test_nonperiodic_log_bandwidth_is_invariant_to_label_units() -> None:
+    inputs = np.linspace(-2.0, 3.0, 80)[:, None]
+    residuals = np.column_stack([np.sin(inputs[:, 0]), np.ones(80)])
+    first = NonPeriodicLogBandwidthKernelCovariance(
+        1, 2, jitter=0.0, dtype=torch.float64
+    )
+    second = NonPeriodicLogBandwidthKernelCovariance(
+        1, 2, jitter=0.0, dtype=torch.float64
+    )
+    first.initialize_parameters(residuals, inputs)
+    second.initialize_parameters(residuals, 100.0 * inputs + 17.0)
+    first.set_data(residuals, inputs)
+    second.set_data(residuals, 100.0 * inputs + 17.0)
+
+    expected = first(np.asarray([[-1.0], [1.5]])).detach().numpy()
+    actual = second(
+        100.0 * np.asarray([[-1.0], [1.5]]) + 17.0
+    ).detach().numpy()
+
+    np.testing.assert_allclose(
+        second.bandwidth_lambda().detach().numpy(),
+        first.bandwidth_lambda().detach().numpy(),
+        rtol=1e-10,
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(actual, expected, rtol=1e-10, atol=1e-12)
+
+
+def test_nonperiodic_multidimensional_kernel_has_ard_bandwidths() -> None:
+    rng = np.random.default_rng(4)
+    inputs = rng.normal(size=(60, 2))
+    residuals = rng.normal(size=(60, 3))
+    estimator = NonPeriodicLogBandwidthKernelCovariance(
+        2, 3, initial_lambda=0.4, dtype=torch.float64
+    )
+    estimator.initialize_parameters(residuals, inputs)
+    estimator.set_data(residuals, inputs)
+
+    loss = estimator(inputs[:4]).sum()
+    loss.backward()
+
+    assert estimator.log_lambda.shape == (2,)
+    assert estimator.log_lambda.grad is not None
+    assert torch.isfinite(estimator.log_lambda.grad).all()
 
 
 def test_periodic_log_bandwidth_kernel_matches_equation_and_has_gradient() -> None:
@@ -104,6 +207,30 @@ def test_variational_gkr_supports_mean_minibatches() -> None:
     assert len(model.mean_loss_history) == 2
 
 
+def test_torch_gkr_selects_log_lambda_by_default_and_precision_explicitly() -> None:
+    default_model = TorchGKR(2, 3)
+    precision_model = TorchGKR(
+        2,
+        3,
+        config=GKRConfig(covariance_kernel_parameterization="precision"),
+    )
+    periodic_model = TorchGKR(1, 3, circular_period=np.pi)
+
+    assert isinstance(
+        default_model.covariance_model,
+        NonPeriodicLogBandwidthKernelCovariance,
+    )
+    assert isinstance(precision_model.covariance_model, TorchKernelCovariance)
+    assert not isinstance(
+        precision_model.covariance_model,
+        NonPeriodicLogBandwidthKernelCovariance,
+    )
+    assert isinstance(
+        periodic_model.covariance_model,
+        PeriodicLogBandwidthKernelCovariance,
+    )
+
+
 def test_restore_log_lambda_gkr_checkpoint_preserves_predictions() -> None:
     theta = np.linspace(0.0, np.pi, 18, endpoint=False)[:, None]
     responses = np.column_stack(
@@ -149,6 +276,76 @@ def test_restore_log_lambda_gkr_checkpoint_preserves_predictions() -> None:
     restored = restore_gkr_checkpoint(checkpoint)
     actual_mean, actual_covariance = restored.predict(query)
 
+    np.testing.assert_allclose(actual_mean, expected_mean, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(
+        actual_covariance, expected_covariance, rtol=1e-12, atol=1e-12
+    )
+
+
+def test_restore_nonperiodic_log_lambda_checkpoint_preserves_predictions() -> None:
+    theta = np.linspace(-1.0, 1.0, 18)[:, None]
+    responses = np.column_stack([theta[:, 0], theta[:, 0] ** 2])
+    model = TorchGKR(
+        n_input=1,
+        n_output=2,
+        config=GKRConfig(
+            mean_iterations=2,
+            n_inducing=5,
+            covariance_epochs=1,
+            covariance_batch_size=18,
+            prediction_batch_size=18,
+            log_every=0,
+        ),
+        dtype=torch.float64,
+        device="cpu",
+        seed=7,
+    )
+    model.fit(responses, theta)
+    query = np.asarray([[-0.6], [0.4]])
+    expected_mean, expected_covariance = model.predict(query)
+
+    checkpoint = gkr_checkpoint(model)
+    restored = restore_gkr_checkpoint(checkpoint)
+    actual_mean, actual_covariance = restored.predict(query)
+
+    assert checkpoint["covariance_kernel_metadata"]["kernel_family"] == "rbf"
+    np.testing.assert_allclose(actual_mean, expected_mean, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(
+        actual_covariance, expected_covariance, rtol=1e-12, atol=1e-12
+    )
+
+
+def test_restore_legacy_precision_checkpoint_preserves_predictions() -> None:
+    theta = np.linspace(-1.0, 1.0, 18)[:, None]
+    responses = np.column_stack([theta[:, 0], theta[:, 0] ** 2])
+    model = TorchGKR(
+        n_input=1,
+        n_output=2,
+        config=GKRConfig(
+            mean_iterations=2,
+            n_inducing=5,
+            covariance_epochs=1,
+            covariance_batch_size=18,
+            prediction_batch_size=18,
+            covariance_kernel_parameterization="precision",
+            log_every=0,
+        ),
+        dtype=torch.float64,
+        device="cpu",
+        seed=8,
+    )
+    model.fit(responses, theta)
+    query = np.asarray([[-0.3], [0.7]])
+    expected_mean, expected_covariance = model.predict(query)
+    checkpoint = gkr_checkpoint(model)
+    checkpoint.pop("covariance_kernel_metadata")
+    checkpoint["config"].pop("covariance_kernel_parameterization")
+
+    restored = restore_gkr_checkpoint(checkpoint)
+    actual_mean, actual_covariance = restored.predict(query)
+
+    assert type(restored.covariance_model) is TorchKernelCovariance
+    assert restored.config.covariance_kernel_parameterization == "precision"
     np.testing.assert_allclose(actual_mean, expected_mean, rtol=1e-12, atol=1e-12)
     np.testing.assert_allclose(
         actual_covariance, expected_covariance, rtol=1e-12, atol=1e-12

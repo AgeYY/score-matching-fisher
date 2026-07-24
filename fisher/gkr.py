@@ -172,6 +172,11 @@ class GKRConfig:
     likelihood_jitter: float = 1e-5
     prediction_batch_size: int = 3000
     standardize_responses: bool = True
+    covariance_kernel_parameterization: str = "log-lambda"
+    covariance_neighbors_per_effective_dimension: float = 5.0
+    covariance_lambda_epsilon: float = 1e-8
+    covariance_initialization_grid_size: int = 256
+    covariance_initial_lambda: float | None = None
     log_every: int = 25
 
 
@@ -266,6 +271,282 @@ class TorchKernelCovariance(torch.nn.Module):
             denominator = denominator + weights.sum(dim=0)
         covariance = numerator / denominator.clamp_min(1e-12)[:, None, None]
         eye = torch.eye(self.n_output, dtype=self.dtype, device=self.device)
+        return covariance + self.jitter * eye.unsqueeze(0)
+
+
+def _residual_participation_ratio(residuals: torch.Tensor) -> torch.Tensor:
+    centered = residuals - residuals.mean(dim=0, keepdim=True)
+    denominator = max(int(residuals.shape[0]) - 1, 1)
+    covariance = centered.transpose(0, 1) @ centered / denominator
+    trace = torch.trace(covariance)
+    trace_square = covariance.square().sum()
+    return trace.square() / trace_square.clamp_min(
+        torch.finfo(residuals.dtype).tiny
+    )
+
+
+class NonPeriodicLogBandwidthKernelCovariance(TorchKernelCovariance):
+    """Gaussian RBF covariance kernel with learned ARD log bandwidths."""
+
+    def __init__(
+        self,
+        n_input: int,
+        n_output: int,
+        *,
+        neighbors_per_effective_dimension: float = 5.0,
+        lambda_epsilon: float = 1e-8,
+        initialization_grid_size: int = 256,
+        initial_lambda: float | None = None,
+        jitter: float = 1e-6,
+        dtype: torch.dtype = torch.float64,
+        device: str | torch.device = "cpu",
+    ) -> None:
+        if int(n_input) < 1:
+            raise ValueError("n_input must be positive.")
+        if float(neighbors_per_effective_dimension) <= 0.0:
+            raise ValueError(
+                "neighbors_per_effective_dimension must be positive."
+            )
+        if float(lambda_epsilon) <= 0.0:
+            raise ValueError("lambda_epsilon must be positive.")
+        if int(initialization_grid_size) < 2:
+            raise ValueError("initialization_grid_size must be at least two.")
+        if initial_lambda is not None and float(initial_lambda) <= 0.0:
+            raise ValueError("initial_lambda must be positive when provided.")
+        super().__init__(
+            n_input,
+            n_output,
+            circular_period=None,
+            jitter=jitter,
+            dtype=dtype,
+            device=device,
+        )
+        del self.kernel_precision_cholesky
+        self.neighbors_per_effective_dimension = float(
+            neighbors_per_effective_dimension
+        )
+        self.lambda_epsilon = float(lambda_epsilon)
+        self.initialization_grid_size = int(initialization_grid_size)
+        self.requested_initial_lambda = (
+            None if initial_lambda is None else float(initial_lambda)
+        )
+        starting_lambda = 1.0 if initial_lambda is None else float(initial_lambda)
+        self.log_lambda = torch.nn.Parameter(
+            torch.full(
+                (self.n_input,),
+                math.log(starting_lambda),
+                dtype=dtype,
+                device=self.device,
+            )
+        )
+        self.register_buffer(
+            "input_mean",
+            torch.zeros(self.n_input, dtype=dtype, device=self.device),
+        )
+        self.register_buffer(
+            "input_std",
+            torch.ones(self.n_input, dtype=dtype, device=self.device),
+        )
+        self.initial_lambda = np.full(
+            self.n_input, starting_lambda, dtype=np.float64
+        )
+        self.residual_participation_ratio = float("nan")
+        self.target_effective_sample_size = float("nan")
+        self.initial_effective_sample_size = float("nan")
+
+    def bandwidth_lambda(self) -> torch.Tensor:
+        return torch.exp(self.log_lambda)
+
+    def precision(self) -> torch.Tensor:
+        return torch.diag(
+            1.0 / (self.bandwidth_lambda() + self.lambda_epsilon)
+        )
+
+    def _standardize(self, inputs: torch.Tensor) -> torch.Tensor:
+        return (inputs - self.input_mean) / self.input_std
+
+    def _representative_queries(self, inputs: torch.Tensor) -> torch.Tensor:
+        count = min(self.initialization_grid_size, int(inputs.shape[0]))
+        if count == int(inputs.shape[0]):
+            return inputs
+        centered = inputs - inputs.mean(dim=0, keepdim=True)
+        if self.n_input == 1:
+            score = centered[:, 0]
+        else:
+            _, _, right = torch.linalg.svd(centered, full_matrices=False)
+            score = centered @ right[0]
+        order = torch.argsort(score)
+        positions = torch.linspace(
+            0,
+            int(inputs.shape[0]) - 1,
+            count,
+            dtype=self.dtype,
+            device=self.device,
+        ).round().long()
+        return inputs[order[positions]]
+
+    def _squared_distance(
+        self,
+        inputs: torch.Tensor,
+        query: torch.Tensor,
+        bandwidth_lambda: torch.Tensor,
+    ) -> torch.Tensor:
+        difference = (
+            self._standardize(inputs)[:, None, :]
+            - self._standardize(query)[None, :, :]
+        )
+        return (
+            difference.square()
+            / (bandwidth_lambda + self.lambda_epsilon)
+        ).sum(dim=-1)
+
+    def median_effective_sample_size(
+        self,
+        inputs: TensorLike,
+        *,
+        bandwidth_lambda: float | TensorLike | None = None,
+    ) -> torch.Tensor:
+        inputs_t = _as_2d(inputs, dtype=self.dtype, device=self.device)
+        if inputs_t.shape[1] != self.n_input:
+            raise ValueError("Input dimension does not match n_input.")
+        if inputs_t.shape[0] < 1:
+            raise ValueError("inputs must contain at least one observation.")
+        if bandwidth_lambda is None:
+            value = self.bandwidth_lambda()
+        else:
+            value = torch.as_tensor(
+                bandwidth_lambda, dtype=self.dtype, device=self.device
+            )
+            if value.ndim == 0:
+                value = value.repeat(self.n_input)
+        if value.shape != (self.n_input,) or torch.any(value <= 0.0):
+            raise ValueError(
+                "bandwidth_lambda must be positive and scalar or length n_input."
+            )
+        query = self._representative_queries(inputs_t)
+        squared_distance = self._squared_distance(inputs_t, query, value)
+        log_weights = -0.5 * squared_distance
+        log_weights -= log_weights.max(dim=0, keepdim=True).values
+        weights = torch.exp(log_weights)
+        effective_size = weights.sum(dim=0).square() / weights.square().sum(
+            dim=0
+        ).clamp_min(torch.finfo(self.dtype).tiny)
+        return torch.median(effective_size)
+
+    def _solve_initial_lambda(
+        self,
+        inputs: torch.Tensor,
+        target_effective_size: float,
+    ) -> float:
+        lower = math.log(1e-12)
+        upper = math.log(1e6)
+        with torch.no_grad():
+            for _ in range(80):
+                midpoint = 0.5 * (lower + upper)
+                effective_size = float(
+                    self.median_effective_sample_size(
+                        inputs,
+                        bandwidth_lambda=math.exp(midpoint),
+                    ).cpu()
+                )
+                if effective_size < target_effective_size:
+                    lower = midpoint
+                else:
+                    upper = midpoint
+        return math.exp(0.5 * (lower + upper))
+
+    def initialize_parameters(
+        self,
+        residuals: TensorLike,
+        inputs: TensorLike,
+    ) -> None:
+        residuals_t = _as_2d(
+            residuals, dtype=self.dtype, device=self.device
+        )
+        inputs_t = _as_2d(inputs, dtype=self.dtype, device=self.device)
+        if residuals_t.shape[0] != inputs_t.shape[0]:
+            raise ValueError("Residuals and inputs must have the same length.")
+        if (
+            residuals_t.shape[1] != self.n_output
+            or inputs_t.shape[1] != self.n_input
+        ):
+            raise ValueError("Initialization data dimensions do not match.")
+        if residuals_t.shape[0] < 2:
+            raise ValueError(
+                "At least two observations are required for bandwidth initialization."
+            )
+        with torch.no_grad():
+            self.input_mean.copy_(inputs_t.mean(dim=0))
+            self.input_std.copy_(
+                inputs_t.std(dim=0, unbiased=False).clamp_min(1e-8)
+            )
+            participation_ratio = float(
+                _residual_participation_ratio(residuals_t).cpu()
+            )
+            target = min(
+                max(
+                    self.neighbors_per_effective_dimension
+                    * participation_ratio,
+                    float(self.n_output + 2),
+                ),
+                float(residuals_t.shape[0] - 1),
+            )
+            scalar_lambda = (
+                self.requested_initial_lambda
+                if self.requested_initial_lambda is not None
+                else self._solve_initial_lambda(inputs_t, target)
+            )
+            self.log_lambda.fill_(math.log(scalar_lambda))
+            initial_effective_size = float(
+                self.median_effective_sample_size(
+                    inputs_t,
+                    bandwidth_lambda=scalar_lambda,
+                ).cpu()
+            )
+        self.initial_lambda = np.full(
+            self.n_input, scalar_lambda, dtype=np.float64
+        )
+        self.residual_participation_ratio = participation_ratio
+        self.target_effective_sample_size = float(target)
+        self.initial_effective_sample_size = initial_effective_size
+
+    def forward(
+        self,
+        query: TensorLike,
+        *,
+        batch_size: int = 3000,
+    ) -> torch.Tensor:
+        if self.train_inputs.numel() == 0:
+            raise RuntimeError("Call set_data before predicting covariance.")
+        query_t = _as_2d(query, dtype=self.dtype, device=self.device)
+        if query_t.shape[1] != self.n_input:
+            raise ValueError("Query dimension does not match n_input.")
+        numerator = torch.zeros(
+            query_t.shape[0],
+            self.n_output,
+            self.n_output,
+            dtype=self.dtype,
+            device=self.device,
+        )
+        denominator = torch.zeros(
+            query_t.shape[0], dtype=self.dtype, device=self.device
+        )
+        bandwidth_lambda = self.bandwidth_lambda()
+        for start in range(0, self.train_inputs.shape[0], int(batch_size)):
+            stop = min(start + int(batch_size), self.train_inputs.shape[0])
+            inputs = self.train_inputs[start:stop]
+            residuals = self.train_residuals[start:stop]
+            squared_distance = self._squared_distance(
+                inputs, query_t, bandwidth_lambda
+            )
+            weights = torch.exp(-0.5 * squared_distance)
+            grams = torch.einsum("bi,bj->bij", residuals, residuals)
+            numerator += torch.einsum("bq,bij->qij", weights, grams)
+            denominator += weights.sum(dim=0)
+        covariance = numerator / denominator.clamp_min(1e-12)[:, None, None]
+        eye = torch.eye(
+            self.n_output, dtype=self.dtype, device=self.device
+        )
         return covariance + self.jitter * eye.unsqueeze(0)
 
 
@@ -394,14 +675,7 @@ class PeriodicLogBandwidthKernelCovariance(TorchKernelCovariance):
 
     @staticmethod
     def _participation_ratio(residuals: torch.Tensor) -> torch.Tensor:
-        centered = residuals - residuals.mean(dim=0, keepdim=True)
-        denominator = max(int(residuals.shape[0]) - 1, 1)
-        covariance = centered.transpose(0, 1) @ centered / denominator
-        trace = torch.trace(covariance)
-        trace_square = covariance.square().sum()
-        return trace.square() / trace_square.clamp_min(
-            torch.finfo(residuals.dtype).tiny
-        )
+        return _residual_participation_ratio(residuals)
 
     def _solve_initial_lambda(
         self,
@@ -510,6 +784,64 @@ class PeriodicLogBandwidthKernelCovariance(TorchKernelCovariance):
         return covariance + self.jitter * eye.unsqueeze(0)
 
 
+def _create_covariance_model(
+    *,
+    n_input: int,
+    n_output: int,
+    circular_period: CircularPeriod,
+    config: GKRConfig,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> TorchKernelCovariance:
+    parameterization = str(config.covariance_kernel_parameterization)
+    if parameterization == "precision":
+        return TorchKernelCovariance(
+            n_input,
+            n_output,
+            circular_period=circular_period,
+            jitter=config.covariance_jitter,
+            dtype=dtype,
+            device=device,
+        )
+    if parameterization != "log-lambda":
+        raise ValueError(
+            "covariance_kernel_parameterization must be 'log-lambda' or "
+            "'precision'."
+        )
+    common = {
+        "neighbors_per_effective_dimension": (
+            config.covariance_neighbors_per_effective_dimension
+        ),
+        "lambda_epsilon": config.covariance_lambda_epsilon,
+        "initialization_grid_size": (
+            config.covariance_initialization_grid_size
+        ),
+        "initial_lambda": config.covariance_initial_lambda,
+        "jitter": config.covariance_jitter,
+        "dtype": dtype,
+        "device": device,
+    }
+    periods = _periods(circular_period, n_input)
+    if all(value is None for value in periods):
+        return NonPeriodicLogBandwidthKernelCovariance(
+            n_input,
+            n_output,
+            **common,
+        )
+    if n_input == 1 and periods[0] is not None:
+        return PeriodicLogBandwidthKernelCovariance(
+            n_input,
+            n_output,
+            circular_period=periods[0],
+            **common,
+        )
+    raise ValueError(
+        "The log-lambda covariance kernel supports either entirely "
+        "non-periodic labels or one scalar periodic label. Use the precision "
+        "parameterization for mixed or multidimensional periodic labels."
+    )
+
+
 class TorchGKR:
     """Fit a GKR conditional Gaussian model using Torch and GPyTorch."""
 
@@ -537,15 +869,94 @@ class TorchGKR:
         self.mean_likelihood: gpytorch.likelihoods.GaussianLikelihood | None = None
         self.mean_loss_history: list[float] = []
         self.covariance_loss_history: list[float] = []
-        self.covariance_model = TorchKernelCovariance(
-            self.n_input,
-            self.n_output,
+        self.covariance_model = _create_covariance_model(
+            n_input=self.n_input,
+            n_output=self.n_output,
             circular_period=circular_period,
-            jitter=self.config.covariance_jitter,
+            config=self.config,
             dtype=dtype,
             device=self.device,
         )
         self._generator = torch.Generator(device="cpu").manual_seed(self.seed)
+
+    def covariance_kernel_metadata(self) -> dict[str, Any]:
+        model = self.covariance_model
+        if isinstance(
+            model,
+            (
+                NonPeriodicLogBandwidthKernelCovariance,
+                PeriodicLogBandwidthKernelCovariance,
+            ),
+        ):
+            parameterization = "log-lambda"
+        else:
+            parameterization = "precision"
+        metadata: dict[str, Any] = {
+            "parameterization": parameterization,
+            "configuration": {
+                "neighbors_per_effective_dimension": (
+                    self.config.covariance_neighbors_per_effective_dimension
+                ),
+                "lambda_epsilon": self.config.covariance_lambda_epsilon,
+                "initialization_grid_size": (
+                    self.config.covariance_initialization_grid_size
+                ),
+                "initial_lambda": self.config.covariance_initial_lambda,
+            },
+        }
+        if isinstance(
+            model,
+            (
+                NonPeriodicLogBandwidthKernelCovariance,
+                PeriodicLogBandwidthKernelCovariance,
+            ),
+        ):
+            initial_lambda = np.asarray(
+                model.initial_lambda, dtype=np.float64
+            )
+            learned_lambda = (
+                model.bandwidth_lambda().detach().cpu().numpy()
+            )
+            metadata.update(
+                {
+                    "kernel_family": (
+                        "periodic-rbf"
+                        if isinstance(
+                            model, PeriodicLogBandwidthKernelCovariance
+                        )
+                        else "rbf"
+                    ),
+                    "initial_lambda": (
+                        float(initial_lambda)
+                        if initial_lambda.ndim == 0
+                        else initial_lambda.tolist()
+                    ),
+                    "learned_lambda": (
+                        float(learned_lambda)
+                        if learned_lambda.ndim == 0
+                        else learned_lambda.tolist()
+                    ),
+                    "residual_participation_ratio": (
+                        model.residual_participation_ratio
+                    ),
+                    "target_effective_sample_size": (
+                        model.target_effective_sample_size
+                    ),
+                    "initial_effective_sample_size": (
+                        model.initial_effective_sample_size
+                    ),
+                    "final_effective_sample_size": float(
+                        model.median_effective_sample_size(
+                            model.train_inputs
+                        )
+                        .detach()
+                        .cpu()
+                    ),
+                }
+            )
+        else:
+            metadata["kernel_family"] = "precision"
+        return metadata
 
     def _select_inducing_points(self, inputs: torch.Tensor, count: int) -> torch.Tensor:
         if count >= inputs.shape[0]:
@@ -749,7 +1160,13 @@ def restore_gkr_checkpoint(
         raise ValueError(f"GKR checkpoint is missing {sorted(missing)}.")
 
     target_device = torch.device(device)
-    config = GKRConfig(**dict(checkpoint["config"]))
+    covariance_state = checkpoint["covariance_model"]
+    config_values = dict(checkpoint["config"])
+    if "covariance_kernel_parameterization" not in config_values:
+        config_values["covariance_kernel_parameterization"] = (
+            "log-lambda" if "log_lambda" in covariance_state else "precision"
+        )
+    config = GKRConfig(**config_values)
     model = TorchGKR(
         n_input=int(checkpoint["n_input"]),
         n_output=int(checkpoint["n_output"]),
@@ -788,30 +1205,60 @@ def restore_gkr_checkpoint(
     model.mean_model.load_state_dict(mean_state)
     model.mean_likelihood.load_state_dict(likelihood_state)
 
-    covariance_state = checkpoint["covariance_model"]
-    if "log_lambda" not in covariance_state:
-        raise ValueError(
-            "This checkpoint loader currently requires the periodic log-lambda "
-            "covariance parameterization."
-        )
     metadata = dict(checkpoint.get("covariance_kernel_metadata", {}))
     kernel_config = dict(metadata.get("configuration", {}))
-    covariance_model = PeriodicLogBandwidthKernelCovariance(
-        n_input=model.n_input,
-        n_output=model.n_output,
-        circular_period=model.circular_period,
-        neighbors_per_effective_dimension=float(
-            kernel_config.get("neighbors_per_effective_dimension", 5.0)
-        ),
-        lambda_epsilon=float(kernel_config.get("lambda_epsilon", 1e-8)),
-        initialization_grid_size=int(
-            kernel_config.get("initialization_grid_size", 256)
-        ),
-        initial_lambda=metadata.get("initial_lambda"),
-        jitter=config.covariance_jitter,
-        dtype=dtype,
-        device=target_device,
-    )
+    if "log_lambda" in covariance_state:
+        initial_lambda_value = metadata.get(
+            "initial_lambda",
+            kernel_config.get("initial_lambda"),
+        )
+        if isinstance(initial_lambda_value, (list, tuple, np.ndarray)):
+            initial_lambda_value = float(
+                np.asarray(initial_lambda_value, dtype=np.float64).reshape(-1)[0]
+            )
+        common: dict[str, Any] = {
+            "n_input": model.n_input,
+            "n_output": model.n_output,
+            "neighbors_per_effective_dimension": float(
+                kernel_config.get("neighbors_per_effective_dimension", 5.0)
+            ),
+            "lambda_epsilon": float(
+                kernel_config.get("lambda_epsilon", 1e-8)
+            ),
+            "initialization_grid_size": int(
+                kernel_config.get("initialization_grid_size", 256)
+            ),
+            "initial_lambda": initial_lambda_value,
+            "jitter": config.covariance_jitter,
+            "dtype": dtype,
+            "device": target_device,
+        }
+        periods = _periods(model.circular_period, model.n_input)
+        if all(value is None for value in periods):
+            covariance_model = NonPeriodicLogBandwidthKernelCovariance(
+                **common
+            )
+        elif model.n_input == 1 and periods[0] is not None:
+            covariance_model = PeriodicLogBandwidthKernelCovariance(
+                circular_period=periods[0],
+                **common,
+            )
+        else:
+            raise ValueError(
+                "Cannot restore a log-lambda covariance checkpoint with mixed "
+                "or multidimensional periodic inputs."
+            )
+    elif "kernel_precision_cholesky" in covariance_state:
+        covariance_model = TorchKernelCovariance(
+            n_input=model.n_input,
+            n_output=model.n_output,
+            circular_period=model.circular_period,
+            jitter=config.covariance_jitter,
+            dtype=dtype,
+            device=target_device,
+        )
+    else:
+        raise ValueError("Unrecognized GKR covariance checkpoint state.")
     covariance_model.set_data(
         covariance_state["train_residuals"],
         covariance_state["train_inputs"],

@@ -62,3 +62,23 @@ def test_density_plot_writes_png_and_svg(tmp_path: Path) -> None:
     png, svg = module._plot(grouped, tmp_path)
     assert png.is_file()
     assert svg.is_file()
+
+
+def test_density_plot_supports_one_dataset(tmp_path: Path) -> None:
+    module = _load_script()
+    dataset = next(iter(module.DATASETS))
+    grouped = []
+    for method in module.METHODS:
+        for density in (2.0, 4.0):
+            grouped.append(
+                {
+                    "dataset": dataset,
+                    "method": method,
+                    "train_density": density,
+                    "mae_mean": 1.0 / density,
+                    "mae_std": 0.1 / density,
+                }
+            )
+    png, svg = module._plot(grouped, tmp_path)
+    assert png.is_file()
+    assert svg.is_file()

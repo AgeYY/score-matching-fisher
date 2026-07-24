@@ -89,6 +89,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--aggregate-only", action="store_true")
     parser.add_argument(
+        "--skip-ole",
+        action="store_true",
+        help="Fit and report only Flow Matching and GKR.",
+    )
+    parser.add_argument(
+        "--gkr-only",
+        action="store_true",
+        help="Refresh upgraded GKR while preserving cached Flow and OLE estimates.",
+    )
+    parser.add_argument(
         "--skip-aggregate",
         action="store_true",
         help="Fit requested cases without writing shared aggregate artifacts.",
@@ -112,7 +122,7 @@ def _json_ready(value: Any) -> Any:
 
 
 def _signature(args: argparse.Namespace, *, dataset: str, seed: int, n_total: int) -> dict[str, Any]:
-    return {
+    signature = {
         "dataset": dataset,
         "seed": int(seed),
         "n_total": int(n_total),
@@ -131,7 +141,11 @@ def _signature(args: argparse.Namespace, *, dataset: str, seed: int, n_total: in
         "estimator_sample_pool": "training_split_only",
         "flow_validation_pool": "validation_split_only",
         "response_standardization": "flow_train_split_featurewise",
+        "gkr_covariance_kernel": "log-lambda-v1",
     }
+    if bool(args.skip_ole):
+        signature["skip_ole"] = True
+    return signature
 
 
 def _truth(population: Any, theta_midpoints: np.ndarray) -> np.ndarray:
@@ -160,6 +174,19 @@ def _fit_case(
                 return {key: np.asarray(saved[key]) for key in saved.files} | {
                     "metadata": metadata
                 }
+    cached_arrays: dict[str, np.ndarray] | None = None
+    cached_metadata: dict[str, Any] | None = None
+    if bool(args.gkr_only):
+        if not result_path.is_file() or not metadata_path.is_file():
+            raise FileNotFoundError(
+                f"--gkr-only requires cached Flow/OLE results: {result_path}"
+            )
+        with np.load(result_path, allow_pickle=False) as saved:
+            cached_arrays = {
+                key: np.asarray(saved[key])
+                for key in saved.files
+            }
+        cached_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
 
     dataset_path = case_dir / "dataset.npz"
     make_native_dataset_npz(
@@ -177,27 +204,35 @@ def _fit_case(
     population = build_dataset_from_meta(dict(bundle.meta))
     truth = _truth(population, theta_midpoints)
 
-    flow_model, flow_training, flow_estimate, _ = fit_flow_direction_estimator(
-        theta_train=bundle.theta_train,
-        x_train=bundle.x_train,
-        theta_validation=bundle.theta_validation,
-        x_validation=bundle.x_validation,
-        theta_grid=theta_grid,
-        device=device,
-        seed=int(seed),
-        epochs=int(args.epochs),
-        patience=int(args.early_patience),
-        batch_size=int(args.batch_size),
-        learning_rate=float(args.lr),
-        hidden_dim=int(args.hidden_dim),
-        depth=int(args.depth),
-        ode_steps=int(args.ode_steps),
-    )
-    flow = np.asarray(flow_estimate["fisher"], dtype=np.float64).reshape(-1)
-    torch.save(
-        {key: value.detach().cpu() for key, value in flow_model.state_dict().items()},
-        case_dir / "flow_selected_model.pt",
-    )
+    flow_model = None
+    flow_training: dict[str, Any] | None = None
+    if cached_arrays is None:
+        flow_model, flow_training, flow_estimate, _ = fit_flow_direction_estimator(
+            theta_train=bundle.theta_train,
+            x_train=bundle.x_train,
+            theta_validation=bundle.theta_validation,
+            x_validation=bundle.x_validation,
+            theta_grid=theta_grid,
+            device=device,
+            seed=int(seed),
+            epochs=int(args.epochs),
+            patience=int(args.early_patience),
+            batch_size=int(args.batch_size),
+            learning_rate=float(args.lr),
+            hidden_dim=int(args.hidden_dim),
+            depth=int(args.depth),
+            ode_steps=int(args.ode_steps),
+        )
+        flow = np.asarray(flow_estimate["fisher"], dtype=np.float64).reshape(-1)
+        torch.save(
+            {
+                key: value.detach().cpu()
+                for key, value in flow_model.state_dict().items()
+            },
+            case_dir / "flow_selected_model.pt",
+        )
+    else:
+        flow = np.asarray(cached_arrays["flow_fisher"], dtype=np.float64)
 
     gkr_model, gkr_estimate, _ = fit_gkr_direction_estimator(
         theta_train=bundle.theta_train,
@@ -209,53 +244,103 @@ def _fit_case(
     gkr = np.asarray(gkr_estimate.linear_fisher, dtype=np.float64).reshape(-1)
     torch.save(gkr_checkpoint(gkr_model), case_dir / "gkr_model.pt")
 
-    ole_result, _ = fit_cross_fitted_ole_direction_estimator(
-        theta_train=bundle.theta_train,
-        x_train=bundle.x_train,
-        theta_grid=theta_grid,
-        n_splits=int(args.ole_crossfit_folds),
-        seed=20_260_721 + int(seed),
-        min_endpoint_samples=int(args.ole_min_endpoint_samples),
-    )
-    ole = np.asarray(ole_result.linear_fisher, dtype=np.float64).reshape(-1)
-    ole_raw = np.asarray(ole_result.linear_fisher_raw, dtype=np.float64).reshape(-1)
-    endpoint_counts = np.concatenate(
-        [np.asarray(ole_result.n_left), np.asarray(ole_result.n_right)]
-    )
-    arrays = {
-        "theta_grid": theta_grid,
-        "theta_midpoints": theta_midpoints,
-        "ground_truth": truth,
-        "flow_fisher": flow,
-        "gkr_fisher": gkr,
-        "ole_fisher": ole,
-        "ole_fisher_raw": ole_raw,
-        "ole_endpoint_counts": endpoint_counts,
-        "flow_train_losses": np.asarray(flow_training["train_losses"], dtype=np.float64),
-        "flow_validation_losses": np.asarray(flow_training["val_losses"], dtype=np.float64),
-        "gkr_mean_losses": np.asarray(gkr_estimate.mean_loss, dtype=np.float64),
-        "gkr_covariance_losses": np.asarray(gkr_estimate.covariance_loss, dtype=np.float64),
-    }
+    if cached_arrays is None and not bool(args.skip_ole):
+        ole_result, _ = fit_cross_fitted_ole_direction_estimator(
+            theta_train=bundle.theta_train,
+            x_train=bundle.x_train,
+            theta_grid=theta_grid,
+            n_splits=int(args.ole_crossfit_folds),
+            seed=20_260_721 + int(seed),
+            min_endpoint_samples=int(args.ole_min_endpoint_samples),
+        )
+        ole = np.asarray(ole_result.linear_fisher, dtype=np.float64).reshape(-1)
+        ole_raw = np.asarray(
+            ole_result.linear_fisher_raw, dtype=np.float64
+        ).reshape(-1)
+        endpoint_counts = np.concatenate(
+            [np.asarray(ole_result.n_left), np.asarray(ole_result.n_right)]
+        )
+    if cached_arrays is None:
+        assert flow_training is not None
+        arrays = {
+            "theta_grid": theta_grid,
+            "theta_midpoints": theta_midpoints,
+            "ground_truth": truth,
+            "flow_fisher": flow,
+            "gkr_fisher": gkr,
+            "flow_train_losses": np.asarray(
+                flow_training["train_losses"], dtype=np.float64
+            ),
+            "flow_validation_losses": np.asarray(
+                flow_training["val_losses"], dtype=np.float64
+            ),
+            "gkr_mean_losses": np.asarray(
+                gkr_estimate.mean_loss, dtype=np.float64
+            ),
+            "gkr_covariance_losses": np.asarray(
+                gkr_estimate.covariance_loss, dtype=np.float64
+            ),
+        }
+        if not bool(args.skip_ole):
+            arrays.update(
+                {
+                    "ole_fisher": ole,
+                    "ole_fisher_raw": ole_raw,
+                    "ole_endpoint_counts": endpoint_counts,
+                }
+            )
+    else:
+        arrays = dict(cached_arrays)
+        arrays["gkr_fisher"] = gkr
+        arrays["gkr_mean_losses"] = np.asarray(
+            gkr_estimate.mean_loss, dtype=np.float64
+        )
+        arrays["gkr_covariance_losses"] = np.asarray(
+            gkr_estimate.covariance_loss, dtype=np.float64
+        )
+        ole = np.asarray(arrays["ole_fisher"], dtype=np.float64)
+        endpoint_counts = np.asarray(
+            arrays["ole_endpoint_counts"], dtype=np.float64
+        )
     np.savez_compressed(result_path, **arrays)
-    method_curves = {"Flow Matching": flow, "GKR": gkr, "OLE (cross-fit)": ole}
-    metadata = {
-        "signature": signature,
-        "n_train": int(bundle.x_train.shape[0]),
-        "n_validation": int(bundle.x_validation.shape[0]),
-        "train_density": float(bundle.x_train.shape[0] / int(args.x_dim)),
-        "median_ole_endpoint_count": float(np.median(endpoint_counts)),
-        "median_ole_endpoint_density": float(np.median(endpoint_counts) / int(args.x_dim)),
-        "flow_selected_epoch": int(flow_training["selected_epoch"]),
-        "flow_stopped_epoch": int(flow_training["stopped_epoch"]),
-        "mae": {
-            method: float(np.mean(np.abs(curve - truth)))
-            for method, curve in method_curves.items()
-        },
-    }
+    method_curves = {"Flow Matching": flow, "GKR": gkr}
+    if not bool(args.skip_ole):
+        method_curves["OLE (cross-fit)"] = ole
+    metadata = dict(cached_metadata or {})
+    metadata.update(
+        {
+            "signature": signature,
+            "n_train": int(bundle.x_train.shape[0]),
+            "n_validation": int(bundle.x_validation.shape[0]),
+            "train_density": float(
+                bundle.x_train.shape[0] / int(args.x_dim)
+            ),
+            "median_ole_endpoint_count": (
+                float(np.median(endpoint_counts))
+                if not bool(args.skip_ole)
+                else None
+            ),
+            "median_ole_endpoint_density": (
+                float(np.median(endpoint_counts) / int(args.x_dim))
+                if not bool(args.skip_ole)
+                else None
+            ),
+            "mae": {
+                method: float(np.mean(np.abs(curve - truth)))
+                for method, curve in method_curves.items()
+            },
+            "gkr_covariance_kernel": "log-lambda-v1",
+        }
+    )
+    if flow_training is not None:
+        metadata["flow_selected_epoch"] = int(flow_training["selected_epoch"])
+        metadata["flow_stopped_epoch"] = int(flow_training["stopped_epoch"])
     metadata_path.write_text(
         json.dumps(_json_ready(metadata), indent=2) + "\n", encoding="utf-8"
     )
-    del flow_model, gkr_model
+    del gkr_model
+    if flow_model is not None:
+        del flow_model
     if device.type == "cuda":
         torch.cuda.empty_cache()
     return arrays | {"metadata": metadata}
@@ -277,6 +362,8 @@ def _read_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
                 ):
                     continue
                 for method in METHODS:
+                    if method not in metadata["mae"]:
+                        continue
                     rows.append(
                         {
                             "dataset": dataset,
@@ -285,11 +372,11 @@ def _read_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
                             "n_total": int(n_total),
                             "n_train": int(metadata["n_train"]),
                             "train_density": float(metadata["train_density"]),
-                            "median_ole_endpoint_count": float(
-                                metadata["median_ole_endpoint_count"]
+                            "median_ole_endpoint_count": metadata.get(
+                                "median_ole_endpoint_count"
                             ),
-                            "median_ole_endpoint_density": float(
-                                metadata["median_ole_endpoint_density"]
+                            "median_ole_endpoint_density": metadata.get(
+                                "median_ole_endpoint_density"
                             ),
                             "method": method,
                             "mae": float(metadata["mae"][method]),
@@ -320,8 +407,17 @@ def _group_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                         "n_total": n_total,
                         "n_train": int(selected[0]["n_train"]),
                         "train_density": float(selected[0]["train_density"]),
-                        "median_ole_endpoint_density": float(
-                            np.mean([row["median_ole_endpoint_density"] for row in selected])
+                        "median_ole_endpoint_density": (
+                            float(
+                                np.mean(
+                                    [
+                                        row["median_ole_endpoint_density"]
+                                        for row in selected
+                                    ]
+                                )
+                            )
+                            if selected[0]["median_ole_endpoint_density"] is not None
+                            else None
                         ),
                         "method": method,
                         "n_repeats": int(values.size),
@@ -344,12 +440,28 @@ def _plot(grouped: list[dict[str, Any]], output_dir: Path) -> tuple[Path, Path]:
             "savefig.bbox": "tight",
         }
     )
-    fig, axes = plt.subplots(1, 2, figsize=(7.5, 3.5), constrained_layout=True)
-    for axis, dataset in zip(axes, DATASETS, strict=True):
+    datasets = [
+        dataset
+        for dataset in DATASETS
+        if any(row["dataset"] == dataset for row in grouped)
+    ]
+    if not datasets:
+        raise ValueError("Cannot plot an empty grouped result.")
+    fig, axes_array = plt.subplots(
+        1,
+        len(datasets),
+        figsize=(3.5 * len(datasets) + 0.5, 3.5),
+        constrained_layout=True,
+        squeeze=False,
+    )
+    axes = axes_array[0]
+    for axis, dataset in zip(axes, datasets, strict=True):
         for method in METHODS:
             selected = [
                 row for row in grouped if row["dataset"] == dataset and row["method"] == method
             ]
+            if not selected:
+                continue
             selected.sort(key=lambda row: float(row["train_density"]))
             x = np.asarray([row["train_density"] for row in selected], dtype=np.float64)
             y = np.asarray([row["mae_mean"] for row in selected], dtype=np.float64)
@@ -422,6 +534,8 @@ def main() -> int:
     args.output_dir = args.output_dir.expanduser().resolve()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     device = require_device(str(args.device))
+    if bool(args.skip_ole) and bool(args.gkr_only):
+        raise ValueError("--skip-ole and --gkr-only cannot be combined.")
     datasets = list(DATASETS) if args.dataset == "all" else [str(args.dataset)]
     started = time.perf_counter()
     if not args.aggregate_only:
@@ -445,6 +559,7 @@ def main() -> int:
                         + " ".join(
                             f"{method}={result['metadata']['mae'][method]:.6g}"
                             for method in METHODS
+                            if method in result["metadata"]["mae"]
                         ),
                         flush=True,
                     )
