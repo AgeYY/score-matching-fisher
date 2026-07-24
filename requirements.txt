@@ -14,6 +14,8 @@
 numpy
 scipy
 matplotlib
+h5py
+requests
 scikit-learn
 pillow
 typing-extensions
